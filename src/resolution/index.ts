@@ -21,10 +21,12 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
+import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
+import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -39,6 +41,10 @@ import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
+import { builtinModules } from 'module';
+import { parse as parseJsonc } from 'jsonc-parser';
+
+const NODE_BUILTINS = new Set(builtinModules);
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -437,7 +443,9 @@ export class ReferenceResolver {
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
+    this.manifestScopes.clear();
     this.knownNames = null;
+    this.knownLowerNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
@@ -446,6 +454,8 @@ export class ReferenceResolver {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
       clearCppMacroVisibility(this.context);
+      clearSwiftTypeVisibility(this.context);
+      clearTypeParameterMemos(this.context);
     }
   }
 
@@ -497,6 +507,10 @@ export class ReferenceResolver {
   private createContext(): ResolutionContext {
     return {
       resolveImport: (ref) => resolveViaImport(ref, this.context),
+      isOutOfRepoImport: (source, fromFile, language) =>
+        isExternalImport(source, language, this.context) &&
+        resolveImportPath(source, fromFile, language, this.context) === null &&
+        this.isDeclaredOutsidePackage(source, fromFile),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -724,6 +738,14 @@ export class ReferenceResolver {
               const target = this.nodeById(edge.target);
               if (target?.name && target.name !== typeName) supertypes.add(target.name);
             }
+            // A Swift conformance to a type the project only extends (SwiftUI's
+            // `View`) resolves to nothing — the extension is not the type — yet
+            // the members its extensions add are still the conformer's.
+            if (language === 'swift') {
+              for (const name of swiftExtendedConformances(tn, this.context)) {
+                if (name !== typeName) supertypes.add(name);
+              }
+            }
           }
           supers = [...supertypes];
         }
@@ -863,6 +885,21 @@ export class ReferenceResolver {
     };
   }
 
+  /** Lowercased `knownNames`, built the first time a case-insensitive language asks. */
+  private knownLowerNames: Set<string> | null = null;
+
+  /** `hasAnyPossibleMatch` for a language whose names ignore case: the name, or any `.`/`::`/`->` part of it. */
+  private hasAnyPossibleMatchIgnoringCase(name: string): boolean {
+    if (!this.knownNames) return true;
+    if (!this.knownLowerNames || this.knownLowerNames.size === 0) {
+      this.knownLowerNames = new Set();
+      for (const known of this.knownNames) this.knownLowerNames.add(known.toLowerCase());
+    }
+    const lower = name.toLowerCase();
+    if (this.knownLowerNames.has(lower)) return true;
+    return lower.split(/::|->|\./).some((part) => part.length > 0 && this.knownLowerNames!.has(part));
+  }
+
   /**
    * Check if a reference name has any possible match in the codebase.
    * Uses the pre-built knownNames set to skip expensive resolution
@@ -969,10 +1006,20 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
-    const candidate = this.gateTargetKind(this.resolveOneInner(ref), ref);
-    const resolved = candidate?.resolvedBy === 'framework'
-      ? this.gateFrameworkLanguage(candidate, ref)
-      : this.gateLanguage(candidate, ref);
+    // A Swift type reference never lands on an `extension X {}` node, nor on a
+    // nested type it cannot name bare (see ./swift-type-visibility).
+    // A name a declaration around the reference declares as a type parameter
+    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters).
+    const candidate = gateTypeParameter(
+      gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+      ref,
+      this.context,
+    );
+    const scoped = this.gateRustScope(candidate, ref);
+    const resolved = this.gateSuperSelfCall(
+      scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
+      ref,
+    );
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -1039,6 +1086,9 @@ export class ReferenceResolver {
     const preFilterPass =
       isNixPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
+      // PHP, Pascal, CFML, COBOL and VB.NET names ignore case: `formatprice()`
+      // calls `FormatPrice`, which the exact-name set never lists.
+      (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
@@ -2318,10 +2368,13 @@ export class ReferenceResolver {
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
-      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts';
+      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts'
+      || ref.language === 'vue' || ref.language === 'svelte' || ref.language === 'astro';
 
-    // JavaScript/TypeScript built-ins
-    if (isJsTs && JS_BUILT_INS.has(name)) {
+    // JavaScript/TypeScript built-ins — unless the file imports its own
+    // binding of that name (`import Map from './Map.svelte'`).
+    if (isJsTs && JS_BUILT_INS.has(name) &&
+        !this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === name)) {
       return true;
     }
 
@@ -2834,6 +2887,105 @@ export class ReferenceResolver {
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
     return result;
+  }
+
+  /**
+   * `super.didMoveToWindow()` inside an override of `didMoveToWindow` calls
+   * the PARENT's implementation, never the method making the call. Extraction
+   * keeps a `super` call under the bare method name, so every strategy found
+   * the enclosing method itself: one expo-camera view had eleven of its
+   * overrides "calling" themselves. The parent's method is usually a
+   * framework's (UIKit, Android, React); a self-edge is never it. Real
+   * recursion keeps its edge — only a call written through `super` / `base`
+   * (C#) / `[super …]` (Objective-C) / `parent::` (PHP) / `super().` (Python)
+   * is declined.
+   */
+  private gateSuperSelfCall(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result || ref.referenceKind !== 'calls' || result.targetNodeId !== ref.fromNodeId) return result;
+    const name = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf('.'), ref.referenceName.lastIndexOf(':')) + 1);
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return result;
+    const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+    if (!line) return result;
+    const escaped = name.replace(/\$/g, '\\$');
+    const viaSuper = new RegExp(
+      String.raw`(?:\b(?:super|base)\s*(?:\(\s*(?:[\w.]+\s*,\s*\w+)?\s*\))?\s*\??\.\s*|\[\s*super\s+|\bparent\s*::\s*)` + escaped + String.raw`\b`,
+    );
+    return viaSuper.test(line) ? null : result;
+  }
+
+  /**
+   * A bare Rust name reaches only what is in scope — every strategy's result,
+   * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
+   * isRustNameInScope).
+   */
+  private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
+    const target = this.nodeById(result.targetNodeId);
+    return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+  }
+
+  /** The repository's own package name, from its root package.json; null without one. */
+  /** Per directory: the package names its package.json and every enclosing one own and depend on. */
+  private manifestScopes = new Map<string, { own: Set<string>; deps: Set<string> }>();
+
+  /**
+   * Is `source` a package from outside the repository? Only when the importing
+   * file's package.json (or an enclosing one) declares it, or it is a Node
+   * built-in or a runtime's virtual module. A specifier nothing declares is
+   * an alias this resolver does not know — SvelteKit's `$lib/…`, Nuxt's
+   * `~/…`, a nested app's own `@/…` — and stays the project's.
+   */
+  private isDeclaredOutsidePackage(source: string, fromFile: string): boolean {
+    // Deno's standard library is `@std/…` from JSR.
+    if (/^(?:node|bun|jsr|npm|https?):/.test(source) || source.startsWith('@std/') || NODE_BUILTINS.has(source)) return true;
+    const name = source.startsWith('@') ? source.split('/').slice(0, 2).join('/') : source.split('/')[0]!;
+    const normalized = fromFile.replace(/\\/g, '/');
+    const scope = this.manifestScope(normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '');
+    if (scope.own.has(name)) return false;
+    if (scope.deps.has(name)) return true;
+    // SvelteKit's `$app/…` and Astro's `astro:…` belong to the framework —
+    // unless this repository is that framework.
+    const provider = source.startsWith('astro:') ? 'astro' : /^\$(?:app|env|service-worker)(?:\/|$)/.test(source) ? '@sveltejs/kit' : null;
+    return provider !== null && !scope.own.has(provider) && !this.context.getWorkspacePackages?.()?.byName.has(provider);
+  }
+
+  private manifestScope(dir: string): { own: Set<string>; deps: Set<string> } {
+    const memo = this.manifestScopes.get(dir);
+    if (memo) return memo;
+    const parent = dir === '' ? null : this.manifestScope(dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '');
+    let scope = parent ?? { own: new Set<string>(), deps: new Set<string>() };
+    try {
+      const json = JSON.parse(this.context.readFile(dir ? `${dir}/package.json` : 'package.json') ?? 'null') as Record<string, unknown> | null;
+      if (json && typeof json === 'object') {
+        scope = { own: new Set(scope.own), deps: new Set(scope.deps) };
+        if (typeof json.name === 'string' && json.name.length > 0) scope.own.add(json.name);
+        for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+          const deps = json[field];
+          if (!deps || typeof deps !== 'object') continue;
+          for (const [dep, version] of Object.entries(deps)) {
+            // `workspace:*`, `file:../shared`, `link:…`: a package in this repository.
+            if (typeof version === 'string' && /^(?:workspace|file|link|portal):/.test(version)) scope.own.add(dep);
+            else scope.deps.add(dep);
+          }
+        }
+      }
+    } catch { /* no or unreadable package.json */ }
+    // A Deno import map names packages the same way — an entry that maps to a
+    // registry or a URL, not one that maps to a path in the repository.
+    for (const file of ['deno.json', 'deno.jsonc']) {
+      const raw = this.context.readFile(dir ? `${dir}/${file}` : file);
+      if (!raw) continue;
+      const json = parseJsonc(raw) as { imports?: Record<string, unknown> } | undefined;
+      const imports = json && typeof json === 'object' ? json.imports : undefined;
+      if (!imports || typeof imports !== 'object') continue;
+      for (const [key, target] of Object.entries(imports)) {
+        if (typeof target !== 'string' || !/^(?:jsr|npm|https?):/.test(target)) continue;
+        if (scope === parent) scope = { own: new Set(scope.own), deps: new Set(scope.deps) };
+        scope.deps.add(key.replace(/\/$/, ''));
+      }
+    }
+    this.manifestScopes.set(dir, scope);
+    return scope;
   }
 
   /** The one supertype-kind node a TypeScript value shares its name and file with. */

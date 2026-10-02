@@ -1,12 +1,13 @@
 /**
  * Vue / Nuxt Framework Resolver
  *
- * Handles Vue component references, compiler macros (defineProps, etc.),
- * Nuxt auto-imports, and Nuxt file-based routing patterns.
+ * Handles Vue component references, compiler macros (defineProps, etc.) and
+ * Nuxt auto-imports; `nuxtResolver` reads Nuxt's file-based routes.
  */
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { dependsOn } from './package-deps';
 
 /**
  * Vue 3 compiler macros — compiler-provided, not user code
@@ -186,13 +187,34 @@ export const vueResolver: FrameworkResolver = {
 
     return null;
   },
+};
+
+/**
+ * Nuxt's file-based routes: `pages/` screens, `server/api/` endpoints and
+ * `middleware/`. Its own resolver, detected only in a Nuxt app: a plain Vue
+ * app keeps its views in a `pages/` folder just as often (halo's console
+ * does), and those are components a router config names, not addresses.
+ */
+export const nuxtResolver: FrameworkResolver = {
+  name: 'nuxt',
+  appDependencies: ['nuxt', 'nuxt3', '@nuxt/kit'],
+
+  detect(context: ResolutionContext): boolean {
+    if (dependsOn(context, 'nuxt', 'nuxt3', '@nuxt/kit')) return true;
+    return context.getAllFiles().some((f) => /(?:^|\/)nuxt\.config\.(?:[cm]?[jt]s)$/.test(f));
+  },
+
+  resolve(): ResolvedRef | null {
+    return null;
+  },
 
   extract(filePath: string, _content: string) {
     const nodes: Node[] = [];
     const now = Date.now();
 
-    // Normalize to forward slashes
-    const normalized = filePath.replace(/\\/g, '/');
+    // Forward slashes, and a leading `/` so an app at the repository root
+    // (`pages/index.vue`) is found by the same `/pages/` search as a nested one.
+    const normalized = '/' + filePath.replace(/\\/g, '/');
 
     // Detect Nuxt page routes (pages/ directory)
     const pagesIndex = normalized.indexOf('/pages/');
@@ -221,8 +243,10 @@ export const vueResolver: FrameworkResolver = {
       const afterApi = normalized.substring(apiIndex + '/server/api/'.length);
       const routeName = afterApi
         .replace(/\.[^/.]+$/, '') // Remove extension
-        .replace(/\/index$/, ''); // index -> parent path
-      const apiRoute = '/api/' + routeName;
+        .replace(/(?:^|\/)index$/, '') // index -> parent path
+        .replace(/\[\.\.\.([^\]]+)\]/g, '*$1') // [...slug] -> *slug
+        .replace(/\[([^\]]+)\]/g, ':$1'); // [id] -> :id, as a page's params are
+      const apiRoute = routeName === '' ? '/api' : '/api/' + routeName;
 
       nodes.push({
         id: `route:${filePath}:${apiRoute}:1`,
@@ -317,7 +341,7 @@ function filePathToNuxtRoute(normalized: string, afterPagesStart: number): strin
   const withoutExt = afterPages.replace(/\.vue$/, '');
 
   // Remove /index suffix (index.vue -> parent route)
-  const withoutIndex = withoutExt.replace(/\/index$/, '');
+  const withoutIndex = withoutExt.replace(/(?:^|\/)index$/, '');
 
   // Convert Nuxt param syntax [param] to :param
   let route = '/' + withoutIndex

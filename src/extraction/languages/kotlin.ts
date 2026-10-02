@@ -161,7 +161,24 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
   return hasFun && hasInterfaceType;
 }
 
+/**
+ * The qualifier of a function type's receiver — `DatabaseConfig.` in
+ * `configure: (DatabaseConfig.Builder.() -> Unit)?`. The grammar reads a
+ * single-segment receiver (`Builder.() -> Unit`) but not a qualified one, and
+ * its error recovery then drops the enclosing class: Exposed's
+ * `DatabaseTestsBase` came out as a file of loose functions. `X.(` is not an
+ * expression, so the shape only occurs in a type.
+ */
+const QUALIFIED_RECEIVER = /\b(?:[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.)+(?=[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.\()/g;
+
+/** Blank a function type's receiver qualifier to spaces (offsets survive), leaving its simple type name. */
+export function blankKotlinQualifiedReceivers(source: string): string {
+  if (!source.includes('.(')) return source;
+  return source.replace(QUALIFIED_RECEIVER, (m) => ' '.repeat(m.length));
+}
+
 export const kotlinExtractor: LanguageExtractor = {
+  preParse: blankKotlinQualifiedReceivers,
   functionTypes: ['function_declaration'],
   classTypes: ['class_declaration'],
   methodTypes: ['function_declaration'], // Methods are functions inside classes

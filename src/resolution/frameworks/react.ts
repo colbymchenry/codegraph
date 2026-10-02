@@ -28,6 +28,15 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A component, hook or context the file IMPORTS is the import's: the
+    // package's (`useQuery` from `@tanstack/react-query`, `<Button>` from a UI
+    // kit), or the module the import names, which import resolution finds.
+    // Framework resolution runs first, and a name lookup here bound trpc's
+    // tests' `useQuery` to a hook nested in one of trpc's own factories.
+    if (context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === ref.referenceName)) {
+      return null;
+    }
+
     // Pattern 1: Component references (PascalCase). Only from JSX-capable
     // files — a component is USED in markup, which only parses in .tsx/.jsx.
     // Without this gate, every PascalCase TYPE reference in plain .ts files
@@ -54,7 +63,7 @@ export const reactResolver: FrameworkResolver = {
 
     // Pattern 2: Hook references (use*)
     if (ref.referenceName.startsWith('use') && ref.referenceName.length > 3) {
-      const result = resolveHook(ref.referenceName, context);
+      const result = resolveHook(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
           original: ref,
@@ -338,12 +347,19 @@ function resolveComponent(
 /**
  * Resolve a custom hook reference using name-based lookup
  */
-function resolveHook(name: string, context: ResolutionContext): string | null {
+function resolveHook(name: string, fromFile: string, context: ResolutionContext): string | null {
   const candidates = context.getNodesByName(name);
   if (candidates.length === 0) return null;
 
-  const hooks = candidates.filter((n) => n.kind === 'function' && n.name.startsWith('use'));
+  // A hook nested inside another function is only callable in there.
+  const nested = (n: Node): boolean =>
+    context.getNodesInFile(n.filePath).some((f) =>
+      f.id !== n.id && (f.kind === 'function' || f.kind === 'method') && f.startLine <= n.startLine && f.endLine >= n.endLine &&
+      (f.startLine < n.startLine || f.endLine > n.endLine));
+  const hooks = candidates.filter((n) => n.kind === 'function' && n.name.startsWith('use') && !nested(n));
   if (hooks.length === 0) return null;
+  const sameFile = hooks.find((n) => n.filePath === fromFile);
+  if (sameFile) return sameFile.id;
 
   // Prefer hooks directories
   const HOOK_DIRS = ['/hooks/', '/src/hooks/', '/lib/hooks/', '/utils/hooks/'];

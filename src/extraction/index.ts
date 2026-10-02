@@ -32,7 +32,8 @@ import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
-import { detectFrameworks } from '../resolution/frameworks';
+import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks';
+import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
@@ -1908,7 +1909,76 @@ export class ExtractionOrchestrator {
     const fileList = files ?? scanDirectory(this.rootDir);
     const context = this.buildDetectionContext(fileList);
     this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
+    const declared = declaredDependencies(context);
+    this.gatedFrameworks = new Map();
+    for (const name of this.detectedFrameworkNames) {
+      const deps = getFrameworkResolver(name)?.appDependencies;
+      // Gated only when some manifest names the framework: otherwise detection
+      // found it by other evidence and every file is its app's.
+      if (deps && deps.some((d) => declared.has(d))) this.gatedFrameworks.set(name, deps);
+    }
+    this.appFrameworkMemo.clear();
+    this.manifestDependencies.clear();
     return this.detectedFrameworkNames;
+  }
+
+  /** Detected frameworks whose extractors run only inside their own apps, with the packages that mark one. */
+  private gatedFrameworks = new Map<string, readonly string[]>();
+  /** `<dir>|<framework>` → does the package.json at or above `dir` declare the framework. */
+  private appFrameworkMemo = new Map<string, boolean>();
+  /** Directory → the dependency names its package.json declares, null without one. */
+  private manifestDependencies = new Map<string, Set<string> | null>();
+
+  /**
+   * The detected frameworks whose extractors apply to `filePath`: all of them,
+   * except one with `appDependencies` when neither the file's package.json nor
+   * an enclosing one declares any of them.
+   */
+  private frameworksForFile(filePath: string, names: string[]): string[] {
+    if (this.gatedFrameworks.size === 0) return names;
+    const slash = filePath.lastIndexOf('/');
+    const dir = slash < 0 ? '' : filePath.slice(0, slash);
+    const kept = names.filter((name) => this.frameworkAppliesIn(dir, name));
+    return kept.length === names.length ? names : kept;
+  }
+
+  private frameworkAppliesIn(dir: string, name: string): boolean {
+    const deps = this.gatedFrameworks.get(name);
+    if (!deps) return true;
+    const key = `${dir}|${name}`;
+    const memo = this.appFrameworkMemo.get(key);
+    if (memo !== undefined) return memo;
+    // The nearest manifest that names ANY gated framework decides: true-sheet's
+    // root package.json declares expo-router for its example app, and its
+    // `docs/` Next.js app — whose own package.json declares `next` — is not
+    // an Expo app for it.
+    let applies = false;
+    for (let d: string | null = dir; d !== null; d = d === '' ? null : d.includes('/') ? d.slice(0, d.lastIndexOf('/')) : '') {
+      const declared = this.dependenciesDeclaredIn(d);
+      if (!declared) continue;
+      if (deps.some((dep) => declared.has(dep))) {
+        applies = true;
+        break;
+      }
+      if ([...this.gatedFrameworks].some(([other, otherDeps]) => other !== name && otherDeps.some((dep) => declared.has(dep)))) break;
+    }
+    this.appFrameworkMemo.set(key, applies);
+    return applies;
+  }
+
+  private dependenciesDeclaredIn(dir: string): Set<string> | null {
+    if (this.manifestDependencies.has(dir)) return this.manifestDependencies.get(dir)!;
+    let declared: Set<string> | null = null;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(this.rootDir, dir, 'package.json'), 'utf8')) as Record<string, unknown>;
+      declared = new Set();
+      for (const field of ['dependencies', 'devDependencies', 'peerDependencies']) {
+        const group = pkg[field];
+        if (group && typeof group === 'object') for (const name of Object.keys(group)) declared.add(name);
+      }
+    } catch { /* no or unreadable manifest */ }
+    this.manifestDependencies.set(dir, declared);
+    return declared;
   }
 
   /**
@@ -2099,8 +2169,9 @@ export class ExtractionOrchestrator {
      */
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, frameworkNames));
-      return pool.requestParse({ filePath, content, language, frameworkNames });
+      const names = this.frameworksForFile(filePath, frameworkNames);
+      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
+      return pool.requestParse({ filePath, content, language, frameworkNames: names });
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
@@ -2722,7 +2793,7 @@ export class ExtractionOrchestrator {
     // Extract from source. Use cached framework names if indexAll has run,
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
-    const frameworkNames = this.ensureDetectedFrameworks();
+    const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
     const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database

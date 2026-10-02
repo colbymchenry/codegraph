@@ -256,7 +256,10 @@ mismatch between `package.json` and `package-lock.json`, runs
 version fields (top-level + `packages.""`), and auto-commits + pushes the
 result back to `main` with `[skip ci]`. So a GitHub-web-UI single-file edit to
 `package.json` is enough to kick off a clean release. (If they edit both files
-locally, that's fine too — the sync step no-ops.)
+locally, that's fine too — the sync step no-ops.) Bump `ui/package.json` to the
+same version in that change: the component library is versioned with the
+engine, `ui-package.test.ts` pins it, and the workflow does not sync it — the
+1.6.1 bump left `main` red on exactly that.
 
 Once `package.json` is at the target version on `main`, trigger
 **Actions → Release → Run workflow** (on `main`). The workflow:

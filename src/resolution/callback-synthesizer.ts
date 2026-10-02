@@ -33,9 +33,10 @@ import { nextLinkEdges } from './next-router-synthesizer';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
 import { tanstackLinkEdges } from './tanstack-router-synthesizer';
 import { vueRouterLinkEdges } from './vue-router-synthesizer';
+import { angularTemplateEdges } from './angular-template-synthesizer';
 import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
-import { crossTierEdges, hasCrossTierPattern } from './tier-synthesizer';
+import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
@@ -1029,6 +1030,25 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     methodsMemo.set(classId, methods);
     return methods;
   };
+  // A Swift protocol's methods live in its extensions: requirements are not
+  // extracted as methods, and `extension EventMonitor { func request(…) }` is
+  // where the default implementations a conformer overrides are. A class-kind
+  // node sharing a protocol's name is one of its extensions.
+  const protocolMemo = new Map<string, Node[]>();
+  const baseMethodsOf = (base: Node): Node[] => {
+    if (base.language !== 'swift' || base.kind !== 'interface') return methodsOf(base.id);
+    const hit = protocolMemo.get(base.id);
+    if (hit) return hit;
+    const methods = [
+      ...methodsOf(base.id),
+      ...queries
+        .getNodesByName(base.name)
+        .filter((n) => n.language === 'swift' && n.kind === 'class')
+        .flatMap((n) => methodsOf(n.id)),
+    ];
+    protocolMemo.set(base.id, methods);
+    return methods;
+  };
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
   // types that conform to protocols. Iterate both.
@@ -1056,7 +1076,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         if (arr) arr.push(m); else implByName.set(m.name, [m]);
       }
       let added = 0;
-      for (const bm of methodsOf(base.id)) {
+      for (const bm of baseMethodsOf(base)) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
         for (const m of implByName.get(bm.name) ?? []) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -1202,6 +1222,15 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+function languageForJsxFile(file: string): Language {
+  if (file.endsWith('.tsx')) return 'tsx';
+  if (/\.[cm]?ts$/.test(file)) return 'typescript';
+  if (file.endsWith('.jsx')) return 'jsx';
+  if (file.endsWith('.vue')) return 'vue';
+  if (file.endsWith('.svelte')) return 'svelte';
+  return 'javascript';
+}
+
 /** `localName` → the project file it is imported from, for one file's imports. */
 function importedFrom(ctx: ResolutionContext, file: string, language: Language): Map<string, string> {
   const out = new Map<string, string>();
@@ -1239,7 +1268,21 @@ function jsxChild(
   importsOf: () => Map<string, string>
 ): Node | undefined {
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
-  if (candidates.length <= 1) return candidates[0];
+  if (candidates.length === 0) {
+    // A name nothing declares is the file's DEFAULT import of a module's one
+    // component under another name: segmented-control renders
+    // `<RNCSegmentedControlNativeComponent>`, the default export of a module
+    // that is `requireNativeComponent('RNCSegmentedControl')`; element-plus's
+    // tests render `<Autocomplete>` from `autocomplete.vue`. A named import
+    // names an export of its own, which a barrel's one component is not.
+    const isDefault = ctx
+      .getImportMappings(file, languageForJsxFile(file))
+      .some((m) => m.localName === name && m.isDefault);
+    const from = isDefault ? importsOf().get(name) : undefined;
+    const components = from ? ctx.getNodesInFile(from).filter((n) => n.kind === 'component') : [];
+    return components.length === 1 ? components[0] : undefined;
+  }
+  if (candidates.length === 1) return candidates[0];
   const local = candidates.find((n) => n.filePath === file);
   if (local) return local;
   const from = importsOf().get(name);
@@ -1470,8 +1513,79 @@ const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
 // is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
 const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
+// The same calls with the event named by a CONSTANT — NetInfo listens with
+// `addListener(PrivateTypes.DEVICE_CONNECTIVITY_EVENT, …)`, many libraries emit
+// with `.emit(EVENT_NAME, …)` or `sendEventWithName:kLocationEvent`.
+const RN_OBJC_SEND_CONST_RE = /\bsendEventWithName\s*:\s*([A-Za-z_]\w*)\b/g;
+const RN_SWIFT_SEND_CONST_RE = /\bsendEvent\s*\(\s*withName\s*:\s*([A-Za-z_][\w.]*)/g;
+const RN_JVM_EMIT_CONST_RE = /\.emit\s*\(\s*([A-Za-z_][\w.]*)\s*,/g;
+const RN_NATIVE_SENDEVENT_CONST_RE = /\bsendEvent\s*\(\s*[A-Za-z_][\w.]*\s*,\s*([A-Za-z_][\w.]*)\s*,/g;
+const RN_JS_LISTEN_CONST_RE = /\.(?:on|once|addListener)\(\s*((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$.]*|(?:async\s*)?(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\s*\())/g;
+
+const CONSTANT_KINDS = new Set<NodeKind>(['constant', 'variable', 'field', 'property', 'enum_member']);
+
+/**
+ * The string an event-name constant holds, read off its declaration line:
+ * `export const DEVICE_CONNECTIVITY_EVENT = 'netInfo.networkStatusDidChange'`,
+ * `static final String EVENT = "x"`, `const val EVENT = "x"`,
+ * `NSString *const kEvent = @"x"`, `#define kEvent @"x"`, `static let event = "x"`,
+ * an enum case `Changed = 'changed'`.
+ *
+ * Scoped as the language scopes the name, never by the name alone — a
+ * parameter `eventName` is not some test's `eventName = "pong"`:
+ * - a bare `NAME` is a declaration in the same file, or (JS) the one an
+ *   import of that name points at;
+ * - `Owner.NAME` is a declaration inside `Owner`, or (JS) `NAME` in the file
+ *   a namespace import `Owner` points at.
+ * Null unless those declarations agree on one literal.
+ */
+function constantEventName(expr: string, file: string, ctx: ResolutionContext, memo: Map<string, string | null>): string | null {
+  const key = `${file}\0${expr}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const parts = expr.replace(/\.rawValue$/, '').split('.');
+  const name = parts[parts.length - 1]!;
+  const owner = parts.length > 1 ? parts[parts.length - 2]! : null;
+  let value: string | null = null;
+  if (/^[A-Za-z_$][\w$]*$/.test(name) && name !== 'this' && (parts.length <= 2 || parts[0] !== 'this')) {
+    const read = (n: Node): string | null => {
+      const line = (ctx.getFileLines?.(n.filePath) ?? ctx.readFile(n.filePath)?.split(/\r?\n/))?.[n.startLine - 1] ?? '';
+      const at = line.indexOf(name);
+      if (at < 0) return null;
+      const rest = line.slice(at + name.length);
+      const m = /^\s*(?::[^=;]*)?[=:]\s*@?(["'`])([^"'`]+)\1/.exec(rest) ?? /^\s+@?(")([^"]+)"/.exec(rest);
+      return m ? m[2]! : null;
+    };
+    const declaredIn = (f: string) => ctx.getNodesInFile(f).filter((n) => n.name === name && CONSTANT_KINDS.has(n.kind));
+    const js = /\.(?:[cm]?[jt]sx?)$/.test(file);
+    const language: Language = /\.tsx$/.test(file) ? 'tsx' : /\.[cm]?ts$/.test(file) ? 'typescript' : file.endsWith('.jsx') ? 'jsx' : 'javascript';
+    const importedFile = (local: string): string | null => {
+      if (!js) return null;
+      const binding = ctx.getImportMappings(file, language).find((m) => m.localName === local);
+      return binding ? resolveImportPath(binding.source, file, language, ctx) : null;
+    };
+    let decls: Node[] = [];
+    if (owner === null) {
+      decls = declaredIn(file);
+      if (decls.length === 0) {
+        const from = importedFile(name);
+        if (from) decls = declaredIn(from);
+      }
+    } else {
+      const from = importedFile(owner);
+      decls = from
+        ? declaredIn(from)
+        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${owner}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
+    }
+    const values = new Set(decls.map(read).filter((v): v is string => v !== null));
+    value = values.size === 1 ? [...values][0]! : null;
+  }
+  memo.set(key, value);
+  return value;
+}
+
 async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
+  const constants = new Map<string, string | null>();
   // Native dispatchers (source = the native method whose body sends the
   // event) and JS handlers (target = the function/method registered as
   // the listener) keyed by event name.
@@ -1501,6 +1615,11 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       while ((m = RN_OBJC_SEND_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
+      RN_OBJC_SEND_CONST_RE.lastIndex = 0;
+      while ((m = RN_OBJC_SEND_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (event) addDispatcher(event, lineOf(m.index));
+      }
     }
 
     // Swift side: same RCTEventEmitter method, parens/named-args syntax.
@@ -1513,6 +1632,11 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
       while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      RN_SWIFT_SEND_CONST_RE.lastIndex = 0;
+      while ((m = RN_SWIFT_SEND_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (event) addDispatcher(event, lineOf(m.index));
       }
     }
 
@@ -1529,6 +1653,13 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
       while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      for (const re of [RN_JVM_EMIT_CONST_RE, RN_NATIVE_SENDEVENT_CONST_RE]) {
+        re.lastIndex = 0;
+        while ((m = re.exec(content))) {
+          const event = constantEventName(m[1]!, file, ctx, constants);
+          if (event) addDispatcher(event, lineOf(m.index));
+        }
       }
     }
 
@@ -1613,6 +1744,23 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
         if (!enclosing) continue;
         const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
         if (!map.has(enclosing.id)) map.set(enclosing.id, `${file}:${lineOf(m.index)}`);
+        jsHandlersByEvent.set(event, map);
+      }
+      // A constant event name: the listener lands where a literal one would —
+      // the named handler when it is a node, else the enclosing function.
+      RN_JS_LISTEN_CONST_RE.lastIndex = 0;
+      while ((m = RN_JS_LISTEN_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (!event) continue;
+        const arg = m[2]!;
+        const bare = /^[A-Za-z_$][\w$.]*$/.test(arg) ? arg.slice(arg.lastIndexOf('.') + 1) : null;
+        const line = lineOf(m.index);
+        // The handler this file names — never a same-named function elsewhere.
+        const named = bare ? nodesInFile.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === bare) : undefined;
+        const target = named ?? enclosingFn(nodesInFile, line);
+        if (!target) continue;
+        const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
+        if (!map.has(target.id)) map.set(target.id, `${file}:${line}`);
         jsHandlersByEvent.set(event, map);
       }
     }
@@ -3635,7 +3783,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
-  if (hasCrossTierPattern(content)) return true;
+  if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
   if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
@@ -3671,6 +3819,10 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // Before the in-process emitter pass: the same (source, target) pair
   // keeps the more specific edge — the one that says which tier it crosses.
   { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
+  // A Spring / Laravel test's request (`mockMvc.perform(post("/x"))`,
+  // `$this->postJson('api/x')`) onto the route it reaches, so the handler
+  // counts as tested.
+  { name: 'testRequestEdges', gate: (has) => has('java', 'kotlin', 'php'), run: (_q, c, y) => testRequestEdges(c, y) },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
@@ -3734,6 +3886,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'reactRouterLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactRouterLinkEdges(c, y) },
   { name: 'tanstackLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => tanstackLinkEdges(c, y) },
   { name: 'vueRouterLinkEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vueRouterLinkEdges(c, y) },
+  // An Angular template: the child components it renders and its `routerLink`s.
+  { name: 'angularTemplateEdges', gate: (has) => has('typescript'), run: (_q, c, y) => angularTemplateEdges(c, y) },
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },

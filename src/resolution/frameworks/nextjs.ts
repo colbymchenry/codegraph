@@ -222,6 +222,7 @@ export function nextNavVerb(name: string): string | null {
 export const nextjsResolver: FrameworkResolver = {
   name: 'nextjs',
   languages: [...ROUTE_LANGUAGES],
+  appDependencies: ['next'],
 
   detect(context: ResolutionContext): boolean {
     if (dependsOn(context, 'next')) return true;

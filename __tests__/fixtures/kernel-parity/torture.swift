@@ -86,6 +86,13 @@ func freeFn(a: Int, cb: @escaping (Int) -> Void) -> Session? {
   x?.optCall()
   y!.forced()
   Foo.make().draw()
+  API.PackageController.GetRoute.query(on: db)
+  API.PackageController
+    .GetRoute.query(on: db)
+  API.Model(name: "x")
+  Self.Inner.make()
+  App.lower.call()
+  API.Ünicode.query()
   foo.bar().baz()
   "lit".upper()
   arr.map { $0.name }

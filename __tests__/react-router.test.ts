@@ -593,3 +593,101 @@ describe('react-router: route declaration boundaries (#1348)', () => {
     expect(result).toEqual({ paths: ['/child', '/shell'], bindings: ['/child->Child', '/shell->Shell'] });
   });
 });
+
+describe('react-router: v5 redirects and styled link wrappers', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rr-wrappers-'));
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'app', dependencies: { react: '*', 'react-router-dom': '^5.0.0', 'styled-components': '*' } }),
+      // react-boilerplate: the header's links are a styled Link, default-exported.
+      'app/components/Header/HeaderLink.js': `import { Link } from 'react-router-dom';
+import styled from 'styled-components';
+
+export default styled(Link)\`
+  color: #41addd;
+\`;
+`,
+      'app/components/Header/index.js': `import React from 'react';
+import HeaderLink from './HeaderLink';
+
+export default function Header() {
+  return (
+    <nav>
+      <HeaderLink to="/">Home</HeaderLink>
+      <HeaderLink to="/features">Features</HeaderLink>
+    </nav>
+  );
+}
+`,
+      'app/components/Nav.js': `import React from 'react';
+import { NavLink } from 'react-router-dom';
+import styled from 'styled-components';
+
+const MenuLink = styled(NavLink)\`
+  padding: 4px;
+\`;
+
+export default function Nav() {
+  return <MenuLink to="/features">Features</MenuLink>;
+}
+`,
+      // takenote: a guard renders v5's <Redirect to>.
+      'app/router/PrivateRoute.js': `import React from 'react';
+import { Route, Redirect } from 'react-router-dom';
+
+export default function PrivateRoute({ component: Component, ...rest }) {
+  return <Route {...rest} render={(props) => (rest.isAuthenticated ? <Component {...props} /> : <Redirect to="/" />)} />;
+}
+`,
+      'app/containers/App.js': `import React from 'react';
+import { Switch, Route } from 'react-router-dom';
+import HomePage from './HomePage';
+import FeaturePage from './FeaturePage';
+
+export default function App() {
+  return (
+    <Switch>
+      <Route exact path="/" component={HomePage} />
+      <Route path="/features" component={FeaturePage} />
+    </Switch>
+  );
+}
+`,
+      'app/containers/HomePage.js': `import React from 'react';
+export default function HomePage() { return <h1>Home</h1>; }
+`,
+      'app/containers/FeaturePage.js': `import React from 'react';
+export default function FeaturePage() { return <h1>Features</h1>; }
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    cg = await CodeGraph.init(root, { index: true });
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const navsFrom = (name: string) => {
+    const from = cg.getNodesByName(name).find((n) => n.kind === 'function' || n.kind === 'component')!;
+    return cg
+      .getOutgoingEdges(from.id)
+      .filter((e) => e.kind === 'navigates')
+      .map((e) => `${(e.metadata as Record<string, unknown>).navMethod} ${cg.getNode(e.target)!.name}`)
+      .sort();
+  };
+
+  it('a styled(Link) wrapper, imported or local, is a link', () => {
+    expect(navsFrom('Header')).toEqual(['link /', 'link /features']);
+    expect(navsFrom('Nav')).toEqual(['link /features']);
+  });
+
+  it('v5’s <Redirect to> navigates', () => {
+    expect(navsFrom('PrivateRoute')).toEqual(['redirect /']);
+  });
+});

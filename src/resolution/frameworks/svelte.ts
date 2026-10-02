@@ -276,11 +276,14 @@ function filePathToSvelteKitRoute(filePath: string): string | null {
   const lastSlash = afterRoutes.lastIndexOf('/');
   const dirPath = lastSlash === -1 ? '' : afterRoutes.substring(0, lastSlash);
 
-  // Convert SvelteKit param syntax [param] to :param
-  let route = '/' + dirPath
-    .replace(/\[\.\.\.([^\]]+)\]/g, '*$1')  // [...rest] -> *rest
-    .replace(/\[{2}([^\]]+)\]{2}/g, ':$1?') // [[optional]] -> :optional?
-    .replace(/\[([^\]]+)\]/g, ':$1');        // [param] -> :param
+  // A `(group)` directory shares a layout and never appears in the URL:
+  // `(app)/(layout)/blocks` is `/blocks`. A parameter's `=matcher` checks
+  // its value and is no part of its name.
+  const segments = dirPath.split('/').filter((seg) => seg.length > 0 && !/^\(.*\)$/.test(seg));
+  let route = '/' + segments.join('/')
+    .replace(/\[\.\.\.([^\]=]+)(?:=[^\]]*)?\]/g, '*$1')  // [...rest] / [...rest=m] -> *rest
+    .replace(/\[{2}([^\]=]+)(?:=[^\]]*)?\]{2}/g, ':$1?') // [[optional]] -> :optional?
+    .replace(/\[([^\]=]+)(?:=[^\]]*)?\]/g, ':$1');        // [param] / [param=m] -> :param
 
   if (route === '/') return '/';
   // Remove trailing slash

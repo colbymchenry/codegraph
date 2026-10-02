@@ -40,7 +40,53 @@ function extractSwiftReturnType(node: SyntaxNode, source: string): string | unde
   return undefined;
 }
 
+/**
+ * A declaration in a body whose type may continue onto `&` lines:
+ * `typealias X = A`, `let client: any A`. Indented — a top-level declaration
+ * parses as written, and is left alone.
+ */
+const COMPOSITION_HEAD = /^[ \t]+(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:[a-z]+(?:\([a-z]+\))?\s+)*(?:typealias|let|var)\s/;
+const COMPOSITION_CONTINUATION = /^([ \t]*)&([ \t]+)(?=\S)/;
+
+/**
+ * Move a protocol composition's line-leading `&` onto the line before it.
+ *
+ *     typealias EditorClient = AutocompleteService.Client
+ *       & MediaUploadService.Client
+ *
+ * is valid Swift, but in a type's body tree-sitter-swift ends the declaration
+ * at the newline and the `&` line is an ERROR that swallows the enclosing type
+ * (IceCubesApp's 980-line `EditorStore` came out as loose variables, no class).
+ * With the `&` trailing the previous line it parses. Same length and line
+ * count; only the continuation line's tokens sit one column left. Applied to
+ * an indented `typealias`/`let`/`var` statement's `&` lines only — a
+ * line-leading `&&`, `&+` or inout `&x` is never touched.
+ */
+export function joinSwiftCompositionContinuations(source: string): string {
+  if (!/\n[ \t]*&[ \t]/.test(source)) return source;
+  const original = source.split('\n');
+  const lines = original.slice();
+  let changed = false;
+  for (let i = 1; i < lines.length; i++) {
+    const cont = COMPOSITION_CONTINUATION.exec(lines[i]!);
+    if (!cont) continue;
+    let head = i - 1;
+    while (head > 0 && COMPOSITION_CONTINUATION.test(original[head]!)) head--;
+    if (!COMPOSITION_HEAD.test(original[head]!)) continue;
+    const prev = lines[i - 1]!;
+    const cr = prev.endsWith('\r') ? '\r' : '';
+    const body = cr ? prev.slice(0, -1) : prev;
+    // The previous line must end on a type; a trailing comment would swallow the `&`.
+    if (!/[\w>)\]?!]$/.test(body) || body.includes('//')) continue;
+    lines[i - 1] = `${body}&${cr}`;
+    lines[i] = `${cont[1]}${cont[2]}${lines[i]!.slice(cont[0].length)}`;
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
 export const swiftExtractor: LanguageExtractor = {
+  preParse: joinSwiftCompositionContinuations,
   functionTypes: ['function_declaration'],
   classTypes: ['class_declaration'],
   methodTypes: ['function_declaration'], // Methods are functions inside classes

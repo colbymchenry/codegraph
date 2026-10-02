@@ -39,6 +39,7 @@ import { intParam } from './respond';
 import { buildRoutes, type WireRoute } from './routes';
 import { isTestFile, isTestPath } from '../../search/query-utils';
 import { toNodeRef, toPosixPath, wireList, type WireList, type WireNodeRef } from './wire';
+import { readIndexedFileText } from './source';
 
 /** Rows per derived list, and the default for `limit`. */
 const DEFAULT_LIMIT = 12;
@@ -240,7 +241,7 @@ function routeEntries(cg: CodeGraph, limit: number): WireEntryPoints['routes'] {
  * otherwise answer with an empty list.
  */
 function executableFiles(cg: CodeGraph, limit: number): WireList<WireEntryFile> {
-  const ranked = cg.getTopCallingFiles(SCAN_ROWS);
+  const ranked = withoutPreviews(cg, cg.getTopCallingFiles(SCAN_ROWS));
 
   const kept: Array<{ node: Node; calls: number; reaches: number }> = [];
   const perDir = new Map<string, number>();
@@ -270,6 +271,84 @@ function executableFiles(cg: CodeGraph, limit: number): WireList<WireEntryFile> 
   // `eligible` counts every non-test file the scan saw: a floor, never an
   // overstatement.
   return wireList(items, Math.max(eligible, items.length));
+}
+
+/** A Swift file read for its `#Preview` blocks, at most. */
+const MAX_PREVIEW_SCAN = 1024 * 1024;
+
+/**
+ * The ranking with a Swift file's `#Preview { … }` calls taken out.
+ *
+ * A preview sits at the top level of a SwiftUI view's file, so its body's
+ * constructions are module-level edges out of the file — and every view with
+ * a preview ranked as "a file that runs something". A preview is Xcode's
+ * canvas, never code the app runs. A file whose only module-level calls are
+ * previews leaves the list; the rest are re-ranked on what is left.
+ */
+function withoutPreviews<T extends { nodeId: string; filePath: string; calls: number; reaches: number; score: number }>(cg: CodeGraph, rows: T[]): T[] {
+  let adjusted = false;
+  const out: T[] = [];
+  for (const row of rows) {
+    if (!row.filePath.endsWith('.swift')) {
+      out.push(row);
+      continue;
+    }
+    const text = readIndexedFileText(cg, cg.getProjectRoot(), row.filePath, MAX_PREVIEW_SCAN);
+    const spans = text && text.includes('#Preview') ? swiftPreviewSpans(text) : [];
+    if (spans.length === 0) {
+      out.push(row);
+      continue;
+    }
+    const inPreview = cg
+      .getOutgoingEdges(row.nodeId)
+      .filter((e) => (e.kind === 'calls' || e.kind === 'instantiates') && e.line != null && spans.some(([from, to]) => e.line! >= from && e.line! <= to)).length;
+    if (inPreview === 0) {
+      out.push(row);
+      continue;
+    }
+    adjusted = true;
+    const calls = row.calls - inPreview;
+    if (calls > 0) out.push({ ...row, calls, score: calls * (1 + row.reaches) });
+  }
+  if (adjusted) out.sort((a, b) => b.score - a.score || b.calls - a.calls || (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0));
+  return out;
+}
+
+/**
+ * The line spans (1-based, inclusive) of a Swift file's top-level
+ * `#Preview { … }` macros, trailing closures included — WidgetKit's
+ * `#Preview(as: .systemSmall) { … } timeline: { … }` is one preview.
+ */
+export function swiftPreviewSpans(text: string): Array<[number, number]> {
+  const lines = text.split(/\r?\n/);
+  const spans: Array<[number, number]> = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^#Preview\b/.test(lines[i]!)) continue;
+    let depth = 0;
+    let opened = false;
+    let end = -1;
+    for (let j = i; j < lines.length && end < 0; j++) {
+      const line = lines[j]!;
+      for (let c = 0; c < line.length; c++) {
+        const ch = line[c];
+        if (ch === '{') {
+          depth++;
+          opened = true;
+        } else if (ch === '}' && opened && --depth === 0) {
+          // Another trailing closure (`} timeline: {`) continues the macro.
+          const rest = `${line.slice(c + 1)} ${lines[j + 1] ?? ''}`;
+          if (!/^\s*\w+\s*:\s*\{/.test(rest)) {
+            end = j;
+            break;
+          }
+        }
+      }
+    }
+    if (end < 0) break;
+    spans.push([i + 1, end + 1]);
+    i = end;
+  }
+  return spans;
 }
 
 /**
@@ -317,15 +396,18 @@ function testFiles(cg: CodeGraph, limit: number): WireList<WireEntryTest> {
   return wireList(items, Math.max(ranked.length, items.length));
 }
 
-/** The most depended-on symbols, tests and non-navigable kinds removed. */
+/** The most depended-on symbols, tests, generated files and non-navigable kinds removed. */
 function hubs(cg: CodeGraph, limit: number): WireList<WireEntryHub> {
-  const ranked = cg.getTopDependedOn(SCAN_ROWS);
+  const ranked = cg
+    .getTopDependedOn(SCAN_ROWS)
+    .map((row) => ({ row, node: cg.getNode(row.nodeId) }));
+  // A vendored bundle's one-letter functions are depended on by the bundle alone.
+  const generated = cg.generatedFilePredicate(ranked.flatMap(({ node }) => (node ? [node.filePath] : [])));
 
   const items: WireEntryHub[] = [];
   let eligible = 0;
-  for (const row of ranked) {
-    const node = cg.getNode(row.nodeId);
-    if (!node || NON_HUB_KINDS.has(node.kind) || isTestFile(node.filePath)) continue;
+  for (const { row, node } of ranked) {
+    if (!node || NON_HUB_KINDS.has(node.kind) || isTestFile(node.filePath) || generated(node.filePath)) continue;
     eligible += 1;
     if (items.length >= limit) continue;
     items.push({ ...toNodeRef(node), dependents: row.dependents });

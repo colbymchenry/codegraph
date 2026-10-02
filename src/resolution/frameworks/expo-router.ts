@@ -70,6 +70,8 @@ export function routePathForFile(filePath: string): string | null {
   const segs = bare.split('/');
   if (segs.includes('__tests__') || segs.includes('__mocks__')) return null;
   const base = segs[segs.length - 1]!;
+  // `hello+api.ts` is an endpoint (`apiRoutePathForFile`), not a screen.
+  if (base.endsWith('+api')) return null;
   // `_layout` (and any other `_`-prefixed file) is not navigable. `+not-found`
   // is a real screen; the other `+` files (`+html`, `+native-intent`) are not.
   if (base.startsWith('_')) return null;
@@ -78,6 +80,26 @@ export function routePathForFile(filePath: string): string | null {
   if (kept[kept.length - 1] === 'index') kept.pop();
   return '/' + kept.join('/');
 }
+
+/**
+ * An API route's path — `app/blog/og-image/[post]+api.ts` is
+ * `/blog/og-image/:post`, written the way every server route is so a
+ * client's `fetch('/blog/og-image/…')` can find it. Null for any other file.
+ */
+export function apiRoutePathForFile(filePath: string): string | null {
+  const dir = APP_DIR.exec(filePath);
+  if (!dir) return null;
+  const rel = filePath.slice(dir.index + dir[0].length);
+  const ext = /\.(tsx|ts|jsx|js|mjs|cjs)$/.exec(rel);
+  if (!ext) return null;
+  const bare = rel.slice(0, ext.index);
+  if (!bare.endsWith('+api')) return null;
+  const segs = bare.slice(0, -'+api'.length).split('/').filter((seg) => seg.length > 0 && !(seg.startsWith('(') && seg.endsWith(')')));
+  if (segs[segs.length - 1] === 'index') segs.pop();
+  return '/' + segs.map((seg) => seg.replace(/^\[\.\.\.(.+)\]$/, ':$1*').replace(/^\[(.+)\]$/, ':$1')).join('/');
+}
+
+const API_METHODS = 'GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS';
 
 function languageForFile(filePath: string): Language {
   const ext = ROUTE_EXT.exec(filePath)?.[1];
@@ -713,6 +735,7 @@ function scoreMatch(href: string[], route: string[]): number | null {
 export const expoRouterResolver: FrameworkResolver = {
   name: 'expo-router',
   languages: [...ROUTE_LANGUAGES],
+  appDependencies: ['expo-router'],
 
   detect(context: ResolutionContext): boolean {
     if (dependsOn(context, 'expo-router')) return true;
@@ -727,6 +750,40 @@ export const expoRouterResolver: FrameworkResolver = {
   },
 
   extract(filePath: string, content: string) {
+    const apiPath = apiRoutePathForFile(filePath);
+    if (apiPath !== null) {
+      // `export async function GET(request) {…}` / `export const POST = …` — one endpoint per method.
+      const language = languageForFile(filePath);
+      const stripped = stripCommentsForRegex(content, 'typescript');
+      const nodes: Node[] = [];
+      const references: UnresolvedRef[] = [];
+      const seen = new Set<string>();
+      const decl = new RegExp(`\\bexport\\s+(?:async\\s+)?function\\s+(${API_METHODS})\\b|\\bexport\\s+(?:const|let)\\s+(${API_METHODS})\\s*=`, 'g');
+      let m: RegExpExecArray | null;
+      while ((m = decl.exec(stripped)) !== null) {
+        const method = (m[1] ?? m[2])!;
+        if (seen.has(method)) continue;
+        seen.add(method);
+        const line = stripped.slice(0, m.index).split('\n').length;
+        const node: Node = {
+          id: `route:${filePath}:${line}:${method}:${apiPath}`,
+          kind: 'route',
+          name: `${method} ${apiPath}`,
+          qualifiedName: `${filePath}::${method}:${apiPath}`,
+          filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: m[0].length,
+          language,
+          isExported: true,
+          updatedAt: Date.now(),
+        };
+        nodes.push(node);
+        references.push({ fromNodeId: node.id, referenceName: method, referenceKind: 'references', line, column: 0, filePath, language, candidates: [method] });
+      }
+      return { nodes, references };
+    }
     const routePath = routePathForFile(filePath);
     if (routePath === null) return { nodes: [], references: [] };
     const language = languageForFile(filePath);

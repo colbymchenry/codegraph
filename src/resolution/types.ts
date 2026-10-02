@@ -167,6 +167,13 @@ export interface ResolutionContext {
    * Minimal contexts without import resolution may omit this capability. */
   resolveImport?(ref: UnresolvedRef): ResolvedRef | null;
   /**
+   * Whether an import specifier, written in `fromFile`, names a module outside
+   * the repository: a package that is not a relative path, a tsconfig alias, a
+   * workspace member or the repository's own package name, and that resolves
+   * to no project file. Supplied by the coordinator, like `resolveImport`.
+   */
+  isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
@@ -232,6 +239,16 @@ export interface FrameworkResolver {
   name: string;
   /** Languages this framework applies to. If omitted, applies to all languages. */
   languages?: Language[];
+  /**
+   * Packages an app declares when it is built on this framework. When set,
+   * `extract()` runs only on files of an app whose package.json — the file's
+   * own or an enclosing one — declares one of them: in a monorepo with an Expo
+   * app beside a Next.js app, Expo Router must not read the Next app's
+   * `app/layout.tsx` as a `/layout` screen. When no manifest in the project
+   * declares any, detection found the framework by other evidence and the
+   * extractor runs on every file, as before.
+   */
+  appDependencies?: readonly string[];
   /** Detect if project uses this framework (project-level, called once at startup) */
   detect(context: ResolutionContext): boolean;
   /** Resolve a reference using framework-specific patterns */

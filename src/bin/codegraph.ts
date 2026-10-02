@@ -63,7 +63,7 @@ import { ansiColorsEnabled } from '../ui/color';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
-import { installCommandSupervision } from './command-supervision';
+import { installCommandSupervision, watchParent } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 // Value import, but dependency-free by design so `--help` text can name the
@@ -2148,6 +2148,10 @@ ${BROWSER_ENV}=none to never open one.
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+    // Killing the command the user started (its pid, not Ctrl+C's process
+    // group) leaves this re-exec'd server with no parent to forward the
+    // signal: shut down the same way instead of serving the port forever.
+    watchParent(shutdown);
   });
 
 /**

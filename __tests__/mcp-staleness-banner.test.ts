@@ -40,6 +40,18 @@ function waitFor(condition: () => boolean, timeoutMs = 2000, intervalMs = 25): P
   });
 }
 
+/**
+ * Keep the watcher's edits pending for the rest of the test. A long
+ * `debounceMs` alone does not: a lone edit syncs after a 300ms quiet window
+ * whatever the configured debounce (#1397), and under full-suite load a tool
+ * call can outlast that (status spawns a worker to count changes), so the sync
+ * cleared the entry before the response was built. A sync that never settles
+ * leaves each entry pending (marked as indexing once it starts).
+ */
+function holdWatcherSync(cg: CodeGraph): void {
+  vi.spyOn(cg, 'sync').mockReturnValue(new Promise<never>(() => {}));
+}
+
 describe('MCP staleness banner', () => {
   let testDir: string;
   let cg: CodeGraph;
@@ -92,7 +104,7 @@ describe('MCP staleness banner', () => {
   };
 
   it('prepends a stale banner when the response references a pending file', async () => {
-    // Long debounce so the edit lingers in pendingFiles while we query.
+    holdWatcherSync(cg);
     cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
@@ -124,6 +136,7 @@ describe('MCP staleness banner', () => {
   });
 
   it('uses the footer (not the banner) when pending files are not referenced', async () => {
+    holdWatcherSync(cg);
     cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
@@ -164,6 +177,7 @@ describe('MCP staleness banner', () => {
   });
 
   it('lists pending files under "Pending sync" in codegraph_status', async () => {
+    holdWatcherSync(cg);
     cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
@@ -244,6 +258,7 @@ describe('MCP staleness banner — matching whole paths (#1968)', () => {
     cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts', '**/*.tsx'], exclude: [] } });
     await cg.indexAll();
     handler = new ToolHandler(cg);
+    holdWatcherSync(cg);
     cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
   });

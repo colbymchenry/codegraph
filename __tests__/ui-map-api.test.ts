@@ -28,6 +28,7 @@ import {
   moduleIdFor,
   normalizeRoot,
   pickDefaultDepth,
+  passThroughDirs,
   pickDefaultRoot,
   resetMapCache,
 } from '../src/ui-server/api/map';
@@ -227,20 +228,20 @@ afterAll(async () => {
 
 describe('moduleIdFor', () => {
   it('names a module after the first `depth` segments under the root', () => {
-    expect(moduleIdFor('src/core/engine.ts', 'src', 1)).toEqual({ id: 'src/core', facade: false });
-    expect(moduleIdFor('src/a/b/c.ts', 'src', 2)).toEqual({ id: 'src/a/b', facade: false });
-    expect(moduleIdFor('a/b/c.ts', '', 1)).toEqual({ id: 'a', facade: false });
+    expect(moduleIdFor('src/core/engine.ts', 'src', 1)).toEqual({ id: 'src/core', label: 'src/core', facade: false });
+    expect(moduleIdFor('src/a/b/c.ts', 'src', 2)).toEqual({ id: 'src/a/b', label: 'src/a/b', facade: false });
+    expect(moduleIdFor('a/b/c.ts', '', 1)).toEqual({ id: 'a', label: 'a', facade: false });
   });
 
   it('keeps a façade as its own box and buckets the other loose files', () => {
-    expect(moduleIdFor('src/index.ts', 'src', 1)).toEqual({ id: 'src/index.ts', facade: true });
+    expect(moduleIdFor('src/index.ts', 'src', 1)).toEqual({ id: 'src/index.ts', label: 'src/index.ts', facade: true });
     expect(moduleIdFor('src/lib.rs', 'src', 1)?.facade).toBe(true);
     expect(moduleIdFor('pkg/__init__.py', 'pkg', 1)?.facade).toBe(true);
     expect(moduleIdFor('src/types.ts', 'src', 1)).toEqual({
       id: 'src/(root files)',
-      facade: false,
+      label: 'src/(root files)', facade: false,
     });
-    expect(moduleIdFor('types.ts', '', 1)).toEqual({ id: '(root files)', facade: false });
+    expect(moduleIdFor('types.ts', '', 1)).toEqual({ id: '(root files)', label: '(root files)', facade: false });
   });
 
   it('buckets a loose file into the directory it is actually in, not the top one', () => {
@@ -249,7 +250,7 @@ describe('moduleIdFor', () => {
     // file lives somewhere it does not.
     expect(moduleIdFor('src/a/loose.ts', 'src', 2)).toEqual({
       id: 'src/a/(root files)',
-      facade: false,
+      label: 'src/a/(root files)', facade: false,
     });
   });
 
@@ -258,6 +259,73 @@ describe('moduleIdFor', () => {
     // A sibling whose name merely starts with the root is not under it.
     expect(moduleIdFor('srcx/y.ts', 'src', 1)).toBeNull();
   });
+
+describe('folders nothing forks in (Maven, Gradle)', () => {
+  const MAVEN = [
+    'src/main/java/org/springframework/samples/petclinic/PetClinicApplication.java',
+    'src/main/java/org/springframework/samples/petclinic/owner/Owner.java',
+    'src/main/java/org/springframework/samples/petclinic/owner/OwnerController.java',
+    'src/main/java/org/springframework/samples/petclinic/vet/Vet.java',
+    'src/main/java/org/springframework/samples/petclinic/visit/Visit.java',
+    'src/main/java/org/springframework/samples/petclinic/model/BaseEntity.java',
+    'src/test/java/org/springframework/samples/petclinic/owner/OwnerControllerTests.java',
+  ];
+
+  it('finds the folders with one subfolder and no file of their own', () => {
+    expect([...passThroughDirs(MAVEN)].sort()).toEqual([
+      'src/main',
+      'src/main/java',
+      'src/main/java/org',
+      'src/main/java/org/springframework',
+      'src/main/java/org/springframework/samples',
+      'src/test',
+      'src/test/java',
+      'src/test/java/org',
+      'src/test/java/org/springframework',
+      'src/test/java/org/springframework/samples',
+      'src/test/java/org/springframework/samples/petclinic',
+    ]);
+    // A folder holding a file is a boundary even with one subfolder.
+    expect(passThroughDirs(['a/b/c.ts', 'a/x.ts']).has('a')).toBe(false);
+  });
+
+  it('counts depth in folders that fork, and elides the chain in the label', () => {
+    const through = passThroughDirs(MAVEN);
+    expect(moduleIdFor(MAVEN[1]!, 'src', 1, through)).toEqual({
+      id: 'src/main/java/org/springframework/samples/petclinic',
+      label: 'src/main/…/petclinic',
+      facade: false,
+    });
+    expect(moduleIdFor(MAVEN[1]!, 'src', 2, through)).toEqual({
+      id: 'src/main/java/org/springframework/samples/petclinic/owner',
+      label: 'src/main/…/petclinic/owner',
+      facade: false,
+    });
+    // The application class sits loose in the package root.
+    expect(moduleIdFor(MAVEN[0]!, 'src', 2, through)).toEqual({
+      id: 'src/main/java/org/springframework/samples/petclinic/(root files)',
+      label: 'src/main/…/petclinic/(root files)',
+      facade: false,
+    });
+    // Without the set, nothing changes: one level per folder.
+    expect(moduleIdFor(MAVEN[1]!, 'src', 2)?.id).toBe('src/main/java');
+  });
+
+  it('opens a Maven project on its packages, not on one box', () => {
+    const files = MAVEN.map((p) => ({ path: p, symbols: 10, test: p.includes('/test/') }));
+    const through = passThroughDirs(MAVEN);
+    const depth = pickDefaultDepth(files, 'src', through);
+    const ids = new Set(files.filter((f) => !f.test).map((f) => moduleIdFor(f.path, 'src', depth, through)!.id));
+    expect(depth).toBe(2);
+    expect([...ids].sort()).toEqual([
+      'src/main/java/org/springframework/samples/petclinic/(root files)',
+      'src/main/java/org/springframework/samples/petclinic/model',
+      'src/main/java/org/springframework/samples/petclinic/owner',
+      'src/main/java/org/springframework/samples/petclinic/vet',
+      'src/main/java/org/springframework/samples/petclinic/visit',
+    ]);
+  });
+});
 });
 
 describe('normalizeRoot', () => {

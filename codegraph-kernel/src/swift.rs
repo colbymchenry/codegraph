@@ -110,6 +110,24 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
+/// SWIFT_TYPE_PATH_RECEIVER (tree-sitter.ts): `API.PackageController.GetRoute` —
+/// two segments or more, each an ASCII capital then `[A-Za-z0-9_]*` (JS `\w`),
+/// not led by `Self.`.
+fn is_type_path(s: &str) -> bool {
+    if s.starts_with("Self.") {
+        return false;
+    }
+    let mut segments = 0;
+    for seg in s.split('.') {
+        let b = seg.as_bytes();
+        if b.is_empty() || !b[0].is_ascii_uppercase() || !b[1..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -1061,8 +1079,16 @@ impl<'t> Walker<'t> {
                     } else {
                         method_name.to_string()
                     };
+                } else if let Some(path) = receiver
+                    .filter(|r| r.kind() == "navigation_expression")
+                    .map(|r| strip_js_ws(self.text(r)))
+                    .filter(|p| is_type_path(p))
+                {
+                    // A type path, `API.PackageController.GetRoute.query(on:)`:
+                    // keep it for the resolver (tree-sitter.ts SWIFT_TYPE_PATH_RECEIVER).
+                    callee_name = format!("{path}.{method_name}");
                 } else {
-                    // self_expression / super_expression / inner nav /
+                    // self_expression / super_expression / instance nav /
                     // postfix / multi_line_string_literal → bare method name.
                     callee_name = method_name.to_string();
                 }

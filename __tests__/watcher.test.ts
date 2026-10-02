@@ -1180,6 +1180,21 @@ describe('FileWatcher', () => {
       // FSEvents can coalesce writes made while a new stream is being registered.
       await new Promise(resolve => setTimeout(resolve, 700));
     };
+    // fs.watch() returns before macOS registers the stream: libuv serves every
+    // watch in a process from one FSEvents stream, rebuilt on its own thread
+    // after each watch/close, and an edit made before that lands is never
+    // reported. Under full-suite load that dropped the edit made right after a
+    // restart. Poke a probe under `dir` until the watcher reports it, so the
+    // edit under test is made once, against a stream known to be live.
+    const untilLive = (dir: string) => {
+      const probe = path.join(dir, 'watch-probe.ts');
+      const rel = path.relative(testDir, probe).replace(/\\/g, '/');
+      return waitFor(() => {
+        if (cg!.getPendingFiles().some(p => p.path === rel)) return true;
+        fs.writeFileSync(probe, `// ${Date.now()}\n`);
+        return false;
+      }, 8000);
+    };
 
     afterEach(() => {
       cg = undefined;
@@ -1234,10 +1249,12 @@ describe('FileWatcher', () => {
       fs.unlinkSync(alias);
       link(b, alias);
       await waitFor(() => has('secondTarget') && !has('firstTarget'), 8000);
+      await untilLive(alias);
       fs.writeFileSync(path.join(b, 'b.ts'), 'export function retargetEdit() {}');
       await waitFor(() => has('retargetEdit'), 8000);
       cg!.unwatch();
       expect(cg!.watch({ debounceMs: 100 })).toBe(true);
+      await untilLive(alias);
       fs.writeFileSync(path.join(b, 'b.ts'), 'export function restartedEdit() {}');
       await waitFor(() => has('restartedEdit'), 8000);
       fs.unlinkSync(alias);

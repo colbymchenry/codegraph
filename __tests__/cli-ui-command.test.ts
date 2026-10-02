@@ -328,6 +328,29 @@ describe('codegraph ui — serving', () => {
     }
   }, 60_000);
 
+  // `codegraph ui` re-execs itself with `--liftoff-only`, and the command the
+  // user started blocks in spawnSync, unable to forward a signal: killing it by
+  // pid (a process manager, an IDE task, `kill`) used to leave the server
+  // serving the port forever. POSIX-only: it relies on reparenting.
+  it.runIf(process.platform !== 'win32')('stops serving when the command it was started as is killed', async () => {
+    const viewer = await startViewer(['--no-open', '--port', '0', projectDir], {
+      CODEGRAPH_WASM_RELAUNCHED: '',
+      CODEGRAPH_PPID_POLL_MS: '200',
+    });
+    expect((await get(viewer.port, '/api/stats')).status).toBe(200);
+    viewer.child.kill('SIGKILL');
+    const deadline = Date.now() + 15_000;
+    let serving = true;
+    while (serving && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      serving = await get(viewer.port, '/api/stats').then(
+        () => true,
+        () => false
+      );
+    }
+    expect(serving).toBe(false);
+  }, 60_000);
+
   it('refuses a foreign Host end-to-end', async () => {
     const viewer = await startViewer(['--no-open', '--port', '0', projectDir], {});
     try {

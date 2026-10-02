@@ -2069,6 +2069,102 @@ const RULES_BY_LANGUAGE: ReadonlyMap<Language, Rules> = new Map<Language, Rules>
  * capped. The index keeps no decorators, so they are read here at request
  * time like the guards.
  */
+/**
+ * A `return` a definition makes itself — never one inside a lambda, a local
+ * function or a nested / anonymous class — with what it returns, as written.
+ * `value` is the string a same-class constant holds, when the expression is
+ * a bare name that declares one: Spring MVC handlers return
+ * `VIEWS_OWNER_CREATE_OR_UPDATE_FORM`, and the view is its value.
+ */
+export interface ReturnSite {
+  line: number;
+  column: number;
+  expression: string;
+  value?: string;
+}
+
+/** Scopes whose `return`s belong to something else. */
+const NESTED_SCOPE_TYPES: ReadonlySet<string> = new Set([
+  'lambda_expression',
+  'class_body',
+  'lambda_literal',
+  'anonymous_function',
+  'object_literal',
+  'arrow_function',
+  'function_expression',
+  'function_declaration',
+  'function_definition',
+  'method_declaration',
+  'method_definition',
+  'lambda',
+]);
+
+export async function returnsForFile(absPath: string, language: Language, line: number): Promise<ReturnSite[]> {
+  if (!supportsBranchGuards(language)) return [];
+  const cached = await treeFor(absPath, language);
+  if (!cached) return [];
+  return returnsInTree(cached.tree.rootNode, line);
+}
+
+/** {@link returnsForFile} over source text — the test surface. */
+export async function returnsInSource(source: string, language: Language, line: number): Promise<ReturnSite[]> {
+  if (!supportsBranchGuards(language)) return [];
+  const tree = await parse(source, language);
+  if (!tree) return [];
+  try {
+    return returnsInTree(tree.rootNode, line);
+  } finally {
+    tree.delete();
+  }
+}
+
+export function returnsInTree(root: SyntaxNode, line: number): ReturnSite[] {
+  const row = line - 1;
+  let node: SyntaxNode | null = innermostAt(root, row, firstNonBlankColumn(root.text, row));
+  let definition: SyntaxNode | null = null;
+  for (let up = 0; node && up < 12; up++, node = node.parent) {
+    if (DEFINITION_TYPES.has(node.type)) {
+      definition = node;
+      break;
+    }
+  }
+  if (!definition) return [];
+  const out: ReturnSite[] = [];
+  const visit = (n: SyntaxNode): void => {
+    for (const c of namedChildren(n)) {
+      if (NESTED_SCOPE_TYPES.has(c.type)) continue;
+      const isReturn = c.type === 'return_statement' || (c.type === 'jump_expression' && /^return\b/.test(c.text));
+      if (isReturn) {
+        const expr = namedChildren(c)[0];
+        if (expr) out.push({ line: c.startPosition.row + 1, column: c.startPosition.column, expression: collapse(expr.text) });
+        continue;
+      }
+      visit(c);
+    }
+  };
+  visit(definition);
+  // A bare name: the string a same-class constant holds (`static final String X = "…"`).
+  let cls: SyntaxNode | null = definition.parent;
+  for (let up = 0; cls && up < 6 && !CLASS_TYPES.has(cls.type); up++) cls = cls.parent;
+  if (cls) {
+    const strings = new Map<string, string>();
+    const collect = (n: SyntaxNode): void => {
+      for (const c of namedChildren(n)) {
+        if (c.type === 'variable_declarator') {
+          const name = c.childForFieldName('name')?.text;
+          const value = c.childForFieldName('value');
+          if (name && value?.type === 'string_literal') strings.set(name, value.text.replace(/^"|"$/g, ''));
+        } else if (c.type === 'field_declaration' || c.type === 'class_body') collect(c);
+      }
+    };
+    collect(cls);
+    for (const r of out) {
+      if (/^[A-Za-z_$][\w$]*$/.test(r.expression) && strings.has(r.expression)) r.value = strings.get(r.expression)!;
+    }
+  }
+  return out;
+}
+
 export interface DefinitionDecorators {
   own: string[];
   /** The enclosing class's, when the definition is a member. */
