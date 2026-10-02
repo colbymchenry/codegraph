@@ -166,6 +166,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - When an agent asks CodeGraph about a separate git repository nested inside an indexed project, one the project's index leaves out (for example because the parent's `.gitignore` excludes it), it now gets the usual "isn't indexed" guidance instead of answers from the parent project's code. Nested repositories the parent does index, such as submodules, work as before. Thanks @wstczyw for the report. (#2110)
 - Editing a file that defines the same name more than once, like two classes that each have an `execute` method or a method's overloads, no longer moves every caller from other files onto one of them during `codegraph sync`. A sync interrupted partway through a file also no longer loses those callers until a full re-index. Thanks @ijbranch for the report. (#2276)
 - Delphi and Free Pascal include files (`.inc`) are now indexed as Pascal. Before, they were read as PHP and came up empty. A `.inc` file with a `<?php` tag is still PHP, and a `codegraph.json` mapping for `.inc` still wins. Thanks @ijbranch for the report. (#2279)
+- In Python, a call written on the instance, like `self.get_breadcrumbs(...)`, now links to the class's own method even when the file also imports a function of the same name. Before, the import claimed it: Django REST Framework's renderers, netbox's change logging and django-allauth's account adapter all linked their own method calls to an imported helper.
 
 ## [1.6.1] - 2026-09-29
 

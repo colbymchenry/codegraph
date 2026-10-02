@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1240,7 +1240,12 @@ export class ReferenceResolver {
     }
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
-    const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    // `self.get_ip()` is a method call on the instance even when the file
+    // also imports a function named `get_ip`: the import never names it.
+    const selfCall = ref.language === 'python' && ref.referenceKind === 'calls' &&
+      this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
+      isPythonSelfCall(ref, this.context);
+    const importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;

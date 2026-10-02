@@ -1714,6 +1714,15 @@ function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { rec
   return { receiver: head.slice(-40), links };
 }
 
+/**
+ * Whether a Python call recorded by its bare name was written on the instance,
+ * `self.get_ip(request)`. The extractor drops the `self.`, so a same-named name
+ * the file imports would otherwise claim the method call (#2074 follow-up).
+ */
+export function isPythonSelfCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return ref.language === 'python' && bareCallReceiver(ref, context)?.receiver === 'self';
+}
+
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = bareCallReceiver(ref, context);
