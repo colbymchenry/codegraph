@@ -298,6 +298,15 @@ export interface UpgradeDeps {
   error: (msg: string) => void;
   platform: NodeJS.Platform;
   /**
+   * Wire Claude Code's front-load prompt hook into the GLOBAL Claude profile
+   * when that profile already has CodeGraph configured; resolves true when it
+   * changed the settings file. That file is the user's real
+   * `~/.claude/settings.json`, so the writer is injected like every other side
+   * effect here — the CLI passes {@link defaultWirePromptHook}, unit tests a
+   * recorder (#2275: tests that reached the real one rewrote the developer's).
+   */
+  wirePromptHook: () => Promise<boolean>;
+  /**
    * Offer the one-time CodeGraph Pro beta opt-in after a successful update
    * (see installer/beta-signup — self-gating: TTY only, and silent forever
    * once any install/upgrade ask was answered). Optional so unit tests and
@@ -528,10 +537,7 @@ function selfHealInstalledSurfaces(deps: UpgradeDeps): void {
  */
 async function selfHealPromptHook(deps: UpgradeDeps): Promise<void> {
   if (process.env.CODEGRAPH_NO_PROMPT_HOOK === '1' || process.env.CODEGRAPH_PROMPT_HOOK === '0') return;
-  const { claudeTarget, writePromptHookEntry } = await import('../installer/targets/claude');
-  if (!claudeTarget.detect('global').alreadyConfigured) return;
-  const res = writePromptHookEntry('global');
-  if (res.action === 'created' || res.action === 'updated') {
+  if (await deps.wirePromptHook()) {
     deps.log(
       c.dim('Enabled the CodeGraph front-load hook for Claude Code (structural prompts). Disable any time: CODEGRAPH_NO_PROMPT_HOOK=1'),
     );
@@ -713,4 +719,16 @@ export function defaultCapture(cmd: string, args: string[]): { code: number; std
   const r = spawnSync(cmd, args, { encoding: 'utf-8', windowsHide: true, timeout: 30_000 });
   if (r.error) return null;
   return { code: r.status ?? -1, stdout: r.stdout ?? '' };
+}
+
+/**
+ * The production `UpgradeDeps.wirePromptHook`: writes the hook only when the
+ * global Claude profile already carries CodeGraph's MCP entry, and leaves the
+ * file byte-for-byte alone once the hook is there.
+ */
+export async function defaultWirePromptHook(): Promise<boolean> {
+  const { claudeTarget, writePromptHookEntry } = await import('../installer/targets/claude');
+  if (!claudeTarget.detect('global').alreadyConfigured) return false;
+  const res = writePromptHookEntry('global');
+  return res.action === 'created' || res.action === 'updated';
 }

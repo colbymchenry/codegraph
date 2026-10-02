@@ -14,6 +14,7 @@ import {
   reindexAdvisory,
   runUpgrade,
   verifyResolvedVersion,
+  defaultWirePromptHook,
   buildWindowsUpgradeScript,
   NPM_PACKAGE,
   type InstallMethod,
@@ -230,13 +231,15 @@ interface Calls {
   captures: Array<{ cmd: string; args: string[] }>;
   logs: string[];
   errors: string[];
+  /** How many times the upgrade asked deps to wire the Claude prompt hook. */
+  promptHookWires: number;
 }
 
 function makeDeps(
   overrides: Partial<UpgradeDeps> & { method: InstallMethod; currentVersion: string },
   runExit = 0
 ): { deps: UpgradeDeps; calls: Calls } {
-  const calls: Calls = { runs: [], captures: [], logs: [], errors: [] };
+  const calls: Calls = { runs: [], captures: [], logs: [], errors: [], promptHookWires: 0 };
   const deps: UpgradeDeps = {
     currentVersion: overrides.currentVersion,
     method: overrides.method,
@@ -252,6 +255,12 @@ function makeDeps(
       return overrides.capture ? overrides.capture(cmd, args) : null;
     },
     hasCommand: overrides.hasCommand ?? ((c) => c === 'curl'),
+    // A recorder, never the real writer: that one edits the GLOBAL Claude
+    // profile, which here would be the developer's own (#2275).
+    wirePromptHook: async () => {
+      calls.promptHookWires += 1;
+      return overrides.wirePromptHook ? overrides.wirePromptHook() : false;
+    },
     log: (m) => calls.logs.push(m),
     warn: (m) => calls.logs.push(m),
     error: (m) => calls.errors.push(m),
@@ -470,6 +479,104 @@ describe('runUpgrade beta signup offer', () => {
     const { deps } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
     deps.offerBetaSignup = async () => { throw new Error('boom'); };
     expect(await runUpgrade({}, deps)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post-upgrade prompt-hook self-heal — only ever through deps (#2275). The
+// real writer edits the GLOBAL Claude profile; while the upgrade called it
+// directly, every successful fake upgrade in this file could wire the hook
+// into the developer's own ~/.claude/settings.json.
+// ---------------------------------------------------------------------------
+
+describe('post-upgrade prompt-hook self-heal', () => {
+  // A configured global Claude profile the REAL writer would act on, so an
+  // upgrade that bypasses deps shows up as a settings.json written here.
+  const KEYS = ['CLAUDE_CONFIG_DIR', 'CODEGRAPH_NO_PROMPT_HOOK', 'CODEGRAPH_PROMPT_HOOK'] as const;
+  const saved: Partial<Record<(typeof KEYS)[number], string | undefined>> = {};
+  let profile: string;
+
+  function configureProfile(): void {
+    fs.writeFileSync(
+      path.join(profile, '.claude.json'),
+      JSON.stringify({ mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } } }),
+    );
+  }
+
+  beforeEach(() => {
+    for (const k of KEYS) saved[k] = process.env[k];
+    delete process.env.CODEGRAPH_NO_PROMPT_HOOK;
+    delete process.env.CODEGRAPH_PROMPT_HOOK;
+    profile = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-claude-'));
+    process.env.CLAUDE_CONFIG_DIR = profile;
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(profile, { recursive: true, force: true });
+  });
+
+  it('a successful upgrade wires the hook through deps, never the real writer', async () => {
+    configureProfile();
+    const { deps, calls } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(fs.existsSync(path.join(profile, 'settings.json')), 'the real writer ran').toBe(false);
+    expect(calls.promptHookWires).toBe(1);
+  });
+
+  it('notes the hook only when the writer changed something', async () => {
+    const quiet = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    expect(await runUpgrade({}, quiet.deps)).toBe(0);
+    expect(quiet.calls.logs.join('\n')).not.toMatch(/front-load hook/);
+
+    const wired = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      wirePromptHook: async () => true,
+    });
+    expect(await runUpgrade({}, wired.deps)).toBe(0);
+    expect(wired.calls.logs.join('\n')).toMatch(/Enabled the CodeGraph front-load hook/);
+  });
+
+  it('the kill-switch skips the writer entirely', async () => {
+    process.env.CODEGRAPH_NO_PROMPT_HOOK = '1';
+    const { deps, calls } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(calls.promptHookWires).toBe(0);
+  });
+
+  it('does not wire on --check, when up to date, or when the upgrade fails', async () => {
+    const check = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    expect(await runUpgrade({ check: true }, check.deps)).toBe(0);
+    const current = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.9' });
+    expect(await runUpgrade({}, current.deps)).toBe(0);
+    const failed = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' }, 1);
+    expect(await runUpgrade({}, failed.deps)).toBe(1);
+    for (const { calls } of [check, current, failed]) expect(calls.promptHookWires).toBe(0);
+  });
+
+  it('a throwing writer never fails the upgrade', async () => {
+    const { deps } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      wirePromptHook: async () => { throw new Error('EACCES'); },
+    });
+    expect(await runUpgrade({}, deps)).toBe(0);
+  });
+
+  // The production writer itself, pointed at the temp profile above.
+  it('the real writer wires a configured profile once, and leaves an unconfigured one alone', async () => {
+    const settings = path.join(profile, 'settings.json');
+    expect(await defaultWirePromptHook()).toBe(false);
+    expect(fs.existsSync(settings)).toBe(false);
+
+    configureProfile();
+    expect(await defaultWirePromptHook()).toBe(true);
+    const written = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(JSON.stringify(written.hooks.UserPromptSubmit)).toMatch(/prompt-hook/);
+    expect(await defaultWirePromptHook()).toBe(false); // idempotent
   });
 });
 
