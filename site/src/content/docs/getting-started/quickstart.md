@@ -37,3 +37,23 @@ codegraph init
 `codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done. Your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
 Next: build [Your First Graph](/codegraph/getting-started/your-first-graph/), or see the full [Installation](/codegraph/getting-started/installation/) options.
+
+
+## 4. Running in Docker
+
+You can also build a CodeGraph Docker image:
+
+```bash
+VERSION="1.4.1" # pick the latest version
+docker build --build-arg CODEGRAPH_VERSION="$VERSION" -f Dockerfile -t colbymchenry/codegraph .
+```
+
+To run a CodeGraph CLI command, add it at the end, e.g. for `codegraph init` run:
+```bash
+docker run --rm -i --init -v "$(pwd)":/workspace:rw colbymchenry/codegraph init
+```
+
+Run the CodeGraph MCP server:
+```bash
+docker run --rm -i --init -v "$(pwd)":/workspace:rw colbymchenry/codegraph
+```
