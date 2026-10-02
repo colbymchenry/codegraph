@@ -1715,6 +1715,7 @@ export class ReferenceResolver {
         `${JSON.stringify(ref.referenceName)} ${ref.filePath}:${ref.line}`
       );
     }
+    if (!result && ref.referenceKind === 'calls') this.addFailedCallCost(ref, dt);
     const key = result ? result.resolvedBy : `fail:${ref.referenceKind}`;
     const slot = this.resolveProfile.get(key);
     if (slot) {
@@ -1726,8 +1727,35 @@ export class ReferenceResolver {
     return result;
   }
 
+  /**
+   * CODEGRAPH_RESOLVE_PROFILE: failed-call cost by receiver root (`assert` in
+   * `assert.ok`, `this.x` in `this.x.y`) and by name shape — which receivers
+   * the matcher spends its failing work on.
+   */
+  private failedCallCost: Map<string, { n: number; ns: bigint }> | null =
+    process.env.CODEGRAPH_RESOLVE_PROFILE ? new Map() : null;
+
+  private addFailedCallCost(ref: UnresolvedRef, dt: bigint): void {
+    if (!this.failedCallCost) return;
+    const name = ref.referenceName;
+    const parts = name.split('.');
+    const shape = name.includes('().') ? 'chain' : parts.length === 1 ? 'bare'
+      : parts[0] === 'this' ? `this+${parts.length - 1}` : `dotted${parts.length}`;
+    const root = parts[0] === 'this' && parts.length > 2 ? `this.${parts[1]}` : parts[0]!;
+    for (const key of [`shape:${ref.language}:${shape}`, `root:${root}`]) {
+      const slot = this.failedCallCost.get(key);
+      if (slot) { slot.n++; slot.ns += dt; } else this.failedCallCost.set(key, { n: 1, ns: dt });
+    }
+  }
+
   /** Dump the CODEGRAPH_RESOLVE_PROFILE histogram to stderr (no-op when off). */
   dumpResolveProfile(label: string): void {
+    if (this.failedCallCost) {
+      const rows = [...this.failedCallCost.entries()].sort((a, b) => Number(b[1].ns - a[1].ns));
+      const shapes = rows.filter(([k]) => k.startsWith('shape:'));
+      const roots = rows.filter(([k]) => k.startsWith('root:')).slice(0, 60);
+      for (const [k, v] of [...shapes, ...roots]) console.error(`[failed-call] ${label} ${k} n=${v.n} ns=${v.ns}`);
+    }
     if (!this.resolveProfile || this.resolveProfile.size === 0) return;
     const rows = [...this.resolveProfile.entries()]
       .map(([k, v]) => ({ k, n: v.n, ms: Number(v.ns / 1_000_000n) }))

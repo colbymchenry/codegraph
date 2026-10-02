@@ -2601,6 +2601,37 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
+ * A receiver name's nodes as matchMethodCall reads them: its method-owner types,
+ * and its constant/variable holders by file — both in getNodesByName's order.
+ * Once per name, not per call: a module receiver like `assert` is an `import`
+ * node in every file that imports it (2,653 on vscode), and both filters walked
+ * that list for each of its 88k calls.
+ */
+interface ReceiverNodes {
+  owners: Node[];
+  holdersByFile: Map<string, Node[]>;
+}
+const RECEIVER_NODES = new WeakMap<ResolutionContext, Map<string, ReceiverNodes>>();
+
+function receiverNodes(name: string, context: ResolutionContext): ReceiverNodes {
+  let memo = RECEIVER_NODES.get(context);
+  if (!memo) { memo = new Map(); RECEIVER_NODES.set(context, memo); }
+  let view = memo.get(name);
+  if (!view) {
+    view = { owners: [], holdersByFile: new Map() };
+    for (const n of context.getNodesByName(name)) {
+      if (isMethodOwnerKind(n)) view.owners.push(n);
+      if (n.kind === 'constant' || n.kind === 'variable') {
+        const list = view.holdersByFile.get(n.filePath);
+        if (list) list.push(n); else view.holdersByFile.set(n.filePath, [n]);
+      }
+    }
+    memo.set(name, view);
+  }
+  return view;
+}
+
+/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -3533,6 +3564,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TARGET_LANGUAGE.delete(context);
+  RECEIVER_NODES.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -4362,9 +4394,7 @@ export function matchMethodCall(
   if (dotMatch && !objectOrClass!.includes('.') && OBJECT_LITERAL_LANGUAGES.has(ref.language)) {
     const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null => {
       // Same-file holders only, so the call-site-first ordering is moot.
-      const holders = context.getNodesByName(objectOrClass!).filter(
-        (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
-      );
+      const holders = receiverNodes(objectOrClass!, context).holdersByFile.get(ref.filePath) ?? [];
       for (const holder of holders) {
         const hit =
           resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method') ??
@@ -4382,10 +4412,7 @@ export function matchMethodCall(
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
-    const classCandidates = preferCallSiteFile(
-      context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind),
-      ref.filePath,
-    );
+    const classCandidates = preferCallSiteFile(receiverNodes(objectOrClass!, context).owners, ref.filePath);
 
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
@@ -4436,7 +4463,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
       const fuzzyClassCandidates = preferCallSiteFile(
-        context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind),
+        receiverNodes(capitalizedReceiver, context).owners,
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {
