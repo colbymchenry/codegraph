@@ -151,7 +151,7 @@ From the agent benchmark (6.1), the reindex speed tests on Playwright and Django
 | 8.14 | Django's 8 callers the by-caller judge calls wrong | Merged precision 98% on seed 1, the only miss in that table | Read the 8 | Real merge errors fixed, or the judge's rule refined |
 | 8.15 | Python without types | 91% of Django's unverified edges are untyped receivers; the compiler resolves nothing there, and the benchmark could not score a Python task | Out of reach for SCIP; note it where users see verification | — |
 
-Housekeeping: decide on Cursor's stashed 6.1–6.3 attempt (`git stash list`: "cursor: roadmap 6.1-6.3 (discarded)"); FORK.md still describes `-scip.N` release tags although releases are deferred (7.4).
+Housekeeping: FORK.md still describes `-scip.N` release tags although releases are deferred (7.4).
 
 ## Order
 
