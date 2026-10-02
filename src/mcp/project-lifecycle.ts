@@ -2,13 +2,15 @@
 import { realpathSync } from 'fs';
 import type { Socket } from 'net';
 import type CodeGraph from '../index';
-import { isInitialized } from '../directory';
+import { canonicalProjectRoot, isInitialized } from '../directory';
 import { LockUnavailableError, watchDisabledReason } from '../sync';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { connectWithHello } from './proxy';
 import { markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
 
 interface Project {
+  /** Identity key: one entry however the root is spelled (#2278). */
+  key: string;
   cg: CodeGraph;
   refs: number;
   owner: boolean;
@@ -35,13 +37,14 @@ export function acquireProject(
   options: Parameters<CodeGraph['watch']>[0],
 ): ProjectLease {
   root = realpathSync(root);
-  let project = projects.get(root);
+  const key = canonicalProjectRoot(root);
+  let project = projects.get(key);
   if (!project) {
     const cg = open();
-    project = { cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
+    project = { key, cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
       timer: setInterval(() => { void ready(root, project!); }, 1000) };
     project.timer.unref();
-    projects.set(root, project);
+    projects.set(key, project);
   }
   const entry = project;
   entry.refs++;
@@ -80,7 +83,7 @@ function retire(root: string, project: Project): Promise<void> {
       setTimeout(finish, 25);
       return;
     }
-    projects.delete(root);
+    projects.delete(project.key);
     project.cg.close();
     if (project.owner) releaseWriterLock(root);
     resolve();

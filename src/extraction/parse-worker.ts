@@ -17,6 +17,7 @@ import { parentPort } from 'worker_threads';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
+import { commonJsRequireRefs } from './commonjs-requires';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
 import type { Language, ExtractionResult } from '../types';
 
@@ -103,7 +104,8 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
           result = {
             nodes: [],
             edges: [],
-            unresolvedReferences: [],
+            // Read beside the kernel's tables (extractFromSource's own post-step).
+            unresolvedReferences: commonJsRequireRefs(filePath!, content!, language),
             errors: raw.errors,
             durationMs: 0,
             kernelBuffers: raw.buffers,

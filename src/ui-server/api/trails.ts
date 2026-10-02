@@ -458,6 +458,7 @@ function gitUserName(projectRoot: string): string | null {
       encoding: 'utf-8',
       timeout: 2_000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     });
     const name = out.trim();
     return name === '' ? null : name.slice(0, 120);

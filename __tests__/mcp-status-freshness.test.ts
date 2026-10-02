@@ -42,9 +42,8 @@ describe('MCP status freshness (#1959)', () => {
     fs.writeFileSync(path.join(root, 'add.ts'), 'export const added = 1;\n');
 
     const result = await handler.execute('codegraph_status', {});
-    expect(result.structuredContent).toEqual({ freshness: {
-      lastIndexedAt: cg.getLastIndexedAt(), changes: { added: 1, modified: 1, removed: 1 }, complete: true,
-    } });
+    // Claude Code would show structuredContent in place of this text (#2088).
+    expect(result).not.toHaveProperty('structuredContent');
     const changed = result.content[0].text;
     expect(changed).toContain('**Changes since index:** 1 added, 1 modified, 1 removed');
   });

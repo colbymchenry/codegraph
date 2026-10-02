@@ -30,6 +30,7 @@ import {
   pickDefaultDepth,
   passThroughDirs,
   pickDefaultRoot,
+  pickDefaultView,
   resetMapCache,
 } from '../src/ui-server/api/map';
 
@@ -639,5 +640,39 @@ describe('GET /api/map', () => {
     const all = await getMap('?root=&depth=1');
     expect(all.root).toBe('');
     expect(all.modules.map((m: any) => m.id)).not.toEqual(src.modules.map((m: any) => m.id));
+  });
+});
+
+describe('the view the map opens on', () => {
+  it('counts files loose in the repository root as program', () => {
+    // git: hundreds of top-level `.c` files beside `builtin/`.
+    expect(
+      pickDefaultRoot([
+        { path: 'git.c', symbols: 60, test: false },
+        { path: 'refs.c', symbols: 50, test: false },
+        { path: 'builtin/add.c', symbols: 40, test: false },
+        { path: 'builtin/commit.c', symbols: 30, test: false },
+      ])
+    ).toBe('');
+  });
+
+  it('opens on the repository when the source folder is one flat folder', () => {
+    // Express: everything under `lib/` sits in `lib/` itself.
+    const files = [
+      ...Array.from({ length: 30 }, (_, i) => ({ path: `lib/f${i}.js`, symbols: 10, test: false })),
+      { path: 'index.js', symbols: 1, test: false },
+      { path: 'benchmarks/run.js', symbols: 3, test: false },
+      { path: 'test/app.js', symbols: 50, test: true },
+    ];
+    expect(pickDefaultView(files)).toEqual({ root: '', depth: 1 });
+  });
+
+  it('keeps a source folder that draws a picture of its own', () => {
+    const files = [
+      { path: 'src/a/x.ts', symbols: 40, test: false },
+      { path: 'src/b/y.ts', symbols: 40, test: false },
+      { path: 'scripts/z.ts', symbols: 2, test: false },
+    ];
+    expect(pickDefaultView(files).root).toBe('src');
   });
 });

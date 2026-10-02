@@ -215,7 +215,10 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
   });
 });
 
-describe('a video .ts never stays pending (#1910)', () => {
+// Each case builds a git repository and indexes it, the last one twice over. On
+// Windows every git process costs ~100 ms, which puts these cases at 5–6 s there,
+// past vitest's 5 s default.
+describe('a video .ts never stays pending (#1910)', { timeout: 30_000 }, () => {
   const dirs: string[] = [];
   afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
   const gitProject = (): string => {
