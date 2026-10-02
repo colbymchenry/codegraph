@@ -217,26 +217,16 @@ export const expressResolver: FrameworkResolver = {
       const openParen = safe.indexOf('(', match.index);
       const closeParen = openParen >= 0 ? matchDelim(safe, openParen, '(', ')') : -1;
       const args = closeParen > openParen ? safe.slice(openParen + 1, closeParen) : '';
-      const arrowAt = args.indexOf('=>');
+      const inline = inlineHandlerBody(args);
 
-      if (arrowAt >= 0) {
-        // Inline arrow handler (`router.post('/x', async (req,res) => {…})`). The
-        // arrow is anonymous, so its body — the actual request→service flow — would
-        // be lost. Attribute the body's calls to the route node as `calls` edges so
-        // `trace(route, service)` connects. Body = balanced `{…}` after `=>`, or the
-        // single-expression tail for `=> expr` arrows.
-        const afterArrow = args.slice(arrowAt + 2);
-        const braceAt = afterArrow.indexOf('{');
-        let body = afterArrow;
-        let bodyStart = openParen + 1 + arrowAt + 2;
-        if (braceAt >= 0 && afterArrow.slice(0, braceAt).trim() === '') {
-          const end = matchDelim(afterArrow, braceAt, '{', '}');
-          if (end > braceAt) {
-            body = afterArrow.slice(braceAt + 1, end);
-            bodyStart += braceAt + 1;
-          }
-        }
-        for (const name of handlerCallNames(body)) {
+      if (inline) {
+        // Inline handler (`router.post('/x', async (req,res) => {…})`,
+        // `app.get('/x', function (req, res) {…})`). It is anonymous, so its
+        // body — the actual request→service flow — would be lost. Attribute the
+        // body's calls to the route node as `calls` edges so
+        // `trace(route, service)` connects.
+        const bodyStart = openParen + 1 + inline.start;
+        for (const name of handlerCallNames(inline.body)) {
           references.push({
             fromNodeId: routeNode.id,
             referenceName: name,
@@ -247,7 +237,7 @@ export const expressResolver: FrameworkResolver = {
             language: lang,
           });
         }
-        references.push(...replyRefs(safe, bodyStart, bodyStart + body.length, routeNode.id, filePath, lang));
+        references.push(...replyRefs(safe, bodyStart, bodyStart + inline.body.length, routeNode.id, filePath, lang));
       } else {
         // Named handler: the LAST comma-separated arg (earlier ones are middleware).
         const parts = args.split(',').map((s) => s.trim()).filter(Boolean);
@@ -296,11 +286,13 @@ export const expressResolver: FrameworkResolver = {
           updatedAt: now,
         };
         nodes.push(routeNode);
-        if (args.includes('=>')) {
-          for (const name of handlerCallNames(args)) {
+        const inline = inlineHandlerBody(args);
+        if (inline) {
+          for (const name of handlerCallNames(inline.body)) {
             references.push({ fromNodeId: routeNode.id, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language: lang });
           }
-          references.push(...replyRefs(safe, openParen + 1, closeParen, routeNode.id, filePath, lang));
+          const bodyStart = openParen + 1 + inline.start;
+          references.push(...replyRefs(safe, bodyStart, bodyStart + inline.body.length, routeNode.id, filePath, lang));
         } else {
           const parts = splitTopLevel(args).map((s) => s.trim()).filter(Boolean);
           const last = parts[parts.length - 1];
@@ -428,6 +420,48 @@ function splitTopLevel(args: string): string[] {
   }
   out.push(args.slice(start));
   return out;
+}
+
+/**
+ * The body of a handler written inline as a registration's LAST argument — an
+ * arrow (`async (req, res) => {…}`, `req => …`) or a function expression
+ * (`function (req, res) {…}`, the form Express's own examples use), bare or
+ * inside a wrapper call (`asyncHandler(async (req, res) => {…})`). `start` is
+ * the body's offset into `args`. Null when the last argument names a handler
+ * instead: an inline middleware before a named handler is not the handler.
+ */
+function inlineHandlerBody(args: string): { body: string; start: number } | null {
+  // A trailing comma (Prettier's default) leaves an empty last part.
+  const parts = splitTopLevel(args);
+  let lastStart = args.length;
+  let last = '';
+  for (let i = parts.length - 1, end = args.length; i >= 0; i--) {
+    const start = end - parts[i]!.length;
+    if (parts[i]!.trim() !== '') {
+      last = parts[i]!;
+      lastStart = start;
+      break;
+    }
+    end = start - 1;
+  }
+  const arrowAt = last.indexOf('=>');
+  const fn = /(?:^|[^\w$.])function\b\s*\*?\s*[\w$]*\s*\(/.exec(last);
+  if (fn && (arrowAt < 0 || fn.index < arrowAt)) {
+    const open = fn.index + fn[0].length - 1;
+    const close = matchDelim(last, open, '(', ')');
+    const brace = close > open ? last.indexOf('{', close) : -1;
+    const end = brace >= 0 ? matchDelim(last, brace, '{', '}') : -1;
+    if (end < 0) return null;
+    return { body: last.slice(brace + 1, end), start: lastStart + brace + 1 };
+  }
+  if (arrowAt < 0) return null;
+  const afterArrow = last.slice(arrowAt + 2);
+  const braceAt = afterArrow.indexOf('{');
+  if (braceAt >= 0 && afterArrow.slice(0, braceAt).trim() === '') {
+    const end = matchDelim(afterArrow, braceAt, '{', '}');
+    if (end > braceAt) return { body: afterArrow.slice(braceAt + 1, end), start: lastStart + arrowAt + 2 + braceAt + 1 };
+  }
+  return { body: afterArrow, start: lastStart + arrowAt + 2 };
 }
 
 /** `/api` + `/users` → `/api/users`; `/api/` + `/` → `/api`. */

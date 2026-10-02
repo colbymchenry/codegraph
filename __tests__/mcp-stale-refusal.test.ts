@@ -121,7 +121,9 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     const result = await handler.execute('codegraph_search', { query: 'unicodeSymbol' });
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('cannot answer from this index');
-    expect(result.structuredContent).toEqual({ freshness: { stale: [relative], unchecked: [] } });
+    expect(result.content[0].text).toContain(`- ${relative}`);
+    // Claude Code would show structuredContent in place of this text (#2088).
+    expect(result).not.toHaveProperty('structuredContent');
     expect(result).not.toHaveProperty('_cgAnswerFiles');
   });
 
@@ -137,7 +139,7 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
   );
 
   it('refuses rather than silently validating only the first 200 contributing files', async () => {
-    for (let i = 0; i < 201; i++) {
+    for (let i = 0; i < 230; i++) {
       fs.writeFileSync(path.join(root, `caller${i}.ts`),
         `import { alphaOnly } from './alpha'; export function caller${i}() { return alphaOnly(); }\n`);
     }
@@ -147,7 +149,13 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     const result = await handler.execute('codegraph_impact', { symbol: 'alphaOnly' });
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('validation budget');
-    expect((result.structuredContent!.freshness as { unchecked: string[] }).unchecked.length).toBeGreaterThan(0);
+    const text = result.content[0].text;
+    const total = Number(text.match(/validation budget for (\d+) files/)![1]);
+    // A long unchecked list stays bounded: the first 20 and a count of the rest.
+    expect(total).toBeGreaterThan(20);
+    expect(text.split('\n').filter(line => /^- (?!…)/.test(line))).toHaveLength(20);
+    expect(text).toContain(`- … ${total - 20} more (narrow the query)`);
+    expect(result).not.toHaveProperty('structuredContent');
     expect(result.content[0].text).not.toContain('**Impact');
   });
 

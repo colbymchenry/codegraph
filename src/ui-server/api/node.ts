@@ -244,10 +244,17 @@ function buildMembers(
   endpoints: Map<string, Node>,
   overrides?: Map<string, WireOverride>
 ): { items: WireMember[]; total: number } {
+  // Each member once, and never the symbol itself or a file: a component in a
+  // Vue / Svelte / Astro file was recorded as containing its script's file node
+  // and every symbol in it, so the walk one level down met those symbols
+  // again — and a member listed twice is a repeated key the viewer cannot draw.
+  const seen = new Set<string>([focal.id]);
+  const admit = (child: Node | undefined): child is Node =>
+    !!child && child.kind !== 'file' && !seen.has(child.id) && !!seen.add(child.id);
   const direct: Array<{ node: Node; parentId: string; depth: number }> = [];
   for (const edge of containsOut) {
     const child = endpoints.get(edge.target);
-    if (child) direct.push({ node: child, parentId: focal.id, depth: 1 });
+    if (admit(child)) direct.push({ node: child, parentId: focal.id, depth: 1 });
   }
 
   const containerIds = direct
@@ -260,7 +267,7 @@ function buildMembers(
     const grandNodes = cg.getNodesByIds(grandEdges.map((e) => e.target));
     for (const edge of grandEdges) {
       const child = grandNodes.get(edge.target);
-      if (child) nested.push({ node: child, parentId: edge.source, depth: 2 });
+      if (admit(child)) nested.push({ node: child, parentId: edge.source, depth: 2 });
     }
   }
 

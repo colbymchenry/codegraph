@@ -377,6 +377,8 @@ export interface WireRoute {
   routeFile: string;
   routeLine: number;
   routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
 }
 
 export interface WireRoutes {
@@ -410,6 +412,8 @@ export interface WireEntryRoute {
   routeFile: string;
   routeLine: number;
   routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
 }
 
 export interface WireEntryFile extends WireNodeRef {

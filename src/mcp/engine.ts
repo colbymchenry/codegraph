@@ -167,6 +167,11 @@ export class MCPEngine {
     this.toolHandler.setDefaultProjectHint(projectPath);
   }
 
+  /** Whether this engine only reads: no watcher, no sync, no writer slot. */
+  isReadOnly(): boolean {
+    return this.opts.readOnly;
+  }
+
   /** Project root that the engine resolved on first init (null if none). */
   getProjectPath(): string | null {
     return this.projectPath;

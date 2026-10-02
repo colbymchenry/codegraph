@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { canonicalProjectRoot } from '../directory';
 import {
   getDaemonPidPath,
   getDaemonSocketCandidates,
@@ -50,8 +51,14 @@ export function getRegistryDir(): string {
   return path.join(os.homedir(), '.codegraph', 'daemons');
 }
 
+/**
+ * One record per project, so it is keyed the same way the daemon socket is:
+ * over {@link canonicalProjectRoot}, not a raw `path.resolve` — otherwise the
+ * same project spelled with another drive-letter case files two records, and
+ * `list` over-lists while `stop --all` misses one.
+ */
 function recordPath(root: string): string {
-  const hash = crypto.createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16);
+  const hash = crypto.createHash('sha256').update(canonicalProjectRoot(root)).digest('hex').slice(0, 16);
   return path.join(getRegistryDir(), `${hash}.json`);
 }
 
@@ -242,7 +249,7 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
   }
   if (pid == null) {
     const rec = listDaemons({ prune: false }).find(
-      (r) => path.resolve(r.root) === path.resolve(root)
+      (r) => canonicalProjectRoot(r.root) === canonicalProjectRoot(root)
     );
     pid = rec?.pid ?? null;
     if (rec) identity = rec;
