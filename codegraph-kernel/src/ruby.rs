@@ -206,6 +206,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -468,6 +470,8 @@ impl<'t> Walker<'t> {
         let mut skip_children = false;
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "method" {
             // functionTypes ∩ methodTypes: inside class-like (module counts!)
@@ -535,6 +539,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call" {
             self.extract_call(node);
@@ -692,7 +698,13 @@ impl<'t> Walker<'t> {
         }
         let name = self.text(left).to_string();
         let signature = right.map(|r| util::init_signature(self.text(r)));
-        self.create_node("variable", &name, node, Extra { docstring, signature, visibility: None });
+        let row =
+            self.create_node("variable", &name, node, Extra { docstring, signature, visibility: None });
+        // visit_node skips an assignment's children, so the right-hand side's
+        // string literals are reached here, owned by the assigned name.
+        if let (Some(row), Some(r)) = (row, right) {
+            self.markdown_refs_from_subtree(r, row);
+        }
     }
 
     /// extractImport — every non-body `call` lands here (importTypes:['call']).

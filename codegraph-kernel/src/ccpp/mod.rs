@@ -450,6 +450,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -940,6 +942,8 @@ impl<'t> Walker<'t> {
         }
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if self.is_cpp_constructor_declaration(node) {
             self.extract_method(node);
@@ -1773,6 +1777,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call_expression" {
             self.extract_call(node);

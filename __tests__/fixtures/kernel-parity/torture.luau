@@ -58,4 +58,20 @@ M:update({ x = 1, y = 2 }, print)
 
 local préfixe = "café"
 function after_unicode() end
+
+-- Markdown path references: code -> documentation edges. Every shape the
+-- normalizer branches on, so the two arms have to agree about the rejections
+-- (URL, escape above the root) as well as the emissions.
+local md_guide = "../docs/guide.md#install"
+local md_bare = "README.md"
+local md_rooted = "/docs/rooted.md"
+local md_escapes = "../../../../outside.md"
+local md_remote = "https://example.com/remote.md"
+local md_queried = "./notes.md?raw=1#top"
+local md_two_in_one = "see a.md and also sub/b.mdx"
+
+function md_load()
+  load_doc("docs/deep/nested.markdown")
+end
+
 return M
