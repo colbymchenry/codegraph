@@ -7,7 +7,7 @@ const CodeGraph = require('../../dist/index.js').default;
 const { ToolHandler } = require('../../dist/mcp/tools.js');
 const { scipStatus } = require('../../dist/scip/index.js');
 const { scipVerdict } = require('../../dist/scip/notes.js');
-const { SCIP_LANGUAGES, readMeta, needsMerge, forgetMerges } = require('../../dist/scip/store.js');
+const { SCIP_LANGUAGES, needsMerge, forgetMerges } = require('../../dist/scip/store.js');
 
 function pickLang(root) {
   for (const lang of SCIP_LANGUAGES) {

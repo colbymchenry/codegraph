@@ -26,7 +26,7 @@ import { QueryBuilder } from '../db/queries';
 import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
-import { epochMs } from './resolver-pool';
+import { RESOLVE_PROFILE, epochMs } from './resolver-pool';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -90,11 +90,11 @@ port.on('message', (msg: InMessage) => {
         const out = resolver.resolveListForAdmission(msg.refs);
         const t1 = epochMs();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Math.round(t1 - t0)}ms`);
-        port.postMessage({ type: 'result', id: msg.id, ...out, t0, t1 });
+        port.postMessage(RESOLVE_PROFILE ? { type: 'result', id: msg.id, ...out, t0, t1 } : { type: 'result', id: msg.id, ...out });
         // CODEGRAPH_RESOLVE_PROFILE: this chunk's timeline on the shared clock
         // (sent by main, resolve start/end, result serialized) — the gaps
         // between a worker's chunks are deserialization or waiting.
-        if (process.env.CODEGRAPH_RESOLVE_PROFILE) {
+        if (RESOLVE_PROFILE) {
           const r = (x: number): string => x.toFixed(2);
           console.error(`[chunk] ${threadId} ${msg.id} ${r(msg.sentAt ?? 0)} ${r(t0)} ${r(t1)} ${r(epochMs())} ${msg.refs.length}`);
         }

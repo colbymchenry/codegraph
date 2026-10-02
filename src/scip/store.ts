@@ -287,7 +287,7 @@ export function indexedHashes(db: SqliteDatabase, paths: Iterable<string>): Map<
  * and would drop verified scip edges from status counts (playwright: ~24k null-meta edges).
  * `column`: an aliased column (`e.metadata`) where the query joins.
  */
-export function edgeFlag(flag: 'scipSilent' | 'scipStale', column = 'metadata'): string {
+function edgeFlag(flag: 'scipSilent' | 'scipStale', column = 'metadata'): string {
   return `COALESCE(${column},'') LIKE '%"${flag}":true%'`;
 }
 

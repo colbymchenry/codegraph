@@ -1892,7 +1892,7 @@ export class ReferenceResolver {
     // the loop's wall time splits into "main waits on workers" vs "workers
     // wait on main" (between batches) vs "workers idle inside a batch".
     const batchProf = loopProf
-      ? { loopStart: epochMs(), mainWait: 0, workerGap: 0, innerIdle: 0, busy: 0, delivery: 0, batches: 0, prevEnd: 0, n: 0 }
+      ? { mainWait: 0, workerGap: 0, innerIdle: 0, busy: 0, delivery: 0, batches: 0, prevEnd: 0, n: 0 }
       : null;
     let lastTiming: BatchTiming | undefined;
 
@@ -2082,10 +2082,10 @@ export class ReferenceResolver {
       lp('read', tLp);
 
       const tBatch = Date.now();
-      const settleStart = epochMs();
+      const settleStart = batchProf ? epochMs() : 0;
       lastTiming = undefined;
       const result = await settleBatch(inFlight, batch);
-      const settleEnd = epochMs();
+      const settleEnd = batchProf ? epochMs() : 0;
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch ${inFlight.mode}: ${batch.length} refs in ${Date.now() - tBatch}ms`);
       lp('settle', tBatch);
 

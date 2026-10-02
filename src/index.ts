@@ -592,6 +592,8 @@ export class CodeGraph {
         let result: IndexResult;
         // Set once parsing succeeds: whether resolution's ref and edge windows
         // will drop (and later rebuild) indexes the parse window would rebuild.
+        // The resolver makes the same call from the same pending count — nothing
+        // between here and resolution (re-init, postExtract) touches refs.
         let resolutionRebuilds = false;
         try {
           result = await this.orchestrator.indexAll(

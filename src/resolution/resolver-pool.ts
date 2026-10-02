@@ -35,12 +35,12 @@ export interface ChunkResult {
 
 /**
  * When a fan-out ran, on one clock (`performance.timeOrigin + now()` is epoch
- * ms in every thread): dispatched by the main thread, first chunk started and
- * last chunk finished in a worker, last result handled on the main thread
- * (late when the main thread was busy), and the workers' summed busy time.
+ * ms in every thread): first chunk started and last chunk finished in a
+ * worker, last result handled on the main thread (late when the main thread
+ * was busy), and the workers' summed busy time. Only under
+ * CODEGRAPH_RESOLVE_PROFILE — the workers stamp nothing otherwise.
  */
 export interface BatchTiming {
-  dispatchAt: number;
   start: number;
   end: number;
   received: number;
@@ -49,6 +49,9 @@ export interface BatchTiming {
 
 /** Epoch ms with sub-ms precision, comparable across worker threads. */
 export const epochMs = (): number => performance.timeOrigin + performance.now();
+
+/** CODEGRAPH_RESOLVE_PROFILE: stamp chunks so the batch loop can attribute its waits. */
+export const RESOLVE_PROFILE = !!process.env.CODEGRAPH_RESOLVE_PROFILE;
 
 interface PoolWorker {
   worker: Worker;
@@ -196,7 +199,7 @@ export class ResolverPool {
             deferredThisMember: msg.deferredThisMember!,
             byMethod: msg.byMethod!,
             timing: msg.t0 === undefined || msg.t1 === undefined ? undefined
-              : { dispatchAt: 0, start: msg.t0, end: msg.t1, received: epochMs(), busyMs: msg.t1 - msg.t0 },
+              : { start: msg.t0, end: msg.t1, received: epochMs(), busyMs: msg.t1 - msg.t0 },
           });
         } else if (msg.type === 'synth-result' && msg.id !== undefined) {
           pw.busy--;
@@ -270,7 +273,6 @@ export class ResolverPool {
    */
   async resolveBatch(refs: UnresolvedReference[]): Promise<ChunkResult> {
     if (this.failed) throw this.failed;
-    const dispatchAt = epochMs();
     const chunkPromises: Promise<ChunkResult>[] = [];
     const chunkSize = Math.ceil(refs.length / (this.workers.length * CHUNKS_PER_WORKER));
     for (let i = 0; i < refs.length; i += chunkSize) {
@@ -284,15 +286,16 @@ export class ResolverPool {
       chunkPromises.push(
         new Promise<ChunkResult>((resolve, reject) => {
           this.waiters.set(id, { resolve, reject });
-          pw.worker.postMessage({ type: 'resolve', id, refs: chunk, sentAt: epochMs() });
+          pw.worker.postMessage({ type: 'resolve', id, refs: chunk, sentAt: RESOLVE_PROFILE ? epochMs() : undefined });
         })
       );
     }
     const chunks = await Promise.all(chunkPromises);
     const out: ChunkResult = { resolved: [], unresolved: [], deferredChain: [], deferredThisMember: [], byMethod: {} };
-    const timing: BatchTiming = { dispatchAt, start: Infinity, end: 0, received: 0, busyMs: 0 };
+    let timing: BatchTiming | undefined;
     for (const c of chunks) {
       if (c.timing) {
+        timing ??= { start: Infinity, end: 0, received: 0, busyMs: 0 };
         timing.start = Math.min(timing.start, c.timing.start);
         timing.end = Math.max(timing.end, c.timing.end);
         timing.received = Math.max(timing.received, c.timing.received);
@@ -304,7 +307,7 @@ export class ResolverPool {
       out.deferredThisMember.push(...c.deferredThisMember);
       for (const [k, v] of Object.entries(c.byMethod)) out.byMethod[k] = (out.byMethod[k] || 0) + v;
     }
-    if (timing.end > 0) out.timing = timing;
+    if (timing) out.timing = timing;
     return out;
   }
 
