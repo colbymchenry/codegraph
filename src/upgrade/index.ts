@@ -17,11 +17,12 @@
  * vendored `node` binary and a `bin/codegraph` launcher next to its `lib/`, so
  * we can recognize it from the running file's path without a marker file.
  *
- * Windows wrinkle: a running `node.exe` is locked and can't be deleted, so the
- * bundle's `current\` dir can't be overwritten in place by the process doing
- * the upgrade. We therefore spawn a DETACHED helper that waits for this
- * process to exit (releasing the lock), then runs `install.ps1`. This is the
- * conventional Windows self-update dance (rustup/nvm-windows do the same).
+ * Windows wrinkle: a running `node.exe` and a loaded `.node` addon are locked —
+ * they can't be overwritten or deleted, by this process or by the MCP servers
+ * of open agent sessions. They CAN be renamed, so the Windows upgrade unpacks
+ * the new bundle next to `current\` and swaps it in file by file, renaming each
+ * replaced file aside and rolling every step back on failure (see
+ * `WINDOWS_SWAP_FUNCTION`, shared verbatim with `install.ps1`).
  */
 
 import * as fs from 'fs';
@@ -34,6 +35,7 @@ export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
+export const INSTALL_PS1_URL = `${RAW_BASE}/install.ps1`;
 
 // ---------------------------------------------------------------------------
 // Install-method detection (pure — fully unit-testable via injected probes)
@@ -578,36 +580,140 @@ function upgradeUnixBundle(
   return 0;
 }
 
+/**
+ * The PowerShell function that moves an unpacked Windows bundle into the
+ * install's `current\` dir. Shared VERBATIM with `install.ps1` (a test pins the
+ * two copies equal), so a first install, a re-run of the installer, and
+ * `codegraph upgrade` all replace files the same way.
+ *
+ * Why file-by-file renames (#2185): every open agent session runs a CodeGraph
+ * MCP server from `current\`, which keeps `node.exe` and the native kernel
+ * (`lib\kernel\codegraph-kernel.node`) locked. Windows refuses to overwrite or
+ * delete a running exe or a loaded DLL but does let it be renamed. The old
+ * upgrade renamed only `node.exe` and then `Copy-Item`ed over the rest, so the
+ * locked kernel failed the copy halfway — leaving no `node.exe` and a mix of
+ * versions, which no `codegraph` command could repair. Now each file being
+ * replaced (or dropped by the new version) is renamed aside to
+ * `<name>.old-<token>` before the staged file is moved in; any failure undoes
+ * every step, and the renamed-aside files are deleted on the next successful
+ * run once nothing holds them.
+ */
+export const WINDOWS_SWAP_FUNCTION = String.raw`function Install-CodeGraphFiles([string]$Stage, [string]$Dest) {
+  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete a
+  # running node.exe or a loaded .node addon, but it can rename one, so every
+  # file being replaced (or dropped by the new version) is first renamed aside
+  # to <name>.old-<token>. Any failure puts every file back, so the install is
+  # never left half-replaced or without its node.exe.
+  $ErrorActionPreference = 'Stop'
+  $stageDir = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
+  foreach ($need in 'node.exe', 'bin\codegraph.cmd') {
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need))) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  }
+  $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $asideName = '\.old-[0-9a-f]{8,32}$'
+  $files = @{}; $dirs = @{}
+  foreach ($i in @(Get-ChildItem -LiteralPath $stageDir -Recurse -Force)) {
+    $rel = $i.FullName.Substring($stageDir.Length)
+    if ($i.PSIsContainer) { $dirs[$rel] = $true } else { $files[$rel] = $true }
+  }
+  $undo = New-Object System.Collections.ArrayList
+  function Move-Logged([string]$From, [string]$To) { [IO.File]::Move($From, $To); [void]$undo.Add(@($From, $To)) }
+  function Undo-Logged {
+    $lost = 0
+    for ($n = $undo.Count - 1; $n -ge 0; $n--) {
+      $u = $undo[$n]
+      try { if ($u.Count -eq 2) { [IO.File]::Move($u[1], $u[0]) } else { [IO.Directory]::Delete($u[0]) } } catch { if ($u.Count -eq 2) { $lost++ } }
+    }
+    $undo.Clear()
+    $lost
+  }
+  $done = $false; $at = $Dest
+  try {
+    if (-not (Test-Path -LiteralPath $Dest)) { [void][IO.Directory]::CreateDirectory($Dest); [void]$undo.Add(@($Dest)) }
+    $destDir = (Resolve-Path -LiteralPath $Dest).ProviderPath.TrimEnd('\')
+    foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File)) {
+      if (-not $files.ContainsKey($f.FullName.Substring($destDir.Length)) -and $f.Name -notmatch $asideName) {
+        $at = $f.FullName; Move-Logged $at "$at.old-$token"
+      }
+    }
+    foreach ($rel in @($dirs.Keys | Sort-Object Length)) {
+      $at = $destDir + $rel
+      if (-not [IO.Directory]::Exists($at)) { [void][IO.Directory]::CreateDirectory($at); [void]$undo.Add(@($at)) }
+    }
+    foreach ($rel in @($files.Keys)) {
+      $at = $destDir + $rel
+      if ([IO.File]::Exists($at)) { Move-Logged $at "$at.old-$token" }
+      Move-Logged ($stageDir + $rel) $at
+    }
+    $done = $true
+  } catch {
+    $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+    $lost = Undo-Logged
+    $msg = "Could not replace $at ($($x.Message))."
+    if ($lost) {
+      $msg += " $lost file(s) could not be put back, so the install may not start. Close your agent sessions and any running codegraph commands, then reinstall: irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex"
+    } else {
+      $msg += " Nothing was changed: the existing install still works. If another program has CodeGraph's files open, close your agent sessions (they run the CodeGraph MCP server) and any running codegraph commands, then try again."
+    }
+    $e = New-Object System.Exception($msg); $e.Data['codegraphDamaged'] = [bool]$lost; throw $e
+  } finally {
+    # Interrupted (Ctrl+C) without reaching catch: still put everything back.
+    if (-not $done) { [void](Undo-Logged) }
+  }
+  # Delete what this run and earlier ones renamed aside. A file a running
+  # process still holds can't be deleted yet; the next install retries it.
+  foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+    if ($f.Name -match $asideName) { try { [IO.File]::Delete($f.FullName) } catch {} }
+  }
+  foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)) {
+    if (-not $dirs.ContainsKey($d.FullName.Substring($destDir.Length))) { try { [IO.Directory]::Delete($d.FullName) } catch {} }
+  }
+}
+`;
+
+/** Single-quote a value for PowerShell (a `'` inside is doubled). */
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Exit code of the upgrade script when files could not all be put back. */
+export const WINDOWS_UPGRADE_DAMAGED = 2;
+
 /** Build the in-place Windows upgrade script (exported for unit-testing). */
 export function buildWindowsUpgradeScript(bundleRoot: string, version: string, arch: string): string {
   const target = `win32-${arch}`;
   const url = `https://github.com/${REPO}/releases/download/${version}/codegraph-${target}.zip`;
-  // Windows can't DELETE a running exe but CAN rename it, so we upgrade IN
-  // PLACE: download → rename the locked node.exe aside → extract the new bundle
-  // over current\. Synchronous, no detached helper (which dies under SSH/job
-  // objects and has worse UX). The running process keeps its renamed node.exe
-  // mapped; the NEXT `codegraph` invocation uses the new one. We can't reuse
-  // install.ps1 here — it `Remove-Item`s current\, which fails on the locked exe.
+  // Synchronous, no detached helper (which dies under SSH/job objects and has
+  // worse UX). The bundle is unpacked into a sibling of current\ — the same
+  // volume, so the swap is renames, never a half-finished copy — and nothing
+  // in current\ changes until it is fully unpacked. The running process keeps
+  // its renamed node.exe mapped; the NEXT `codegraph` invocation uses the new
+  // one. Exit codes: 0 installed, 1 failed with the install unchanged,
+  // WINDOWS_UPGRADE_DAMAGED when the rollback could not restore every file.
   return [
     `$ErrorActionPreference='Stop'`,
-    `$dest='${bundleRoot}'`,
-    `$url='${url}'`,
-    `Write-Host "Downloading $url"`,
+    WINDOWS_SWAP_FUNCTION,
+    `$dest=${psQuote(bundleRoot)}`,
+    `$url=${psQuote(url)}`,
     `$tmp=Join-Path $env:TEMP ('cg-up-'+[guid]::NewGuid().ToString('N'))`,
-    `New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
-    `$zip=Join-Path $tmp 'cg.zip'`,
-    `Invoke-WebRequest -Uri $url -OutFile $zip`,
-    `$stage=Join-Path $tmp 'stage'`,
-    `Expand-Archive -Path $zip -DestinationPath $stage -Force`,
-    `$inner=Join-Path $stage 'codegraph-${target}'`,
-    `$src=if(Test-Path $inner){$inner}else{$stage}`,
-    `$node=Join-Path $dest 'node.exe'`,
-    `if(Test-Path $node){Rename-Item -Path $node -NewName ('node.exe.old-'+[guid]::NewGuid().ToString('N')) -Force}`,
-    `Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force`,
-    `Get-ChildItem -Path $dest -Filter 'node.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }`,
-    `Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue`,
-    `Write-Host "Installed CodeGraph ${version} to $dest"`,
-  ].join(';');
+    `$stage=Join-Path (Split-Path -Parent $dest) ('.staging-'+[guid]::NewGuid().ToString('N').Substring(0,8))`,
+    `$code=0`,
+    `try {`,
+    `  Write-Host "Downloading $url"`,
+    `  New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
+    `  $zip=Join-Path $tmp 'cg.zip'`,
+    `  Invoke-WebRequest -Uri $url -OutFile $zip`,
+    `  Expand-Archive -Path $zip -DestinationPath $stage -Force`,
+    `  $inner=Join-Path $stage 'codegraph-${target}'`,
+    `  Install-CodeGraphFiles $(if(Test-Path $inner){$inner}else{$stage}) $dest`,
+    `  Write-Host "Installed CodeGraph ${version} to $dest"`,
+    `} catch {`,
+    `  [Console]::Error.WriteLine($_.Exception.Message)`,
+    `  $code=if($_.Exception.Data['codegraphDamaged']){${WINDOWS_UPGRADE_DAMAGED}}else{1}`,
+    `}`,
+    `Remove-Item -LiteralPath $stage,$tmp -Recurse -Force -ErrorAction SilentlyContinue`,
+    `exit $code`,
+  ].join('\n');
 }
 
 function upgradeWindowsBundle(
@@ -624,7 +730,15 @@ function upgradeWindowsBundle(
   deps.log(c.dim(`Downloading and installing ${latest}…`));
   const code = deps.run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]);
   if (code !== 0) {
-    deps.error(`Installer exited with code ${code}.`);
+    // The script has already printed what went wrong and what to do.
+    if (code === WINDOWS_UPGRADE_DAMAGED) {
+      deps.error('The upgrade failed and some files could not be put back.');
+      deps.log(c.dim(`Close your agent sessions and any running codegraph commands, then reinstall:  irm ${INSTALL_PS1_URL} | iex`));
+    } else if (code === 1) {
+      deps.error(`The upgrade to ${latest} did not complete; your existing install was left as it was.`);
+    } else {
+      deps.error(`Installer exited with code ${code}.`);
+    }
     return 1;
   }
   deps.log('');

@@ -16,6 +16,8 @@ import {
   verifyResolvedVersion,
   defaultWirePromptHook,
   buildWindowsUpgradeScript,
+  WINDOWS_SWAP_FUNCTION,
+  WINDOWS_UPGRADE_DAMAGED,
   NPM_PACKAGE,
   type InstallMethod,
   type UpgradeDeps,
@@ -211,14 +213,121 @@ describe('version helpers', () => {
     expect(a).toContain('codegraph index -f');
   });
 
-  it('buildWindowsUpgradeScript targets the right asset per arch and renames-not-deletes the exe', () => {
+  it('buildWindowsUpgradeScript targets the right asset per arch', () => {
     const arm = buildWindowsUpgradeScript('C:\\cg\\current', 'v1.2.3', 'arm64');
     expect(arm).toContain('releases/download/v1.2.3/codegraph-win32-arm64.zip');
     expect(arm).toContain("$dest='C:\\cg\\current'");
-    expect(arm).toContain('Rename-Item'); // never Remove-Item on the locked exe
-    expect(arm).not.toMatch(/Remove-Item[^;]*\$dest'?\s*;/); // doesn't delete current\
+    expect(arm).toContain("Join-Path $stage 'codegraph-win32-arm64'");
     const x64 = buildWindowsUpgradeScript('C:\\cg\\current', 'v1.2.3', 'x64');
     expect(x64).toContain('codegraph-win32-x64.zip');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Windows file swap (#2185) — a running CodeGraph process (an agent session's
+// MCP server) keeps node.exe and the native kernel locked: they can be renamed
+// but not overwritten or deleted. The upgrade used to rename only node.exe and
+// then Copy-Item over the rest, so the locked kernel failed the copy halfway
+// and left the install with no node.exe. PowerShell can't run on the macOS
+// test host, so these pin the script's shape; the behavior is validated on a
+// real Windows machine.
+// ---------------------------------------------------------------------------
+
+describe('windows bundle swap script (#2185)', () => {
+  const INSTALL_PS1 = path.join(__dirname, '..', 'install.ps1');
+  const installPs1 = () => fs.readFileSync(INSTALL_PS1, 'utf-8').replace(/\r\n/g, '\n');
+  const script = () => buildWindowsUpgradeScript('C:\\Users\\me\\AppData\\Local\\codegraph\\current', 'v1.6.2', 'x64');
+  /** The swap function's own statements, comments dropped. */
+  const swapCode = () => WINDOWS_SWAP_FUNCTION.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
+
+  it('install.ps1 carries the same swap function, verbatim', () => {
+    const m = /# >>> Install-CodeGraphFiles[^\n]*\n([\s\S]*?)# <<< Install-CodeGraphFiles/.exec(installPs1());
+    expect(m, 'install.ps1 lost its Install-CodeGraphFiles markers').not.toBeNull();
+    expect(m![1]).toBe(WINDOWS_SWAP_FUNCTION);
+  });
+
+  it('never copies over or deletes current\\ in place', () => {
+    for (const text of [script(), installPs1()]) {
+      expect(text).not.toMatch(/Copy-Item/);
+      expect(text).not.toMatch(/Remove-Item[^\n]*\$dest\b/);
+      expect(text).not.toMatch(/Expand-Archive[^\n]*\$dest\b/);
+    }
+  });
+
+  it('unpacks next to current\\ (same volume), not into %TEMP%, then swaps', () => {
+    const s = script();
+    expect(s).toContain(`$stage=Join-Path (Split-Path -Parent $dest) ('.staging-'`);
+    expect(s).toMatch(/Expand-Archive -Path \$zip -DestinationPath \$stage/);
+    expect(s.indexOf('Expand-Archive')).toBeLessThan(s.indexOf('Install-CodeGraphFiles $('));
+    // install.ps1 stages next to current\ too.
+    expect(installPs1()).toContain(`$stage = Join-Path $installDir ('.staging-'`);
+    expect(installPs1()).toMatch(/Install-CodeGraphFiles \$\(.*\) \$dest$/m);
+  });
+
+  it('renames every replaced file aside before moving the staged file in', () => {
+    const code = swapCode();
+    // Replaced files and files the new version drops are both renamed aside…
+    expect(code.match(/Move-Logged \$at "\$at\.old-\$token"/g)).toHaveLength(2);
+    // …and the aside-rename of a target comes before the staged file moves in.
+    const aside = code.indexOf('if ([IO.File]::Exists($at)) { Move-Logged $at "$at.old-$token" }');
+    const moveIn = code.indexOf('Move-Logged ($stageDir + $rel) $at');
+    expect(aside).toBeGreaterThan(0);
+    expect(moveIn).toBeGreaterThan(aside);
+    // No in-place overwrite or delete of a live file during the swap.
+    expect(code).not.toMatch(/\[IO\.File\]::(Copy|Replace)\(/);
+    expect(code).not.toMatch(/Move-Item|Rename-Item/);
+  });
+
+  it('rolls back on failure and on interruption, and says whether the install still works', () => {
+    const code = swapCode();
+    expect(code).toMatch(/catch \{[\s\S]*\$lost = Undo-Logged[\s\S]*\} finally \{\s*if \(-not \$done\) \{ \[void\]\(Undo-Logged\) \}/);
+    // Undo walks the log backwards, moving each file back to where it was.
+    expect(code).toContain('for ($n = $undo.Count - 1; $n -ge 0; $n--)');
+    expect(code).toContain('[IO.File]::Move($u[1], $u[0])');
+    expect(code).toContain('Nothing was changed: the existing install still works.');
+    expect(code).toContain("$e.Data['codegraphDamaged'] = [bool]$lost");
+    // The upgrade script maps that flag to the exit code runUpgrade reads.
+    expect(script()).toContain(`$code=if($_.Exception.Data['codegraphDamaged']){${WINDOWS_UPGRADE_DAMAGED}}else{1}`);
+    expect(script().trimEnd().endsWith('exit $code')).toBe(true);
+  });
+
+  it('refuses a download that is not a bundle before touching current\\', () => {
+    const code = swapCode();
+    expect(code).toContain("foreach ($need in 'node.exe', 'bin\\codegraph.cmd')");
+    expect(code.indexOf("foreach ($need in")).toBeLessThan(code.indexOf('try {'));
+  });
+
+  it('cleans up renamed-aside leftovers, including ones from earlier upgrades', () => {
+    const m = /\$asideName = '([^']+)'/.exec(WINDOWS_SWAP_FUNCTION);
+    expect(m).not.toBeNull();
+    const aside = new RegExp(m![1]!, 'i'); // PowerShell -match is case-insensitive
+    // The pre-fix upgrade left node.exe.old-<32-hex guid>; this one uses 8 hex.
+    expect(aside.test('node.exe.old-0123456789abcdef0123456789ABCDEF')).toBe(true);
+    expect(aside.test('codegraph-kernel.node.old-deadbeef')).toBe(true);
+    for (const shipped of ['node.exe', 'codegraph-kernel.node', 'old-deadbeef.js', 'x.old-1234567', 'a.old-deadbeef.js']) {
+      expect(aside.test(shipped), shipped).toBe(false);
+    }
+    // No file a bundle actually ships looks like a leftover.
+    const walk = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [e.name]));
+    const distDir = path.join(__dirname, '..', 'dist');
+    if (fs.existsSync(distDir)) expect(walk(distDir).filter((n) => aside.test(n))).toEqual([]);
+    // Deleted only after a successful swap, and a still-locked one is skipped.
+    const code = swapCode();
+    expect(code.indexOf('[IO.File]::Delete($f.FullName)')).toBeGreaterThan(code.indexOf('$done = $true'));
+    expect(code).toContain('try { [IO.File]::Delete($f.FullName) } catch {}');
+  });
+
+  it('quotes the install path for PowerShell', () => {
+    const s = buildWindowsUpgradeScript("C:\\Users\\o'brien\\codegraph\\current", 'v1.6.2', 'x64');
+    expect(s).toContain("$dest='C:\\Users\\o''brien\\codegraph\\current'");
+  });
+
+  it('fits a Windows command line even for a long install path', () => {
+    const root = `C:\\${'very-long-directory-name\\'.repeat(8)}codegraph\\current`;
+    const encoded = Buffer.from(buildWindowsUpgradeScript(root, 'v10.20.30', 'arm64'), 'utf16le').toString('base64');
+    // CreateProcess caps the whole command line at 32,767 characters.
+    expect(encoded.length).toBeLessThan(24_000);
   });
 });
 
@@ -335,11 +444,10 @@ describe('runUpgrade', () => {
     expect(calls.runs).toHaveLength(1);
     expect(calls.runs[0].cmd).toBe('powershell.exe');
     const decoded = decodeEncodedCommand(calls.runs[0].args);
-    // Downloads the right asset, renames the locked exe aside, copies over current\.
+    // Downloads the right asset and swaps it in with the shared rename-aside function.
     expect(decoded).toContain('releases/download/v0.9.9/codegraph-win32-');
-    expect(decoded).toContain('Rename-Item');
-    expect(decoded).toContain('node.exe.old-');
-    expect(decoded).toContain('Copy-Item');
+    expect(decoded).toContain(WINDOWS_SWAP_FUNCTION);
+    expect(decoded).toMatch(/^\s*Install-CodeGraphFiles .* \$dest$/m);
   });
 
   it('windows bundle: a non-zero installer exit is a failure', async () => {
@@ -353,7 +461,37 @@ describe('runUpgrade', () => {
     );
     const code = await runUpgrade({}, deps);
     expect(code).toBe(1);
-    expect(calls.errors.join('\n')).toMatch(/exited with code/i);
+    // Exit 1 is the script's "failed, install unchanged" code (#2185).
+    expect(calls.errors.join('\n')).toMatch(/did not complete; your existing install was left as it was/i);
+  });
+
+  it('windows bundle: an incomplete rollback points at the reinstall command', async () => {
+    const { deps, calls } = makeDeps(
+      {
+        method: { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
+        currentVersion: '0.9.8',
+        platform: 'win32',
+      },
+      WINDOWS_UPGRADE_DAMAGED
+    );
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(1);
+    expect(calls.errors.join('\n')).toMatch(/could not be put back/i);
+    expect(calls.logs.join('\n')).toContain('install.ps1 | iex');
+    expect(calls.runs).toHaveLength(1); // no post-upgrade refresh/probe after a failure
+  });
+
+  it('windows bundle: any other exit code is reported as-is', async () => {
+    const { deps, calls } = makeDeps(
+      {
+        method: { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
+        currentVersion: '0.9.8',
+        platform: 'win32',
+      },
+      -1
+    );
+    expect(await runUpgrade({}, deps)).toBe(1);
+    expect(calls.errors.join('\n')).toMatch(/exited with code -1/i);
   });
 
   it('npm global: shells out to npm install -g @pkg@latest', async () => {
