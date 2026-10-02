@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as v8 from 'v8';
 import * as vm from 'vm';
+import { Worker } from 'worker_threads';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
@@ -33,8 +34,10 @@ export interface ScipHost {
   getProjectRoot(): string;
   /** raw connection for reads */
   scipReadDb(): SqliteDatabase;
-  /** runs `fn` holding the index mutex + cross-process write lock */
-  scipWrite<T>(fn: (db: SqliteDatabase) => T): Promise<T>;
+  /** the database file, for a merge on its own connection (passOffThread) */
+  scipDbPath(): string;
+  /** runs `fn` holding the index mutex + cross-process write lock, until what it returns settles */
+  scipWrite<T>(fn: (db: SqliteDatabase) => T | Promise<T>): Promise<T>;
 }
 
 /**
@@ -63,7 +66,27 @@ export function mergeInstalled(host: ScipHost, results: readonly ProduceResult[]
   for (const r of results) if (r.status === 'installed') scopes.push(r.scope);
   if (scopes.length === 0) return Promise.resolve(null);
   const scope = scopes.every((s): s is MergeScope => s !== undefined) ? joinScopes(scopes) : undefined;
-  return host.scipWrite(db => runScipPass(db, host.getProjectRoot(), scope));
+  const root = host.getProjectRoot();
+  return host.scipWrite(db => passOffThread(host.scipDbPath(), root, scope) ?? runScipPass(db, root, scope));
+}
+
+/**
+ * runScipPass on a worker thread with its own connection (merge-worker.ts):
+ * the process — the MCP server, for the watcher's reindex — keeps answering
+ * from the committed graph meanwhile (WAL), where an in-process merge held it
+ * 1 s (Django) to 6–27 s (vscode). Null when the compiled worker is not beside
+ * this module (running from source: tests); the merge then runs in process.
+ */
+function passOffThread(dbPath: string, projectRoot: string, scope?: MergeScope): Promise<ScipPassReport | null> | null {
+  const file = path.join(__dirname, 'merge-worker.js');
+  if (!fs.existsSync(file)) return null;
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(file, { workerData: { dbPath, projectRoot, scope } });
+    worker.once('message', (m: { report?: ScipPassReport | null; error?: string }) =>
+      m.error === undefined ? resolve(m.report ?? null) : reject(new Error(m.error)));
+    worker.once('error', reject);
+    worker.once('exit', code => reject(new Error(`merge worker exited (${code}) without a report`))); // no-op once settled
+  });
 }
 
 export interface ScipPassReport {

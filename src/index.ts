@@ -1262,12 +1262,17 @@ export class CodeGraph {
     return this.db.getDb();
   }
 
-  /** Runs `fn` under the same in-process mutex and cross-process lock as indexing. */
-  async scipWrite<T>(fn: (db: SqliteDatabase) => T): Promise<T> {
+  /** The database file, for a SCIP merge on its own connection. */
+  scipDbPath(): string {
+    return this.db.getPath();
+  }
+
+  /** Runs `fn` under the same in-process mutex and cross-process lock as indexing, until what it returns settles. */
+  async scipWrite<T>(fn: (db: SqliteDatabase) => T | Promise<T>): Promise<T> {
     return this.indexMutex.withLock(async () => {
       this.fileLock.acquire();
       try {
-        return fn(this.db.getDb());
+        return await fn(this.db.getDb());
       } finally {
         this.fileLock.release();
       }

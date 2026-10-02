@@ -5,6 +5,7 @@ import * as path from 'path';
 import { pathToFileURL } from 'url';
 import CodeGraph from '../../src/index';
 import type { Edge } from '../../src/types';
+import type { SqliteDatabase } from '../../src/db/sqlite-adapter';
 import { importScipFile, runScipPass, scipStatus } from '../../src/scip';
 import { scipVerdict } from '../../src/scip/notes';
 import { produceIndex } from '../../src/scip/produce';
@@ -104,6 +105,23 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(edge('sum', 'Invoice::totalPrice')).toMatchObject({ provenance: 'scip', line: 6 });
     expect(scipVerdict({ provenance: 'scip' } as Edge)).toBe('verified');
   });
+
+  // The compiled worker only exists in dist/ (from source, mergeInstalled merges in process).
+  it.runIf(fs.existsSync(path.join(__dirname, '..', '..', 'dist', 'scip', 'merge-worker.js')))(
+    'the merge after a reindex runs on its own thread and connection; the caller sees it once committed', async () => {
+      importFixture();
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { mergeInstalled } = require('../../dist/scip/index.js') as typeof import('../../src/scip/index');
+      const untouchable = new Proxy({}, { get: () => { throw new Error('the caller\'s connection was used'); } }) as SqliteDatabase;
+      const report = await mergeInstalled({
+        getProjectRoot: () => dir,
+        scipDbPath: () => cg.scipDbPath(),
+        scipReadDb: () => untouchable,
+        scipWrite: async fn => fn(untouchable),
+      }, [{ status: 'installed', lang: 'typescript', documents: 2, resolvedCalls: 0, durationMs: 0, warnings: [] }]);
+      expect(report?.outcome.edgesUpdated).toBeGreaterThan(0);
+      expect(edge('sum', 'helper')?.provenance).toBe('scip');
+    });
 
   it('explore lists every compiler-verified call site of the symbol a query names', async () => {
     const explore = async (query: string) =>
