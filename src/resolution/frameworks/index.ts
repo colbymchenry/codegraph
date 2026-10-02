@@ -9,6 +9,7 @@ import type { Language } from '../../types';
 import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
+import { httpRoutingResolver } from './http-routing';
 import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { nextjsResolver } from './nextjs';
@@ -46,6 +47,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   drupalResolver,
   // JavaScript/TypeScript
   expressResolver,
+  httpRoutingResolver,
   nestjsResolver,
   reactResolver,
   // React Router — `<Route path>` routes are `reactResolver`'s; `history.push('/x')` / `navigate('/x')` → navigates edges
@@ -158,6 +160,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
+export { httpRoutingResolver } from './http-routing';
 export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { reactRouterResolver } from './react-router';

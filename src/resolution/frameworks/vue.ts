@@ -9,6 +9,8 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
 import { pageComponentRef, resolvePageComponent } from './page-component';
+import { detectLanguage, getParser } from '../../extraction/grammars';
+import { httpHandlerReferences } from './http-routing';
 
 /** The languages a Vue app's scripts are written in. */
 const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
@@ -74,13 +76,7 @@ const NUXT_AUTO_IMPORTS = new Set([
 /**
  * Nuxt virtual module prefixes (auto-import namespaces)
  */
-const NUXT_VIRTUAL_MODULES = [
-  '#imports',
-  '#components',
-  '#app',
-  '#build',
-  '#head',
-];
+const NUXT_VIRTUAL_MODULES = ['#imports', '#components', '#app', '#build', '#head'];
 
 export const vueResolver: FrameworkResolver = {
   name: 'vue',
@@ -218,14 +214,14 @@ export const nuxtResolver: FrameworkResolver = {
     return resolvePageComponent(ref, context);
   },
 
-  extract(filePath: string, _content: string) {
+  extract(filePath: string, content: string) {
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
 
     // Forward slashes, and a leading `/` so an app at the repository root
     // (`pages/index.vue`) is found by the same `/pages/` search as a nested one.
-    const normalized = '/' + filePath.replace(/\\/g, '/');
+    const normalized = '/' + filePath.replace(/\\/g, '/').replace(/^\/+/, '');
 
     // Detect Nuxt page routes (pages/ directory)
     const pagesIndex = normalized.indexOf('/pages/');
@@ -250,30 +246,77 @@ export const nuxtResolver: FrameworkResolver = {
       }
     }
 
-    // Detect Nuxt API routes (server/api/ directory)
-    const apiIndex = normalized.indexOf('/server/api/');
-    if (apiIndex !== -1) {
-      const afterApi = normalized.substring(apiIndex + '/server/api/'.length);
-      const routeName = afterApi
-        .replace(/\.[^/.]+$/, '') // Remove extension
-        .replace(/(?:^|\/)index$/, '') // index -> parent path
-        .replace(/\[\.\.\.([^\]]+)\]/g, '*$1') // [...slug] -> *slug
-        .replace(/\[([^\]]+)\]/g, ':$1'); // [id] -> :id, as a page's params are
-      const apiRoute = routeName === '' ? '/api' : '/api/' + routeName;
-
-      nodes.push({
+    // Nitro reserves method suffixes and index names in both server directories.
+    const server = /\/server\/(api|routes)\/(.+)\.(?:[cm]?[jt]s)$/.exec(normalized);
+    if (server && !/\.d\.[cm]?ts$/.test(normalized)) {
+      const method = /\.(get|post|put|patch|delete|head|options|connect|trace)$/.exec(server[2]!);
+      const routeName = server[2]!
+        .replace(/\.(get|post|put|patch|delete|head|options|connect|trace)$/, '')
+        .replace(/(^|\/)index$/, '')
+        .replace(/\[\.\.\.([^\]]*)\]/g, '*$1')
+        .replace(/\[([^\]]+)\]/g, ':$1');
+      const apiRoute =
+        (server[1] === 'api' ? '/api' : '') + (routeName ? '/' + routeName : '') || '/';
+      const name = `${method?.[1]?.toUpperCase() ?? 'ANY'} ${apiRoute}`;
+      const node: Node = {
         id: `route:${filePath}:${apiRoute}:1`,
         kind: 'route',
-        name: apiRoute,
-        qualifiedName: `${filePath}::route:${apiRoute}`,
+        name,
+        qualifiedName: `${filePath}::${name}`,
         filePath,
         startLine: 1,
-        endLine: 1,
+        endLine: content.split('\n').length,
         startColumn: 0,
         endColumn: 0,
-        language: normalized.endsWith('.vue') ? 'vue' : 'typescript',
+        language: detectLanguage(filePath),
         updatedAt: now,
-      });
+      };
+      nodes.push(node);
+      const parser = getParser(node.language);
+      const tree = parser?.parse(content);
+      if (tree)
+        try {
+          for (const statement of tree.rootNode.namedChildren) {
+            if (
+              statement.type !== 'export_statement' ||
+              !statement.children.some((child) => child.type === 'default')
+            )
+              continue;
+            let handler =
+              statement.childForFieldName('value') ?? statement.childForFieldName('declaration');
+            if (
+              handler?.type === 'call_expression' &&
+              ['defineEventHandler', 'eventHandler'].includes(
+                handler.childForFieldName('function')?.text ?? '',
+              )
+            ) {
+              handler = handler.childForFieldName('arguments')?.namedChildren[0] ?? null;
+              if (handler?.type === 'object') {
+                const properties = handler.namedChildren;
+                const property = [...properties]
+                  .reverse()
+                  .find(
+                    (child) =>
+                      (
+                        child.childForFieldName('key')?.text ??
+                        child.childForFieldName('name')?.text ??
+                        child.text
+                      ).replace(/^['"]|['"]$/g, '') === 'handler',
+                  );
+                handler = properties.some(
+                  (child) =>
+                    child.type === 'spread_element' ||
+                    child.childForFieldName('key')?.type === 'computed_property_name',
+                )
+                  ? null
+                  : (property?.childForFieldName('value') ?? property ?? null);
+              }
+            }
+            references.push(...httpHandlerReferences(node, handler));
+          }
+        } finally {
+          tree.delete();
+        }
     }
 
     // Detect Nuxt middleware (middleware/ directory)
@@ -314,7 +357,7 @@ function isPascalCase(str: string): boolean {
 function resolveComponent(
   name: string,
   fromFile: string,
-  context: ResolutionContext
+  context: ResolutionContext,
 ): string | null {
   // Collect ALL basename matches first. The previous version returned the
   // FIRST `Button.vue` found anywhere in the tree (its same-directory pass
@@ -351,16 +394,22 @@ function filePathToNuxtRoute(normalized: string, afterPagesStart: number): strin
   const afterPages = normalized.substring(afterPagesStart);
 
   // Remove the .vue extension
-  const withoutExt = afterPages.replace(/\.vue$/, '');
+  const withoutExt = afterPages
+    .replace(/\.vue$/, '')
+    .split('/')
+    .filter((part) => !/^\([^/]+\)$/.test(part))
+    .join('/');
 
   // Remove /index suffix (index.vue -> parent route)
   const withoutIndex = withoutExt.replace(/(?:^|\/)index$/, '');
 
   // Convert Nuxt param syntax [param] to :param
-  let route = '/' + withoutIndex
-    .replace(/\[\.\.\.([^\]]+)\]/g, '*$1')  // [...slug] -> *slug (catch-all)
-    .replace(/\[{2}([^\]]+)\]{2}/g, ':$1?') // [[optional]] -> :optional?
-    .replace(/\[([^\]]+)\]/g, ':$1');        // [param] -> :param
+  let route =
+    '/' +
+    withoutIndex
+      .replace(/\[\.\.\.([^\]]+)\]/g, '*$1') // [...slug] -> *slug (catch-all)
+      .replace(/\[{2}([^\]]+)\]{2}/g, ':$1?') // [[optional]] -> :optional?
+      .replace(/\[([^\]]+)\]/g, ':$1'); // [param] -> :param
 
   if (route === '/') return '/';
   // Remove trailing slash
