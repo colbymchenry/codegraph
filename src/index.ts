@@ -590,6 +590,9 @@ export class CodeGraph {
         // — they delete per-file rows mid-phase through the file_path indexes.
         if (freshDb) this.db.beginBulkParseLoad();
         let result: IndexResult;
+        // Set once parsing succeeds: whether resolution's ref and edge windows
+        // will drop (and later rebuild) indexes the parse window would rebuild.
+        let resolutionRebuilds = false;
         try {
           result = await this.orchestrator.indexAll(
             options.onProgress,
@@ -601,10 +604,15 @@ export class CodeGraph {
             // edge snapshots) and delete, which belongs on one thread.
             freshDb ? { dbPath: this.db.getPath(), fastInit } : null
           );
+          if (freshDb && result.success && result.filesIndexed > 0) {
+            const tCount = Date.now();
+            resolutionRebuilds = this.queries.getUnresolvedReferencesCount() >= minRefsForPool();
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-ref-count: ${Date.now() - tCount}ms (resolution rebuilds: ${resolutionRebuilds})`);
+          }
         } finally {
           if (freshDb) {
             const tIdx = Date.now();
-            await this.db.endBulkParseLoad();
+            await this.db.endBulkParseLoad({ resolutionRebuilds });
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
           }
           const tFts = Date.now();
@@ -712,6 +720,10 @@ export class CodeGraph {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
           scipMergeDue = true;
         }
+
+        // Indexes the parse window left to resolution's windows: rebuilt here if
+        // resolution never ran them (one query when it did).
+        if (resolutionRebuilds) await this.db.ensureSecondaryIndexes();
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread (worker connection): on a multi-GB index this is minutes

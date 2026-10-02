@@ -155,6 +155,53 @@ describe('CodeGraph Foundation', () => {
       expect(execCalls).toBe(0);
     });
 
+    it('leaves the ref and edge indexes to resolution, and ensureSecondaryIndexes restores them', async () => {
+      const dbPath = getDatabasePath(tempDir);
+      const connection = DatabaseConnection.initialize(dbPath);
+      const names = (): string[] => (connection.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      const before = names();
+      connection.beginBulkParseLoad();
+      await connection.endBulkParseLoad({ resolutionRebuilds: true });
+      const skipped = before.filter((n) => !names().includes(n));
+      await connection.ensureSecondaryIndexes();
+      const after = names();
+      connection.close();
+
+      expect(skipped.sort()).toEqual([
+        'idx_edges_kind', 'idx_edges_provenance', 'idx_edges_source_kind', 'idx_edges_synthesis_site', 'idx_edges_target_kind',
+        'idx_unresolved_failed_tail', 'idx_unresolved_file_path', 'idx_unresolved_from_name', 'idx_unresolved_from_node', 'idx_unresolved_name',
+      ]);
+      expect(after).toEqual(before);
+    });
+
+    it('a full index that leaves indexes to the resolution windows ends with every index', async () => {
+      fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function a() { return b(); }\nexport function b() { return 1; }\n');
+      const previous = process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN;
+      process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN = '0';
+      try {
+        const cg = await CodeGraph.init(tempDir);
+        const db = (cg as any).db as DatabaseConnection;
+        const before = (db.getDb()
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+          .all() as Array<{ name: string }>).map((r) => r.name);
+        const end = db.endBulkParseLoad.bind(db);
+        let rebuilds: boolean | undefined;
+        db.endBulkParseLoad = (options) => { rebuilds = options?.resolutionRebuilds; return end(options); };
+        await cg.indexAll();
+        expect(rebuilds).toBe(true);
+        const after = (db.getDb()
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+          .all() as Array<{ name: string }>).map((r) => r.name);
+        cg.close();
+        expect(after).toEqual(before);
+      } finally {
+        if (previous === undefined) delete process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN;
+        else process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN = previous;
+      }
+    });
+
     it('should return correct database size', () => {
       const cg = CodeGraph.initSync(tempDir);
       const stats = cg.getStats();
