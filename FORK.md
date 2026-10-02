@@ -13,12 +13,12 @@ including `FORK-PLAN.md`. On Django, the POC took "who calls X" recall from 47â€
 |---|---|
 | `main`, tags `vX.Y.Z` | mirror of upstream (`git fetch upstream && git push origin 'refs/remotes/upstream/*:refs/heads/*' --tags`) |
 | `scip` | the fork: rebased onto each upstream release tag |
-| tags `vX.Y.Z-scip.N` | fork releases |
+| tags `vX.Y.Z-scip.N` | fork releases â€” none yet: releases are deferred (roadmap 7.4); install from a local bundle (below) |
 
 Upstream's `Release` and `Deploy site` workflows are disabled on this repo. Only `scip CI` runs here.
 
 **Rebase onto a new upstream release:** `git fetch upstream --tags && git rebase vX.Y.Z scip`.
-Then run the SCIP suite, the upstream suite and the eval gate (below) before cutting `-scip.N`.
+Then run the SCIP suite, the upstream suite and the eval gate (below).
 Upstream files the fork touches (keep these hunks small):
 
 - `src/index.ts`: the `runScipPass` hook in `indexAll`, the `onSynced` hook in `sync`, the reindex scheduler in `watch`/`unwatch`, and `scipReadDb`/`scipWrite`
