@@ -1,6 +1,6 @@
 # codegraph-scip roadmap
 
-Status: planned, not started. Decided 2026-10-01. For what is already built, see [`FORK.md`](../FORK.md).
+Status: phases 0–5 done; 6.1 measured and 6.2 tried (2026-10-01); Phase 8 holds what the measurements turned up. For what is already built, see [`FORK.md`](../FORK.md).
 
 **Goal:** an accurate, fresh, compiler-verified call graph that measurably helps agents, on any machine, without hand-holding.
 
@@ -8,7 +8,7 @@ Status: planned, not started. Decided 2026-10-01. For what is already built, see
 - ~11% of call edges are still unverified (vscode 99.8k of 915k);
 - a small edit costs ~40 s on vscode (~20 s patching the index, ~20 s merging);
 - a first index costs ~4 min and ~10 GB of RAM;
-- nobody has measured whether agents actually answer better;
+- on mid-size repos an agent answers "who calls X" as well with grep alone (6.1): the fork's verified callers only help if they reach the agent and it trusts them;
 - maintenance and setup are still manual.
 
 ## Decisions
@@ -104,8 +104,8 @@ Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped cal
 
 | # | Task | How | Check |
 |---|---|---|---|
-| 6.1 | Agent eval | Upstream's `scripts/agent-eval`: regular vs fork on "who calls X / change X safely" tasks; correctness, tokens, tool calls | A decision on 6.2 |
-| 6.2 | Show verification in answers (if 6.1 supports it) | `explore` / `callers` list compiler-verified callers first and mark the rest | Re-measured by 6.1 |
+| 6.1 | **Done** (one run per cell). Agent eval | `scripts/scip-eval/agent-bench/`: grep only vs upstream codegraph vs the fork, each on its own repo copy and graph; four "who calls X" tasks on Playwright and ripgrep (13–67 sites, 41–282 grep hits, one two-level) | Every arm right on every task, ~$0.13–0.23 and under a minute each (FORK.md, "Agent benchmark"). The fork's verified callers never reached the agent: explore answered with other content, and the agent re-derived the sites with grep |
+| 6.2 | **Tried.** Show verification in answers | Not a re-ordering: explore now opens with every call site of a symbol the query names, with its line and caller, marked compiler-verified and complete for what the compiler resolves (`src/scip/callsites.ts`) | Arm D: fewer tokens where used (T3 192k vs 234–247k) but the agent still re-greps, and skipped codegraph on T2. Next: 8.1–8.3 |
 | 6.3 | Eval coverage | Extend `compare.ts` to type edges, interface calls and `instantiates` | New gate rows in FORK.md |
 
 ## Phase 7: maintenance and distribution
@@ -117,6 +117,42 @@ Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped cal
 | 7.3 | Multi-OS | CI matrix (Linux/macOS/Windows) for the SCIP suite; fix tsgo-index's `/`-only paths; build every platform's bundle | Green on all three |
 | 7.4 | Releases and upgrade (**deferred**: no releases yet) | Later: CI builds bundles (with the native kernel) on tag, and `codegraph upgrade` installs from the fork's release | — |
 
+## Phase 8: what the measurements turned up (2026-10-01)
+
+From the agent benchmark (6.1), the reindex speed tests on Playwright and Django, and a fresh-eyes review of the branch. **8.1–8.3 come first:** they decide whether the rest is worth building. Grouped by what each serves.
+
+**Agents (does the verified graph change what an agent does?)**
+
+| # | Task | Why (measured) | How | Check |
+|---|---|---|---|---|
+| 8.1 | Make the call-sites answer one the agent stops at | Arm D got the complete, verified list and still re-checked it with grep (T3: 6 Bash calls after it) | Try what the answer carries rather than how it is worded: the count against a grep-style count ("67 of 87 `.start()` hits; the other 20 are `regex::Match`"), the sites the compiler rejected, per-file grouping. Wording-only steering has failed before (AGENTS.md) | bench arm D, ≥3 runs: tool calls after the answer → 0–1, tokens below arm A |
+| 8.2 | Adoption: agents skip codegraph | The fork's agent never called it on T1/T2 (C and D) | Measure the call rate over ≥3 runs per task; add a bench arm with the user's real setup (the UserPromptSubmit codegraph hook, which the bench disables) | Call rate per arm; whether the hook moves it |
+| 8.3 | A benchmark that can separate the arms | One run per cell, mid-size repos, a frontier model: every arm right | ≥3 runs per cell; vscode-size repo (grep output far larger); Haiku 4.5 as a weaker model; a change task with a compiler oracle (rename, `cargo check` / `tsc` must pass, the diff touches only the truth sites); a multi-question session | A decision: keep investing in verification, or stop at what is built |
+| 8.4 | Two-level impact in one answer | T4 agents asked for level 1 and grepped level 2 | Extend the call-sites section with the callers' callers when the query asks for impact | Only after 8.1/8.3 show the one-level answer pays |
+| 8.5 | Verify-and-track after an edit | The goal is changes that are checked, not only found | One call after an edit: compiler errors in the changed files, affected callers (verified first) and whether they still type-check, the tests that cover them, the graph diff | Bench change tasks: fewer broken builds / missed callers than grep |
+
+**Freshness and speed**
+
+| # | Task | Why (measured) | How | Check |
+|---|---|---|---|---|
+| 8.6 | codegraph's own sync (upstream) | Playwright: a 1-file sync takes 6.5 s, 4.7 s of it whole-graph callback synthesis (`dedupe-merge`); 50 files ~12 s — most of the 29 s from edit to verified call | Report upstream with the timings, or make synthesis incremental in the fork (a core divergence; weigh against rebases) | 1-file sync under 1 s on Playwright |
+| 8.7 | Resident tsgo, measured first | A patch reloads the whole program each time (~1 s Playwright, more on vscode); TypeScript 7.1's API has `createSnapshot` / `updateSnapshot(fileNotifications)` and reference queries | A spike: one tsgo session per project in the daemon; time `updateSnapshot` + re-resolving a 1- and a 50-file edit; peak memory | Sub-second edits → build it (opt-in, replaces Phase 3's deferred item); else drop |
+| 8.8 | Merge off the MCP server's main thread | The merge runs synchronously in the server: it answers nothing for 1 s (Django) to 6–27 s (vscode) | A worker with its own connection, or yield between chunks | An explore during a merge answers within normal time |
+| 8.9 | Patch estimates that calibrate themselves | tsgo's estimate was 5× too high: the watcher rebuilt in full (89 s) where a patch took 3.3 s; recalibrated by hand (1 s + 0.015 s/file) | Record each patch's measured time per unit in the index metadata; estimate from that, the declared cost only as a start | The watcher picks a patch whenever one is cheaper |
+| 8.10 | Bound patch drift | Patches follow importers one level; nothing forces a full run | Full rebuild after N patches or T hours; a 20-edit chain against a full run with `patch-equivalence.sh` | 0 differences after the chain |
+| 8.11 | Re-measure on vscode | Today's speed-ups (no re-encode in the splice, faster encoder, 10 s wait) measured on Playwright only | Needs ~10 GB free | FORK.md's vscode rows updated |
+
+**Design and correctness**
+
+| # | Task | Why | How | Check |
+|---|---|---|---|---|
+| 8.12 | Key calls by the called name's column | codegraph records a call at the expression's start, SCIP at the called name; `callLine` and `callShape` rebuild the link from text, and caused the chain-line bugs | Record the called name's column at extraction (an upstream extractor hunk; offer it upstream) and join on `(file, line, col)` | Invariant tests unchanged; `site.ts` and most of `syntax.ts` deleted. Decision pending: it is a core divergence |
+| 8.13 | Verdict flags as a column | `metadata LIKE '%scipSilent%'` scans the edge table in the merge and `scip status` | An indexed column, created lazily outside upstream's migrations (like `scip_documents`) | Same graph; status and merge faster on vscode |
+| 8.14 | Django's 8 callers the by-caller judge calls wrong | Merged precision 98% on seed 1, the only miss in that table | Read the 8 | Real merge errors fixed, or the judge's rule refined |
+| 8.15 | Python without types | 91% of Django's unverified edges are untyped receivers; the compiler resolves nothing there, and the benchmark could not score a Python task | Out of reach for SCIP; note it where users see verification | — |
+
+Housekeeping: decide on Cursor's stashed 6.1–6.3 attempt (`git stash list`: "cursor: roadmap 6.1-6.3 (discarded)"); FORK.md still describes `-scip.N` release tags although releases are deferred (7.4).
+
 ## Order
 
 1. **Phase 0:** cheap, and 0.1 prevents running out of memory.
@@ -127,4 +163,5 @@ Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped cal
 6. **The rest of Phase 4.**
 7. **Phase 5.**
 8. **Phase 6:** the agent eval, then 6.2 and 6.3.
-9. **Phase 7.** 7.1 whenever TypeScript 7.1 ships; 7.2 at each upstream release; 7.4 when releases are wanted.
+9. **Phase 8:** 8.1–8.3 first (they decide whether verification is worth more work), 8.7's spike and 8.6's upstream report in parallel; the rest by what those show.
+10. **Phase 7.** 7.1 whenever TypeScript 7.1 ships; 7.2 at each upstream release; 7.4 when releases are wanted.

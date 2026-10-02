@@ -57,6 +57,7 @@ import {
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { scipFlowNote, scipTrailNote } from '../scip/notes';
+import { callSitesSection } from '../scip/callsites';
 import { measurePendingChanges } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
@@ -4962,6 +4963,8 @@ export class ToolHandler {
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
+    const callSites = callSitesSection(cg.scipReadDb(), cg.getProjectRoot(), query, exactNodeIds); // fork: src/scip/callsites.ts
+    if (callSites) lines.push(callSites);
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
 

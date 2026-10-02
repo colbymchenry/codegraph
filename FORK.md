@@ -23,7 +23,7 @@ Upstream files the fork touches (keep these hunks small):
 
 - `src/index.ts`: the `runScipPass` hook in `indexAll`, the `onSynced` hook in `sync`, the reindex scheduler in `watch`/`unwatch`, and `scipReadDb`/`scipWrite`
 - `src/bin/codegraph.ts`: `registerScipCommands`, the update-check default, and the `upgrade` refusal
-- `src/mcp/tools.ts`: `scipFlowNote` and `scipTrailNote`
+- `src/mcp/tools.ts`: `scipFlowNote`, `scipTrailNote`, and `callSitesSection` at the top of explore's answer
 - `install.sh`: `CODEGRAPH_ARCHIVE`, to install a locally built bundle
 
 Everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixtures/scip-ts/` and `scripts/scip-eval/`.
@@ -302,6 +302,22 @@ The Django codegraph-only baseline (75–78% recall) is higher than the POC's 47
 The merged result reproduces the POC: 100%/100% here, 99%/100% there. On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
 
 Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph attributes their calls to a variable node whose span is one line, so 18 sites get a parallel file-level SCIP edge. Rust tests defined through macros (`rgtest!(name, |…| {…})`) have no function node, so their calls are attributed to the file. This matches codegraph's convention for top-level code; the heuristic has no edges there at all.
+
+## Agent benchmark (roadmap 6.1)
+
+Does any of this change what an agent does? `scripts/scip-eval/agent-bench/bench.sh` asks a headless Claude Code agent (Sonnet 5.5, effort high) the same question in arms that differ only in what codegraph serves it, each on its own copy of the repo with its own freshly built graph, and `score.js` scores the answer against the compiler's. Arms: **A** no codegraph (CLI blocked too), **B** upstream codegraph 1.6.1, **C** this fork, **D** this fork with the call-sites answer below. Measured 2026-10-01, one run per cell.
+
+| task (truth) | grep noise | A | B | C | D |
+|---|---|---|---|---|---|
+| T1 Playwright, callers of server `Frame.url()` (13 sites) | 41 | 13/13 · $0.18 · 27 s | 13/13 · $0.20 · 29 s | 13/13 · $0.15 · 26 s | – |
+| T2 Playwright, server `JSHandle.evaluate()` (23 sites) | 282 | 23/23 · 225k tok · $0.22 · 46 s | 23/23 + 1 wrong · 222k · $0.21 · 44 s | 23/23 · 242k · $0.22 · 54 s | 22/23 · 244k · $0.23 · 40 s |
+| T3 ripgrep, `grep_matcher::Match::start` (67 sites) | 87 | 67/67 · 234k · $0.20 · 48 s | 67/67 · 265k · $0.23 · 65 s | 67/67 · 247k · $0.22 · 48 s | 67/67 · 192k · $0.18 · 41 s |
+| T4 ripgrep, `LineTerminator::as_bytes` two levels (4 + 14 functions) | 198 | 18/18 · 125k · $0.13 · 34 s | 18/18 · 173k · $0.17 · 33 s | 18/18 · 128k · $0.14 · 23 s | 18/18 · 119k · $0.13 · 21 s |
+
+- **Grep alone was enough.** Sonnet 5.5 filtered hundreds of hits by reading types and imports and got every task right in under a minute. Where upstream's graph was empty (T1: 0 callers) or wrong (T4: 37 of 39), its agent fell back to grep, once by writing its own TypeScript compiler-API script, and paid for the extra output.
+- **The fork's verified callers never reached the agent.** Agents called `codegraph_explore` at most once, then redid the task with grep: explore answered with related source and other symbols' blast radius, not the call sites (T3: 16k chars, none of the 67). In T1 and T2 the fork's agent did not call it at all.
+- **Arm D** (`src/scip/callsites.ts`): explore now opens with every call site of a symbol the query names (`Type.method`, `Type::method`), each with its line and caller, and says the list is compiler-verified and complete for what the compiler resolves. Where the agent used it, it took fewer steps and tokens (T3 192k against 234–247k) but still re-checked with grep, and on T2 it did not call codegraph at all. Trust and adoption, not the index, are what limit the gain.
+- A Django (Python) task was dropped: untyped receivers (`form.save()`) leave no compiler truth to score against, and some are other classes' `save`.
 
 ## Status
 

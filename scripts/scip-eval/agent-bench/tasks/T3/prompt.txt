@@ -1,0 +1,3 @@
+I am about to change the `start()` method of the `Match` type in the `grep-matcher` crate (crates/matcher/src/lib.rs) and need its blast radius first. Find every call site of that method in this workspace — calls that resolve to `grep_matcher::Match::start`, not other `start()` methods (regex crate matches, ranges, other types). Do not modify any files.
+
+End your answer with a section headed `CALL SITES` listing each call site as `path:line` (repo-relative path, 1-based line of the call), one per line, and nothing else in that section.

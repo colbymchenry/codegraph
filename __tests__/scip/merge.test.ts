@@ -10,6 +10,7 @@ import { scipVerdict } from '../../src/scip/notes';
 import { produceIndex } from '../../src/scip/produce';
 import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
 import { ScipReindexScheduler } from '../../src/scip/reindex';
+import { ToolHandler } from '../../src/mcp/tools';
 import { indexPath, scipDir, tryReindexLock } from '../../src/scip/store';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
@@ -102,6 +103,18 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(edge('Service::run', 'Service::step')?.provenance).toBe('scip');
     expect(edge('sum', 'Invoice::totalPrice')).toMatchObject({ provenance: 'scip', line: 6 });
     expect(scipVerdict({ provenance: 'scip' } as Edge)).toBe('verified');
+  });
+
+  it('explore lists every compiler-verified call site of the symbol a query names', async () => {
+    const explore = async (query: string) =>
+      ((await new ToolHandler(cg).execute('codegraph_explore', { query })).content[0] as { text: string }).text;
+    expect(await explore('Invoice totalPrice callers')).not.toContain('**Call sites of'); // no compiler data yet: unchanged
+    importFixture();
+    await pass();
+    const text = await explore('Invoice totalPrice callers');
+    expect(text).toMatch(/\*\*Call sites of `Invoice::totalPrice` \(src\/models\.ts:\d+\) — \d+: \d+ compiler-verified\*\*/);
+    expect(text).toContain('src/main.ts:6 — `return invoices.reduce((acc, inv) => acc + inv.totalPrice(), 0) + helper(2);` (in `sum`)');
+    expect(text).toMatch(/src\/main\.ts:\d+ — `return new Invoice\(4\)` \(in `chained`\)/); // a chain: keyed where its expression starts
   });
 
   it('replaces a wrong heuristic target with the compiler-resolved one', async () => {
