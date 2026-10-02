@@ -71,13 +71,18 @@ export function tsProjects(root: string, files = repoFiles(root)): string[] {
   return [...new Set(dirs)].sort();
 }
 
+/** The deepest of `byDepth` (projects, longest first) containing `file`. */
+function ownerOf(byDepth: readonly string[], file: string): string | undefined {
+  return byDepth.find(p => p === '.' || file.startsWith(`${p}/`));
+}
+
 /** Source files per project, each file counted once — for the deepest project containing it. */
 export function projectWeights(projects: string[], files: string[]): Map<string, number> {
   const weights = new Map(projects.map(p => [p, 0]));
   const byDepth = [...projects].sort((a, b) => b.length - a.length);
   for (const f of files) {
     if (!SOURCE.test(f)) continue;
-    const owner = byDepth.find(p => p === '.' || f.startsWith(`${p}/`));
+    const owner = ownerOf(byDepth, f);
     if (owner) weights.set(owner, weights.get(owner)! + 1);
   }
   return weights;
@@ -225,7 +230,7 @@ export const typescriptIndexer: IndexerSpec = {
     'scip-typescript': {
       units(root, files) {
         const byDepth = tsProjects(root).sort((a, b) => b.length - a.length);
-        return [...new Set(files.map(f => byDepth.find(p => p === '.' || f.startsWith(`${p}/`)) ?? '.'))];
+        return [...new Set(files.map(f => ownerOf(byDepth, f) ?? '.'))];
       },
       // A process start-up plus ~0.03 s a file (vscode: 361 s for 13.8k files), per project.
       seconds(root, projects) {

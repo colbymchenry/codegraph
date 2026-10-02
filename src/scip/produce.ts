@@ -33,10 +33,8 @@ import {
   readHashed, readMeta, snapshotHashes,
 } from './store';
 
-export { MAX_PATCHES, MAX_PATCH_AGE_MS, nextPatchRatio } from './store';
-
 /** Largest drop in resolved calls a new index may show before it is rejected. */
-export const MAX_RESOLUTION_DROP = 0.2;
+const MAX_RESOLUTION_DROP = 0.2;
 
 const INDEXER_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -69,7 +67,7 @@ export interface ProduceOptions {
 const MIN_IMPORT_CONFIDENCE = 0.5;
 
 /** Most files a patch re-indexes, however cheap it looks; beyond this a full run is easier to trust. */
-export const MAX_INCREMENTAL_FILES = 500;
+const MAX_INCREMENTAL_FILES = 500;
 
 export interface IncrementalPlan {
   /** files to re-index: changed since the snapshot, plus the files importing them */
@@ -335,7 +333,7 @@ async function patchIndex(
       warnings, incremental: present.length,
       // A patch of an index never merged (installed, then the round failed) carries its unmerged
       // documents along: only a full merge brings them in — a scope would mark them merged unjudged.
-      scope: isMerged(previous) ? { files: [...replaced], symbols: [...symbols] } : undefined,
+      scope: isMerged(db, lang, previous) ? { files: [...replaced], symbols: [...symbols] } : undefined,
     };
   } finally {
     sweep(raw);

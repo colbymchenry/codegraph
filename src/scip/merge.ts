@@ -212,7 +212,10 @@ export function markStaleForFiles(db: SqliteDatabase, changedFiles: readonly str
     WHERE provenance = 'scip' AND (
       source IN (SELECT id FROM nodes WHERE file_path = ?1) OR
       target IN (SELECT id FROM nodes WHERE file_path = ?1))`);
-  let n = 0;
-  for (const f of changedFiles) n += stmt.run(f).changes;
-  return n;
+  // One transaction: a throw part-way must not leave some re-attached edges reading as verified.
+  return db.transaction(() => {
+    let n = 0;
+    for (const f of changedFiles) n += stmt.run(f).changes;
+    return n;
+  })();
 }

@@ -18,7 +18,7 @@ export const EXTERNAL = '<external>';
  * ones. Synthesized dynamic-dispatch edges (`provenance='heuristic'`) are
  * bridges SCIP can't see, so they are never candidates.
  */
-export const HEURISTIC_PROVENANCE = "(provenance IS NULL OR provenance = 'tree-sitter')";
+const HEURISTIC_PROVENANCE = "(provenance IS NULL OR provenance = 'tree-sitter')";
 
 const CALLABLE_KINDS: readonly string[] = ['function', 'method'];
 const TYPE_KINDS: readonly string[] = ['class', 'struct', 'interface', 'trait'];

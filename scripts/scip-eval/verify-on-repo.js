@@ -7,7 +7,7 @@ const CodeGraph = require('../../dist/index.js').default;
 const { ToolHandler } = require('../../dist/mcp/tools.js');
 const { scipStatus } = require('../../dist/scip/index.js');
 const { scipVerdict } = require('../../dist/scip/notes.js');
-const { SCIP_LANGUAGES, readMeta, needsMerge } = require('../../dist/scip/store.js');
+const { SCIP_LANGUAGES, readMeta, needsMerge, forgetMerges } = require('../../dist/scip/store.js');
 
 function pickLang(root) {
   for (const lang of SCIP_LANGUAGES) {
@@ -77,17 +77,15 @@ async function main() {
   const marked = /\[unverified\]/.test(t2) || /not \(marked\)/.test(t2);
   console.log(`[${label}] EXPLORE_UNVERIFIED_MARK ${marked}`);
 
-  const metaPath = path.join(root, `.codegraph/scip/${lang}.meta.json`);
-  const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-  delete meta.mergedAt;
-  fs.writeFileSync(metaPath, JSON.stringify(meta));
-  console.log(`[${label}] STRIPPED_mergedAt needsMerge=${needsMerge(root)}`);
+  forgetMerges(db);
+  const pending = needsMerge(db, root);
+  console.log(`[${label}] FORGOT_MERGES needsMerge=${pending}`);
 
   cg.close();
 
   const results = {
     label, lang, hasCallSites: has, verdict, deltaOk, marked,
-    needsMerge: needsMerge(root),
+    needsMerge: pending,
   };
   fs.writeFileSync(path.join(root, '..', `${label}-probe.json`), JSON.stringify(results, null, 2));
   if (verdict !== 'unverified' || !deltaOk || !marked || !has) process.exitCode = 1;

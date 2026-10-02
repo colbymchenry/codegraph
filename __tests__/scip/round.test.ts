@@ -34,14 +34,13 @@ describe('reindexRound', () => {
     expect(results.map(r => r.status)).toEqual(['installed', 'failed']);
     expect(report).not.toBeNull();
     expect(edgesBetween(p.cg.scipReadDb(), 'sum', 'Invoice::totalPrice', ['calls'])[0]?.provenance).toBe('scip');
-    expect(needsMerge(p.dir)).toBe(false);
+    expect(needsMerge(p.cg.scipReadDb(), p.dir)).toBe(false);
   });
 
   it('heals an install that never reached merge: --changed current still merges', async () => {
     fakeIndexer(p.dir, 'index.scip');
     expect((await produceIndex(p.cg.scipReadDb(), p.dir, 'typescript')).status).toBe('installed');
-    expect(readMeta(p.dir, 'typescript')?.mergedAt).toBeUndefined();
-    expect(needsMerge(p.dir)).toBe(true);
+    expect(needsMerge(p.cg.scipReadDb(), p.dir)).toBe(true);
     expect(edgesBetween(p.cg.scipReadDb(), 'sum', 'Invoice::totalPrice', ['calls'])[0]?.provenance).not.toBe('scip');
 
     // Same bytes as the snapshot → produce says current; old mergeInstalled would skip.
@@ -49,7 +48,7 @@ describe('reindexRound', () => {
     expect(results).toEqual([{ status: 'current', lang: 'typescript' }]);
     expect(report).not.toBeNull();
     expect(edgesBetween(p.cg.scipReadDb(), 'sum', 'Invoice::totalPrice', ['calls'])[0]?.provenance).toBe('scip');
-    expect(needsMerge(p.dir)).toBe(false);
+    expect(needsMerge(p.cg.scipReadDb(), p.dir)).toBe(false);
 
     // A second current round does not re-merge for nothing.
     const again = await mergeInstalled(p.cg, [{ status: 'current', lang: 'typescript' }]);
@@ -88,7 +87,7 @@ describe('a patch on an install never merged', () => {
     expect(r.status === 'installed' && r.scope).toBeUndefined();
     await mergeInstalled(p.cg, [r]);
     expect(edgesBetween(p.cg.scipReadDb(), 'sum', 'Invoice::totalPrice', ['calls'])[0]?.provenance).toBe('scip');
-    expect(needsMerge(p.dir)).toBe(false);
+    expect(needsMerge(p.cg.scipReadDb(), p.dir)).toBe(false);
   });
 
   it('keeps the untouched documents as they are: the same index and resolved calls as compacting every document again', async () => {

@@ -11,9 +11,8 @@
 
 import type { CodeGraph } from '../index';
 import type { FileLock } from '../utils';
-import { describe } from './cli';
-import { mergeInstalled } from './index';
-import { ProduceResult, StartedIndex, startIndex } from './produce';
+import { StartedIndex, startIndex } from './produce';
+import { describeInstalled, describePass, runRound } from './round';
 import { pendingReferenceSites, referenceSites } from './sites';
 import { SCIP_LANGUAGES, tryReindexLock } from './store';
 
@@ -51,27 +50,17 @@ export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
     },
     async finish() {
       try {
-        const results: ProduceResult[] = [];
         const refs = started.length ? referenceSites(cg.scipReadDb()) : new Map(); // resolved now: what compaction keeps
-        for (const s of started) {
-          try {
-            const r = await s.finish(refs);
-            results.push(r);
-            if (r.status === 'installed') {
-              messages.push({ level: 'success', message: `${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s` });
-              for (const w of r.warnings) messages.push({ level: 'warn', message: `${r.lang}: ${w}` });
-            } else if (r.status !== 'skipped' && r.status !== 'current') {
-              messages.push({ level: 'warn', message: `${r.lang}: ${r.status} — ${r.reason}` });
-            }
-          } catch (err) {
-            const { lang } = s;
-            const reason = err instanceof Error ? err.message : String(err);
-            results.push({ status: 'failed', lang, reason });
-            messages.push({ level: 'warn', message: `${lang}: failed — ${reason}` });
+        const { results, report } = await runRound(cg, started.map(s => ({ lang: s.lang, run: () => s.finish(refs) })));
+        for (const r of results) {
+          if (r.status === 'installed') {
+            messages.push({ level: 'success', message: describeInstalled(r) });
+            for (const w of r.warnings) messages.push({ level: 'warn', message: `${r.lang}: ${w}` });
+          } else if (r.status !== 'skipped' && r.status !== 'current') {
+            messages.push({ level: 'warn', message: `${r.lang}: ${r.status} — ${r.reason}` });
           }
         }
-        const report = await mergeInstalled(cg, results);
-        if (report) messages.push({ level: 'success', message: describe(report) });
+        if (report) messages.push({ level: 'success', message: describePass(report) });
         return messages;
       } finally {
         lock?.release();

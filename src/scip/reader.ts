@@ -438,7 +438,7 @@ export interface ParsedSymbol {
   last: Descriptor;
 }
 
-export function isLocalSymbol(symbol: string): boolean {
+function isLocalSymbol(symbol: string): boolean {
   return symbol.startsWith('local ');
 }
 

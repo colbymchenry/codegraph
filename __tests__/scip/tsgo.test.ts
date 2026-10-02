@@ -9,8 +9,7 @@ import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
-import { MAX_PATCHES, MAX_PATCH_AGE_MS } from '../../src/scip/produce';
-import { ScipMeta, scipDir } from '../../src/scip/store';
+import { MAX_PATCHES, MAX_PATCH_AGE_MS, ScipMeta, scipDir } from '../../src/scip/store';
 import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
 

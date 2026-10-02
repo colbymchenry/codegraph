@@ -183,10 +183,10 @@ describe('SCIP merge (TypeScript fixture)', () => {
   it('a re-index whose merge fails leaves the index awaiting a merge, not stamped merged from before', async () => {
     importFixture();
     await merge(p);
-    expect(needsMerge(dir)).toBe(false);
+    expect(needsMerge(cg.scipReadDb(), dir)).toBe(false);
     fs.writeFileSync(indexPath(dir, 'typescript'), 'not a scip index'); // the merge after the index throws
     await cg.indexAll(); // a failed merge never fails the index
-    expect(needsMerge(dir)).toBe(true); // the next round merges it
+    expect(needsMerge(cg.scipReadDb(), dir)).toBe(true); // the next round merges it
   });
 
   it('scip import vouches only for sources not modified after the index was written', async () => {

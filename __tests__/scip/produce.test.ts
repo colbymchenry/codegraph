@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
-import { nextPatchRatio, produceIndex } from '../../src/scip/produce';
-import { indexPath, metaAfterImport, scipDir } from '../../src/scip/store';
+import { produceIndex } from '../../src/scip/produce';
+import { indexPath, metaAfterImport, nextPatchRatio, scipDir } from '../../src/scip/store';
 import { FIXTURES, FixtureProject, edgesBetween, fakeIndexer, fakeRuns, indexedFixture, merge, writeConfig } from './helpers';
 
 /** Producing an index (src/scip/produce.ts): running the indexer, guarding what it installs, and reporting what it can't do. */

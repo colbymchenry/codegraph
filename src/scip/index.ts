@@ -24,8 +24,8 @@ import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reade
 import { ReferenceSites, heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
-  SILENT_EDGE, STALE_EDGE, indexedHashes, installIndex, markMerged, markUnmerged, metaAfterImport, mergedDocumentCounts, needsMerge,
-  readHashed, readMeta, recordMergedDocuments,
+  SILENT_EDGE, STALE_EDGE, forgetMerges, indexedHashes, installIndex, metaAfterImport, mergedDocumentCounts, needsMerge,
+  readHashed, readMeta, recordMergedDocuments, verifiedEdge,
 } from './store';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -67,10 +67,9 @@ export function mergeInstalled(host: ScipHost, results: readonly ProduceResult[]
   const scopes: Array<MergeScope | undefined> = [];
   for (const r of results) if (r.status === 'installed') scopes.push(r.scope);
   const root = host.getProjectRoot();
-  const pending = needsMerge(root);
-  if (scopes.length === 0 && !pending) return Promise.resolve(null);
-  // Scoped when every install this round was a patch (pending is expected — install
-  // clears mergedAt). Full merge for a full rebuild, or for orphan heal (pending, no installs).
+  // Nothing installed this round: merge only an index still awaiting it (orphan heal).
+  if (scopes.length === 0 && !needsMerge(host.scipReadDb(), root)) return Promise.resolve(null);
+  // Scoped when every install this round was a patch. Full merge for a full rebuild, or for orphan heal.
   const scope = scopes.length > 0 && scopes.every((s): s is MergeScope => s !== undefined)
     ? joinScopes(scopes) : undefined;
   return host.scipWrite(db => mergePass(db, host.scipDbPath(), root, scope));
@@ -93,7 +92,7 @@ export function mergePass(db: SqliteDatabase, dbPath: string, projectRoot: strin
  * finishes is retried by the next round — then the merge.
  */
 export function mergeRebuiltGraph(db: SqliteDatabase, dbPath: string, projectRoot: string): Promise<ScipPassReport | null> {
-  for (const { lang } of availableIndexes(projectRoot)) markUnmerged(projectRoot, lang);
+  forgetMerges(db);
   return mergePass(db, dbPath, projectRoot);
 }
 
@@ -126,7 +125,7 @@ export interface ScipPassReport {
   stats: Record<string, number>;
   outcome: MergeOutcome;
   durationMs: number;
-  /** wall time per phase, ms: decode, hashGate, scipSites, heuristicSites, merge */
+  /** wall time per phase, ms: decode, hashGate, definitions, scipSites, heuristicSites, merge, gc */
   phases: Record<string, number>;
 }
 
@@ -211,7 +210,7 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
   const judged = scope ? affectedFiles(db, indexes, scope, staleDocuments) : null;
   const freshFiles = new Set(fresh.keys());
   const defs = scipDefinitions(db, indexes, freshFiles);
-  lap('scipSites');
+  lap('definitions');
 
   // Sites and their verdicts a chunk of files at a time (one transaction for all):
   // a large repo's sites, file texts and heuristic edges never sit in memory at once.
@@ -241,8 +240,6 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
     for (const { lang, meta } of indexes) recordMergedDocuments(db, lang, meta, merged.get(lang) ?? []);
     return total;
   })();
-  const mergedAt = Date.now();
-  for (const { lang } of indexes) markMerged(projectRoot, lang, mergedAt);
   lap('merge');
   return {
     documents: indexes.reduce((n, i) => n + i.docs.length, 0),
@@ -355,9 +352,7 @@ export function scipStatus(db: SqliteDatabase, projectRoot: string): ScipStatus 
   return {
     indexes,
     edges: {
-      // Same rule as scipVerdict: stale/silent are not "compiler-verified".
-      // COALESCE in SILENT_EDGE/STALE_EDGE: null metadata must count as verified.
-      scip: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND NOT (${SILENT_EDGE}) AND NOT (${STALE_EDGE})`),
+      scip: one(`SELECT COUNT(*) AS n FROM edges WHERE ${verifiedEdge()}`),
       stale: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND ${STALE_EDGE}`),
       silent: one(`SELECT COUNT(*) AS n FROM edges WHERE ${SILENT_EDGE}`),
     },

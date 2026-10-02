@@ -26,10 +26,10 @@ export interface ReindexOptions {
   log?: (msg: string) => void;
 }
 
-export const DEFAULT_IDLE_MS = 60_000;
-export const DEFAULT_PATCH_IDLE_MS = 10_000;
-export const DEFAULT_MIN_INTERVAL_MS = 10 * 60_000;
-export const DEFAULT_INCREMENTAL_INTERVAL_MS = 10_000;
+const DEFAULT_IDLE_MS = 60_000;
+const DEFAULT_PATCH_IDLE_MS = 10_000;
+const DEFAULT_MIN_INTERVAL_MS = 10 * 60_000;
+const DEFAULT_INCREMENTAL_INTERVAL_MS = 10_000;
 
 export class ScipReindexScheduler {
   private timer: NodeJS.Timeout | null = null;

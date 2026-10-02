@@ -7,8 +7,8 @@
  */
 
 import type { Command } from 'commander';
-import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, mergePass, scipStatus } from './index';
-import { reindexRound } from './round';
+import { SCIP_LANGUAGES, ScipLanguage, importScipFile, mergePass, scipStatus } from './index';
+import { describeInstalled, describePass, reindexRound } from './round';
 import { referenceSites } from './sites';
 import { scipDir, tryReindexLock } from './store';
 
@@ -28,16 +28,6 @@ function parseLang(raw: string | undefined): ScipLanguage | undefined {
     throw new Error(`--lang must be one of ${SCIP_LANGUAGES.join(', ')} (got "${raw}")`);
   }
   return raw as ScipLanguage;
-}
-
-export function describe(r: ScipPassReport): string {
-  const o = r.outcome;
-  return [
-    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale${r.judgedDocuments < r.freshDocuments ? `, ${r.judgedDocuments} re-judged` : ''}) in ${r.durationMs}ms (${Object.entries(r.phases).map(([k, v]) => `${k} ${v}`).join(', ')})`,
-    `sites: ${o.agree} agree, ${o.conflict} conflict, ${o.scipOnly} added, ${o.alreadyVerified} already verified, ${o.scipOnlyExternal} external-only, ${o.silent} unverified heuristic edges`,
-    `edges: ${o.edgesUpdated} verified, ${o.edgesDeleted} wrong removed, ${o.edgesInserted} missing added` +
-      (o.scipEdgesDropped || o.scipEdgesStale ? `, ${o.scipEdgesDropped} outdated dropped, ${o.scipEdgesStale} stale` : ''),
-  ].join('\n');
 }
 
 export function registerScipCommands(program: Command, h: CliHelpers): void {
@@ -78,7 +68,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
 
   const mergeAndReport = async (cg: import('../index').CodeGraph) => {
     const report = await cg.scipWrite((db) => mergePass(db, cg.scipDbPath(), cg.getProjectRoot()));
-    if (report) h.success(describe(report));
+    if (report) h.success(describePass(report));
     else h.info('No SCIP index installed — nothing to merge');
   };
 
@@ -100,8 +90,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
         let current = 0;
         for (const r of results) {
           if (r.status === 'installed') {
-            const how = r.incremental !== undefined ? ` (patched: ${r.incremental} file(s) re-indexed)` : '';
-            h.success(`${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
+            h.success(describeInstalled(r));
             for (const w of r.warnings) h.warn(`${r.lang}: ${w}`);
           } else if (r.status === 'current') {
             h.info(`${r.lang}: up to date`);
@@ -113,7 +102,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
             h.warn(`${r.lang}: ${r.status} — ${r.reason}`);
           }
         }
-        if (report) h.success(describe(report));
+        if (report) h.success(describePass(report));
         else if (only && current === 0 && !results.some(r => r.status === 'installed')) process.exitCode = 1;
       })));
 

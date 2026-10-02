@@ -18,9 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import type { Edge } from '../types';
-import { scipVerdict } from './notes';
-import { edgeFlag } from './store';
+import { verifiedEdge } from './store';
 
 /** A path the query names (`src/x.ts`, `lib.rs`), not a `Type.method`. */
 const SOURCE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|rb|php|swift|c|cc|cpp|h|hpp)$/;
@@ -36,19 +34,11 @@ const MAX_SITES = 1000;
  */
 const MAX_DETAILED_CHARS = 8000;
 interface Target { id: string; name: string; qualified_name: string; file_path: string; start_line: number; language: string }
-interface Site { file: string; line: number; caller: string; provenance: string | null; metadata: string | null }
+/** `verified`: 1 when compiler-verified — the same rule Flow/trail read (store.ts verifiedEdge). */
+interface Site { file: string; line: number; caller: string; verified: number }
 
 /** Appends `line`; its length as `join('\n')` counts it. */
 const push = (out: string[], line: string): number => (out.push(line), line.length + 1);
-
-/** Compiler-verified: same rule Flow/trail use — not just `provenance === 'scip'` (stale keeps that). */
-function compilerVerified(provenance: string | null, metadata: string | null): boolean {
-  let meta: Record<string, unknown> | undefined;
-  if (metadata) {
-    try { meta = JSON.parse(metadata) as Record<string, unknown>; } catch { /* ignore */ }
-  }
-  return scipVerdict({ provenance: provenance as Edge['provenance'], metadata: meta }) === 'verified';
-}
 
 /**
  * Callables for the Call sites section: explore's resolved ids first, then any
@@ -82,7 +72,7 @@ function targets(db: SqliteDatabase, query: string, ids: Iterable<string>): Targ
 
 /** `ids`: explore's exact + named callable node ids (one naming policy). */
 export function callSitesSection(db: SqliteDatabase, projectRoot: string, query: string, ids: Iterable<string>): string {
-  const sitesOf = db.prepare(`SELECT s.file_path AS file, e.line, s.qualified_name AS caller, e.provenance, e.metadata
+  const sitesOf = db.prepare(`SELECT s.file_path AS file, e.line, s.qualified_name AS caller, (${verifiedEdge('e')}) AS verified
     FROM edges e JOIN nodes s ON s.id = e.source WHERE e.target = ? AND e.kind = 'calls' AND e.line IS NOT NULL
     ORDER BY s.file_path, e.line`);
   const texts = new Map<string, string[] | null>();
@@ -100,8 +90,7 @@ export function callSitesSection(db: SqliteDatabase, projectRoot: string, query:
   const sections: string[] = [];
   for (const t of targets(db, query, ids)) {
     const sites = sitesOf.all(t.id) as Site[];
-    const ok = sites.map(s => compilerVerified(s.provenance, s.metadata));
-    const verified = ok.filter(Boolean).length;
+    const verified = sites.filter(s => s.verified).length;
     if (verified === 0) continue; // no compiler data for it: nothing this section can vouch for
     const unverified = sites.length - verified;
     const lines = [
@@ -121,13 +110,13 @@ export function callSitesSection(db: SqliteDatabase, projectRoot: string, query:
     for (let i = 0; i < shown.length && chars <= MAX_DETAILED_CHARS; i++) {
       const s = shown[i]!;
       if (s.file !== file) chars += push(detailed, `\`${(file = s.file)}\``);
-      chars += push(detailed, `- ${s.line}${ok[i] ? '' : ' [unverified]'} — \`${lineText(s.file, s.line)}\` (in \`${s.caller}\`)`);
+      chars += push(detailed, `- ${s.line}${s.verified ? '' : ' [unverified]'} — \`${lineText(s.file, s.line)}\` (in \`${s.caller}\`)`);
     }
     if (chars <= MAX_DETAILED_CHARS) {
       lines.push(...detailed);
     } else {
       const byFile = new Map<string, string[]>();
-      shown.forEach((s, i) => byFile.set(s.file, [...(byFile.get(s.file) ?? []), `${s.line}${ok[i] ? '' : '?'}`]));
+      shown.forEach(s => byFile.set(s.file, [...(byFile.get(s.file) ?? []), `${s.line}${s.verified ? '' : '?'}`]));
       lines.push(`Lines per file${unverified ? ' (`?`: unverified)' : ''}; name a file in another codegraph_explore for its source:`);
       for (const [f, ls] of byFile) lines.push(`- \`${f}\`: ${ls.join(', ')}`);
     }
@@ -171,7 +160,7 @@ function otherCalls(db: SqliteDatabase, t: Target, sites: readonly Site[]): stri
   // multi-ms–tens of ms on common names (vscode `toString`: ~60 ms / 3k rows).
   const ordered = db.prepare(
     `SELECT n.qualified_name AS qn, n.file_path AS file, COUNT(*) AS n,
-            SUM(e.provenance = 'scip' AND NOT (${edgeFlag('scipSilent', 'e.metadata')}) AND NOT (${edgeFlag('scipStale', 'e.metadata')})) AS verified
+            SUM(${verifiedEdge('e')}) AS verified
      FROM edges e JOIN nodes n ON n.id = e.target
      WHERE n.name = ? AND NOT (n.qualified_name = ? AND n.file_path = ?) AND e.kind = 'calls'
      GROUP BY n.qualified_name, n.file_path

@@ -13,8 +13,10 @@
  * stale and its call sites are left alone. The gate itself runs in the pass
  * (index.ts); this module owns the hashes it compares.
  *
- * `scip_documents` records which documents are currently merged into the graph.
- * It is created lazily and sits outside the upstream migration chain, so an
+ * `scip_documents` records which documents are currently merged into the graph,
+ * and `scip_merges` which installed index (by `producedAt`) they came from —
+ * written in the merge's own transaction, so the stamp can't disagree with the
+ * edges. Both are created lazily and sits outside the upstream migration chain, so an
  * upstream rebase never collides with it.
  */
 
@@ -46,12 +48,6 @@ export interface ScipMeta {
   patches?: number;
   /** measured ÷ declared time of this tool's patches, averaged: scales the adapter's `seconds` (produce.ts) */
   patchRatio?: number;
-  /**
-   * When the last successful merge of this installed index finished. Missing or
-   * older than `producedAt` means the index is on disk but not yet in the graph
-   * (install then crash / throw before merge) — the next round must merge it.
-   */
-  mergedAt?: number;
   /** every call the index counts carries ROLE_COUNTED_CALL (compact.ts): a patch can keep its other documents as they are */
   callMarks?: boolean;
 }
@@ -76,7 +72,7 @@ export function patchDriftExceeded(meta: ScipMeta, now = Date.now()): boolean {
     || (meta.fullAt !== undefined && now - meta.fullAt > MAX_PATCH_AGE_MS);
 }
 
-/** Meta after a full indexer run (install clears `mergedAt` via {@link installIndex}). */
+/** Meta after a full indexer run. */
 export function metaAfterFull(
   previous: ScipMeta | null,
   fields: {
@@ -190,35 +186,33 @@ export function installIndex(projectRoot: string, lang: ScipLanguage, write: (fi
   } finally {
     fs.rmSync(tmp, { force: true });
   }
-  // A new install is not yet merged — drop any previous mergedAt so a later
-  // "current" produce still triggers mergeInstalled (orphaned-install heal).
-  const { mergedAt: _drop, ...rest } = meta;
-  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(rest));
+  // A new install has a new producedAt, so it reads as unmerged (isMerged) until a merge records it.
+  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
 }
 
-/** Record that `lang`'s installed index has been merged into the graph. */
-export function markMerged(projectRoot: string, lang: ScipLanguage, at = Date.now()): void {
-  const meta = readMeta(projectRoot, lang);
-  if (!meta) return;
-  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify({ ...meta, mergedAt: at }));
+/** Read-only: false when the fork's tables don't exist yet (callers may not hold the write lock). */
+function hasTable(db: SqliteDatabase, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
-/** `lang`'s installed index is no longer in the graph (the graph was rebuilt): the next round merges it. */
-export function markUnmerged(projectRoot: string, lang: ScipLanguage): void {
-  const meta = readMeta(projectRoot, lang);
-  if (!meta || meta.mergedAt === undefined) return;
-  const { mergedAt: _drop, ...rest } = meta;
-  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(rest));
+/**
+ * This exact install (by `producedAt`) has been merged into the graph. False after
+ * an install the round threw or crashed before merging, and after {@link forgetMerges}.
+ */
+export function isMerged(db: SqliteDatabase, lang: ScipLanguage, meta: ScipMeta): boolean {
+  if (!hasTable(db, 'scip_merges')) return false;
+  const row = db.prepare('SELECT produced_at FROM scip_merges WHERE language = ?').get(lang) as { produced_at: number } | undefined;
+  return row?.produced_at === meta.producedAt;
 }
 
-/** This install has been merged into the graph since it was produced. */
-export function isMerged(meta: ScipMeta): boolean {
-  return meta.mergedAt !== undefined && meta.mergedAt >= meta.producedAt;
+/** True when any installed index is not the one last merged (or was never merged). */
+export function needsMerge(db: SqliteDatabase, projectRoot: string): boolean {
+  return availableIndexes(projectRoot).some(({ lang, meta }) => !isMerged(db, lang, meta));
 }
 
-/** True when any installed index is newer than its last merge (or was never merged). */
-export function needsMerge(projectRoot: string): boolean {
-  return availableIndexes(projectRoot).some(({ meta }) => !isMerged(meta));
+/** The graph was rebuilt (every SCIP edge gone): no installed index is merged any more. */
+export function forgetMerges(db: SqliteDatabase): void {
+  if (hasTable(db, 'scip_merges')) db.exec('DELETE FROM scip_merges');
 }
 
 /**
@@ -240,7 +234,7 @@ export function tryReindexLock(projectRoot: string): FileLock | null {
 }
 
 /** Atomic write: a concurrent reader sees the old file or the new one, never half of either. */
-export function writeFileAtomic(file: string, data: string | Buffer): void {
+function writeFileAtomic(file: string, data: string | Buffer): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data);
@@ -304,6 +298,15 @@ export const SILENT_EDGE = edgeFlag('scipSilent');
 export const STALE_EDGE = edgeFlag('scipStale');
 
 /**
+ * Compiler-verified — the SQL form of notes.ts `scipVerdict(...) === 'verified'`:
+ * a SCIP edge neither silent nor stale. `alias`: the edges table's alias where the query joins.
+ */
+export function verifiedEdge(alias?: string): string {
+  const col = (c: string) => (alias ? `${alias}.${c}` : c);
+  return `${col('provenance')} = 'scip' AND NOT (${edgeFlag('scipSilent', col('metadata'))}) AND NOT (${edgeFlag('scipStale', col('metadata'))})`;
+}
+
+/**
  * The fork's own tables and indexes, outside upstream's migrations. The partial
  * index keeps counting unverified edges off a full scan of `edges` (Django: 511 → 2 ms).
  */
@@ -315,6 +318,10 @@ function ensureScipSchema(db: SqliteDatabase): void {
     tool TEXT NOT NULL,
     tool_version TEXT NOT NULL,
     imported_at INTEGER NOT NULL
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS scip_merges (
+    language TEXT PRIMARY KEY,
+    produced_at INTEGER NOT NULL
   )`);
   // Recreate if an older install still has the pre-COALESCE predicate (partial-index
   // WHERE must match the query expression for SQLite to use it).
@@ -333,7 +340,7 @@ export interface MergedDocument {
   contentHash: string;
 }
 
-/** Replace one language's merged-document rows. */
+/** Replace one language's merged-document rows, and stamp `meta`'s install as merged (call inside the merge's transaction). */
 export function recordMergedDocuments(
   db: SqliteDatabase, lang: ScipLanguage, meta: ScipMeta, docs: MergedDocument[]
 ): void {
@@ -344,12 +351,12 @@ export function recordMergedDocuments(
   );
   const now = Date.now();
   for (const d of docs) ins.run(d.path, lang, d.contentHash, meta.tool, meta.toolVersion, now);
+  db.prepare('INSERT OR REPLACE INTO scip_merges(language, produced_at) VALUES (?, ?)').run(lang, meta.producedAt);
 }
 
 /** Read-only: never creates the table (callers may not hold the write lock). */
 export function mergedDocumentCounts(db: SqliteDatabase): Map<string, number> {
-  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scip_documents'").get();
-  if (!exists) return new Map();
+  if (!hasTable(db, 'scip_documents')) return new Map();
   const rows = db.prepare('SELECT language, COUNT(*) AS n FROM scip_documents GROUP BY language').all() as
     { language: string; n: number }[];
   return new Map(rows.map(r => [r.language, r.n]));
