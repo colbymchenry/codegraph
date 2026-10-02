@@ -16,8 +16,8 @@
  * `scip_documents` records which documents are currently merged into the graph,
  * and `scip_merges` which installed index (by `producedAt`) they came from —
  * written in the merge's own transaction, so the stamp can't disagree with the
- * edges. Both are created lazily and sits outside the upstream migration chain, so an
- * upstream rebase never collides with it.
+ * edges. Both are created lazily and sit outside the upstream migration chain, so an
+ * upstream rebase never collides with them.
  */
 
 import * as fs from 'fs';
