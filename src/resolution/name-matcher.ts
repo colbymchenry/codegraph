@@ -4644,6 +4644,8 @@ function cfmlComponentFiles(dotted: string, from: string, context: ResolutionCon
   return files;
 }
 
+const NO_RECEIVER_LINES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, boolean>>();
+
 /**
  * Whether a bare reference is receiver-less at its call site, name case
  * aside: the name is not preceded by a `.` on its line (true when the line
@@ -4651,6 +4653,17 @@ function cfmlComponentFiles(dotted: string, from: string, context: ResolutionCon
  * links of a chain (`newFuture(f).then(g)`) over bare.
  */
 function hasNoReceiverOnLine(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // Asked once per CANDIDATE by the per-language scope filters, though only
+  // the ref decides it — a bare `init()` in a CFML codebase has hundreds of
+  // same-named methods, each re-reading the line (#2091).
+  let memo = NO_RECEIVER_LINES.get(context);
+  if (!memo) NO_RECEIVER_LINES.set(context, (memo = new WeakMap()));
+  let answer = memo.get(ref);
+  if (answer === undefined) memo.set(ref, (answer = readNoReceiverOnLine(ref, context)));
+  return answer;
+}
+
+function readNoReceiverOnLine(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return true;
   const lower = line.toLowerCase();
@@ -6629,6 +6642,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_FILE_SCOPES.delete(context);
   RUBY_ANCESTRY.delete(context);
   CFML_CHAINS.delete(context);
+  NO_RECEIVER_LINES.delete(context);
   OBJC_SUPERS.delete(context);
   CSHARP_SUPERS.delete(context);
   CSHARP_STATIC_USINGS.delete(context);

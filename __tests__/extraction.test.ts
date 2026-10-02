@@ -11099,6 +11099,162 @@ import foo.cfm;
       expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
     });
   });
+
+  describe('Calls in tag expressions outside <cfscript>/<cfquery> (#2091)', () => {
+    const callsFrom = (result: ReturnType<typeof extractFromSource>, fromId: string | undefined) =>
+      result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fromId && (r.referenceKind === 'calls' || r.referenceKind === 'instantiates'))
+        .map((r) => `${r.referenceKind === 'instantiates' ? 'new ' : ''}${r.referenceName}@${r.line}`)
+        .sort();
+
+    it('should extract calls in <cfset>, <cfif>, <cfelseif> and <cfreturn>, attributed to the enclosing method', () => {
+      const code = `<cfcomponent>
+\t<cffunction name="a">
+\t\t<cfset x = b(1)>
+\t\t<cfif c(2)>
+\t\t<cfelseif e(3)>
+\t\t</cfif>
+\t\t<cfreturn d()>
+\t</cffunction>
+\t<cffunction name="b"></cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Svc.cfc', code);
+      const a = result.nodes.find((n) => n.kind === 'method' && n.name === 'a');
+      expect(a).toBeDefined();
+      expect(callsFrom(result, a?.id)).toEqual(['b@3', 'c@4', 'd@7', 'e@5']);
+    });
+
+    it('should extract #hash# expressions in output, strings and tag attributes — once each, alongside <cfquery> bodies', () => {
+      const code = `<cfcomponent>
+<cffunction name="render">
+  <cfset var y = svc.load(1)>
+  <cfset local.msg = "Hi #userName()#">
+  <cfoutput>#fmt(y)# and #variables.mailer.send()#</cfoutput>
+  <cfloop array="#getItems()#" index="i"></cfloop>
+  <cfquery name="q" datasource="#dsn()#">SELECT #col()# FROM t</cfquery>
+  <cfset obj = new Widget()>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('View.cfc', code);
+      const render = result.nodes.find((n) => n.kind === 'method' && n.name === 'render');
+      expect(callsFrom(result, render?.id)).toEqual([
+        'col@7',
+        'dsn@7',
+        'fmt@5',
+        'getItems@6',
+        'new Widget@8',
+        'svc.load@3',
+        'userName@4',
+        'variables.mailer.send@5',
+      ]);
+      // `<cfset var y = …>` is a function local — no variable node for it.
+      expect(result.nodes.find((n) => n.name === 'y')).toBeUndefined();
+    });
+
+    it('should attribute component-scope and template-scope calls to the component and the file', () => {
+      const component = `<cfcomponent>\n<cfset setup()>\n<cffunction name="m"></cffunction>\n</cfcomponent>\n`;
+      const cfc = extractFromSource('Pseudo.cfc', component);
+      const cls = cfc.nodes.find((n) => n.kind === 'class');
+      expect(callsFrom(cfc, cls?.id)).toEqual(['setup@2']);
+
+      const template = `<cfset items = loadItems()>\n<cfoutput>#renderList(items)#</cfoutput>\n`;
+      const cfm = extractFromSource('index.cfm', template);
+      const file = cfm.nodes.find((n) => n.kind === 'file');
+      expect(callsFrom(cfm, file?.id)).toEqual(['loadItems@1', 'renderList@2']);
+    });
+
+    it("should keep each call's own line and column (several per line, and across lines)", () => {
+      const code = `<cfcomponent>
+<cffunction name="m"><cfset a()><cfif   b.c()><cfset d(e())></cfif>
+  <cfset total = sum(
+      count(), other.fetch())><cfoutput>#last()#</cfoutput>
+</cffunction>
+</cfcomponent>
+`;
+      const lines = code.split('\n');
+      const result = extractFromSource('Pos.cfc', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((r) => r.referenceName).sort()).toEqual(['a', 'b.c', 'count', 'd', 'e', 'last', 'other.fetch', 'sum']);
+      for (const r of calls) {
+        expect(lines[r.line - 1]!.slice(r.column).startsWith(r.referenceName)).toBe(true);
+      }
+    });
+
+    it('should read a <cfloop condition="…"> attribute as an expression', () => {
+      const code = `<cfcomponent>\n<cffunction name="drain">\n<cfloop condition="hasNext()">\n</cfloop>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Queue.cfc', code);
+      const drain = result.nodes.find((n) => n.kind === 'method' && n.name === 'drain');
+      expect(callsFrom(result, drain?.id)).toEqual(['hasNext@3']);
+    });
+
+    it('should not read HTML <script> bodies or plain text as CFML calls', () => {
+      const code = `<cfcomponent>\n<cffunction name="page">\n<script>notACall();</script>\n<p>also(not)</p>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Page.cfc', code);
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls')).toEqual([]);
+    });
+  });
+
+  describe('<cffunction> inside a generic container tag (#2091)', () => {
+    it('should extract a method nested in <cfprocessingdirective> (the Application.cfc shape)', () => {
+      const code = `<cfcomponent>
+\t<cfprocessingdirective suppresswhitespace="true">
+\t\t<cffunction name="onRequestStart">
+\t\t\t<cfset loadConfig()>
+\t\t</cffunction>
+\t</cfprocessingdirective>
+</cfcomponent>
+`;
+      const result = extractFromSource('Application.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'onRequestStart');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('Application::onRequestStart');
+      expect(result.edges.some((e) => e.kind === 'contains' && e.source === cls?.id && e.target === method?.id)).toBe(true);
+      const call = result.unresolvedReferences.find((r) => r.referenceName === 'loadConfig');
+      expect(call?.fromNodeId).toBe(method?.id);
+    });
+
+    it('should extract a top-level function nested in <cfsilent> in a template', () => {
+      const code = `<cfsilent>\n<cffunction name="helper"><cfreturn 1></cffunction>\n</cfsilent>\n`;
+      const result = extractFromSource('lib.cfm', code);
+      expect(result.nodes.find((n) => n.name === 'helper')?.kind).toBe('function');
+    });
+  });
+
+  describe('<cfinterface> (#2091)', () => {
+    const code = `<cfinterface extends="IBase, IOther">
+\t<cffunction name="search" access="public" returntype="any">
+\t\t<cfargument name="q" type="string">
+\t</cffunction>
+\t<cffunction name="count"></cffunction>
+</cfinterface>
+`;
+
+    it('should extract an interface node named from the file, with its functions as methods', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      expect(iface?.name).toBe('ISearchable');
+      expect(iface?.startLine).toBe(1);
+      expect(iface?.endLine).toBe(6);
+      expect(result.nodes.filter((n) => n.kind === 'class')).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.qualifiedName).sort()).toEqual(['ISearchable::count', 'ISearchable::search']);
+      for (const m of methods) {
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === iface?.id && e.target === m.id)).toBe(true);
+      }
+      expect(methods.find((m) => m.name === 'search')?.returnType).toBe('any');
+    });
+
+    it('should extract each interface it extends', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      const ext = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+      expect(ext.map((r) => r.referenceName)).toEqual(['IBase', 'IOther']);
+      expect(ext.every((r) => r.fromNodeId === iface?.id)).toBe(true);
+    });
+  });
 });
 
 describe('COBOL Extraction', () => {
