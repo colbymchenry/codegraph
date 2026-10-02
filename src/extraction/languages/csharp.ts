@@ -112,6 +112,10 @@ export const csharpExtractor: LanguageExtractor = {
         if (text === 'protected') return 'protected';
         if (text === 'internal') return 'internal';
       }
+      // An explicit interface implementation (`void IFoo.Bar()`) cannot carry
+      // an access modifier; it is reachable through the interface, so it is
+      // public even though its class body declares it (#2164).
+      if (child?.type === 'explicit_interface_specifier') return 'public';
     }
     // No modifier: an interface's members are public, a type declared in a
     // namespace (or the file) is internal, and a class or struct member is private.
