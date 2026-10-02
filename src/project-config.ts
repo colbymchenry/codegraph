@@ -314,14 +314,21 @@ function extractInclude(parsed: object, file: string): string[] {
 function loadParsedConfig(rootDir: string): ParsedConfig {
   const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
 
-  let mtimeMs: number;
+  // Search ranking calls this once per candidate path, and most projects
+  // have no config file: a throwing stat would build an ENOENT error for
+  // every one of them.
+  let stat: fs.Stats | undefined;
   try {
-    mtimeMs = fs.statSync(file).mtimeMs;
+    stat = fs.statSync(file, { throwIfNoEntry: false });
   } catch {
+    stat = undefined;
+  }
+  if (!stat) {
     // No config file — drop any stale cache entry and return the default.
     cache.delete(rootDir);
     return EMPTY_CONFIG;
   }
+  const mtimeMs = stat.mtimeMs;
 
   const entry = cache.get(rootDir);
   if (entry && entry.mtimeMs === mtimeMs) return entry.config;
