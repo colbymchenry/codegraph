@@ -131,8 +131,10 @@ describe('SCIP merge (TypeScript fixture)', () => {
     await pass();
     const text = await explore('Invoice totalPrice callers');
     expect(text).toMatch(/\*\*Call sites of `Invoice::totalPrice` \(src\/models\.ts:\d+\) — \d+: \d+ compiler-verified\*\*/);
-    expect(text).toContain('src/main.ts:6 — `return invoices.reduce((acc, inv) => acc + inv.totalPrice(), 0) + helper(2);` (in `sum`)');
-    expect(text).toMatch(/src\/main\.ts:\d+ — `return new Invoice\(4\)` \(in `chained`\)/); // a chain: keyed where its expression starts
+    expect(text).toContain('`src/main.ts`\n- 6 — `return invoices.reduce((acc, inv) => acc + inv.totalPrice(), 0) + helper(2);` (in `sum`)');
+    expect(text).toMatch(/\n- \d+ — `return new Invoice\(4\)` \(in `chained`\)/); // a chain: keyed where its expression starts
+    // what a grep for the name would add, accounted for: `o.totalPrice()` on an Order
+    expect(text).toMatch(/Other calls named `totalPrice`, which neither the compiler nor codegraph resolved to this one: \d+ to `Order::totalPrice` \(compiler-verified\)/);
   });
 
   it('replaces a wrong heuristic target with the compiler-resolved one', async () => {
