@@ -55,6 +55,9 @@ docs/business/
 # CodeGraph data directories (in test projects)
 .codegraph/
 
+# `codegraph view` default HTML output
+codegraph_view.html
+
 test_frameworks
 
 # Test language repos for manual testing
