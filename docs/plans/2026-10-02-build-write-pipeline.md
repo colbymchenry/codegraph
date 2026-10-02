@@ -1,6 +1,21 @@
 # Faster graph builds: the write pipeline (D, E, G, idle time)
 
-**Status:** plan, nothing built. Measured 2026-10-02 on a vscode copy (14,858 files, ~2M edges) and Playwright (1,678 files), Node 22.23.3, warm cache.
+**Status:** executed 2026-10-02 — G shipped, D built and **rejected** on measurement, E not reproduced (instrumented). Results below; the original plan follows, wrong estimates struck through.
+
+## Results (vscode full `codegraph index` with SCIP, one run each)
+
+| build | wall | resolution phase | edge-index rebuild | graph |
+|---|---|---|---|---|
+| before G (fix A + ANALYZE order) | 162.0 s | — | — | — |
+| **G** | **153.5 s** | 81.8 s | 6.0 s | synthesized edges identical (27,355) |
+| G + D | 160.9 s | 88.7 s | 16.6 s (dedupe 7.2 s, identity 2.0 s) | all 2,058,339 edges identical (every column) |
+
+- **G:** the Flutter and C++ passes now check the class's language before loading its methods; both dropped below the timing log's threshold (were 3.5 s and 3.3 s).
+- **D: rejected.** The graph was identical, but the build was ~7 s *slower*. In the real build the batch loop finished only ~3.4 s earlier (the isolated benchmark promised ~12 s: inserts interleave with the resolver's other main-thread work, so they were not the loop's critical path), while closing the window cost 10.6 s more — dedupe took 7.2 s on the real table against 2.9 s on the scratch copy. Reverted. Found on the way, worth keeping if D is ever retried: the window's only by-source edge read is the supertype walk (`resolution/index.ts`), and SQLite uses a partial index only when the query repeats its condition verbatim (bound kinds, or the same kinds reordered, scan the table).
+- **E: not reproduced.** With per-index timing (`[index-timing]` under `CODEGRAPH_SYNTH_TIMINGS`, kept) the edge indexes rebuilt in 6.0 s in total, 0.4–2.3 s each — what they cost in isolation. The earlier 15.4–19.6 s builds ran under other load (profiler, concurrent indexing); the log will name the index and WAL size if it recurs.
+- **Lesson:** the isolated insert benchmark measured the right operation and the wrong thing — what matters is whether it sits on the build's critical path. Measure in a real build before building on an isolated number.
+
+**Status (original):** plan, nothing built. Measured 2026-10-02 on a vscode copy (14,858 files, ~2M edges) and Playwright (1,678 files), Node 22.23.3, warm cache.
 **Scope:** upstream code (`src/db/`, `src/resolution/`, `src/index.ts`). The fork may carry these changes; each one will conflict on upstream merges until offered upstream.
 
 ## Where a vscode build spends its time
@@ -40,7 +55,7 @@ Every write goes through one SQLite writer, and the phases run one after another
 - Which edge the old `INSERT OR IGNORE` kept: the first inserted. "Lowest rowid" keeps the same one, so `metadata`/`provenance` of a duplicate match today's.
 - Dedupe cost on repos with many duplicates (count attempted vs kept during a run).
 
-**Expected:** ~7.5 s off vscode's resolution phase (−9% of the build). **Test:** edge-for-edge identical graph (all columns) on Playwright, Django, vscode; crash-heal test (kill inside the window, reopen, unique index present, no duplicates).
+~~**Expected:** ~7.5 s off vscode's resolution phase (−9% of the build).~~ **Measured:** +7 s (slower) — see Results. **Test:** edge-for-edge identical graph (all columns) on Playwright, Django, vscode; crash-heal test (kill inside the window, reopen, unique index present, no duplicates).
 
 ## E — the edge-index rebuild is 3× slower in the build than in isolation
 
@@ -53,7 +68,7 @@ Every write goes through one SQLite writer, and the phases run one after another
 2. Record at that moment: WAL size, whether the WAL valve or a checkpoint is running, other open connections (resolver/synthesis workers reading).
 3. Hypotheses to test in that order: a concurrent checkpoint or reader holding the WAL (the rebuild then reads through a long WAL with readers pinning it); the `setImmediate` yields letting other main-thread work run between statements (wall ≠ statement time — but the CPU profile put 15.4 s inside `exec`, so this is the weaker one).
 
-**Expected:** up to ~10 s if the cause is contention that can be scheduled around (e.g. pause the valve, or rebuild after workers close their connections). Do E before deciding on the writer worker below: it changes how much writer time there is.
+~~**Expected:** up to ~10 s if the cause is contention that can be scheduled around~~ **Measured:** not reproduced — see Results. (Original: up to ~10 s if the cause is contention that can be scheduled around (e.g. pause the valve, or rebuild after workers close their connections). Do E before deciding on the writer worker below: it changes how much writer time there is.
 
 ## G — whole-graph synthesis passes that filter by language too late
 
@@ -63,13 +78,13 @@ Every write goes through one SQLite writer, and the phases run one after another
 
 **Must verify.** For `cppOverrideEdges`, sub- and base-class methods are already filtered to `cpp`; skipping non-cpp classes up front must give the same edges (a cpp class is the only one with cpp methods). For `flutterBuildEdges`, read the whole pass to confirm what else it matches.
 
-**Expected:** ~5–7 s of synthesis CPU on vscode; wall time less (passes run 6 at a time). **Test:** synthesized-edge sets identical on vscode, a Flutter repo, and a C++ repo.
+**Expected:** ~5–7 s of synthesis CPU on vscode; wall time less (passes run 6 at a time). **Measured:** build 162.0 → 153.5 s (one run each; part of that may be run-to-run variation), synthesized edges identical. **Test:** synthesized-edge sets identical on vscode, a Flutter repo, and a C++ repo.
 
 ## Idle time — after D, E, G
 
 Ordered by expected gain per effort; decide with numbers after D and E land.
 
-1. **Make the writer's work smaller** — D, E (above). Every second off the writer comes off the wall clock.
+1. ~~**Make the writer's work smaller** — D, E (above). Every second off the writer comes off the wall clock.~~ D showed the opposite: the main thread's insert time was not the critical path. Before items 2–3, measure what the batch loop actually waits on (resolver results vs. writes) with timestamps per batch.
 2. **Resolution writes off the main thread.** Parsing already has a store-writer worker; resolution writes inline, so the main thread alternates between handing out batches and writing. A writer worker would let it keep the resolvers fed. Main cost: a second protocol (like `store-writer.ts`) for edges, ref deletes and ref marks, with backpressure.
 3. **Read the next batch ahead.** `getUnresolvedReferencesBatchAfter` (6.6 s) can run on a read connection while the writer writes (WAL), hiding most of it.
 4. **Overlap phases where dependencies allow** — e.g. rebuild indexes nothing reads yet in the background. Needs a map of which phase reads which index first.
