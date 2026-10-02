@@ -27,7 +27,7 @@ import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
-import { ResolverPool, minRefsForPool } from './resolver-pool';
+import { ResolverPool, minRefsForPool, epochMs, type BatchTiming } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -58,6 +58,8 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
  * reads another edge kind must be added here.
  */
 const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
+/** CODEGRAPH_RESOLVE_PROFILE: refs slower than this are logged one by one. */
+const SLOW_REF_NS = 20_000_000n;
 
 // SUPERTYPE_TARGET_KINDS (the kinds an extends/implements edge may TARGET)
 // lives in ./types — the name-matcher needs the same set to restrict its
@@ -1707,6 +1709,12 @@ export class ReferenceResolver {
     const t0 = process.hrtime.bigint();
     const result = this.resolveOne(ref);
     const dt = process.hrtime.bigint() - t0;
+    if (dt > SLOW_REF_NS) {
+      console.error(
+        `[slow-ref] ${Number(dt / 1_000_000n)}ms ${result ? result.resolvedBy : 'fail'} ${ref.referenceKind} ${ref.language} ` +
+        `${JSON.stringify(ref.referenceName)} ${ref.filePath}:${ref.line}`
+      );
+    }
     const key = result ? result.resolvedBy : `fail:${ref.referenceKind}`;
     const slot = this.resolveProfile.get(key);
     if (slot) {
@@ -1740,8 +1748,10 @@ export class ReferenceResolver {
     deferredThisMember: UnresolvedRef[];
     byMethod: Record<string, number>;
   } {
+    const tPrelude = this.resolveProfile ? Date.now() : 0;
     this.warmCaches();
     this.advanceSupertypeGeneration();
+    if (this.resolveProfile && Date.now() - tPrelude > 20) console.error(`[slow-ref] prelude ${Date.now() - tPrelude}ms`);
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
@@ -1850,6 +1860,13 @@ export class ReferenceResolver {
       : null;
     const lp = (k: string, t0: number): void => { if (loopProf) loopProf[k] = (loopProf[k] ?? 0) + (Date.now() - t0); };
     let tLp = 0;
+    // Same switch: one line per fanned-out batch, on the workers' clock, so
+    // the loop's wall time splits into "main waits on workers" vs "workers
+    // wait on main" (between batches) vs "workers idle inside a batch".
+    const batchProf = loopProf
+      ? { loopStart: epochMs(), mainWait: 0, workerGap: 0, innerIdle: 0, busy: 0, delivery: 0, batches: 0, prevEnd: 0, n: 0 }
+      : null;
+    let lastTiming: BatchTiming | undefined;
 
     await this.warmCachesYielding(maybeYield);
 
@@ -1956,6 +1973,7 @@ export class ReferenceResolver {
       if (inFlight.mode === 'pool') {
         const settled = await inFlight.settled;
         if (settled.ok) {
+          lastTiming = settled.out.timing;
           this.appendDeferredFromWorkers(settled.out.deferredChain, settled.out.deferredThisMember);
           return {
             resolved: settled.out.resolved,
@@ -2036,7 +2054,10 @@ export class ReferenceResolver {
       lp('read', tLp);
 
       const tBatch = Date.now();
+      const settleStart = epochMs();
+      lastTiming = undefined;
       const result = await settleBatch(inFlight, batch);
+      const settleEnd = epochMs();
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch ${inFlight.mode}: ${batch.length} refs in ${Date.now() - tBatch}ms`);
       lp('settle', tBatch);
 
@@ -2175,6 +2196,27 @@ export class ReferenceResolver {
       lp('marks', tLp);
 
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch persist: ${Date.now() - tPersist}ms`);
+      // Assigned inside settleBatch, which TS's narrowing can't see.
+      const t = lastTiming as BatchTiming | undefined;
+      if (batchProf && t && pool) {
+        const span = t.end - t.start;
+        const gap = batchProf.prevEnd > 0 ? Math.max(0, t.start - batchProf.prevEnd) : 0;
+        const innerIdle = pool.size * span - t.busyMs;
+        batchProf.mainWait += settleEnd - settleStart;
+        batchProf.workerGap += gap;
+        batchProf.innerIdle += innerIdle;
+        batchProf.busy += t.busyMs;
+        batchProf.delivery += Math.max(0, t.received - t.end);
+        batchProf.batches++;
+        batchProf.prevEnd = t.end;
+        const r = (x: number): number => Math.round(x);
+        console.error(
+          `[batch-timing] #${batchProf.n} n=${batch.length} readEdge=${readEdge} workers: gap=${r(gap)} span=${r(span)} busy=${r(t.busyMs)} ` +
+          `util=${(t.busyMs / Math.max(1, pool.size * span)).toFixed(2)} | main: asked=${r(settleStart - t.end)} wait=${r(settleEnd - settleStart)} ` +
+          `delivery=${r(t.received - t.end)} persist=${r(epochMs() - settleEnd)}`
+        );
+      }
+      if (batchProf) batchProf.n++;
 
       // Aggregate stats
       aggregateStats.total += result.stats.total;
@@ -2287,6 +2329,14 @@ export class ReferenceResolver {
       if (pool) await pool.destroy().catch(() => undefined);
     }
 
+    if (batchProf && batchProf.batches > 0) {
+      const s = (x: number): string => `${(x / 1000).toFixed(1)}s`;
+      console.error(
+        `[batch-timing] summary pool-batches=${batchProf.batches}/${batchProf.n} main-wait=${s(batchProf.mainWait)} ` +
+        `worker-busy=${s(batchProf.busy)} worker-gap-between=${s(batchProf.workerGap)} (per worker) ` +
+        `worker-idle-inside=${s(batchProf.innerIdle)} (all workers) delivery-lag=${s(batchProf.delivery)}`
+      );
+    }
     if (loopProf) {
       const parts = Object.entries(loopProf).map(([k, v]) => `${k}=${(v / 1000).toFixed(1)}s`).join(' ');
       console.error(`[resolve-profile] loop-stages ${parts}`);
