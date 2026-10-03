@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- New opt-in Claude Code hook, `codegraph gate-hook`, for when an agent keeps reaching for grep in an indexed project. Registered for `PreToolUse` and `PostToolUse` (see the README), it turns away Grep, Glob and `rg`/`grep`/`find`/`fd` until the session has made one CodeGraph query. After that, text search works again for literals and non-code files. Searches inside `node_modules` are never blocked, and `CODEGRAPH_NO_GATE_HOOK=1` turns it off.
+- New opt-in Claude Code hook, `codegraph gate-hook`, for when an agent keeps reaching for grep in an indexed project. Registered for `PreToolUse` and `PostToolUse` (see the README), it turns away Grep, Glob and `rg`/`grep`/`find`/`fd` until the session has made one CodeGraph query. After that, text search works again for literals and non-code files. Only searches that read inside the indexed project are gated (not `node_modules`, `/tmp` logs, or `cd elsewhere && grep`), and `CODEGRAPH_NO_GATE_HOOK=1` turns it off.
 
 ### Fixes
 

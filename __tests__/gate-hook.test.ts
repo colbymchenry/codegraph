@@ -76,6 +76,25 @@ describe('gate-hook', () => {
     expect(runGateHook(pre('Grep', { pattern: 'foo' }, { cwd: plain }), env)).toBeNull();
   });
 
+  it('allows searches that read outside the indexed project, even when run from it', () => {
+    const plain = path.join(tmp, 'plain');
+    fs.mkdirSync(plain);
+    expect(runGateHook(pre('Bash', { command: `pnpm test > ${plain}/out.log; grep -c FAIL ${plain}/out.log` }), env)).toBeNull();
+    expect(runGateHook(pre('Bash', { command: `cd ${plain} && grep -rn foo .` }), env)).toBeNull();
+    expect(runGateHook(pre('Bash', { command: `cd ${plain}; for f in a b; do grep -n x "$f"; done` }), env)).toBeNull();
+    expect(runGateHook(pre('Grep', { pattern: 'foo', path: plain }), env)).toBeNull();
+    expect(runGateHook(pre('Glob', { pattern: '*.md', path: path.join(plain, 'docs') }), env)).toBeNull();
+  });
+
+  it('denies searches that reach the project: own line, loop body, or explicit path from elsewhere', () => {
+    const plain = path.join(tmp, 'plain');
+    fs.mkdirSync(plain);
+    denied(runGateHook(pre('Bash', { command: 'echo start\ngrep -rn foo .' }), env));
+    denied(runGateHook(pre('Bash', { command: 'for f in a b; do grep -n foo src/$f; done' }), env));
+    denied(runGateHook(pre('Bash', { command: `cd ${plain} && rg foo ${repo}/src` }), env));
+    denied(runGateHook(pre('Grep', { pattern: 'foo' }, { cwd: plain, tool_input: { pattern: 'foo', path: repo } }), env));
+  });
+
   it('unlocks Grep for the session after a PostToolUse on a codegraph MCP tool', () => {
     denied(runGateHook(pre('Grep', { pattern: 'foo' }), env));
     expect(runGateHook(post('mcp__codegraph__codegraph_explore', { query: 'x' }), env)).toBeNull();

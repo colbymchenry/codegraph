@@ -31,11 +31,20 @@ interface GatePayload {
   tool_input?: { command?: string; path?: string; pattern?: string };
 }
 
-/** First word of each `&&` / `||` / `;` segment, basename-lowercased. Pipes stay in their segment. */
+const SHELL_KEYWORD = /^(do|then|else|elif|time|!|\{|\()$/;
+
+/**
+ * Words of each `&&` / `||` / `;` / newline segment, head basename-lowercased.
+ * Leading shell keywords are dropped (`do grep` is a grep). Pipes stay in their segment.
+ */
 function commandSegments(command: string): string[][] {
   return command
-    .split(/&&|\|\||;/)
-    .map((segment) => segment.trim().split(/\s+/).filter(Boolean))
+    .split(/&&|\|\||;|\n/)
+    .map((segment) => {
+      const words = segment.trim().split(/\s+/).filter(Boolean);
+      while (words.length > 0 && SHELL_KEYWORD.test(words[0]!)) words.shift();
+      return words;
+    })
     .filter((words) => words.length > 0)
     .map(([head, ...rest]) => [head!.split(/[\\/]/).pop()!.toLowerCase(), ...rest]);
 }
@@ -49,15 +58,54 @@ const NODE_MODULES = /(^|[\\/])node_modules([\\/]|$)/;
 // Options whose value names what to skip, not where to search (`--exclude-dir node_modules`, `-g '!node_modules'`).
 const EXCLUSION_OPTION = /^(--?(exclude|ignore)[\w-]*|-g|--glob|--iglob)$/;
 
-/** True when the search targets a path inside node_modules (the index does not cover vendored deps). */
-function searchesNodeModules(command: string): boolean {
-  return commandSegments(command).some(([head, ...args]) => {
-    if (!SEARCH_COMMAND.test(head!)) return false;
-    return args.some((arg, i) => {
-      if (arg.startsWith('-') || EXCLUSION_OPTION.test(args[i - 1] ?? '')) return false;
-      return NODE_MODULES.test(arg.replace(/^['"]|['"]$/g, ''));
-    });
-  });
+const unquote = (word: string) => word.replace(/^['"]|['"]$/g, '');
+
+/** Resolves a shell path word against `dir`: expands `~`, and on Windows reads Git Bash's `/c/x` as `C:/x`. */
+function localPath(word: string, dir: string): string {
+  let p = unquote(word);
+  if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
+  if (process.platform === 'win32') p = p.replace(/^\/([a-zA-Z])(\/|$)/, '$1:/');
+  return path.resolve(dir, p);
+}
+
+/**
+ * Paths one search command reads: its non-option operands up to a pipe or
+ * redirection, skipping exclusion-option values. grep-likes and fd take the
+ * pattern first; find takes paths first. No path operand means `dir`.
+ */
+function searchPaths([head, ...args]: string[], dir: string): string[] {
+  const isFind = head!.replace(/\.exe$/, '') === 'find';
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === '|' || /^\d*[<>]/.test(arg) || (isFind && /^[-(!]/.test(arg))) break;
+    if (arg.startsWith('-') || EXCLUSION_OPTION.test(args[i - 1] ?? '')) continue;
+    operands.push(arg);
+  }
+  const paths = (isFind ? operands : operands.slice(1)).filter((p) => !p.includes('$'));
+  return paths.length > 0 ? paths.map((p) => localPath(p, dir)) : [dir];
+}
+
+/**
+ * True when any path a search reads sits inside an indexed project. Paths in
+ * node_modules don't count: the index does not cover vendored deps.
+ */
+function readsIndexedCode(paths: string[]): boolean {
+  return paths.some((p) => !NODE_MODULES.test(p) && isIndexed(p));
+}
+
+/**
+ * True when a Bash command text-searches an indexed project. `cd` is followed
+ * across segments, so `cd /tmp && grep x log` or `grep -c FAIL /tmp/out.log`
+ * run from an indexed repo are not gated: CodeGraph can't answer them.
+ */
+export function bashSearchIsGated(command: string, cwd: string): boolean {
+  let dir = cwd;
+  for (const words of commandSegments(command)) {
+    if (words[0] === 'cd') dir = localPath(words[1] ?? '~', dir);
+    else if (SEARCH_COMMAND.test(words[0]!) && readsIndexedCode(searchPaths(words, dir))) return true;
+  }
+  return false;
 }
 
 /** True when a Bash command runs a `codegraph <query-ish subcommand>`. */
@@ -102,13 +150,13 @@ export function runGateHook(raw: string, env: NodeJS.ProcessEnv = process.env): 
     }
 
     if (isQuery || fs.existsSync(marker)) return null;
-    const isSearch = tool === 'Grep' || tool === 'Glob' || (tool === 'Bash' && isSearchHead(command));
-    if (!isSearch) return null;
-    // Vendored dependency trees are not what the index is for: allow searches whose target is inside node_modules.
-    if ((typeof input.path === 'string' && NODE_MODULES.test(input.path)) || searchesNodeModules(command)) {
-      return null;
-    }
-    if (!isIndexed(input.path || payload.cwd || process.cwd())) return null;
+    // Only searches that read inside an indexed project are gated.
+    const cwd = payload.cwd || process.cwd();
+    const gated =
+      tool === 'Grep' || tool === 'Glob'
+        ? readsIndexedCode([localPath(typeof input.path === 'string' && input.path ? input.path : '.', cwd)])
+        : tool === 'Bash' && bashSearchIsGated(command, cwd);
+    if (!gated) return null;
 
     return JSON.stringify({
       hookSpecificOutput: {
