@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- An Axum or Actix route whose handler rustfmt wrapped onto a line below the route call now links to that handler, and a call inside a closure handler, or the next route after an Actix resource, is no longer taken for a route's handler (#2326). Thanks @mg-mg-mg.
 
 ## [1.6.2] - 2026-10-03
 
