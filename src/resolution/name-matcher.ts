@@ -166,7 +166,7 @@ export function sameLanguageFamily(a: string, b: string): boolean {
 const CODE_FAMILY: Record<string, string> = {
   ...LANGUAGE_FAMILY,
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
-  lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
+  lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', elixir: 'elixir', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
 };
 

@@ -61,6 +61,16 @@ describe('cross-language name resolution (#1986)', () => {
     expect(cg!.getOutgoingEdges(page.id).filter((e) => cg!.getNode(e.target)?.language === 'python')).toEqual([]);
   });
 
+  it('keeps foreign calls off Elixir functions (Phoenix assets/js next to lib/)', async () => {
+    await index({
+      'lib/app/notifier.ex': 'defmodule App.Notifier do\n  def push_event(x), do: x\nend\n',
+      'assets/js/app.js': 'export function jsCaller() { return push_event(1); }',
+      'tools/script.py': 'def pyCaller():\n    return push_event(1)\n',
+    });
+    expect(targets('jsCaller')).toEqual([]);
+    expect(targets('pyCaller')).toEqual([]);
+  });
+
   it('preserves web, JVM, native and .NET interoperability', async () => {
     await index({
       'helper.js': 'export function helper() { return 1; }\nexport class WebBase {}',
