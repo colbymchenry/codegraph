@@ -73,10 +73,12 @@ const NODE_REFS_PER_REQUEST = 60;
  * answers, so the ids go out in batches and the answers are merged (#1976).
  */
 export async function fetchNodeRefs(ids: readonly string[], signal?: AbortSignal): Promise<WireNodeRefs> {
-  if (ids.length <= NODE_REFS_PER_REQUEST) return getGraphAdapter().nodes(ids, signal);
+  // A workspace may switch while a batch is in flight; do not mix projects.
+  const adapter = getGraphAdapter();
+  if (ids.length <= NODE_REFS_PER_REQUEST) return adapter.nodes(ids, signal);
   const merged: WireNodeRefs = { items: [], missing: [] };
   for (let i = 0; i < ids.length; i += NODE_REFS_PER_REQUEST) {
-    const batch = await getGraphAdapter().nodes(ids.slice(i, i + NODE_REFS_PER_REQUEST), signal);
+    const batch = await adapter.nodes(ids.slice(i, i + NODE_REFS_PER_REQUEST), signal);
     merged.items.push(...batch.items);
     merged.missing.push(...batch.missing);
   }
@@ -181,7 +183,7 @@ export function canDrawSteps(): boolean {
 }
 
 export function fetchMap(
-  opts: { root?: string | null; depth?: number } = {},
+  opts: import('./adapter').MapRequest = {},
   signal?: AbortSignal
 ): Promise<WireMapPayload> {
   return getGraphAdapter().map(opts, signal);
@@ -245,4 +247,16 @@ export function deleteTrail(id: string, signal?: AbortSignal): Promise<WireTrail
     return Promise.reject(new ApiFailure(0, 'refused', 'This viewer cannot delete trails.', null));
   }
   return adapter.deleteTrail(id, signal);
+}
+
+/** 旧宿主缺少分页能力时，调用方保留原来的有界列表。 */
+export function fetchBrowse(request: import('./adapter').BrowseRequest, signal?: AbortSignal): Promise<import('./wire').WireBrowsePage> {
+  const method = getGraphAdapter().browse;
+  if (!method) return Promise.reject(new ApiFailure(501, 'unsupported', '宿主未提供目录分页。', null));
+  return method(request, signal);
+}
+export function fetchNeighbors(request: import('./adapter').NeighborRequest, signal?: AbortSignal): Promise<import('./wire').WireNeighborPage> {
+  const method = getGraphAdapter().neighbors;
+  if (!method) return Promise.reject(new ApiFailure(501, 'unsupported', '宿主未提供关系分页。', null));
+  return method(request, signal);
 }

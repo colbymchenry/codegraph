@@ -90,7 +90,7 @@ export * from './lib/wire';
 export { default as SymbolView } from './views/SymbolView.svelte';
 /** How one symbol reaches another, one card per hop, opened at the call line. */
 export { default as FlowStrip } from './views/FlowView.svelte';
-/** The repository at module granularity, layered so dependencies point down. */
+/** The repository at module granularity, with left-to-right dependency analysis. */
 export { default as ArchitectureMap } from './views/MapView.svelte';
 /** One file: the outline in source order between two dependency rails. */
 export { default as FileView } from './views/FileView.svelte';

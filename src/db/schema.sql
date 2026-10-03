@@ -215,3 +215,8 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- 工作台游标分页避免对高连接节点重复排序。
+CREATE INDEX IF NOT EXISTS idx_edges_source_id ON edges(source, id);
+CREATE INDEX IF NOT EXISTS idx_edges_target_id ON edges(target, id);
+CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_path, id);

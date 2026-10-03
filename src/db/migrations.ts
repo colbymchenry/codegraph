@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Migration definition
@@ -18,6 +18,28 @@ interface Migration {
   version: number;
   description: string;
   up: (db: SqliteDatabase) => void;
+}
+
+/** Shared repair for upstream v10 and the fork that already used that version. */
+function migrateSynthesisInputs(db: SqliteDatabase): void {
+  db.exec(`
+    DROP INDEX IF EXISTS idx_nodes_kind;
+    CREATE INDEX idx_nodes_kind ON nodes(kind, file_path, start_line, id);
+    CREATE TABLE IF NOT EXISTS synthesis_inputs (
+      file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+      WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+    UPDATE edges SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy', 'go-method-contains')
+      WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
+        SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
+        WHERE s.id = edges.source AND s.language = 'go' AND t.language = 'go'
+          AND s.kind IN ('struct', 'class', 'interface', 'enum', 'type_alias') AND t.kind = 'method'
+          AND s.file_path != t.file_path
+      );
+    INSERT OR REPLACE INTO project_metadata(key, value, updated_at)
+      VALUES ('synthesis_pending', '1', 0);
+  `);
 }
 
 /**
@@ -180,26 +202,7 @@ const migrations: Migration[] = [
   {
     version: 10,
     description: 'Track synthesis inputs and stabilize synthesis traversal for incremental refresh (#1988)',
-    up: (db) => {
-      db.exec(`
-        DROP INDEX IF EXISTS idx_nodes_kind;
-        CREATE INDEX idx_nodes_kind ON nodes(kind, file_path, start_line, id);
-        CREATE TABLE IF NOT EXISTS synthesis_inputs (
-          file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
-          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
-        UPDATE edges SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy', 'go-method-contains')
-          WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
-            SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
-            WHERE s.id = edges.source AND s.language = 'go' AND t.language = 'go'
-              AND s.kind IN ('struct', 'class', 'interface', 'enum', 'type_alias') AND t.kind = 'method'
-              AND s.file_path != t.file_path
-          );
-        INSERT OR REPLACE INTO project_metadata(key, value, updated_at)
-          VALUES ('synthesis_pending', '1', 0);
-      `);
-    },
+    up: migrateSynthesisInputs,
   },
   {
     version: 11,
@@ -213,6 +216,24 @@ const migrations: Migration[] = [
         CREATE INDEX idx_edges_synthesis_site
           ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
           WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description: 'Reconcile legacy Pinable v10 and retain workbench cursor indexes',
+    up: (db) => {
+      // Pinable used v10 for pagination before upstream assigned v10 to
+      // synthesis. Its recorded version therefore skips upstream's v10.
+      // Inspect the schema rather than changing an already-applied history row.
+      const hasSynthesisInputs = db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'synthesis_inputs'"
+      ).get();
+      if (!hasSynthesisInputs) migrateSynthesisInputs(db);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_edges_source_id ON edges(source, id);
+        CREATE INDEX IF NOT EXISTS idx_edges_target_id ON edges(target, id);
+        CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_path, id);
       `);
     },
   },

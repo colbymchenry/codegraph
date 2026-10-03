@@ -21,30 +21,37 @@ Prototype sources: `CodeGraph/codegraph-web-prototype/` (`proto.css`, `proto.js`
 
 ## 2. Visual language
 
-The engine's paper/ink editorial system (`site/src/styles/theme.css`): flat, hairline rules, **square corners everywhere**
-(`border-radius: 0 !important` globally), no shadows, no gradients, sentence case, **no tiny all-caps tracked labels**,
-one oxblood accent used only for focus/selection/edges, one amber used only for the "untested" warning.
+当前主题采用“交通线路 + 战术站点”的专业开发工具表达：方形节点承载真实代码信息，站点圆环和左侧状态轨表达
+位置，线路颜色表达关系状态。游戏感集中在线路画布，不使用插画、3D、霓虹 HUD、圆角卡片堆叠或装饰性文案。
+线型和粗细继续分别表达置信度与关系权重，因此所有状态在无彩色情况下仍可区分。
+
+后文附录中的早期 prototype CSS 仅保留为历史测量参考；其旧配色和“单强调色”约束不再是主题来源。
 Syntax highlighting is deliberately near-monochrome so the graph's edges are the only colour in the code.
 
 ### 2.1 Color tokens
 
 | token | light | dark | used for |
 |---|---|---|---|
-| `--paper` | `#f7f6f2` | `#16150f` | page/body background (always set explicitly) |
-| `--paper-2` | `#f1efe8` | `#1c1a14` | trail bar, inputs, hovered code line, figure grounds |
-| `--press` | `#e8e6dd` | `#23211a` | hover fills, inline code background, bars |
-| `--press-2` | `#dedbd0` | `#2c2a22` | reserved (pressed state) |
-| `--ink` | `#16150f` | `#f3f1ea` | primary text, node borders, major rules |
-| `--ink-2` | `#56544a` | `#b8b5a8` | secondary text, strings, callers' names when uncertain |
-| `--ink-3` | `#87847a` | `#87847a` | tertiary text, comments, glyph borders, edge labels |
-| `--ink-4` | `#b4b1a5` | `#5d5b52` | line numbers, resting connectors, dimmed map nodes |
-| `--rule` | `#16150f` | `#f3f1ea` | top bar bottom rule, code/blast section rules |
-| `--rule-soft` | `#d6d3c8` | `#34322a` | rail dividers, chips, card borders |
-| `--rule-faint` | `#e6e3d9` | `#26241d` | row separators, map layer lines |
-| `--accent` | `#7a2230` | `#d48b96` | oxblood: call-site links, current trail hop, hot connectors, selected map edges |
-| `--accent-ink` | `#5e1a25` | `#e5a5ae` | accent text on accent-soft |
-| `--accent-soft` | `#f0e3e5` | `#33201f` | tinted rows ("you came from here"), hot code lines |
-| `--accent-line` | `#d9b3b9` | `#6b3a42` | accent borders/underlines at rest |
+| `--paper` | `#f3f6f2` | `#0b151b` | 页面与画布底色 |
+| `--paper-2` | `#eaf0eb` | `#111f26` | 顶栏、路径栏、详情面板和输入框 |
+| `--press` | `#dfe9e3` | `#19303a` | 悬停与按压反馈 |
+| `--press-2` | `#cfddd6` | `#24414b` | 更强的按压反馈 |
+| `--ink` | `#122026` | `#e8f1ee` | 主要文字和关键规则线 |
+| `--ink-2` | `#41555c` | `#b3c3bf` | 次级文字、字符串和线路标签 |
+| `--ink-3` | `#566b72` | `#899e9a` | 三级文字、注释和字形边框 |
+| `--ink-4` | `#7f9296` | `#668087` | 行号、不可达和弱化内容 |
+| `--rule` | `#1d343d` | `#d6e5e1` | 主要分隔线 |
+| `--rule-soft` | `#b9c8c4` | `#29424a` | 面板、控件和节点边框 |
+| `--rule-faint` | `#dce6e2` | `#172a32` | 行分隔与坐标网格 |
+| `--accent` / `--route-main` | `#b66a00` | `#f2b84b` | 当前路径、选中节点和焦点 |
+| `--route-branch` | `#147c98` | `#49afc7` | 普通关联线路 |
+| `--route-return` | `#b8443e` | `#e06a63` | 逆向边与循环线路 |
+| `--route-muted` | `#7f9296` | `#668087` | 不可达、终止和弱化线路 |
+| `--route-grid` | `#dce6e2` | `#183039` | 画布坐标网格 |
+| `--route-band` | `#eaf0ec` | `#102129` | 章节层带和选中站点底色 |
+| `--accent-ink` | `#804900` | `#ffd278` | 强调色文字 |
+| `--accent-soft` | `#f5e8c9` | `#3a2c13` | 当前代码行和强调背景 |
+| `--accent-line` | `#cf9b43` | `#8a6426` | 强调边框与下划线 |
 | `--amber` | `#8a5a0b` | `#d9a94a` | "No test reaches this within 3 caller hops" badge only |
 | `--amber-soft` | `#f3e9d2` | `#2e2716` | that badge's fill |
 
@@ -65,14 +72,10 @@ media/`[data-theme]` block. `body { background: var(--paper); color: var(--ink) 
   name on its own line weight 600; **call-site link** = `--accent`, underline `--accent-line`, offset 3px, hover/hot fill
   `--accent-soft`; uncertain link = `--ink-2`, dotted underline `--ink-4`; link to a symbol outside the index = `--ink-2`,
   underline `--rule-soft`, not clickable.
-  - *As built (CG-43) — comments are `--code-comment`, not `--ink-3`.* `--ink-3` measures 3.46:1 on `--paper` and 3.00:1 on
-    the hot-line tint `--accent-soft`, both under the 4.5:1 that 12.5px body text needs. `--code-comment` is the smallest
-    step along the same warm-grey ramp that clears 4.5:1 on every background a code line can have (`#6a675d` light —
-    paper 5.23, paper-2 4.92, accent-soft 4.53; `#8e8b81` dark — 5.36 / 5.10 / 4.51) while staying quieter than the
-    `--ink-2` strings and numbers use, so the recession order above is unchanged. Everything else in this list passes as
-    specified: ink 16.9/16.2, ink-2 7.03/8.89, accent 9.25/6.91 (8.02/5.80 on `--accent-soft`).
-  - *Line numbers remain `--ink-4` (1.99:1 light, 2.69:1 dark) — a known contrast gap, left as specified rather than
-    changed inside a rendering task. Worth a design call before phase 2.*
+  - `--code-comment` 与 `--ink-3` 使用同一可读色阶。亮色下在 `--paper`、`--paper-2`、`--accent-soft`
+    上的对比度分别为 5.15、4.85、4.62；暗色下分别为 6.53、5.95、4.79，均满足小字号正文的 4.5:1。
+  - 主要正文 `--ink`、次级正文 `--ink-2` 和强调文字 `--accent-ink` 在各自页面与强调背景上均高于 4.5:1。
+    `--ink-4` 只用于行号、弱化节点与非正文图形。
 
 ### 2.3 Kind glyphs
 
@@ -84,8 +87,8 @@ Container/type kinds get a `--press` fill.
 ## 3. Layout and components
 
 ### 3.1 App shell
-- Grid rows: **top bar 48px** / **trail bar 34px** / main. Top bar: brand (10px hollow square mark + "CodeGraph" 600 14px +
-  "ui" in `--ink-3`), view tabs (`Map · Symbol · Flow`, 5px 10px padding, active = 2px `--ink` bottom border), search input
+- Grid rows: **top bar 48px** / **trail bar 34px** / main. Top bar: brand (12px route station mark + "CodeGraph" 600 14px +
+  "ui" in `--ink-3`), view tabs (`Map · Symbol · Flow`, 5px 10px padding, active = 2px `--route-main` bottom border), search input
   (30px tall, `--paper-2` fill, `--rule-soft` border → `--ink` on focus, max-width 720px), project stats in `--ink-2` 12px.
   Bottom rule of the top bar is `--rule` (1px); the trail bar's is `--rule-soft`.
 - Focus ring everywhere: `outline: 2px solid var(--accent); outline-offset: 1px`. `prefers-reduced-motion` disables transitions.
@@ -180,15 +183,15 @@ drawn (hovered symbol, else the symbol the scroll position is inside) and the he
 total. Clicking an arc scrolls to the callee's definition and marks it. Data: `GET /api/filecode/<path>`.
 
 ### 3.5 Flow strip (`#/flow/<key>`)
-Header: "Flow" + a `<select>` of flows (`--paper-2`, `--rule-soft` border, 12.5px sans) + a 78ch note.
-Cards **380px** wide, `--rule-soft` border (`--ink` on hover, `--accent` when current), header grid `16px | 1fr` padding `10px 12px 6px`
+Header: "Flow" + a `<select>` of flows (`--paper-2`, `--route-branch` border, 12.5px sans) + a 78ch note.
+Cards **380px** wide, `--rule-soft` border with a `--route-branch` status rail (`--route-main` double outline when current), header grid `16px | 1fr` padding `10px 12px 6px`
 (name 600 13px mono, `file:line` 11px `--ink-3`), separator `--rule-faint`, source window `12px/19px` mono with line numbers
 (grid `40px | 1fr | 6px`), the call line tinted `--accent-soft` and the calling identifier as an accent link; ±3 lines around the call.
-Links between cards: **86px** wide; a 1px `--ink-3` line with a filled arrowhead (polygon `76,3 84,7 76,11` in a 86×14 box);
+Links between cards: **86px** wide; a 1.5px `--route-main` line with a filled arrowhead; alternate paths use `--route-branch`
+at reduced opacity, and a terminal link uses `--route-muted` (polygon `76,3 84,7 76,11` in a 86×14 box);
 label 11px mono `--ink-3` centred (`calls`, `line 2029`; `via callback · registered at file:line`); uncertain dasharray `2 3`;
 heuristic dasharray `5 3`. End cap: **240px**, dashed `--rule-soft` border, 12px text — "Where the graph stops" + the boundary
-(form, key, line) + uncertain continuations. In the real build the strip is a Svelte Flow canvas laid out left→right with the
-same card/link visuals.
+(form, key, line) + uncertain continuations. In the real build the strip uses G6 Canvas with Svelte HTML code cards. Semantic positions and terminal boundaries are preserved.
 
 **End cap, as built (phase 2, CG-51).** Shown only when a flow does not reach everything the question named —
 a connected answer has no boundary to announce. 240px, 1px dashed `--rule-soft`, padding 12px, 12px/1.45 `--ink-2`,
@@ -203,28 +206,26 @@ hangs off opens at the dispatch line and tints it `--accent-soft`. One cap per s
 The verdict comes from `src/graph/dynamic-boundary-report.ts` — the detector `codegraph_explore` announces boundaries
 with — so the strip and the MCP answer cannot disagree.
 
-### 3.6 Map (`#/map`)
-Grid: canvas `minmax(600px,1fr)` | side panel **320px** (`--rule-soft` left border, 14px 16px padding).
-Nodes: rect `width = max(110, label.length × 7.3 + 28)`, **height 40**, `--paper` fill, 1px `--ink` stroke (2px + `--press` fill
-when hovered/selected; `--ink-4` when dimmed; test modules dashed `4 3` in `--ink-3`), label 13px mono at (10,17), count
-"N symbols · M files · R depend on it" 11px `--ink-3` at (10,32). **Weight bar:** 4px band inside the bottom edge, `--ink` at
-0.3 (0.55 hovered/selected, 0.1 dimmed or generated), `width = node.width × (R / max R drawn)` — how much of the picture
-leans on this box. `R` is `dependents.files`: files OUTSIDE the module holding a direct confident reference into one of its
-files. **Direct, not transitive** — the transitive closure was measured and saturates on any repository with a dependency
-cycle (139–282 of 377 files on a real mobile app, a flat spread that only reports cyclicity), while the direct count on the
-same repository spreads 0–127 and names the modules a reader would name by hand. Relative to the heaviest box *drawn*, so
-turning tests on rescales rather than overflowing a maximum nobody can see; a module with R=0 draws no bar at all. Layers: vertical gap **74px**, horizontal gap **34px**, padding 44px; entry points at the
-top ("entry points" label), foundations at the bottom ("foundations — depend on nothing below"); faint layer lines `--rule-faint`.
-Layout: aggregate edges by module; break 2-cycles keeping the heavier direction; longest-path layering (a module sits one layer
-above everything it depends on); barycenter ordering, 3 sweeps; single-node layers centred; ports spread along each box
-(`x = left + width × (i+1)/(n+1)` over the node's sorted out/in edges) so bundles fan. Edges: cubic `M x0,y0 C x0,my x1,my x1,y1`
-(`my` = midpoint), `stroke-width = min(6, 1 + log2(count) × 0.7)`, `--ink` at opacity 0.28 (hot 0.95, dimmed 0.06); a 12px transparent
-hit path per edge; edges with count < 4 (< 6 when tests included) hidden until a touching module is selected; cycle back-edges only when
-selected, `--accent` opacity 0.6, dasharray `4 3`. Tooltip: `--paper`, 1px `--ink` border, 8px 10px, 12px: "src/a → src/b", "N edges",
-by kind, top 4 symbol pairs. Side panel: title, 2-sentence explanation, hidden-edge note, "Include tests, scripts, kernel & site" checkbox,
-"Mutual dependencies" fold, selected module's dependencies/dependents with counts and its files. Fit: SVG width 100%,
-`viewBox` to content, `height: max(100%, 0.9 × content)` so labels never scale below ~0.9. In the real build this is a Svelte Flow
-canvas (custom node + custom edge components; hidden handles as ports; pan/zoom/fitView) with the same geometry.
+### 3.6 Map and shared graph analysis (G6, 2026-09-08)
+Map, Screens, Flow and Steps share `GraphCanvas` and the internal `GraphScene` / `GraphController` boundary.
+Map uses left-to-right AntV Dagre in a cancellable Worker. Directed strongly connected components are condensed before layout;
+cycles have a stable internal arrangement. Directory groups reserve separate space. Map defaults to directory Combos; cycle Combos
+are an alternative grouping mode. There are no editing handles or heavy grid lines.
+
+Native nodes have rounded outlines and readable module labels. Edges stay between 1 and 2px, with 2.5px highlights.
+Map merges mutual dependencies into one display edge with two arrows and separate directional counts. Every display edge keeps
+its original IDs; BFS and cycle analysis always use the loaded, filtered directed relationships. A visually upward edge is never
+classified as a cycle. File-level cycles remain a separate server-provided detail.
+
+The toolbar provides find, 100%, fit, focus selection, minimap, restore layout, one-hop direction/focus, group folding, cycle location
+and a deterministic shortest directed path. A path query unfolds hidden members; no result means no path in the current scope.
+Selection and hover only update styles, without moving nodes or recomputing routes. Map can explicitly compact incoming/current/outgoing
+nodes left-to-right and keep mutual neighbours in a separate block. Normal selection preserves positions.
+
+Small Map/Screens scenes use G6 shortest-path obstacle avoidance. More than 100 routed edges use one shared occupancy grid in the
+Worker, passing computed control points to G6; this avoids rebuilding every node's obstacle map 2,000 times on the main thread.
+The generic orth router is not treated as obstacle avoidance. Flow/Steps submit their existing semantic positions and specialized paths.
+The complete implementation and verification notes are in [G6 graph workbench](g6-graph-workbench.md).
 
 ### 3.7 Search palette
 Results panel under the input: 1px `--ink` border, max-height 420px; group headers 12px `--ink-3` (`Flow`, `Symbols & files`);
@@ -434,11 +435,11 @@ bottom → top; up: **top → bottom**; level: **top → top**, an arch whose co
 of one box, one direction), ranked by reach, farthest first, measured towards the hub's row; a line spanning several rows keeps
 its track in the gap beside its fan; level arches rise `gap × (0.66 − 0.26 × k/(n−1))`. Hover: the curve nearest the pointer,
 sampled at 24 points, within **10** screen px; no hit paths. Zoom **0.2–3**.
-Nodes as §3.6, sized for the screen's path (13px mono) over its component (11px sans); entry mark `●` in `--accent`;
-origins dashed `--ink-3`; unreached `--ink-4` stroke. Edges: the §3.6 cubic, `stroke-width = min(3, §3.6 width)`,
-`--ink` 0.32 (hot 0.95; soft 0.38 while another of the selected screen's lines is in focus; focus 1.0; dimmed 0.06);
-synthesized dasharray `5 3`; back `--accent` 0.6 dashed `4 3` (hot 0.85). Pills, on the selected screen's edges and the
-hovered one only: 10.5px mono on `--paper`, 1px `--rule` border (hot `--ink-3`; focus `--ink` + 0 2px 8px shadow), **17px**
+Nodes as §3.6, sized for the screen's path (13px mono) over its component (11px sans); entry station in `--route-main`;
+origins dashed `--ink-3`; unreached dashed `--route-muted`. Edges: the §3.6 cubic, `stroke-width = min(3, §3.6 width)`,
+`--route-branch` 0.52 (`--route-main` 0.95 when hot; soft 0.38; focus 1.0; dimmed 0.06);
+synthesized dasharray `5 3`; back `--route-return` 0.82 dashed `4 3` (hot 0.85). Pills, on the selected screen's edges and the
+hovered one only: 10.5px mono on `--paper-2`, 1px `--route-branch` border (focus `--route-main` + left status rail), **17px**
 tall, width `chars × 6.3 + 12`; text = the innermost top-level `&&` clause of the condition, ≤ **36** chars, `…` prefix
 when outer guards precede it, `→` / `←` prefix for leaving / arriving at the selected screen, or "N ways · M conditional"
 for a pair with several. Placement: at the FAR end of the line; first lane centred **13px** outside the far box, lanes
@@ -550,42 +551,16 @@ the server names it on the step (`WireStep.region` — the fold's first node; th
 in the screen body; the first-reaching parent's region for everything deeper — first reach wins, as `first` does, so a
 shared store is one box in the region that got there first and every other region's way in is a link). Endpoints and
 functions carry none: their rows already read in the code's order, and `view=order` is untouched. The viewer
-(`steps-model.ts`'s `packRegions`) then lays each region out as its own small column, and tiles the columns into bands
-under a width budget aimed at a readable aspect, in the order the walk met them: the screen's own source order, top of
-the screen to the left. Regions are **not** squared off into rows — that made every row as tall as its tallest member,
-leaving the median screen's canvas 55% region and 45% nothing (`/home` 44%: 4,860px to hold ~2,160px of picture, all of
-it scrolled through). Each region instead goes as HIGH as it can and then as far LEFT as it can (a skyline over the
-regions already placed, `floorAt`), which keeps the reading order — regions are placed in source order, so an earlier
-one is never pushed below a later one — while a short region tucks under another short one. `/home`: 4,860px -> 3,584px,
-aspect 0.59 -> 0.94. **Within a region the rows come from the region's own links**, never from distance to the
-anchor, which is flat inside a region: a handler and the store it calls are both one hop from the screen, and side by
-side their line was a level arch, hidden at rest — the store looked wired to nothing. Cycle-closing links are set
-aside before the rows are settled (`forwardLinks`, the twin of the order reading's `withoutBackEdges`): relaxation
-never converges on a cyclic graph, and one screen's 65 boxes had been pushed to rows 294-301 while the rest sat at
-0-2. **A region is packed as CLUSTERS, not as rows**: a step, then the steps it sets in motion on the line under it,
-stepped in by `CLUSTER_INDENT`; a step that fires nothing needs no cluster, so the region's own starting points that
-lead nowhere still share one line (a screen's handlers are siblings, not a hierarchy — giving each its own line turned
-a flat region into a column). Rows-then-wrap was the alternative and it failed for a measurable reason: it put every
-step of one distance on the same rows and wrapped them at a fixed 720px, so a box and the thing it fires ended up
-seven lines apart — 70 of 113 lines on `/capture` joined boxes ONE step apart and rendered seven lines apart, which is
-what the 652 crossings were made of. The width a picture's lines run to is **tried, not estimated** (`REGION_WIDTHS`,
-scored by `canvasCost` against `CANVAS_ASPECT` 1.4): a cluster spends lines on its own structure, so `total / width`
-undercounts a region's lines badly and a formula tuned on that estimate wrapped 98 boxes into a 4,356px column. Laying
-a region out is cheap (~2ms for the whole model, eight widths included) and exact, so `layoutAt` runs the whole pack at
-each width and the best finished CANVAS wins. It has to be the canvas, not each region: squaring each region off
-individually leaves fewer of them side by side, so `/home` went 3,584px -> 5,624px while every region looked better.
-Within a region the clusters STACK — dropping them side by side as the regions drop onto the canvas was measured
-(total height 42,084 -> 39,756px, -6%) and rejected, because two clusters side by side run each other's lines through
-the other: lines-over-boxes 120 -> 134, crossings 5 -> 8. Regions differ, being far enough apart that few lines run
-between them. `/capture` went from a 1,227x5,588 ribbon to 3,417x3,348.
+(`steps-model.ts`'s `packRegions`) then lays each region out as its own small column — a box above what it sets in
+motion, a line wrapping past ~720px — and tiles the columns into bands under a width budget aimed at a readable aspect,
+in the order the walk met them: the screen's own source order, top of the screen to the left. **Within a region the
+rows come from the region's own links** (longest lead-to path, settled by relaxation as the order reading's rows are),
+never from distance to the anchor, which is flat inside a region: a handler and the store it calls are both one hop
+from the screen, and side by side their line was a level arch, hidden at rest — the store looked wired to nothing.
 Each region wears a caption (`RegionCaption.svelte` — its component's name over a hairline spanning its width)
 and the key explains it. **At rest the picture hides exactly two things** (`stepEdgeVisible`): the anchor's own fan —
 the anchor leads to everything *by definition*, `/home`'s 104 ways of saying so were the moiré, so one line into each
-region stands in for it, landing on the box nearest that region's top-left the anchor actually leads to (the walk's
-first member used to stand for the region, but clustering moves a step that fires something BELOW the ones that fire
-nothing, so that box could sit lines down inside the region and the line had to reach past everything above it); those
-stand-in lines are themselves subject to the stub rule, since on a ten-region screen the ones reaching into a lower
-band were 17% of all lines drawn and **79% of every crossing left** — and, as everywhere on the canvas, what points back up the layering. Every other
+region's first box stands in for it — and, as everywhere on the canvas, what points back up the layering. Every other
 lead-to draws, a line between two regions included: the empty state's prompt firing the same handler as the header's IS
 the picture, and an earlier cut that reserved cross-region lines for selection made a box that leads three places read
 as wired to nothing. The two hidings compose well: a shared step fed from below — the toast action every handler calls
@@ -596,23 +571,6 @@ an effect) — and the key says so; selecting it lights its line from the anchor
 tracked curves (over a tighter in-region gap), same pills, pointer and panel. Result across the app's 52 screens: widest
 picture ~3,400px (was 28,452), at-rest lines on `/home` 80 of 190 — the region-local structure plus 11 lines between
 regions — with zero boxes that lead somewhere while drawing nothing.
-
-**Stubs — a link too far to follow is said in words, not drawn.** Clustering makes most links local, but not all: a
-step reached from two places is drawn under whichever reached it first, so the *other* way in has to cross the picture.
-A line is a good drawing of a hop between two boxes a reader takes in at once and a bad one of a hop across two
-thousand pixels — on `/capture` the 113 lines drawn at rest crossed each other **652 times** and each ran over ~5 other
-boxes' names, so no line could be followed and the boxes could not be read either. So `packStubs` (over the finished
-layout, since this is a question about geometry) keeps a link as a line only when it runs down the layering and its two
-boxes are within `STUB_SPAN_LINES` (3) lines and `REGION_LINE_MIN` (720px) across; everything else — back edges
-included, which drew nothing at all before, **and the screen's own line into a region**, which has no exception —
-becomes a `StepStub` at **both** ends: `→ resumeInference` under the box
-that leads there, `← CaptureView` under the box it arrives at, rendered by `StepStubs.svelte` in the gap under the box,
-capped at three with `+N more`. This is not a hiding: the link is *stated*, which says more than a line vanishing off
-the edge of the screen does, and it is the one at-rest cut that does not produce the "box that leads somewhere and
-draws nothing" every earlier cut produced (§ the arc above). Selecting the box draws every one of its real lines, as
-before, and the stub block steps aside while it is selected. The anchor's fan is never stubbed — it is already one line
-per region. Result on `/capture`: 48 lines drawn at rest crossing each other **once** (was 652), lines-over-boxes 553 →
-26, with every quiet box still one the screen itself fires directly.
 
 **Decisions — a choice made inside a box, said under it.** A fork the tree can see is written *inside* a box and its
 arms *leave* that box: `resolvePostLoginRoute` ends `return (await hasSeenWelcome(id)) ? '/home/' : '/welcome/'`, so two
@@ -699,7 +657,7 @@ another site's arguments counting before that site, so `generateToken(…)` in `
 of the `200` it is part of; the layout (`map-model.ts` `order`) takes that as the row's initial order and its sweeps move a box
 only to sit under its parents. A link whose first hop is written inside another call's arguments says so (`WireStepLink.within`,
 `inside res.json(…)` in the panel and the tooltip) — the nesting is stated, never drawn as an edge out of an effect. Boxes:
-the §3.12 screen box for a screen or a handler; **bridge / event** add a 3px `--accent` left rule (the language
+the §3.12 screen box for a screen or a handler; **bridge / event** add a 3px `--route-main` left rule (the language
 changes under the code) and lead with `⇢` / `⇠ <event name>`; **store** sits on `--paper-2`; **effect** is dashed
 `--ink-3` (a place the graph cannot follow into), labelled by the API (`client.post`) over `category · caller`. Edges,
 pills, tooltip and the panel's hover contract are §3.12's verbatim; the panel adds *Start here →* (re-anchor) on any
@@ -800,9 +758,7 @@ screen. Tests: `ui-steps-program.test.ts` (the fold, over hand-made records), `u
 its rows), and one `in order` reading per framework in `ui-steps-api-servers.test.ts`.
 
 ## 4. Libraries and versions
-- Svelte 5 (≥ 5.25) + Vite (workspace `ui/`), Svelte Flow `@xyflow/svelte` ^1.6 for the Map and Flow canvases only (custom nodes/edges,
-  hidden handles for port spreading, local selection state — the pattern in docker-app's `StackGraph.svelte`); `@dagrejs/dagre` only as a
-  fallback if crossing quality demands it (never ELK). Symbol view = DOM + one SVG overlay (`ResizeObserver` re-layout).
+- Svelte 5 (≥ 5.25) + Vite; exact `@antv/g6` 5.1.1 and `@antv/layout` 2.0.0 for all four graph canvases. Symbol view remains DOM + one SVG overlay (`ResizeObserver` re-layout).
 - Syntax classification comes off **the engine's own tree-sitter parse** — no highlighter dependency, no second grammar set.
   - *As built (CG-43, replaced in CG-57).* The first cut ran Shiki with 56 pruned TextMate grammars in `dist/textmate/`. That is
     gone: `@shikijs/*` is off the dependency list, `scripts/prune-grammars.mjs` and `npm run build:textmate` are deleted, and
@@ -845,8 +801,7 @@ the same question about the same graph.
 - **Navigation is a driver, not a callback** (`ui/src/lib/navigation.ts`): the components build hrefs, because middle-click and
   "copy link address" are how people read code. The default is the viewer's hash space; a host installs its own URL space. The
   app's half — the hash parser and the live route — attaches window listeners at module scope and is **pruned out of the package**.
-- **Theming is colour and type only.** `theme.css` carries the §2.1 tokens and maps Svelte Flow's `--xy-*` variables onto them, so a
-  host never sees library defaults in the pane, controls or minimap. Geometry (34px rail rows, the 300/320px rails, the 20px code
+- **Theming is colour and type only.** `theme.css` carries the §2.1 tokens; the G6 boundary reads them for native shapes and observes theme changes. Svelte HTML cards inherit the same tokens. Geometry (34px rail rows, the 300/320px rails, the 20px code
   line) is not themable: the Symbol view measures those against each other to put a callee row beside the line that calls it.
 - Versioned with the engine (`scripts/sync-ui-version.mjs`), because the payload shapes are versioned with the binary that serves
   them. **Prepared, not published**: `"private": true` is the guard and `scripts/pack-npm.sh` only packs it under
@@ -888,7 +843,7 @@ Sentence case; controls say what happens ("Read as flow", "Clear"); counts alway
 ## Appendix — prototype stylesheet (verbatim; measurements above are derived from it)
 
 ```css
-/* ---------- tokens: paper/ink editorial, one oxblood accent ---------- */
+/* ---------- historical tokens: deprecated colours, geometry reference only ---------- */
 :root {
   --paper: #f7f6f2; --paper-2: #f1efe8; --press: #e8e6dd; --press-2: #dedbd0;
   --ink: #16150f; --ink-2: #56544a; --ink-3: #87847a; --ink-4: #b4b1a5;

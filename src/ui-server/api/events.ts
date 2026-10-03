@@ -93,6 +93,9 @@ export interface WireIndexRevision {
   files: number;
 }
 
+export interface EventProbeResult { index: WireIndexRevision | null; files: string[]; total: number }
+export type EventProbeLoader = (since: number | null, signal: AbortSignal) => Promise<EventProbeResult>;
+
 /** Sent once, immediately, so a client knows what it is synchronised against. */
 export interface WireEventHello {
   type: 'hello';
@@ -172,8 +175,10 @@ export class EventHub {
   private indexUp = false;
   private degraded: string | null = null;
   private closed = false;
+  private asyncProbe: AbortController | null = null;
+  private probeAgain = false;
 
-  constructor(projectRoot: string, session: GraphSession) {
+  constructor(projectRoot: string, session: GraphSession, private readonly projectId?: string, private readonly loadProbe?: EventProbeLoader) {
     this.projectRoot = projectRoot;
     this.session = session;
   }
@@ -243,6 +248,7 @@ export class EventHub {
       heartbeatMs: HEARTBEAT_MS,
       at: Date.now(),
     });
+    if (this.loadProbe && !this.asyncProbe) this.checkIndex();
     return true;
   }
 
@@ -279,7 +285,7 @@ export class EventHub {
     try {
       // `retry` on every frame is cheap and means a client that reconnects with
       // the browser's own EventSource still backs off the way we asked.
-      client.res.write(`retry: 3000\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      client.res.write(`retry: 3000\nevent: ${event.type}\ndata: ${JSON.stringify(this.projectId === undefined ? event : { ...event, projectId: this.projectId })}\n\n`);
     } catch {
       this.drop(client);
     }
@@ -293,12 +299,13 @@ export class EventHub {
 
   private ensureWatching(): void {
     if (this.closed) return;
-    this.revision ??= this.probe();
+    if (!this.loadProbe) this.revision ??= this.probe();
     this.startSourceWatcher();
     this.startIndexWatcher();
   }
 
   private stopWatching(): void {
+    this.asyncProbe?.abort(); this.asyncProbe = null; this.probeAgain = false;
     if (this.indexTimer) {
       clearTimeout(this.indexTimer);
       this.indexTimer = null;
@@ -423,6 +430,7 @@ export class EventHub {
   /** One query. An unmoved revision is not an event. */
   private checkIndex(): void {
     if (this.closed || this.clients.size === 0) return;
+    if (this.loadProbe) { this.checkIndexAsync(); return; }
     const next = this.probe();
     if (next === null) return;
     const previous = this.revision;
@@ -458,6 +466,28 @@ export class EventHub {
       total: Math.max(total, files.length),
       truncated: files.length < total,
       at: Date.now(),
+    });
+  }
+
+  /** 工作区探测使用共享查询池；一个 hub 同时最多保留一个任务。 */
+  private checkIndexAsync(): void {
+    if (this.asyncProbe) { this.probeAgain = true; return; }
+    const controller = new AbortController();
+    this.asyncProbe = controller;
+    const current = () => this.asyncProbe === controller && !this.closed && this.clients.size > 0;
+    void this.loadProbe!(this.revision?.lastIndexedAt ?? null, controller.signal).then(result => {
+      if (!current() || result.index === null) return;
+      const previous = this.revision;
+      this.revision = result.index;
+      if (previous?.lastIndexedAt === result.index.lastIndexedAt && previous.files === result.index.files) return;
+      this.broadcast({ type: 'index', index: result.index, files: result.files,
+        total: Math.max(result.total, result.files.length), truncated: result.files.length < result.total, at: Date.now() });
+    }).catch(() => {
+      // 饱和或离线时保持 hello/心跳可用，下次文件事件或新订阅再探测。
+    }).finally(() => {
+      if (this.asyncProbe !== controller) return;
+      this.asyncProbe = null;
+      if (this.probeAgain) { this.probeAgain = false; this.checkIndex(); }
     });
   }
 

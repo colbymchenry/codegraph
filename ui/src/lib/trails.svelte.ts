@@ -1,3 +1,6 @@
+let projectEpoch = 0;
+/** 同一项目的读取刷新也只接收最新请求；不影响保存操作的项目生命周期。 */
+let readGeneration = 0;
 /**
  * The saved trails, as live state.
  *
@@ -31,12 +34,16 @@ let inflight: Promise<void> | null = null;
 
 function load(): Promise<void> {
   if (inflight) return inflight;
+  const epoch = projectEpoch;
+  const generation = ++readGeneration;
   inflight = fetchTrails()
     .then((value) => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       payload = value;
       failure = null;
     })
     .catch((cause: unknown) => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       // A viewer whose trails cannot be listed still works; the section is the
       // only thing that has to know, and it prints the reason rather than an
       // empty box that looks like "you have never saved one".
@@ -44,6 +51,7 @@ function load(): Promise<void> {
       failure = cause instanceof Error ? cause.message : String(cause);
     })
     .finally(() => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       settled = true;
     });
   return inflight;
@@ -59,6 +67,7 @@ function adopt(next: WireTrails): void {
 }
 
 export const trails = {
+  resetProject(): void { projectEpoch++; readGeneration++; payload = null; settled = false; failure = null; busy = false; inflight = null; },
   get list(): readonly WireTrail[] {
     return payload?.trails ?? [];
   },
@@ -126,6 +135,7 @@ export const trails = {
    * @returns the id written, or null when the save failed (see `failure`).
    */
   async save(name: string, note: string, hops: readonly TrailHop[]): Promise<string | null> {
+    const epoch = projectEpoch;
     busy = true;
     try {
       const answer = await saveTrail({
@@ -133,27 +143,33 @@ export const trails = {
         note,
         hops: hops.map((hop) => ({ dir: hop.dir, id: hop.id })),
       });
+      if (epoch !== projectEpoch) return null;
       adopt(answer);
       return answer.saved ?? null;
     } catch (cause) {
+      if (epoch !== projectEpoch) return null;
       failure = cause instanceof Error ? cause.message : String(cause);
       return null;
     } finally {
-      busy = false;
+      if (epoch === projectEpoch) busy = false;
     }
   },
 
   /** Remove a saved trail. Returns whether it went. */
   async remove(id: string): Promise<boolean> {
+    const epoch = projectEpoch;
     busy = true;
     try {
-      adopt(await deleteTrail(id));
+      const answer = await deleteTrail(id);
+      if (epoch !== projectEpoch) return false;
+      adopt(answer);
       return true;
     } catch (cause) {
+      if (epoch !== projectEpoch) return false;
       failure = cause instanceof Error ? cause.message : String(cause);
       return false;
     } finally {
-      busy = false;
+      if (epoch === projectEpoch) busy = false;
     }
   },
 

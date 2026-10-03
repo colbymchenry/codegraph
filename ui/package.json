@@ -45,7 +45,8 @@
     "svelte": "^5.25.0"
   },
   "dependencies": {
-    "@xyflow/svelte": "^1.6.5"
+    "@antv/g6": "5.1.1",
+    "@antv/layout": "2.0.0"
   },
   "devDependencies": {
     "@fontsource-variable/archivo": "^5.3.0",

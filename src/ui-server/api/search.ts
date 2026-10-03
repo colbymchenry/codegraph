@@ -1,22 +1,6 @@
 /**
- * `GET /api/search?q=` — the search palette's one round-trip.
- *
- * Three lookups feed it, because no single one covers what a person types into
- * a palette:
- *
- * - `getNodesByNameSubstring` — case-insensitive, catches the exact, prefix and
- *   mid-name matches (`profileInfo` inside `getProfileInfoV2`) that FTS tokens
- *   cannot.
- * - `searchNodes` — FTS5, plus the engine's own LIKE and fuzzy fallbacks, and
- *   the `kind:` / `lang:` / `path:` / `name:` filter grammar for free.
- * - `getNodesByName` — every symbol with exactly that name, uncapped, so a
- *   heavily-overloaded name never loses its definitions below a search cut.
- *
- * They are then merged and ranked by HOW the name matched — exact, prefix,
- * substring, qualified name, file path — rather than by any single engine's
- * score, because those scores are not comparable with each other. Results are
- * grouped by kind: "did I mean the class or the method" is the question a
- * palette actually has to answer.
+ * GET /api/search 在数据库中先应用过滤并限制候选数量，再合并有界全文搜索结果。
+ * 按名称匹配等级排序，保留符号分组；候选池耗尽时明确标记总数不完整。
  */
 
 import type { CodeGraph } from '../../index';
@@ -111,18 +95,15 @@ export function buildSearch(cg: CodeGraph, query: URLSearchParams): unknown {
     if (!candidates.has(node.id)) candidates.set(node.id, node);
   };
 
-  if (text.length > 0) {
-    for (const node of cg.getNodesByName(text)) remember(node);
-    for (const node of cg.getNodesByNameSubstring(text, { limit: CANDIDATE_POOL })) remember(node);
-  }
-  for (const result of cg.searchNodes(raw, { limit: CANDIDATE_POOL })) remember(result.node);
+  const direct = cg.getUiSearchCandidates(parsed, CANDIDATE_POOL);
+  for (const node of direct) remember(node);
+  const related = cg.searchNodes(raw, { limit: CANDIDATE_POOL });
+  for (const result of related) remember(result.node);
+  const candidateLimited = direct.length >= CANDIDATE_POOL || related.length >= CANDIDATE_POOL;
 
   const scored: Array<{ node: Node; match: MatchKind }> = [];
   for (const node of candidates.values()) {
-    // `searchNodes` applies the filter grammar to its own results, but the two
-    // direct name lookups above know nothing about it — so `kind:class Cache`
-    // would otherwise pull in `CacheKey` and every `Cache` method through the
-    // substring lookup. The gate belongs to the merged candidate set.
+    // 合并后再次核对过滤条件，保持直接候选与全文搜索的匹配语义一致。
     if (!matchesFilters(node, parsed)) continue;
     // An empty text portion means the query was pure filters (`kind:route`);
     // everything `searchNodes` returned already satisfies them, so there is no
@@ -185,6 +166,8 @@ export function buildSearch(cg: CodeGraph, query: URLSearchParams): unknown {
       names: parsed.nameFilters,
     },
     results: wireList(results, scored.length),
+    candidateLimited,
+    totalExact: !candidateLimited,
     groups,
   };
 }

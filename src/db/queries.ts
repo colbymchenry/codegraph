@@ -1413,6 +1413,69 @@ export class QueryBuilder {
    * run — ReferenceResolver memoizes this in its nameCache — and the population
    * is capped by AMBIGUOUS_NAME_CEILING (#999).
    */
+  /** UI 候选先在 SQL 中过滤，再限制数量；不改变解析器的同名查询。 */
+  getUiSearchCandidates(parsed: ReturnType<typeof parseQuery>, limit: number): Node[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    for (const [column, values] of [['kind', parsed.kinds], ['language', parsed.languages]] as const) {
+      if (values.length) {
+        clauses.push(`${column} IN (SELECT value FROM json_each(?))`);
+        params.push(JSON.stringify(values));
+      }
+    }
+    for (const [column, values] of [['file_path', parsed.pathFilters], ['name', parsed.nameFilters]] as const) {
+      if (values.length) {
+        clauses.push(`(${values.map(() => `instr(lower(${column}), lower(?)) > 0`).join(' OR ')})`);
+        params.push(...values);
+      }
+    }
+    const text = parsed.text.trim().toLowerCase();
+    if (text) {
+      clauses.push('(instr(lower(name), ?) > 0 OR instr(lower(qualified_name), ?) > 0 OR instr(lower(file_path), ?) > 0)');
+      params.push(text, text, text);
+    }
+    const rank = text ? 'CASE WHEN lower(name) = ? THEN 0 WHEN substr(lower(name), 1, length(?)) = ? THEN 1 WHEN instr(lower(name), ?) > 0 THEN 2 ELSE 3 END,' : '';
+    if (text) params.push(text, text, text, text);
+    params.push(limit);
+    return (this.db.prepare(`SELECT * FROM nodes ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''}
+      ORDER BY ${rank} file_path, start_line, id LIMIT ?`).all(...params) as NodeRow[]).map(rowToNode);
+  }
+
+  /** 以边主键续页，保留同一目标的不同调用位置。 */
+  getUiNeighborPage(id: string, direction: 'in' | 'out', after: number, limit: number): Array<{ key: number; edge: Edge; node: Node }> {
+    const column = direction === 'in' ? 'target' : 'source';
+    const peer = direction === 'in' ? 'source' : 'target';
+    const rows = this.db.prepare(`SELECT * FROM edges WHERE ${column} = ? AND id > ? ORDER BY id LIMIT ?`).all(id, after, limit) as EdgeRow[];
+    const nodes = this.getNodesByIds(rows.map(row => row[peer]));
+    return rows.flatMap(row => { const node = nodes.get(row[peer]); return node ? [{ key: row.id, edge: rowToEdge(row), node }] : []; });
+  }
+
+  /** 文件内符号使用稳定 ID 游标，查询结果始终有界。 */
+  getUiSymbolPage(file: string, after: string, limit: number): Node[] {
+    return (this.db.prepare('SELECT * FROM nodes WHERE file_path = ? AND id > ? ORDER BY id LIMIT ?')
+      .all(file, after, limit) as NodeRow[]).map(rowToNode);
+  }
+
+  /** 只返回当前目录的一层成员，目录聚合在数据库完成。 */
+  getUiBrowsePage(root: string, kind: 'directories' | 'files', after: string, limit: number): Array<{ path: string; kind: 'directory' | 'file'; files: number }> {
+    const prefix = root ? root + '/' : '';
+    // '/' 的下一个 ASCII 字符是 '0'；按此前缀区间可包含所有 Unicode 子路径。
+    const tailStart = Array.from(prefix).length + 1; // SQLite substr 按码点计数。
+    const range = prefix ? 'path >= ? AND path < ?' : '1 = 1';
+    const rangeParams = prefix ? [prefix, root + '0'] : [];
+    if (kind === 'files') {
+      return this.db.prepare(`SELECT path, 'file' AS kind, 1 AS files FROM files
+        WHERE ${range} AND path > ? AND instr(substr(path, ?), '/') = 0 ORDER BY path LIMIT ?`)
+        .all(...rangeParams, after, tailStart, limit) as Array<{path:string;kind:'file';files:number}>;
+    }
+    return this.db.prepare(`WITH relative AS (
+        SELECT substr(path, ?) AS tail FROM files WHERE ${range}
+      ), children AS (
+        SELECT ? || substr(tail, 1, instr(tail, '/') - 1) AS path FROM relative WHERE instr(tail, '/') > 0
+      ) SELECT path, 'directory' AS kind, count(*) AS files FROM children WHERE path > ? GROUP BY path ORDER BY path LIMIT ?`)
+      .all(tailStart, ...rangeParams, prefix, after, limit) as Array<{path:string;kind:'directory';files:number}>;
+  }
+
   getNodesByName(name: string): Node[] {
     if (!this.stmts.getNodesByName) {
       this.stmts.getNodesByName = this.db.prepare(
@@ -2718,8 +2781,12 @@ export class QueryBuilder {
       minConfidence: number;
       topPairsPerLink: number;
       pairKinds: readonly EdgeKind[];
+      bounded?: boolean;
+      minWeight?: number;
     }
   ): {
+    truncated?: boolean;
+    uncertainEdges?: number;
     links: Array<{
       source: string;
       target: string;
@@ -2758,6 +2825,40 @@ export class QueryBuilder {
       } catch (err) {
         this.db.exec('ROLLBACK');
         throw err;
+      }
+
+      if (options.bounded) {
+        // 聚合到模块/关系类型，避免把所有符号对搬入 JS 堆。
+        const rows = this.db.prepare(`SELECT ms.mod AS source, mt.mod AS target, e.kind AS kind,
+          SUM(CASE WHEN ${CONFIDENCE} >= ? THEN 1 ELSE 0 END) AS count,
+          SUM(CASE WHEN ${CONFIDENCE} >= ? AND ${DECLARED} THEN 1 ELSE 0 END) AS declared,
+          SUM(CASE WHEN ${CONFIDENCE} < ? THEN 1 ELSE 0 END) AS uncertain
+          FROM cg_module_map ms
+          CROSS JOIN nodes sn ON sn.file_path = ms.path
+          CROSS JOIN edges e ON e.source = sn.id
+          JOIN nodes tn ON tn.id = e.target
+          JOIN cg_module_map mt ON mt.path = tn.file_path
+          WHERE e.kind IN (SELECT value FROM json_each(?)) AND ms.mod <> mt.mod
+          GROUP BY ms.mod, mt.mod, e.kind ORDER BY ms.mod, mt.mod`).iterate(options.minConfidence, options.minConfidence, options.minConfidence, JSON.stringify(options.kinds));
+        const links: ModuleLinkTotal[] = [];
+        let uncertainEdges = 0, pairCount = 0, currentKey = '';
+        let group: ModuleLinkTotal[] = [];
+        const flush = () => {
+          uncertainEdges += group.reduce((sum, row) => sum + row.uncertain, 0);
+          if (group.reduce((sum, row) => sum + row.count, 0) < (options.minWeight ?? 1)) return;
+          links.push(...group.map(row => ({ ...row, uncertain: 0 })));
+          pairCount++;
+        };
+        for (const row of rows as Iterable<ModuleLinkTotal>) {
+          const key = `${row.source}\0${row.target}`;
+          if (currentKey && key !== currentKey) {
+            flush(); group = [];
+            if (pairCount > 2000) return { links, pairs: [], truncated: true, uncertainEdges };
+          }
+          currentKey = key; group.push(row);
+        }
+        flush();
+        return { links, pairs: [], truncated: pairCount > 2000, uncertainEdges };
       }
 
       // ONE pass over the edge table. Grouping by the symbol names as well as
@@ -2819,6 +2920,16 @@ export class QueryBuilder {
    * a cycle conjured by a common method name is a false alarm a reader cannot
    * check.
    */
+  getUiFileDependencyPairs(files: string[], minConfidence: number, limit = 2001): Array<{ source: string; target: string }> {
+    return this.db.prepare(`SELECT DISTINCT sn.file_path AS source, tn.file_path AS target
+      FROM json_each(?) f CROSS JOIN nodes sn ON sn.file_path = f.value
+      CROSS JOIN edges e ON e.source = sn.id JOIN nodes tn ON tn.id = e.target
+      WHERE e.kind <> 'contains' AND sn.file_path <> tn.file_path
+        AND tn.file_path IN (SELECT value FROM json_each(?))
+        AND COALESCE(json_extract(e.metadata, '$.confidence'), 1) >= ? LIMIT ?`)
+      .all(JSON.stringify(files), JSON.stringify(files), minConfidence, limit) as Array<{ source: string; target: string }>;
+  }
+
   getCrossFileDependencyPairs(minConfidence: number): Array<{ source: string; target: string }> {
     return this.db
       .prepare(

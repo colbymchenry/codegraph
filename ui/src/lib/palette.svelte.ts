@@ -1,3 +1,6 @@
+let projectEpoch = 0;
+/** 同一项目的读取刷新也只接收最新请求；不影响保存操作的项目生命周期。 */
+let readGeneration = 0;
 /**
  * The search palette's live state.
  *
@@ -77,12 +80,16 @@ let entriesInflight: Promise<void> | null = null;
 
 function loadEntries(): Promise<void> {
   if (entriesInflight) return entriesInflight;
+  const epoch = projectEpoch;
+  const generation = ++readGeneration;
   entriesInflight = fetchEntryPoints({ limit: ENTRY_LIMIT, routes: ENTRY_ROUTE_LIMIT })
     .then((value) => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       entries = value;
       entriesFailure = null;
     })
     .catch((cause: unknown) => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       // The palette still works without them; a failed "where do I start"
       // should never stop someone from typing a name. The entry-points panel
       // is the one screen that has nothing else to show, so the reason is
@@ -91,6 +98,7 @@ function loadEntries(): Promise<void> {
       entriesFailure = cause instanceof Error ? cause.message : String(cause);
     })
     .finally(() => {
+      if (epoch !== projectEpoch || generation !== readGeneration) return;
       entriesSettled = true;
     });
   return entriesInflight;
@@ -153,6 +161,7 @@ function current(): Palette {
 }
 
 export const palette = {
+  resetProject(): void { projectEpoch++; readGeneration++; palette.reset(); entries = null; entriesSettled = false; entriesFailure = null; entriesInflight = null; },
   get query(): string {
     return query;
   },
