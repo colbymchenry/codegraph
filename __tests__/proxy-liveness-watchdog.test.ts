@@ -45,7 +45,11 @@ async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fall
           await delay(2500);
           return { content: [{ type: 'text', text: 'finished' }] };
         } }),
-        stop: () => {},
+        // Slow, like a stop waiting on a query worker still starting up: the
+        // proxy must not exit before it settles.
+        stop: () => mode === 'slow-fallback'
+          ? delay(300).then(() => { require('fs').writeSync(1, 'STOPPED\\n'); })
+          : undefined,
       }),
     });
   `], {
@@ -76,6 +80,7 @@ async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fall
       await until(exited);
       expect(child.exitCode, stderr).toBe(0);
       expect(child.signalCode).toBeNull();
+      expect(stdout, stderr).toContain('STOPPED');
     } else {
       await until(() => stdout.includes('WEDGED') || exited());
       expect(stdout, stderr).toContain('WEDGED');

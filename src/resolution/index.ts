@@ -27,7 +27,7 @@ import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
-import { ResolverPool, minRefsForPool } from './resolver-pool';
+import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -2109,7 +2109,7 @@ export class ReferenceResolver {
         adaptiveSeqRefs += batch.length;
         const remaining = total - processed - batch.length;
         const projectedMs = (adaptiveSeqMs / Math.max(1, adaptiveSeqRefs)) * Math.max(0, remaining);
-        if (projectedMs >= ADAPTIVE_ENGAGE_SETTLE_MS) {
+        if (shouldEngageAdaptively(projectedMs, remaining, ADAPTIVE_ENGAGE_SETTLE_MS)) {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(`[pool-timing] adaptive engage: projected ${Math.round(projectedMs)}ms sequential settle over ${remaining} remaining refs`);
           }

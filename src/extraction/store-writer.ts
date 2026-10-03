@@ -9,6 +9,7 @@
 
 import { Worker } from 'worker_threads';
 import { ExtractionResult, Language, Node, Edge, UnresolvedReference, FileRecord } from '../types';
+import { terminateOnceStarted, workerStarted } from '../worker-teardown';
 
 /** One file's complete store payload (pre-filtered — see storeFileBundle). */
 export interface StoreBundle {
@@ -66,6 +67,8 @@ export function finalizeStoreBundle(
 
 export class StoreWriter {
   private worker: Worker;
+  /** Settles on the worker's first message or its end — see worker-teardown.ts. */
+  private started: Promise<void>;
   private readyPromise: Promise<void>;
   private firstError: Error | null = null;
   private drainWaiters = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
@@ -77,6 +80,7 @@ export class StoreWriter {
 
   constructor(workerScriptPath: string, dbPath: string, fastInit: boolean) {
     this.worker = new Worker(workerScriptPath);
+    this.started = workerStarted(this.worker);
     let readyResolve!: () => void;
     let readyReject!: (e: Error) => void;
     this.readyPromise = new Promise<void>((resolve, reject) => {
@@ -175,14 +179,18 @@ export class StoreWriter {
     return p;
   }
 
-  /** Close the worker's DB connection and join the thread. */
-  async close(): Promise<void> {
+  /**
+   * Close the worker's DB connection and join the thread; the worker collects
+   * garbage and exits by itself (worker-teardown.ts). One that hasn't by
+   * `timeoutMs` is terminated — but never while it is still starting up.
+   */
+  async close(timeoutMs = 5000): Promise<void> {
     if (this.exited) return;
     this.worker.postMessage({ type: 'close' });
     await new Promise<void>((resolve) => {
       const t = setTimeout(() => {
-        void this.worker.terminate().then(() => resolve());
-      }, 5000);
+        void terminateOnceStarted(this.worker, this.started).then(() => resolve());
+      }, timeoutMs);
       this.worker.once('exit', () => {
         clearTimeout(t);
         resolve();

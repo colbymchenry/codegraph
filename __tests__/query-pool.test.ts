@@ -182,6 +182,63 @@ describe('QueryPool', () => {
     expect(pool.healthy).toBe(false);
   });
 
+  describe('destroy never terminates a worker still starting up', () => {
+    // Terminating a worker while it is still loading its modules can crash the
+    // whole process on Windows (0xC0000005), and the daemon destroys its pool
+    // whenever it stops. FakeWorker(…, null) never posts 'ready' by itself.
+    it('answers callers at once, then waits for the worker to start', async () => {
+      let worker!: FakeWorker;
+      const pool = new QueryPool({
+        root: '/x', size: 1, softTimeoutMs: 10_000,
+        createWorker: () => (worker = new FakeWorker(() => ({ hang: true }), null)),
+      });
+      const pending = pool.run('codegraph_explore', { query: 'q' });
+      let destroyed = false;
+      const down = pool.destroy().then(() => { destroyed = true; });
+      expect((await pending).isError).toBe(true); // not held behind the start
+      await sleep(50);
+      expect(destroyed).toBe(false);
+      expect(worker.alive).toBe(true);
+      worker.emitMessage({ type: 'ready', ok: true });
+      await down;
+      expect(worker.alive).toBe(false);
+    });
+
+    it('terminates a started worker at once', async () => {
+      let worker!: FakeWorker;
+      const pool = new QueryPool({ root: '/x', size: 1, startSettleMs: 10_000, createWorker: () => (worker = new FakeWorker(() => ({ result: ok('r') }))) });
+      await sleep(5);
+      const started = Date.now();
+      await pool.destroy();
+      expect(worker.alive).toBe(false);
+      expect(Date.now() - started).toBeLessThan(1_000);
+    });
+
+    it('gives up waiting on a start that never finishes', async () => {
+      let worker!: FakeWorker;
+      const pool = new QueryPool({ root: '/x', size: 1, startSettleMs: 60, createWorker: () => (worker = new FakeWorker(() => ({ hang: true }), null)) });
+      const started = Date.now();
+      await pool.destroy();
+      expect(worker.alive).toBe(false);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(55);
+    });
+
+    it('does not wait on a worker that died while starting', async () => {
+      const workers: FakeWorker[] = [];
+      const pool = new QueryPool({
+        root: '/x', size: 1, startSettleMs: 10_000,
+        // The first never starts; its replacement does.
+        createWorker: () => { const w = new FakeWorker(() => ({ result: ok('r') }), workers.length ? true : null); workers.push(w); return w; },
+      });
+      workers[0].emitExit();
+      await sleep(5);
+      const started = Date.now();
+      await pool.destroy();
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(workers.every((w) => !w.alive)).toBe(true);
+    });
+  });
+
   it('is not `ready` until a worker completes its cold start (#662 first-call stall)', async () => {
     // A worker cold start is seconds (tens under load); a call queued behind it
     // waits for the 45s busy backstop with nothing served. The ToolHandler must
@@ -405,6 +462,50 @@ describe('MCP query pool with real projects (#1465)', () => {
     } finally {
       await pool.destroy();
       await Promise.all(exits);
+    }
+  }, 30000);
+
+  it('never terminates a real worker before it has started', async () => {
+    const alpha = await indexProject('alpha', 'alphaSymbol');
+    const startedWhenEnded: boolean[] = [];
+    pool = new QueryPool({
+      root: alpha, size: 1,
+      createWorker: () => {
+        const worker = new Worker(path.resolve(__dirname, '../dist/mcp/query-worker.js'), { workerData: { root: alpha } });
+        let started = false;
+        worker.on('message', (m: { type?: string }) => { if (m?.type === 'ready') started = true; });
+        const terminate = worker.terminate.bind(worker);
+        worker.terminate = () => {
+          startedWhenEnded.push(started);
+          return terminate();
+        };
+        return worker;
+      },
+    });
+    await pool.destroy(); // its eager worker is still loading
+    expect(startedWhenEnded).toEqual([true]);
+  }, 30000);
+
+  it('engine stop waits for the query pool to shut down', async () => {
+    const alpha = await indexProject('alpha', 'alphaSymbol');
+    const activeEngine = await start(alpha);
+    expect(pool).not.toBeNull();
+    const realPool = pool!;
+    let release!: () => void;
+    const destroy = vi.spyOn(realPool, 'destroy').mockReturnValue(new Promise<void>((r) => { release = r; }));
+    try {
+      let stopped = false;
+      const stopping = activeEngine.stop().then(() => { stopped = true; });
+      // Everything else stop() closes is done well inside this; only the pool is held.
+      await Promise.race([stopping, sleep(1_500)]);
+      expect(stopped).toBe(false);
+      release();
+      await stopping;
+      expect(stopped).toBe(true);
+    } finally {
+      release();
+      destroy.mockRestore();
+      await realPool.destroy();
     }
   }, 30000);
 
