@@ -73,6 +73,43 @@ export function writeConfig(): void {}
     expect(hit.kind).not.toBe('file');
   });
 
+  it('keeps unchanged symbol words through repeated full indexing', async () => {
+    const before = cg.getSegmentMatches(['state', 'machine']);
+    expect(before.map((m) => m.name)).toContain('OrderStateMachine');
+
+    for (let run = 0; run < 2; run++) {
+      expect((await cg.indexAll()).success).toBe(true);
+      expect(cg.getNodesByName('OrderStateMachine')).toHaveLength(1);
+      expect(cg.getSegmentMatches(['state', 'machine'])).toEqual(before);
+      expect(cg.getSegmentMatches(['checkout', 'service']).map((m) => m.name)).toContain('CheckoutService');
+    }
+  });
+
+  it('rebuilds words for both changed and unchanged files after a full index', async () => {
+    const touched = path.join(dir, 'src', 'state-machine.ts');
+    fs.writeFileSync(touched, fs.readFileSync(touched, 'utf8').replace('OrderStateMachine', 'RenamedWorkflowEngine'));
+
+    expect((await cg.indexAll()).success).toBe(true);
+    expect(cg.getSegmentMatches(['renamed', 'workflow']).map((m) => m.name)).toContain('RenamedWorkflowEngine');
+    expect(cg.getSegmentMatches(['checkout', 'service']).map((m) => m.name)).toContain('CheckoutService');
+    expect(cg.getSegmentMatches(['state', 'machine'])).toEqual([]);
+
+    await cg.sync();
+    expect(cg.getSegmentMatches(['checkout', 'service']).map((m) => m.name)).toContain('CheckoutService');
+  });
+
+  it('preserves existing symbol words when full indexing is cancelled', async () => {
+    const before = cg.getSegmentMatches(['state', 'machine']);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await cg.indexAll({ signal: controller.signal });
+    expect(result.success).toBe(false);
+    expect(result.errors.some((error) => error.message === 'Aborted')).toBe(true);
+    expect(cg.getNodesByName('OrderStateMachine')).toHaveLength(1);
+    expect(cg.getSegmentMatches(['state', 'machine'])).toEqual(before);
+  });
+
   it('single rare word qualifies; ubiquitous and singleton words do not', () => {
     // "checkout" clusters (Service + Controller) — a concept this repo is about.
     expect(cg.getSegmentMatches(['checkout']).map((m) => m.name)).toContain('CheckoutService');
