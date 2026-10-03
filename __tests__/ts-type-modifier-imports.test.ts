@@ -277,3 +277,10 @@ describe('a type imported with a `type` modifier resolves to its declaration', (
     expect(typeRefs('barrel')).toEqual(['lib/cfg.ts']);
   });
 });
+
+describe('string-named namespace re-export', () => {
+  it('`export * as "aa" from` exports the namespace, not every member', () => {
+    expect(extractReExports(`export * as "aa" from './a';\nexport * from './b';\n`, 'typescript'))
+      .toEqual([{ kind: 'namespace', exportedName: 'aa', source: './a' }, { kind: 'wildcard', source: './b' }]);
+  });
+});
