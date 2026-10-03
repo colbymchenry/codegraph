@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In VB.NET, reading or setting a `Shared` field or property through its class name, like `AppSession.SessionId` or `AppSession.CurrentUser = "demo"`, now counts as a use of that field or property and of the class, so `codegraph callers` and impact no longer miss it. (#2305)
 
 ## [1.6.2] - 2026-10-03
 
