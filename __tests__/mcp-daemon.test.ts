@@ -40,6 +40,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { deregisterDaemon } from '../src/mcp/daemon-registry';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { once } from 'events';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
@@ -222,6 +223,11 @@ describe('Shared MCP daemon (issue #411)', () => {
       await waitProcessExit(daemonPid, 5000);
     }
     await new Promise((r) => setTimeout(r, 50));
+    // SIGKILL deliberately bypasses Daemon.stop(), so its global discovery
+    // record cannot self-remove. Clean it explicitly before deleting the temp
+    // project; otherwise every full suite leaves one dead registry file per
+    // test under ~/.codegraph/daemons.
+    deregisterDaemon(realRoot);
     servers.length = 0;
     removeSpawnLog(tempDir);
     await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
