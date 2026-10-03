@@ -113,7 +113,8 @@ function deepBraces(depth: number): string {
 const ENV_KEYS = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_LANGS', 'CODEGRAPH_KERNEL_PATH'] as const;
 let savedEnv: Record<string, string | undefined>;
 
-describe.skipIf(!kernelBuilt)('kernel deep-nesting guard (#1581)', () => {
+// CODEGRAPH_KERNEL=0 turns the kernel off: these assert what it does.
+describe.skipIf(!kernelBuilt || process.env.CODEGRAPH_KERNEL === '0')('kernel deep-nesting guard (#1581)', () => {
   let routed: Language[] = [];
 
   beforeAll(async () => {
