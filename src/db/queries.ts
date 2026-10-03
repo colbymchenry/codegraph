@@ -1357,6 +1357,26 @@ export class QueryBuilder {
   }
 
   /**
+   * Fast check to see if a repository has Qt indicators (signals, slots, or Qt meta-types).
+   * Used to bypass the O(N-methods) qtSignalChannelEdges pass on non-Qt C++ codebases like Chromium.
+   */
+  hasQtIndicators(): boolean {
+    const hasSignalOrSlot = this.db.prepare(
+      "SELECT 1 FROM nodes WHERE kind = 'method' AND (signature LIKE 'signal %' OR signature LIKE 'slot %') LIMIT 1"
+    ).get();
+    if (hasSignalOrSlot) return true;
+    
+    // Qt context properties from QML registration
+    const hasQmlReg = this.db.prepare(
+      "SELECT 1 FROM nodes WHERE kind = 'variable' AND name LIKE 'qt-context-property:%' LIMIT 1"
+    ).get();
+    if (hasQmlReg) return true;
+
+    return false;
+  }
+
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {

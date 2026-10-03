@@ -247,6 +247,7 @@ const MARKUP_HOST_LANGUAGES: ReadonlySet<string> = new Set([
   'blade',
   'erb',
   'handlebars',
+  'qml',
 ]);
 
 /**

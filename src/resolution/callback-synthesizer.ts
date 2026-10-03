@@ -40,6 +40,20 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
+import { maskCppNonCode } from '../extraction/languages/c-cpp';
+import { qtExecutableTarget } from './frameworks/qt';
+import {
+  buildQtFunctionIndex,
+  collectQtUsingNamespaces,
+  getQtCppScopes,
+  normalizeQtOwner,
+  qtEnclosingFunction,
+  qtEnclosingFunctionPrefix,
+  qtFunctionHeaderOwner,
+  qtOwnerPrefixes,
+  qtScopeAt,
+  type QtFunctionBody,
+} from './frameworks/qt-cpp-scope';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -87,6 +101,13 @@ const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars t
 // where the pass cannot emit a single edge — on a 12k-file PHP/JS app that was
 // 20+ minutes of the "Resolving refs" tail and a #850 watchdog kill (#1235).
 const CC_LANGUAGES = new Set(['swift', 'kotlin']);
+
+const QT_CPP_LANGUAGES = ['cpp', 'c'];
+const QT_SIGNAL_LANGUAGES = [...QT_CPP_LANGUAGES, 'qml'];
+const QT_CPP_FILE_RE = /\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|ipp|inl)$/i;
+const QT_EMIT_RE = /\b(?:emit|Q_EMIT)\s+([A-Za-z_]\w*)\s*\(/g;
+const QT_CONNECT_MACRO_RE = /\b(?:QObject\s*::\s*)?connect\s*\(\s*([A-Za-z_]\w*)\s*,\s*SIGNAL\s*\(\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*\)\s*,\s*(?:([A-Za-z_]\w*)\s*,\s*)?(?:SLOT|SIGNAL)\s*\(\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*\)/g;
+const QT_CONNECT_PTR_RE = /\b(?:QObject\s*::\s*)?connect\s*\(\s*[^,;]+,\s*&\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)\s*,\s*[^,;]+,\s*&\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)/g;
 
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
@@ -358,6 +379,248 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
       if (seen.has(key)) continue;
       seen.add(key);
       edges.push({ source: d, target: h, kind: 'calls', provenance: 'heuristic', metadata: { synthesizedBy: 'event-emitter', event, registeredAt } });
+    }
+  }
+  return edges;
+}
+
+function qtOwner(node: Node): string | null {
+  const prefix = node.qualifiedName.slice(0, -(`::${node.name}`).length);
+  if (prefix === node.filePath) return node.language === 'qml' ? node.filePath : null;
+  const filePrefix = `${node.filePath}::`;
+  const ownerPath = prefix.startsWith(filePrefix) ? prefix.slice(filePrefix.length) : prefix;
+  return ownerPath || null;
+}
+
+function qtMemberKey(owner: string, name: string): string {
+  return `${owner}::${name}`;
+}
+
+function addQtMember(members: Map<string, Node[]>, node: Node): void {
+  const owner = qtOwner(node);
+  if (!owner) return;
+  const key = qtMemberKey(owner, node.name);
+  const matches = members.get(key) ?? [];
+  if (!matches.some((existing) => existing.id === node.id)) matches.push(node);
+  members.set(key, matches);
+}
+
+/**
+ * The members named `owner::name` at the first lookup level that has any — C++ lookup order, so an inner `ns::Sender` hides an outer `Sender`.
+ * More than one hit at that level is an ambiguity the caller must refuse.
+ */
+function findQtMembers(
+  members: ReadonlyMap<string, readonly Node[]>,
+  owner: string,
+  name: string,
+  levels: readonly (readonly string[])[],
+): readonly Node[] {
+  const raw = normalizeQtOwner(owner);
+  for (const level of levels) {
+    const found = new Map<string, Node>();
+    for (const prefix of level) {
+      for (const match of members.get(qtMemberKey(prefix ? `${prefix}::${raw}` : raw, name)) ?? []) found.set(match.id, match);
+    }
+    if (found.size) return [...found.values()];
+  }
+  return [];
+}
+
+function qtEmitterOwner(node: Node, source: string): string | null {
+  const fromQualifiedName = qtOwner(node);
+  if (fromQualifiedName) return fromQualifiedName;
+  if (node.kind !== 'method') return null;
+  const escapedName = node.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = source.match(new RegExp(
+    `\\b((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Za-z_]\\w*)\\s*::\\s*${escapedName}\\s*\\(`,
+  ));
+  return match ? normalizeQtOwner(match[1]!) : null;
+}
+
+function uniqueQtPointerType(prefix: string | null, variableName: string): string | null {
+  if (!prefix) return null;
+  const escapedName = variableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declaration = new RegExp(
+    `\\b((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Za-z_]\\w*)\\s*\\*+\\s*${escapedName}\\b`,
+    'g',
+  );
+  const types = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = declaration.exec(prefix)) !== null) types.add(normalizeQtOwner(match[1]!));
+  return types.size === 1 ? [...types][0]! : null;
+}
+
+/** Qt signals bridge `emit`, QML handlers, and explicit QObject::connect calls. */
+async function qtSignalChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  if (!queries.hasQtIndicators()) return [];
+
+  const signals = new Map<string, Node[]>();
+  const slots = new Map<string, Node[]>();
+  const methods = new Map<string, Node[]>();
+  const cppCallablesByFile = new Map<string, Node[]>();
+  let scanned = 0;
+  const addCallable = (node: Node) => {
+    const inFile = cppCallablesByFile.get(node.filePath);
+    if (inFile) inFile.push(node);
+    else cppCallablesByFile.set(node.filePath, [node]);
+  };
+  for (const node of queries.iterateNodesByKindIn('method', QT_SIGNAL_LANGUAGES)) {
+    if ((++scanned & 255) === 0) await onYield();
+    const isSignal = !!node.signature?.startsWith('signal ');
+    if (isSignal) addQtMember(signals, node);
+    else if (node.signature?.startsWith('slot ')) addQtMember(slots, node);
+    if (node.language === 'qml') continue;
+    addCallable(node);
+    if (!isSignal) addQtMember(methods, node);
+  }
+  if (signals.size === 0) return [];
+  // Out-of-line definitions may be indexed as plain functions; only an
+  // `Owner::name` one can be a slot body or an emitter.
+  for (const node of queries.iterateNodesByKindIn('function', QT_CPP_LANGUAGES)) {
+    if ((++scanned & 255) === 0) await onYield();
+    if (!qtOwner(node)) continue;
+    addCallable(node);
+    addQtMember(methods, node);
+  }
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const add = (source: Node, target: Node, line: number | undefined, metadata: Record<string, unknown>) => {
+    if (source.id === target.id || seen.has(`${source.id}>${target.id}`)) return;
+    seen.add(`${source.id}>${target.id}`);
+    edges.push({ source: source.id, target: target.id, kind: 'calls', line, provenance: 'heuristic', metadata });
+  };
+  const only = (nodes: readonly Node[]): Node | null => (nodes.length === 1 ? nodes[0]! : null);
+
+  // What `connect` names as the receiving end: a slot (or the body it
+  // declares), another signal (signal -> signal chains), or, in the
+  // pointer-to-member form, an ordinary method. The first kind that has any
+  // match decides; ambiguity inside it means no edge.
+  const resolveTarget = (owner: string, name: string, prefixes: readonly (readonly string[])[]): Node | null => {
+    const slotMatches = findQtMembers(slots, owner, name, prefixes);
+    if (slotMatches.length) {
+      const slot = only(slotMatches);
+      return slot ? qtExecutableTarget(slot, ctx) : null;
+    }
+    const signalMatches = findQtMembers(signals, owner, name, prefixes);
+    if (signalMatches.length) return only(signalMatches);
+    const methodMatches = findQtMembers(methods, owner, name, prefixes);
+    if (!methodMatches.length) return null;
+    const targets = new Map<string, Node>();
+    for (const method of methodMatches) {
+      const target = qtExecutableTarget(method, ctx);
+      targets.set(target.id, target);
+    }
+    return targets.size === 1 ? [...targets.values()][0]! : null;
+  };
+
+  // A QML handler has already been owner-resolved by qtResolver; turn that
+  // association into the runtime signal flow that reaches the handler.
+  for (const candidates of signals.values()) {
+    if (candidates.length !== 1) continue;
+    const signal = candidates[0]!;
+    const owner = qtOwner(signal)!;
+    for (const binding of queries.getIncomingEdges(signal.id, ['references'])) {
+      const handler = queries.getNodeById(binding.source);
+      const expectedHandler = `on${signal.name.charAt(0).toUpperCase()}${signal.name.slice(1)}`;
+      if (
+        !handler ||
+        handler.language !== 'qml' ||
+        handler.kind !== 'method' ||
+        (handler.name !== expectedHandler && !handler.name.endsWith(`.${expectedHandler}`))
+      ) continue;
+      add(signal, handler, binding.line, {
+        synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner,
+        registeredAt: `${handler.filePath}:${binding.line ?? handler.startLine}`,
+      });
+    }
+  }
+
+  const files = new Set<string>(cppCallablesByFile.keys());
+  for (const filePath of ctx.getAllFiles()) if (QT_CPP_FILE_RE.test(filePath)) files.add(filePath);
+  let scannedFiles = 0;
+  for (const filePath of files) {
+    if ((++scannedFiles & 31) === 0) await onYield();
+    const content = ctx.readFile(filePath);
+    if (!content) continue;
+    const callables = cppCallablesByFile.get(filePath);
+    const mayEmit = !!callables && (content.includes('emit') || content.includes('Q_EMIT'));
+    const mayConnect = QT_CPP_FILE_RE.test(filePath) && content.includes('connect');
+    if (!mayEmit && !mayConnect) continue;
+
+    const source = maskCppNonCode(content);
+    const scopes = getQtCppScopes(source);
+    const usings = collectQtUsingNamespaces(source);
+    const lineAt = makeLineAt(source, 1);
+
+    if (mayEmit) {
+      const lineOffsets = [0];
+      for (let at = source.indexOf('\n'); at !== -1; at = source.indexOf('\n', at + 1)) lineOffsets.push(at + 1);
+      for (const method of callables!) {
+        const from = lineOffsets[method.startLine - 1];
+        if (from === undefined) continue;
+        const body = source.slice(from, lineOffsets[method.endLine] ?? source.length);
+        QT_EMIT_RE.lastIndex = 0;
+        let match = QT_EMIT_RE.exec(body);
+        if (!match) continue;
+        const owner = qtEmitterOwner(method, body);
+        if (!owner) continue;
+        const prefixes = qtOwnerPrefixes(qtScopeAt(scopes, from).namespaceName, null, usings);
+        for (; match !== null; match = QT_EMIT_RE.exec(body)) {
+          const signal = only(findQtMembers(signals, owner, match[1]!, prefixes));
+          if (!signal) continue;
+          const line = lineAt(from + match.index);
+          add(method, signal, line, {
+            synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner: qtOwner(signal) ?? owner,
+            registeredAt: `${filePath}:${line}`,
+          });
+        }
+      }
+    }
+
+    if (!mayConnect) continue;
+    let functions: QtFunctionBody[] | null = null;
+    const functionIndex = () => (functions ??= buildQtFunctionIndex(source));
+    const functionOwnerAt = (offset: number): string | null => {
+      const body = qtEnclosingFunction(functionIndex(), offset);
+      return body ? qtFunctionHeaderOwner(source.slice(body.headerStart, body.open)) : null;
+    };
+    const prefixesAt = (offset: number) =>
+      qtOwnerPrefixes(qtScopeAt(scopes, offset).namespaceName, functionOwnerAt(offset), usings);
+    const variableOwnerAt = (name: string, offset: number): string | null =>
+      name === 'this'
+        ? functionOwnerAt(offset) ?? qtScopeAt(scopes, offset).className
+        : uniqueQtPointerType(qtEnclosingFunctionPrefix(functionIndex(), source, offset), name);
+
+    QT_CONNECT_MACRO_RE.lastIndex = 0;
+    let macro: RegExpExecArray | null;
+    while ((macro = QT_CONNECT_MACRO_RE.exec(source)) !== null) {
+      const senderOwner = variableOwnerAt(macro[1]!, macro.index);
+      const receiverOwner = variableOwnerAt(macro[3] ?? 'this', macro.index);
+      if (!senderOwner || !receiverOwner) continue;
+      const prefixes = prefixesAt(macro.index);
+      const signal = only(findQtMembers(signals, senderOwner, macro[2]!, prefixes));
+      const target = signal && resolveTarget(receiverOwner, macro[4]!, prefixes);
+      if (!signal || !target) continue;
+      const line = lineAt(macro.index);
+      add(signal, target, line, {
+        synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner: qtOwner(signal) ?? senderOwner,
+        connection: 'SIGNAL/SLOT', registeredAt: `${filePath}:${line}`,
+      });
+    }
+
+    QT_CONNECT_PTR_RE.lastIndex = 0;
+    let pointer: RegExpExecArray | null;
+    while ((pointer = QT_CONNECT_PTR_RE.exec(source)) !== null) {
+      const prefixes = prefixesAt(pointer.index);
+      const signal = only(findQtMembers(signals, pointer[1]!, pointer[2]!, prefixes));
+      const target = signal && resolveTarget(pointer[3]!, pointer[4]!, prefixes);
+      if (!signal || !target) continue;
+      const line = lineAt(pointer.index);
+      add(signal, target, line, {
+        synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner: qtOwner(signal) ?? pointer[1]!,
+        connection: 'pointer', registeredAt: `${filePath}:${line}`,
+      });
     }
   }
   return edges;
@@ -3781,6 +4044,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
+  if (/\b(?:emit|SIGNAL|SLOT|QObject\s*::\s*connect)\b/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
@@ -3814,6 +4078,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
 export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
   { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  { name: 'qtSignalEdges', gate: (has) => has('cpp', 'qml'), run: (q, c, y) => qtSignalChannelEdges(q, c, y) },
   // Cross-tier channels — a client's `fetch('/api/x')` onto its own route,
   // a queue job onto its consumer, a bus / socket event onto its handler.
   // Before the in-process emitter pass: the same (source, target) pair

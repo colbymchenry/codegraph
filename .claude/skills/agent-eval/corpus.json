@@ -1,5 +1,14 @@
 {
   "_comment": "Test corpus for /agent-eval. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
+  "C++": [
+    {
+      "name": "kdeconnect-kde",
+      "repo": "https://invent.kde.org/network/kdeconnect-kde",
+      "size": "Medium",
+      "files": "~800",
+      "question": "How do plugin signals (e.g. ping received) route to the DBus interface and eventually to the QML UI?"
+    }
+  ],
   "TypeScript": [
     {
       "name": "ky",

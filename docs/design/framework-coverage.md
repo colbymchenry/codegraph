@@ -137,6 +137,30 @@ reaches the Screens tab.
 **Size:** an edge-kind change plus route nodes for `pages/` entries — no new
 analysis.
 
+### 5. Qt / QML — flows connect, but no routes and no branch guards
+
+**Has:** the dispatch half. `qtResolver` (`frameworks/qt.ts`) and
+`qtSignalChannelEdges` (`callback-synthesizer.ts`) link a QML handler to the C++
+it triggers: pointer and `SIGNAL`/`SLOT` `connect(…)` (namespace- and
+`using namespace`-aware), `emit` / `Q_EMIT`, `Q_INVOKABLE`, `Q_PROPERTY`
+accessors, context properties, typed `id`s, `qmlRegisterType` / `QML_ELEMENT`
+names, QML enums and `Connections`. `codegraph_explore` traces the flow.
+**Missing, on all three axes:**
+
+| Axis | Status |
+|---|---|
+| `route` nodes | none — `StackView` / `Loader` / `SwipeView` page sets are not modelled |
+| `navigates` edges | none — so no Screens tab for a QML app |
+| branch-guard rules | none — QML and its JS bodies yield no `WHEN` labels |
+
+**Known gaps in the flow itself:** a `connect` whose slot is a lambda, the
+3-argument pointer form `connect(sender, &S::sig, &S::slot)` with an implicit
+`this` receiver, flows that cross a `Loader { source: … }` / `Qt.createComponent`
+string, and an `id` declared in the *parent* file that an included component
+calls through (only ids of the component's own file resolve). All four stay
+unlinked rather than guessed. The first step for navigation would be
+`StackView.push(Component | url)`, which names its target with a literal.
+
 ---
 
 ## Languages
@@ -155,7 +179,7 @@ the first two inherit the C rules and the third has none.)
 **No rules** — boxes draw, arrows carry no condition, and no arguments or
 trigger labels are read: PHP, Ruby, Rust, Scala, Dart, Erlang, Lua, Luau, R,
 Solidity, COBOL, CFML, VB.NET, Nix, Terraform, Pascal/Delphi, Liquid, Razor,
-Twig, ArkTS, and the `.svelte` / `.vue` / `.astro` template languages.
+Twig, ArkTS, QML, and the `.svelte` / `.vue` / `.astro` template languages.
 
 A language with no rules yields **nothing**, never a wrong label — that is the
 design, so an absent row here is a missing feature, not a bug.
