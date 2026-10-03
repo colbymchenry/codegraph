@@ -36,6 +36,7 @@ import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { enforcescriptModdedResolver } from './enforcescript-modded';
 
 /**
  * All registered framework resolvers
@@ -100,6 +101,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // Enforce Script — link `modded class Foo` to its original namesake
+  enforcescriptModdedResolver,
 ];
 
 /**
@@ -182,3 +185,4 @@ export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver, expoModulesJsResolver } from './expo-modules';
 export { expoRouterResolver } from './expo-router';
 export { fabricViewResolver } from './fabric';
+export { enforcescriptModdedResolver } from './enforcescript-modded';
