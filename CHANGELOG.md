@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Pi is now a supported agent.** `codegraph install --target=pi` wires the CodeGraph MCP server into Pi, writing `~/.pi/agent/mcp.json` for a global install or `.pi/mcp.json` for a project-local one (respecting a custom `PI_CODING_AGENT_DIR`), and `codegraph uninstall` reverses it. (#2112)
+
 ### Fixes
 
 - On Windows, terminal windows no longer flash open and closed while CodeGraph runs in the background. Since 1.6.1, a background MCP server popped up a console window (a full Windows Terminal window when that is the default terminal) several times when it started and again every time it re-synced a changed file. All of CodeGraph's git calls now run hidden. Thanks @Suharaz, @23q3, @A-Van-Gestel and @HarryMuc. (#2094, #2096)

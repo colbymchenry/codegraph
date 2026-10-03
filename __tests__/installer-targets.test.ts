@@ -79,6 +79,7 @@ function setHome(dir: string): { restore: () => void } {
     COPILOT_HOME: process.env.COPILOT_HOME,
     CODEX_HOME: process.env.CODEX_HOME,
     CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -88,6 +89,7 @@ function setHome(dir: string): { restore: () => void } {
   delete process.env.COPILOT_HOME;
   delete process.env.CODEX_HOME;
   delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.PI_CODING_AGENT_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -98,6 +100,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
       if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
       if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
+      if (prev.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prev.PI_CODING_AGENT_DIR;
     },
   };
 }
@@ -508,6 +511,97 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('# My personal Gemini context');
     expect(body).toContain('Always respond concisely.');
     expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('pi: install writes ~/.pi/agent/mcp.json (mcpServers.codegraph, exposure direct) and the AGENTS.md block (#704)', () => {
+    const pi = getTarget('pi')!;
+    const result = pi.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.pi', 'agent', 'mcp.json');
+    const agentsMd = path.join(tmpHome, '.pi', 'agent', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsMd)).toBe(true);
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+      exposure: 'direct',
+    });
+    // Re-install is fully unchanged (idempotent).
+    const second = pi.install('global', { autoAllow: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('pi: install preserves a pre-existing sibling MCP server in mcp.json', () => {
+    const pi = getTarget('pi')!;
+    const mcp = path.join(tmpHome, '.pi', 'agent', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'npx', args: ['-y', 'other-mcp'], exposure: 'direct' } },
+    }, null, 2) + '\n');
+
+    pi.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('pi: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const pi = getTarget('pi')!;
+    const mcp = path.join(tmpHome, '.pi', 'agent', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'npx', args: ['-y', 'other-mcp'] } },
+    }, null, 2) + '\n');
+
+    pi.install('global', { autoAllow: true });
+    pi.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('pi: local install writes ./.pi/mcp.json and the project-root ./AGENTS.md block', () => {
+    const pi = getTarget('pi')!;
+    const result = pi.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.pi/mcp.json'))).toBe(true);
+    // AGENTS.md sits at the project root, NOT under .pi/ — that's the
+    // file Pi's context-file discovery reads.
+    expect(paths.some((p) => p.endsWith('/AGENTS.md') && !p.includes('/.pi/'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+    // Global config is untouched by a local install.
+    expect(fs.existsSync(path.join(tmpHome, '.pi', 'agent', 'mcp.json'))).toBe(false);
+  });
+
+  it('pi: local uninstall reverses the local install and leaves the global entry alone', () => {
+    const pi = getTarget('pi')!;
+    pi.install('global', { autoAllow: true });
+    pi.install('local', { autoAllow: true });
+    expect(pi.detect('local').alreadyConfigured).toBe(true);
+
+    pi.uninstall('local');
+
+    expect(pi.detect('local').alreadyConfigured).toBe(false);
+    expect(pi.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('pi: honors PI_CODING_AGENT_DIR for the global location', () => {
+    const pi = getTarget('pi')!;
+    const custom = path.join(tmpHome, 'custom-agent-dir');
+    process.env.PI_CODING_AGENT_DIR = custom;
+
+    pi.install('global', { autoAllow: true });
+
+    expect(fs.existsSync(path.join(custom, 'mcp.json'))).toBe(true);
+    expect(fs.existsSync(path.join(custom, 'AGENTS.md'))).toBe(true);
+    // The default ~/.pi/agent is NOT written when the override is set.
+    expect(fs.existsSync(path.join(tmpHome, '.pi', 'agent', 'mcp.json'))).toBe(false);
   });
 
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
