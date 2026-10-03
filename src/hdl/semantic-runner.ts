@@ -150,7 +150,7 @@ function collect(root: string, profile: ActiveHdlProfile, signal?: AbortSignal, 
 function run(executable: string, args: string[], cwd: string, timeout: number, signal?: AbortSignal, astFile?: string): Promise<{stdout:string;stderr:string}> {
   abort(signal);
   return new Promise((resolve,reject) => {
-    const child = spawn(executable,args,{cwd,detached:true,shell:false,stdio:['ignore','pipe','pipe']});
+    const child = spawn(executable,args,{cwd,detached:true,shell:false,stdio:['ignore','pipe','pipe'],windowsHide:true});
     let stdout = '', stderr = '', size = 0, failure: Error | undefined, finished = false;
     const stop = (message: string): void => {
       failure ??= new Error(message);
