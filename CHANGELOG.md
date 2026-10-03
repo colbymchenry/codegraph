@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Installing or removing CodeGraph in Codex now preserves TOML examples in your instructions and recognizes server tables with spaces or quoted names, keeping your configuration readable. (#2250) Thanks @rudycelekli.
 
 ## [1.6.2] - 2026-10-03
 

@@ -67,8 +67,7 @@ export function upsertTomlTable(
   header: string,
   block: string,
 ): { content: string; action: 'inserted' | 'replaced' | 'unchanged' } {
-  const headerLine = `[${header}]`;
-  const headerIdx = findHeaderIndex(fileContent, headerLine);
+  const headerIdx = findHeaderIndex(fileContent, header);
 
   if (headerIdx === -1) {
     // Insert at end with separating blank line if there's existing content.
@@ -81,7 +80,7 @@ export function upsertTomlTable(
   }
 
   // Find the end of this block: next table header or EOF.
-  const blockEnd = findNextTableHeader(fileContent, headerIdx + headerLine.length);
+  const blockEnd = findNextTableHeader(fileContent, headerIdx);
   const existingBlock = fileContent.substring(headerIdx, blockEnd).replace(/\n+$/, '');
 
   if (existingBlock === block) {
@@ -110,11 +109,10 @@ export function removeTomlTable(
   fileContent: string,
   header: string,
 ): { content: string; action: 'removed' | 'not-found' } {
-  const headerLine = `[${header}]`;
-  const headerIdx = findHeaderIndex(fileContent, headerLine);
+  const headerIdx = findHeaderIndex(fileContent, header);
   if (headerIdx === -1) return { content: fileContent, action: 'not-found' };
 
-  const blockEnd = findNextTableHeader(fileContent, headerIdx + headerLine.length);
+  const blockEnd = findNextTableHeader(fileContent, headerIdx);
   const before = fileContent.substring(0, headerIdx).replace(/\n+$/, '');
   const after = fileContent.substring(blockEnd).replace(/^\n+/, '');
   const joined = before + (before && after ? '\n\n' : '') + after;
@@ -122,15 +120,32 @@ export function removeTomlTable(
 }
 
 /**
- * Locate the byte index of a header line (`[foo.bar]`) when it
- * appears at the start of a line. Returns -1 if not found.
+ * Locate a real table, excluding header-shaped text in multiline values.
+ * Our dotted bare keys can also be quoted or separated by whitespace.
  */
-function findHeaderIndex(content: string, headerLine: string): number {
-  // Search BOL or right after a newline.
-  if (content.startsWith(headerLine)) return 0;
-  const needle = '\n' + headerLine;
-  const idx = content.indexOf(needle);
-  return idx === -1 ? -1 : idx + 1;
+function findHeaderIndex(content: string, header: string): number {
+  const key = header.split('.').map(part => {
+    const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return `(?:${escaped}|"${escaped}"|'${escaped}')`;
+  }).join(String.raw`[ \t]*\.[ \t]*`);
+  const pattern = new RegExp(String.raw`^[ \t]*\[[ \t]*${key}[ \t]*\][ \t]*(?:#.*)?\r?$`);
+  const state: TomlLexState = { multilineString: null, arrayDepth: 0, inlineTableDepth: 0 };
+  let lineStart = 0;
+  while (lineStart < content.length) {
+    const newlineIdx = content.indexOf('\n', lineStart);
+    const line = content.slice(lineStart, newlineIdx === -1 ? content.length : newlineIdx);
+    if (state.multilineString === null && state.arrayDepth === 0 && state.inlineTableDepth === 0
+      && pattern.test(line)) return lineStart;
+    scanTomlLine(line, state);
+    if (newlineIdx === -1) break;
+    lineStart = newlineIdx + 1;
+  }
+  return -1;
+}
+
+/** Detection and edits must agree on whether the managed table exists. */
+export function hasTomlTable(content: string, header: string): boolean {
+  return findHeaderIndex(content, header) !== -1;
 }
 
 /**

@@ -49,7 +49,7 @@ import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
-import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
+import { buildTomlTable, hasTomlTable, removeTomlTable, upsertTomlTable } from './toml';
 
 const TOML_HEADER = 'mcp_servers.codegraph';
 
@@ -102,7 +102,7 @@ class CodexTarget implements AgentTarget {
     if (fs.existsSync(tomlPath)) {
       try {
         const content = fs.readFileSync(tomlPath, 'utf-8');
-        alreadyConfigured = content.includes(`[${TOML_HEADER}]`);
+        alreadyConfigured = hasTomlTable(content, TOML_HEADER);
       } catch { /* ignore */ }
     }
     // Global: ~/.codex/ existing means Codex has run here. Local: the
