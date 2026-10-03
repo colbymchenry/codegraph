@@ -21,11 +21,15 @@ import {
  * all JSON-shaped agent configs (Claude, Cursor, opencode), only the
  * surrounding wrapper differs. Codex (TOML) builds its own block.
  */
-export function getMcpServerConfig(): { type: string; command: string; args: string[] } {
+export function getMcpServerConfig(projectPath?: string): { type: string; command: string; args: string[] } {
+  const args = ['serve', '--mcp'];
+  if (projectPath) {
+    args.push('--path', projectPath);
+  }
   return {
     type: 'stdio',
     command: 'codegraph',
-    args: ['serve', '--mcp'],
+    args,
   };
 }
 

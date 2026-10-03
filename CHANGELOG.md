@@ -211,6 +211,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Expo Router apps: screens and navigation are in the graph.** Every screen file under `app/` (or `src/app/`) is now a route node named by its path — `/object-detail`, `/item/[id]`, with `(group)` folders stripped — linked to the component it renders. Calls like `router.push('/object-detail?…')`, `router.navigate({ pathname: '/item/[id]', params })`, template-literal hrefs, an href held in a local `const`, and `router.push(await pickRoute())` where the helper returns screen paths (one edge per screen it can return) resolve to the screen they open as a new `navigates` edge that remembers the href, so "where does tapping this go" and "who opens this screen" are one hop in `codegraph_explore` and `callers` instead of a dead end at a string. Re-index after upgrading to pick the new edges up.
 
+- **`codegraph init` writes the MCP config your agent actually finds, pinned to the project.** It creates a project-level entry for opencode (`opencode.jsonc`) and Claude Code (`.mcp.json`) with `--path <project_root>`. An agent that launches the server from somewhere other than the project root — a sandboxed worktree, most visibly opencode's — otherwise left the server unable to locate `.codegraph/`, and the session quietly answered from no project at all. The write is idempotent: re-running `codegraph init` never rewrites an identical entry.
+
 ### Fixes
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)

@@ -52,8 +52,8 @@ import {
  * Claude Code wait for this server's tools at startup, so they are in the
  * first prompt rather than listed after the server connects in the background.
  */
-function getClaudeMcpServerConfig() {
-  return { ...getMcpServerConfig(), alwaysLoad: true };
+function getClaudeMcpServerConfig(projectRoot?: string) {
+  return { ...getMcpServerConfig(projectRoot), alwaysLoad: true };
 }
 
 /**
@@ -71,12 +71,12 @@ function configDir(loc: Location): string {
     ? globalConfigDir()
     : path.join(process.cwd(), '.claude');
 }
-function mcpJsonPath(loc: Location): string {
+function mcpJsonPath(loc: Location, projectRoot?: string): string {
   // global → $CLAUDE_CONFIG_DIR/.claude.json for a custom profile, else
   // ~/.claude.json (beside ~/.claude, not inside it). User scope: every project.
   // local  → ./.mcp.json (project scope: the ONLY project-level MCP
   // file Claude Code reads — NOT ./.claude.json, which it ignores).
-  if (loc !== 'global') return path.join(process.cwd(), '.mcp.json');
+  if (loc !== 'global') return path.join(projectRoot ?? process.cwd(), '.mcp.json');
   const override = process.env.CLAUDE_CONFIG_DIR;
   return override && override.trim().length > 0
     ? path.join(path.resolve(override), '.claude.json')
@@ -255,11 +255,11 @@ class ClaudeCodeTarget implements AgentTarget {
  * writes all three files. Without this split the shims silently
  * cause side effects callers don't expect.
  */
-export function writeMcpEntry(loc: Location): WriteResult['files'][number] {
-  const file = mcpJsonPath(loc);
+export function writeMcpEntry(loc: Location, projectRoot?: string): WriteResult['files'][number] {
+  const file = mcpJsonPath(loc, projectRoot);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getClaudeMcpServerConfig();
+  const after = getClaudeMcpServerConfig(projectRoot);
 
   if (jsonDeepEqual(before, after)) {
     // Already exactly what we'd write — preserve byte-identical file.
@@ -510,6 +510,16 @@ export function removeInstructionsEntry(loc: Location): WriteResult['files'][num
   const file = instructionsPath(loc);
   const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
   return { path: file, action };
+}
+
+/**
+ * Write a project-level .mcp.json with --path pointing to the project root.
+ * Used by `codegraph init` to ensure the MCP server can locate the
+ * .codegraph/ directory even when the agent's cwd doesn't match the real
+ * project root (e.g. opencode worktree sandboxing).
+ */
+export function writeLocalMcpEntry(projectRoot: string): WriteResult['files'][number] {
+  return writeMcpEntry('local', projectRoot);
 }
 
 export const claudeTarget: AgentTarget = new ClaudeCodeTarget();
