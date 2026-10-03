@@ -13,9 +13,10 @@
  *    path), interface multi-extends first-only drop, the call-encoding zoo
  *    (`this->prop.m`, DOT-joined scoped calls, `Cls::factory().m` fluent,
  *    nullsafe `?->` nothing, literal receivers kept), instantiation shapes
- *    (qualified verbatim, `new static/self/parent` literal, `$cls`, the
- *    anonymous-class garbage ref + file-level-function methods), static value
- *    reads, php type refs, HOF string/array callables, value-ref targets
+ *    (qualified reduced to its trailing name, `new static/self/parent`
+ *    literal, `$cls`, the anonymous-class garbage ref + file-level-function
+ *    methods), static value reads including namespaced `Foo\Bar::class`
+ *    receivers, php type refs, HOF string/array callables, value-ref targets
  *    (namespaced top-level consts DROPPED), heredoc/nowdoc/interpolation,
  *    attributes shifting node lines without emitting.
  *  - TortureModule.module — drupal extension routing + un-namespaced
