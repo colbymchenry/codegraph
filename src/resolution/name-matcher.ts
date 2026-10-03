@@ -5079,6 +5079,12 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
   // segment, and a path is not a prelude lookup.
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  // A type read through one of its items — `Mode::A`, `Limits::MAX`, `Self::A`
+  // (#2328) — is a type that declares that item: ripgrep's `Match::None` is
+  // `ignore`'s enum, not the matcher's `struct Match`.
+  const item = ref.referenceKind === 'references' && line !== undefined
+    ? new RegExp(`^(?:${name}|Self)\\s*::\\s*([A-Z]\\w*)`).exec(line.slice(ref.column))?.[1] : undefined;
+  if (item !== undefined && !declaresRustItem(candidate, item, context)) return false;
   // Written through a path on its line (`jsont::SubMatch { … }`, `io::Result<…>`),
   // wherever the reference's column points.
   const pathed = line === undefined ? null
@@ -5134,6 +5140,13 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     return uses.bound.has(name) || rustGlobCovers(uses, candidate, ref);
   }
   return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
+}
+
+/** Whether a Rust type declares `item`: a variant of the enum, or an associated const in its file. */
+function declaresRustItem(type: Node, item: string, context: ResolutionContext): boolean {
+  const named = context.getNodesInFileNamed?.(type.filePath, item) ?? context.getNodesInFile(type.filePath);
+  return named.some((n) => n.name === item &&
+    (n.kind === 'enum_member' ? n.qualifiedName === `${type.qualifiedName}::${item}` : n.kind === 'variable' || n.kind === 'constant'));
 }
 
 /** The line of the `impl` / `trait` header above `ref` in its file (0 for none). */
