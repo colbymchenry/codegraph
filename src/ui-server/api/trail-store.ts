@@ -28,7 +28,7 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { CODEGRAPH_DIR } from '../../directory';
 import { resolveProjectFile } from '../security';
 import { ApiError, badRequest } from './respond';
@@ -162,6 +162,9 @@ export function parseTrail(id: string, text: string): StoredTrail | null {
   }
   if (typeof raw !== 'object' || raw === null) return null;
   const value = raw as Record<string, unknown>;
+  // Unversioned hand-written trails predate the stored format marker and are
+  // treated as v1. A declared future/unknown version must not be guessed at.
+  if (value.version !== undefined && value.version !== TRAIL_FORMAT_VERSION) return null;
   if (typeof value.name !== 'string' || value.name.trim() === '') return null;
   if (!Array.isArray(value.hops) || value.hops.length === 0) return null;
 
@@ -230,7 +233,15 @@ export function listStoredTrails(projectRoot: string): StoredTrailList {
       skipped += 1;
       continue;
     }
-    const trail = readTrailFile(path.join(dir, name), id);
+    let trail: StoredTrail | null = null;
+    try {
+      // Use the same per-file chokepoint as direct reads. Checking only the
+      // directory lets `trails/x.json -> /outside/secret.json` escape it.
+      trail = readStoredTrail(projectRoot, id);
+    } catch {
+      // A linked or otherwise refused entry is an unreadable trail, not a reason
+      // to hide every valid trail beside it.
+    }
     if (trail) trails.push(trail);
     else skipped += 1;
   }
@@ -241,14 +252,25 @@ export function listStoredTrails(projectRoot: string): StoredTrailList {
 }
 
 function readTrailFile(absolute: string, id: string): StoredTrail | null {
+  let fd: number | null = null;
   try {
-    const stat = fs.statSync(absolute);
+    // O_NOFOLLOW closes the race between path validation and the actual open:
+    // replacing a checked file with a symlink must fail rather than follow it.
+    // O_NONBLOCK keeps a FIFO with no writer from parking the whole server on
+    // this open; a regular file ignores it, and `isFile()` below rejects the rest.
+    fd = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)
+    );
+    const stat = fs.fstatSync(fd);
     // A file too big to be a trail is skipped rather than read: this directory
     // is inside the project, and something else may one day put a log in it.
     if (!stat.isFile() || stat.size > MAX_TRAIL_FILE_BYTES) return null;
-    return parseTrail(id, fs.readFileSync(absolute, 'utf-8'));
+    return parseTrail(id, fs.readFileSync(fd, 'utf-8'));
   } catch {
     return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
   }
 }
 
@@ -263,9 +285,9 @@ export function readStoredTrail(projectRoot: string, id: string): StoredTrail | 
  * Write a trail, atomically.
  *
  * Temp file beside the target then `rename`, so a reader either sees the
- * previous trail or the new one and never a partial file. The temp name carries
- * the pid: two `codegraph ui` processes on one project is unusual but not
- * forbidden, and two writers sharing a temp name would corrupt each other's.
+ * previous trail or the new one and never a partial file. A random suffix plus
+ * exclusive creation means neither another viewer nor a pre-planted symlink can
+ * capture the temporary write.
  */
 export function writeStoredTrail(projectRoot: string, trail: StoredTrail): void {
   const dir = trailsDirectory(projectRoot);
@@ -274,10 +296,18 @@ export function writeStoredTrail(projectRoot: string, trail: StoredTrail): void 
   } catch (err) {
     throw writeFailure(err);
   }
+  // The directory did not necessarily exist during the first check. Resolve it
+  // again now that mkdir completed, so an existing parent symlink cannot turn a
+  // not-yet-existing trail directory into an out-of-project write.
+  trailsDirectory(projectRoot);
   const target = trailPath(projectRoot, trail.id);
-  const temp = `${target}.${process.pid}.tmp`;
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify(trail, null, 2)}\n`, 'utf-8');
+    fs.writeFileSync(temp, `${JSON.stringify(trail, null, 2)}\n`, {
+      encoding: 'utf-8',
+      flag: 'wx',
+      mode: 0o600,
+    });
     fs.renameSync(temp, target);
   } catch (err) {
     try {
