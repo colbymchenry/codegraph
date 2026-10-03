@@ -442,6 +442,61 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
   }, 60_000);
 
 
+  // A daemon that answered one projectPath query for another project must not
+  // keep that project's writer lock until it exits: the project's own daemon
+  // and `codegraph index` there would stay locked out (#2087).
+  it('releases an idle explicit project and its writer lock, and retakes it on the next call', async () => {
+    const prev = process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
+    process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS = '200';
+    const lock = path.join(serviceB, '.codegraph/writer.pid');
+    try {
+      expect(await search(serviceB, 'betaOriginal')).toContain('betaOriginal');
+      expect(JSON.parse(fs.readFileSync(lock, 'utf8')).pid).toBe(process.pid);
+      expect(opened[0]!.isWatching()).toBe(true);
+
+      expect(await waitFor(async () => !fs.existsSync(lock), 10000)).toBe(true);
+      expect(() => opened[0]!.getStats()).toThrow();
+
+      // Still synchronized while in use: the next call reopens and catches up.
+      fs.writeFileSync(path.join(serviceB, 'src/sample.ts'), 'export function afterIdleRelease() {}\n');
+      expect(await search(serviceB, 'afterIdleRelease')).toContain('afterIdleRelease');
+      expect(opened).toHaveLength(2);
+      expect(opened[1]!.isWatching()).toBe(true);
+      expect(JSON.parse(fs.readFileSync(lock, 'utf8')).pid).toBe(process.pid);
+    } finally {
+      if (prev === undefined) delete process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
+      else process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS = prev;
+    }
+  });
+
+  it('defers an idle release until an active catch-up finishes (#2087)', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    onOpen = (cg) => {
+      const sync = cg.sync.bind(cg);
+      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+    };
+    const prevIdle = process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
+    process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS = '50';
+    process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '10';
+    const lock = path.join(serviceB, '.codegraph/writer.pid');
+    try {
+      fs.writeFileSync(path.join(serviceB, 'src/sample.ts'), 'export function idleCatchUp() {}\n');
+      await search(serviceB, 'betaOriginal');
+      await new Promise((r) => setTimeout(r, 300));
+      expect(() => opened[0]!.getStats()).not.toThrow();
+      expect(fs.existsSync(lock)).toBe(true);
+      release();
+      expect(await waitFor(async () => !fs.existsSync(lock), 10000)).toBe(true);
+      expect(names(serviceB)).toEqual(['idleCatchUp']);
+      expect(() => opened[0]!.getStats()).toThrow();
+    } finally {
+      release();
+      if (prevIdle === undefined) delete process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS;
+      else process.env.CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS = prevIdle;
+    }
+  });
+
   it('drains a tool operation before closing its cached graph', async () => {
     await search(serviceA, 'alphaOriginal');
     const handler = engine.getToolHandler();

@@ -40,19 +40,25 @@ renders. Bad input is a `400` with a message, never a guess. Chart data carries
 
 | Endpoint | Answers |
 |---|---|
-| `/api/meta` | The days data actually exists for. The picker anchors its presets on `latest_day` so no chart ends on a day the nightly rollup has not written yet. |
+| `/api/meta` | How current the data is: `today`, the rollup's last day (`latest_rollup_day`), the last day an event arrived, machines active yesterday, and two flags — `ingest_stalled` and `rollup_behind` — that put a warning above the panels when either writer stops. Cached 60 s. |
 | `/api/summary` | Big numbers: production users, active machines, new machines, installs, uninstalls, indexing runs, tool calls. |
-| `/api/timeseries?metric=` | `installs_uninstalls`, `new_installs`, `production_users`, `indexing_activity`, `tool_calls`, `duration_buckets`. One dense point per day — a day with nothing is a zero, not a gap. |
+| `/api/timeseries?metric=` | `installs_uninstalls`, `new_installs`, `production_users`, `indexing_activity`, `tool_calls`, `duration_buckets`. One dense point per day — a day with nothing is a zero, not a gap. Days after the rollup's last day are `null` ("not counted yet") and `covered_through` says where that is; `new_installs` is written live and runs through today. |
 | `/api/breakdown?dim=` | `os`, `arch`, `codegraph_version`, `node_major`, `language`, `file_count_bucket`, `duration_bucket`, `target`, `scope`, `kind`, `name`, `client_name`, `name_error`. Optional `&event=`, `&metric=count\|machines`, `&limit=`. |
 | `/api/activation?window=7` | Install → first index funnel, plus the daily rate. |
 | `/api/retention` | Day 0–14 cohort curve for machines first seen in the range. |
 | `/api/health` | Liveness plus the latest event/rollup day. Uncached. |
 
-Everything reads the `daily_*` rollups and `machine_days`, which are kept forever, so a
-chart stays correct for days whose raw events have been purged. `/api/activation` is the
-one exception — "did this machine ever run an index" is not a daily aggregate — so it
-reads raw `events` and is bounded by the ingest worker's retention window. It reports
-`raw_events_from` for that reason.
+Everything reads the `daily_*` rollups, `machine_days` and `machine_first_seen`, which are
+kept forever, so a chart stays correct for days whose raw events have been purged. **No
+panel reads raw `events`.** D1 runs one query at a time per database: the activation funnel
+used to join every cohort machine against `events`, which took ~55 s for one week of
+cohorts in production and failed every panel queued behind it. It now reads
+`machine_first_seen.first_index_day`, which the nightly rollup maintains.
+
+The presets end on **today** (UTC — every event and rollup is keyed on the UTC day). Live
+numbers — production users, new machines, retention — run through today; rolled-up ones
+stop at the rollup's last day, normally yesterday, and the filter row says which day that
+is.
 
 ### Two numbers that are easy to misread
 
@@ -103,6 +109,12 @@ npm run deploy
 
 Both secrets are required — the worker refuses every request if either is missing, so a
 half-configured deployment fails closed rather than becoming an open dashboard.
+
+The activation panels read `machine_first_seen.first_index_day`, which arrives with
+`telemetry-worker/migrations/0002_first_index_day.sql`. Apply the ingest worker's
+migrations and deploy it **before** this worker, or those two panels fail with a query
+error (the rest of the page is unaffected) — see "Backfilling first_index_day" in
+`telemetry-worker/README.md`.
 
 Rotating either one is a `wrangler secret put` away. Rotating `SESSION_SECRET` invalidates
 outstanding cookies too, and is the right move if you think one leaked.

@@ -648,6 +648,28 @@ from ..services import auth_service
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
     });
+
+    it('should extract parenthesized Python from-imports', () => {
+      const content = `
+from store.base import (
+    Base,
+    helper as h,  # a comment, with a comma and a call()
+)
+"""
+from docstring import NotAnImport
+"""
+from store.rows import (Row, Col)
+`;
+
+      const mappings = extractImportMappings('src/main.py', content, 'python');
+
+      expect(mappings.map((m) => [m.localName, m.exportedName, m.source])).toEqual([
+        ['Base', 'Base', 'store.base'],
+        ['h', 'helper', 'store.base'],
+        ['Row', 'Row', 'store.rows'],
+        ['Col', 'Col', 'store.rows'],
+      ]);
+    });
   });
 
   describe('JVM FQN Import Resolution', () => {

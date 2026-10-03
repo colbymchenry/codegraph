@@ -32,6 +32,7 @@ import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
+import { commonJsRequireRefs } from './commonjs-requires';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -656,6 +657,10 @@ export class TreeSitterExtractor {
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
+
+      // A CommonJS `require('./x')` is a file import, like ESM's `import`. The
+      // kernel reads the same (kernel/index.ts and the parse worker's transport).
+      this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
 
       // hasError is routine for several grammars; warn only when no symbols survived.
       const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;

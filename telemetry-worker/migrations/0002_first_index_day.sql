@@ -1,0 +1,19 @@
+-- codegraph telemetry — the first day each machine ran an index.
+--
+-- Serves the install → first-index activation funnel. Until this column, the
+-- dashboard answered that funnel by joining every cohort machine against raw
+-- `events`, which on production volume took ~55 s for ONE week of cohorts — long
+-- enough to stall D1 (one query at a time per database) and fail every other
+-- panel queued behind it. With the first index day stored next to the first-seen
+-- day, the funnel is a range read over `machine_first_seen` alone.
+--
+-- It is also what lets the funnel outlive the raw-event retention purge, like
+-- every other panel: the nightly cron fills it from `events` while they exist.
+--
+-- Written by the nightly rollup (telemetry-worker/src/rollup.ts), never by the
+-- ingest path, and only ever lowered: NULL means "has not indexed (yet)".
+-- Existing rows start NULL — backfill them by re-running the rollup over the
+-- retained days (see "Backfilling first_index_day" in telemetry-worker/README.md).
+--
+-- ADD COLUMN with no default is a schema-only change in SQLite: no row is rewritten.
+ALTER TABLE machine_first_seen ADD COLUMN first_index_day TEXT;

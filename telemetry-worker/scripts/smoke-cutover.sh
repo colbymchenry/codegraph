@@ -233,11 +233,13 @@ ts "indexing activity"       indexing_activity   '[3]' '[3]'
 ts "tool calls (sums the prop)" tool_calls       '[20]' '[2]'
 
 MET=$(api "meta")
-is "meta anchors on the rolled-up day" "$DAY" "$(jget "$MET" latest_day)"
+is "meta reports the rolled-up day"     "$DAY" "$(jget "$MET" latest_day)"
 is "meta reports the rollup ran"       "$DAY" "$(jget "$MET" latest_rollup_day)"
 
-# The funnel is the one panel that reads RAW events rather than a rollup, so it is
-# also the one the retention purge can blind — worth pinning that it works today.
+# The funnel reads machine_first_seen.first_index_day, which only the nightly
+# rollup writes (from raw `index` events). This is the seam that pins it: ingest
+# writes the events, the rollup sets the column, the dashboard reads it. If the
+# rollup stopped setting it, "activated" here would read 0.
 #
 # Its denominator is FIRST-SEEN MACHINES, not `install` events (api.ts: "a machine
 # that reinstalls does not re-enter the funnel"). m3 is the discriminator: it never
@@ -247,7 +249,7 @@ ACT=$(api "activation?$RANGE&window=1")
 is "funnel counts new machines, not install events" 3 "$(jget "$ACT" installs)"
 is "all three indexed within the window"            3 "$(jget "$ACT" activated)"
 is "nobody dropped out"                             0 "$(jget "$ACT" dropped)"
-is "raw-event floor is reported to the caller" "$DAY" "$(jget "$ACT" raw_events_from)"
+is "cohorts are counted through the rolled-up day" "$DAY" "$(jget "$ACT" covered_through)"
 
 is "retention endpoint answers" 200 \
    "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$DASH/api/retention?$RANGE")"

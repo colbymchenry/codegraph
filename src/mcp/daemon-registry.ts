@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { canonicalProjectRoot } from '../directory';
 import {
   getDaemonPidPath,
   getDaemonSocketCandidates,
@@ -31,6 +32,7 @@ import {
   type DaemonLockInfo,
 } from './daemon-paths';
 import { readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
+import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -50,8 +52,14 @@ export function getRegistryDir(): string {
   return path.join(os.homedir(), '.codegraph', 'daemons');
 }
 
+/**
+ * One record per project, so it is keyed the same way the daemon socket is:
+ * over {@link canonicalProjectRoot}, not a raw `path.resolve` — otherwise the
+ * same project spelled with another drive-letter case files two records, and
+ * `list` over-lists while `stop --all` misses one.
+ */
 function recordPath(root: string): string {
-  const hash = crypto.createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16);
+  const hash = crypto.createHash('sha256').update(canonicalProjectRoot(root)).digest('hex').slice(0, 16);
   return path.join(getRegistryDir(), `${hash}.json`);
 }
 
@@ -206,6 +214,18 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** How long `stopDaemonAt` gives a daemon to exit on SIGTERM before looking closer. */
+const DAEMON_TERM_WAIT_MS = 3_000;
+
+/**
+ * How much longer `stopDaemonAt` waits for a daemon that is partway through its
+ * own shutdown: it has stopped answering its socket (or let go of its lock) but
+ * not yet exited. That shutdown waits up to {@link WORKER_START_SETTLE_MS} for a
+ * query worker still starting up before it exits, so this covers that plus the
+ * rest of the shutdown (#2311).
+ */
+const DAEMON_SHUTDOWN_GRACE_MS = WORKER_START_SETTLE_MS + 2_000;
+
 async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -228,8 +248,14 @@ export interface StopResult {
  * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
  * falling back to the registry. Rebuild callers preserve unverified live locks
  * instead of interpreting a failed probe as permission to discard the database.
+ * A daemon still finishing its own shutdown is waited for, up to
+ * `shutdownGraceMs` more (default {@link DAEMON_SHUTDOWN_GRACE_MS}; tests
+ * shorten it), before it is reported `still-running`.
  */
-export async function stopDaemonAt(root: string, options: { preserveUnverified?: boolean } = {}): Promise<StopResult> {
+export async function stopDaemonAt(
+  root: string,
+  options: { preserveUnverified?: boolean; shutdownGraceMs?: number } = {},
+): Promise<StopResult> {
   let pid: number | null = null;
   let identity: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
@@ -242,7 +268,7 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
   }
   if (pid == null) {
     const rec = listDaemons({ prune: false }).find(
-      (r) => path.resolve(r.root) === path.resolve(root)
+      (r) => canonicalProjectRoot(r.root) === canonicalProjectRoot(root)
     );
     pid = rec?.pid ?? null;
     if (rec) identity = rec;
@@ -278,17 +304,29 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
   // (no graceful path), so we always sweep artifacts ourselves below.
   try { process.kill(pid, 'SIGTERM'); } catch { /* raced to exit */ }
   let outcome: StopResult['outcome'] = 'term';
-  if (!(await waitForDeath(pid, 3000))) {
+  if (!(await waitForDeath(pid, DAEMON_TERM_WAIT_MS))) {
     // Re-prove identity before escalating; the old PID may have been reused.
-    if (!sameLock() || !await probeDaemonIdentity(identity) || !sameLock()) {
-      return { root, pid, outcome: 'still-running' };
+    if (sameLock() && await probeDaemonIdentity(identity) && sameLock()) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
+      if (!(await waitForDeath(pid, 2000))) {
+        return { root, pid, outcome: 'still-running' };
+      }
+      outcome = 'kill';
+    } else {
+      // No longer answering its socket, or no longer holding the lock it held
+      // when it was signalled: a daemon partway through its own shutdown, which
+      // closes the socket first and can then wait on a query worker still
+      // starting up before it releases the lock and exits (#2311). On Windows,
+      // where SIGTERM is TerminateProcess, this is a termination still settling.
+      // Its identity can't be re-proven without the socket, so signal nothing
+      // more; just wait, bounded, for the PID to go. One that outlives the
+      // wait is reported, as before.
+      if (!(await waitForDeath(pid, options.shutdownGraceMs ?? DAEMON_SHUTDOWN_GRACE_MS))) {
+        return { root, pid, outcome: 'still-running' };
+      }
     }
-    try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-    if (!(await waitForDeath(pid, 2000))) {
-      return { root, pid, outcome: 'still-running' };
-    }
-    outcome = 'kill';
   }
+  // Compares the lock with the one we signalled, so a successor's is kept.
   cleanupDaemonArtifacts(root, lockContents);
   return { root, pid, outcome };
 }

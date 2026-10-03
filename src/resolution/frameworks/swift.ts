@@ -379,16 +379,66 @@ export const vaporResolver: FrameworkResolver = {
       }
       const line = safe.slice(0, match.index).split('\n').length;
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segs) || '/';
+      const id = `route:${filePath}:${line}:${method}:${routePath}`;
       nodes.push({
-        id: `route:${filePath}:${line}:${method}:${routePath}`, kind: 'route', name: `${method} ${routePath}`,
+        id, kind: 'route', name: `${method} ${routePath}`,
         qualifiedName: `${filePath}::route:${routePath}`, filePath, startLine: line, endLine: line,
         startColumn: 0, endColumn: match[0].length, language: 'swift', updatedAt: now,
       });
+      // The closure IS the handler: its calls are the route's, as an Express
+      // inline handler's are, so Steps draws what `GET hello` does.
+      const open = match.index + match[0].length - 1;
+      const close = closingBrace(safe, open);
+      if (close > open) {
+        for (const name of closureCallNames(safe.slice(open + 1, close))) {
+          references.push({ fromNodeId: id, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language: 'swift' });
+        }
+      }
     }
 
     return { nodes, references };
   },
 };
+
+/** The `}` matching the `{` at `open`; string literals are skipped. -1 when unbalanced. */
+function closingBrace(s: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') {
+      for (i++; i < s.length && s[i] !== '"'; i++) if (s[i] === '\\') i++;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** Words Swift writes before a `(` that are not calls. */
+const SWIFT_NOT_CALLS = new Set(['if', 'guard', 'switch', 'while', 'for', 'return', 'catch', 'case', 'in', 'try', 'await', 'throw', 'some', 'any']);
+
+/**
+ * The calls a route closure's body makes, each once, keeping the receiver
+ * (`Todo.query`, `req.auth.require`) so they resolve as calls on it. A member
+ * of an expression (`a.b().c(`) names nothing this can follow.
+ */
+function closureCallNames(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const callRe = /((?:[A-Za-z_]\w*\s*[?!]?\.\s*)*)([A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(body)) !== null) {
+    const callee = m[2]!;
+    const receiver = m[1]!.replace(/[\s?!]/g, '').replace(/\.$/, '');
+    if (!receiver && (SWIFT_NOT_CALLS.has(callee) || /[.)\]]\s*$/.test(body.slice(0, m.index)))) continue;
+    const name = receiver ? `${receiver}.${callee}` : callee;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
 
 // Directory patterns
 const VIEW_DIRS = ['/Views/', '/View/', '/Screens/', '/Components/', '/UI/'];

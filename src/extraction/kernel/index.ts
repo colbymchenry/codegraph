@@ -15,6 +15,7 @@
  */
 
 import type { ExtractionResult, Language } from '../../types';
+import { commonJsRequireRefs } from '../commonjs-requires';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
@@ -269,6 +270,8 @@ export function materializeKernelResult(
     language
   );
   decoded.durationMs = result.durationMs;
+  // References read beside the tables (a CommonJS `require`) ride on the transport.
+  if (result.unresolvedReferences.length > 0) decoded.unresolvedReferences.push(...result.unresolvedReferences);
   return decoded;
 }
 
@@ -294,6 +297,8 @@ export function tryKernelExtract(
     const buffers = kernel.extractFile(filePath, pre, language);
     const result = decodeExtractBuffers(buffers, filePath, language);
     POST_PASSES[language]?.(result, source);
+    // Read beside the tables, as TreeSitterExtractor does (a CommonJS `require`).
+    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, language));
     result.durationMs = Date.now() - t0;
     return result;
   } catch (err) {

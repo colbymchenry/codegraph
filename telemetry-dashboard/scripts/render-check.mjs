@@ -176,8 +176,12 @@ const PROBE = `(() => {
       tableHidden: section.querySelector('[data-role="table"]').hidden,
     };
   });
+  const warning = document.getElementById('data-warning');
   return {
     ready: document.body.dataset.ready === 'true',
+    warning: warning.hidden ? null : warning.textContent,
+    customFrom: document.querySelector('[data-role="custom-from"]').value,
+    customTo: document.querySelector('[data-role="custom-to"]').value,
     range: document.getElementById('range-summary').textContent,
     dataThrough: document.getElementById('data-through').textContent,
     refreshed: document.getElementById('refreshed-at').textContent,
@@ -299,17 +303,32 @@ async function main() {
   // The very same registry the page just rendered from, imported here so the
   // expectations cannot drift from the panels under test.
   const { PANELS } = await import(pathToFileURL(join(root, 'public', 'panels.js')).href);
+  const { shortDay } = await import(pathToFileURL(join(root, 'public', 'theme.js')).href);
+  const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const today = utcDay(Date.now());
   check(`all ${PANELS.length} panels are on the page`, view.panels.length === PANELS.length, `got ${view.panels.length}`);
-  const broken = view.panels.filter((p) => p.state !== 'ready');
+  // The fixture lives in July, so a range ending today has nothing in it: every
+  // panel should say so plainly, and none should error.
+  const broken = view.panels.filter((p) => p.state !== 'ready' && p.state !== 'empty');
   check(
-    'every panel reached its ready state',
+    'every panel settled without an error',
     broken.length === 0,
     broken.map((p) => `${p.id}: ${p.state} ${p.message}`).join(' | '),
   );
   check('the default range is the 30-day preset', view.selectedPreset === 'Last 30 days', view.selectedPreset);
-  check('the range is stated in the filter row', /Jun|Jul/.test(view.range), view.range);
-  check('the data horizon is stated', view.dataThrough.includes('Jul 10'), view.dataThrough);
+  same('…ending today, not on the last rolled-up day', today, view.customTo);
+  same('…and starting 29 days before', utcDay(Date.now() - 29 * 864e5), view.customFrom);
+  check('the range is stated in the filter row', view.range.includes(shortDay(today)), view.range);
+  check('the rollup horizon is stated', view.dataThrough.includes('Event counts through Jul 10'), view.dataThrough);
+  check('…with yesterday\'s activity beside it', view.dataThrough.includes('0 machines active yesterday'), view.dataThrough);
   check('the refresh time is stated', view.refreshed.startsWith('Last refreshed'), view.refreshed);
+  // Nothing has arrived since the fixture's last day: the page must say so rather
+  // than present July as current.
+  check(
+    'a stalled ingest is called out above the panels',
+    view.warning?.includes('No new events since Jul 10.') === true,
+    String(view.warning),
+  );
 
   // A CSP violation surfaces here as a `security` log entry, which is the point
   // of the check: the page must work under `script-src 'self'` with no inline
@@ -339,10 +358,10 @@ async function main() {
     (await cdp.evaluate(sessionId, 'document.body.dataset.ready === "true"')) === true,
   );
   view = await cdp.evaluate(sessionId, PROBE);
-  const weekly = view.panels.find((p) => p.id === 'daily-production-users');
-  check('a daily line now holds 7 points', weekly.chart?.labels.length === 7, `${weekly.chart?.labels.length}`);
+  same('the range now starts 6 days back', utcDay(Date.now() - 6 * 864e5), view.customFrom);
+  check('…and still ends today', view.customTo === today, view.customTo);
   check('the 7-day preset is marked selected', view.selectedPreset === 'Last 7 days', view.selectedPreset);
-  check('every panel re-rendered cleanly', view.panels.every((p) => p.state === 'ready'));
+  check('every panel re-rendered cleanly', view.panels.every((p) => p.state === 'ready' || p.state === 'empty'));
 
   console.log('\nA custom range works the same way');
   await cdp.evaluate(
@@ -358,6 +377,12 @@ async function main() {
   view = await cdp.evaluate(sessionId, PROBE);
   check('the fixture window is 10 days', view.panels.find((p) => p.id === 'daily-production-users').chart?.labels.length === 10);
   check('no preset stays highlighted', view.selectedPreset === null, view.selectedPreset);
+  const notReady = view.panels.filter((p) => p.state !== 'ready');
+  check(
+    'every panel reached its ready state',
+    notReady.length === 0,
+    notReady.map((p) => `${p.id}: ${p.state} ${p.message}`).join(' | '),
+  );
 
   // -- every panel plots what the API returned ------------------------------
   console.log('\nEvery panel plots the API’s own numbers');
@@ -427,6 +452,29 @@ async function main() {
   same('run length keeps its bucket order', ['<10s', '10-60s', '1-5m', '5m+'], byId['run-length'].chart.labels);
   same('languages lead with typescript', 'typescript', byId.languages.chart.labels[0]);
   check('retention starts at 100%', byId.retention.chart.datasets[0].data[0] === 100);
+
+  console.log('\nPast the rollup\'s last day, lines stop instead of dropping to zero');
+  await cdp.evaluate(
+    sessionId,
+    `document.body.dataset.ready = "";
+     document.querySelector('[data-role="custom-from"]').value = "2026-07-05";
+     document.querySelector('[data-role="custom-to"]').value = "2026-07-14";
+     document.querySelector('[data-role="custom-apply"]').click();`,
+  );
+  await waitFor('the over-the-edge render', async () =>
+    (await cdp.evaluate(sessionId, 'document.body.dataset.ready === "true"')) === true,
+  );
+  const edge = Object.fromEntries((await cdp.evaluate(sessionId, PROBE)).panels.map((p) => [p.id, p]));
+  same(
+    'daily production users ends in gaps after Jul 10',
+    [[2, 3, 2, 1, 1, 1, null, null, null, null]],
+    edge['daily-production-users'].chart?.datasets.map((d) => d.data),
+  );
+  same(
+    'new installs are live, so they stay zero rather than gap',
+    [[2, 0, 0, 1, 2, 0, 0, 0, 0, 0]],
+    edge['new-installs'].chart?.datasets.map((d) => d.data),
+  );
 
   // Colour, spacing and label collisions are not things an assertion catches.
   // RENDER_SHOT=/tmp/dash.png npm run smoke:render → look at it.
