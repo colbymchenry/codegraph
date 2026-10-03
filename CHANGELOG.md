@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Indexing and sync on large projects, especially C and C++ codebases with huge generated headers, now keep cached source text and preprocessor data within a fixed memory budget, so the final resolution pass no longer runs out of memory. (#1583)
+- `codegraph_impact` on a heavily referenced symbol now stops at a safety limit and says the answer was truncated, instead of exhausting the MCP server's memory; narrow it with `file` or a smaller `depth`. (#1583)
+- The MCP server now recycles its query workers after they sit idle, releasing the memory a burst of large queries left behind while keeping one worker warm for the next call. (#1583)
+- Path search between two symbols no longer slows down sharply or grows its memory use on densely connected graphs. (#1583)
 
 ## [1.6.2] - 2026-10-03
 
