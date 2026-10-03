@@ -430,6 +430,13 @@ describe('python attribute-chain receivers', () => {
       expect(await resolves('class Svc:\n    def __init__(self):\n        self.x = Other()\n\n    def go(self, a):\n        if a:\n            self.x = Foo()\n        return self.x.m()\n')).toEqual([]);
     });
 
+    it('an assignment inside a nested def is not typed by the enclosing method', async () => {
+      expect(await resolves('class Svc:\n    def __init__(self, c: Foo):\n        def on_ready(c):\n            self.x = c\n        self.cb = on_ready\n\n    def go(self):\n        return self.x.m()\n')).toEqual([]);
+      cg!.close(); cg = undefined;
+      fs.rmSync(path.join(tempDir, '.codegraph'), { recursive: true, force: true });
+      expect(await resolves('def load():\n    return object\n\nclass Svc:\n    def __init__(self):\n        def setup():\n            Foo = load()\n            self.x = Foo()\n        setup()\n\n    def go(self):\n        return self.x.m()\n')).toEqual([]);
+    });
+
     it('an augmented assignment is not typed by its right-hand side', async () => {
       expect(await resolves('class Svc:\n    def go(self):\n        self.x += Foo()\n        return self.x.m()\n')).toEqual([]);
     });

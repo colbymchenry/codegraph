@@ -8605,6 +8605,7 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
   const viaSelf = new RegExp(`\\b(?:self|cls)\\.${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=(?!=)\\s*(.+?))?\\s*$`);
   let signature: string | null = null;
   let defStart = -1;
+  let nestedDefIndent = -1;
   const found = new Set<string>();
 
   for (let ln = owner.startLine + 1; ln <= owner.endLine; ln++) {
@@ -8617,14 +8618,24 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
       // The enclosing method's signature, possibly over several lines. A def
       // nested in a method is not one: its parameters and locals are its own.
       defStart = ln;
+      nestedDefIndent = -1;
       signature = text;
       for (let k = ln; k < owner.endLine && !/\)\s*(?:->[^:]*)?:\s*$/.test(signature); k++) {
         signature += ' ' + (lines[k] ?? '').trim();
       }
       continue;
     }
+    if (nestedDefIndent >= 0 && indent(line) <= nestedDefIndent) nestedDefIndent = -1;
+    if (nestedDefIndent < 0 && /^(?:async\s+)?def\s/.test(text) && indent(line) > bodyIndent) {
+      nestedDefIndent = indent(line);
+      continue;
+    }
     const m = indent(line) === bodyIndent ? classLevel.exec(text) : viaSelf.exec(text);
     if (!m || (!m[1] && !m[2])) continue;
+    // `self.x = c` inside a def nested in a method (a callback) reads that
+    // def's own parameters and locals, which the method's scope does not see:
+    // it says nothing usable here.
+    if (nestedDefIndent >= 0 && indent(line) > nestedDefIndent) continue;
     const inDef = indent(line) !== bodyIndent && defStart > 0;
     const at = ln;
     let value = m[2];
