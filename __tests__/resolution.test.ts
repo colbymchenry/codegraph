@@ -3428,6 +3428,73 @@ func (mx *Mux) dispatch() {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }, 30000);
+
+    it('resolves field chains when the method receiver type is unexported (#2323)', async () => {
+      // `func (s *server)` is the idiomatic gRPC/HTTP handler shape. The
+      // typed-parameter pattern is PascalCase-guarded, so a lowercase receiver
+      // type used to yield no base type and the whole chain was dropped.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-2323-'));
+      try {
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+        fs.mkdirSync(path.join(tmpDir, 'domain'));
+        fs.mkdirSync(path.join(tmpDir, 'handlers'));
+        fs.writeFileSync(
+          path.join(tmpDir, 'domain', 'service.go'),
+          `package domain
+
+type Service struct{}
+
+func (s *Service) AddItem(name string) error { return nil }
+
+func (s *Service) Count() int { return 0 }
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'handlers', 'server.go'),
+          `package handlers
+
+import "example.com/app/domain"
+
+type server struct {
+	service *domain.Service
+}
+
+func (s *server) Create(name string) error {
+	return s.service.AddItem(name)
+}
+
+type cache[T any] struct {
+	service *domain.Service
+}
+
+func (c *cache[T]) Size() int {
+	return c.service.Count()
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const addItem = (await cg.searchNodes('AddItem', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(addItem).toBeDefined();
+        const addCallers = await cg.getCallers(addItem!.node.id);
+        expect(addCallers.map((c) => c.node.name)).toContain('Create');
+
+        // Generic receiver: the type parameter list must not hide the type.
+        const count = (await cg.searchNodes('Count', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(count).toBeDefined();
+        const countCallers = await cg.getCallers(count!.node.id);
+        expect(countCallers.map((c) => c.node.name)).toContain('Size');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
   });
 
   describe('Imported singleton instance-method calls (#1292)', () => {
