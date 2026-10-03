@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Git sync hooks now refresh the project they were installed for, so a project inside a larger repository stays current after commit, pull and checkout; installing them no longer breaks an existing hook written in another language, and runs even when your own hook ends with `exit`.
 
 ## [1.6.2] - 2026-10-03
 
