@@ -2621,12 +2621,21 @@ function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, conte
     memo = new Map();
     PY_MODULE_LOCAL.set(context, memo);
   }
-  let local = memo.get(module);
+  // The import resolver decides where a module lives (package roots), and the
+  // answer can depend on the importer (a monorepo service's own root), so key
+  // by both. A file that merely ENDS in `requests/__init__.py` — a copy nested
+  // in a test fixture — is not the `requests` an import names.
+  const key = `${ref.filePath}\0${module}`;
+  let local = memo.get(key);
   if (local === undefined) {
-    const rel = module.replace(/\./g, '/');
-    local = context.getAllFiles().some((f) =>
-      f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
-    memo.set(module, local);
+    if (context.resolveModuleFile) {
+      local = context.resolveModuleFile(module, ref.filePath, 'python') !== null;
+    } else {
+      const rel = module.replace(/\./g, '/');
+      local = context.getAllFiles().some((f) =>
+        f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
+    }
+    memo.set(key, local);
   }
   return !local;
 }
@@ -9587,6 +9596,14 @@ function matchReferenceInner(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  // A python name imported from a module the project does not provide — `from
+  // requests import get` with no `requests` at a package root — names nothing
+  // in the project. Name matching would bind the import to any same-named
+  // symbol, such as a copy of the package nested in a test fixture.
+  if (ref.language === 'python' && ref.referenceKind === 'imports' && isPythonNameImportedFromOutside(ref.referenceName, ref, context)) {
+    return null;
   }
 
   // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,
