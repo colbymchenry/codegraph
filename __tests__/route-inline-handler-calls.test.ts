@@ -70,6 +70,6 @@ describe('inline route handler calls', () => {
   });
 
   it('reach the service a member call names', () => {
-    expect(routeCalls('/users/:id')).toContain('src/services.ts: lookup');
+    expect(routeCalls('/users/:id')).toEqual(['src/services.ts: userService::lookup']);
   });
 });

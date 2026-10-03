@@ -114,9 +114,8 @@ describe('this.<field>.<method>() (#1496)', () => {
   });
 
   it('resolves a field typed `typeof <objectLiteral>` onto the literal\'s member', () => {
-    // The members are bare-named functions inside the constant's extent (#1573).
-    expect(calleesOf('Keeper::settings')).toEqual(['getSettings']);
-    expect(calleesOf('Keeper::get')).toEqual(['get']);
+    expect(calleesOf('Keeper::settings')).toEqual(['DraftHubStorage::getSettings']);
+    expect(calleesOf('Keeper::get')).toEqual(['DraftHubStorage::get']);
     const self = cg.getCallers(method('Keeper::get').id).some(({ node }) => node.id === method('Keeper::get').id);
     expect(self).toBe(false);
   });

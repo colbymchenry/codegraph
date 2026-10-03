@@ -5,7 +5,8 @@
  * symbol shared the name, so a storage wrapper's `get` called itself (#1707).
  * Those calls stay unresolved, as do untyped identifier chains (#1566);
  * their qualified source references remain available for effect reporting. The existing
- * `window.MyNs.run()` and `this.<field>.m()` paths remain outside that guard.
+ * `window.MyNs.run()` and `this.<field>.m()` paths remain outside that guard; a
+ * `window.Known = { ping }` literal in the index names its own member (#2300).
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -44,6 +45,8 @@ beforeAll(async () => {
       'export function viaGlobal(): string {\n' +
       '  return window.MyNs.ping();\n' +
       '}\n' +
+      'window.Known = { ping };\n' +
+      'export function viaKnown(): string { return window.Known.ping(); }\n' +
       'export class PingService { ping(): string { return "service"; } }\n' +
       'export class Runner {\n' +
       '  constructor(private svc: PingService) {}\n' +
@@ -92,6 +95,7 @@ describe('TS/JS call through a host-global chain (#1707)', () => {
   it('keeps a chain rooted at a project value — window.MyNs.m() and this.<field>.m()', () => {
     const ping = fn('ping', 'service.ts').id;
     expect(callTargets(fn('viaGlobal', 'service.ts').id)).toContain(ping);
+    expect(callTargets(fn('viaKnown', 'service.ts').id)).toEqual([ping]);
     expect(callTargets(method('Runner::run').id)).toEqual([method('PingService::ping').id]);
   });
 

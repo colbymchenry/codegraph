@@ -1785,6 +1785,8 @@ function resurrectRefFromDroppedEdge(
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
+    ...(Array.isArray(e.metadata?.refCandidates) && e.metadata.refCandidates.every(candidate => typeof candidate === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
   };
 }
 
@@ -3162,6 +3164,15 @@ export class ExtractionOrchestrator {
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
+      // Literal ownership candidates must be replayed against the edited file;
+      // retaining a definition identity alone does not retain its value proof.
+      if (Array.isArray(e.metadata?.refCandidates)) {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) {
+          resurrected.push(ref);
+          continue;
+        }
+      }
       const newTargetId = replacementOf.get(e.target);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });

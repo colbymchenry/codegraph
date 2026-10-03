@@ -65,6 +65,16 @@ const INSTANCE_REF_KINDS: ReadonlySet<string> = new Set(['calls', 'references', 
 
 export function foldScriptResult(result: ExtractionResult, fold: ScriptFold, sink: ScriptSink): void {
   const blockFile = `file:${fold.filePath}`;
+  const topMetadata = new Map<string, Edge['metadata']>();
+  for (const edge of result.edges) {
+    const object = edge.metadata?.jsObject;
+    if (object && typeof object === 'object') {
+      const info = object as { binding?: string; scope?: number[] };
+      if (typeof info.binding === 'string') info.binding = info.binding.replace(/^binding:(\d+):/, (_, line: string) => `binding:${Number(line) + fold.lineOffset}:`);
+      if (Array.isArray(info.scope) && info.scope.length === 4) info.scope = info.scope.map((value, i) => i === 0 || i === 2 ? value + fold.lineOffset : value);
+    }
+    if (edge.kind === 'contains' && edge.source === blockFile) topMetadata.set(edge.target, edge.metadata);
+  }
   // What already has a parent inside the block — a method's class, a nested
   // function's function. The block's file holding something is not a parent:
   // the component is, now.
@@ -89,13 +99,14 @@ export function foldScriptResult(result: ExtractionResult, fold: ScriptFold, sin
     node.endLine += fold.lineOffset;
     node.language = fold.language;
     sink.nodes.push(node);
-    if (!parented.has(node.id)) sink.edges.push({ source: fold.componentNodeId, target: node.id, kind: 'contains' });
+    if (!parented.has(node.id)) sink.edges.push({ source: fold.componentNodeId, target: node.id, kind: 'contains',
+      ...(topMetadata.get(node.id) !== undefined ? { metadata: topMetadata.get(node.id) } : {}) });
   }
 
   for (const edge of result.edges) {
     if (edge.kind === 'contains' && edge.source === blockFile) continue;
     if (edge.line) edge.line += fold.lineOffset;
-    if (fold.perInstance && runsAsComponent(edge.source) && edge.kind !== 'imports') edge.source = fold.componentNodeId;
+    if (fold.perInstance && runsAsComponent(edge.source) && edge.kind !== 'imports' && edge.kind !== 'contains') edge.source = fold.componentNodeId;
     sink.edges.push(edge);
   }
 

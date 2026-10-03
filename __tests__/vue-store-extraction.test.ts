@@ -9,8 +9,8 @@
  *   - Vuex module: non-exported `const actions = {…}` / `const mutations = {…}`.
  *   - Pinia options: `defineStore({ actions: {…}, getters: {…} })`.
  *   - Pinia setup: `defineStore('id', () => { const foo = …; return { foo } })`.
- * And the precision gate: a non-exported `const actions = {…}` in a file that
- * isn't a Vue store contributes nothing.
+ * Plain named literals also have generic member definitions; their presence
+ * does not turn dynamic dispatch into a Vue store call.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
@@ -111,9 +111,7 @@ export const useChatStore = defineStore('chat', () => {
     cg.close?.();
   });
 
-  it('does not extract a non-exported `const actions = {…}` outside a Vue store file', async () => {
-    // A plain module that happens to hold a non-exported `const actions` object of
-    // functions, but lacks any second Vue-store signal — the gate must not fire.
+  it('plain named actions have generic ownership without synthesizing dynamic Vue dispatch', async () => {
     fs.writeFileSync(
       path.join(dir, 'commands.js'),
       `const actions = {
@@ -128,10 +126,14 @@ export function run(key) { return actions[key](); }
     await cg.indexAll();
     const db = (cg as any).db.db;
 
-    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doThing'`).get().c).toBe(0);
-    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'doOther'`).get().c).toBe(0);
-    // The real exported function is still extracted normally.
-    expect(db.prepare(`SELECT count(*) c FROM nodes WHERE name = 'run' AND kind='function'`).get().c).toBeGreaterThan(0);
+    expect(db.prepare(`SELECT kind, qualified_name FROM nodes WHERE name IN ('doThing', 'doOther') ORDER BY qualified_name`).all())
+      .toEqual([
+        { kind: 'function', qualified_name: 'actions::doOther' },
+        { kind: 'function', qualified_name: 'actions::doThing' },
+      ]);
+    const run = cg.getNodesByQualifiedName('run');
+    expect(run.map(n => n.kind)).toEqual(['function']);
+    expect(cg.getOutgoingEdgesFrom(run.map(n => n.id)).filter(e => e.kind === 'calls')).toEqual([]);
 
     cg.close?.();
   });

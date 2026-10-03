@@ -90,6 +90,8 @@ export interface ResolutionResult {
 export interface ResolutionContext {
   /** Get all nodes in a file */
   getNodesInFile(filePath: string): Node[];
+  /** AST-proven literal ownership persisted on containment edges (including anonymous scopes). */
+  getJsObjectInfo?(nodeId: string): import('../extraction/js-object-bindings').JsObjectInfo | null;
   /** Whether any node in the file is exported (`getNodesInFile(f).some(n => n.isExported)`), as one indexed probe. */
   fileHasExportedNode?(filePath: string): boolean;
   /** `getNodesInFile(f).filter(n => n.isExported)`, without decoding the rest of the file. */

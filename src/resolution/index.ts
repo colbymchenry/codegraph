@@ -29,6 +29,8 @@ import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
+import { resolveJsObjectCall, JS_OBJECT_LANGUAGES } from './js-object-members';
+import type { JsObjectInfo } from '../extraction/js-object-bindings';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -298,6 +300,7 @@ export class ReferenceResolver {
   // resolution pass (same lifetime assumption as nameCache); clearCaches() resets
   // it between passes. Callers must treat the returned array as read-only.
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
+  private jsObjectInfoCache = new Map<string, JsObjectInfo | null>();
   // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
   private fileExistsMemo = new Map<string, boolean>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
@@ -444,6 +447,7 @@ export class ReferenceResolver {
     this.supertypeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
+    this.jsObjectInfoCache.clear();
     this.fileExistsMemo.clear();
     this.manifestScopes.clear();
     this.knownNames = null;
@@ -506,8 +510,35 @@ export class ReferenceResolver {
   /**
    * Create the resolution context
    */
+  private jsObjectInfo(nodeId: string): JsObjectInfo | null {
+    if (this.jsObjectInfoCache.has(nodeId)) return this.jsObjectInfoCache.get(nodeId)!;
+    this.jsObjectInfoCache.set(nodeId, null); // a corrupt containment cycle must not recurse forever.
+    for (const edge of this.queries.getIncomingEdges(nodeId, ['contains'])) {
+      const info = edge.metadata?.jsObject;
+      if (info && typeof info === 'object') {
+        const object = info as Partial<JsObjectInfo>;
+        if (typeof object.path === 'string' && typeof object.binding === 'string' &&
+            Array.isArray(object.scope) && object.scope.length === 4 && object.scope.every(value => Number.isInteger(value) && value >= 0)) {
+          const result: JsObjectInfo = { path: object.path, binding: object.binding, scope: object.scope as JsObjectInfo['scope'] };
+          this.jsObjectInfoCache.set(nodeId, result);
+          return result;
+        }
+      }
+      if (edge.metadata?.jsObjectMember === true) {
+        const owner = this.jsObjectInfo(edge.source);
+        if (owner) {
+          const result = { ...owner, ownerId: edge.source };
+          this.jsObjectInfoCache.set(nodeId, result);
+          return result;
+        }
+      }
+    }
+    return null;
+  }
+
   private createContext(): ResolutionContext {
     return {
+      getJsObjectInfo: (nodeId) => this.jsObjectInfo(nodeId),
       resolveImport: (ref) => resolveViaImport(ref, this.context),
       isOutOfRepoImport: (source, fromFile, language) =>
         isExternalImport(source, language, this.context) &&
@@ -869,6 +900,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -1042,7 +1074,17 @@ export class ReferenceResolver {
       ref,
       this.context,
     );
-    const scoped = this.gateRustScope(candidate, ref);
+    const objectInfo = candidate &&
+      (ref.candidates !== undefined || (ref.referenceKind === 'calls' && ref.referenceName.includes('.'))) &&
+      JS_OBJECT_LANGUAGES.has(this.nodeById(candidate.targetNodeId)?.language ?? '')
+      ? this.jsObjectInfo(candidate.targetNodeId) : null;
+    const literal = candidate && (
+      (objectInfo?.ownerId && ref.candidates !== undefined &&
+        !ref.candidates.includes(this.nodeById(candidate.targetNodeId)?.qualifiedName ?? '')) ||
+      // A direct literal holder proves the receiver, not a missing callable member.
+      (objectInfo && !objectInfo.ownerId && ref.referenceKind === 'calls' && ref.referenceName.includes('.'))
+    ) ? null : candidate;
+    const scoped = this.gateRustScope(literal, ref);
     const resolved = this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
@@ -1097,6 +1139,10 @@ export class ReferenceResolver {
     // strategy ran, and PHP gives each one exactly one meaning; resolve it first.
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
+
+    const objectCall = resolveJsObjectCall(ref, this.context,
+      (name) => this.resolveOneInner({ ...ref, referenceName: name, candidates: undefined }));
+    if (objectCall !== undefined) return this.gateLanguage(objectCall, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
@@ -1401,6 +1447,7 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
+          ...(ref.original.candidates !== undefined ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -1690,6 +1737,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1810,6 +1858,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
