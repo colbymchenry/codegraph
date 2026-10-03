@@ -117,8 +117,9 @@ function spawnerOf(call: ts.CallExpression, b: ChildProcessBindings): string | n
 function optionsArg(call: ts.CallExpression, spawner: string): ts.Expression | undefined {
   const [, second, third] = call.arguments;
   if (SPAWNERS[spawner] === 'command') return second;
-  // (file, options) is allowed when the args array is omitted.
-  if (second && ts.isObjectLiteralExpression(second)) return second;
+  // (file, options) is allowed when the args array is omitted: an object there
+  // is the options, literal or not (`execFileSync('git', opts)`).
+  if (call.arguments.length === 2 || (second && ts.isObjectLiteralExpression(second))) return second;
   return third;
 }
 
@@ -215,13 +216,15 @@ function hideState(expr: ts.Expression | undefined, sf: ts.SourceFile, seen = ne
   if (ts.isObjectLiteralExpression(e)) {
     let state: HideState = 'absent';
     for (const prop of e.properties) {
-      if (ts.isPropertyAssignment(prop) && prop.name.getText(sf) === 'windowsHide') {
-        state = unwrap(prop.initializer).kind === ts.SyntaxKind.TrueKeyword ? 'hidden' : 'unhidden';
-      } else if (ts.isShorthandPropertyAssignment(prop) && prop.name.text === 'windowsHide') {
-        state = 'unhidden'; // not provable statically
-      } else if (ts.isSpreadAssignment(prop)) {
+      if (ts.isSpreadAssignment(prop)) {
         const spread = hideState(prop.expression, sf, trail);
         if (spread !== 'absent') state = spread;
+      } else if (ts.isComputedPropertyName(prop.name)) {
+        state = 'unhidden'; // `[key]: …` may be windowsHide
+      } else if (prop.name.text === 'windowsHide') {
+        // Quoted or not, the same property. Only a literal `true` is provable:
+        // a shorthand, a method or an accessor is not.
+        state = ts.isPropertyAssignment(prop) && unwrap(prop.initializer).kind === ts.SyntaxKind.TrueKeyword ? 'hidden' : 'unhidden';
       }
     }
     return state; // last write wins, matching object-literal semantics
@@ -330,6 +333,8 @@ describe('the windowsHide guard fails closed', () => {
     ['windowsHide: false', `import { spawn } from 'child_process'; spawn('git', [], { windowsHide: false });`],
     ['a later spread overriding it', `import { spawn } from 'child_process'; spawn('git', [], { windowsHide: true, ...{ windowsHide: false } });`],
     ['a later spread that might override it', `import { spawn } from 'child_process'; spawn('git', [], { windowsHide: true, ...extra() });`],
+    ['a later quoted key overriding it', `import { spawn } from 'child_process'; spawn('git', [], { windowsHide: true, 'windowsHide': false });`],
+    ['a later computed key that might override it', `import { spawn } from 'child_process'; spawn('git', [], { windowsHide: true, [key]: false });`],
     ['a default import', `import cp from 'child_process'; cp.execFileSync('git', ['status'], { encoding: 'utf8' });`],
     ['an import-equals', `import cp = require('child_process'); cp.spawnSync('git', ['status']);`],
     ['a require()', `const { execFileSync } = require('child_process'); execFileSync('git', ['status'], { windowsHide: true });`],
@@ -371,6 +376,8 @@ describe('the windowsHide guard fails closed', () => {
   it.each([
     ['a literal', `import { execFileSync } from 'child_process'; execFileSync('git', ['status'], { windowsHide: true });`],
     ['(file, options)', `import { execFileSync } from 'child_process'; execFileSync('git', { windowsHide: true });`],
+    ['(file, options) through a const', `import { execFileSync } from 'child_process'; const o = { windowsHide: true }; execFileSync('git', o);`],
+    ['a quoted key', `import { spawn } from 'child_process'; spawn('git', [], { 'windowsHide': true });`],
     ['a command spawner', `import { exec } from 'child_process'; exec('git status', { windowsHide: true }); /a/.exec('a');`],
     ['a const', `import { spawn } from 'child_process'; const o = { windowsHide: true }; spawn('git', [], o);`],
     ['a spread const', `import { spawn } from 'child_process'; const base = { windowsHide: true }; spawn('git', [], { ...base, cwd: '.' });`],
