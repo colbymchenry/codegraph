@@ -471,6 +471,25 @@ npm install -g @colbymchenry/codegraph
 
 <sub>One wildcard auto-approves every CodeGraph tool — `codegraph_explore` is the only one listed by default, but if you re-enable others via `CODEGRAPH_MCP_TOOLS` they're already permitted, no prompt.</sub>
 
+**Optional: make Claude Code query CodeGraph before searching text.** `codegraph gate-hook` is an opt-in hook that, in an indexed project, denies `Grep`, `Glob` and `rg`/`grep`/`find`/`fd` run via Bash until the session has made one CodeGraph query (the MCP tool or `codegraph explore|query|node`). Searches in `node_modules` are never blocked, and it does nothing outside an indexed project. Register it yourself — `codegraph install` does not add it:
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Grep|Glob|Bash", "hooks": [{ "type": "command", "command": "codegraph gate-hook" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "mcp__.*codegraph.*|Bash", "hooks": [{ "type": "command", "command": "codegraph gate-hook" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "mcp__.*codegraph.*|Bash", "hooks": [{ "type": "command", "command": "codegraph gate-hook" }] }
+    ]
+  }
+}
+```
+
+<sub>Set `CODEGRAPH_NO_GATE_HOOK=1` to switch it off without editing settings. On any error it allows the call silently, so it can't break a session.</sub>
+
 </details>
 
 <details>

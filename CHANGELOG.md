@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- New opt-in Claude Code hook, `codegraph gate-hook`, for when an agent keeps reaching for grep in an indexed project. Registered for `PreToolUse` and `PostToolUse` (see the README), it turns away Grep, Glob and `rg`/`grep`/`find`/`fd` until the session has made one CodeGraph query. After that, text search works again for literals and non-code files. Searches inside `node_modules` are never blocked, and `CODEGRAPH_NO_GATE_HOOK=1` turns it off.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

@@ -1657,6 +1657,43 @@ program
   });
 
 /**
+ * codegraph gate-hook  (hidden)
+ *
+ * An opt-in Claude Code hook (PreToolUse `Grep|Glob|Bash`, PostToolUse and
+ * PostToolUseFailure `mcp__.*codegraph.*|Bash`) that denies text search in an
+ * indexed project until the session has made one CodeGraph query. Reads the
+ * hook payload JSON on stdin; prints a PreToolUse deny JSON only when it
+ * blocks. NOT installed by `codegraph install` — users register it themselves.
+ *
+ * LOAD-BEARING: same contract as `prompt-hook` — every failure path (kill-switch
+ * `CODEGRAPH_NO_GATE_HOOK=1`, TTY stdin, bad payload, no index) exits 0 silently.
+ */
+program
+  .command('gate-hook', { hidden: true })
+  .description('Claude Code PreToolUse/PostToolUse hook: require a CodeGraph query before text search (reads hook JSON on stdin)')
+  .action(async () => {
+    try {
+      if (process.env.CODEGRAPH_NO_GATE_HOOK === '1') return;
+      if (process.stdin.isTTY) return; // invoked by hand, no piped payload
+
+      const raw = await new Promise<string>((resolve) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', (c) => { data += c; });
+        process.stdin.on('end', () => resolve(data));
+        process.stdin.on('error', () => resolve(data));
+      });
+
+      const { runGateHook } = await import('../hooks/gate');
+      const out = runGateHook(raw);
+      try { getTelemetry().recordUsage('cli_command', `gate-hook-${out ? 'deny' : 'allow'}`, true); } catch { /* never break the hook */ }
+      if (out) process.stdout.write(out + '\n');
+    } catch {
+      // Degradable by contract: never surface an error to the tool pipeline.
+    }
+  });
+
+/**
  * codegraph node [name]
  *
  * The CLI face of the MCP codegraph_node tool: one symbol's source +
