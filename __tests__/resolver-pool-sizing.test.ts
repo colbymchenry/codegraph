@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import * as os from 'os';
-import { ResolverPool } from '../src/resolution/resolver-pool';
+import { ResolverPool, ADAPTIVE_ENGAGE_MIN_REFS, shouldEngageAdaptively } from '../src/resolution/resolver-pool';
 import {
   cgroupMemoryAvailable,
   darwinMemoryAvailable,
@@ -105,4 +105,18 @@ describe('memory budget helpers', () => {
       expect(darwinMemoryAvailable()).toBeNull();
     }
   );
+});
+
+describe('adaptive pool engagement needs a real amount of work left', () => {
+  it('does not boot the pool for a small remainder, however slow the observed rate', () => {
+    // A busy machine: 11 refs left projected at 506 ms (seen on a loaded 4-core VM).
+    expect(shouldEngageAdaptively(506, 11, 400)).toBe(false);
+    expect(shouldEngageAdaptively(60_000, ADAPTIVE_ENGAGE_MIN_REFS - 1, 400)).toBe(false);
+  });
+
+  it('boots it for a large remainder whose projected settle clears the bar', () => {
+    // tokio-class: ~55k Rust refs at ~36 µs each.
+    expect(shouldEngageAdaptively(1_980, 55_000, 400)).toBe(true);
+    expect(shouldEngageAdaptively(399, 55_000, 400)).toBe(false);
+  });
 });

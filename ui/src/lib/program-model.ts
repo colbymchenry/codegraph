@@ -174,12 +174,12 @@ export function orderGraph(program: NonNullable<WireStepsPayload['program']>, an
           // An arm that answers, returns or throws does not rejoin — nothing
           // leaves the last box in it, which is what says so on a canvas.
           const armTails = flow(arm.body, entry, []);
-          if (arm.ends === null) out.push(...armTails);
+          if (arm.ends === null) for (const t of armTails) out.push(t);
         }
         // An `if` with no `else` runs on either way; a fork with both sides
         // covered runs on only through the arms that did not end.
-        if (item.arms.length < 2) out.push(...tails.map((t) => ({ ...t, runs: [...t.runs, ...runs] })));
-        tails = out;
+        if (item.arms.length < 2) for (const t of tails) out.push({ ...t, runs: [...t.runs, ...runs] });
+        tails = mergeTails(out);
       } else if (item.kind === 'block') {
         const label = runWords(item);
         const inner = flow(item.body, tails, [...runs, label]);
@@ -204,6 +204,26 @@ export function orderGraph(program: NonNullable<WireStepsPayload['program']>, an
   const ids = new Set(seen);
   for (const f of forks) ids.add(f.id);
   return { edges, depth: rows(anchor, ids, edges), forks };
+}
+
+/**
+ * Ways on that wait at the same place are one place to go on from. Without
+ * this, an `if` with no `else` — or a fork whose arms draw nothing — doubles
+ * every way it crosses (once under its condition, once without), and a body
+ * with eighty such checks (jsoup's `parse`) never finished: the page died
+ * overflowing the stack. The merged way keeps what every way to it had to
+ * hold; a condition only some of them needed is dropped, so the line
+ * under-claims rather than claims a side it does not have.
+ */
+function mergeTails(tails: readonly Tail[]): Tail[] {
+  const byPlace = new Map<string, Tail>();
+  for (const t of tails) {
+    const key = `${t.id}\0${t.arm ?? ''}\0${t.runs.join('\0')}`;
+    const found = byPlace.get(key);
+    if (found) found.when = found.when.filter((w) => t.when.includes(w));
+    else byPlace.set(key, { ...t, when: [...t.when], runs: [...t.runs] });
+  }
+  return [...byPlace.values()];
 }
 
 /** Whether anything in this block draws a box — a fork with one drawn arm is a guard clause, not a point. */

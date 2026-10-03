@@ -287,7 +287,14 @@ export function resolveNamedTokens(
 ): NamedSymbolFlow {
   const directed = opts.mode === 'directed';
   const out = EMPTY_FLOW();
-  const tokens = flowTokens(query);
+  // A directed question names its two ends exactly — a symbol's own name, as
+  // the viewer's links write it: an Objective-C selector (`initWithFrame:`), a
+  // Ruby predicate (`valid?`), a two-letter method (`ok`, Go's `Do`). The
+  // free-text filter below is for explore's bag of words, and it dropped every
+  // one of those, leaving the other end reported as naming nothing.
+  const tokens = directed && opts.from && opts.to
+    ? [...new Set([normalizeToken(opts.from), normalizeToken(opts.to)])]
+    : flowTokens(query);
   out.tokens = tokens;
   if (tokens.length < 2) return out;
 

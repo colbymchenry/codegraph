@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import { Worker } from 'worker_threads';
 import CodeGraph from '../src/index';
 import { measurePendingChanges } from '../src/mcp/index-freshness';
 import { ToolHandler } from '../src/mcp/tools';
@@ -42,9 +43,8 @@ describe('MCP status freshness (#1959)', () => {
     fs.writeFileSync(path.join(root, 'add.ts'), 'export const added = 1;\n');
 
     const result = await handler.execute('codegraph_status', {});
-    expect(result.structuredContent).toEqual({ freshness: {
-      lastIndexedAt: cg.getLastIndexedAt(), changes: { added: 1, modified: 1, removed: 1 }, complete: true,
-    } });
+    // Claude Code would show structuredContent in place of this text (#2088).
+    expect(result).not.toHaveProperty('structuredContent');
     const changed = result.content[0].text;
     expect(changed).toContain('**Changes since index:** 1 added, 1 modified, 1 removed');
   });
@@ -52,6 +52,32 @@ describe('MCP status freshness (#1959)', () => {
   it('returns unknown rather than a false zero when the measurement cannot open an index', async () => {
     expect(await measurePendingChanges(path.join(root, 'missing'))).toBeNull();
   });
+
+  it('past its deadline, never terminates the worker before it has loaded its modules', async () => {
+    // Terminating a worker while it loads its modules can crash the whole
+    // process on Windows (0xC0000005). A 1 ms deadline passes while the real
+    // worker is still loading: the answer is unknown at once, and the worker
+    // is terminated only after it has posted 'loaded'.
+    const posted = new WeakSet<object>();
+    const loadedWhenEnded: boolean[] = [];
+    const emit = Worker.prototype.emit;
+    vi.spyOn(Worker.prototype, 'emit').mockImplementation(function (this: Worker, event: string | symbol, ...args: unknown[]) {
+      if (event === 'message') posted.add(this);
+      return emit.call(this, event, ...args);
+    });
+    const terminate = Worker.prototype.terminate;
+    vi.spyOn(Worker.prototype, 'terminate').mockImplementation(function (this: Worker) {
+      loadedWhenEnded.push(posted.has(this));
+      return terminate.call(this);
+    });
+    try {
+      expect(await measurePendingChanges(root, 1)).toBeNull();
+      await vi.waitFor(() => expect(loadedWhenEnded).toHaveLength(1), { timeout: 20_000 });
+      expect(loadedWhenEnded).toEqual([true]);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  }, 30_000);
 
   it('counts edits committed after the index even when the working tree is clean', async () => {
     fs.writeFileSync(path.join(root, 'modify.ts'), 'export const modify = 99;\n');

@@ -1227,6 +1227,311 @@ def direct(obj: Store):
     } finally { cg.close(); }
   });
 
+  it('#1820: a module global bound by its assignments resolves as a receiver', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-global-'));
+    fs.writeFileSync(path.join(tmpDir, 'store.py'), 'class Store:\n    def fetch(self, ids):\n        return ids\n');
+    fs.writeFileSync(path.join(tmpDir, 'decoy.py'), 'class Decoy:\n    def fetch(self, ids):\n        return []\n');
+    fs.writeFileSync(path.join(tmpDir, 'settings.py'), `from decoy import Decoy
+conn = None
+
+def init():
+    global conn
+    from store import Store
+    conn = Store()
+
+def shadow():
+    conn = Decoy()
+    return conn
+
+def same_file(pool):
+    pool.submit(conn.fetch, [])
+
+def param_shadow(pool, conn):
+    pool.submit(conn.fetch, [])
+
+def loop_shadow(pool, items):
+    for conn in items:
+        pool.submit(conn.fetch, [])
+`);
+    fs.writeFileSync(path.join(tmpDir, 'consumer.py'), `import settings
+from settings import conn
+
+def via_module(pool):
+    pool.submit(settings.conn.fetch, [])
+
+def via_name(pool):
+    pool.submit(conn.fetch, [])
+
+def import_shadow(pool, settings):
+    pool.submit(settings.conn.fetch, [])
+
+def local_import(pool):
+    from settings import conn
+    pool.submit(conn.fetch, [])
+`);
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const store = cg.getNodesByName('fetch').find(n => n.qualifiedName.startsWith('Store::'))!;
+      const into = cg.getIncomingEdges(store.id).filter(e => e.kind === 'references' && e.metadata?.fnRef === true);
+      // A parameter or loop variable of the same name is not the global; a local import of it is.
+      expect(sourceNames(cg, into)).toEqual(['local_import', 'same_file', 'via_module', 'via_name']);
+      const decoy = cg.getNodesByName('fetch').find(n => n.qualifiedName.startsWith('Decoy::'))!;
+      expect(cg.getIncomingEdges(decoy.id).filter(e => e.metadata?.fnRef === true)).toHaveLength(0);
+    } finally { cg.close(); }
+  });
+
+  it('#1820: a module global with several backends binds to the declaration they share', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-global-many-'));
+    fs.mkdirSync(path.join(tmpDir, 'backends'));
+    fs.writeFileSync(path.join(tmpDir, 'backends', '__init__.py'), '');
+    fs.writeFileSync(path.join(tmpDir, 'backends', 'base.py'),
+      'class Base:\n    def fetch(self, ids):\n        raise NotImplementedError("backend")\n' +
+      '    def search(self):\n        raise NotImplementedError("backend")\n');
+    fs.writeFileSync(path.join(tmpDir, 'backends', 'es.py'),
+      'from backends.base import Base\nclass ES(Base):\n    def search(self):\n        return []\n');
+    fs.writeFileSync(path.join(tmpDir, 'backends', 'vec.py'),
+      'from backends.base import (\n    Base,\n)\nclass Vec(Base):\n    def fetch(self, ids):\n        return ids\n' +
+      '    def search(self):\n        return []\n');
+    fs.writeFileSync(path.join(tmpDir, 'other.py'), 'class Other:\n    def fetch(self, ids):\n        return ids\n');
+    fs.writeFileSync(path.join(tmpDir, 'settings.py'), `import backends.es
+conn = None
+
+def init(engine):
+    global conn
+    if engine == "es":
+        conn = backends.es.ES()
+    else:
+        from backends import vec as vec_module
+        conn = vec_module.Vec()
+`);
+    fs.writeFileSync(path.join(tmpDir, 'unknown.py'), `from other import Other
+conn = None
+mixed = None
+
+def init(flag):
+    global conn, mixed
+    conn = make_conn()
+    mixed = Other() if flag else None
+`);
+    fs.writeFileSync(path.join(tmpDir, 'consumer.py'), `import settings
+import unknown
+
+def gc(pool):
+    pool.submit(settings.conn.fetch, [])
+
+def find(pool):
+    pool.submit(settings.conn.search)
+
+def opaque(pool):
+    pool.submit(unknown.conn.fetch, [])
+    pool.submit(unknown.mixed.fetch, [])
+`);
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const byOwner = (owner: string, name = 'fetch') => cg.getNodesByName(name).find(n => n.qualifiedName.startsWith(`${owner}::`))!;
+      const fnRefs = (owner: string, name = 'fetch') => cg.getIncomingEdges(byOwner(owner, name).id)
+        .filter(e => e.kind === 'references' && e.metadata?.fnRef === true);
+      // ES inherits Base.fetch and Vec overrides it: the shared declaration is Base.fetch.
+      expect(sourceNames(cg, fnRefs('Base'))).toEqual(['gc']);
+      expect(fnRefs('Vec')).toHaveLength(0);
+      // Both backends override search: the declaration they inherit is still Base.search.
+      expect(sourceNames(cg, fnRefs('Base', 'search'))).toEqual(['find']);
+      expect([...fnRefs('ES', 'search'), ...fnRefs('Vec', 'search')]).toHaveLength(0);
+      // An opaque initializer (`make_conn()`, a conditional) leaves the global's type unknown.
+      expect(fnRefs('Other')).toHaveLength(0);
+    } finally { cg.close(); }
+  });
+
+  // One index per adversarial case: several seconds on a loaded machine.
+  it('#1820: a module global never binds through a shadow, an unknown value or a deeper chain', async () => {
+    const header = `from store import Store
+from decoy import Decoy
+conn = None
+
+def init():
+    global conn
+    conn = Store()
+`;
+    // Each case: its files, and the fnRef edges into any `fetch` it must produce.
+    const cases: Record<string, [Record<string, string>, string[]]> = {
+      control: [{ 'm.py': header + 'def cb(pool):\n    pool.submit(conn.fetch)\n' }, ['cb -> Store::fetch']],
+      tuple_first: [{ 'm.py': header + 'def cb(pool):\n    conn, _ = (Decoy(), None)\n    pool.submit(conn.fetch)\n' }, []],
+      loop_and_nested_global: [{ 'm.py': header +
+        'def cb(pool, items):\n    for conn in items:\n        pass\n    def nested():\n        global conn\n    pool.submit(conn.fetch)\n' }, []],
+      multiline_conditional: [{ 'm.py': header.replace('conn = Store()', 'conn = Store(\n        x=1,\n    ) if flag else Decoy()') +
+        'def cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      multiline_constructor: [{ 'm.py': header.replace('conn = Store()', 'conn = Store(\n        x=1,\n    )') +
+        'def cb(pool):\n    pool.submit(conn.fetch)\n' }, ['cb -> Store::fetch']],
+      closure_param: [{ 'm.py': header + 'def outer(conn):\n    def cb(pool):\n        pool.submit(conn.fetch)\n    return cb\n' }, []],
+      closure_local: [{ 'm.py': header + 'def outer(pool):\n    conn = Decoy()\n    def cb():\n        pool.submit(conn.fetch)\n    return cb\n' }, []],
+      lambda_param: [{ 'm.py': header + 'def cb(pool):\n    pool.submit(lambda conn: pool.map(conn.fetch))\n' }, []],
+      comprehension: [{ 'm.py': header + 'def cb(pool, xs):\n    [pool.submit(conn.fetch) for conn in xs]\n' }, []],
+      except_as: [{ 'm.py': header + 'def cb(pool):\n    try:\n        pass\n    except Exception as conn:\n        pool.submit(conn.fetch)\n' }, []],
+      match_as: [{ 'm.py': header + 'def cb(pool, x):\n    match x:\n        case Decoy() as conn:\n            pool.submit(conn.fetch)\n' }, []],
+      global_in_nested_def: [{ 'm.py': 'from decoy import Decoy\nconn = None\n\ndef init():\n    def helper():\n        global conn\n    conn = Decoy()\n\n' +
+        'def cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      keyword_in_multiline_call: [{ 'm.py': 'from decoy import Decoy\nconn = None\napp = dict(\n    conn=Decoy()\n)\n\n' +
+        'def cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      tuple_rebind: [{ 'm.py': header + 'def reset():\n    global conn\n    conn, other = Decoy(), 1\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      with_rebind: [{ 'm.py': header + 'def reset():\n    global conn\n    with open_decoy() as conn:\n        pass\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      docstring: [{ 'm.py': 'from store import Store\nconn = None\n"""\nconn = Store()\n"""\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      deeper_chain: [{ 'settings.py': header, 'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.pool.fetch)\n' }, []],
+      importer_rebinds: [{ 'settings.py': header,
+        'c.py': 'from settings import conn\nfrom decoy import Decoy\n\ndef reset():\n    global conn\n    conn = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      local_import_of_other_module: [{ 'settings.py': header, 'other_settings.py': 'from decoy import Decoy\nconn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    import other_settings as settings\n    pool.submit(settings.conn.fetch)\n' }, []],
+      local_from_import_of_other_module: [{ 'settings.py': header, 'other_settings.py': 'from decoy import Decoy\nconn = Decoy()\n',
+        'c.py': 'from settings import conn\n\ndef cb(pool):\n    from other_settings import conn\n    pool.submit(conn.fetch)\n' }, []],
+      comment_in_parenthesized_import: [{ 'settings.py': header + 'other = 1\n',
+        'c.py': 'from settings import (\n    other,  # see fetch()\n    conn,\n)\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, ['cb -> Store::fetch']],
+      star_import_override: [{ 'local.py': 'from decoy import Decoy\nconn = Decoy()\n', 'settings.py': header + 'from local import *\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      match_sequence_capture: [{ 'm.py': header + 'def cb(pool, x):\n    match x:\n        case [conn]:\n            pool.submit(conn.fetch)\n' }, []],
+      match_keyword_capture: [{ 'm.py': header + 'def cb(pool, x):\n    match x:\n        case Decoy(inner=conn):\n            pool.submit(conn.fetch)\n' }, []],
+      match_bare_capture: [{ 'm.py': header + 'def cb(pool, x):\n    match x:\n        case conn:\n            pool.submit(conn.fetch)\n' }, []],
+      multiline_loop_target: [{ 'm.py': header + 'def cb(pool, xs):\n    for (a,\n         conn) in xs:\n        pool.submit(conn.fetch)\n' }, []],
+      multiline_tuple_local: [{ 'm.py': header + 'def cb(pool):\n    (a,\n     conn) = 1, Decoy()\n    pool.submit(conn.fetch)\n' }, []],
+      multiline_tuple_rebind: [{ 'm.py': header + 'def reset():\n    global conn\n    (a,\n     conn) = 1, Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      annotation_contradicts_value: [{ 'm.py': 'from store import Store\nfrom decoy import Decoy\nconn: Store = Decoy()\n\n' +
+        'def cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      annotation_over_factory: [{ 'm.py': 'from store import Store\nconn: Store = make_store()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' },
+        ['cb -> Store::fetch']],
+      external_production_write: [{ 'settings.py': header,
+        'reset.py': 'import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      external_aliased_write: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'reset.py': 'import pkg.settings as cfg\n\ndef reset():\n    cfg.conn = make_conn()\n',
+        'c.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      external_relative_write: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'pkg/reset.py': 'from . import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'c.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      external_setattr: [{ 'settings.py': header,
+        'reset.py': 'import settings\nfrom decoy import Decoy\n\ndef reset():\n    setattr(settings, "conn", Decoy())\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      external_subclass_write: [{ 'settings.py': header,
+        'sub.py': 'from store import Store\nclass SubStore(Store):\n    def fetch(self, ids):\n        return ids\n',
+        'reset.py': 'import settings\nfrom sub import SubStore\n\ndef reset():\n    settings.conn = SubStore()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      test_double_write: [{ 'settings.py': header,
+        'tests/test_c.py': 'import settings\nfrom unittest.mock import MagicMock\n\ndef test_cb(pool):\n    settings.conn = MagicMock()\n    pool.submit(settings.conn.fetch)\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      test_monkeypatch: [{ 'settings.py': header,
+        'tests/test_c.py': 'import settings\n\ndef test_cb(monkeypatch, pool):\n    monkeypatch.setattr(settings, "conn", object())\n    pool.submit(settings.conn.fetch)\n' }, []],
+      globals_literal_write: [{ 'm.py': header + 'def reset():\n    globals()["conn"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      globals_dynamic_write: [{ 'm.py': header + 'for name, obj in [("conn", Decoy())]:\n    globals()[name] = obj\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      unrelated_attribute_write: [{ 'settings.py': header,
+        'other.py': 'from decoy import Decoy\n\nclass Holder:\n    def __init__(self):\n        self.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      // A write lands on the module its import names, never on another module sharing its tail.
+      write_path_is_exact: [{ 'x/__init__.py': '', 'y/__init__.py': '', 'x/settings.py': header, 'y/settings.py': header,
+        'reset.py': 'from x import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'cx.py': 'from x import settings\n\ndef cb_x(pool):\n    pool.submit(settings.conn.fetch)\n',
+        'cy.py': 'from y import settings\n\ndef cb_y(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb_y -> Store::fetch']],
+      ambiguous_write_target: [{ 'x/__init__.py': '', 'y/__init__.py': '', 'x/settings.py': header, 'y/settings.py': header,
+        'reset.py': 'import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'cx.py': 'from x import settings\n\ndef cb_x(pool):\n    pool.submit(settings.conn.fetch)\n',
+        'cy.py': 'from y import settings\n\ndef cb_y(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      relative_write_is_exact: [{ 'pkg/__init__.py': '', 'pkg/sub/__init__.py': '', 'pkg/settings.py': header,
+        'other/__init__.py': '', 'other/pkg/__init__.py': '', 'other/pkg/settings.py': header,
+        'pkg/sub/reset.py': 'from .. import settings\n\ndef reset():\n    settings.conn = make_conn()\n',
+        'c2.py': 'from other.pkg import settings\n\ndef cb2(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb2 -> Store::fetch']],
+      namespace_import_binds_root: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'c.py': 'import pkg.settings\nfrom decoy import Decoy\n\nsettings = Bag()\nsettings.conn = Decoy()\n',
+        'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      // `other.pkg.settings as settings` is not an explicit alias of `pkg.settings`: the
+      // write goes to the other module, so pkg's global keeps its type (the consumer's
+      // relative import names pkg/settings.py exactly).
+      alias_of_longer_module_is_not_explicit: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'other/__init__.py': '', 'other/pkg/__init__.py': '', 'other/pkg/settings.py': 'conn = None\n',
+        'reset.py': 'import pkg.settings\nimport other.pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'pkg/d.py': 'from . import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      alias_in_string_is_not_explicit: [{ 'pkg/__init__.py': '', 'pkg/settings.py': 'conn = None\n',
+        'reset.py': 'import pkg.settings\nfrom decoy import Decoy\nnote = "import pkg.settings as settings"\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      explicit_alias_equal_to_leaf: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'reset.py': 'import pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      one_line_main_write: [{ 'settings.py': header,
+        'run.py': 'import settings\nfrom decoy import Decoy\n\nif __name__ == "__main__": settings.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      globals_in_main_block: [{ 'm.py': header + 'if __name__ == "__main__":\n    globals()["conn"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' },
+        ['cb -> Store::fetch']],
+      vars_in_function_is_locals: [{ 'm.py': header + 'def dump():\n    return vars()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' },
+        ['cb -> Store::fetch']],
+      example_write_is_production: [{ 'settings.py': header,
+        'examples/wire.py': 'import settings\nfrom decoy import Decoy\n\ndef wire():\n    settings.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      conftest_write_is_test: [{ 'settings.py': header,
+        'pkg/conftest.py': 'import settings\nfrom decoy import Decoy\n\ndef fixture():\n    settings.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      main_block_write: [{ 'settings.py': header,
+        'run.py': 'import settings\nfrom decoy import Decoy\n\nif __name__ == "__main__":\n    settings.conn = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      own_main_block_write: [{ 'm.py': header + 'if __name__ == "__main__":\n    conn = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' },
+        ['cb -> Store::fetch']],
+      globals_continued_key: [{ 'm.py': header + 'def reset():\n    globals()[\n        "conn"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      globals_alias: [{ 'm.py': header + 'def reset():\n    g = globals()\n    g["conn"] = Decoy()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      globals_in_string: [{ 'm.py': header + 'NOTE = "globals().update(mapping)"\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' },
+        ['cb -> Store::fetch']],
+      external_dict_write: [{ 'settings.py': header,
+        'reset.py': 'import settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.__dict__["conn"] = Decoy()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
+      external_annotated_write: [{ 'settings.py': header,
+        'reset.py': 'import settings\nfrom store import Store\n\ndef reset():\n    settings.conn: Store = Store()\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      external_parenthesized_write: [{ 'settings.py': header,
+        'reset.py': 'import settings\nfrom store import Store\n\ndef reset():\n    settings.conn = (Store())\n',
+        'c.py': 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      dotted_import_collision: [{ 'alpha/__init__.py': '', 'beta/__init__.py': '',
+        'alpha/foo.py': 'class Client:\n    def fetch(self):\n        return 1\n', 'beta/foo.py': 'class Client:\n    def fetch(self):\n        return 2\n',
+        'm.py': 'import beta.foo\nimport alpha.foo\nconn = None\n\ndef init():\n    global conn\n    conn = alpha.foo.Client()\n\ndef cb(pool):\n    pool.submit(conn.fetch)\n' }, []],
+      dotted_base_collision: [{ 'alpha/__init__.py': '', 'beta/__init__.py': '',
+        'alpha/foo.py': 'class Client:\n    def fetch(self):\n        return 1\n', 'beta/foo.py': 'class Client:\n    def fetch(self):\n        return 2\n',
+        'm.py': 'import beta.foo\nimport alpha.foo\n\nclass Sub(alpha.foo.Client):\n    pass\n\ndef go(pool, s: Sub):\n    pool.submit(s.fetch)\n' }, []],
+    };
+    const got: Record<string, string[]> = {};
+    for (const [name, [files, _]] of Object.entries(cases)) {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `cg-fnref-global-${name}-`));
+      const all = { 'store.py': 'class Store:\n    def fetch(self, ids):\n        return ids\n',
+        'decoy.py': 'class Decoy:\n    def fetch(self, ids):\n        return []\n', ...files };
+      for (const [file, content] of Object.entries(all)) {
+        fs.mkdirSync(path.dirname(path.join(tmpDir, file)), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, file), content);
+      }
+      const cg = CodeGraph.initSync(tmpDir);
+      try {
+        await cg.indexAll();
+        got[name] = cg.getNodesByName('fetch').flatMap(t => cg.getIncomingEdges(t.id)
+          .filter(e => e.kind === 'references' && e.metadata?.fnRef === true)
+          .map(e => `${cg.getNode(e.source)?.name} -> ${t.qualifiedName}`)).sort();
+      } finally { cg.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); tmpDir = undefined; }
+    }
+    expect(got).toEqual(Object.fromEntries(Object.entries(cases).map(([name, [, want]]) => [name, want])));
+  }, 60_000);
+
+  it('#1820: a module global re-resolves after its module changes (sync)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-global-sync-'));
+    const settings = 'from store import Store\nfrom decoy import Decoy\nconn = None\n\ndef init():\n    global conn\n    conn = Store()\n';
+    const consumer = 'import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n';
+    fs.writeFileSync(path.join(tmpDir, 'store.py'), 'class Store:\n    def fetch(self, ids):\n        return ids\n');
+    fs.writeFileSync(path.join(tmpDir, 'decoy.py'), 'class Decoy:\n    def fetch(self, ids):\n        return []\n');
+    fs.writeFileSync(path.join(tmpDir, 'settings.py'), settings);
+    fs.writeFileSync(path.join(tmpDir, 'consumer.py'), consumer);
+    const cg = CodeGraph.initSync(tmpDir);
+    const edges = () => cg.getNodesByName('fetch').flatMap(t => cg.getIncomingEdges(t.id)
+      .filter(e => e.metadata?.fnRef === true).map(e => `${cg.getNode(e.source)?.name} -> ${t.qualifiedName}`));
+    try {
+      await cg.indexAll();
+      expect(edges()).toEqual(['cb -> Store::fetch']);
+      fs.writeFileSync(path.join(tmpDir, 'settings.py'), settings.replace('conn = Store()', 'conn = Decoy()'));
+      fs.writeFileSync(path.join(tmpDir, 'consumer.py'), consumer + '\n# touched\n');
+      await cg.sync();
+      expect(edges()).toEqual(['cb -> Decoy::fetch']);
+    } finally { cg.close(); }
+  });
+
   it('#1820: Go receiver types disambiguate method values and reject external fields', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-go-scope-'));
     fs.writeFileSync(path.join(tmpDir, 'main.go'), `package demo

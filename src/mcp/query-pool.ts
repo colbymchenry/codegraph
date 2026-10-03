@@ -69,6 +69,17 @@ const CRASH_BUDGET = 12;
  */
 const MAX_CONCURRENT_SPAWN = 2;
 
+/**
+ * How long `destroy()` waits for a worker that is still starting up before
+ * terminating it anyway. Terminating a worker while it is still loading its
+ * modules can take the whole process down with an access violation
+ * (0xC0000005, seen on Windows), and the daemon shuts its pool down whenever
+ * it stops — a session that ends within a few seconds of starting has a
+ * worker in exactly that state. A start takes about a second normally and a
+ * few under heavy load; the cap only bounds a start that is wedged.
+ */
+const WORKER_START_SETTLE_MS = 15_000;
+
 /** Shape of a message a worker posts back (ready handshake or a tool result). */
 interface WorkerMessage {
   type?: string;
@@ -99,6 +110,8 @@ export interface QueryPoolOptions {
   maxRetries?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
+  /** How long destroy() waits on a worker still starting up (tests shorten it). Default 15s. */
+  startSettleMs?: number;
 }
 
 /**
@@ -150,6 +163,10 @@ export class QueryPool {
   // a large DB open) saturate the box and starve the main loop. Grow only when
   // the queue outstrips idle + pending.
   private pendingWorkers = new Set<PoolWorker>();
+  // Each worker's start, settled when it posts 'ready' (either way) or goes
+  // away — what destroy() waits on before terminating it (see
+  // WORKER_START_SETTLE_MS).
+  private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void }>();
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
@@ -158,6 +175,7 @@ export class QueryPool {
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly createWorker: () => PoolWorker;
+  private readonly startSettleMs: number;
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
@@ -165,6 +183,7 @@ export class QueryPool {
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
+    this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
 
@@ -211,12 +230,18 @@ export class QueryPool {
     }
     this.workers.add(w);
     this.pendingWorkers.add(w);
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    this.starts.set(w, { settled, settle });
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as WorkerMessage));
-    w.on('error', () => this.onWorkerGone(w));
-    w.on('exit', (code) => { if (code !== 0) this.onWorkerGone(w); });
+    w.on('error', () => { this.startSettled(w); this.onWorkerGone(w); });
+    w.on('exit', (code) => { this.startSettled(w); if (code !== 0) this.onWorkerGone(w); });
   }
 
   private onMessage(w: PoolWorker, m: WorkerMessage): void {
+    // Before the retired-worker check: destroy() waits on this for a worker
+    // it has already let go of.
+    if (m?.type === 'ready') this.startSettled(w);
     if (!m || !this.workers.has(w)) return; // ignore late messages from retired workers
     if (m.type === 'ready') {
       if (!this.pendingWorkers.delete(w)) return; // already handled this handshake
@@ -311,7 +336,36 @@ export class QueryPool {
     });
   }
 
-  /** Terminate all workers and answer any outstanding calls gracefully. */
+  private startSettled(w: PoolWorker): void {
+    const start = this.starts.get(w);
+    if (!start) return;
+    this.starts.delete(w);
+    start.settle();
+  }
+
+  /**
+   * Terminate a worker, but not while it is still starting up: wait for it to
+   * post 'ready' (or go away), up to `startSettleMs` (WORKER_START_SETTLE_MS —
+   * see that constant for the crash this avoids).
+   */
+  private async terminateStarted(w: PoolWorker): Promise<void> {
+    const start = this.starts.get(w);
+    if (start) {
+      let cap: NodeJS.Timeout | undefined;
+      await Promise.race([
+        start.settled,
+        new Promise<void>((resolve) => { cap = setTimeout(resolve, this.startSettleMs); cap.unref?.(); }),
+      ]);
+      clearTimeout(cap);
+    }
+    try { await w.terminate(); } catch { /* already gone */ }
+  }
+
+  /**
+   * Terminate all workers and answer any outstanding calls gracefully. A worker
+   * still starting up is terminated once it has started (see
+   * WORKER_START_SETTLE_MS); outstanding calls are answered first.
+   */
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -324,6 +378,6 @@ export class QueryPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => Promise.resolve(w.terminate()).catch(() => { /* already gone */ })));
+    await Promise.all(ws.map((w) => this.terminateStarted(w)));
   }
 }

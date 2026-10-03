@@ -92,12 +92,21 @@ check "health stays uncached" "no-store" \
   "$(curl -sD - -o /dev/null -b "$JAR" "$BASE/api/health" | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r')"
 
 echo
-echo "/api/meta — what the range picker anchors on"
+echo "/api/meta — how current each kind of number is"
+TODAY="$(node -e 'console.log(new Date().toISOString().slice(0, 10))')"
+YESTERDAY="$(node -e 'console.log(new Date(Date.now() - 864e5).toISOString().slice(0, 10))')"
 META="$(get "/api/meta")"
-field "latest day"        latest_day       2026-07-10 "$META"
-field "earliest day"      earliest_day     2026-07-01 "$META"
-field "raw events start"  earliest_raw_day 2026-07-01 "$META"
-field "retention window"  retention_days   14         "$META"
+field "today, as a UTC day"  today            "$TODAY"   "$META"
+field "latest rollup day"    latest_rollup_day 2026-07-10 "$META"
+field "…kept as latest_day"  latest_day       2026-07-10 "$META"
+field "earliest day"         earliest_day     2026-07-01 "$META"
+field "raw events start"     earliest_raw_day 2026-07-01 "$META"
+field "retention window"     retention_days   14         "$META"
+# The fixture stops on 07-10, months ago: nothing has arrived since, but the
+# rollup did cover every day that saw activity, so it is not behind.
+field "ingest stalled (no events since 07-10)" ingest_stalled true "$META"
+field "rollup not behind (it covered every active day)" rollup_behind false "$META"
+field "nobody active yesterday" machines_yesterday 0 "$META"
 
 echo
 echo "/api/summary — the big numbers (12 machines, one of them CI)"
@@ -134,12 +143,29 @@ field "calls per day"     datasets.0.data '[0,40,28,0,0,12,0,0,0,5]' "$TS"
 field "machines per day"  datasets.1.data '[0,1,2,0,0,1,0,0,0,1]'    "$TS"
 
 TS="$(get "/api/timeseries?metric=duration_buckets&$RANGE")"
+field "coverage reported"         covered_through  2026-07-10              "$TS"
 field "bucket order is the scale" datasets.0.label '<10s'                  "$TS"
 field "…and ends at the longest"  datasets.3.label '5m+'                   "$TS"
 field "<10s over time"            datasets.0.data  '[2,0,1,1,0,0,0,1,0,0]' "$TS"
 field "10-60s over time"          datasets.1.data  '[0,2,0,0,0,0,1,0,0,1]' "$TS"
 field "1-5m over time"            datasets.2.data  '[0,0,0,0,1,1,0,0,0,0]' "$TS"
 field "5m+ over time"             datasets.3.data  '[0,0,1,0,0,0,0,0,1,0]' "$TS"
+
+echo
+echo "Past the rollup's last day: not counted yet, so null — never a zero"
+# The fixture is rolled up through 07-10; 07-11 and 07-12 have not been.
+LATE="from=2026-07-09&to=2026-07-12"
+TS="$(get "/api/timeseries?metric=installs_uninstalls&$LATE")"
+field "installs stop at the rollup"   datasets.0.data '[2,0,null,null]' "$TS"
+field "…and say where"                covered_through 2026-07-10        "$TS"
+field "the table twin keeps the gap"  rows.2.Installs  null             "$TS"
+TS="$(get "/api/timeseries?metric=production_users&$LATE")"
+field "daily production users too"    datasets.0.data '[1,1,null,null]' "$TS"
+TS="$(get "/api/timeseries?metric=duration_buckets&$LATE")"
+field "run length over time too"      datasets.0.data '[0,0,null,null]' "$TS"
+TS="$(get "/api/timeseries?metric=new_installs&$LATE")"
+field "new installs are live: zeros, not gaps" datasets.0.data '[2,0,0,0]' "$TS"
+field "…and claim no rollup coverage"          covered_through null        "$TS"
 
 echo
 echo "/api/breakdown — bars and pies"
@@ -209,6 +235,7 @@ field "…so two dropped"                    dropped    2 "$ACT"
 field "window"                             window_days 7 "$ACT"
 field "daily rate, null where no cohort"   datasets.0.data '[75,50,100,null,100,null,null,100,100,null]' "$ACT"
 field "recent cohorts flagged incomplete"  incomplete_from 2026-07-04 "$ACT"
+field "cohorts counted through the rollup" covered_through 2026-07-10 "$ACT"
 field "…and the completed ones are not"    rows.2.complete true "$ACT"
 field "…while the last week is"            rows.8.complete false "$ACT"
 
@@ -216,6 +243,14 @@ field "…while the last week is"            rows.8.complete false "$ACT"
 # until 07-03. Everyone else who ever indexed did it on day 0 or day 1.
 ACT="$(get "/api/activation?window=1&$RANGE")"
 field "a 1-day window converts fewer" activated 9 "$ACT"
+
+# m11 (indexed 07-10) and m12 (indexed 07-09) arrived on 07-09. 07-11 onward has
+# not been rolled up, so those cohorts are gaps and stay out of the totals.
+ACT="$(get "/api/activation?from=2026-07-09&to=2026-07-12")"
+field "uncounted cohorts stay out of the totals" installs 2 "$ACT"
+field "…both counted ones converted"             activated 2 "$ACT"
+field "…and draw as gaps, not 0%"                datasets.0.data '[100,null,null,null]' "$ACT"
+field "…with no conversions claimed"             rows.2.activated null "$ACT"
 
 echo
 echo "/api/retention — day 0–14, denominator per day"
@@ -258,6 +293,19 @@ EMPTY="$(get "/api/breakdown?dim=os&from=2025-01-01&to=2025-01-07")"
 field "no bars"         labels '[]' "$EMPTY"
 EMPTY="$(get "/api/timeseries?metric=production_users&from=2025-01-01&to=2025-01-03")"
 field "still a dense axis" datasets.0.data '[0,0,0]' "$EMPTY"
+
+echo
+echo "A rollup that stops is called out"
+# One machine active yesterday that no rollup has covered — what a failed nightly
+# run (or a database refusing writes) leaves behind. Removed again straight after.
+STALE_ID=00000000-0000-4000-8000-0000000000ff
+npx wrangler d1 execute codegraph-telemetry --local \
+  --command "INSERT INTO machine_days (machine_id, day, prod) VALUES ('$STALE_ID', '$YESTERDAY', 1)" >/dev/null 2>&1
+META="$(get "/api/meta")"
+field "rollup behind once a day goes un-rolled" rollup_behind true "$META"
+field "…and yesterday's machine is counted"     machines_yesterday 1 "$META"
+npx wrangler d1 execute codegraph-telemetry --local \
+  --command "DELETE FROM machine_days WHERE machine_id = '$STALE_ID'" >/dev/null 2>&1
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
