@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Migration definition
@@ -214,6 +214,23 @@ const migrations: Migration[] = [
           ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
           WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
       `);
+    },
+  },
+  {
+    version: 12,
+    description:
+      'Reconcile Haskell topology fingerprints with upstream synthesis migrations',
+    up: (db) => {
+      // The Haskell branch also used v10, for topology fingerprints. Its
+      // existing indexes have not run upstream's v10 synthesis migration.
+      const synthesisInputs = db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'synthesis_inputs'"
+      ).get();
+      if (!synthesisInputs) migrations.find((migration) => migration.version === 10)!.up(db);
+      const cols = db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>;
+      if (!cols.some((column) => column.name === 'haskell_topology_hash')) {
+        db.exec('ALTER TABLE files ADD COLUMN haskell_topology_hash TEXT');
+      }
     },
   },
 ];

@@ -12,6 +12,39 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
+### Security
+
+- Indexing now bounds re-export searches so deeply interconnected modules cannot cause exponential work and block the process. (#1337)
+
+### Fixes
+
+#### Haskell indexing
+
+- Large Haskell projects index and refresh exported definitions faster while preserving import visibility and ambiguity checks. (#1337)
+
+- Haskell local functions keep their callers when they shadow a parameter with the same name. (#1337)
+
+- Custom Haskell functions named like standard combinators no longer create calls to arguments they do not execute. (#1337)
+
+- Haskell pattern synonyms now retain calls through local helpers while excluding quoted code that is not executed.
+
+- Haskell calls now respect nested and inline local scopes, keeping helpers from capturing unrelated calls elsewhere in a function.
+
+- Haskell names shared by a module declaration and an import remain unresolved when ambiguous, including after an imported module changes its exports.
+
+- Haskell record fields shared by several constructors resolve as one selector per type, and applied deriving clauses no longer create false class relationships.
+
+- Haskell record construction now links each field to the type named by its constructor, including through qualified imports.
+
+- Incremental Haskell updates refresh affected module imports with fewer database reads while preserving unrelated graph relationships.
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 ## [1.6.2] - 2026-10-03
 

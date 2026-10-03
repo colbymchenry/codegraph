@@ -563,4 +563,3 @@ function resolveByNameAndKind(
 ): string | null {
   return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }
-

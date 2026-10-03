@@ -3984,6 +3984,19 @@ export async function synthesizeCallbackEdges(
   const langs = queries.getDistinctFileLanguages();
   const has = (...ls: string[]): boolean => ls.some((l) => langs.has(l));
   const NONE: Edge[] = [];
+  // Haskell currently has no modeled FFI/framework bridge. Several generic
+  // synthesizers resolve callback names directly (outside ReferenceResolver),
+  // so a mixed repo could otherwise connect a JS event handler to a coincident
+  // same-named Haskell declaration. Build one compact ID set and enforce the
+  // unsupported boundary centrally for every synthesis pass, including worker
+  // results; same-language Haskell edges remain valid.
+  const hasMixedHaskell = langs.has('haskell')
+    && [...langs].some((language) => language !== 'haskell');
+  const haskellNodeIds = hasMixedHaskell
+    ? queries.getNodeIdsByLanguage('haskell')
+    : null;
+  const crossesHaskellBoundary = (edge: Edge): boolean => haskellNodeIds !== null
+    && haskellNodeIds.has(edge.source) !== haskellNodeIds.has(edge.target);
 
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
   // FIRST: a method declared in a different file from its receiver type is
@@ -3997,7 +4010,9 @@ export async function synthesizeCallbackEdges(
     if (bp) await bp;
   };
 
-  const goMethodContains = has('go') ? await goCrossFileMethodContainsEdges(queries, yieldToLoop) : NONE;
+  const goMethodContains = (has('go')
+    ? await goCrossFileMethodContainsEdges(queries, yieldToLoop)
+    : NONE).filter((edge) => !crossesHaskellBoundary(edge));
   for (let i = 0; i < goMethodContains.length; i += 2000) {
     queries.insertEdges(goMethodContains.slice(i, i + 2000));
     await yieldToLoop();
@@ -4009,7 +4024,9 @@ export async function synthesizeCallbackEdges(
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
-  const goImpl = has('go') ? await goImplementsEdges(queries, yieldToLoop) : NONE;
+  const goImpl = (has('go')
+    ? await goImplementsEdges(queries, yieldToLoop)
+    : NONE).filter((edge) => !crossesHaskellBoundary(edge));
   for (let i = 0; i < goImpl.length; i += 2000) {
     queries.insertEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();
@@ -4121,6 +4138,7 @@ export async function synthesizeCallbackEdges(
   const merged: Edge[] = [];
   const seen = new Set<string>();
   for (const e of passEdges.flat()) {
+    if (crossesHaskellBoundary(e)) continue;
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);

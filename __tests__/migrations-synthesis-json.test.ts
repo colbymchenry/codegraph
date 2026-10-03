@@ -79,6 +79,20 @@ describe('synthesis metadata JSON boundaries and migration', () => {
     ]);
   });
 
+  it('preserves resolver-owned Haskell calls when refreshing callback synthesis', async () => {
+    queries.insertEdge({ source: 'a', target: 'b', kind: 'calls', line: 1,
+      metadata: { synthesizedBy: 'haskell-combinator', haskellImportDependent: true, registeredAt: 'a.hs:1' } });
+    queries.insertEdge({ source: 'a', target: 'b', kind: 'calls', line: 2,
+      metadata: { synthesizedBy: 'event-emitter', registeredAt: 'a.ts:2' } });
+    const before = queries.getOutgoingEdges('a').filter(edge => edge.line === 1);
+    const stage = new SynthesisStage(connection.getPath());
+    try {
+      expect(stage.queries.getOutgoingEdges('a')).toEqual(before);
+      await stage.publish();
+    } finally { stage.close(); }
+    expect(queries.getOutgoingEdges('a')).toEqual(before);
+  });
+
   it('upgrades pre-v10 malformed metadata, including legacy Go containment', () => {
     const raw = connection.getDb();
     raw.exec(`DROP INDEX idx_edges_synthesis_site;
@@ -94,6 +108,57 @@ describe('synthesis metadata JSON boundaries and migration', () => {
     expect(queries.getOutgoingEdges('a', ['contains'])[0].metadata?.synthesizedBy).toBe('go-method-contains');
     expect(queries.hasSynthesizedEdgesTouchingFile('a.ts')).toBe(true);
     insertRaw('still malformed', 2);
+  });
+
+  it.each([10, 11])('adds Haskell fingerprints to an upstream v%s index without losing rows', version => {
+    const raw = connection.getDb();
+    raw.exec(`ALTER TABLE files DROP COLUMN haskell_topology_hash;
+      DELETE FROM schema_versions WHERE version >= 10;`);
+    raw.prepare('INSERT INTO schema_versions(version, applied_at, description) VALUES (?, 0, ?)')
+      .run(version, 'upstream fixture');
+    insertRaw('broken json {{{');
+    connection.close();
+
+    connection = DatabaseConnection.open(path.join(dir, 'test.db'));
+    queries = new QueryBuilder(connection.getDb());
+    expect(getCurrentVersion(connection.getDb())).toBe(CURRENT_SCHEMA_VERSION);
+    expect(connection.getDb().prepare('PRAGMA table_info(files)').all()
+      .some(column => column.name === 'haskell_topology_hash')).toBe(true);
+    expect(queries.getOutgoingEdges('a')).toHaveLength(1);
+    expect(connection.getDb().prepare('SELECT COUNT(*) AS count FROM synthesis_inputs').get())
+      .toEqual({ count: 0 });
+  });
+
+  it('upgrades the Haskell v10 layout with upstream synthesis and preserves fingerprints', () => {
+    const raw = connection.getDb();
+    raw.exec(`DROP INDEX idx_edges_synthesis_site;
+      DROP TABLE synthesis_inputs;
+      DROP INDEX idx_nodes_kind;
+      CREATE INDEX idx_nodes_kind ON nodes(kind);
+      DELETE FROM schema_versions WHERE version >= 10;
+      INSERT INTO schema_versions(version, applied_at, description) VALUES (10, 0, 'Haskell topology fixture');
+      INSERT INTO files(path, content_hash, language, size, modified_at, indexed_at, haskell_topology_hash)
+        VALUES ('Main.hs', 'content', 'haskell', 1, 0, 0, 'preserved-topology');
+      UPDATE nodes SET language = 'go', kind = CASE id WHEN 'a' THEN 'struct' ELSE 'method' END;`);
+    raw.prepare("INSERT INTO edges(source, target, kind, metadata) VALUES ('a', 'b', 'contains', ?)")
+      .run('broken containment {{{');
+    connection.close();
+
+    connection = DatabaseConnection.open(path.join(dir, 'test.db'));
+    queries = new QueryBuilder(connection.getDb());
+    expect(getCurrentVersion(connection.getDb())).toBe(CURRENT_SCHEMA_VERSION);
+    expect(connection.getDb().prepare('SELECT haskell_topology_hash FROM files WHERE path = ?').get('Main.hs'))
+      .toEqual({ haskell_topology_hash: 'preserved-topology' });
+    expect(queries.getOutgoingEdges('a', ['contains'])[0].metadata?.synthesizedBy).toBe('go-method-contains');
+    expect(connection.getDb().prepare("PRAGMA index_info('idx_nodes_kind')").all().map(column => column.name))
+      .toEqual(['kind', 'file_path', 'start_line', 'id']);
+    expect(connection.getDb().prepare("SELECT value FROM project_metadata WHERE key = 'synthesis_pending'").get())
+      .toEqual({ value: '1' });
+    expect(connection.getDb().prepare('SELECT COUNT(*) AS count FROM synthesis_inputs').get())
+      .toEqual({ count: 0 });
+    const before = connection.getDb().prepare('SELECT * FROM edges ORDER BY id').all();
+    runMigrations(connection.getDb(), getCurrentVersion(connection.getDb()));
+    expect(connection.getDb().prepare('SELECT * FROM edges ORDER BY id').all()).toEqual(before);
   });
 
   it('replaces the v10 index on open and safely replays the replacement', () => {

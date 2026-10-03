@@ -29,7 +29,7 @@
  * (so every symbol merges into ONE cluster), the target functions past L1000, and
  * a 2,500-line generated `.d.ts` for the ranker to penalise.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -153,6 +153,20 @@ describe('CG-38 — an agent-named symbol renders its definition', () => {
   it('never steers the agent to Read', async () => {
     const response = await explore('queueMessage flushQueuedMessages');
     expect(response).not.toMatch(/\buse Read\b|\bRead the file\b/i);
+  }, 120_000);
+
+  it('normalizes a Haskell file suffix on the MCP named-seeding path', async () => {
+    // There is deliberately no queueMessage.hs in the index, so path pinning
+    // leaves this token for named-symbol seeding. The suffix must be removed
+    // before the exact-name lookup, just as it is for the flow prelude.
+    const lookup = vi.spyOn(cg, 'getNodesByName');
+    try {
+      const response = await explore('queueMessage.hs');
+      expect(lookup).toHaveBeenCalledWith('queueMessage');
+      expect(renderedLines(response)).toContain(defLineOf('queueMessage'));
+    } finally {
+      lookup.mockRestore();
+    }
   }, 120_000);
 });
 
