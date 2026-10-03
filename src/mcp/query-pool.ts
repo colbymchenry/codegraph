@@ -52,6 +52,9 @@ const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
  * do not remain resident for the daemon's whole lifetime. */
 const DEFAULT_IDLE_SHRINK_MS = 60_000;
 
+/** How long a retired idle worker gets to exit on 'close' before it is terminated. */
+const RETIRE_TIMEOUT_MS = 5_000;
+
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
 
@@ -114,6 +117,8 @@ export interface QueryPoolOptions {
   maxRetries?: number;
   /** Idle delay before recycling back to one fresh worker. Default 60s; 0 disables. */
   idleShrinkMs?: number;
+  /** How long a retired idle worker gets to exit by itself (tests shorten it). Default 5s. */
+  retireTimeoutMs?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
   /** How long destroy() waits on a worker still starting up (tests shorten it). Default 15s. */
@@ -181,9 +186,13 @@ export class QueryPool {
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly idleShrinkMs: number;
+  private readonly retireTimeoutMs: number;
   private readonly createWorker: () => PoolWorker;
   private readonly startSettleMs: number;
   private idleShrinkTimer?: NodeJS.Timeout;
+  // Retired idle workers asked to exit, each with the timer that terminates it
+  // if it hasn't by RETIRE_TIMEOUT_MS.
+  private retiring = new Map<PoolWorker, NodeJS.Timeout>();
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
@@ -191,6 +200,7 @@ export class QueryPool {
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
     this.idleShrinkMs = Math.max(0, opts.idleShrinkMs ?? DEFAULT_IDLE_SHRINK_MS);
+    this.retireTimeoutMs = opts.retireTimeoutMs ?? RETIRE_TIMEOUT_MS;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
     this.spawnOne(); // one eager warm worker, ready for the first call
@@ -244,7 +254,7 @@ export class QueryPool {
     this.starts.set(w, { settled, settle });
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as WorkerMessage));
     w.on('error', () => { this.startSettled(w); this.onWorkerGone(w); });
-    w.on('exit', (code) => { this.startSettled(w); if (code !== 0) this.onWorkerGone(w); });
+    w.on('exit', (code) => { this.startSettled(w); this.retired(w); if (code !== 0) this.onWorkerGone(w); });
   }
 
   private onMessage(w: PoolWorker, m: WorkerMessage): void {
@@ -303,10 +313,36 @@ export class QueryPool {
     this.workers.clear();
     this.idle = [];
     this.everReady = false;
-    // Idle workers have all started; terminateStarted() still guards the
-    // mid-start window (WORKER_START_SETTLE_MS) and never rejects.
-    for (const w of stale) void this.terminateStarted(w);
+    for (const w of stale) this.retire(w);
     this.spawnOne();
+  }
+
+  /**
+   * Ask an idle worker to exit by itself: it closes its connections and
+   * collects garbage first, so no marking is in flight when its thread ends
+   * (see worker-teardown.ts). One that hasn't exited by `retireTimeoutMs` is
+   * terminated.
+   */
+  private retire(w: PoolWorker): void {
+    const cap = setTimeout(() => {
+      this.retiring.delete(w);
+      void this.terminateStarted(w);
+    }, this.retireTimeoutMs);
+    cap.unref?.();
+    this.retiring.set(w, cap);
+    try {
+      w.postMessage({ type: 'close' });
+    } catch {
+      this.retired(w);
+      void this.terminateStarted(w);
+    }
+  }
+
+  private retired(w: PoolWorker): void {
+    const cap = this.retiring.get(w);
+    if (cap === undefined) return;
+    clearTimeout(cap);
+    this.retiring.delete(w);
   }
 
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
