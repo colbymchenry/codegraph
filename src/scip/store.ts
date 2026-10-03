@@ -141,7 +141,7 @@ export function indexPath(projectRoot: string, lang: ScipLanguage): string {
   return path.join(scipDir(projectRoot), `${lang}.scip`);
 }
 
-export function metaPath(projectRoot: string, lang: ScipLanguage): string {
+function metaPath(projectRoot: string, lang: ScipLanguage): string {
   return path.join(scipDir(projectRoot), `${lang}.meta.json`);
 }
 

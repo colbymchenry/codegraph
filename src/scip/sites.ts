@@ -29,7 +29,7 @@ const INTERFACE_KINDS: readonly string[] = ['interface', 'trait'];
 const REFERENCED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'type_alias', 'enum', 'union'];
 
 /** codegraph's label for a type → base edge: a class/struct implements an interface/trait, anything else extends. */
-export function inheritanceKind(sourceKind: string, targetKind: string): 'implements' | 'extends' {
+function inheritanceKind(sourceKind: string, targetKind: string): 'implements' | 'extends' {
   return INTERFACE_KINDS.includes(targetKind) && !INTERFACE_KINDS.includes(sourceKind) ? 'implements' : 'extends';
 }
 
@@ -97,7 +97,7 @@ export function bySource<T>(db: SqliteDatabase, sql: string, files: Iterable<str
   return [...files].flatMap(f => stmt.all(f) as T[]);
 }
 
-export interface SiteTarget {
+interface SiteTarget {
   /** node id, or EXTERNAL */
   target: string;
   /** 0-based column of the callee name, for inserted edges */
@@ -120,7 +120,7 @@ export interface ScipSites {
   stats: Record<string, number>;
 }
 
-export interface NodeRow {
+interface NodeRow {
   id: string; kind: string; name: string; qualified_name: string; file_path: string;
   start_line: number; end_line: number; start_column: number; end_column: number;
 }
@@ -150,7 +150,7 @@ const NODE_KINDS = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...REFE
  * hundreds of thousands of call sites, and scanning a file's every node per
  * site was most of the merge.
  */
-export class FileNodes {
+class FileNodes {
   private byFile = new Map<string, FileIndex | null>();
   private readonly stmt: SqliteStatement;
 

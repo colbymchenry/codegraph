@@ -19,7 +19,7 @@ export const ROLE_DEFINITION = 0x1;
 export const POSITION_ENCODING_UTF8 = 1;
 
 /** Half-open, 0-based source span — SCIP's convention. */
-export interface Span {
+interface Span {
   startLine: number;
   startCol: number;
   endLine: number;
@@ -427,7 +427,7 @@ export function loadScipIndex(file: string): ScipIndex {
 
 export type DescriptorKind = 'namespace' | 'type' | 'term' | 'method' | 'type-parameter' | 'parameter' | 'meta' | 'macro';
 
-export interface Descriptor {
+interface Descriptor {
   name: string;
   kind: DescriptorKind;
 }

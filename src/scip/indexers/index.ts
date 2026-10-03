@@ -53,7 +53,7 @@ export const RUN_WARNING = 'codegraph-scip warning: ';
  * so peak memory is bounded by the largest part. The outputs are combined into
  * one index (see compact.ts).
  */
-export interface Invocation {
+interface Invocation {
   runs: IndexerRun[];
   /** the tool these runs write (`ToolInfo.name`); the adapter's first `tools` entry when unset */
   tool?: string;
@@ -110,7 +110,7 @@ export interface IndexerSpec {
   patch?: Partial<Record<string, PatchSpec>>;
 }
 
-export interface PatchSpec {
+interface PatchSpec {
   /** the smallest pieces a run re-indexes that cover `files`: a file, its directory, its package, its project */
   units(projectRoot: string, files: string[]): string[];
   /** rough seconds to re-index `units`, given how many light runs go side by side */
@@ -122,7 +122,7 @@ export interface PatchSpec {
   runs(full: readonly IndexerRun[], units: string[], outFile: string): IndexerRun[] | null;
 }
 
-export interface IndexerOverride {
+interface IndexerOverride {
   cmd?: string;
   args?: string[];
   env?: Record<string, string>;

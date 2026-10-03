@@ -32,7 +32,7 @@ import { callShape, isCallTarget, siteKind } from './syntax';
  * the documents it keeps without re-reading their files (addCompacted). Beyond
  * SCIP's own roles (≤ 0x40); the merge reads only ROLE_DEFINITION.
  */
-export const ROLE_COUNTED_CALL = 1 << 24;
+const ROLE_COUNTED_CALL = 1 << 24;
 
 export class Compactor {
   meta: IndexMeta | null = null;
