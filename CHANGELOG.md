@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Type hierarchy queries and context results now include subclasses and implementations alongside parent types, retaining every inheritance relationship in diamonds and cycles.
 
 ## [1.6.2] - 2026-10-03
 
