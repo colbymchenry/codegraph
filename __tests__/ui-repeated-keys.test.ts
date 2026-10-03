@@ -25,6 +25,16 @@ beforeAll(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ui-repeated-'));
   const files: Record<string, string> = {
     'package.json': JSON.stringify({ name: 'app', private: true, dependencies: { express: '^4.0.0', astro: '^4.0.0' } }),
+    'dense/app.js': `const express = require('express'); const app = express();
+${Array.from({ length: 24 }, (_, i) => `function task${i}() { return ${i}; }`).join('\n')}
+function second(req, res) { res.end(); }
+function third(req, res) { res.end(); }
+app.get('/dense', (req, res) => {
+${Array.from({ length: 24 }, (_, i) => `task${i}();`).join('\n')}
+});
+app.get('/second', second);
+app.get('/third', third);
+`,
     'server/app.js': `const express = require('express');
 const app = express();
 
@@ -70,6 +80,31 @@ afterAll(() => {
 });
 
 describe('the routes list', () => {
+  it('applies its limit to routes, not to the calls of one inline handler', () => {
+    const payload = buildRoutes(cg, new URLSearchParams('limit=3'));
+    expect(payload.entries.map((e) => e.url)).toEqual(['GET /dense', 'GET /second', 'GET /third']);
+    expect(payload.shown).toBe(3);
+    expect(payload.truncated).toBe(true);
+  });
+
+  it('still calls a project routed when its one inline route has three calls', async () => {
+    const singleRoot = path.join(root, 'one-route');
+    fs.mkdirSync(singleRoot, { recursive: true });
+    fs.writeFileSync(path.join(singleRoot, 'package.json'), JSON.stringify({ dependencies: { express: '^4.0.0' } }));
+    fs.writeFileSync(path.join(singleRoot, 'app.js'), `const app = require('express')();
+function first() {} function second() {} function third() {}
+app.get('/one', () => { first(); second(); third(); });
+`);
+    const single = await CodeGraph.init(singleRoot, { index: true });
+    try {
+      const payload = buildRoutes(single, new URLSearchParams('limit=3'));
+      expect(payload.routed).toBe(true);
+      expect(payload.entries.map((e) => e.url)).toEqual(['GET /one']);
+    } finally {
+      single.close();
+    }
+  });
+
   it('has one row per route', () => {
     const { entries } = buildRoutes(cg, new URLSearchParams());
     const ids = entries.map((e) => e.routeId);
