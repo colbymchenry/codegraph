@@ -194,4 +194,32 @@ class Personal extends L\\Base
 `);
     expect(await edgesFrom('app/Personal.php')).toEqual([]);
   });
+
+  it('matches the namespace alias without regard to its case', async () => {
+    write('app/Blocks/Personal/Fields/FirstName.php', firstName('App\\Blocks\\Personal\\Fields'));
+    write('app/Blocks/Personal/Personal.php',
+      consumer('use App\\Blocks\\Personal\\Fields as Field;', 'new field\\FirstName()'));
+    expect(await instantiated()).toEqual(['App\\Blocks\\Personal\\Fields::FirstName']);
+  });
+
+  it('does not guess the first target when two namespace blocks bind one alias differently', async () => {
+    write('app/Fields/FirstName.php', firstName('App\\Fields'));
+    write('app/Other/FirstName.php', firstName('App\\Other'));
+    write('app/Personal.php', `<?php
+namespace One {
+  use App\\Fields as Field;
+  class Personal { public function a() { return new Field\\FirstName(); } }
+}
+namespace Two {
+  use App\\Other as Field;
+  class Another
+  {
+    public function b() { return new Field\\FirstName(); }
+    public function c() { return new \\App\\Other\\FirstName(); }
+  }
+}
+`);
+    // The alias has two meanings in this file; the fully qualified name has one.
+    expect(await edgesFrom('app/Personal.php')).toEqual(['c instantiates App\\Other::FirstName']);
+  });
 });
