@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Go, calls between the packages of a module whose `go.mod` sits in a subdirectory instead of the project root, like a `server/` backend next to a `web/` frontend or several modules side by side, now resolve, so a package-qualified call such as `store.New()` or a call through a struct field such as `s.db.CreateItem()` finds its target; re-index after upgrading. Thanks @GoDiao for the report. (#2322)
 
 ## [1.6.2] - 2026-10-03
 
