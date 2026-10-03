@@ -843,6 +843,15 @@
             {/if}
           {/each}
         </p>
+        {#if payload.steps.length === 1 && payload.truncated.steps === 0 && payload.truncated.hubs === 0}
+          <!-- A lone anchor is an answer, not an empty canvas: say what the walk looked for. -->
+          <p>
+            Nothing this sets in motion is a step the picture draws — no reply, database, queue, network or
+            other {kindWord('screen', payload.project)} within {payload.depth} calls. Calls between plain functions
+            fold into the lines between steps, so a helper that only computes is drawn alone.
+            {#if payload.anchor}<a href={symbolHref(payload.anchor.id)}>Its callers and callees →</a>{/if}
+          </p>
+        {/if}
         {#if readAs === 'order'}
           <p class="dim">
             <span class="mark">●</span> The anchor is at the top, and each row down is what happens next: a line

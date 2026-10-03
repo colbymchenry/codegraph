@@ -12,6 +12,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import CodeGraph, { LockUnavailableError } from '../src/index';
+import { QueryBuilder } from '../src/db/queries';
 import { __emitWatchEventForTests } from '../src/sync/watcher';
 
 describe('Sync Module', () => {
@@ -830,6 +831,228 @@ describe('Sync Module', () => {
       // callee_two is untouched by the rename and its edge survives.
       expect(callerCount('callee_two')).toBe(1);
     });
+  });
+});
+
+describe('Same-named symbols keep their own cross-file callers across a re-index (#2276)', () => {
+  const dirs: string[] = [];
+  const graphs: CodeGraph[] = [];
+
+  afterEach(() => {
+    for (const cg of graphs.splice(0)) cg.destroy();
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function indexProject(files: Record<string, string>, include: string[]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-2276-'));
+    dirs.push(dir);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    }
+    const cg = CodeGraph.initSync(dir, { config: { include, exclude: [] } });
+    graphs.push(cg);
+    await cg.indexAll();
+    return { dir, cg };
+  }
+
+  /** Every method named `name`, in file/line order, with its callers. */
+  function callersOf(cg: CodeGraph, name: string): string[] {
+    return cg
+      .getNodesByName(name)
+      .filter((n) => n.kind === 'method')
+      .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine)
+      .map((n) => `${n.qualifiedName}: ${cg.getCallers(n.id).map((c) => c.node.name).sort().join(',')}`);
+  }
+
+  /**
+   * Index `files`, rewrite one of them, sync, and return the callers of `name`
+   * before the edit, after the sync, and from a fresh index of the edited tree
+   * — the answer a synced index must agree with.
+   */
+  async function editAndSync(
+    files: Record<string, string>,
+    include: string[],
+    editPath: string,
+    edited: string,
+    name: string
+  ) {
+    const { dir, cg } = await indexProject(files, include);
+    const before = callersOf(cg, name);
+    fs.writeFileSync(path.join(dir, editPath), edited);
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+    const fresh = await indexProject({ ...files, [editPath]: edited }, include);
+    return { before, synced: callersOf(cg, name), fresh: callersOf(fresh.cg, name) };
+  }
+
+  const tsOps = [
+    `export class Foo {`,
+    `  execute(): number {`,
+    `    return 1;`,
+    `  }`,
+    `}`,
+    ``,
+    `export class Bar {`,
+    `  execute(): number {`,
+    `    return 2;`,
+    `  }`,
+    `}`,
+    ``,
+  ].join('\n');
+  const tsFiles = {
+    'ops.ts': tsOps,
+    'callers.ts': [
+      `import { Foo, Bar } from './ops';`,
+      ``,
+      `export function runFoo(): number {`,
+      `  const foo = new Foo();`,
+      `  return foo.execute();`,
+      `}`,
+      ``,
+      `export function runBar(): number {`,
+      `  const bar = new Bar();`,
+      `  return bar.execute();`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it.each([
+    ['a body-only edit', tsOps.replace('return 1;', 'return 10;')],
+    ['an edit that shifts the second class', tsOps.replace('return 1;', 'const n = 1;\n    return n;')],
+  ])('two classes defining `execute`: %s keeps each method its own callers', async (_label, edited) => {
+    const { before, synced, fresh } = await editAndSync(tsFiles, ['**/*.ts'], 'ops.ts', edited, 'execute');
+    expect(before).toEqual(['Foo::execute: runFoo', 'Bar::execute: runBar']);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  it('a re-store that fails part-way leaves the old rows and their incoming edges in place', async () => {
+    const { dir, cg } = await indexProject(tsFiles, ['**/*.ts']);
+    const before = callersOf(cg, 'execute');
+    fs.writeFileSync(path.join(dir, 'ops.ts'), tsOps.replace('return 1;', 'return 10;'));
+
+    const store = vi.spyOn(QueryBuilder.prototype, 'storeFileBundle').mockImplementationOnce(() => {
+      throw new Error('simulated crash mid-store');
+    });
+    try {
+      await expect(cg.sync()).rejects.toThrow('simulated crash mid-store');
+    } finally {
+      store.mockRestore();
+    }
+    // Rolled back to the pre-edit file, so the retry still sees a modified
+    // file — one it snapshots — rather than a new one with no history.
+    expect(callersOf(cg, 'execute')).toEqual(before);
+
+    const retry = await cg.sync();
+    expect(retry.filesModified).toBe(1);
+    expect(callersOf(cg, 'execute')).toEqual(before);
+  });
+
+  it('a caller of a removed twin is re-resolved, not handed to the survivor', async () => {
+    const edited = tsOps.slice(tsOps.indexOf('export class Bar'));
+    const { synced, fresh } = await editAndSync(tsFiles, ['**/*.ts'], 'ops.ts', edited, 'execute');
+    expect(synced).toEqual(fresh);
+  });
+
+  const javaFactory = [
+    `package app;`,
+    ``,
+    `public class Factory {`,
+    `  public static Widget create(int size) {`,
+    `    return new Widget();`,
+    `  }`,
+    ``,
+    `  public static Widget create(String name) {`,
+    `    return new Widget();`,
+    `  }`,
+    `}`,
+    ``,
+  ].join('\n');
+  const javaFiles = {
+    'src/app/Factory.java': javaFactory,
+    'src/app/Widget.java': `package app;\n\npublic class Widget {}\n`,
+    'src/app/Client.java': [
+      `package app;`,
+      ``,
+      `public class Client {`,
+      `  public Widget small() {`,
+      `    return Factory.create(1);`,
+      `  }`,
+      ``,
+      `  public Widget named() {`,
+      `    return Factory.create("x");`,
+      `  }`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it('Java overloads: a body edit leaves each overload the callers it had', async () => {
+    const edited = javaFactory.replace(
+      `create(int size) {\n    return new Widget();`,
+      `create(int size) {\n    Widget w = new Widget();\n    return w;`
+    );
+    const { before, synced, fresh } = await editAndSync(javaFiles, ['**/*.java'], 'src/app/Factory.java', edited, 'create');
+    expect(before.some((line) => /: .+/.test(line))).toBe(true);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  // C# records no signature, so its overloads differ only by position.
+  const csFactory = [
+    `namespace App {`,
+    `  public class Factory {`,
+    `    public static Widget Create(int size) {`,
+    `      return new Widget();`,
+    `    }`,
+    ``,
+    `    public static Widget Create(string name) {`,
+    `      return new Widget();`,
+    `    }`,
+    `  }`,
+    ``,
+    `  public class Widget {}`,
+    `}`,
+    ``,
+  ].join('\n');
+  const csFiles = {
+    'Factory.cs': csFactory,
+    'Client.cs': [
+      `namespace App {`,
+      `  public class Client {`,
+      `    public Widget Small() {`,
+      `      return Factory.Create(1);`,
+      `    }`,
+      ``,
+      `    public Widget Named() {`,
+      `      return Factory.Create("x");`,
+      `    }`,
+      `  }`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it('C# overloads with no signature: a body edit pairs them by position', async () => {
+    const edited = csFactory.replace(
+      `Create(int size) {\n      return new Widget();`,
+      `Create(int size) {\n      var w = new Widget();\n      return w;`
+    );
+    const { before, synced, fresh } = await editAndSync(csFiles, ['**/*.cs'], 'Factory.cs', edited, 'Create');
+    expect(before.some((line) => /: .+/.test(line))).toBe(true);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  it('C# overloads: a new indistinguishable overload re-resolves the callers instead of guessing', async () => {
+    const edited = csFactory.replace(
+      `  public class Factory {\n`,
+      `  public class Factory {\n    public static Widget Create(bool flag) {\n      return new Widget();\n    }\n\n`
+    );
+    const { synced, fresh } = await editAndSync(csFiles, ['**/*.cs'], 'Factory.cs', edited, 'Create');
+    expect(synced).toEqual(fresh);
   });
 });
 

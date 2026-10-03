@@ -198,8 +198,12 @@ process.env.CODEGRAPH_KERNEL_LANGS = 'all';
 for (const { file, lang: extLang } of files) {
   const source = fs.readFileSync(file, 'utf8');
   const rel = path.relative(ROOT, file);
-  // `.h` resolves C vs C++ by content — the same call the indexer makes.
-  const lang = extLang === 'detect' || extLang === 'javascript' || extLang === 'jsx' ? detectLanguage(rel, source) : extLang;
+  // `.h` resolves C vs C++ by content — the same call the indexer makes; so
+  // does `.inc` (PHP vs Pascal, #2279 — a Pascal include is not a kernel file).
+  const lang =
+    extLang === 'detect' || extLang === 'javascript' || extLang === 'jsx' || path.extname(file).toLowerCase() === '.inc'
+      ? detectLanguage(rel, source)
+      : extLang;
   if (!KERNEL_LANGS.has(lang)) continue;
   if (langFilter && !langFilter.has(lang)) continue;
   processed++;

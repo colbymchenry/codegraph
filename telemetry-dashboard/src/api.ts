@@ -3,10 +3,14 @@
  * scoped by the same `?from=&to=` range the picker drives.
  *
  * Rules this file keeps:
- * - **Rollups first.** Every panel is answered from `daily_*` / `machine_days`,
- *   which are kept forever. Only the activation funnel touches raw `events`,
- *   because "did this machine ever run an index" is not a daily aggregate — and
- *   that is also the only endpoint with a horizon (the retention window).
+ * - **Rollups only.** Every panel is answered from `daily_*`, `machine_days` and
+ *   `machine_first_seen`, which are kept forever. No panel reads raw `events`:
+ *   D1 runs one query at a time per database, so one slow scan there fails every
+ *   panel queued behind it. (/api/meta reads the table's first and last day, one
+ *   indexed lookup each.)
+ * - **Today is in range; uncounted days are not zeros.** Rolled-up numbers stop
+ *   at the nightly rollup's last day and come back null after it, so a chart
+ *   ending today draws a gap where the count has not happened yet, not a cliff.
  * - **Parameterized, always.** No value from the query string is ever
  *   concatenated into SQL. Dimensions and metrics are looked up in the tables
  *   below and rejected with a 400 if they are not there, so even the column
@@ -88,9 +92,7 @@ export interface Range {
 
 /**
  * The range every endpoint shares. Absent params default to the last 30 days
- * ending today so a bare `curl /api/summary` still answers something sensible;
- * the dashboard itself always sends both, anchored on /api/meta's latest day so
- * no chart ends on a day the nightly rollup has not written yet.
+ * ending today, which is also what the dashboard's presets send.
  */
 function parseRange(url: URL): Range | ApiResult {
   const rawTo = url.searchParams.get('to');
@@ -212,41 +214,90 @@ interface MetaRow {
   earliest_active_day: string | null;
   earliest_raw_day: string | null;
   latest_raw_day: string | null;
+  machines_yesterday: number | null;
 }
 
 /**
- * What the picker anchors on. The dashboard asks for this first and ends every
- * default range on `latest_day`, because the nightly cron has not rolled up
- * today yet — anchoring on the wall clock would put a phantom zero on the right
- * edge of every line chart.
+ * How fresh the data is, and whether either writer has stopped.
+ *
+ * The page's ranges end on today; this is what tells it how much of that range
+ * each kind of number actually covers. Machine counts (`machine_days`,
+ * `machine_first_seen`) are written by the ingest worker as events arrive, so they
+ * run through today. Everything rolled up by the nightly cron runs through
+ * `latest_rollup_day` — normally yesterday.
+ *
+ * Every lookup here is a single min() or max() per subquery, on purpose: SQLite only
+ * answers those from an index when the aggregate stands alone, and
+ * `SELECT min(day), max(day) FROM events` is a full scan of the biggest table.
+ *
+ * The two flags exist because both writers have failed silently before: from
+ * 2026-08-11 almost no event was stored and no rollup ran, nothing errored where
+ * anyone would see it, and the dashboard kept presenting Aug 9 as "the latest day"
+ * for seven weeks. Each flag is a fact the page states, not a tuned threshold.
  */
 async function meta(env: Env): Promise<ApiResult> {
+  const now = Date.now();
+  const today = utcDay(now);
+  const yesterday = utcDay(now - DAY_MS);
   const row = await env.DB.prepare(
     `SELECT (SELECT max(day) FROM daily_event_counts) AS latest_rollup_day,
             (SELECT min(day) FROM daily_event_counts) AS earliest_rollup_day,
             (SELECT max(day) FROM machine_days)       AS latest_active_day,
             (SELECT min(day) FROM machine_days)       AS earliest_active_day,
             (SELECT min(day) FROM events)             AS earliest_raw_day,
-            (SELECT max(day) FROM events)             AS latest_raw_day`,
-  ).first<MetaRow>();
+            (SELECT max(day) FROM events)             AS latest_raw_day,
+            (SELECT count(*) FROM machine_days WHERE day = ?) AS machines_yesterday`,
+  )
+    .bind(yesterday)
+    .first<MetaRow>();
 
-  const latest = row?.latest_rollup_day ?? row?.latest_active_day ?? null;
-  const earliest = row?.earliest_rollup_day ?? row?.earliest_active_day ?? null;
+  const latestRollup = row?.latest_rollup_day ?? null;
+  const latestRaw = row?.latest_raw_day ?? null;
+  const latestActive = row?.latest_active_day ?? null;
+
+  // Nothing at all since before yesterday. (Client clocks may run a few minutes
+  // ahead, so the latest day can be tomorrow — that is fresh, not stale.)
+  const ingestStalled = latestRaw !== null && latestRaw < yesterday;
+  // The 00:30 UTC run rolls up yesterday, so the day before that must always be in
+  // by now. Only "behind" if there was activity after the last rolled-up day — a day
+  // nobody used codegraph would be a silent rollup, not a missed one.
+  const rollupBehind =
+    latestActive !== null &&
+    (latestRollup === null || (latestRollup < addDays(today, -2) && latestActive > latestRollup));
+
   return {
     body: {
-      latest_day: latest,
-      earliest_day: earliest,
-      latest_rollup_day: row?.latest_rollup_day ?? null,
-      latest_active_day: row?.latest_active_day ?? null,
-      /** Below this day the activation funnel is blind — raw events are purged. */
+      today,
+      /** The last day the nightly rollup covers. Kept under its old name for callers. */
+      latest_day: latestRollup ?? latestActive,
+      earliest_day: row?.earliest_rollup_day ?? row?.earliest_active_day ?? null,
+      latest_rollup_day: latestRollup,
+      latest_active_day: latestActive,
       earliest_raw_day: row?.earliest_raw_day ?? null,
-      latest_raw_day: row?.latest_raw_day ?? null,
+      latest_raw_day: latestRaw,
+      machines_yesterday: row?.machines_yesterday ?? 0,
+      rollup_behind: rollupBehind,
+      ingest_stalled: ingestStalled,
       max_range_days: MAX_RANGE_DAYS,
       retention_days: RETENTION_DAYS,
-      generated_at: new Date().toISOString(),
+      generated_at: new Date(now).toISOString(),
     },
-    cacheControl: CACHE_CONTROL,
+    // Short: this is the staleness check, and it is one indexed lookup per field.
+    cacheControl: 'private, max-age=60',
   };
+}
+
+/**
+ * The last day the nightly rollup has written. Rolled-up series stop here and go
+ * null after it — "not counted yet", which a chart draws as a gap, rather than a zero
+ * it would draw as a cliff. `daily_event_counts` is keyed (day, event), so this is
+ * one step down its primary key.
+ */
+const COVERAGE_SQL = 'SELECT max(day) AS day FROM daily_event_counts';
+
+/** Like densify(), but days past `coveredThrough` are null: not counted yet, not zero. */
+function densifyCovered(labels: string[], byDay: Map<string, number>, coveredThrough: string | null): (number | null)[] {
+  return labels.map((day) => (coveredThrough === null || day > coveredThrough ? null : (byDay.get(day) ?? 0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -314,12 +365,19 @@ interface SeriesSpec {
   labels: [string] | [string, string];
   sql: string;
   binds: (range: Range) => (string | number)[];
+  /**
+   * Written by the ingest worker as events arrive rather than by the nightly
+   * rollup, so it runs through today instead of stopping at the rollup's last day.
+   */
+  live?: boolean;
 }
 
 /**
- * Every metric here reads a rollup table, so a line stays correct for days whose
- * raw events are long gone. Each query returns (day, a[, b]) and is densified
- * against the full day list, because a day with no rows means zero, not a gap.
+ * Every metric here reads a rollup table (or, if `live`, a table the ingest path
+ * keeps), so a line stays correct for days whose raw events are long gone. Each
+ * query returns (day, a[, b]) and is densified against the full day list, because
+ * a covered day with no rows means zero, not a gap. Days the rollup has not
+ * reached yet are the gap.
  */
 const SERIES: Record<string, SeriesSpec> = {
   installs_uninstalls: {
@@ -341,6 +399,7 @@ const SERIES: Record<string, SeriesSpec> = {
            WHERE first_day BETWEEN ? AND ?
            GROUP BY first_day`,
     binds: (r) => [r.from, r.to],
+    live: true,
   },
   production_users: {
     title: 'Daily production users',
@@ -379,9 +438,12 @@ async function timeseries(env: Env, url: URL, range: Range): Promise<ApiResult> 
     return fail(`unknown metric — one of: ${[...Object.keys(SERIES), 'duration_buckets'].join(', ')}`);
   }
 
-  const { results } = await env.DB.prepare(spec.sql)
-    .bind(...spec.binds(range))
-    .all<DayValueRow>();
+  const batch = await env.DB.batch([
+    env.DB.prepare(spec.sql).bind(...spec.binds(range)),
+    env.DB.prepare(COVERAGE_SQL),
+  ]);
+  const results = rowsOf<DayValueRow>(batch[0]);
+  const coveredThrough = spec.live ? null : (firstOf<{ day: string | null }>(batch[1])?.day ?? null);
 
   const labels = dayList(range);
   const a = new Map<string, number>();
@@ -391,19 +453,23 @@ async function timeseries(env: Env, url: URL, range: Range): Promise<ApiResult> 
     b.set(row.day, row.b ?? 0);
   }
 
-  const datasets = [{ label: spec.labels[0], data: densify(labels, a) }];
-  if (spec.labels.length === 2) datasets.push({ label: spec.labels[1], data: densify(labels, b) });
+  const fill = (byDay: Map<string, number>): (number | null)[] =>
+    spec.live ? densify(labels, byDay) : densifyCovered(labels, byDay, coveredThrough);
+  const datasets = [{ label: spec.labels[0], data: fill(a) }];
+  if (spec.labels.length === 2) datasets.push({ label: spec.labels[1], data: fill(b) });
 
   return {
     body: {
       range,
       metric,
       title: spec.title,
+      /** Last day with real numbers; null for a live series, which runs through today. */
+      covered_through: spec.live ? null : coveredThrough,
       labels,
       datasets,
       rows: labels.map((day, i) => ({
         day,
-        ...Object.fromEntries(datasets.map((d) => [d.label, d.data[i] ?? 0])),
+        ...Object.fromEntries(datasets.map((d) => [d.label, d.data[i] ?? null])),
       })),
     },
     cacheControl: CACHE_CONTROL,
@@ -412,14 +478,17 @@ async function timeseries(env: Env, url: URL, range: Range): Promise<ApiResult> 
 
 /** "Session run length over time": one series per duration bucket, bucket-ordered. */
 async function durationBucketSeries(env: Env, range: Range): Promise<ApiResult> {
-  const { results } = await env.DB.prepare(
-    `SELECT day, value, sum(count) AS n
-       FROM daily_dim_counts
-      WHERE dim = 'duration_bucket' AND event = 'index' AND day BETWEEN ? AND ?
-      GROUP BY day, value`,
-  )
-    .bind(range.from, range.to)
-    .all<{ day: string; value: string; n: number }>();
+  const batch = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT day, value, sum(count) AS n
+         FROM daily_dim_counts
+        WHERE dim = 'duration_bucket' AND event = 'index' AND day BETWEEN ? AND ?
+        GROUP BY day, value`,
+    ).bind(range.from, range.to),
+    env.DB.prepare(COVERAGE_SQL),
+  ]);
+  const results = rowsOf<{ day: string; value: string; n: number }>(batch[0]);
+  const coveredThrough = firstOf<{ day: string | null }>(batch[1])?.day ?? null;
 
   const labels = dayList(range);
   const perBucket = new Map<string, Map<string, number>>();
@@ -437,7 +506,7 @@ async function durationBucketSeries(env: Env, range: Range): Promise<ApiResult> 
 
   const datasets = order.map((bucket) => ({
     label: bucket,
-    data: densify(labels, perBucket.get(bucket) ?? new Map()),
+    data: densifyCovered(labels, perBucket.get(bucket) ?? new Map(), coveredThrough),
   }));
 
   return {
@@ -445,11 +514,12 @@ async function durationBucketSeries(env: Env, range: Range): Promise<ApiResult> 
       range,
       metric: 'duration_buckets',
       title: 'Indexing run length over time',
+      covered_through: coveredThrough,
       labels,
       datasets,
       rows: labels.map((day, i) => ({
         day,
-        ...Object.fromEntries(datasets.map((d) => [d.label, d.data[i] ?? 0])),
+        ...Object.fromEntries(datasets.map((d) => [d.label, d.data[i] ?? null])),
       })),
     },
     cacheControl: CACHE_CONTROL,
@@ -600,11 +670,17 @@ interface ActivationRow {
  * reinstalls does not re-enter the funnel, which is what makes this a
  * conversion rate rather than an install-event ratio.
  *
- * The LEFT JOIN rides events_machine_day (machine_id, day) and `count(DISTINCT)`
- * absorbs the fan-out from a machine that indexed many times. This is the one
- * endpoint that reads raw `events`, so it is bounded by the retention window —
- * `raw_events_from` tells the caller where the data actually starts, and the UI
- * says so rather than drawing a cliff and calling it a drop in conversion.
+ * "Ran an index" is `machine_first_seen.first_index_day`, which the nightly rollup
+ * keeps at the earliest day each machine indexed. That makes this a range read over
+ * one small table. It used to be a join against raw `events` — on production volume
+ * ~55 s per week of cohorts, which held D1's single query lane long enough to fail
+ * every other panel waiting behind it. A first index day is never before the first
+ * day (the ingest path keeps first_day at the machine's earliest event), so "within
+ * the window" is just `first_index_day <= first_day + window`.
+ *
+ * Because first_index_day is rolled up, cohorts after the rollup's last day have no
+ * conversions counted yet. They are left out of the totals and drawn as gaps —
+ * counting them would show a drop in conversion that is only a lag.
  */
 async function activation(env: Env, url: URL, range: Range): Promise<ApiResult> {
   const rawWindow = url.searchParams.get('window');
@@ -615,41 +691,40 @@ async function activation(env: Env, url: URL, range: Range): Promise<ApiResult> 
 
   const batch = await env.DB.batch([
     env.DB.prepare(
-      `SELECT f.first_day AS day,
-              count(DISTINCT f.machine_id) AS installs,
-              count(DISTINCT CASE WHEN e.machine_id IS NOT NULL THEN f.machine_id END) AS activated
-         FROM machine_first_seen f
-         LEFT JOIN events e
-                ON e.machine_id = f.machine_id
-               AND e.event = 'index'
-               AND e.day >= f.first_day
-               AND e.day <= date(f.first_day, ?)
-        WHERE f.first_day BETWEEN ? AND ?
-        GROUP BY f.first_day`,
+      `SELECT first_day AS day,
+              count(*) AS installs,
+              count(CASE WHEN first_index_day <= date(first_day, ?) THEN 1 END) AS activated
+         FROM machine_first_seen
+        WHERE first_day BETWEEN ? AND ?
+        GROUP BY first_day`,
       // A bound modifier string, built from an integer this function validated —
       // date() takes the modifier as data, so nothing is concatenated into SQL.
     ).bind(`+${window} days`, range.from, range.to),
-    env.DB.prepare(`SELECT min(day) AS raw_from, max(day) AS raw_to FROM events`),
+    env.DB.prepare(COVERAGE_SQL),
   ]);
 
   const rows = rowsOf<ActivationRow>(batch[0]);
   const byDay = new Map(rows.map((r) => [r.day, r]));
   const labels = dayList(range);
 
-  const installs = rows.reduce((n, r) => n + (r.installs ?? 0), 0);
-  const activated = rows.reduce((n, r) => n + (r.activated ?? 0), 0);
-
   // Cohorts younger than the window have not finished converting yet, so their
   // rate is a floor, not a result. Marked rather than dropped: hiding the last
   // week of a conversion chart is its own kind of lie.
-  const boundsRow = firstOf<{ raw_from: string | null; raw_to: string | null }>(batch[1]);
-  const latestRaw = boundsRow?.raw_to ?? utcDay(Date.now());
-  const incompleteFrom = addDays(latestRaw, -(window - 1));
+  const coveredThrough = firstOf<{ day: string | null }>(batch[1])?.day ?? null;
+  const incompleteFrom = addDays(coveredThrough ?? utcDay(Date.now()), -(window - 1));
+  const counted = (day: string): boolean => coveredThrough !== null && day <= coveredThrough;
 
+  let installs = 0;
+  let activated = 0;
   const detail = labels.map((day) => {
     const row = byDay.get(day);
     const dayInstalls = row?.installs ?? 0;
+    if (!counted(day)) {
+      return { day, installs: dayInstalls, activated: null, rate: null, complete: false };
+    }
     const dayActivated = row?.activated ?? 0;
+    installs += dayInstalls;
+    activated += dayActivated;
     return {
       day,
       installs: dayInstalls,
@@ -669,8 +744,8 @@ async function activation(env: Env, url: URL, range: Range): Promise<ApiResult> 
       rate: installs > 0 ? activated / installs : null,
       /** Cohorts from this day on have not had the full window to convert. */
       incomplete_from: incompleteFrom,
-      /** Raw events start here; a range reaching further back under-counts. */
-      raw_events_from: boundsRow?.raw_from ?? null,
+      /** The last cohort day in the totals: later cohorts have no conversions counted yet. */
+      covered_through: coveredThrough,
       labels,
       datasets: [
         {

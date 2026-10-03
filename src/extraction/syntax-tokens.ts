@@ -42,6 +42,7 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { Language } from '../types';
 import { EXTRACTORS } from './languages';
 import { getParser, loadGrammarsForLanguages } from './grammars';
+import { parseWithinBudget } from './parse-budget';
 import type { LanguageExtractor } from './tree-sitter-types';
 
 /* ------------------------------------------------------------- the classes -- */
@@ -450,7 +451,7 @@ async function tokenizeRegion(
     await loadGrammarsForLanguages([language]);
     const parser = getParser(language);
     if (!parser) return null;
-    const tree = parser.parse(source);
+    const tree = parseWithinBudget(parser, source);
     if (!tree?.rootNode) return null;
     try {
       return classifyTree(tree.rootNode, source, language, offset);
