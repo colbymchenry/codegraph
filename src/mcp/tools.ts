@@ -3411,6 +3411,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'python-override') {
+      return {
+        label: `base-method dispatch — runs the subclass override (dynamic dispatch)`,
+        compact: `dynamic: base → override${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'closure-collection') {
       const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
       return {

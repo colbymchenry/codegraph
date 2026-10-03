@@ -1102,6 +1102,105 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
 }
 
 /**
+ * Python override dispatch. A call bound to a base method (a base-typed
+ * receiver `store: Base; store.fetch()`, or a module global holding one of
+ * several backends) runs the subclass override at runtime — no static edge
+ * reaches it, so `callers`/`impact` of the override miss every such call.
+ * Link each override to the NEAREST declaration of the same name up its
+ * `extends` chain: Python classes often inherit through a base that does not
+ * redeclare the method (`Leaf(Mid(Base))`, only Base and Leaf define it).
+ * Not dispatch, so skipped on either side: class-creation hooks (`Base()`
+ * never runs `Leaf.__init__`), static and class methods (`Base.fetch()` names
+ * its class), and properties (read, not called). A supertype is followed when
+ * its `extends` edge was resolved through an import or lies in the same file;
+ * a cross-file bare-name guess (`exact-match` / `fuzzy`) is not.
+ * Over-approximation accepted (reachability-correct), like interface-impl; no
+ * cap, since each override yields one edge per nearest declaration.
+ */
+const PYTHON_NON_VIRTUAL = new Set(['__init__', '__new__', '__init_subclass__', '__class_getitem__']);
+const PYTHON_NON_DISPATCH_DECORATOR = /^@?(?:staticmethod|classmethod|(?:functools\.)?cached_property|property|\w+\.(?:setter|getter|deleter))\b/;
+const GUESSED_SUPERTYPE = new Set(['exact-match', 'fuzzy']);
+async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  // Python decorators are not on the node (only `isStatic`); read the `@` lines
+  // above the def, past blank and comment lines between them.
+  const isPythonDispatchMethod = (m: Node): boolean => {
+    if (PYTHON_NON_VIRTUAL.has(m.name) || m.isStatic) return false;
+    const lines = ctx.getFileLines?.(m.filePath) ?? ctx.readFile(m.filePath)?.split('\n') ?? [];
+    for (let i = m.startLine - 2; i >= 0; i--) {
+      const line = lines[i]!.trim();
+      if (line === '' || line.startsWith('#')) continue;
+      if (!line.startsWith('@')) break;
+      if (PYTHON_NON_DISPATCH_DECORATOR.test(line)) return false;
+    }
+    return true;
+  };
+  let scanned = 0;
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const methodsMemo = new Map<string, Map<string, Node[]>>();
+  const methodsOf = (classId: string): Map<string, Node[]> => {
+    let byName = methodsMemo.get(classId);
+    if (byName) return byName;
+    byName = new Map();
+    for (const e of queries.getOutgoingEdges(classId, ['contains'])) {
+      const n = queries.getNodeById(e.target);
+      if (!n || n.kind !== 'method' || n.language !== 'python') continue;
+      const arr = byName.get(n.name);
+      if (arr) arr.push(n); else byName.set(n.name, [n]);
+    }
+    methodsMemo.set(classId, byName);
+    return byName;
+  };
+  const basesOf = (cls: Node): Node[] =>
+    queries.getOutgoingEdges(cls.id, ['extends'])
+      .map((e) => ({ e, base: queries.getNodeById(e.target) }))
+      .filter(({ e, base }) => !!base && base.kind === 'class' && base.language === 'python' && base.id !== cls.id &&
+        (base.filePath === cls.filePath ||
+          !GUESSED_SUPERTYPE.has(String((e.metadata as { resolvedBy?: string } | undefined)?.resolvedBy))))
+      .map(({ base }) => base!);
+  for (const cls of queries.iterateNodesByKind('class')) {
+    if ((++scanned & 63) === 0) await onYield();
+    if (cls.language !== 'python') continue;
+    const bases = basesOf(cls);
+    if (bases.length === 0) continue;
+    for (const [name, all] of methodsOf(cls.id)) {
+      const overrides = all.filter(isPythonDispatchMethod);
+      if (overrides.length === 0) continue;
+      // Breadth-first up the bases; a branch stops at its first declaration.
+      const visited = new Set<string>([cls.id]);
+      let frontier = bases;
+      for (let depth = 0; frontier.length && depth < 16; depth++) {
+        const next: Node[] = [];
+        for (const base of frontier) {
+          if (visited.has(base.id)) continue;
+          visited.add(base.id);
+          const declared = methodsOf(base.id).get(name);
+          if (!declared) { next.push(...basesOf(base)); continue; }
+          // The nearest declaration ends this branch even when it is static or a property.
+          for (const bm of declared.filter(isPythonDispatchMethod)) {
+            for (const m of overrides) {
+              const key = `${bm.id}>${m.id}`;
+              if (bm.id === m.id || seen.has(key)) continue;
+              seen.add(key);
+              edges.push({
+                source: bm.id,
+                target: m.id,
+                kind: 'calls',
+                line: bm.startLine,
+                provenance: 'heuristic',
+                metadata: { synthesizedBy: 'python-override', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+              });
+            }
+          }
+        }
+        frontier = next;
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Go gRPC stub → impl bridge. The protoc-gen-go-grpc codegen emits an
  * `UnimplementedXxxServer` struct in `*_grpc.pb.go` carrying one method
  * per service RPC; the real handler is a hand-written struct in another
@@ -3839,6 +3938,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
     run: (q, _c, y) => interfaceOverrideEdges(q, y),
   },
+  { name: 'pythonOverrideEdges', gate: (has) => has('python'), run: (q, c, y) => pythonOverrideEdges(q, c, y) },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
   { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
