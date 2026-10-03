@@ -3011,6 +3011,60 @@ const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Python's dict / list / set / str / file / `re` methods. On an untyped
+ * receiver (`options.setdefault(…)`, `d.copy()`) they are the builtin
+ * type's, never a same-named project method the call happens to share a
+ * file with.
+ */
+const PYTHON_STD_METHODS: ReadonlySet<string> = new Set([
+  'get', 'setdefault', 'pop', 'popitem', 'update', 'items', 'keys', 'values', 'copy', 'clear',
+  'append', 'extend', 'insert', 'remove', 'index', 'count', 'sort', 'reverse', 'add', 'discard',
+  'union', 'intersection', 'difference', 'split', 'rsplit', 'join', 'strip', 'lstrip', 'rstrip',
+  'replace', 'startswith', 'endswith', 'lower', 'upper', 'format', 'encode', 'decode', 'find',
+  'rfind', 'splitlines', 'read', 'readline', 'readlines', 'write', 'writelines', 'close', 'seek',
+  'flush', 'group', 'groups', 'match', 'search', 'sub', 'findall', 'fullmatch',
+]);
+
+/**
+ * Scala's collection / Option / Future methods and the `java.*` calls Scala
+ * code makes. On Play, ~2,500 `map` / `get` / `foreach` calls on untyped
+ * values landed on unrelated project methods.
+ */
+const SCALA_STD_METHODS: ReadonlySet<string> = new Set([
+  'map', 'flatMap', 'filter', 'filterNot', 'foreach', 'fold', 'foldLeft', 'foldRight', 'reduce',
+  'collect', 'collectFirst', 'find', 'exists', 'forall', 'count', 'get', 'getOrElse', 'orElse',
+  'orNull', 'isEmpty', 'nonEmpty', 'isDefined', 'contains', 'headOption', 'head', 'tail', 'last',
+  'lastOption', 'take', 'drop', 'groupBy', 'sortBy', 'sorted', 'mkString', 'toList', 'toSeq',
+  'toSet', 'toMap', 'toVector', 'toArray', 'zip', 'zipWithIndex', 'size', 'length', 'update',
+  'updated', 'recover', 'recoverWith', 'transform', 'andThen', 'compose', 'onComplete', 'asScala',
+  'asJava', 'getOrElseUpdate', 'put', 'remove', 'add', 'append', 'replace', 'split', 'trim',
+  'startsWith', 'endsWith', 'format', 'equals', 'hashCode', 'toString', 'set', 'build', 'execute',
+  'of', 'encode', 'decode', 'max', 'min',
+]);
+
+/**
+ * `java.lang` / `java.util` / streams and the Android framework calls Java
+ * code makes on values whose type the resolver cannot see — a lambda
+ * parameter, a `var`, a call result, an inherited field. On Play ~1,100
+ * test-map `put` calls landed on a test class's `RejectingMap::put`. Names
+ * Java projects commonly declare themselves (`post`, `of`, `apply`, `run`,
+ * `start`, `getId`) stay out.
+ */
+const JAVA_STD_METHODS: ReadonlySet<string> = new Set([
+  'equals', 'hashCode', 'toString', 'getClass', 'compareTo',
+  'get', 'put', 'add', 'remove', 'contains', 'containsKey', 'containsValue', 'size', 'isEmpty',
+  'clear', 'iterator', 'hasNext', 'next', 'stream', 'forEach', 'keySet', 'values', 'entrySet',
+  'addAll', 'removeAll', 'putAll', 'putIfAbsent', 'getOrDefault', 'computeIfAbsent', 'indexOf',
+  'toArray', 'subList',
+  'length', 'charAt', 'substring', 'trim', 'split', 'startsWith', 'endsWith', 'equalsIgnoreCase',
+  'toLowerCase', 'toUpperCase', 'replace', 'format', 'valueOf',
+  'map', 'filter', 'orElse', 'orElseGet', 'orElseThrow', 'ifPresent', 'isPresent', 'collect',
+  'findFirst', 'anyMatch', 'allMatch',
+  'postDelayed', 'removeCallbacks', 'obtainMessage', 'getResources', 'getSystemService',
+  'findViewById', 'setVisibility', 'startActivity',
+]);
+
+/**
  * A request handler the web framework dispatches to: a Django / DRF / Flask
  * view's `get` / `post` / …, a controller's `index` / `store` / `update` /
  * `destroy`. Nothing calls one through an instance by name, so a guess from
@@ -3055,6 +3109,9 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'kotlin': return KOTLIN_STD_METHODS;
     case 'csharp': return CSHARP_STD_METHODS;
     case 'dart': return DART_STD_METHODS;
+    case 'python': return PYTHON_STD_METHODS;
+    case 'scala': return SCALA_STD_METHODS;
+    case 'java': return JAVA_STD_METHODS;
     default: return null;
   }
 }
@@ -6775,7 +6832,9 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // PascalCase-guarded (unlike the anchored patterns above) to keep the
         // keyword-free `ident Type` shape from matching unrelated pairs; the
         // enclosing-scope bound already excludes package-level struct fields.
-        new RegExp(`\\b${r}\\s+\\*?([A-Z][\\w.]*)`), // func use(lg Logger) / (l Logger)
+        // A package-qualified type (`conn net.Conn`) is captured whole, so a
+        // library type is known to be one rather than left to a name guess.
+        new RegExp(`\\b${r}\\s+\\*?((?:[a-z_]\\w*\\.)?[A-Z][\\w.]*)`), // func use(lg Logger) / (l Logger) / (c net.Conn)
       ];
     case 'ruby':
       return [
@@ -8108,11 +8167,12 @@ export function matchMethodCall(
         // `json` of its `MockedResponse`.
         !isUnnamedTestDouble(targetMethods[0]!, objectOrClass!, ref, context) &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
-        // Rust / Go / Kotlin / C#: a standard-library method name on an
-        // untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
-        // `reader.Value.ToString()`) is the library type's.
+        // Rust / Go / Kotlin / C# / Python / Scala / Java: a standard-library
+        // method name on an untyped receiver (`sym.map(…)`,
+        // `w.Header().Get(…)`, `reader.Value.ToString()`,
+        // `options.setdefault(…)`) is the library type's.
         !(stdMethodNames(ref.language)?.has(methodName!) &&
-          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
+          !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -8137,7 +8197,7 @@ export function matchMethodCall(
       // Same-file candidates first, so a score tie (`score > bestScore` keeps
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
-      const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
+      const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base|cls)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
         if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
