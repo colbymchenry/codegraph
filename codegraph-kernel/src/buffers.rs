@@ -75,6 +75,9 @@ pub const META_SIZE: usize = 36;
 pub const NODE_ROW_SIZE: usize = 96;
 pub const EDGE_ROW_SIZE: usize = 44;
 pub const REF_ROW_SIZE: usize = 40;
+/// Byte offsets of a ref row's string fields (layout above), for `patch_ref_str`.
+pub const REF_REFERENCE_NAME: usize = 16;
+pub const REF_CANDIDATES: usize = 24;
 
 /// Mirror of NODE_KINDS in src/types.ts — order is the wire contract.
 pub const NODE_KINDS: [&str; 23] = [
@@ -313,6 +316,13 @@ impl Tables {
 
     pub fn push_ref(&mut self, r: &RefRow) {
         self.push_ref_flagged(r, 0);
+    }
+
+    /// Rewrite one string field of a ref row already pushed at `row_offset` in `refs`.
+    pub fn patch_ref_str(&mut self, row_offset: usize, field: usize, value: StrRef) {
+        let at = row_offset + field;
+        self.refs[at..at + 4].copy_from_slice(&value.0.to_le_bytes());
+        self.refs[at + 4..at + 8].copy_from_slice(&value.1.to_le_bytes());
     }
 
     pub fn push_ref_flagged(&mut self, r: &RefRow, flags: u8) {

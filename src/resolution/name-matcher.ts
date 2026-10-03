@@ -1143,6 +1143,21 @@ export function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
+  // Literal members are value-owned definitions, never free functions named by a bare call.
+  const object = candidate.kind === 'function' && ['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro'].includes(ref.language)
+    ? context.getJsObjectInfo?.(candidate.id) : null;
+  if (object?.ownerId) {
+    if (ref.candidates !== undefined && !ref.candidates.includes(candidate.qualifiedName)) return false;
+    if (!/[.:]/.test(ref.referenceName)) {
+      if (candidate.filePath !== ref.filePath || ref.line < candidate.startLine || ref.line > candidate.endLine) return false;
+      const line = context.getFileLines?.(candidate.filePath)?.[candidate.startLine - 1] ?? context.readFile(candidate.filePath)?.split('\n')[candidate.startLine - 1] ?? '';
+      if (!new RegExp(`^(?:async\\s+)?function\\s*\\*?\\s*${ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(line.slice(candidate.startColumn))) return false;
+    }
+    if (!object.binding.startsWith('global:') && candidate.filePath === ref.filePath) {
+      const [sl, sc, el, ec] = object.scope;
+      if ((ref.line < sl || (ref.line === sl && ref.column < sc)) || (ref.line > el || (ref.line === el && ref.column >= ec))) return false;
+    }
+  }
   // A `val` / `const` declared in a function body is that body's alone —
   // okio's `(source as Source).buffer()` bound to a `val buffer = Buffer()`
   // inside another test file's `pipe()`.
@@ -5716,7 +5731,7 @@ export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] 
  * Languages whose object literals declare callable members — `export const
  * api = { call() {…}, get: () => {…} }` used as a namespace (#1573).
  */
-const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'vue', 'svelte', 'astro']);
 
 /** True when `inner`'s source range lies within `outer`'s (lines, then columns on a shared line). */
 function rangeWithin(inner: Node, outer: Node): boolean {
@@ -5739,13 +5754,11 @@ function sameRange(a: Node, b: Node): boolean {
 
 /**
  * Resolve `container.member` where `container` is a VALUE holding an object
- * literal — `export const api = { call() {…}, get: () => {…} }` used as the
- * module's namespace (#1573). The members are extracted as plain functions
- * with BARE qualified names inside the constant's source extent (there is no
- * `api::call`), so neither the `Container::member` lookup the class-shaped
- * kinds use (#825) nor the declared-type inference for singleton instances
- * (#1292) can reach them, and every such call resolved to nothing — or, via
- * an import, to the constant itself. This looks the member up by CONTAINMENT:
+ * literal — `const api = { call() {…}, get: () => {…} }` used as a namespace
+ * (#1573). Current literal members are qualified under their holder; legacy
+ * indexes and exported factory-return members retain bare qualified names.
+ * The class-shaped lookup (#825) and singleton type inference (#1292) cannot
+ * validate that ownership across both forms. Look the member up by CONTAINMENT:
  * a node named `member` whose range lies inside the container's, in the
  * container's own file. A helper declared inside a member's body is not a
  * member and is skipped; nothing else in the file can donate a match. Calls
@@ -5904,8 +5917,7 @@ export function resolveObjectLiteralBinding(
   const code = blankStringContents(stripCommentsForRegex(lines.join('\n'), 'typescript'));
   const offsets = [0];
   for (let i = 0; i < code.length; i++) if (code[i] === '\n') offsets.push(i + 1);
-  const scopeAt = (node: Node): number[] => {
-    const end = (offsets[node.startLine - 1] ?? code.length) + node.startColumn;
+  const scopeAtOffset = (end: number): number[] => {
     const scope: number[] = [];
     for (let i = 0; i < end; i++) {
       if (code[i] === '{') scope.push(i);
@@ -5913,7 +5925,34 @@ export function resolveObjectLiteralBinding(
     }
     return scope;
   };
+  const offsetOf = (node: Node): number => (offsets[node.startLine - 1] ?? code.length) + node.startColumn;
+  const scopeAt = (node: Node): number[] => scopeAtOffset(offsetOf(node));
   const scope = scopeAt(container);
+
+  // Anonymous wrappers have no function node. Only headers of ACTIVE braces
+  // can bind this alias: a sibling IIFE's parameters are already out of scope.
+  const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const headerAt = (end: number): string => {
+    let start = end - 1;
+    let depth = 0;
+    for (; start >= 0; start--) {
+      const ch = code[start];
+      if (ch === ')' || ch === ']' || ch === '}') depth++;
+      else if (ch === '(' || ch === '[' || ch === '{') {
+        if (depth === 0) break;
+        depth--;
+      } else if (depth === 0 && (ch === ';' || ch === ',' || (ch === '=' && code[start + 1] !== '>'))) break;
+    }
+    return `${code.slice(start + 1, end)}{`;
+  };
+  if (scope.some(open => hasParameterBinding(headerAt(open), escaped))) return null;
+  // An expression-body arrow can put the assignment directly after its head.
+  const before = code.slice(0, offsetOf(container));
+  const arrowHead = /=>\s*(?:\(\s*)*$/.exec(before);
+  if (arrowHead && hasParameterBinding(headerAt(arrowHead.index + 2), escaped)) return null;
+  const selfHeader = new RegExp(`\\bfunction(?:\\s*\\*\\s*|\\s+)${escaped}(?=\\s*(?:<|\\())`);
+  let selfDepth = 0;
+  for (const [index, open] of scope.entries()) if (selfHeader.test(headerAt(open))) selfDepth = index + 1;
 
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
   const accepts =
@@ -5930,6 +5969,27 @@ export function resolveObjectLiteralBinding(
   // Select the lexical binding BEFORE checking callability: a nearer value
   // shadows an outer function even if that value cannot be called.
   const local = locals[0]?.node;
+  // Primitive locals are deliberately not indexed. Their source declaration
+  // still shadows an outer callable; only an indexed function starting at
+  // this initializer is evidence that the binding itself is callable.
+  const declarations = [...code.matchAll(localBindingPatterns(binding, 'g').decl)]
+    .map(match => ({ match, scope: scopeAtOffset(match.index!) }))
+    .filter(entry => entry.scope.every((position, i) => scope[i] === position))
+    .sort((a, b) => b.scope.length - a.scope.length);
+  const declared = declarations[0];
+  if (declared && (!locals.length || declared.scope.length >= locals[0]!.scope.length)) {
+    const equals = declared.match[0].indexOf('=');
+    let valueAt = declared.match.index! + equals + 1;
+    while (/\s/.test(code[valueAt] ?? '') && valueAt < code.length) valueAt++;
+    const nameAt = declared.match.index! + (/^(?:const|let|var)\s+/.exec(declared.match[0])?.[0].length ?? 0);
+    const declaredValue = local && ['constant', 'variable', 'component'].includes(local.kind) && offsetOf(local) === nameAt;
+    if (!local || equals < 0 || !accepts(local) || (!declaredValue && offsetOf(local) !== valueAt) ||
+        declarations.some(entry => entry !== declared && entry.scope.length === declared.scope.length)) return null;
+  }
+  // A named function expression's self-binding is not the outer namesake.
+  // Keep a proven nearer local; otherwise this alias boundary stays opaque.
+  if (selfDepth > 0 && (!locals.length || locals[0]!.scope.length < selfDepth) &&
+      (!declared || declared.scope.length < selfDepth)) return null;
   if (local) return accepts(local)
     ? { original: ref, targetNodeId: local.id, confidence: 0.85, resolvedBy: 'instance-method' }
     : null;
@@ -7891,6 +7951,7 @@ export function matchMethodCall(
         (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
       );
       for (const holder of holders) {
+        if (context.getJsObjectInfo?.(holder.id) && ref.candidates !== undefined && !ref.candidates.includes(`${holder.qualifiedName}::${methodName}`)) continue;
         const hit =
           resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method') ??
           resolveObjectLiteralBinding(holder, methodName!, ref, context);

@@ -7,6 +7,7 @@ use crate::textutil as util;
 use super::{
     body_of, is_builtin_type, is_literal_receiver, is_react_hoc, is_variable_type,
     is_vue_collection_name, Extra, Scope, Walker,
+    JsObjectOwner, js_object_metadata,
 };
 use crate::buffers::edge_kind_index;
 use tree_sitter::Node;
@@ -15,6 +16,10 @@ impl<'t> Walker<'t> {
     // --- extractFunction --------------------------------------------------------
 
     pub(super) fn extract_function(&mut self, node: Node<'t>, name_override: Option<String>) {
+        self.extract_function_with_metadata(node, name_override, None);
+    }
+
+    fn extract_function_with_metadata(&mut self, node: Node<'t>, name_override: Option<String>, contains_metadata: Option<String>) {
         let mut name = name_override
             .clone()
             .unwrap_or_else(|| self.extract_name(node));
@@ -50,18 +55,25 @@ impl<'t> Walker<'t> {
             return;
         }
 
+        let object_member = contains_metadata.is_some();
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(common_js_export || self.is_exported(node)),
+            is_exported: Some(!object_member && (common_js_export || self.is_exported(node))),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
+            contains_metadata,
             ..Extra::default()
         };
         let Some(row) = self.create_node("function", &name, node, extra) else {
             return;
         };
+        if object_member {
+            let point = self.js_binding_point(node);
+            let qualified_name = self.js_qualified_name(&name);
+            self.js_object_members.entry(point).or_insert(qualified_name);
+        }
 
         self.extract_type_annotations(node, row);
         self.extract_decorators_for(node, row);
@@ -374,6 +386,25 @@ impl<'t> Walker<'t> {
     }
 
     pub(super) fn extract_variable(&mut self, node: Node<'t>) {
+        self.extract_variable_selection(node, None);
+    }
+
+    pub(super) fn extract_local_objects(&mut self, node: Node<'t>) -> bool {
+        if !is_variable_type(node.kind()) { return false; }
+        let objects: Vec<Node> = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).filter(|child|
+            child.kind() == "variable_declarator" && child.child_by_field_name("value").is_some_and(|value|
+                matches!(value.kind(), "object" | "object_expression") && self.object_has_inline_functions(value))).collect();
+        if objects.is_empty() { return false; }
+        for child in &objects { self.extract_variable_selection(node, Some(*child)); }
+        self.scan_fn_ref_subtree(node, 0);
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i).filter(|n| n.kind() == "variable_declarator") else { continue };
+            if !objects.iter().any(|object| object.id() == child.id()) { self.visit_function_body(child); }
+        }
+        true
+    }
+
+    fn extract_variable_selection(&mut self, node: Node<'t>, selected: Option<Node<'t>>) {
         let is_const = self.is_const_decl(node);
         let kind: &'static str = if is_const { "constant" } else { "variable" };
         let docstring = crate::docstring::preceding_docstring(node, self.src);
@@ -384,6 +415,7 @@ impl<'t> Walker<'t> {
             if child.kind() != "variable_declarator" {
                 continue;
             }
+            if selected.is_some_and(|n| n.id() != child.id()) { continue; }
             let Some(name_node) = child.child_by_field_name("name") else { continue };
             let value = child.child_by_field_name("value");
 
@@ -398,6 +430,7 @@ impl<'t> Walker<'t> {
                 continue;
             }
             let name = self.text(name_node).to_string();
+            let direct_object = value.filter(|v| matches!(v.kind(), "object" | "object_expression"));
 
             // Arrow/function/generator values extract as functions, named by the declarator.
             if let Some(v) = value {
@@ -429,6 +462,9 @@ impl<'t> Walker<'t> {
                 }
             }
 
+            let object_info = direct_object.map(|_| self.js_object_info(child, &name, true));
+            let contains_metadata = object_info.as_ref().map(js_object_metadata);
+            let qualified_name = self.js_qualified_name(&name);
             let var_row = self.create_node(
                 kind,
                 &name,
@@ -437,10 +473,14 @@ impl<'t> Walker<'t> {
                     docstring: docstring.clone(),
                     signature: init_signature.clone(),
                     is_exported: Some(is_exported),
+                    contains_metadata,
                     ..Extra::default()
                 },
             );
             if let Some(row) = var_row {
+                if let Some(info) = object_info {
+                    self.js_object_owners.push(JsObjectOwner { row, qualified_name, info });
+                }
                 self.extract_variable_type_annotation(child, row);
             }
 
@@ -458,7 +498,7 @@ impl<'t> Walker<'t> {
             // shape most React Native stores are written in. Mirrors
             // TreeSitterExtractor.isExportedLater.
             let extract_object_methods =
-                (is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
+                (direct_object.is_some() || is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
 
             let rtk_endpoints = match value {
                 Some(v) if v.kind() == "call_expression" => self.find_rtk_endpoints_object(v),
@@ -508,7 +548,13 @@ impl<'t> Walker<'t> {
 
             if extract_object_methods {
                 if let Some(obj) = object_of_fns {
-                    self.extract_object_literal_functions(obj);
+                    if let (Some(_), Some(row)) = (direct_object, var_row) {
+                        self.stack.push(Scope { row, kind, name: name.clone() });
+                        self.extract_owned_object_literal_functions(obj);
+                        self.stack.pop();
+                    } else {
+                        self.extract_object_literal_functions(obj);
+                    }
                 }
             }
             if let Some(rtk) = rtk_endpoints {
@@ -548,6 +594,68 @@ impl<'t> Walker<'t> {
     }
 
     // --- object-literal / store helpers -------------------------------------------------
+
+    fn static_object_key(&self, key: Node<'t>) -> Option<String> {
+        if !matches!(key.kind(), "property_identifier" | "string" | "number") { return None; }
+        Some(util::object_key_name(self.text(key)))
+    }
+
+    fn extract_owned_object_literal_functions(&mut self, obj: Node<'t>) {
+        for i in 0..obj.named_child_count() {
+            let Some(member) = obj.named_child(i) else { continue };
+            if member.kind() == "pair" {
+                let key = member.child_by_field_name("key").and_then(|key| self.static_object_key(key));
+                if let Some(value) = member.child_by_field_name("value") {
+                    if let Some(name) = key.as_ref().filter(|_| matches!(value.kind(), "arrow_function" | "function_expression" | "generator_function")) {
+                        self.extract_function_with_metadata(value, Some(name.clone()), Some("{\"jsObjectMember\":true}".to_string()));
+                    } else if value.kind() == "call_expression" {
+                        let function = value.child_by_field_name("arguments").and_then(|args| args.named_child(0));
+                        let bound = function.and_then(|function| self.curried_wrapper_bound_name(function));
+                        if let (Some(function), Some(bound), Some(_)) = (function, bound, key) {
+                            self.extract_function_with_metadata(function, Some(bound), Some("{\"jsObjectMember\":true}".to_string()));
+                        } else { self.visit_function_body(value); }
+                    } else { self.visit_function_body(value); }
+                }
+            } else if member.kind() == "method_definition" {
+                if let Some(name) = member.child_by_field_name("name").and_then(|key| self.static_object_key(key)) {
+                    self.extract_function_with_metadata(member, Some(name), Some("{\"jsObjectMember\":true}".to_string()));
+                } else if let Some(body) = member.child_by_field_name("body") { self.visit_function_body(body); }
+            } else if member.kind() == "spread_element" {
+                self.visit_function_body(member);
+            }
+        }
+    }
+
+    pub(super) fn extract_object_assignment(&mut self, node: Node<'t>) -> bool {
+        if node.kind() != "assignment_expression" { return false; }
+        let Some(object) = node.child_by_field_name("right").filter(|n| matches!(n.kind(), "object" | "object_expression")) else { return false };
+        let Some(path) = self.js_member_path(node.child_by_field_name("left")).filter(|path| path.contains('.')) else { return false };
+        let proof = self.js_object_root(node, path.split('.').next().unwrap_or(&path));
+        let root = path.split('.').next().unwrap_or(&path);
+        let root_owner = self.js_object_owners.iter().find(|owner| owner.info.path == root && owner.info.binding == proof);
+        let root_info = root_owner.map(|owner| (owner.qualified_name.clone(), owner.info.scope));
+        if !proof.starts_with("global:") && root_info.is_none() { return false; }
+        let mut info = self.js_object_info(node, &path, false);
+        let qualified_name = if let Some((qualified_name, scope)) = root_info {
+            info.scope = scope;
+            format!("{qualified_name}{}", &path[root.len()..])
+        } else { path.clone() };
+        let contains_metadata = js_object_metadata(&info);
+        let signature = format!("= {}", util::slice_utf16(self.text(object), 100).0);
+        let Some(row) = self.create_node("variable", &path, node, Extra {
+            signature: Some(signature),
+            is_exported: Some(false),
+            contains_metadata: Some(contains_metadata),
+            qualified_name: Some(qualified_name.clone()),
+            ..Extra::default()
+        }) else { return false };
+        self.js_object_owners.push(JsObjectOwner { row, qualified_name, info });
+        self.stack.push(Scope { row, kind: "variable", name: path });
+        self.extract_owned_object_literal_functions(object);
+        self.stack.pop();
+        self.scan_fn_ref_subtree(node, 0);
+        true
+    }
 
     pub(super) fn extract_object_literal_functions(&mut self, obj: Node<'t>) {
         for i in 0..obj.named_child_count() {
@@ -646,7 +754,7 @@ impl<'t> Walker<'t> {
             }
             if member.kind() == "pair" {
                 if let Some(v) = member.child_by_field_name("value") {
-                    if matches!(v.kind(), "arrow_function" | "function_expression") {
+                    if matches!(v.kind(), "arrow_function" | "function_expression" | "generator_function") {
                         return true;
                     }
                 }
@@ -1165,6 +1273,7 @@ impl<'t> Walker<'t> {
         let func = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0));
+        let object_path = self.js_member_path(func);
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1240,7 +1349,7 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_call_ref(&callee_name.clone(), node);
+            self.push_object_call_ref(&callee_name, node, object_path.as_deref());
         }
     }
 

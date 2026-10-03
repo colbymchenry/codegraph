@@ -16,7 +16,7 @@ use crate::textutil as util;
 use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
     RefRow, StrRef, Tables, FLAG_IS_ASYNC, FLAG_IS_EXPORTED, FLAG_IS_STATIC, FUNCTION_REF_CODE,
-    NONE, NONE_STR,
+    NONE, NONE_STR, REF_CANDIDATES, REF_REFERENCE_NAME,
 };
 use crate::ids;
 use crate::langs;
@@ -93,6 +93,36 @@ fn is_variable_type(kind: &str) -> bool {
     matches!(kind, "lexical_declaration" | "variable_declaration")
 }
 
+fn is_js_binding_function(kind: &str) -> bool {
+    is_function_type(kind) || kind == "method_definition"
+}
+
+fn is_js_binding_scope(kind: &str) -> bool {
+    matches!(kind, "program" | "statement_block" | "catch_clause" | "for_statement" | "for_in_statement")
+}
+
+fn add_js_binding(bindings: &mut HashMap<String, String>, name: String, proof: String) {
+    let proof = if bindings.get(&name).is_some_and(|old| old != &proof) { "unknown".to_string() } else { proof };
+    bindings.insert(name, proof);
+}
+
+fn json_string(value: &str) -> String {
+    let mut result = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            ch if ch < ' ' => result.push_str(&format!("\\u{:04x}", ch as u32)),
+            _ => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
+}
+
 /// LITERAL_RECEIVER_TYPES (tree-sitter.ts) — full set; only a handful occur in
 /// TS/JS grammars but membership is what the TS code tests.
 fn is_literal_receiver(kind: &str) -> bool {
@@ -153,12 +183,39 @@ struct Extra {
     is_async: Option<bool>,
     is_static: Option<bool>,
     qualified_name: Option<String>,
+    contains_metadata: Option<String>,
 }
 
 struct ValueScope<'t> {
     row: u32,
     node: Node<'t>,
     name: String,
+}
+
+#[derive(Clone)]
+struct JsObjectInfo {
+    path: String,
+    binding: String,
+    scope: [u32; 4],
+}
+
+struct JsObjectOwner {
+    row: u32,
+    qualified_name: String,
+    info: JsObjectInfo,
+}
+
+struct PendingObjectCall {
+    row_offset: usize,
+    path: String,
+    proof: String,
+    /// extract_call named the call by its bare member, not by `path`.
+    collapsed: bool,
+}
+
+fn js_object_metadata(info: &JsObjectInfo) -> String {
+    format!("{{\"jsObject\":{{\"path\":{},\"binding\":{},\"scope\":[{},{},{},{}]}}}}", json_string(&info.path), json_string(&info.binding),
+        info.scope[0], info.scope[1], info.scope[2], info.scope[3])
 }
 
 pub struct Walker<'t> {
@@ -185,6 +242,12 @@ pub struct Walker<'t> {
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
     vue_store_file: Option<bool>,
+    /// AST lexical binding proofs, including anonymous and same-line scopes.
+    js_object_scopes: HashMap<usize, HashMap<String, String>>,
+    js_object_owners: Vec<JsObjectOwner>,
+    js_object_members: HashMap<String, String>,
+    js_object_writes: Option<HashMap<String, HashSet<String>>>,
+    pending_object_calls: Vec<PendingObjectCall>,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -234,6 +297,11 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
         vue_store_file: None,
+        js_object_scopes: HashMap::new(),
+        js_object_owners: Vec::new(),
+        js_object_members: HashMap::new(),
+        js_object_writes: None,
+        pending_object_calls: Vec::new(),
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -267,6 +335,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
     w.stack.push(Scope { row: 0, kind: "file", name: base_name.to_string() });
 
     w.visit_node(tree.root_node());
+    w.finalize_object_call_candidates();
 
     // End-of-file passes, in the TS extract() order.
     w.flush_fn_ref_candidates();
@@ -341,6 +410,288 @@ impl<'t> Walker<'t> {
         self.push_ref(self.top_row(), name, edge_kind_index("calls").unwrap(), node);
     }
 
+    fn push_object_call_ref(&mut self, name: &str, node: Node<'t>, path: Option<&str>) {
+        let Some(path) = path else {
+            self.push_call_ref(name, node);
+            return;
+        };
+        let proof = self.js_object_root(node, path.split('.').next().unwrap_or(path));
+        if !path.contains('.') {
+            let candidates = self.js_object_members.get(&proof).map(|name| vec![name.clone()])
+                .or_else(|| proof.starts_with("parameter:").then(Vec::new));
+            if let Some(candidates) = candidates {
+                self.push_object_candidates(name, node, &candidates);
+            } else { self.push_call_ref(name, node); }
+            return;
+        }
+        let proof = if self.js_object_is_written(node, path) { "unknown".to_string() } else { proof };
+        if proof == "import" {
+            self.push_call_ref(name, node);
+            return;
+        }
+        let row_offset = self.tables.refs.len();
+        self.push_object_candidates(name, node, &[]);
+        self.pending_object_calls.push(PendingObjectCall { row_offset, path: path.to_string(), proof, collapsed: name != path });
+    }
+
+    fn push_object_candidates(&mut self, name: &str, node: Node, candidates: &[String]) {
+        let candidates = self.arena.put(&candidates.join("\0"));
+        let reference_name = self.arena.put(name);
+        self.tables.push_ref(&RefRow {
+            from_idx: self.top_row(),
+            kind: edge_kind_index("calls").unwrap(),
+            line: self.line_of(node),
+            column: self.col_of(node),
+            reference_name,
+            candidates,
+            from_id_str: NONE_STR,
+        });
+    }
+
+    fn js_binding_point(&self, node: Node) -> String {
+        format!("binding:{}:{}", self.line_of(node), self.col_of(node))
+    }
+
+    fn js_parameter_point(&self, node: Node) -> String {
+        format!("parameter:{}:{}", self.line_of(node), self.col_of(node))
+    }
+
+    fn js_member_path(&self, node: Option<Node<'t>>) -> Option<String> {
+        stack_guard!();
+        let node = node?;
+        if node.kind() == "identifier" { return Some(self.text(node).to_string()); }
+        if node.kind() != "member_expression" { return None; }
+        let object = self.js_member_path(node.child_by_field_name("object"))?;
+        let property = node.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" { return None; }
+        Some(format!("{object}.{}", self.text(property)))
+    }
+
+    fn js_pattern_names(&self, pattern: Option<Node<'t>>) -> Vec<String> {
+        stack_guard!();
+        let Some(pattern) = pattern else { return Vec::new() };
+        match pattern.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => vec![self.text(pattern).to_string()],
+            "pair_pattern" => self.js_pattern_names(pattern.child_by_field_name("value")),
+            "assignment_pattern" | "object_assignment_pattern" => self.js_pattern_names(pattern.child_by_field_name("left")),
+            "required_parameter" | "optional_parameter" => self.js_pattern_names(
+                pattern.child_by_field_name("pattern").or_else(|| pattern.child_by_field_name("name")),
+            ),
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => (0..pattern.named_child_count())
+                .flat_map(|i| self.js_pattern_names(pattern.named_child(i))).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn collect_js_import_bindings(&self, node: Node<'t>, bindings: &mut HashMap<String, String>) {
+        stack_guard!();
+        match node.kind() {
+            "import_specifier" => {
+                if let Some(name) = node.child_by_field_name("alias").or_else(|| node.child_by_field_name("name")) {
+                    add_js_binding(bindings, self.text(name).to_string(), "import".to_string());
+                }
+            }
+            "namespace_import" => {
+                if let Some(name) = node.named_child_count().checked_sub(1).and_then(|i| node.named_child(i)) {
+                    add_js_binding(bindings, self.text(name).to_string(), "import".to_string());
+                }
+            }
+            "import_clause" => {
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i) else { continue };
+                    if child.kind() == "identifier" {
+                        add_js_binding(bindings, self.text(child).to_string(), "import".to_string());
+                    } else {
+                        self.collect_js_import_bindings(child, bindings);
+                    }
+                }
+            }
+            _ => for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) { self.collect_js_import_bindings(child, bindings); }
+            },
+        }
+    }
+
+    fn collect_js_scope_bindings(&self, node: Node<'t>, direct: bool, bindings: &mut HashMap<String, String>) {
+        stack_guard!();
+        match node.kind() {
+            "export_statement" => for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) { self.collect_js_scope_bindings(child, direct, bindings); }
+            },
+            "lexical_declaration" | "variable_declaration" => {
+                if direct || node.kind() == "variable_declaration" {
+                    for i in 0..node.named_child_count() {
+                        let Some(child) = node.named_child(i).filter(|n| n.kind() == "variable_declarator") else { continue };
+                        for name in self.js_pattern_names(child.child_by_field_name("name")) {
+                            add_js_binding(bindings, name, self.js_binding_point(child));
+                        }
+                    }
+                }
+            }
+            "import_statement" => self.collect_js_import_bindings(node, bindings),
+            _ if is_js_binding_function(node.kind()) || node.kind() == "class_declaration" => {
+                if direct {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        add_js_binding(bindings, self.text(name).to_string(), self.js_binding_point(node));
+                    }
+                }
+            }
+            _ => for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) { self.collect_js_scope_bindings(child, false, bindings); }
+            },
+        }
+    }
+
+    fn js_scope_binding(&mut self, scope: Node<'t>, name: &str) -> Option<String> {
+        if !self.js_object_scopes.contains_key(&scope.id()) {
+            let mut bindings = HashMap::new();
+            if scope.kind() == "catch_clause" {
+                for name in self.js_pattern_names(scope.child_by_field_name("parameter")) {
+                    add_js_binding(&mut bindings, name, self.js_parameter_point(scope));
+                }
+            } else if is_js_binding_function(scope.kind()) {
+                for name in self.js_pattern_names(scope.child_by_field_name("parameters").or_else(|| scope.child_by_field_name("parameter"))) {
+                    add_js_binding(&mut bindings, name, self.js_parameter_point(scope));
+                }
+                if let Some(name) = scope.child_by_field_name("name").filter(|_| scope.kind() != "method_definition") {
+                    if !bindings.contains_key(self.text(name)) {
+                        add_js_binding(&mut bindings, self.text(name).to_string(), self.js_binding_point(scope));
+                    }
+                }
+            } else {
+                for i in 0..scope.named_child_count() {
+                    if let Some(child) = scope.named_child(i) { self.collect_js_scope_bindings(child, true, &mut bindings); }
+                }
+            }
+            self.js_object_scopes.insert(scope.id(), bindings);
+        }
+        self.js_object_scopes.get(&scope.id()).and_then(|bindings| bindings.get(name)).cloned()
+    }
+
+    fn js_object_root(&mut self, node: Node<'t>, name: &str) -> String {
+        let mut parent = node.parent();
+        while let Some(scope) = parent {
+            if is_js_binding_scope(scope.kind()) || is_js_binding_function(scope.kind()) {
+                if let Some(proof) = self.js_scope_binding(scope, name) { return proof; }
+            }
+            parent = scope.parent();
+        }
+        if matches!(name, "window" | "globalThis" | "self") { format!("global:{name}") } else { "unknown".to_string() }
+    }
+
+    fn collect_js_object_writes(&mut self, node: Node<'t>, writes: &mut HashMap<String, HashSet<String>>) {
+        stack_guard!();
+        let assignment = matches!(node.kind(), "assignment_expression" | "augmented_assignment_expression");
+        let deletion = node.kind() == "unary_expression" && self.text(node).strip_prefix("delete").is_some_and(|tail|
+            tail.chars().next().map_or(true, |ch| !ch.is_ascii_alphanumeric() && ch != '_'));
+        let left = if assignment { node.child_by_field_name("left") }
+            else if node.kind() == "update_expression" || deletion { node.child_by_field_name("argument") }
+            else { None };
+        if let Some(left) = left {
+            let written = self.js_member_path(Some(left));
+            let literal_namespace = node.kind() == "assignment_expression" && written.as_ref().is_some_and(|path| path.contains('.'))
+                && node.child_by_field_name("right").is_some_and(|right| matches!(right.kind(), "object" | "object_expression"));
+            if !literal_namespace {
+                let mut root = left;
+                while matches!(root.kind(), "member_expression" | "subscript_expression") {
+                    let Some(inner) = root.child_by_field_name("object") else { break };
+                    root = inner;
+                }
+                if root.kind() == "identifier" {
+                    let name = self.text(root).to_string();
+                    let proof = self.js_object_root(node, &name);
+                    if !matches!(proof.as_str(), "unknown" | "import") {
+                        let suffix = written.map(|path| path[name.len()..].to_string()).unwrap_or_else(|| "*".to_string());
+                        writes.entry(proof).or_default().insert(suffix);
+                    }
+                }
+            }
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) { self.collect_js_object_writes(child, writes); }
+        }
+    }
+
+    fn js_object_is_written(&mut self, node: Node<'t>, path: &str) -> bool {
+        if self.js_object_writes.is_none() {
+            let mut program = node;
+            while let Some(parent) = program.parent() { program = parent; }
+            let mut writes = HashMap::new();
+            self.collect_js_object_writes(program, &mut writes);
+            self.js_object_writes = Some(writes);
+        }
+        let name = path.split('.').next().unwrap_or(path);
+        let suffix = &path[name.len()..];
+        let proof = self.js_object_root(node, name);
+        self.js_object_writes.as_ref().and_then(|writes| writes.get(&proof)).is_some_and(|writes|
+            writes.iter().any(|write| write == "*" || write.is_empty() || suffix == write || suffix.starts_with(&format!("{write}."))))
+    }
+
+    fn js_object_info(&mut self, node: Node<'t>, path: &str, direct_binding: bool) -> JsObjectInfo {
+        let mut scope = node.parent();
+        let hoisted = direct_binding && scope.is_some_and(|scope| scope.kind() == "variable_declaration");
+        while let Some(current) = scope {
+            let boundary = if hoisted {
+                is_js_binding_function(current.kind()) || current.kind() == "program"
+            } else { is_js_binding_scope(current.kind()) };
+            if current.parent().is_none() || boundary { break; }
+            scope = current.parent();
+        }
+        let range = if hoisted {
+            scope.filter(|scope| is_js_binding_function(scope.kind())).and_then(|scope| scope.child_by_field_name("body")).or(scope).unwrap_or(node)
+        } else { scope.unwrap_or(node) };
+        let binding = if direct_binding { self.js_binding_point(node) } else { self.js_object_root(node, path.split('.').next().unwrap_or(path)) };
+        JsObjectInfo { path: path.to_string(), binding,
+            scope: [self.line_of(range), self.col_of(range), range.end_position().row as u32 + 1, self.end_col_of(range)] }
+    }
+
+    fn finalize_object_call_candidates(&mut self) {
+        for call in std::mem::take(&mut self.pending_object_calls) {
+            let Some((receiver, member)) = call.path.rsplit_once('.') else { continue };
+            let root = call.path.split('.').next().unwrap_or(&call.path);
+            let global = call.proof.starts_with("global:");
+            let candidates = if global {
+                vec![format!("{receiver}::{member}")]
+            } else {
+                let mut names = Vec::new();
+                for owner in self.js_object_owners.iter().filter(|owner| owner.info.path == root && owner.info.binding == call.proof) {
+                    let name = format!("{}{}::{member}", owner.qualified_name, &receiver[root.len()..]);
+                    if !names.contains(&name) { names.push(name); }
+                }
+                names
+            };
+            if call.collapsed {
+                // extract_call named this call by its bare member (`window.X.m()`,
+                // `self.m()`, `cls.m()`): keep that name and no candidates unless
+                // the path names a namespace on the host global or a proven literal.
+                let keep_name = if global { !receiver.contains('.') } else { candidates.is_empty() };
+                if keep_name {
+                    self.tables.patch_ref_str(call.row_offset, REF_CANDIDATES, NONE_STR);
+                    continue;
+                }
+                let name = self.arena.put(&call.path);
+                self.tables.patch_ref_str(call.row_offset, REF_REFERENCE_NAME, name);
+            }
+            let candidates = self.arena.put(&candidates.join("\0"));
+            self.tables.patch_ref_str(call.row_offset, REF_CANDIDATES, candidates);
+        }
+    }
+
+    fn js_qualified_name(&self, name: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for scope in &self.stack {
+            if scope.kind == "file" { continue; }
+            if let Some(owner) = self.js_object_owners.iter().find(|owner| owner.row == scope.row) {
+                parts.clear();
+                parts.push(&owner.qualified_name);
+            } else {
+                parts.push(&scope.name);
+            }
+        }
+        parts.push(name);
+        parts.join("::")
+    }
+
     // --- createNode -----------------------------------------------------------
 
     /// createNode (tree-sitter.ts): id, qualified name from the scope stack,
@@ -366,20 +717,7 @@ impl<'t> Walker<'t> {
             }
         }
 
-        let qualified = extra.qualified_name.unwrap_or_else(|| {
-            let mut parts: Vec<&str> = Vec::new();
-            for s in &self.stack {
-                if s.kind != "file" {
-                    parts.push(&s.name);
-                }
-            }
-            let mut qn = parts.join("::");
-            if !qn.is_empty() {
-                qn.push_str("::");
-            }
-            qn.push_str(name);
-            qn
-        });
+        let qualified = extra.qualified_name.unwrap_or_else(|| self.js_qualified_name(name));
 
         let mut flags = BoolFlags::default();
         if let Some(v) = extra.is_exported {
@@ -397,6 +735,7 @@ impl<'t> Walker<'t> {
         let id_ref = self.arena.put(&id);
         let doc_ref = opt_str(&mut self.arena, extra.docstring.as_deref());
         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+        let contains_metadata = opt_str(&mut self.arena, extra.contains_metadata.as_deref());
         let row = self.tables.push_node(&NodeRow {
             kind: node_kind_index(kind).unwrap(),
             visibility: extra.visibility.unwrap_or(0),
@@ -425,7 +764,7 @@ impl<'t> Walker<'t> {
             provenance: 0,
             line: NONE,
             column: NONE,
-            metadata_json: NONE_STR,
+            metadata_json: contains_metadata,
             source_id_str: NONE_STR,
             target_id_str: NONE_STR,
         });
@@ -640,6 +979,8 @@ impl<'t> Walker<'t> {
         // Function-as-value capture — independent of the dispatch ladder.
         self.maybe_capture_fn_refs(node);
 
+        if self.extract_object_assignment(node) { return; }
+
         if is_function_type(kind) {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
             self.extract_function(node, None);
@@ -728,6 +1069,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+
+        if self.extract_local_objects(node) || self.extract_object_assignment(node) { return; }
 
         if kind == "call_expression" {
             self.extract_call(node);

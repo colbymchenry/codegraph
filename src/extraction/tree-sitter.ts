@@ -33,6 +33,7 @@ import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
+import { JsObjectBindings, jsMemberPath, type JsObjectInfo } from './js-object-bindings';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -522,6 +523,12 @@ export class TreeSitterExtractor {
   private errors: ExtractionError[] = [];
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
+  private jsObjectBindings: JsObjectBindings | null = null;
+  private jsObjectOwners: Array<{ node: Node; info: JsObjectInfo }> = [];
+  private jsObjectOwnerIds = new Set<string>();
+  /** An owned member's binding point → its qualified name (first wins, as in the kernel). */
+  private jsObjectMembers = new Map<string, string>();
+  private jsObjectCalls: Array<{ ref: UnresolvedReference; path: string; proof: string }> = [];
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
   // symbol's qualifiedName (see visitNode). Prefix-only by design — no
   // namespace NODE is created: `namespace cutlass {` opens in thousands of
@@ -649,6 +656,7 @@ export class TreeSitterExtractor {
       if (packageNodeId) this.nodeStack.push(packageNodeId);
 
       this.visitNode(this.tree.rootNode);
+      this.flushJsObjectCalls();
 
       // Gate + flush function-as-value candidates (#756) while the file's
       // nodes and import refs are complete and the file node is still pushed.
@@ -1078,6 +1086,7 @@ export class TreeSitterExtractor {
 
     const nodeType = node.type;
     let skipChildren = false;
+    if (this.extractJsObjectAssignment(node)) return;
 
     // Language-specific custom visitor hook
     if (this.extractor.visitNode) {
@@ -1655,11 +1664,92 @@ export class TreeSitterExtractor {
     for (const nodeId of this.nodeStack) {
       const node = this.nodes.find((n) => n.id === nodeId);
       if (node && node.kind !== 'file') {
-        parts.push(node.name);
+        // An object-literal owner qualifies what it holds by its own qualified
+        // name, which differs from the stack path for `ns.mod = {…}` written
+        // inside a function (mirrors the kernel's js_qualified_name).
+        if (this.jsObjectOwnerIds.has(node.id)) parts.splice(0, parts.length, node.qualifiedName);
+        else parts.push(node.name);
       }
     }
     parts.push(name);
     return parts.join('::');
+  }
+
+  private isJsObjectLanguage(): boolean {
+    return ['typescript', 'tsx', 'javascript', 'jsx'].includes(this.language);
+  }
+
+  private jsObjects(): JsObjectBindings {
+    return this.jsObjectBindings ??= new JsObjectBindings(this.source);
+  }
+
+  private markJsContainment(node: Node, metadata: Record<string, unknown>): void {
+    for (let i = this.edges.length - 1; i >= 0; i--) {
+      const edge = this.edges[i]!;
+      if (edge.kind === 'contains' && edge.target === node.id) {
+        edge.metadata = { ...edge.metadata, ...metadata };
+        return;
+      }
+    }
+  }
+
+  private markJsObjectOwner(node: Node, info: JsObjectInfo): void {
+    this.markJsContainment(node, { jsObject: info });
+    this.jsObjectOwners.push({ node, info });
+    this.jsObjectOwnerIds.add(node.id);
+  }
+
+  private flushJsObjectCalls(): void {
+    for (const { ref, path, proof } of this.jsObjectCalls) {
+      if (proof === 'import') continue;
+      const split = path.lastIndexOf('.');
+      const receiver = path.slice(0, split);
+      const member = path.slice(split + 1);
+      const root = receiver.split('.')[0]!;
+      const global = proof.startsWith('global:');
+      let candidates: string[];
+      if (global) candidates = [`${receiver}::${member}`];
+      else {
+        const owners = this.jsObjectOwners.filter(entry => entry.info.path === root && entry.info.binding === proof);
+        candidates = [...new Set(owners.map(entry => `${entry.node.qualifiedName}${receiver.slice(root.length)}::${member}`))];
+      }
+      if (ref.referenceName !== path) {
+        // extractCall named this call by its bare member (`window.X.m()`,
+        // `self.m()`, `cls.m()`): keep that name and no candidates unless the
+        // path names a namespace on the host global or a proven literal.
+        if (global ? !receiver.includes('.') : candidates.length === 0) continue;
+        ref.referenceName = path;
+      }
+      ref.candidates = candidates;
+    }
+  }
+
+  /** A literal assignment names a namespace only through a proven lexical/global root. */
+  private extractJsObjectAssignment(node: SyntaxNode): boolean {
+    if (!this.isJsObjectLanguage() || node.type !== 'assignment_expression') return false;
+    const value = getChildByField(node, 'right');
+    const path = jsMemberPath(getChildByField(node, 'left'), this.source);
+    if (!path?.includes('.') || !value || !['object', 'object_expression'].includes(value.type)) return false;
+    const info = this.jsObjects().info(node, path, false);
+    const root = path.split('.')[0]!;
+    const rootOwner = this.jsObjectOwners.find(entry => entry.info.path === root && entry.info.binding === info.binding);
+    if (!info.binding.startsWith('global:') && !rootOwner) return false;
+    if (rootOwner) info.scope = rootOwner.info.scope;
+    const owner = this.createNode('variable', path, node, {
+      signature: `= ${getNodeText(value, this.source).slice(0, 100)}`,
+      isExported: false,
+      qualifiedName: info.binding.startsWith('global:') ? path : `${rootOwner!.node.qualifiedName}${path.slice(root.length)}`,
+    });
+    if (!owner) return false;
+    this.markJsObjectOwner(owner, info);
+    const previousStack = this.nodeStack;
+    if (info.binding.startsWith('global:')) this.nodeStack = this.nodeStack.slice(0, 1);
+    this.nodeStack.push(owner.id);
+    this.extractObjectLiteralFunctions(value, true);
+    this.nodeStack.pop();
+    this.nodeStack = previousStack;
+    this.scanFnRefSubtree(node, 0);
+    return true;
   }
 
   /**
@@ -1720,7 +1810,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private extractFunction(node: SyntaxNode, nameOverride?: string): void {
+  private extractFunction(node: SyntaxNode, nameOverride?: string, objectMember = false): void {
     if (!this.extractor) return;
 
     // If the language provides getReceiverType and this function has a receiver
@@ -1803,12 +1893,17 @@ export class TreeSitterExtractor {
       docstring,
       signature,
       visibility,
-      isExported,
+      isExported: objectMember ? false : isExported,
       isAsync,
       isStatic,
       returnType,
     });
     if (!funcNode) return;
+    if (objectMember) {
+      this.markJsContainment(funcNode, { jsObjectMember: true });
+      const point = `binding:${funcNode.startLine}:${funcNode.startColumn}`;
+      if (!this.jsObjectMembers.has(point)) this.jsObjectMembers.set(point, funcNode.qualifiedName);
+    }
 
     // Extract type annotations (parameter types and return type)
     this.extractTypeAnnotations(node, funcNode.id);
@@ -2441,20 +2536,24 @@ export class TreeSitterExtractor {
    * object returned by a store-initializer call. Handles both `key: () => {}` /
    * `key: function() {}` pairs and method shorthand `key() {}`.
    */
-  private extractObjectLiteralFunctions(obj: SyntaxNode): void {
+  private extractObjectLiteralFunctions(obj: SyntaxNode, scoped = false): void {
     for (let i = 0; i < obj.namedChildCount; i++) {
       const member = obj.namedChild(i);
       if (!member) continue;
       if (member.type === 'pair') {
         const key = getChildByField(member, 'key');
         const value = getChildByField(member, 'value');
-        if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
-          this.extractFunction(value, this.objectKeyName(key));
+        const staticKey = key && (key.type === 'property_identifier' || key.type === 'string' || key.type === 'number');
+        if (key && value && (!scoped || staticKey) && (value.type === 'arrow_function' || value.type === 'function_expression' || (scoped && value.type === 'generator_function'))) {
+          this.extractFunction(value, this.objectKeyName(key), scoped);
         } else if (value?.type === 'call_expression') {
           // `key: Effect.fn("…")(function* () {…})` — see curriedWrapperBoundName.
           const fn = getChildByField(value, 'arguments')?.namedChild(0);
           const bound = fn ? this.curriedWrapperBoundName(fn) : null;
-          if (fn && bound) this.extractFunction(fn, bound);
+          if (fn && bound && (!scoped || staticKey)) this.extractFunction(fn, bound, scoped);
+          else if (scoped && value) this.visitFunctionBody(value, '');
+        } else if (scoped && value) {
+          this.visitFunctionBody(value, '');
         }
       } else if (member.type === 'method_definition') {
         // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
@@ -2462,7 +2561,13 @@ export class TreeSitterExtractor {
         // explicit name (method_definition exposes a `body` field, so resolveBody
         // falls through to it and the node spans the full method).
         const key = getChildByField(member, 'name');
-        if (key) this.extractFunction(member, this.objectKeyName(key));
+        if (key && (!scoped || ['property_identifier', 'string', 'number'].includes(key.type))) this.extractFunction(member, this.objectKeyName(key), scoped);
+        else if (scoped) {
+          const body = getChildByField(member, 'body');
+          if (body) this.visitFunctionBody(body, '');
+        }
+      } else if (scoped && member.type === 'spread_element') {
+        this.visitFunctionBody(member, '');
       }
     }
   }
@@ -2730,7 +2835,7 @@ export class TreeSitterExtractor {
       if (member?.type === 'method_definition') return true;
       if (member?.type === 'pair') {
         const v = getChildByField(member, 'value');
-        if (v?.type === 'arrow_function' || v?.type === 'function_expression') return true;
+        if (v?.type === 'arrow_function' || v?.type === 'function_expression' || v?.type === 'generator_function') return true;
       }
     }
     return false;
@@ -2838,7 +2943,7 @@ export class TreeSitterExtractor {
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
    */
-  private extractVariable(node: SyntaxNode): void {
+  private extractVariable(node: SyntaxNode, objectOnly = false): void {
     if (!this.extractor) return;
 
     // Different languages have different variable declaration structures
@@ -2862,6 +2967,8 @@ export class TreeSitterExtractor {
         if (child?.type === 'variable_declarator') {
           const nameNode = getChildByField(child, 'name');
           const valueNode = getChildByField(child, 'value');
+          const directObject = this.isJsObjectLanguage() && !!valueNode && ['object', 'object_expression'].includes(valueNode.type);
+          if (objectOnly && (!directObject || !this.objectHasInlineFunctions(valueNode!))) continue;
 
           if (nameNode) {
             // Skip destructured patterns (e.g., `let { x, y } = $props()` in Svelte)
@@ -2912,6 +3019,7 @@ export class TreeSitterExtractor {
               signature: initSignature,
               isExported,
             });
+            if (varNode && directObject) this.markJsObjectOwner(varNode, this.jsObjects().info(child, name, true));
 
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
@@ -2950,7 +3058,7 @@ export class TreeSitterExtractor {
             // normal body walk (extracting those consts), not be skipped here.
             const hasInlineFns = !!objectOfFns && this.objectHasInlineFunctions(objectOfFns);
             const extractObjectMethods =
-              (isExported || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
+              (directObject || isExported || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
 
             // RTK Query: `createApi`/`injectEndpoints` define endpoints as
             // object-literal properties whose values are `build.query/mutation(...)`
@@ -3004,7 +3112,9 @@ export class TreeSitterExtractor {
             }
 
             if (extractObjectMethods && objectOfFns) {
-              this.extractObjectLiteralFunctions(objectOfFns);
+              if (directObject && varNode) this.nodeStack.push(varNode.id);
+              this.extractObjectLiteralFunctions(objectOfFns, directObject);
+              if (directObject && varNode) this.nodeStack.pop();
             }
             if (rtkEndpoints) {
               this.extractRtkEndpoints(rtkEndpoints);
@@ -5177,13 +5287,27 @@ export class TreeSitterExtractor {
     }
 
     if (calleeName) {
-      this.unresolvedReferences.push({
+      const ref: UnresolvedReference = {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
-      });
+      };
+      if (this.isJsObjectLanguage()) {
+        const functionNode = getChildByField(node, 'function');
+        const full = jsMemberPath(functionNode, this.source);
+        if (full?.includes('.')) {
+          const root = full.split('.')[0]!;
+          this.jsObjectCalls.push({ ref, path: full, proof: this.jsObjects().isWritten(node, full) ? 'unknown' : this.jsObjects().root(node, root) });
+        } else if (functionNode?.type === 'identifier') {
+          const proof = this.jsObjects().root(node, getNodeText(functionNode, this.source));
+          const self = this.jsObjectMembers.get(proof);
+          if (self !== undefined) ref.candidates = [self];
+          else if (proof.startsWith('parameter:')) ref.candidates = [];
+        }
+      }
+      this.unresolvedReferences.push(ref);
     }
   }
 
@@ -5947,6 +6071,26 @@ export class TreeSitterExtractor {
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+      if (this.isJsObjectLanguage()) {
+        if (this.extractJsObjectAssignment(node)) return;
+        if (nodeType === 'lexical_declaration' || nodeType === 'variable_declaration') {
+          const isCallableObject = (child: SyntaxNode): boolean => {
+            const value = getChildByField(child, 'value');
+            return child.type === 'variable_declarator' && !!value &&
+              ['object', 'object_expression'].includes(value.type) && this.objectHasInlineFunctions(value);
+          };
+          const hasObject = node.namedChildren.some(isCallableObject);
+          if (hasObject) {
+            this.extractVariable(node, true);
+            this.scanFnRefSubtree(node, 0);
+            // Retain annotation/call ownership for ordinary locals in a mixed declaration.
+            for (const child of node.namedChildren) if (child.type === 'variable_declarator' && !isCallableObject(child)) {
+              visitForCallsAndStructure(child);
+            }
+            return;
+          }
+        }
+      }
 
       // A function-like macro defined inside a body is still a macro (#1838).
       if ((this.language === 'c' || this.language === 'cpp') && nodeType === 'preproc_function_def') {

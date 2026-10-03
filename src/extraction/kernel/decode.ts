@@ -46,7 +46,7 @@ function str(arena: Buffer, row: Buffer, at: number): string | undefined {
 /** NUL-joined list field; undefined when absent. */
 function strList(arena: Buffer, row: Buffer, at: number): string[] | undefined {
   const joined = str(arena, row, at);
-  return joined === undefined ? undefined : joined.split('\0');
+  return joined === undefined ? undefined : joined === '' ? [] : joined.split('\0');
 }
 
 /** Tri-state boolean from a (present, value) bit pair. */
