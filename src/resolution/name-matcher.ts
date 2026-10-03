@@ -7865,8 +7865,6 @@ export function matchMethodCall(
   // MODULE path (`pkg.mod.func()`) never gets here: import resolution claims it
   // first, through the module the import names.
   if (pythonAttrReceiver) {
-    const scoped = matchPythonScopedAttrCall(objectOrClass!, methodName!, ref, context);
-    if (scoped !== undefined) return scoped;
     return matchPythonAttrCall(objectOrClass!, methodName!, ref, context);
   }
 
@@ -8518,6 +8516,34 @@ function pythonDefStatements(
 }
 
 /**
+ * Whether an assignment target binds `name` itself — `name`, `*name`, or an
+ * element of a tuple / list target (`a, (name, b)`, `[name, b]`). A target that
+ * only USES the name does not: `d[name] = 1` and `self._h[name] = c` store
+ * into a container, `name.attr = 1` sets an attribute.
+ */
+function pythonTargetBinds(target: string, name: string): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of target.matchAll(new RegExp(`(?<![.\\w])${n}\\b`, 'g'))) {
+    const after = target.slice(m.index! + name.length).trimStart();
+    if (after.startsWith('.') || after.startsWith('[') || after.startsWith('(')) continue;
+    // Inside a subscript (`d[name]`): a `[` opened right after a name, call or
+    // subscript, not a list display (`[name, b] = …`).
+    let inSubscript = false;
+    const stack: boolean[] = [];
+    for (let i = 0; i < m.index!; i++) {
+      const c = target[i]!;
+      if (c === '[') stack.push(/[\w)\]]\s*$/.test(target.slice(0, i)));
+      else if (c === ']') stack.pop();
+      else if (c === '(') stack.push(false);
+      else if (c === ')') stack.pop();
+    }
+    inSubscript = stack.some(Boolean);
+    if (!inSubscript) return true;
+  }
+  return false;
+}
+
+/**
  * Whether `name` is rebound inside the `def` on line `defLine`, before line
  * `upto` — a parameter (unless `params` is false), an assignment target, a
  * loop / `with` / `except` target, a walrus, a nested `def` / `class` of that
@@ -8540,14 +8566,13 @@ function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: 
     const paramNames = list.split(',').map((p) => p.trim().replace(/^\*{1,2}/, '').split(/[:=]/)[0]!.trim());
     if (paramNames.includes(name)) return true;
   }
-  const word = new RegExp(`(?<![.\\w])${n}\\b`);
   const loop = new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()\\[\\]]*(?<![.\\w])${n}\\b[\\w\\s,()\\[\\]]*\\bin\\b`);
   const as = new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`);
   const walrus = new RegExp(`(?<![.\\w])${n}\\s*:=`);
   for (const { statements, nested } of body) {
     if (nested === name) return true;
     for (const st of statements) {
-      if (pythonAssignTargets(st).some((t) => word.test(t))) return true;
+      if (pythonAssignTargets(st).some((t) => pythonTargetBinds(t, name))) return true;
       if (loop.test(st) || walrus.test(st)) return true;
       if (!/^(?:from|import)\b/.test(st) && as.test(st)) return true;
     }
@@ -8754,69 +8779,6 @@ function pythonSubclassMethod(
   return descendants.length === 1
     ? { original: ref, targetNodeId: descendants[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
     : null;
-}
-
-/**
- * Python call through an attribute the calling `def` itself assigned before
- * the call — `self.conn = Pool(); self.conn.send()`, `c.client = Foo();
- * c.client.m()`, `self.a.b = Foo(); self.a.b.m()` — typed by the nearest such
- * assignment, under the same rules as the class body: a call counts only as
- * the whole value, a name the method rebinds first is not the module's class,
- * and the class is the one the file's imports name. `undefined` when the `def`
- * assigns no such receiver (the class body decides); null when the nearest
- * assignment says nothing usable (`Pool().acquire()`), which then decides.
- */
-function matchPythonScopedAttrCall(
-  receiver: string,
-  methodName: string,
-  ref: UnresolvedRef,
-  context: ResolutionContext,
-): ResolvedRef | null | undefined {
-  let fn: Node | null = null;
-  for (const n of context.getNodesInFile(ref.filePath)) {
-    if ((n.kind !== 'function' && n.kind !== 'method') || n.startLine >= ref.line || n.endLine < ref.line) continue;
-    if (!fn || n.startLine > fn.startLine) fn = n;
-  }
-  if (!fn) return undefined;
-  const source = context.readFile(ref.filePath);
-  if (!source) return undefined;
-  const lines = stripCommentsForRegex(source, 'python').split('\n');
-  const want = receiver.replace(/\s+/g, '');
-  const { header, body } = pythonDefStatements(lines, fn.startLine, ref.line);
-
-  let found: { line: number; annotation?: string; value?: string } | null = null;
-  for (const { line, statements } of body) {
-    for (const st of statements) {
-      const targets = pythonAssignTargets(st);
-      if (targets.some((t) => t.replace(/\s+/g, '') === want)) {
-        // The raw text after this statement's last top-level `=` (strings intact).
-        const raw = (lines[line - 1] ?? '').trim();
-        const ann = new RegExp(`^${receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*([^=]+?)\\s*(?:=|$)`).exec(raw);
-        const eq = /(?<![=!<>:])=(?!=)\s*(.*)$/.exec(raw.replace(/^[^=]*?\b(?:if|elif|while|else|try|finally|with)\b[^:]*:/, ''));
-        found = statements.length === 1 && targets.length === 1
-          ? { line, annotation: ann?.[1], value: eq?.[1] }
-          : { line };
-      } else if (targets.some((t) => new RegExp(`(?<![.\\w])${want.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.])`).test(t.replace(/\s+/g, '')))) {
-        found = { line }; // unpacked or otherwise rebound: untyped
-      }
-    }
-  }
-  if (!found) return undefined;
-
-  let ev: PythonAttrEvidence = null;
-  if (found.annotation) {
-    ev = pythonAnnotationEvidence(found.annotation);
-  } else if (found.value) {
-    const joined = pythonJoinedValue(lines, found.line, found.value, fn.endLine).text.trim();
-    const reads = pythonValueCallees(joined).map((c) => c.split('.')[0]!);
-    if (!reads.some((c) => pythonBoundInDef(lines, fn!.startLine, found!.line, c))) {
-      const bare = /^[A-Za-z_]\w*$/.test(joined);
-      ev = bare && pythonBoundInDef(lines, fn.startLine, found.line, joined, false) ? null : pythonValueEvidence(joined, header.trim());
-    }
-  }
-  if (!ev || ev === 'runtime') return null;
-  const cls = pythonClassNamed(ev.type, ref.filePath, context);
-  return cls ? pythonMethodOnClass(cls, methodName, ref, context) ?? pythonSubclassMethod(cls, methodName, ref, context) : null;
 }
 
 /**
