@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Elixir is now a supported language (`.ex`/`.exs`). CodeGraph indexes modules (including nested ones) as namespaces, public and private functions and macros (a function's multiple clauses become one symbol), structs, protocols and their implementations, and picks up specs and doc attributes as signatures and docstrings. Cross-module calls resolve through the file's alias declarations (including grouped and renamed aliases), behaviours count as implementations, and function captures and struct literals become references. Dynamic dispatch with no static target (a module held in a variable, `apply/3`, process messaging) is deliberately left unlinked rather than guessed. Phoenix/Ecto DSLs, user-macro expansion, and `.heex` templates are out of scope for this first version.
 
 ## [1.6.2] - 2026-10-03
 
