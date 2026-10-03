@@ -468,6 +468,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python and Go methods passed as values (`executor.submit(self.store.fetch)`) now appear in callers and impact results. Thanks @JosefAschauer. (#1820)
 - Methods called by a base class outside the index (React lifecycle methods, a stream's `_transform`, NestJS hooks) are no longer reported as dead code. Thanks @inth3shadows for the report and @danusha2345. (#1973)
 
+- **A database transaction error cannot leave subsequent operations uncommitted.** When an operation inside a transaction fails and the database aborts the transaction before a rollback finishes, the connection's transaction counter is now guaranteed to reset so later transactions on the same connection preserve their ACID isolation.
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
