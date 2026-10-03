@@ -432,13 +432,19 @@ interface FileFacts {
 const NO_INCLUDES: string[] = [];
 
 export async function cFnPointerDispatchEdges(
-  _queries: QueryBuilder,
+  queries: QueryBuilder,
   ctx: ResolutionContext,
   onYield: MaybeYield,
   onFraction?: (fraction: number) => void
 ): Promise<Edge[]> {
   let scannedFiles = 0;
-  const files = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
+  const cFiles = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
+  // Generated C (parser tables, protobuf-c, bison output) holds data tables,
+  // not the hand-written registrations and dispatch sites this pass links,
+  // and it can dwarf the real code: 248 MB of tree-sitter parsers in one
+  // repository, for no edges.
+  const generated = queries.generatedPredicateFor(cFiles);
+  const files = cFiles.filter((f) => !generated(f));
   if (files.length === 0) return [];
 
   // CODEGRAPH_SYNTH_TIMINGS sub-attribution: this pass is 86% of kernel-scale
