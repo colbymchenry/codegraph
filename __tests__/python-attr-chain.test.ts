@@ -389,24 +389,49 @@ describe('python attribute-chain receivers', () => {
       expect(await resolves('from foo import Foo\n\ndef load():\n    return object\n\nclass Svc:\n    def __init__(self, k):\n        if k: Foo = load()\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n')).toEqual([]);
     });
 
-    it('resolves a deeper attribute the calling method assigned', async () => {
-      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def go(self):\n        self.a.b = Foo()\n        return self.a.b.m()\n')).toEqual(['method:m@foo.py']);
+    it('leaves a deeper attribute chain unresolved, even one the calling method assigned', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def go(self):\n        self.a.b = Foo()\n        return self.a.b.m()\n')).toEqual([]);
     });
 
-    it('resolves an attribute assigned on an untyped parameter in the same method', async () => {
+    it('leaves an attribute on an untyped parameter unresolved', async () => {
       write('foo.py', FOO);
       write('other.py', OTHER);
       write('svc.py', 'from foo import Foo\n\ndef go(c):\n    c.client = Foo()\n    return c.client.m()\n');
       cg = await CodeGraph.init(tempDir, { index: true });
-      expect(callsFrom('function', 'go').filter((c) => c.startsWith('method:m@'))).toEqual(['method:m@foo.py']);
+      expect(callsFrom('function', 'go').filter((c) => c.startsWith('method:m@'))).toEqual([]);
     });
 
-    it('the calling method\'s own assignment decides over a disagreeing one elsewhere', async () => {
-      expect(await resolves('from foo import Foo\nfrom other import Other\n\nclass Svc:\n    def reset(self):\n        self.x = Other()\n\n    def go(self):\n        self.x = Foo()\n        return self.x.m()\n')).toEqual(['method:m@foo.py']);
+    it('assignments that disagree anywhere in the class are no evidence, even in the calling method', async () => {
+      expect(await resolves('from foo import Foo\nfrom other import Other\n\nclass Svc:\n    def reset(self):\n        self.x = Other()\n\n    def go(self):\n        self.x = Foo()\n        return self.x.m()\n')).toEqual([]);
+    });
+  });
+  describe('review round 2026-10-02', () => {
+    const write = (rel: string, src: string) => {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, rel), src);
+    };
+    const resolves = async (svc: string) => {
+      write('foo.py', 'class Foo:\n    def m(self):\n        return 1\n');
+      write('other.py', 'class Other:\n    def m(self):\n        return 2\n');
+      write('svc.py', 'from foo import Foo\nfrom other import Other\n\n' + svc);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      return callsFrom('method', 'go').filter((c) => c.startsWith('method:m@'));
+    };
+
+    it('storing into a container keyed by the class, or setting its attribute, is not a rebinding', async () => {
+      expect(await resolves('class Svc:\n    def __init__(self, d, c):\n        d[Foo] = 1\n        self._h[Foo] = c\n        Foo.attr = 1\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n')).toEqual(['method:m@foo.py']);
     });
 
-    it('the calling method\'s own untyped assignment is no edge, whatever the class body says', async () => {
-      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def __init__(self):\n        self.x = Foo()\n\n    def go(self):\n        self.x = make()\n        return self.x.m()\n\ndef make():\n    return 1\n')).toEqual([]);
+    it('branches of the calling method that disagree are no evidence', async () => {
+      expect(await resolves('class Svc:\n    def go(self, a):\n        if a:\n            self.x = Foo()\n        else:\n            self.x = Other()\n        return self.x.m()\n')).toEqual([]);
+    });
+
+    it('a branch in the calling method does not override the class body', async () => {
+      expect(await resolves('class Svc:\n    def __init__(self):\n        self.x = Other()\n\n    def go(self, a):\n        if a:\n            self.x = Foo()\n        return self.x.m()\n')).toEqual([]);
+    });
+
+    it('an augmented assignment is not typed by its right-hand side', async () => {
+      expect(await resolves('class Svc:\n    def go(self):\n        self.x += Foo()\n        return self.x.m()\n')).toEqual([]);
     });
   });
 });
