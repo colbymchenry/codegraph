@@ -6001,19 +6001,18 @@ export function resolveMethodOnType(
     ? preferredFqn.slice(GO_DIR_HINT.length)
     : undefined;
   if (goDir !== undefined) {
-    matches = matches.filter((m) => goFileDir(m.filePath) === goDir);
+    const inDir = matches.filter((m) => goFileDir(m.filePath) === goDir);
     preferredFqn = undefined;
-    // The supertype walk below is keyed by bare type NAME: only take it (a
-    // promoted method of an embedded type) when every Go type of that name
-    // is the one in `goDir`, or `api.Vehicle` would borrow the embeds of
-    // some other package's `Vehicle` struct.
-    if (
-      matches.length === 0 &&
-      context.getNodesByName(typeName).some(
-        (n) => n.language === 'go' && GO_TYPE_KINDS.has(n.kind) && goFileDir(n.filePath) !== goDir,
-      )
-    ) {
-      return null;
+    if (inDir.length > 0) {
+      matches = inDir;
+    } else {
+      // A promoted method of what the type in `goDir` embeds, read off its own
+      // declaration: the supertype walk below is keyed by bare type NAME, so
+      // `api.Vehicle` would borrow the embeds of another package's `Vehicle`.
+      // An embedding we cannot follow proves nothing absent: the name then
+      // resolves as it did before package scoping.
+      const promoted = goPromotedMethod(typeName, goDir, methodName, ref, context, confidence, resolvedBy, depth);
+      if (promoted !== undefined) return promoted;
     }
   }
   if (matches.length === 0) {
@@ -6681,6 +6680,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_EXTERNAL_QUALIFIED.delete(context);
+  GO_ALIASES.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -8377,9 +8377,10 @@ const GO_TYPE_KINDS = new Set(['struct', 'interface', 'type_alias', 'class', 'en
  * imported package's directory (qualified): stripping `bytes.` and matching
  * the bare name would bind `buf.Write()` on a `*bytes.Buffer` to any project
  * type that happens to be called `Buffer`, and `site.API` must not become the
- * `API` interface of another package.
+ * `API` interface of another package. An alias (`type Context = web.Context`)
+ * is followed to the type it names.
  */
-function goInferredTypeName(raw: string, filePath: string, context: ResolutionContext): string | null {
+function goInferredTypeName(raw: string, filePath: string, context: ResolutionContext, depth = 0): string | null {
   const cleaned = raw.replace(/[&*]/g, '').trim();
   const parts = cleaned.split('.');
   if (parts.length > 2) return null;
@@ -8401,7 +8402,160 @@ function goInferredTypeName(raw: string, filePath: string, context: ResolutionCo
     .getNodesByName(type)
     .find((n) => n.language === 'go' && GO_TYPE_KINDS.has(n.kind) && inPkg!(goFileDir(n.filePath)));
   if (decl) return goTypeRef(goFileDir(decl.filePath), type);
-  return parts.length === 2 && goIsExternalImport(parts[0]!, filePath, context) ? GO_EXTERNAL_TYPE : null;
+  if (parts.length === 2 && goIsExternalImport(parts[0]!, filePath, context)) return GO_EXTERNAL_TYPE;
+  // An alias declares no node. One whose target cannot be placed keeps the
+  // bare name, which resolves as it did before package scoping.
+  const alias = goAliasDecl(type, filePath, parts.length === 2 ? parts[0] : undefined, inPkg, context);
+  if (!alias) return null;
+  const target = alias.target !== null && depth < 4
+    ? goInferredTypeName(alias.target, alias.filePath, context, depth + 1)
+    : null;
+  return target ?? type;
+}
+
+/**
+ * A method the Go type `typeName` declared in `dir` gets from what it embeds
+ * (`*cached.BaseManager`, a `Middle` that embeds it in turn, an interface's
+ * `io.Reader`), each embedded type taken in its own package. Null when the
+ * type provably lacks it — everything it embeds was followed or lies outside
+ * the project; undefined when an embedding cannot be followed.
+ */
+function goPromotedMethod(
+  typeName: string,
+  dir: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+  depth: number,
+): ResolvedRef | null | undefined {
+  if (depth >= 4) return undefined;
+  const decls = context.getNodesByName(typeName).filter(
+    (n) => n.language === 'go' && GO_TYPE_KINDS.has(n.kind) && goFileDir(n.filePath) === dir,
+  );
+  if (decls.length === 0) return undefined;
+  let unknown = false;
+  for (const decl of decls) {
+    const embeds = goEmbeddedTypes(decl, context);
+    if (!embeds) { unknown = true; continue; }
+    for (const raw of embeds) {
+      const embedded = goInferredTypeName(raw, decl.filePath, context);
+      if (embedded === GO_EXTERNAL_TYPE) continue;
+      const split = embedded ? splitGoTypeRef(embedded) : undefined;
+      if (split?.dir === undefined) { unknown = true; continue; }
+      const hit = resolveMethodOnType(
+        split.type, methodName, ref, context, confidence, resolvedBy, GO_DIR_HINT + split.dir, depth + 1,
+      );
+      if (hit) return hit;
+    }
+  }
+  return unknown ? undefined : null;
+}
+
+/**
+ * What a Go struct or interface declaration embeds, as written: the elements
+ * of its body at brace depth 1 that are a lone type name (`*cached.BaseManager`,
+ * `Middle`, `io.Reader`). A defined type (`type T U`) embeds nothing — it does
+ * not get U's methods. Null when the declaration cannot be read, or an
+ * interface lists a type set (`~int | string`).
+ */
+function goEmbeddedTypes(decl: Node, context: ResolutionContext): string[] | null {
+  if (decl.kind !== 'struct' && decl.kind !== 'interface') return [];
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
+  if (!lines) return null;
+  const text = lines
+    .slice(Math.max(0, decl.startLine - 1), decl.endLine)
+    .map((l) => l.replace(/`[^`]*`|"(?:[^"\\]|\\.)*"/g, '').replace(/\/\/.*$/, ''))
+    .join('\n')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ');
+  const head = text.match(new RegExp(`\\b${decl.name}\\s*(?:\\[[^\\]]*\\])?\\s*(?:struct|interface)\\s*\\{`));
+  if (!head) return null;
+  const elements: string[] = [];
+  let element = '';
+  for (let i = head.index! + head[0].length, depth = 1; i < text.length && depth > 0; i++) {
+    const ch = text[i]!;
+    if (ch === '{') depth++;
+    else if (ch === '}') depth--;
+    else if (depth === 1 && (ch === '\n' || ch === ';')) { elements.push(element.trim()); element = ''; }
+    else if (depth === 1) element += ch;
+  }
+  elements.push(element.trim());
+  const embeds: string[] = [];
+  for (const el of elements) {
+    const m = el.match(/^\*?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)(?:\s*\[.*\])?$/);
+    if (m) embeds.push(m[1]!);
+    else if (decl.kind === 'interface' && /[|~]/.test(el)) return null;
+  }
+  return embeds;
+}
+
+/** `type Name = Target` of one Go package, by name; `target` null when it is not a plain type name. */
+type GoAliases = Map<string, { target: string | null; filePath: string }>;
+const GO_ALIASES = new WeakMap<ResolutionContext, {
+  filesByDir: Map<string, string[]>;
+  aliasesByDir: Map<string, GoAliases>;
+  dirsFor: Map<string, string[]>;
+}>();
+
+/**
+ * The alias `type <name> = …` declared in the package `inPkg` accepts — the
+ * caller's own (`qualifier` undefined) or the one the file imports as
+ * `qualifier` — read off the package's files, since an alias has no node.
+ */
+function goAliasDecl(
+  name: string,
+  filePath: string,
+  qualifier: string | undefined,
+  inPkg: (dir: string) => boolean,
+  context: ResolutionContext,
+): { target: string | null; filePath: string } | null {
+  let memo = GO_ALIASES.get(context);
+  if (!memo) {
+    const filesByDir = new Map<string, string[]>();
+    for (const f of context.getAllFiles()) {
+      if (!f.endsWith('.go')) continue;
+      const d = goFileDir(f);
+      const list = filesByDir.get(d);
+      if (list) list.push(f);
+      else filesByDir.set(d, [f]);
+    }
+    memo = { filesByDir, aliasesByDir: new Map(), dirsFor: new Map() };
+    GO_ALIASES.set(context, memo);
+  }
+  const key = qualifier === undefined ? goFileDir(filePath) : `${filePath}\u0000${qualifier}`;
+  let dirs = memo.dirsFor.get(key);
+  if (!dirs) {
+    dirs = [...memo.filesByDir.keys()].filter(inPkg);
+    memo.dirsFor.set(key, dirs);
+  }
+  for (const dir of dirs) {
+    let aliases = memo.aliasesByDir.get(dir);
+    if (!aliases) {
+      aliases = new Map();
+      for (const f of memo.filesByDir.get(dir) ?? []) {
+        const lines = context.getFileLines?.(f) ?? context.readFile(f)?.split(/\r?\n/) ?? [];
+        let group = false;
+        for (const raw of lines) {
+          const line = raw.replace(/\/\/.*$/, '');
+          if (/^type\s*\(\s*$/.test(line)) { group = true; continue; }
+          if (group && /^\)/.test(line)) { group = false; continue; }
+          const m = line.match(group
+            ? /^\s+([A-Za-z_]\w*)(?:\[[^\]]*\])?\s*=\s*(.+?)\s*;?\s*$/
+            : /^type\s+([A-Za-z_]\w*)(?:\[[^\]]*\])?\s*=\s*(.+?)\s*;?\s*$/);
+          if (!m) continue;
+          // `pkg.Type`, `*Type`, `Type[int]`: the named type; anything else
+          // (`func()`, `map[…]…`, `struct{…}`) is no type we can follow.
+          const target = m[2]!.replace(/\s*\[.*\]$/, '');
+          aliases.set(m[1]!, { target: /^\*?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/.test(target) ? target : null, filePath: f });
+        }
+      }
+      memo.aliasesByDir.set(dir, aliases);
+    }
+    const alias = aliases.get(name);
+    if (alias) return alias;
+  }
+  return null;
 }
 
 /**
@@ -8498,7 +8652,8 @@ const GO_UNTYPED_BINDING = '\u0000untyped';
  * `store.NewStore` (an imported project package: that package's directory).
  * A callee from outside the project (`net.Dial`) yields GO_EXTERNAL_TYPE; one
  * we cannot place yields null — never a same-named function from an unrelated
- * package.
+ * package. A conversion to a project type (`model.BotList(bots)`) yields that
+ * type; `any(v)` and other builtin conversions stay unknown.
  */
 function goConstructorReturnType(callee: string, filePath: string, context: ResolutionContext): string | null {
   const dot = callee.indexOf('.');
@@ -8524,6 +8679,8 @@ function goConstructorReturnType(callee: string, filePath: string, context: Reso
     const first = results.split(/\s+/).pop()!;
     return goInferredTypeName(first, n.filePath, context);
   }
+  const conversion = goInferredTypeName(callee, filePath, context);
+  if (conversion && conversion !== GO_EXTERNAL_TYPE) return conversion;
   return dot >= 0 && goIsExternalImport(callee.slice(0, dot), filePath, context) ? GO_EXTERNAL_TYPE : null;
 }
 

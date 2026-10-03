@@ -181,3 +181,157 @@ describe('Go receiver typing', () => {
     expect(callees).toContain('store/store.go::NewStore');
   });
 });
+
+/**
+ * A receiver typed through an alias (`type Context = web.Context`) is the
+ * aliased type, a conversion (`list := web.Users(names)`) is the type it
+ * names, and a method promoted from an embedded struct — another
+ * package's (`*cached.BaseManager`), or two levels down — is the embedded
+ * type's. A defined type (`type Defined web.Context`, no `=`) does not
+ * inherit its underlying type's methods.
+ */
+describe('Go receiver typing through aliases and embedded structs', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  const files: Record<string, string> = {
+    'app/app.go': `package app
+
+type App struct{}
+
+func (a *App) GetUser() {}
+`,
+    'web/context.go': `package web
+
+import "example.com/app/app"
+
+type Context struct {
+	App *app.App
+}
+
+func (c *Context) MakeAuditRecord() {}
+
+type Users []string
+
+func (u Users) Usernames() []string { return nil }
+`,
+    'api4/handlers.go': `package api4
+
+import (
+	"context"
+
+	"example.com/app/web"
+)
+
+type Context = web.Context
+
+type (
+	Handler = *web.Context
+)
+
+type Defined web.Context
+
+func getUser(c *Context) {
+	c.App.GetUser()
+	c.MakeAuditRecord()
+}
+
+func groupedPointerAlias(h Handler)  { h.MakeAuditRecord() }
+func conversion(names []string)      { list := web.Users(names); list.Usernames() }
+func definedType(d *Defined)         { d.MakeAuditRecord() }
+func stdlibReceiver(ctx context.Context) { ctx.Done() }
+`,
+    'cached/base.go': `package cached
+
+type BaseManager struct{}
+
+func (b *BaseManager) CacheClient() {}
+`,
+    'mgr/manager.go': `package mgr
+
+import "example.com/app/cached"
+
+type Manager struct {
+	*cached.BaseManager
+	name string
+}
+
+type Middle struct {
+	*cached.BaseManager
+}
+
+type Outer struct {
+	Middle
+}
+
+func (m *Manager) Get()  { m.CacheClient() }
+func (o *Outer) Twice()  { o.CacheClient() }
+`,
+    // Same-named types and methods elsewhere, so neither the package-blind
+    // lookup nor a name-only guess has a single answer to fall back on.
+    'decoy/decoy.go': `package decoy
+
+type Context struct{}
+
+func (c *Context) MakeAuditRecord() {}
+
+type Manager struct{}
+type Middle struct{}
+type Outer struct{}
+
+type Decoy struct{}
+
+func (d *Decoy) CacheClient()     {}
+func (d *Decoy) GetUser()         {}
+func (d *Decoy) MakeAuditRecord() {}
+func (d *Decoy) Done()            {}
+func (d *Decoy) Usernames()       {}
+`,
+  };
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-alias-'));
+    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+    for (const [file, source] of Object.entries(files)) {
+      fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
+      fs.writeFileSync(path.join(dir, file), source);
+    }
+    cg = CodeGraph.initSync(dir);
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function methodCallees(caller: string): Promise<string[]> {
+    const node = (await cg.searchNodes(caller.split('::').pop()!, { limit: 20 })).find(
+      (r) =>
+        (r.node.name === caller || r.node.qualifiedName === caller) &&
+        (r.node.kind === 'function' || r.node.kind === 'method'),
+    );
+    expect(node, caller).toBeDefined();
+    return (await cg.getCallees(node!.node.id))
+      .filter((c) => c.node.kind === 'method')
+      .map((c) => `${c.node.filePath}::${c.node.qualifiedName}`)
+      .sort();
+  }
+
+  it.each([
+    ['getUser', ['app/app.go::App::GetUser', 'web/context.go::Context::MakeAuditRecord']],
+    ['groupedPointerAlias', ['web/context.go::Context::MakeAuditRecord']],
+    ['conversion', ['web/context.go::Users::Usernames']],
+    ['Manager::Get', ['cached/base.go::BaseManager::CacheClient']],
+    ['Outer::Twice', ['cached/base.go::BaseManager::CacheClient']],
+  ])('%s resolves through the alias, the conversion or the embedded struct', async (caller, expected) => {
+    expect(await methodCallees(caller)).toEqual(expected);
+  });
+
+  it.each(['definedType', 'stdlibReceiver'])(
+    '%s: a defined type or a receiver typed outside the project gets no edge',
+    async (caller) => {
+      expect(await methodCallees(caller)).toEqual([]);
+    },
+  );
+});
