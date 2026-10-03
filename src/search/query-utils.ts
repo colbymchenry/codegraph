@@ -142,6 +142,13 @@ export function getStemVariants(term: string): string[] {
 }
 
 /**
+ * Ideographic scripts (Han, Hiragana, Katakana, Hangul) are not space-delimited,
+ * so a run of them is one "word" that the ASCII whitespace/underscore/camelCase
+ * tokenization below can't see. Matched as maximal runs and surfaced as terms.
+ */
+const IDEOGRAPHIC_RUN_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+
+/**
  * Extract meaningful search terms from a natural language query.
  * Splits camelCase, PascalCase, snake_case, SCREAMING_SNAKE, and dot.notation
  * into individual tokens before filtering.
@@ -190,6 +197,21 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
     const lower = word.toLowerCase();
     if (lower.length < 3) continue;
     if (STOP_WORDS.has(lower)) continue;
+    tokens.add(lower);
+  }
+
+  // The split above is ASCII-only ([^a-zA-Z0-9]), so a query written in an
+  // ideographic script — Chinese, Japanese, Korean — treats EVERY character as a
+  // separator and yields zero terms. That made `explore` return "No relevant code
+  // found" for symbols named in those scripts, even though they ARE indexed and
+  // `query`/`node` (which pass the raw string to FTS) find them. Recover each
+  // ideographic run as its own term: FTS5's default unicode61 tokenizer keeps
+  // such a run as a single token, so a whole-run term matches exactly the way
+  // query/node already do. Floor of 2 rather than the ≥3 used to strip short
+  // ASCII noise — an ideographic word is 1–2 characters (e.g. "寻路" = pathfinding).
+  for (const run of query.match(IDEOGRAPHIC_RUN_RE) ?? []) {
+    const lower = run.toLowerCase();
+    if (lower.length < 2) continue;
     tokens.add(lower);
   }
 
