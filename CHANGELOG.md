@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Searches with `path:` or `name:` filters now find matching symbols before unrelated results consume the limit, including typo searches and queries containing only filters.
 
 ## [1.6.2] - 2026-10-03
 
