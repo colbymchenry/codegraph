@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Rust, a call to a function brought in by `use`, like `take(3)` after `use crate::util::take;` (also through an `as` alias, a nested group or a `use` inside a function), and a call written as a module path, like `crate::util::take(3)` or `super::util::take(3)`, now link to the function that module declares. Before, they could land on a same-named function of another module, or on a same-named method declared above the function. (#2308)
+
 
 ## [1.6.2] - 2026-10-03
 
