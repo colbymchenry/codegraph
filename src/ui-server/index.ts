@@ -397,9 +397,10 @@ function safeDecode(value: string): string {
 /**
  * Bind the first free port at or after `port`, on loopback only.
  *
- * Only `EADDRINUSE` advances to the next port — a permission failure or a bad
- * address will not get better one port over, and retrying twenty times would
- * only bury the real error.
+ * Only `EADDRINUSE` — and `EACCES`, which Windows reports for a port held
+ * exclusively by another program or inside a reserved range — advance to the
+ * next port. A bad address will not get better one port over, and retrying
+ * twenty times would only bury the real error.
  */
 async function listenWithFallback(
   server: http.Server,
@@ -419,7 +420,9 @@ async function listenWithFallback(
       return address.port;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EADDRINUSE' || i === attempts - 1) {
+      // Windows reports a port held exclusively by another program, or inside
+      // a reserved range, as EACCES rather than EADDRINUSE: it is taken too.
+      if ((code !== 'EADDRINUSE' && code !== 'EACCES') || i === attempts - 1) {
         throw describeBindFailure(err, candidate, opts);
       }
     }
@@ -467,7 +470,13 @@ function describeBindFailure(
       : new Error(`Port ${port} is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.`);
   }
   if (code === 'EACCES') {
-    return new Error(`Not allowed to listen on port ${port}. Ports below 1024 usually need elevated privileges — pick a higher one with --port.`);
+    return opts.fallback
+      ? new Error(
+          `Ports ${opts.port}–${port} are all in use or reserved. Free one, or pick another with --port.`
+        )
+      : new Error(
+          `Windows refused port ${port}: another program holds it, or it is in a reserved range (\`netsh int ipv4 show excludedportrange protocol=tcp\`). Pick another with --port.`
+        );
   }
   return err instanceof Error ? err : new Error(String(err));
 }
