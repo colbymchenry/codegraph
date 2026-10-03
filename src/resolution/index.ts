@@ -42,7 +42,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, resolveRustImportedCall } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -1583,6 +1583,11 @@ export class ReferenceResolver {
     // namesake by its last name.
     const rubyPath = matchRubyConstantPathRef(ref, this.context);
     if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
+
+    // Rust `use …::take as consume; consume()` can have no node named
+    // `consume`. Its explicit binding takes precedence over name heuristics.
+    const rustImportedCall = resolveRustImportedCall(ref, this.context);
+    if (rustImportedCall !== undefined) return this.gateLanguage(rustImportedCall, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
