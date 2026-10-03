@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Go calls made through a struct field, like `s.service.AddItem()`, now resolve when the method's receiver type is unexported (`func (s *server) ...`), the usual shape for gRPC and HTTP handlers. These calls were missing from callers and impact before. Re-index Go projects after upgrading. (#2323)
 
 ## [1.6.2] - 2026-10-03
 

@@ -6770,6 +6770,10 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       return [
         new RegExp(`\\b${r}\\b\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*{`), // lg := Logger{} / &Logger{}
         new RegExp(`\\bvar\\s+${r}\\s+\\*?([A-Za-z_][\\w.]*)`), // var lg Logger / *Logger
+        // A method receiver: anchored on `func (`, so an unexported type
+        // (`func (s *server)`, `func (c *cache[T])`) is safe to accept here,
+        // unlike the keyword-free pattern below (#2323).
+        new RegExp(`\\bfunc\\s*\\(\\s*${r}\\s+\\*?([A-Za-z_]\\w*)\\s*(?:\\[[^\\]]*\\])?\\s*\\)`), // func (s *server)
         // A typed parameter / method receiver (`func use(lg Logger)`,
         // `func (l Logger) M()`) — name-before-type with no `var`/`:=` (#1125).
         // PascalCase-guarded (unlike the anchored patterns above) to keep the
