@@ -465,8 +465,7 @@ export function isExternalImport(
     // In-module imports look like `<module-path>/sub/pkg` — local to
     // this project. Without the module-path check we'd flag every
     // cross-package call in a Go monorepo as external (issue #388).
-    const mod = context?.getGoModule?.();
-    if (mod && (importPath === mod.modulePath || importPath.startsWith(mod.modulePath + '/'))) {
+    if (context?.getGoModuleForImport?.(importPath)) {
       return false;
     }
     // `internal/` packages stay local even when go.mod is missing —
@@ -2481,9 +2480,6 @@ function resolveGoCrossPackageReference(
   imports: ImportMapping[],
   context: ResolutionContext
 ): ResolvedRef | null {
-  const mod = context.getGoModule?.();
-  if (!mod) return null;
-
   // Qualified call: receiver before `.`, member after. A bare reference
   // (no dot) is a same-file/in-package call — handled elsewhere.
   const dotIdx = ref.referenceName.indexOf('.');
@@ -2494,13 +2490,16 @@ function resolveGoCrossPackageReference(
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
-    // Only in-module imports map to a known directory.
-    if (imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/')) {
-      continue;
-    }
-    const pkgDir = imp.source === mod.modulePath
+    // Only in-module imports map to a known directory: the module's own
+    // directory (the project root, or wherever its go.mod sits — #2322)
+    // followed by the rest of the import path.
+    const mod = context.getGoModuleForImport?.(imp.source, ref.filePath);
+    if (!mod) continue;
+    const modDir = path.relative(context.getProjectRoot(), mod.rootDir).replace(/\\/g, '/');
+    const subDir = imp.source === mod.modulePath
       ? ''
       : imp.source.substring(mod.modulePath.length + 1);
+    const pkgDir = modDir && subDir ? `${modDir}/${subDir}` : modDir || subDir;
 
     // Look up the member by name and pick the candidate whose file lives
     // directly in the package directory. Match the immediate parent dir

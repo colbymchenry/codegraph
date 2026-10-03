@@ -20,15 +20,13 @@ export interface GoModule {
 }
 
 /**
- * Read the `go.mod` file at the project root and extract the module path.
- * Returns `null` if no `go.mod` exists or it has no `module` directive.
- *
- * Limitation: only the project-root `go.mod` is read. Nested `go.mod` files
- * (Go workspaces, monorepos with multiple modules) are not yet resolved —
- * a follow-up if a real repro shows up.
+ * Read the `go.mod` file in `moduleDir` and extract the module path.
+ * Returns `null` if no `go.mod` exists there or it has no `module` directive.
+ * The resolver calls it for every directory between a Go file and the project
+ * root, so a module whose `go.mod` sits below the root resolves too (#2322).
  */
-export function loadGoModule(projectRoot: string): GoModule | null {
-  const goModPath = path.join(projectRoot, 'go.mod');
+export function loadGoModule(moduleDir: string): GoModule | null {
+  const goModPath = path.join(moduleDir, 'go.mod');
   let content: string;
   try {
     content = fs.readFileSync(goModPath, 'utf-8');
@@ -43,5 +41,26 @@ export function loadGoModule(projectRoot: string): GoModule | null {
   // Strip optional quoting around the module path.
   const modulePath = match[1]!.replace(/^["']|["']$/g, '');
   if (!modulePath) return null;
-  return { modulePath, rootDir: projectRoot };
+  return { modulePath, rootDir: moduleDir };
+}
+
+/**
+ * The module an import path belongs to: the one whose module path equals it or
+ * is a `/`-bounded prefix of it. Nested modules (`example.com/app` and
+ * `example.com/app/tools`) take the longest module path, as Go does; two
+ * modules declaring the same path prefer `own`, the importing file's module.
+ * `null` for the standard library and third-party modules.
+ */
+export function findGoModuleForImport(
+  importPath: string,
+  modules: readonly GoModule[],
+  own?: GoModule | null
+): GoModule | null {
+  let best: GoModule | null = null;
+  for (const mod of modules) {
+    if (importPath !== mod.modulePath && !importPath.startsWith(`${mod.modulePath}/`)) continue;
+    const length = best ? best.modulePath.length : -1;
+    if (mod.modulePath.length > length || (mod.modulePath.length === length && mod === own)) best = mod;
+  }
+  return best;
 }

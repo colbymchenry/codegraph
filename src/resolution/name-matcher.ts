@@ -1822,9 +1822,8 @@ function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): 
   if (before) {
     const imported = context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before);
     if (imported) {
-      const mod = context.getGoModule?.();
       const local = imported.source.startsWith('.') || imported.source.includes('/internal/') ||
-        (mod !== undefined && mod !== null && (imported.source === mod.modulePath || imported.source.startsWith(`${mod.modulePath}/`)));
+        !!context.getGoModuleForImport?.(imported.source);
       external = !local;
     }
   }
@@ -8282,14 +8281,10 @@ function matchGoFieldChainCall(
       // fabrication this matcher exists to prevent (#1276).
       if (rawType.includes('.')) {
         const pkg = rawType.split('.')[0]!;
-        const mod = context.getGoModule?.();
         const imp = context
           .getImportMappings(s.filePath, 'go')
           .find((i) => i.localName === pkg);
-        const inModule =
-          !!mod &&
-          !!imp &&
-          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+        const inModule = !!imp && !!context.getGoModuleForImport?.(imp.source);
         if (!inModule) continue;
       }
       // Unexported (lowercase) types are idiomatic Go and stay eligible —

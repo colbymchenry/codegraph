@@ -34,7 +34,7 @@ import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
-import { loadGoModule, type GoModule } from './go-module';
+import { findGoModuleForImport, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
@@ -309,8 +309,12 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
   private dirAliases = new Map<string, AliasMap | null>();
-  // go.mod module path. Same lazy/immutable convention as projectAliases.
-  private goModule: GoModule | null | undefined = undefined;
+  // Per directory: the module of the nearest go.mod at or above it, up to the
+  // project root ('' = the root). Same lazy/immutable convention as dirAliases.
+  private goModuleByDir = new Map<string, GoModule | null>();
+  // Every module owning an indexed .go file, plus the root one. Depends on the
+  // file set, like knownFiles, so clearCaches drops it.
+  private goModules: GoModule[] | null = null;
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
@@ -449,6 +453,7 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
+    this.goModules = null;
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
@@ -459,6 +464,22 @@ export class ReferenceResolver {
       clearSwiftTypeVisibility(this.context);
       clearTypeParameterMemos(this.context);
     }
+  }
+
+  /** The module of the nearest `go.mod` at or above project-relative `dir`, up to the project root. */
+  private nearestGoModule(dir: string): GoModule | null {
+    const walked: string[] = [];
+    let found: GoModule | null | undefined;
+    for (;;) {
+      found = this.goModuleByDir.get(dir);
+      if (found !== undefined) break;
+      walked.push(dir);
+      found = loadGoModule(path.join(this.projectRoot, dir));
+      if (found || dir === '') break;
+      dir = goDirOf(dir);
+    }
+    for (const d of walked) this.goModuleByDir.set(d, found);
+    return found;
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -803,11 +824,21 @@ export class ReferenceResolver {
         return found;
       },
 
-      getGoModule: () => {
-        if (this.goModule === undefined) {
-          this.goModule = loadGoModule(this.projectRoot);
+      getGoModuleForImport: (importPath: string, fromFile?: string) => {
+        if (this.goModules === null) {
+          const dirs = new Set<string>(['']);
+          for (const file of this.queries.getAllFilePaths()) {
+            if (file.endsWith('.go')) dirs.add(goDirOf(file));
+          }
+          const modules = new Set<GoModule>();
+          for (const dir of dirs) {
+            const mod = this.nearestGoModule(dir);
+            if (mod) modules.add(mod);
+          }
+          this.goModules = [...modules];
         }
-        return this.goModule;
+        const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
+        return findGoModuleForImport(importPath, this.goModules, own);
       },
 
       getWorkspacePackages: () => {
@@ -3072,6 +3103,12 @@ export class ReferenceResolver {
     if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
+}
+
+/** The project-relative directory holding `p` ('' for the project root). */
+function goDirOf(p: string): string {
+  const dir = path.posix.dirname(p.replace(/\\/g, '/'));
+  return dir === '.' || dir === '/' ? '' : dir;
 }
 
 /**

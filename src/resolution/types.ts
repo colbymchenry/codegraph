@@ -187,13 +187,15 @@ export interface ResolutionContext {
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
-   * Go module info from `go.mod` at the project root. Returns `null`
-   * when the project has no `go.mod` (non-Go projects, pre-modules
-   * Go code, or projects whose modules live in subdirectories). Used
-   * by the Go branch of import resolution to distinguish in-module
-   * cross-package imports from third-party packages.
+   * The project's Go module that an import path belongs to — one whose
+   * `go.mod` is at the project root or in any directory above an indexed
+   * `.go` file (#2322) — or `null` for the standard library, third-party
+   * modules and projects without a `go.mod`. `fromFile` (the importing file)
+   * breaks a tie between two modules declaring the same path. Used by the Go
+   * branch of import resolution to distinguish in-project cross-package
+   * imports from third-party packages.
    */
-  getGoModule?(): import('./go-module').GoModule | null;
+  getGoModuleForImport?(importPath: string, fromFile?: string): import('./go-module').GoModule | null;
   /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
