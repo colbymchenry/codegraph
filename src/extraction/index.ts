@@ -229,6 +229,8 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   'lua_modules', '.luarocks',
   // Delphi / RAD Studio IDE backups (duplicate .pas source — would double-count)
   '__history', '__recovery',
+  // Salam — the compiler's scratch dir for generated programs
+  '.salam-build',
   // Generic cache
   '.cache',
 ]);

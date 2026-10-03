@@ -50,6 +50,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  salam: ['.salam'],
 };
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
@@ -947,6 +948,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'salam') {
+    mappings.push(...extractSalamImports(content));
   }
 
   return mappings;
@@ -1112,6 +1115,37 @@ function extractPythonImports(content: string): ImportMapping[] {
     });
   }
 
+  return mappings;
+}
+
+/**
+ * Extract Salam file imports: `import alias "path.salam"` (several pairs may
+ * share a line). The alias names the file's package in this file, so each
+ * mapping is a namespace import and `alias.Member` resolves against the
+ * target file's `pub` symbols. A bare path is relative to the importing file.
+ * Package imports (`import str`) carry no path and resolve by qualified name.
+ * `فراخوانی` / `خواندن` are the Persian spellings of `import`.
+ */
+function extractSalamImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const lineRe = /^[ \t]*(?:import|فراخوانی|خواندن)[ \t]+(.+)$/gmu;
+  let line: RegExpExecArray | null;
+  while ((line = lineRe.exec(content)) !== null) {
+    const pairRe = /(?:([^\s"`«»]+)[ \t]+)?"([^"\n]+)"/gu;
+    let pair: RegExpExecArray | null;
+    while ((pair = pairRe.exec(line[1]!)) !== null) {
+      const raw = pair[2]!;
+      const stem = raw.replace(/^.*\//, '').replace(/\.salam$/, '');
+      const source = raw.startsWith('.') || raw.startsWith('/') ? raw : `./${raw}`;
+      mappings.push({
+        localName: pair[1] ?? stem,
+        exportedName: '*',
+        source,
+        isDefault: false,
+        isNamespace: true,
+      });
+    }
+  }
   return mappings;
 }
 
