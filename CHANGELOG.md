@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Installing or removing CodeGraph in Hermes now preserves settings that follow your MCP servers, including provider choices and custom values, so your configuration stays intact. (#2251) Thanks @rudycelekli.
 
 ## [1.6.2] - 2026-10-03
 
