@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Rust, a function that uses an enum only through its variants, like `Mode::A`, `mode::Mode::B` or a `Mode::C(x) =>` match arm, now counts as referencing the enum, so it shows up in the enum's callers and impact; reading a type's associated constant, like `Limits::MAX`, references that type too. Re-index Rust projects after upgrading. (#2328)
+
 
 ## [1.6.2] - 2026-10-03
 

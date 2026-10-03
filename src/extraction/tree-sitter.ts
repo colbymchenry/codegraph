@@ -357,9 +357,20 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * static read is pure duplication) — while adding real graph noise (+1813 edges /
  * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
+ * Rust imports too, but a path names its module where it is written
+ * (`mode::Mode::A` under `use crate::mode;`), so often no `use` names the type (#2328).
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'rust',
+]);
+
+/**
+ * Parents of a Rust `scoped_identifier` that is not a member written as a
+ * value or a pattern: the prefix of a longer path, or a `use` tree.
+ */
+const RUST_NON_MEMBER_PATH_PARENTS: ReadonlySet<string> = new Set([
+  'scoped_identifier', 'scoped_type_identifier',
+  'use_declaration', 'use_list', 'scoped_use_list', 'use_as_clause', 'use_wildcard',
 ]);
 
 /**
@@ -5420,6 +5431,31 @@ export class TreeSitterExtractor {
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
         this.pushStaticMemberRef(prev.text, ownerId, prev);
       }
+      return;
+    }
+
+    // Rust writes the member as a path: a variant or an associated const read
+    // (`Mode::A`, `mode::Mode::B`), matched (`Mode::C(x)`, `Mode::D { .. }`), or
+    // `Self::A` in an impl (#2328). The receiver is the segment before the
+    // member, referenced where it is written so a `mode::` / `other::` prefix
+    // scopes it as it does a type annotation. A lowercase receiver is a module
+    // and a lowercase member a function (`util::take`, `Foo::new`); a call's
+    // callee (`Mode::C(1)`) and a struct literal's name are already linked to
+    // their member; the prefix of a longer path and a `use` tree name no member.
+    // Mirrored by the native kernel's `extract_static_member_ref` — change both.
+    if (this.language === 'rust') {
+      const parent = node.parent;
+      if (!parent) return;
+      if (node.type === 'scoped_type_identifier' ? parent.type !== 'struct_pattern'
+        : node.type !== 'scoped_identifier' || RUST_NON_MEMBER_PATH_PARENTS.has(parent.type)) return;
+      if (parent.type === 'call_expression' && getChildByField(parent, 'function')?.startIndex === node.startIndex) return;
+      const member = getChildByField(node, 'name');
+      let recv = getChildByField(node, 'path');
+      if (recv?.type === 'scoped_identifier') recv = getChildByField(recv, 'name');
+      if (!member || recv?.type !== 'identifier' || !/^[A-Z]/.test(getNodeText(member, this.source))) return;
+      let text = getNodeText(recv, this.source);
+      if (text === 'Self') text = this.extractor!.getReceiverType?.(node, this.source) ?? '';
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
       return;
     }
 

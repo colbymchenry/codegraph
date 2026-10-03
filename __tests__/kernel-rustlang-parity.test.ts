@@ -113,6 +113,29 @@ fn next() {}
     assertParity('commands.rs', source.replace(/\n/g, '\r\n'));
   });
 
+  it('variant and associated-const paths reference their type (#2328)', () => {
+    const source = `
+use crate::mode::{self, Mode};
+const DEFAULT: Mode = Mode::A;
+impl Mode {
+    fn flip(&self) -> u8 {
+        let _s = "ü"; let _x = Self::B;
+        match self { Self::A => 1, Mode::C(x) => *x, mode::Mode::D { x } => *x, _ => 0 }
+    }
+}
+trait Tr { fn t(&self) { let _ = Self::K; } }
+fn uses() {
+    use crate::mode::Mode::A;
+    let _a = crate::mode::Mode::A; let _b = Mode::C(1); let _c = Mode::D { x: 2 };
+    let _d = Mode::new(); let _e = util::take(3); let _f = u8::MAX; let _g = Limits::MAX;
+    let _h = xs.map(Mode::C); let _i = Option::<u8>::None; let _j = Mode::A.flip();
+    if let Mode::C(x) | Mode::B = m {}
+}
+`;
+    assertParity('variants.rs', source);
+    assertParity('variants.rs', source.replace(/\n/g, '\r\n'));
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

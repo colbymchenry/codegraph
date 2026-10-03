@@ -66,6 +66,11 @@ fn simple_ident_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[A-Za-z_][0-9A-Za-z_]*$").unwrap())
 }
+/// extractStaticMemberRef's capitalized-receiver test.
+fn capitalized_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Z][A-Za-z0-9_]*$").unwrap())
+}
 
 struct Scope {
     row: u32,
@@ -1201,6 +1206,7 @@ impl<'t> Walker<'t> {
         } else if kind == "struct_expression" {
             self.extract_instantiation(node);
         }
+        self.extract_static_member_ref(node);
 
         // Nested NAMED fns become their own nodes (a nested fn inside an impl
         // method walks up to the impl and indexes as a METHOD).
@@ -1234,6 +1240,62 @@ impl<'t> Walker<'t> {
             if let Some(c) = node.named_child(i) {
                 self.visit_for_calls_and_structure(c);
             }
+        }
+    }
+
+    /// extractStaticMemberRef — the rust branch (#2328): a variant or an
+    /// associated const written as a path (`Mode::A`, `mode::Mode::B`, a
+    /// `Mode::C(x)` / `Mode::D { .. }` pattern, `Self::A` in an impl) references
+    /// the receiver — the segment before the member, at the place it is
+    /// written. A lowercase receiver (module) or member (fn), a call's callee
+    /// or a struct literal's name (both already linked to their member), a
+    /// path's prefix and a `use` tree emit nothing. Mirrored byte-for-byte —
+    /// change both.
+    fn extract_static_member_ref(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() {
+            return;
+        }
+        let Some(parent) = node.parent() else { return };
+        let member_path = match node.kind() {
+            "scoped_identifier" => !matches!(
+                parent.kind(),
+                "scoped_identifier"
+                    | "scoped_type_identifier"
+                    | "use_declaration"
+                    | "use_list"
+                    | "scoped_use_list"
+                    | "use_as_clause"
+                    | "use_wildcard"
+            ),
+            "scoped_type_identifier" => parent.kind() == "struct_pattern",
+            _ => false,
+        };
+        if !member_path {
+            return;
+        }
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function").map(|f| f.start_byte()) == Some(node.start_byte())
+        {
+            return;
+        }
+        let Some(member) = node.child_by_field_name("name") else { return };
+        let mut recv = node.child_by_field_name("path");
+        if let Some(r) = recv {
+            if r.kind() == "scoped_identifier" {
+                recv = r.child_by_field_name("name");
+            }
+        }
+        let Some(recv) = recv else { return };
+        if recv.kind() != "identifier" || !self.text(member).starts_with(|c: char| c.is_ascii_uppercase()) {
+            return;
+        }
+        let mut text = self.text(recv).to_string();
+        if text == "Self" {
+            text = self.receiver_type_of(node).unwrap_or_default();
+        }
+        if capitalized_re().is_match(&text) {
+            let owner = self.top_row();
+            self.push_ref_at(owner, &text, edge_kind_index("references").unwrap(), recv);
         }
     }
 
