@@ -7704,7 +7704,13 @@ export function matchMethodCall(
   const [, objectOrClass, methodName] = match;
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
-  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  // A python attribute receiver (`self.conn`, `cfg.client`) is not one: the
+  // python branch below owns it, and the shared inferrer would answer first by
+  // the assignment's leading name — `self.conn = Pool().acquire()` read as a
+  // `Pool`, `Session` read as the project's class under `from requests import
+  // Session` — skipping that branch's whole-value, rebinding and import checks.
+  const pythonAttrReceiver = ref.language === 'python' && !!dotMatch && objectOrClass!.includes('.');
+  const inferableReceiver = (dotMatch || luaColonMatch || rDollarMatch) && !pythonAttrReceiver;
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -7847,6 +7853,19 @@ export function matchMethodCall(
     objectOrClass!.startsWith('this.')
   ) {
     return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
+  }
+
+  // Python call through an attribute — `self.data.append(x)`,
+  // `cls.registry.lookup(k)`, `cfg.client.send(x)` — which the extractor emits
+  // with its receiver (`self.data.append`) instead of a bare method name.
+  // EXCLUSIVE, for the same reason as the Go, Rust and TS branches above:
+  // everything past this point is name matching, and a bare-name match is how
+  // `self.data.append(1)` bound to an unrelated class's `append`. The evidence
+  // this path accepts is the type the class body gives the attribute. A dotted
+  // MODULE path (`pkg.mod.func()`) never gets here: import resolution claims it
+  // first, through the module the import names.
+  if (pythonAttrReceiver) {
+    return matchPythonAttrCall(objectOrClass!, methodName!, ref, context);
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -8217,6 +8236,605 @@ function isImportBinding(receiver: string, ref: UnresolvedRef, context: Resoluti
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
   return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** Python types whose methods are the runtime's, never a project symbol's. */
+const PYTHON_RUNTIME_TYPES: ReadonlySet<string> = new Set([
+  'list', 'dict', 'set', 'frozenset', 'tuple', 'str', 'bytes', 'bytearray',
+  'int', 'float', 'complex', 'bool', 'object', 'type', 'range', 'slice',
+  'List', 'Dict', 'Set', 'FrozenSet', 'Tuple', 'Sequence', 'Mapping',
+  'MutableMapping', 'MutableSequence', 'Iterable', 'Iterator', 'Callable',
+  'deque', 'defaultdict', 'OrderedDict', 'Counter',
+  'collections.deque', 'collections.defaultdict', 'collections.OrderedDict', 'collections.Counter',
+]);
+
+/** What a python class body says an attribute holds. */
+type PythonAttrEvidence = { type: string } | 'runtime' | null;
+
+/**
+ * The type an annotation names — `Client`, `"Client"`, `Optional[Client]`,
+ * `Client | None`, `models.Client` — or 'runtime' for a builtin container, or
+ * null when it says nothing usable (`Any`, a generic of a project type).
+ */
+function pythonAnnotationEvidence(raw: string): PythonAttrEvidence {
+  let t = raw.trim().replace(/^['"]|['"]$/g, '').trim();
+  for (let i = 0; i < 4 && t; i++) {
+    const opt = t.match(/^(?:typing\.)?Optional\s*\[\s*(.+)\s*\]$/)
+      ?? t.match(/^(?:typing\.)?Union\s*\[\s*([^,\]]+?)\s*,\s*None\s*\]$/)
+      ?? t.match(/^(.+?)\s*\|\s*None$/)
+      ?? t.match(/^None\s*\|\s*(.+)$/);
+    if (!opt) break;
+    t = opt[1]!.trim().replace(/^['"]|['"]$/g, '').trim();
+  }
+  const head = t.split('[')[0]!.trim().replace(/^typing\./, '');
+  if (PYTHON_RUNTIME_TYPES.has(head)) return 'runtime';
+  if (t.includes('[') || !/^[A-Za-z_][\w.]*$/.test(t) || head === 'Any') return null;
+  return { type: t };
+}
+
+/**
+ * The top-level shape of a python expression: string literals collapse to
+ * `S` and everything inside brackets is dropped, so `Client(a, f(b))` reads
+ * `Client()`, `Pool().acquire()` stays `Pool().acquire()` and
+ * `Client() if t else Fake()` keeps its `if`. `open` says why there is no
+ * shape yet: a bracket or triple-quoted string still open, or a trailing `\`
+ * — the expression continues on the next line — versus a single-line string
+ * left open or a bracket closed that was never opened, which no further line
+ * can repair.
+ */
+function pythonExprScan(raw: string): { shape: string | null; open: 'none' | 'continues' | 'broken' } {
+  let out = '';
+  let depth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === '"' || c === "'") {
+      const triple = raw.startsWith(c.repeat(3), i);
+      const close = triple ? c.repeat(3) : c;
+      let j = i + close.length;
+      while (j < raw.length && !raw.startsWith(close, j)) j += raw[j] === '\\' ? 2 : 1;
+      if (j >= raw.length) return { shape: null, open: triple ? 'continues' : 'broken' };
+      if (depth === 0) out = out.replace(/[rbfuRBFU]{1,2}$/, '') + 'S';
+      i = j + close.length - 1;
+    } else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) out += c;
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth < 0) return { shape: null, open: 'broken' };
+      if (depth === 0) out += c;
+    } else if (depth === 0) {
+      out += c;
+    }
+  }
+  const shape = out.replace(/\s+/g, ' ').trim();
+  if (depth > 0 || shape.endsWith('\\')) return { shape: null, open: 'continues' };
+  return { shape, open: 'none' };
+}
+
+function pythonExprShape(raw: string): string | null {
+  return pythonExprScan(raw).shape;
+}
+
+/**
+ * The two arms of a top-level conditional expression — `A if c else B` →
+ * `[A, B]` — or null when `raw` is not one. Keywords inside brackets or
+ * strings do not count.
+ */
+function pythonConditionalArms(raw: string): [string, string] | null {
+  let depth = 0;
+  let ifAt = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === '"' || c === "'") {
+      const close = raw.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+      let j = i + close.length;
+      while (j < raw.length && !raw.startsWith(close, j)) j += raw[j] === '\\' ? 2 : 1;
+      i = j + close.length - 1;
+    } else if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    else if (depth === 0 && /\s/.test(raw[i - 1] ?? '')) {
+      if (ifAt < 0 && /^if\s/.test(raw.slice(i))) ifAt = i;
+      else if (ifAt >= 0 && /^else\s/.test(raw.slice(i))) {
+        return [raw.slice(0, ifAt).trim(), raw.slice(i + 4).trim()];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Same question for an assigned value: `Client(...)`, `[]`, `cap` (a
+ * parameter). A call counts only when it IS the whole value — `Pool().acquire()`
+ * holds what `acquire` returns, `Client() if t else Fake()` holds either, and
+ * neither is evidence of `Pool` or `Client`.
+ */
+function pythonValueEvidence(raw: string, signature: string | null): PythonAttrEvidence {
+  const v = raw.trim();
+  const shape = pythonExprShape(v);
+  if (shape === null) return null;
+  // `A if cond else B` holds one arm or the other: evidence only when both
+  // arms give the same answer, as for two branches of an `if` statement.
+  const arms = pythonConditionalArms(v);
+  if (arms) {
+    const [a, b] = arms.map((arm) => pythonValueEvidence(arm, signature));
+    if (!a || !b) return null;
+    if (a === 'runtime' || b === 'runtime') return a === b ? 'runtime' : null;
+    return a.type === b.type ? a : null;
+  }
+  if (/^(?:S(?: S)*|-?\d[\w.]*|True|False|\[\]|\{\}|\(\))$/.test(shape)) return 'runtime';
+  const ctor = /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
+  if (ctor) {
+    if (PYTHON_RUNTIME_TYPES.has(ctor[1]!)) return 'runtime';
+    // A capitalised callee constructs that class; `make_client()` returns
+    // something this file does not say.
+    return /^[A-Z]/.test(ctor[1]!.split('.').pop()!) ? { type: ctor[1]! } : null;
+  }
+  // `self.cap = cap` — the parameter's annotation in the enclosing `def`.
+  if (signature && /^[A-Za-z_]\w*$/.test(v)) {
+    const param = new RegExp(`[(,]\\s*\\*{0,2}${v}\\s*:\\s*([^,)=]+)`).exec(signature);
+    if (param) return pythonAnnotationEvidence(param[1]!);
+  }
+  return null;
+}
+
+/**
+ * The value starting at `first` on line `ln`, joined with the lines that
+ * continue it — an open bracket or triple-quoted string, or a trailing `\` —
+ * up to a small cap. Returns the text and the last line it used. A value that
+ * does not close within the cap, or cannot (a single-line string left open,
+ * a stray closing bracket), is returned as its first line alone with no line
+ * consumed: the lines after it are statements of their own and must still be
+ * read.
+ */
+function pythonJoinedValue(lines: string[], ln: number, first: string, lastLine: number): { text: string; end: number } {
+  if (pythonExprScan(first).open !== 'continues') return { text: first, end: ln };
+  let text = first;
+  for (let end = ln; end < lastLine && end - ln < 30; ) {
+    text = text.replace(/\\\s*$/, '') + ' ' + (lines[end] ?? '').trim();
+    end++;
+    const { open } = pythonExprScan(text);
+    if (open === 'none') return { text, end };
+    if (open === 'broken') break;
+  }
+  return { text: first, end: ln };
+}
+
+/**
+ * The names `value` calls as a whole expression or conditional arm —
+ * `Client(...)`, `make()` — whose local rebinding would make the evidence
+ * wrong.
+ */
+function pythonValueCallees(value: string): string[] {
+  const arms = pythonConditionalArms(value.trim());
+  if (arms) return arms.flatMap(pythonValueCallees);
+  const shape = pythonExprShape(value.trim().replace(/^await\s+/, ''));
+  const call = shape && /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
+  return call ? [call[1]!] : [];
+}
+
+/**
+ * `line` with the contents of its string literals blanked (quotes kept), so a
+ * string never reads as code: `log("a: return b")` holds no `return`,
+ * `print("Foo = %s")` no assignment. A quote left open blanks the rest of the
+ * line (a triple-quoted string continuing below).
+ */
+function pythonBlankStrings(line: string): string {
+  const out = line.split('');
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (c !== '"' && c !== "'") continue;
+    const q = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+    let j = i + q.length;
+    while (j < line.length && !line.startsWith(q, j)) j += line[j] === '\\' ? 2 : 1;
+    for (let k = i + q.length; k < Math.min(j, line.length); k++) out[k] = ' ';
+    i = Math.min(j + q.length, line.length) - 1;
+  }
+  return out.join('');
+}
+
+/**
+ * The assignment targets of one python statement (strings blanked): `a, (b,
+ * c) = …` → [`a, (b, c)`], `x: T = …` → [`x`], `x += …` → [`x`], `a = b = …` →
+ * [`a`, `b`], and the statement a one-line compound header guards (`if c: x =
+ * …`). A `=` inside brackets is a keyword argument or a default, `==` / `!=` /
+ * `<=` / `>=` compare, and a `lambda`'s defaults bind nothing here — none is a
+ * target.
+ */
+function pythonAssignTargets(statement: string): string[] {
+  const stmt = statement.replace(/^\s*(?:(?:el)?if|while|else|try|finally|except|with|for)\b[^:]*:(?!=)/, '');
+  const targets: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    else if (c === '=' && depth === 0) {
+      if (stmt[i + 1] === '=') { i++; continue; }
+      const prev = stmt[i - 1] ?? '';
+      if (prev === '!' || prev === ':') continue; // `!=`, walrus
+      if ((prev === '<' || prev === '>') && stmt[i - 2] !== prev) continue; // `<=`, `>=`
+      let seg = stmt.slice(from, i);
+      if (/\blambda\b/.test(seg)) break;
+      seg = seg.replace(/(?:\*\*|\/\/|>>|<<|[-+*/%&|^@])$/, '');
+      targets.push(seg.split(':')[0]!.trim());
+      from = i + 1;
+    }
+  }
+  return targets;
+}
+
+/**
+ * The statement-level lines of the `def` on line `defLine`, after its header
+ * and before line `upto`: each with its line number and its statements
+ * (strings blanked, split on `;`). A line that continues a bracketed or
+ * `\`-continued statement is not one — `client=client,` inside a call is a
+ * keyword argument — and neither is a line inside a nested `def` or `class`,
+ * whose header is reported as `nested` (its name is bound here).
+ */
+function pythonDefStatements(
+  lines: string[],
+  defLine: number,
+  upto: number,
+): { header: string; body: Array<{ line: number; statements: string[]; nested?: string }> } {
+  let header = '';
+  let ln = defLine;
+  for (; ln <= upto && ln <= lines.length; ln++) {
+    header += ' ' + (lines[ln - 1] ?? '').trim();
+    if (/\)\s*(?:->[^:]*)?:\s*$/.test(header)) break;
+  }
+  const body: Array<{ line: number; statements: string[]; nested?: string }> = [];
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let depth = 0;
+  let continued = false;
+  let nestedIndent = -1;
+  for (let k = ln + 1; k < upto; k++) {
+    const raw = lines[k - 1] ?? '';
+    if (!raw.trim()) continue;
+    const blanked = pythonBlankStrings(raw);
+    const inside = depth > 0 || continued;
+    for (const c of blanked) {
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    }
+    continued = /\\\s*$/.test(blanked);
+    if (inside) continue;
+    if (nestedIndent >= 0) {
+      if (indent(raw) > nestedIndent) continue;
+      nestedIndent = -1;
+    }
+    const text = blanked.trim();
+    const nested = /^(?:async\s+)?(?:def|class)\s+(\w+)/.exec(text);
+    if (nested) {
+      nestedIndent = indent(raw);
+      body.push({ line: k, statements: [], nested: nested[1]! });
+      continue;
+    }
+    body.push({ line: k, statements: text.split(';').map((t) => t.trim()).filter(Boolean) });
+  }
+  return { header, body };
+}
+
+/**
+ * Whether an assignment target binds `name` itself — `name`, `*name`, or an
+ * element of a tuple / list target (`a, (name, b)`, `[name, b]`). A target that
+ * only USES the name does not: `d[name] = 1` and `self._h[name] = c` store
+ * into a container, `name.attr = 1` sets an attribute.
+ */
+function pythonTargetBinds(target: string, name: string): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of target.matchAll(new RegExp(`(?<![.\\w])${n}\\b`, 'g'))) {
+    const after = target.slice(m.index! + name.length).trimStart();
+    if (after.startsWith('.') || after.startsWith('[') || after.startsWith('(')) continue;
+    // Inside a subscript (`d[name]`): a `[` opened right after a name, call or
+    // subscript, not a list display (`[name, b] = …`).
+    let inSubscript = false;
+    const stack: boolean[] = [];
+    for (let i = 0; i < m.index!; i++) {
+      const c = target[i]!;
+      if (c === '[') stack.push(/[\w)\]]\s*$/.test(target.slice(0, i)));
+      else if (c === ']') stack.pop();
+      else if (c === '(') stack.push(false);
+      else if (c === ')') stack.pop();
+    }
+    inSubscript = stack.some(Boolean);
+    if (!inSubscript) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether `name` is rebound inside the `def` on line `defLine`, before line
+ * `upto` — a parameter (unless `params` is false), an assignment target, a
+ * loop / `with` / `except` target, a walrus, a nested `def` / `class` of that
+ * name — so a call spelled `name(...)` there is NOT the module's class or
+ * function of that name, and a parameter read there no longer holds what its
+ * annotation says. `Signer = import_string(backend); return Signer()`
+ * constructs whatever the setting names, not the `Signer` class beside it.
+ *
+ * Not a rebinding: a keyword argument (`f(name=name)`, also across lines), an
+ * attribute (`obj.name = x`), a comparison, text in a string, a line inside a
+ * nested `def`, or an import of the name — the file's import mappings already
+ * include a function-local import, and every binding of a name must agree
+ * before it types anything.
+ */
+function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: string, params = true): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const { header, body } = pythonDefStatements(lines, defLine, upto);
+  if (params) {
+    const list = /\((.*)\)/.exec(header)?.[1] ?? '';
+    const paramNames = list.split(',').map((p) => p.trim().replace(/^\*{1,2}/, '').split(/[:=]/)[0]!.trim());
+    if (paramNames.includes(name)) return true;
+  }
+  const loop = new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()\\[\\]]*(?<![.\\w])${n}\\b[\\w\\s,()\\[\\]]*\\bin\\b`);
+  const as = new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`);
+  const walrus = new RegExp(`(?<![.\\w])${n}\\s*:=`);
+  for (const { statements, nested } of body) {
+    if (nested === name) return true;
+    for (const st of statements) {
+      if (pythonAssignTargets(st).some((t) => pythonTargetBinds(t, name))) return true;
+      if (loop.test(st) || walrus.test(st)) return true;
+      if (!/^(?:from|import)\b/.test(st) && as.test(st)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * What `owner`'s body says `attr` holds: a class-level declaration
+ * (`registry = Registry()`, `conn: Client`) or an assignment through `self` /
+ * `cls` (`self.cap = Capture()`, `self.cap: Capture`, `self.cap = cap` with
+ * `cap: Capture` in the signature). Two statements that disagree are no
+ * evidence at all.
+ *
+ * Comments and docstrings are blanked before reading, and nested classes are
+ * skipped, so neither can supply the type: a regex over raw class lines took a
+ * type from a docstring once and turned a correct edge into a wrong one.
+ */
+function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContext): PythonAttrEvidence {
+  const source = context.readFile(owner.filePath);
+  if (!source) return null;
+  const lines = stripCommentsForRegex(source, 'python').split('\n');
+  const nested = context
+    .getNodesInFile(owner.filePath)
+    .filter((n) => n.kind === 'class' && n.id !== owner.id && n.startLine > owner.startLine && n.endLine <= owner.endLine);
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let bodyIndent = -1;
+  const a = attr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classLevel = new RegExp(`^${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=\\s*(.+?))?\\s*$`);
+  const viaSelf = new RegExp(`\\b(?:self|cls)\\.${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=(?!=)\\s*(.+?))?\\s*$`);
+  let signature: string | null = null;
+  let defStart = -1;
+  let nestedDefIndent = -1;
+  const found = new Set<string>();
+
+  for (let ln = owner.startLine + 1; ln <= owner.endLine; ln++) {
+    const line = lines[ln - 1];
+    if (!line || !line.trim()) continue;
+    if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
+    if (bodyIndent < 0) bodyIndent = indent(line);
+    const text = line.trim();
+    if (/^(?:async\s+)?def\s/.test(text) && indent(line) === bodyIndent) {
+      // The enclosing method's signature, possibly over several lines. A def
+      // nested in a method is not one: its parameters and locals are its own.
+      defStart = ln;
+      nestedDefIndent = -1;
+      signature = text;
+      for (let k = ln; k < owner.endLine && !/\)\s*(?:->[^:]*)?:\s*$/.test(signature); k++) {
+        signature += ' ' + (lines[k] ?? '').trim();
+      }
+      continue;
+    }
+    if (nestedDefIndent >= 0 && indent(line) <= nestedDefIndent) nestedDefIndent = -1;
+    if (nestedDefIndent < 0 && /^(?:async\s+)?def\s/.test(text) && indent(line) > bodyIndent) {
+      nestedDefIndent = indent(line);
+      continue;
+    }
+    const m = indent(line) === bodyIndent ? classLevel.exec(text) : viaSelf.exec(text);
+    if (!m || (!m[1] && !m[2])) continue;
+    // `self.x = c` inside a def nested in a method (a callback) reads that
+    // def's own parameters and locals, which the method's scope does not see:
+    // it says nothing usable here.
+    if (nestedDefIndent >= 0 && indent(line) > nestedDefIndent) continue;
+    const inDef = indent(line) !== bodyIndent && defStart > 0;
+    const at = ln;
+    let value = m[2];
+    if (!m[1] && value) {
+      const joined = pythonJoinedValue(lines, ln, value, owner.endLine);
+      value = joined.text;
+      ln = joined.end;
+    }
+    // A value read through a name the method rebinds first — `Backend =
+    // load(); self.b = Backend()`, or `box = wrap(box); self.box = box` for a
+    // `box: Box` parameter — is not what the module's class or the annotation
+    // says. That statement is no evidence.
+    if (!m[1] && inDef) {
+      const v = value!.trim();
+      const reads = pythonValueCallees(v).map((c) => c.split('.')[0]!);
+      if (reads.some((c) => pythonBoundInDef(lines, defStart, at, c))) continue;
+      if (/^[A-Za-z_]\w*$/.test(v) && pythonBoundInDef(lines, defStart, at, v, false)) continue;
+    }
+    const ev = m[1]
+      ? pythonAnnotationEvidence(m[1])
+      : pythonValueEvidence(value!, inDef ? signature : null);
+    if (ev) found.add(ev === 'runtime' ? '' : ev.type);
+  }
+  if (found.size !== 1) return null;
+  const only = [...found][0]!;
+  return only === '' ? 'runtime' : { type: only };
+}
+
+/**
+ * The class `className` declared in the python module `modulePath` as seen
+ * from `fromFile` — `pkg.a` / `.a` / `..core` — or null. Relative paths are
+ * anchored at `fromFile`'s package; an absolute one may sit under a source root
+ * (`src/pkg/a.py`), so it matches by path suffix and must be unique.
+ */
+function pythonModuleClass(modulePath: string, className: string, fromFile: string, context: ResolutionContext): Node | null {
+  const dots = /^\.*/.exec(modulePath)![0].length;
+  let rel = modulePath.slice(dots).replace(/\./g, '/');
+  if (dots > 0) {
+    const dir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1);
+    for (let i = 1; i < dots; i++) {
+      if (dir.length === 0) return null;
+      dir.pop();
+    }
+    rel = [...dir, ...(rel ? [rel] : [])].join('/');
+  }
+  if (!rel) return null;
+  const wanted = [`${rel}.py`, `${rel}/__init__.py`, `${rel}.pyi`];
+  const hits = context.getNodesByName(className).filter((n) => {
+    if (n.kind !== 'class' || n.language !== 'python') return false;
+    const fp = n.filePath.replace(/\\/g, '/');
+    return wanted.some((w) => fp === w || (dots === 0 && fp.endsWith(`/${w}`)));
+  });
+  return hits.length === 1 ? hits[0]! : null;
+}
+
+/**
+ * The project class a python type name means in `fromFile`: the class in the
+ * module its import names, or the file's own declaration. An import that names
+ * a module outside the project (`requests.Session`) is null, never a same-named
+ * project class — that is the guess this whole path exists to stop.
+ */
+function pythonClassNamed(typeName: string, fromFile: string, context: ResolutionContext): Node | null {
+  const segs = typeName.split('.');
+  const className = segs[segs.length - 1]!;
+  const imports = context.getImportMappings(fromFile, 'python');
+  const candidates: Array<Node | null> = [];
+  for (const imp of imports) {
+    if (imp.isNamespace && segs.length > 1 && typeName.startsWith(`${imp.source}.`)) {
+      // `import pkg.models` then `pkg.models.User`.
+      const middle = typeName.slice(imp.source.length + 1).split('.').slice(0, -1);
+      candidates.push(pythonModuleClass([imp.source, ...middle].join('.'), className, fromFile, context));
+    } else if (imp.localName === segs[0]) {
+      if (segs.length === 1) {
+        // `from pkg.a import Capture` / `... import Capture as C`.
+        candidates.push(imp.isNamespace ? null : pythonModuleClass(imp.source, imp.exportedName, fromFile, context));
+      } else {
+        // `from pkg import models` then `models.User`; `import models as m` then `m.User`.
+        const base = imp.isNamespace
+          ? imp.source
+          : imp.source.endsWith('.') ? imp.source + imp.exportedName : `${imp.source}.${imp.exportedName}`;
+        candidates.push(pythonModuleClass([base, ...segs.slice(1, -1)].join('.'), className, fromFile, context));
+      }
+    }
+  }
+  if (candidates.length > 0) {
+    // Every binding of the name must agree on one class.
+    const ids = new Set(candidates.map((c) => c?.id ?? ''));
+    return ids.size === 1 && candidates[0] ? candidates[0] : null;
+  }
+  if (segs.length > 1) return null;
+  const local = context
+    .getNodesByName(typeName)
+    .filter((n) => n.kind === 'class' && n.language === 'python' && n.filePath === fromFile);
+  return local.length === 1 ? local[0]! : null;
+}
+
+/**
+ * `method` on class `cls`, or on a base its own `class` line names (resolved
+ * the same way, from `cls`'s file). Reading the bases off the header rather
+ * than the `extends` edges keeps this answerable in the first pass.
+ */
+function pythonMethodOnClass(
+  cls: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  seen: Set<string> = new Set(),
+): ResolvedRef | null {
+  if (seen.has(cls.id) || seen.size >= 5) return null;
+  seen.add(cls.id);
+  const own = context
+    .getNodesByName(methodName)
+    .find((m) =>
+      m.kind === 'method' && m.language === 'python' && m.filePath === cls.filePath &&
+      (m.qualifiedName === `${cls.name}::${methodName}` || m.qualifiedName.endsWith(`::${cls.name}::${methodName}`)));
+  if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
+
+  const source = context.readFile(cls.filePath);
+  if (!source) return null;
+  const header = stripCommentsForRegex(source, 'python')
+    .split('\n')
+    .slice(cls.startLine - 1, cls.startLine + 4)
+    .join(' ');
+  const bases = new RegExp(`\\bclass\\s+${cls.name}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
+  for (const base of (bases ?? '').split(',').map((b) => b.trim())) {
+    if (!/^[A-Za-z_][\w.]*$/.test(base)) continue; // `metaclass=...`, generics
+    const baseCls = pythonClassNamed(base, cls.filePath, context);
+    const hit = baseCls && pythonMethodOnClass(baseCls, methodName, ref, context, seen);
+    if (hit) return { ...hit, confidence: 0.8 };
+  }
+  return null;
+}
+
+/**
+ * A base-typed attribute can hold a subclass-only method (#1820): the one
+ * descendant of `cls` that defines `methodName`, else nothing. Same rule as the
+ * method-value path in `matchMemberFunctionRef`; unrelated same-name methods
+ * never win.
+ */
+function pythonSubclassMethod(
+  cls: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const descendants = context.getNodesByName(methodName).filter((m) => {
+    if (m.kind !== 'method' || m.language !== 'python') return false;
+    const parent = context.getNodesInFile(m.filePath).find((c) =>
+      c.kind === 'class' && m.qualifiedName === `${c.qualifiedName}::${methodName}`);
+    return !!parent && pythonDerivesFrom(parent, cls, ref, context);
+  });
+  return descendants.length === 1
+    ? { original: ref, targetNodeId: descendants[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
+    : null;
+}
+
+/**
+ * Python call through one attribute of a class — `self.cap.stop()`,
+ * `cls.registry.lookup()`, `Svc.registry.lookup()`, `config.llm.rebuild()`.
+ * The class is the one the call sits in (`self` / `cls`), the one the receiver
+ * names, or the declared type of a local; the attribute's type comes from that
+ * class's body; the method is looked up on that type.
+ *
+ * Anything the class body does not type — a builtin container, a factory
+ * function's result, an attribute declared on a base class, an untyped local,
+ * a deeper chain — resolves to nothing rather than to a same-named method
+ * somewhere else.
+ */
+function matchPythonAttrCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const segs = receiver.split('.');
+  if (segs.length !== 2) return null;
+  const [head, attr] = segs as [string, string];
+
+  let owner: Node | null = null;
+  if (head === 'self' || head === 'cls') {
+    // The innermost class whose extent holds the call.
+    for (const n of context.getNodesInFile(ref.filePath)) {
+      if (n.kind !== 'class' || n.startLine > ref.line || n.endLine < ref.line) continue;
+      if (!owner || n.startLine > owner.startLine) owner = n;
+    }
+  } else if (/^[A-Z]/.test(head)) {
+    owner = pythonClassNamed(head, ref.filePath, context);
+  } else {
+    // A local or parameter whose own type the scope states — `config: Config`,
+    // `controller = Controller(...)` — then the attribute on that class.
+    const headType = inferLocalReceiverType(head, ref, context);
+    if (headType) owner = pythonClassNamed(headType, ref.filePath, context);
+  }
+  if (!owner) return null;
+
+  const evidence = pythonAttrEvidence(owner, attr, context);
+  if (!evidence || evidence === 'runtime') return null;
+  const cls = pythonClassNamed(evidence.type, owner.filePath, context);
+  return cls ? pythonMethodOnClass(cls, methodName, ref, context) ?? pythonSubclassMethod(cls, methodName, ref, context) : null;
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
