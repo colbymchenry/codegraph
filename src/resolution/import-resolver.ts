@@ -993,7 +993,7 @@ const ES_IMPORT_RE = new RegExp(
 
 /** `export [type] * [as ns] from '…'`. */
 const WILDCARD_REEXPORT_RE = new RegExp(
-  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\*(?:\\s*as(?:\\s+(${JS_IDENT})|\\s*(?:${JS_STRING})))?\\s*from\\s*['"]([^'"]+)['"]`,
+  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\*(?:\\s*as(?:\\s+(${JS_IDENT})|\\s*(${JS_STRING})))?\\s*from\\s*['"]([^'"]+)['"]`,
   'gu'
 );
 
@@ -1480,7 +1480,9 @@ export function extractReExports(content: string, language: Language): ReExport[
   // Wildcard: `export * from '...'`, optionally `export type *`; `export * as ns
   // from '...'` exports `ns` alone.
   for (const m of cleaned.matchAll(WILDCARD_REEXPORT_RE)) {
-    out.push(m[1] ? { kind: 'namespace', exportedName: m[1], source: m[2]! } : { kind: 'wildcard', source: m[2]! });
+    // `export * as ns` / `export * as "my ns"` (ES2022) exports the namespace alone.
+    const ns = m[1] ?? (m[2] ? m[2].slice(1, -1) : undefined);
+    out.push(ns ? { kind: 'namespace', exportedName: ns, source: m[3]! } : { kind: 'wildcard', source: m[3]! });
   }
 
   // Named: `export { a, b as c } from '...'`, with TypeScript's `type`
