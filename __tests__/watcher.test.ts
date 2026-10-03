@@ -31,6 +31,7 @@ import {
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
+import { rmTempDir } from './rm-temp';
 
 // Keep real filesystem operations, with writable exports for failure injection.
 vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
@@ -104,7 +105,12 @@ describe('FileWatcher', () => {
     __setFsWatchForTests(null); // reset the injected fs.watch seam
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      // The end-to-end test drives a real fs.watch, whose directory handle the
+      // OS releases a beat after unwatch() returns. Windows fails the removal
+      // with EPERM in that window; POSIX unlinks regardless, which is why only
+      // Windows sees it. Every holder this suite owns is already closed at its
+      // own site — this waits out the release, it does not stand in for it.
+      await rmTempDir(testDir);
     }
   });
 

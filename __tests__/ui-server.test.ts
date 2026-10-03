@@ -12,13 +12,15 @@
  * name in undici, and forging it is the whole point of half these cases.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import * as childProcess from 'child_process';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
   browserOpenCommand,
+  openBrowser,
   cacheControlFor,
   contentTypeFor,
   isAllowedHost,
@@ -30,6 +32,11 @@ import {
   startUiServer,
   type UiServerHandle,
 } from '../src/ui-server';
+
+vi.mock('child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('child_process')>(),
+  spawn: vi.fn(),
+}));
 
 interface Response {
   status: number;
@@ -539,6 +546,22 @@ describe('security helpers', () => {
 });
 
 describe('browserOpenCommand', () => {
+  it('does not spawn a browser when CODEGRAPH_BROWSER=none', () => {
+    const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(() => {
+      throw new Error('Unexpected browser launch');
+    });
+    vi.stubEnv('CODEGRAPH_BROWSER', 'none');
+    try {
+      for (const platform of ['win32', 'darwin', 'linux'] as const) {
+        expect(openBrowser('http://127.0.0.1:4747', platform)).toBe(false);
+      }
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('uses the platform opener', () => {
     expect(browserOpenCommand('http://x', 'darwin')).toEqual({ command: 'open', args: ['http://x'] });
     expect(browserOpenCommand('http://x', 'linux')).toEqual({ command: 'xdg-open', args: ['http://x'] });
