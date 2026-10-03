@@ -12,7 +12,7 @@
  * name in undici, and forging it is the whole point of half these cases.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -181,6 +181,47 @@ describe('codegraph ui server', () => {
         expect(res.status).toBe(200);
       } finally {
         await second.close();
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+
+    it('falls back past a port Windows refuses with EACCES', async () => {
+      // On Windows a port held exclusively by another program, or inside a
+      // reserved range, fails listen() with EACCES instead of EADDRINUSE.
+      // Deterministic repro: no real port contention needed — make the port
+      // after the blocked one emit EACCES and expect the server to land
+      // beyond it, serving requests on the port it landed on.
+      const blocker = http.createServer(() => {});
+      await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+      const taken = (blocker.address() as { port: number }).port;
+
+      const realListen = http.Server.prototype.listen;
+      const spy = vi
+        .spyOn(http.Server.prototype, 'listen')
+        .mockImplementation(function (this: http.Server, ...args: unknown[]) {
+          if (args[0] === taken + 1) {
+            const err = Object.assign(
+              new Error(`listen EACCES: permission denied 127.0.0.1:${taken + 1}`),
+              { code: 'EACCES' }
+            );
+            process.nextTick(() => this.emit('error', err));
+            return this;
+          }
+          return (realListen as (...a: unknown[]) => http.Server).apply(this, args);
+        });
+
+      try {
+        const second = await startUiServer({ projectRoot, viewerDir, port: taken });
+        try {
+          expect(second.port).toBeGreaterThan(taken + 1);
+          // …and it actually works on the port it landed on.
+          const res = await request(second.port, '/');
+          expect(res.status).toBe(200);
+        } finally {
+          await second.close();
+        }
+      } finally {
+        spy.mockRestore();
         await new Promise<void>((resolve) => blocker.close(() => resolve()));
       }
     });
