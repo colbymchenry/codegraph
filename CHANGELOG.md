@@ -468,6 +468,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python and Go methods passed as values (`executor.submit(self.store.fetch)`) now appear in callers and impact results. Thanks @JosefAschauer. (#1820)
 - Methods called by a base class outside the index (React lifecycle methods, a stream's `_transform`, NestJS hooks) are no longer reported as dead code. Thanks @inth3shadows for the report and @danusha2345. (#1973)
 
+### Added
+
+- CodeGraph now indexes **Interv** (`.iv`) — functions, algebraic data types with constructors, `import` module edges, and call edges.
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
