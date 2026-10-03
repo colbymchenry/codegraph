@@ -359,7 +359,7 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet',
 ]);
 
 /**
@@ -5450,7 +5450,18 @@ export class TreeSitterExtractor {
       t === 'name' || t === 'scoped_type_identifier'
     ) {
       const text = getNodeText(recv, this.source);
-      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) {
+        this.pushStaticMemberRef(text, ownerId, recv);
+        // VB.NET (#2305): a Shared field/property read or write is a use of the
+        // member too, not just of its class. The bare member name is resolved
+        // against the receiver written on the line (see vbReceiverOf).
+        if (this.language === 'vbnet' && node.type === 'member_access_expression') {
+          const member = getChildByField(node, 'member');
+          if (member?.type === 'identifier') {
+            this.pushStaticMemberRef(getNodeText(member, this.source), ownerId, member);
+          }
+        }
+      }
     }
   }
 

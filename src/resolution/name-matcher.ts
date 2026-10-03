@@ -5432,8 +5432,9 @@ export function matchByExactName(
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
-  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'references') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const vbMemberRead = vbReceiver !== null && ref.referenceKind === 'references';
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
@@ -5455,6 +5456,7 @@ export function matchByExactName(
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(vbMemberRead && !VB_MEMBER_KINDS.has(n.kind)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
@@ -9246,8 +9248,9 @@ export function matchFuzzy(
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
-  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates' || ref.referenceKind === 'references') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const vbMemberRead = vbReceiver !== null && ref.referenceKind === 'references';
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
@@ -9283,6 +9286,7 @@ export function matchFuzzy(
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(vbMemberRead && !VB_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
