@@ -25,6 +25,7 @@ import * as crypto from 'crypto';
 import { canonicalProjectRoot } from '../directory';
 import {
   getDaemonPidPath,
+  getDaemonIndexDir,
   getDaemonSocketCandidates,
   decodeLockInfo,
   canProbeDaemonIdentity,
@@ -37,6 +38,8 @@ import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
   root: string;
+  /** Canonical index directory served by this daemon, independent of the reader's environment. */
+  indexDir: string;
   pid: number;
   version: string;
   socketPath: string;
@@ -53,13 +56,11 @@ export function getRegistryDir(): string {
 }
 
 /**
- * One record per project, so it is keyed the same way the daemon socket is:
- * over {@link canonicalProjectRoot}, not a raw `path.resolve` — otherwise the
- * same project spelled with another drive-letter case files two records, and
- * `list` over-lists while `stop --all` misses one.
+ * One record per canonical index directory, keyed the same way as its socket.
+ * A project may have multiple CODEGRAPH_DIR namespaces running concurrently.
  */
-function recordPath(root: string): string {
-  const hash = crypto.createHash('sha256').update(canonicalProjectRoot(root)).digest('hex').slice(0, 16);
+function recordPath(indexDir: string): string {
+  const hash = crypto.createHash('sha256').update(canonicalProjectRoot(indexDir)).digest('hex').slice(0, 16);
   return path.join(getRegistryDir(), `${hash}.json`);
 }
 
@@ -79,19 +80,20 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /** Best-effort: record this daemon so `list`/`stop --all` can find it. */
-export function registerDaemon(rec: DaemonRecord): void {
+export function registerDaemon(rec: Omit<DaemonRecord, 'indexDir'>): void {
   try {
+    const record: DaemonRecord = { ...rec, indexDir: getDaemonIndexDir(rec.root) };
     fs.mkdirSync(getRegistryDir(), { recursive: true });
-    fs.writeFileSync(recordPath(rec.root), JSON.stringify(rec, null, 2) + '\n', { mode: 0o600 });
+    fs.writeFileSync(recordPath(record.indexDir), JSON.stringify(record, null, 2) + '\n', { mode: 0o600 });
   } catch {
     /* best-effort — list's liveness prune tolerates a missing record */
   }
 }
 
 /** Best-effort: drop this daemon's record on graceful shutdown. */
-export function deregisterDaemon(root: string): void {
+export function deregisterDaemon(root: string, indexDir = getDaemonIndexDir(root)): void {
   try {
-    fs.unlinkSync(recordPath(root));
+    fs.unlinkSync(recordPath(indexDir));
   } catch {
     /* already gone */
   }
@@ -120,12 +122,15 @@ export function listDaemons(opts: { prune?: boolean } = {}): DaemonRecord[] {
     } catch {
       rec = null;
     }
-    const valid = rec && typeof rec.pid === 'number' && typeof rec.root === 'string';
-    if (valid && isProcessAlive(rec!.pid)) {
+    const alive = typeof rec?.pid === 'number' && isProcessAlive(rec.pid);
+    const valid = rec && typeof rec.root === 'string' && typeof rec.indexDir === 'string' && path.isAbsolute(rec.indexDir);
+    if (valid && alive) {
       live.push(rec!);
-    } else if (prune) {
+    } else if (prune && !alive) {
       try { fs.unlinkSync(full); } catch { /* ignore */ }
     }
+    // An unidentifiable live record belongs to an uncertain running process:
+    // leave its discovery metadata intact, without selecting or stopping it.
   }
   return live.sort((a, b) => b.startedAt - a.startedAt);
 }
@@ -145,7 +150,7 @@ export async function listVerifiedDaemons(opts: { prune?: boolean } = {}): Promi
   const verified: DaemonRecord[] = [];
   for (const check of checks) {
     if (check.verified) verified.push(check.rec);
-    else if (prune) deregisterDaemon(check.rec.root);
+    else if (prune) deregisterDaemon(check.rec.root, check.rec.indexDir);
   }
   return verified;
 }
@@ -154,13 +159,14 @@ export async function listVerifiedDaemons(opts: { prune?: boolean } = {}): Promi
 function cleanupDaemonArtifacts(
   root: string,
   expectedLockContents: string | null,
+  indexDir: string,
 ): boolean {
-  const pidPath = getDaemonPidPath(root);
+  const pidPath = getDaemonPidPath(root, indexDir);
   // A daemon owns writer.pid before binding or relocating its socket. Claiming
   // the writer slot therefore freezes every legitimate daemon artifact writer
   // while we compare the inspected lock snapshot and clean it up.
-  if (readWriterLock(root)?.pid === process.pid) return false;
-  const claim = tryAcquireWriterLock(root, 'cleanup');
+  if (readWriterLock(root, 'writer.pid', indexDir)?.pid === process.pid) return false;
+  const claim = tryAcquireWriterLock(root, 'cleanup', 'writer.pid', indexDir);
   if (claim.kind === 'taken') return false;
 
   try {
@@ -177,25 +183,26 @@ function cleanupDaemonArtifacts(
     // Sweep every candidate before releasing daemon.pid, so no successor can
     // acquire the lock and bind a socket that this cleanup then removes.
     if (process.platform !== 'win32') {
-      for (const candidate of getDaemonSocketCandidates(root)) {
+      for (const candidate of getDaemonSocketCandidates(root, indexDir)) {
         try { fs.unlinkSync(candidate); } catch { /* gone */ }
       }
     }
-    deregisterDaemon(root);
+    deregisterDaemon(root, indexDir);
     try { fs.unlinkSync(pidPath); } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
     }
     return true;
   } finally {
-    releaseWriterLock(root);
+    releaseWriterLock(root, 'writer.pid', indexDir);
   }
 }
 
 /** Remove daemon artifacts only when no matching daemon answers the socket hello. */
 export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> {
-  const pidPath = getDaemonPidPath(root);
+  const indexDir = getDaemonIndexDir(root);
+  const pidPath = getDaemonPidPath(root, indexDir);
   const hadArtifacts = fs.existsSync(pidPath) || (
-    process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => fs.existsSync(p))
+    process.platform !== 'win32' && getDaemonSocketCandidates(root, indexDir).some((p) => fs.existsSync(p))
   );
   if (!hadArtifacts) return false;
   let info: DaemonLockInfo | null = null;
@@ -209,7 +216,7 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
     // not proof of PID reuse, so preserve its lock rather than risk two writers.
     if (!canProbeDaemonIdentity(info) || await probeDaemonIdentity(info)) return false;
   }
-  return cleanupDaemonArtifacts(root, lockContents);
+  return cleanupDaemonArtifacts(root, lockContents, indexDir);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -254,13 +261,14 @@ export interface StopResult {
  */
 export async function stopDaemonAt(
   root: string,
-  options: { preserveUnverified?: boolean; shutdownGraceMs?: number } = {},
+  options: { preserveUnverified?: boolean; shutdownGraceMs?: number; indexDir?: string } = {},
 ): Promise<StopResult> {
+  const indexDir = canonicalProjectRoot(options.indexDir ?? getDaemonIndexDir(root));
   let pid: number | null = null;
   let identity: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
   try {
-    lockContents = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+    lockContents = fs.readFileSync(getDaemonPidPath(root, indexDir), 'utf8');
     identity = decodeLockInfo(lockContents);
     pid = identity?.pid ?? null;
   } catch {
@@ -268,18 +276,18 @@ export async function stopDaemonAt(
   }
   if (pid == null) {
     const rec = listDaemons({ prune: false }).find(
-      (r) => canonicalProjectRoot(r.root) === canonicalProjectRoot(root)
+      (r) => canonicalProjectRoot(r.indexDir) === indexDir
     );
     pid = rec?.pid ?? null;
     if (rec) identity = rec;
   }
 
   if (pid == null) {
-    cleanupDaemonArtifacts(root, lockContents);
+    cleanupDaemonArtifacts(root, lockContents, indexDir);
     return { root, pid: null, outcome: 'no-daemon' };
   }
   if (!isProcessAlive(pid)) {
-    const removed = cleanupDaemonArtifacts(root, lockContents);
+    const removed = cleanupDaemonArtifacts(root, lockContents, indexDir);
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
   // Never signal a process merely because it reused a stale daemon PID. The
@@ -289,13 +297,13 @@ export async function stopDaemonAt(
   }
   if (!await probeDaemonIdentity(identity)) {
     if (options.preserveUnverified) return { root, pid, outcome: 'unverified' };
-    const removed = cleanupDaemonArtifacts(root, lockContents);
+    const removed = cleanupDaemonArtifacts(root, lockContents, indexDir);
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
 
   // Identity probing awaits I/O: never act on a superseded ownership record.
   const sameLock = (): boolean => {
-    try { return fs.readFileSync(getDaemonPidPath(root), 'utf8') === lockContents; }
+    try { return fs.readFileSync(getDaemonPidPath(root, indexDir), 'utf8') === lockContents; }
     catch { return lockContents === null; }
   };
   if (!sameLock()) return { root, pid, outcome: 'unverified' };
@@ -327,7 +335,7 @@ export async function stopDaemonAt(
     }
   }
   // Compares the lock with the one we signalled, so a successor's is kept.
-  cleanupDaemonArtifacts(root, lockContents);
+  cleanupDaemonArtifacts(root, lockContents, indexDir);
   return { root, pid, outcome };
 }
 
@@ -335,7 +343,7 @@ export async function stopDaemonAt(
 export async function stopAllDaemons(): Promise<StopResult[]> {
   const results: StopResult[] = [];
   for (const rec of await listVerifiedDaemons()) {
-    results.push(await stopDaemonAt(rec.root));
+    results.push(await stopDaemonAt(rec.root, { indexDir: rec.indexDir }));
   }
   return results;
 }

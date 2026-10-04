@@ -296,18 +296,22 @@ const languageCache = new Map<Language, WasmLanguage>();
 const unavailableGrammarErrors = new Map<Language, string>();
 
 let parserInitialized = false;
+let parserInitializing: Promise<void> | null = null;
+/** Every grammar load, whoever asks, joins this one queue (see loadGrammarsForLanguages). */
+let grammarLoads: Promise<void> = Promise.resolve();
 
 /**
  * Initialize the tree-sitter WASM runtime. Must be called before loading grammars.
  * Does NOT load any grammar WASM files — use loadGrammarsForLanguages() for that.
- * Idempotent — safe to call multiple times.
+ * Idempotent — safe to call multiple times, including concurrently.
  */
 export async function initGrammars(): Promise<void> {
   if (parserInitialized) return;
-
-  await Parser.init();
-
-  parserInitialized = true;
+  parserInitializing ??= Parser.init().then(
+    () => { parserInitialized = true; },
+    (error: unknown) => { parserInitializing = null; throw error; },
+  );
+  await parserInitializing;
 }
 
 /**
@@ -404,7 +408,7 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
-function resolveWasmPath(lang: GrammarLanguage): string {
+export function resolveWasmPath(lang: GrammarLanguage): string {
   const wasmFile = WASM_GRAMMAR_FILES[lang];
   return VENDORED_WASM_LANGS.has(lang)
     ? path.join(__dirname, 'wasm', wasmFile)
@@ -465,33 +469,36 @@ export async function readGrammarWasmBytes(languages: Language[]): Promise<Recor
  * language's bytes are present they're loaded from memory instead of disk.
  */
 export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>): Promise<void> {
-  if (!parserInitialized) {
-    await initGrammars();
-  }
-
-  languages = expandGrammarLanguages(languages);
+  await initGrammars();
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
-  const toLoad = [...new Set(languages)].filter(
+  const wanted = [...new Set(expandGrammarLanguages(languages))];
+  const toLoad = () => wanted.filter(
     (lang): lang is GrammarLanguage =>
       lang in WASM_GRAMMAR_FILES &&
       !languageCache.has(lang) &&
       !unavailableGrammarErrors.has(lang)
   );
+  if (!toLoad().length) return;
 
   // Load grammars sequentially to avoid web-tree-sitter WASM race condition on Node 20+
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
-  for (const lang of toLoad) {
-    try {
-      const bytes = wasmBytes?.[lang];
-      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
-      languageCache.set(lang, language);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[CodeGraph] Failed to load ${lang} grammar — parsing will be unavailable: ${message}`);
-      unavailableGrammarErrors.set(lang, message);
+  // Concurrent callers queue behind each other and skip what an earlier load finished.
+  const load = grammarLoads.then(async () => {
+    for (const lang of toLoad()) {
+      try {
+        const bytes = wasmBytes?.[lang];
+        const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
+        languageCache.set(lang, language);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[CodeGraph] Failed to load ${lang} grammar — parsing will be unavailable: ${message}`);
+        unavailableGrammarErrors.set(lang, message);
+      }
     }
-  }
+  });
+  grammarLoads = load;
+  await load;
 }
 
 /**

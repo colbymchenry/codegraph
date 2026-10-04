@@ -34,6 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import { isTransportEdge } from '../graph/transport-edges';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
@@ -3337,6 +3338,38 @@ export class ToolHandler {
     const m = edge.metadata as Record<string, unknown> | undefined;
     const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
     const at = registeredAt ? ` @${registeredAt}` : '';
+    if (m?.synthesizedBy === 'lua-rust-operation') {
+      const names = Array.isArray(m.operations) ? m.operations.map(String) : typeof m.operation === 'string' ? [m.operation] : [];
+      const operation = names.length ? ` ${names.map(name => `\`${name}\``).join(', ')}` : '';
+      const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
+      return {
+        label: `LuaJIT → Rust operation${operation}${via} (source-derived dispatch)`,
+        compact: `dynamic: lua rust operation${operation}${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'lua-rust-ffi') {
+      const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
+      if (m.transportOnly === true) {
+        return {
+          label: `LuaJIT → Rust FFI transport${via} (carries every operation; operation edges name each handler)`,
+          compact: `transport: lua rust ffi${via}, every operation${at}`,
+          registeredAt,
+        };
+      }
+      return {
+        label: `LuaJIT → Rust FFI${via} (static C-ABI symbol match)`,
+        compact: `dynamic: lua rust ffi${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'lua-module-member') {
+      return {
+        label: 'Lua module member through a proven local getter (static resolution)',
+        compact: `static: lua module member${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'callback') {
       const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
       const field = m.field ? ` on .${String(m.field)}` : '';
@@ -8463,6 +8496,7 @@ export class ToolHandler {
    * callback is WIRED, not where it's invoked.
    */
   private edgeLabel(edge: Edge): string | null {
+    if (isTransportEdge(edge)) return this.synthEdgeNote(edge)?.compact ?? 'transport';
     if (edge.kind === 'calls') return null;
     if (edge.metadata?.fnRef === true) return 'callback registration';
     if (edge.kind === 'instantiates') return 'instantiation';

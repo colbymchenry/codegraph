@@ -10,7 +10,7 @@ import {
 import type { DaemonRecord, StopResult } from '../src/mcp/daemon-registry';
 
 const rec = (root: string, pid: number, startedAt: number): DaemonRecord => ({
-  root, pid, version: '1.0.0', socketPath: `${root}/.codegraph/daemon.sock`, startedAt,
+  root, indexDir: `${root}/.codegraph`, pid, version: '1.0.0', socketPath: `${root}/.codegraph/daemon.sock`, startedAt,
 });
 
 describe('formatUptime', () => {
@@ -28,20 +28,20 @@ describe('buildPickItems', () => {
 
   it('orders newest-first and appends Stop all + Cancel', () => {
     const items = buildPickItems([old, fresh], null, 3000);
-    expect(items.map((i) => i.value)).toEqual(['/p/new', '/p/old', STOP_ALL, CANCEL]);
+    expect(items.map((i) => i.value)).toEqual(['/p/new/.codegraph', '/p/old/.codegraph', STOP_ALL, CANCEL]);
     expect(items[0].hint).toContain('pid 2');
     expect(items[0].hint).toContain('Running');
   });
 
   it('omits Stop all for a single daemon (but keeps Cancel)', () => {
-    expect(buildPickItems([old], null, 3000).map((i) => i.value)).toEqual(['/p/old', CANCEL]);
+    expect(buildPickItems([old], null, 3000).map((i) => i.value)).toEqual(['/p/old/.codegraph', CANCEL]);
   });
 
   it('floats the current project to the top, auto-selected and labelled', () => {
     const items = buildPickItems([old, fresh, cwd], '/p/cwd', 3000);
-    expect(items[0].value).toBe('/p/cwd');
+    expect(items[0].value).toBe('/p/cwd/.codegraph');
     expect(items[0].label).toContain('(current project)');
-    expect(items.slice(1, 3).map((i) => i.value)).toEqual(['/p/new', '/p/old']); // rest newest-first
+    expect(items.slice(1, 3).map((i) => i.value)).toEqual(['/p/new/.codegraph', '/p/old/.codegraph']); // rest newest-first
   });
 });
 
@@ -56,8 +56,8 @@ describe('runDaemonPicker', () => {
     const CANCEL_SYMBOL = Symbol('cancel');
     const deps: PickerDeps = {
       list: () => daemons,
-      stop: async (root): Promise<StopResult> => {
-        daemons = daemons.filter((d) => d.root !== root);
+      stop: async (root, options): Promise<StopResult> => {
+        daemons = daemons.filter((d) => d.indexDir !== options.indexDir);
         stopped.push(root);
         return { root, pid: 0, outcome: 'term' };
       },
@@ -69,7 +69,10 @@ describe('runDaemonPicker', () => {
       },
       cwdRoot: null,
       now: () => 5000,
-      select: async () => choices[i++],
+      select: async () => {
+        const choice = choices[i++];
+        return initial.find(d => d.root === choice)?.indexDir ?? choice;
+      },
       isCancel: (v) => v === CANCEL_SYMBOL,
       note: (m) => notes.push(m),
       done: (m) => { doneMsg = m; },

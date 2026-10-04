@@ -49,9 +49,9 @@ export function buildPickItems(daemons: DaemonRecord[], cwdRoot: string | null, 
   const items: PickItem[] = ordered.map((d) => {
     const current = cwd != null && path.resolve(d.root) === cwd;
     return {
-      value: d.root,
+      value: d.indexDir,
       label: current ? `${d.root}  (current project)` : d.root,
-      hint: `pid ${d.pid} · up ${formatUptime(now - d.startedAt)} · Running`,
+      hint: `${path.basename(d.indexDir)} · pid ${d.pid} · up ${formatUptime(now - d.startedAt)} · Running`,
     };
   });
 
@@ -62,7 +62,7 @@ export function buildPickItems(daemons: DaemonRecord[], cwdRoot: string | null, 
 
 export interface PickerDeps {
   list: () => DaemonRecord[] | Promise<DaemonRecord[]>;
-  stop: (root: string) => Promise<StopResult>;
+  stop: (root: string, options: { indexDir: string }) => Promise<StopResult>;
   stopAll: () => Promise<StopResult[]>;
   /** Realpath'd root of the current project's daemon, or null. */
   cwdRoot: string | null;
@@ -108,27 +108,30 @@ export async function runDaemonPicker(deps: PickerDeps): Promise<void> {
       return;
     }
 
-    const result = await deps.stop(String(choice));
+    const selected = daemons.find(daemon => daemon.indexDir === choice);
+    if (!selected) continue;
+    const result = await deps.stop(selected.root, { indexDir: selected.indexDir });
+    const selectedRoot = selected.root;
     if (result.outcome === 'still-running') {
-      deps.note(`Could not stop daemon (pid ${result.pid}); left its artifacts intact — ${choice}`);
+      deps.note(`Could not stop daemon (pid ${result.pid}); left its artifacts intact — ${selectedRoot}`);
       continue;
     }
     if (result.outcome === 'unverified') {
       deps.note(
-        `Could not verify daemon (pid ${result.pid}); left it running with its artifacts intact — ${choice}`
+        `Could not verify daemon (pid ${result.pid}); left it running with its artifacts intact — ${selectedRoot}`
       );
       continue;
     }
     if (result.outcome === 'not-running') {
-      deps.note(`Daemon was no longer running; removed stale artifacts — ${choice}`);
+      deps.note(`Daemon was no longer running; removed stale artifacts — ${selectedRoot}`);
       continue;
     }
     if (result.outcome === 'no-daemon') {
-      deps.note(`No daemon was found — ${choice}`);
+      deps.note(`No daemon was found — ${selectedRoot}`);
       continue;
     }
     const forced = result.outcome === 'kill' ? ', forced' : '';
-    deps.note(`Stopped daemon (pid ${result.pid}${forced}) — ${choice}`);
+    deps.note(`Stopped daemon (pid ${result.pid}${forced}) — ${selectedRoot}`);
     // Loop: the next iteration re-lists; if more remain it re-prompts, otherwise
     // the top-of-loop empty check prints "All daemons stopped."
   }

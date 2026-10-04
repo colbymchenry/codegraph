@@ -40,6 +40,7 @@ import {
   IndexProgress,
   IndexResult,
   SyncResult,
+  detectLanguage,
   extractFromSource,
   initGrammars,
 } from './extraction';
@@ -48,7 +49,7 @@ import {
   createResolver,
   ResolutionResult,
 } from './resolution';
-import { hasSynthesisPattern } from './resolution/callback-synthesizer';
+import { hasSynthesisPattern, isLuaRustBridgeInput } from './resolution/callback-synthesizer';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
@@ -57,7 +58,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadExtensionOverrides } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -912,10 +913,15 @@ export class CodeGraph {
         let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
+        const languages = this.queries.getDistinctFileLanguages();
+        const overrides = loadExtensionOverrides(this.projectRoot);
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            // An indexed file keeps its recorded language; a new one is detected as extraction will.
+            const language = this.queries.getFileByPath(filePath)?.language ??
+              (content === undefined ? undefined : detectLanguage(filePath, content, overrides));
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
-              this.queries.wasSynthesisInput(filePath) ||
+              this.queries.wasSynthesisInput(filePath) || isLuaRustBridgeInput(language, languages) ||
               (content !== undefined && hasSynthesisPattern(filePath, content)))) {
               refreshSynthesis = true;
               this.queries.setMetadata('synthesis_pending', '1');

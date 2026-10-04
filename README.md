@@ -520,6 +520,73 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 
 4. **Auto-Sync** — The MCP server watches your project using native OS file events. Changes are debounced (2-second quiet window), filtered to source files only, and incrementally synced. The graph stays fresh as you code — no configuration needed.
 
+### LuaJIT FFI and Rust operation dispatch
+
+LuaJIT calls through a verified `require("ffi")` binding, `ffi.C`, or
+`ffi.load(...)` can link by exact symbol name to unique indexed Rust C-ABI exports. This is
+a static symbol match, not verification of which binary a runtime loader opens. The source
+must declare the C ABI (`extern "C"`, `extern "C-unwind"` or bare `extern`) plus
+`no_mangle` or `export_name` (including Rust 2024
+`unsafe(...)` attributes). Aliases, `pcall(ffi.load, ...)`, and conservative
+lazy-loader assignments are supported; spelling a receiver `ffi` is not proof.
+An `ffi.cdef` declaration with an `asm("symbol")` label links its calls to that
+symbol; declarations of one name with different labels link none of them.
+
+For a string-operation protocol, CodeGraph follows Lua parameter-forwarding
+wrappers and Rust parameter forwarding into literal `match` dispatch arms.
+Static operation names link directly to their corresponding Rust handler;
+function-valued arms require evidence that the selected function is invoked.
+The first arm a literal can reach wins; a match guard, a `#[cfg]` arm, or an
+earlier binding pattern that may take the literal leaves it unresolved, and no
+arm after a wildcard is routed. Trait default methods an impl may override are
+not targets.
+Required Lua modules must actually export the invoked member. Cross-crate Rust
+bindings require declared module paths and local Cargo path dependencies
+(including workspace-inherited dependencies). Within a package, `crate::`
+resolves against the one library or binary target that compiles the file.
+Supported declarative macros and
+callback wrappers are followed only when their source proves expression or
+callback invocation.
+There are no built-in project names, operation names, or manual routing tables.
+Ordinary wrapper sidecalls remain in the graph.
+
+Local module getters with a single unconditional return of a literal `require`,
+a proven namespace alias, or another proven local getter are supported inside
+functions. Library getters can return a captured library alias or `ffi.C`.
+Rebinding or mutating a captured namespace invalidates that proof. Global and
+method getters, branching getters, unknown factories, and getters that directly
+return `ffi.load(...)` remain unresolved.
+
+A call into an export that dispatches operations is recorded as a transport
+reference (`transportOnly: true`) beside the operation edges. Through that shared
+entry every caller would reach every handler, so callers, callees, paths, and
+impact treat the transport hop as a boundary: the export's callers and impact
+list its Lua call sites, a Lua function's callees and paths end at the export,
+and code behind the export reaches the export without fanning back out to every
+Lua caller. The operation edges carry each call on to its handler and record the
+native export and Rust dispatch source as provenance. The MCP tools label
+transport hops as such.
+
+In projects that contain both Lua and Rust, a call through a Lua function
+parameter is not resolved to a module or function that happens to share the
+parameter's name, which keeps wrapper parameters from posing as imports. Lua-only
+projects resolve as before.
+
+This is conservative static analysis, not runtime execution. Computed symbols,
+unknown operation values, ambiguous native exports/types, unsupported value
+transforms, and unverified macro expansion remain unresolved. Both sides must
+be indexed. In a project with both languages, any Lua or Rust edit refreshes the
+bridge during incremental sync. Each file's analysis is stored in the index
+directory (`bridge-analyses/`), so every process, including a one-off CLI sync,
+analyzes only the files that changed. Re-index an existing project after
+upgrading to obtain the new bridge edges (`codegraph status` recommends it), and
+after editing Cargo manifests.
+Runtime loading, conditional compilation, custom module paths, procedural
+macros, and external crates are not evaluated.
+
+See the [validation record](docs/design/lua-rust-bridge-validation.md) for real
+repository coverage, indexing cost, and the pending agent benchmark.
+
 ---
 
 ## CLI Reference

@@ -1,8 +1,8 @@
 /**
  * Daemon socket + lockfile path helpers — issue #411.
  *
- * One shared `codegraph serve --mcp` daemon per project root means we need a
- * stable, project-keyed rendezvous between cooperating processes. The IPC
+ * One shared `codegraph serve --mcp` daemon per index means we need a
+ * stable, index-keyed rendezvous between cooperating processes. The IPC
  * surface area is just two file paths:
  *
  *   - `daemon.sock` — Unix domain socket / named pipe the daemon listens on.
@@ -38,14 +38,16 @@ import { canonicalProjectRoot, getCodeGraphDir } from '../directory';
 const POSIX_SOCKET_PATH_LIMIT = 100;
 
 /**
- * Short stable identifier for a project root — used in tmpdir/pipe names.
- *
- * Hashed over {@link canonicalProjectRoot}, never a raw `path.resolve`: the key
- * is a rendezvous, so every spelling of one directory must land on one name or
- * a proxy probes a pipe the running daemon never bound (see that function).
+ * Canonical configured index directory: equivalent root spellings converge,
+ * while CODEGRAPH_DIR namespaces within one project remain independent.
  */
-function projectHash(projectRoot: string): string {
-  return crypto.createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
+export function getDaemonIndexDir(projectRoot: string): string {
+  return canonicalProjectRoot(getCodeGraphDir(canonicalProjectRoot(projectRoot)));
+}
+
+/** Short stable identifier for an index — used in tmpdir/pipe names. */
+function indexHash(indexDir: string): string {
+  return crypto.createHash('sha256').update(canonicalProjectRoot(indexDir)).digest('hex').slice(0, 16);
 }
 
 /**
@@ -55,8 +57,8 @@ function projectHash(projectRoot: string): string {
  * function of the root means the daemon and the proxy compute the identical
  * path without talking to each other.
  */
-function tmpdirSocketPath(projectRoot: string): string {
-  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
+function tmpdirSocketPath(indexDir: string): string {
+  return path.join(os.tmpdir(), `codegraph-${indexHash(indexDir)}.sock`);
 }
 
 /**
@@ -73,12 +75,12 @@ function tmpdirSocketPath(projectRoot: string): string {
  *   - Long in-project path (deep monorepos, Bazel out dirs): `[ <tmpdir> ]` only
  *     — bind would throw ENAMETOOLONG, so we skip straight to tmpdir.
  */
-export function getDaemonSocketCandidates(projectRoot: string): string[] {
+export function getDaemonSocketCandidates(projectRoot: string, indexDir = getDaemonIndexDir(projectRoot)): string[] {
   if (process.platform === 'win32') {
-    return [`\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`];
+    return [`\\\\.\\pipe\\codegraph-${indexHash(indexDir)}`];
   }
-  const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
-  const tmp = tmpdirSocketPath(projectRoot);
+  const inProject = path.join(indexDir, 'daemon.sock');
+  const tmp = tmpdirSocketPath(indexDir);
   if (inProject.length > POSIX_SOCKET_PATH_LIMIT) return [tmp];
   return [inProject, tmp];
 }
@@ -96,8 +98,8 @@ export function getDaemonSocketPath(projectRoot: string): string {
 }
 
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */
-export function getDaemonPidPath(projectRoot: string): string {
-  return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');
+export function getDaemonPidPath(projectRoot: string, indexDir = getDaemonIndexDir(projectRoot)): string {
+  return path.join(indexDir, 'daemon.pid');
 }
 
 /** Structured contents of the pid lockfile. */

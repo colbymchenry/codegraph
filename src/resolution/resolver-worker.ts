@@ -27,6 +27,8 @@ import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import { collectBeforeExit } from '../worker-teardown';
+import { loadGrammarsForLanguages } from '../extraction/grammars';
+import { hasLuaRustBridge } from './name-matcher';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -86,10 +88,26 @@ port.on('message', (msg: InMessage) => {
       }
       case 'resolve': {
         if (!resolver) throw new Error('resolver-worker: resolve before open');
-        const tRes = Date.now();
-        const out = resolver.resolveListForAdmission(msg.refs);
-        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
-        port.postMessage({ type: 'result', id: msg.id, ...out });
+        const r = resolver;
+        void (async () => {
+          const tRes = Date.now();
+          try {
+            const context = r.getResolutionContext();
+            if (hasLuaRustBridge(context) &&
+              msg.refs.some(ref => (ref.language ?? context.getNodeById?.(ref.fromNodeId)?.language) === 'lua')) {
+              await loadGrammarsForLanguages(['lua']);
+            }
+            const out = r.resolveListForAdmission(msg.refs);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
+            port.postMessage({ type: 'result', id: msg.id, ...out });
+          } catch (err) {
+            port.postMessage({
+              type: 'error',
+              id: msg.id,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
         break;
       }
       case 'synth': {

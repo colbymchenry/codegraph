@@ -27,7 +27,7 @@ async function deadPid(): Promise<number> {
   return pid;
 }
 
-function rec(root: string, pid: number, startedAt = Date.now()): DaemonRecord {
+function rec(root: string, pid: number, startedAt = Date.now()): Omit<DaemonRecord, 'indexDir'> {
   return { root, pid, version: '1.0.0', socketPath: `${root}/.codegraph/daemon.sock`, startedAt };
 }
 

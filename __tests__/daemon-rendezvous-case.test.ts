@@ -4,7 +4,7 @@
  * daemon".
  *
  * The daemon's named pipe (Windows) / tmpdir socket (POSIX) is
- * `…codegraph-<sha256(canonical root)>.slice(0,16)`, and the lockfile is shared
+ * `…codegraph-<sha256(canonical index directory)>.slice(0,16)`, and the lockfile is shared
  * while the SOCKET NAME is derived independently by each process. So the moment
  * two processes hash the same directory differently they stop meeting: the
  * proxy's probe finds nothing, it spawns a redundant daemon, and that daemon
