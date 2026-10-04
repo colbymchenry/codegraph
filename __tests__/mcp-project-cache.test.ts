@@ -66,3 +66,22 @@ it('trims idle projects while another project call remains active', async () => 
   cache.trimProjects();
   expect(close).toHaveBeenCalledOnce();
 });
+
+it('waits for a pinned read before finishing closeAll even with an empty cache', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cache-close-'));
+  roots.push(root);
+  CodeGraph.initSync(root).close();
+  handler = new ToolHandler(null);
+  let finish!: (result: { content: [{ type: 'text'; text: string }] }) => void;
+  const pending = new Promise<{ content: [{ type: 'text'; text: string }] }>(resolve => { finish = resolve; });
+  vi.spyOn(handler as unknown as { dispatchTool(): typeof pending }, 'dispatchTool').mockReturnValue(pending);
+  const activeCall = handler.executeReadTool('codegraph_search', { projectPath: root });
+  let closed = false;
+  const closing = handler.closeAll().then(() => { closed = true; });
+  await Promise.resolve();
+  expect(closed).toBe(false);
+  finish({ content: [{ type: 'text', text: 'done' }] });
+  await activeCall;
+  await closing;
+  expect(closed).toBe(true);
+});
