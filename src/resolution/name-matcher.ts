@@ -22561,7 +22561,7 @@ export function matchMethodCall(
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');
-        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
+        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!.replace(/^<(.+)\$anon@[^>]*>$/, '$1')) : [];
         // An untyped python attribute chain is a guess only through its head
         // noun: `self.session` names a `SessionBase` and `self.client` a
         // `ClientMixin`, but mealie's `database.group_shopping_lists` no
