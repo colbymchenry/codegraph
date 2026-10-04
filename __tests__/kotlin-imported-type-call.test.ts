@@ -62,7 +62,7 @@ class Calls {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, source);
       }
-      cg = CodeGraph.initSync(dir, { config: { include: ['**/*.kt', '**/*.java'], exclude: [] } });
+      cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       const callees = (name: string) => {
         const caller = cg!.searchNodes(name).map(r => r.node)
