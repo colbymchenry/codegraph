@@ -9,7 +9,7 @@
  * indexAll() mid-flight in a test would be racy; the aosp modules' own
  * integration tests already cover the fully-indexed path.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -18,7 +18,6 @@ import { findAidlImpl } from '../src/aosp/aidl';
 import { findJniBridge } from '../src/aosp/jni';
 import { grepIndexedSources, indexingCaveat } from '../src/aosp/common';
 import { ToolHandler } from '../src/mcp/tools';
-import type CodeGraph from '../src/index';
 
 function mockCg(isIndexing: boolean): CodeGraph {
   return { isIndexing: () => isIndexing } as unknown as CodeGraph;
