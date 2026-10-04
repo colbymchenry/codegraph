@@ -14100,7 +14100,9 @@ function matchReferenceInner(
   // nested `ParameterizedTypesTest.Field`).
   if ((ref.language === 'java' || ref.language === 'kotlin') && ref.referenceKind !== 'imports' &&
       isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
-    return null;
+    // Kotlin can call an in-project extension on an imported library type.
+    return ref.language === 'kotlin' && ref.referenceKind === 'calls'
+      ? matchMethodCall(ref, context) : null;
   }
 
   // A symbolic name in a Scala type is a type (`F ~> G`) or a kind-projector
