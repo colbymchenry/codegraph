@@ -93,6 +93,8 @@ describe('Resolution Module', () => {
       const nodes = [outer, anon, localMethod, interfaceMethod];
       const context = {
         getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+        getNodesByLowerName: (name: string) => nodes.filter((n) => n.name.toLowerCase() === name),
+        getImportMappings: () => [],
         getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
         getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
         getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
@@ -117,6 +119,7 @@ describe('Resolution Module', () => {
         };
         const context = {
           getNodesByName: () => [target], getNodesInFile: () => [target],
+          getNodesByLowerName: () => [target], getImportMappings: () => [],
           getNodesByQualifiedName: () => [], getNodesByKind: () => [],
           fileExists: () => true, readFile: () => null,
           getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],

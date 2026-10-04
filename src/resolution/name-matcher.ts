@@ -8874,6 +8874,7 @@ export function resolveMethodOnType(
   // block, so Java/Kotlin import disambiguation — whose target is intentionally
   // in ANOTHER file (#314) — is unaffected: that block returns early whenever
   // an import FQN pins the class.
+  if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
   const ordered = preferCallSiteFile(matches, ref.filePath);
   return {
     original: ref,
@@ -12455,7 +12456,7 @@ export function matchMethodCall(
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');
-        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
+        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!.replace(/^<(.+)\$anon@[^>]*>$/, '$1')) : [];
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;

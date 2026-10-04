@@ -1696,12 +1696,7 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    // Members in different Kotlin anonymous objects can share both name and
-    // line. Bind their identity to the enclosing owner as well.
-    const identityName = this.kotlinObjectScopeDepth > 0
-      ? `${this.nodeStack[this.nodeStack.length - 1]}::${name}`
-      : name;
-    const id = this.nodeIds.generate(this.filePath, kind, identityName, node.startPosition.row + 1, node.startPosition.column);
+    const id = this.nodeIds.generate(this.filePath, kind, name, node.startPosition.row + 1, node.startPosition.column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
