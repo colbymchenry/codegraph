@@ -405,6 +405,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph sync` and the file watcher now follow an edit that changes which declaration a module exports as its default, like `export default A` becoming `export default B` while `A` stays, or the module dropping its default. References through `import Y from './x'`, `{ default as Y }`, `require('./x').default`, a barrel that passes the default on or a route that renders it as a layout, and calls on a value typed by it, now link to the new default, or stay unlinked, as a fresh index has them. Before, they kept pointing at the old declaration until the importing file changed or the project was indexed again.
 - `codegraph sync` and the file watcher now relink a named import that a name match had linked to a declaration elsewhere while its module didn't export the name, once an edit makes the module export it, like `import { EmptyState } from './layouts/shared'` after the barrel gains `export { EmptyState } from './EmptyState'`. An import a name match had linked to a class the module exported only as its default comes unlinked once the module stops exporting it. Before, the import, the references through it and calls on values typed by it kept the old link until the importing file changed or the project was indexed again.
 
+### New Features
+
+- Analyze Android platform code with CLI commands and opt-in MCP tools for AIDL/HIDL implementation candidates, JNI bindings, system services, permission and broadcast literals, and Messenger, ContentProvider, and local-socket evidence.
+
 ## [1.6.2] - 2026-10-03
 
 ### Highlights
@@ -631,8 +635,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrading:** re-index your projects after this release — several fixes and the new navigation links are written while indexing.
 
 ### New Features
-
-- Analyze Android platform code with CLI commands and opt-in MCP tools for AIDL/HIDL implementation candidates, JNI bindings, system services, permission and broadcast literals, and Messenger, ContentProvider, and local-socket evidence.
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
