@@ -230,7 +230,7 @@ public class Consumer {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, source);
       }
-      cg = CodeGraph.initSync(tempDir, { config: { include: ['**/*.java'], exclude: [] } });
+      cg = CodeGraph.initSync(tempDir);
       await cg.indexAll();
       const targets = (method: string) => {
         const caller = cg.searchNodes(method).map(r => r.node)
