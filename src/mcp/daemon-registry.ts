@@ -31,7 +31,14 @@ import {
   probeDaemonIdentity,
   type DaemonLockInfo,
 } from './daemon-paths';
-import { readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
+import {
+  readWriterLock,
+  releaseWriterLock,
+  swapWriterLock,
+  tryAcquireWriterLock,
+  type WriterLockInfo,
+} from './writer-lock';
+import { isOlderRelease } from './version';
 import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
 export interface DaemonRecord {
@@ -155,7 +162,6 @@ function cleanupDaemonArtifacts(
   root: string,
   expectedLockContents: string | null,
 ): boolean {
-  const pidPath = getDaemonPidPath(root);
   // A daemon owns writer.pid before binding or relocating its socket. Claiming
   // the writer slot therefore freezes every legitimate daemon artifact writer
   // while we compare the inspected lock snapshot and clean it up.
@@ -164,31 +170,37 @@ function cleanupDaemonArtifacts(
   if (claim.kind === 'taken') return false;
 
   try {
-    if (expectedLockContents === null) {
-      if (fs.existsSync(pidPath)) return false;
-    } else {
-      try {
-        if (fs.readFileSync(pidPath, 'utf8') !== expectedLockContents) return false;
-      } catch {
-        return false;
-      }
-    }
-    // POSIX sockets are real files; Windows named pipes vanish with the process.
-    // Sweep every candidate before releasing daemon.pid, so no successor can
-    // acquire the lock and bind a socket that this cleanup then removes.
-    if (process.platform !== 'win32') {
-      for (const candidate of getDaemonSocketCandidates(root)) {
-        try { fs.unlinkSync(candidate); } catch { /* gone */ }
-      }
-    }
-    deregisterDaemon(root);
-    try { fs.unlinkSync(pidPath); } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
-    }
-    return true;
+    return removeDaemonArtifacts(root, expectedLockContents);
   } finally {
     releaseWriterLock(root);
   }
+}
+
+/** The removal behind {@link cleanupDaemonArtifacts}, for a caller already holding the writer slot. */
+function removeDaemonArtifacts(root: string, expectedLockContents: string | null): boolean {
+  const pidPath = getDaemonPidPath(root);
+  if (expectedLockContents === null) {
+    if (fs.existsSync(pidPath)) return false;
+  } else {
+    try {
+      if (fs.readFileSync(pidPath, 'utf8') !== expectedLockContents) return false;
+    } catch {
+      return false;
+    }
+  }
+  // POSIX sockets are real files; Windows named pipes vanish with the process.
+  // Sweep every candidate before releasing daemon.pid, so no successor can
+  // acquire the lock and bind a socket that this cleanup then removes.
+  if (process.platform !== 'win32') {
+    for (const candidate of getDaemonSocketCandidates(root)) {
+      try { fs.unlinkSync(candidate); } catch { /* gone */ }
+    }
+  }
+  deregisterDaemon(root);
+  try { fs.unlinkSync(pidPath); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+  }
+  return true;
 }
 
 /** Remove daemon artifacts only when no matching daemon answers the socket hello. */
@@ -240,6 +252,8 @@ export interface StopResult {
   pid: number | null;
   /** 'term' graceful, 'kill' force, 'still-running' refused, 'not-running' stale, 'no-daemon' absent, 'unverified' preserved. */
   outcome: 'term' | 'kill' | 'still-running' | 'not-running' | 'no-daemon' | 'unverified';
+  /** The daemon's version as its lock recorded it, when the stop got that far. */
+  version?: string;
 }
 
 /**
@@ -292,13 +306,27 @@ export async function stopDaemonAt(
     const removed = cleanupDaemonArtifacts(root, lockContents);
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
+  return stopVerifiedDaemon(root, identity, lockContents, options.shutdownGraceMs);
+}
 
+/**
+ * The signalling half of a stop, for a daemon whose socket hello just proved
+ * `identity` against the lock read as `lockContents`: SIGTERM, wait, SIGKILL
+ * only one that still answers, then sweep its artifacts.
+ */
+async function stopVerifiedDaemon(
+  root: string,
+  identity: DaemonLockInfo,
+  lockContents: string | null,
+  shutdownGraceMs = DAEMON_SHUTDOWN_GRACE_MS,
+): Promise<StopResult> {
+  const { pid, version } = identity;
   // Identity probing awaits I/O: never act on a superseded ownership record.
   const sameLock = (): boolean => {
     try { return fs.readFileSync(getDaemonPidPath(root), 'utf8') === lockContents; }
     catch { return lockContents === null; }
   };
-  if (!sameLock()) return { root, pid, outcome: 'unverified' };
+  if (!sameLock()) return { root, pid, outcome: 'unverified', version };
 
   // POSIX: SIGTERM runs the daemon's graceful shutdown. Windows: TerminateProcess
   // (no graceful path), so we always sweep artifacts ourselves below.
@@ -309,7 +337,7 @@ export async function stopDaemonAt(
     if (sameLock() && await probeDaemonIdentity(identity) && sameLock()) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
       if (!(await waitForDeath(pid, 2000))) {
-        return { root, pid, outcome: 'still-running' };
+        return { root, pid, outcome: 'still-running', version };
       }
       outcome = 'kill';
     } else {
@@ -321,14 +349,101 @@ export async function stopDaemonAt(
       // Its identity can't be re-proven without the socket, so signal nothing
       // more; just wait, bounded, for the PID to go. One that outlives the
       // wait is reported, as before.
-      if (!(await waitForDeath(pid, options.shutdownGraceMs ?? DAEMON_SHUTDOWN_GRACE_MS))) {
-        return { root, pid, outcome: 'still-running' };
+      if (!(await waitForDeath(pid, shutdownGraceMs))) {
+        return { root, pid, outcome: 'still-running', version };
       }
     }
   }
   // Compares the lock with the one we signalled, so a successor's is kept.
   cleanupDaemonArtifacts(root, lockContents);
-  return { root, pid, outcome };
+  return { root, pid, outcome, version };
+}
+
+/**
+ * Stop the daemon serving `root` when it runs an older CodeGraph release than
+ * `version`, so the caller can start one from its own install (#2335). A
+ * daemon keeps running the code it started with: one that outlived an upgrade
+ * goes on loading grammars from files the upgrade removed, while it holds the
+ * project's writer lock and file watcher. Only a daemon whose lock records an
+ * older release ({@link isOlderRelease}) and whose socket hello confirms that
+ * lock is signalled, exactly as {@link stopDaemonAt} would; one of the same, a
+ * newer or an unknown version is never touched, so two installs cannot take
+ * turns stopping each other's daemon.
+ *
+ * The project's writer slot never falls free on the way: before the signal,
+ * this process takes it over from the old daemon (mode `handover`), and the
+ * caller hands it on to the daemon it starts, which takes it over in turn
+ * ({@link swapWriterLock}). The old daemon's sessions serve themselves
+ * in-process the moment it goes, and one that found the slot free would claim
+ * it as their writer — with the code of an install the upgrade removed — and
+ * keep the new daemon from starting. When the old daemon is not stopped, the
+ * slot goes back to it.
+ *
+ * Resolves null when the lock names no older daemon (there is none, or another
+ * launcher already replaced it) or the slot could not be taken (another
+ * launcher holds it to replace the same daemon). Otherwise says what became of
+ * the daemon: `term` or `kill` when it was stopped, and this process now holds
+ * the slot for its successor (release it with {@link releaseWriterLock} once
+ * that one has taken over or failed); `not-running` when it had already exited
+ * (its successor clears the stale lock); `unverified` or `still-running` when
+ * it is still there.
+ */
+export async function stopOlderDaemon(
+  root: string,
+  version: string,
+  options: { shutdownGraceMs?: number } = {},
+): Promise<StopResult | null> {
+  let lockContents: string;
+  try {
+    lockContents = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    return { root, pid: null, outcome: 'unverified' };
+  }
+  const identity = decodeLockInfo(lockContents);
+  if (!identity) return { root, pid: null, outcome: 'unverified' };
+  if (!isOlderRelease(identity.version, version)) return null;
+  const { pid } = identity;
+  if (!isProcessAlive(pid)) return { root, pid, outcome: 'not-running', version: identity.version };
+  // The hello must name this pid and version (#1553): a reused pid is no daemon.
+  if (!canProbeDaemonIdentity(identity) || !await probeDaemonIdentity(identity)) {
+    return { root, pid, outcome: 'unverified', version: identity.version };
+  }
+  const slot = takeWriterSlotFrom(root, pid);
+  if (!slot) return null;
+  const result = await stopVerifiedDaemon(root, identity, lockContents, options.shutdownGraceMs);
+  if (result.outcome === 'term' || result.outcome === 'kill') {
+    // The stop's own sweep needs the slot this process now holds: clear what
+    // the old daemon left (all of it on Windows, where the stop is
+    // TerminateProcess), so its successor starts on a clean lock.
+    removeDaemonArtifacts(root, lockContents);
+  } else {
+    slot.giveBack();
+  }
+  return result;
+}
+
+/**
+ * Take the project's writer slot from the daemon `pid` this process is about
+ * to stop (see {@link stopOlderDaemon}), whether the record is that daemon's,
+ * stale, or absent. Returns how to give it back to that daemon, or null when
+ * the slot could not be taken: another live process holds it (another
+ * launcher replacing the same daemon), or the swap lost a race.
+ */
+function takeWriterSlotFrom(root: string, pid: number): { giveBack(): void } | null {
+  const previous = readWriterLock(root);
+  if (previous && previous.pid !== pid && previous.pid !== process.pid && isProcessAlive(previous.pid)) return null;
+  const claim: WriterLockInfo = { pid: process.pid, mode: 'handover', startedAt: Date.now(), ready: false };
+  const held = previous
+    ? swapWriterLock(root, previous.pid, claim)
+    : tryAcquireWriterLock(root, 'handover').kind === 'acquired';
+  if (!held) return null;
+  return {
+    giveBack: () => {
+      if (previous?.pid === pid) swapWriterLock(root, process.pid, previous);
+      else releaseWriterLock(root);
+    },
+  };
 }
 
 /** Stop every registered, live daemon. */
