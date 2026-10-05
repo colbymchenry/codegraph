@@ -8,7 +8,8 @@
  *
  *  - Torture.cs        — block namespace + nested/second-namespace quirks,
  *    base_list shapes, records, properties (incl. the bare-identifier
- *    signature loss and never-walked accessor bodies), fields/constants,
+ *    signature loss, accessor bodies walked as the property and
+ *    never-walked initializers), fields/constants,
  *    events/operators/indexer/destructor (no nodes, calls → class), ctor
  *    initializer hole, explicit interface impl, local functions, the call
  *    zoo (raw member-access texts, chained re-encode, `(myDel)(x)` conv,
@@ -166,6 +167,23 @@ describe.skipIf(!kernelBuilt)('kernel C# extraction parity', () => {
       name: 'bodiless struct mints no node; bodiless record still does',
       source: 'public record Empty;\n',
       minNodes: 2,
+    },
+    {
+      // Accessor bodies and `=> expr` are walked as the property (calls,
+      // instantiations, static reads, fn-ref candidates); an `= initializer`
+      // is only scanned for candidates, attributed to the class.
+      name: 'property bodies are walked as the property; initializers only scanned',
+      source: [
+        'public class C {',
+        '  void H(int v) { }',
+        '  public Action P { get { return Make(H); } set { Register(H); } }',
+        '  public int Q => Run(H);',
+        '  public Action R { get; } = Wrap(H);',
+        '  public int S { get => Calc.Max; init => Store(new Widget()); }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 7,
     },
   ];
 

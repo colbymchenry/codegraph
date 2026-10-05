@@ -234,7 +234,7 @@ all PRESERVE):
 | `enum_declaration` | enumTypes:1064 → extractEnum:1914 | body `enum_member_declaration_list` required (bodiless → no node); extractInheritance sees `base_list` → **the underlying type `: byte` emits an `extends` ref named `byte`** (quirk, §inheritance); `enum_member_declaration` children → extractEnumMembers:1958 — `name` field path: ONE `enum_member` node per member, positioned at the member node (attributes included in its span), values/attributes ignored; non-member children (preproc_*, comment) → visitNode (no-op) |
 | `method_declaration` | methodTypes:1027 → extractMethod:1737 | classifyMethodNode absent → always extractMethod. Gate 1747 passes via class-like (a method_declaration outside a type does not occur in non-erroring C# — top-level `void M(){}` parses as local_function_statement, probed); bodyless interface/partial signatures mint nodes with no body walk; **expression-bodied methods have `body: arrow_expression_clause` (a real body FIELD, probed) → walked** |
 | `constructor_declaration` | methodTypes → extractMethod | name field = the class-name identifier → **method node named like the class**; returnType undefined; **`constructor_initializer` (`: base(args)` / `: this(args)`) is a sibling of the body field → NEVER walked → calls inside initializer args are LOST** (probed); expression-bodied ctor body = arrow_expression_clause → walked |
-| `property_declaration` (inside class-like) | propertyTypes:1075 → extractProperty:1986 | property node + scanFnRefSubtree (capture-only) + skipChildren → **accessor bodies (`get { … }`, `get => …`) and the `=> expr` value clause are NEVER walked — calls inside property getters/setters/expression bodies emit NOTHING** (only fn-ref candidates). §property below |
+| `property_declaration` (inside class-like) | propertyTypes:1075 → extractProperty:1986 | property node, then **propertyBodies — each accessor's `body` (`get { … }`, `set => …`) and an expression-bodied `=> expr` `value:` — walked by visitFunctionBody with the property pushed** (calls, instantiates, static reads and fn-ref candidates attribute to the property; changed 2026-10-04, previously never walked), then scanFnRefSubtree (capture-only, attributed to the class) over the rest — **the `= initializer` stays unwalked** — skipping the walked bodies, + skipChildren. §property below |
 | `field_declaration` (inside class-like) | fieldTypes:1084 → extractField:2046 | field/constant nodes per declarator + scanFnRefSubtree + skipChildren → **field initializers emit no calls/instantiates/static-member refs** (fn-ref candidates only). §field below |
 | `local_declaration_statement` | variableTypes:1098 (only reachable at top level — global statements; body locals go through visitFunctionBody instead) | not class-like → extractVariable:2538 → **generic fallback (2863-2881) finds no direct `identifier`/`variable_declarator` children (the declarator nests inside `variable_declaration`, probed) → ZERO nodes minted**; isClassScopeConstantAssignment (1508) needs node.type `assignment` → never true. skipChildren=true + scanFnRefSubtree → **a top-level `var builder = WebApplication.CreateBuilder(args);` produces NO node, NO calls ref, NO instantiates** — only fn-ref candidates. PRESERVE |
 | `using_directive` | importTypes:1209 → extractImport:3170 | hook (§config) → import node + ONE generic `imports` ref {fromNodeId: nodeStack top (namespace node if present, else file), referenceName: moduleName, line/col of the directive}; **no per-binding emitter** (the TS/py/rust/php/ruby ladder at 3197-3234 excludes csharp) |
@@ -305,15 +305,22 @@ for C#) or bare `name`. QUIRKS (probed, PRESERVE):
 - An expression-bodied property (`public int Computed => MaxItems + 1;`) has
   children [modifier, predefined_type, identifier, **arrow_expression_clause
   (`value:` field)**] → typeNode = predefined_type → signature `"int Computed"`;
-  the arrow clause is NEVER walked (calls inside lost).
-- `{ get; } = new();` initializers: the `value:` implicit_object_creation and
-  the accessor_list are both skipped/excluded → no refs, no instantiates.
+  the arrow clause is a property body (walked as the property, below).
+- `{ get; } = new();` initializers: the `value:` implicit_object_creation is
+  NOT a body → no refs, no instantiates (candidates-only scan, attributed to
+  the class); the accessor_list is excluded from the type scan.
 
 Then extractDecoratorsFor (no-op) and **extractTypeAnnotations (2037) →
 extractCsharpTypeRefs** — the `type` field IS walked for refs (so `public
 List<Foo> Items` emits references `List` + `Foo` even though the signature
-kept the raw text). Return value feeds no body walk (the classifyMethodNode
-initializer-walk path at 1031-1047 is TS-only).
+kept the raw text). The returned node is pushed while propertyBodies
+(tree-sitter.ts; csharp.rs `property_bodies`) are walked: every
+`accessor_declaration`'s `body` field (block or arrow_expression_clause, in
+accessor order), then the property's `value:` when it is an
+arrow_expression_clause. The fn-ref scan that follows skips those subtrees
+by node id, so a candidate is captured once — from the property when it sits
+in a body, from the class when it sits in an initializer. (The
+classifyMethodNode initializer-walk path at 1031-1047 is TS-only.)
 
 ### extractField (2046) — field_declaration
 
@@ -758,7 +765,8 @@ AspNetCore refs / Program.cs / Startup.cs / controller-source scan.
   + multi-declarator + instance fields (signatures `Type name`);
   `protected internal` (→ protected); property shapes: predefined-type,
   bare-identifier type (signature loses type), generic type, expression-bodied
-  (`=>` calls LOST), `{ get; } = new();`, accessor bodies with calls (LOST);
+  (`=>` calls → the property), `{ get; } = new();` (initializer LOST),
+  accessor bodies with calls (→ the property);
   event_field_declaration + event_declaration with add/remove bodies (no
   nodes; accessor calls → class); operator + conversion operator + indexer +
   destructor (no nodes; body calls → class); constructor with

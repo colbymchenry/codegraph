@@ -116,8 +116,13 @@ export const vbnetExtractor: LanguageExtractor = {
     // findable declaration (WinForms/WPF code is built around them).
     if (node.type === 'event_declaration' || node.type === 'custom_event_declaration') {
       const nameNode = node.childForFieldName('name');
-      if (nameNode) {
-        ctx.createNode('field', getNodeText(nameNode, ctx.source), node);
+      const event = nameNode ? ctx.createNode('field', getNodeText(nameNode, ctx.source), node) : null;
+      // A Custom Event's AddHandler / RemoveHandler / RaiseEvent blocks run
+      // code, which is the event's.
+      if (event && node.type === 'custom_event_declaration') {
+        ctx.pushScope(event.id);
+        ctx.visitFunctionBody(node, event.id);
+        ctx.popScope();
       }
       return true;
     }
