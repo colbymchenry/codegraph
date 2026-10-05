@@ -20,7 +20,9 @@
  * capture channels incl. named-argument non-capture and the file/class
  * twins; TortureMini/TortureSigs/TortureCtors/TortureVrefDart: signatures
  * verbatim, prefixed-return-type prefix bug, const factories invisible,
- * value-ref matrix with `$X` vs `${X}` asymmetry) and their CRLF variants
+ * value-ref matrix with `$X` vs `${X}` asymmetry; TortureReadsTypes.dart:
+ * getter-read refs and the type positions outside signatures — #2338/#2327)
+ * and their CRLF variants
  * (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
@@ -110,6 +112,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     ['TortureSigs.dart', 4],
     ['TortureCtors.dart', 3],
     ['TortureVrefDart.dart', 4],
+    // Getter reads (#2338) and type positions outside signatures (#2327):
+    // extension `on` types, field / enum-field / top-level types, constant and
+    // field initializers, body types, and the read shapes that are not reads.
+    ['TortureReadsTypes.dart', 20],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

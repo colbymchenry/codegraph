@@ -628,10 +628,59 @@ impl<'t> Walker<'t> {
                     }
                 });
                 let name = self.text(name_node).to_string();
-                self.create_node("constant", &name, node, Extra { signature, ..Default::default() });
+                let constant = self.create_node("constant", &name, node, Extra { signature, ..Default::default() });
+                // The types its initializer names are the constant's (#2327).
+                if let Some(constant) = constant {
+                    let mut value = name_node.next_named_sibling();
+                    while let Some(v) = value {
+                        self.type_refs_dart(v, constant);
+                        value = v.next_named_sibling();
+                    }
+                }
             }
             self.scan_fn_ref_subtree(node, 0);
             return;
+        }
+
+        // A field's declared type and initializer types are its class's (Dart
+        // fields mint no nodes); a top-level variable's are the file's (#2327).
+        // The visitNode hook's `declaration` / `program` rows (dart.ts).
+        // (Parent lookups walk down from the root, so only the node kinds that
+        // can be these positions ask for theirs.)
+        if node.kind() == "declaration" {
+            let in_body = node
+                .parent()
+                .map(|p| matches!(p.kind(), "class_body" | "extension_body" | "enum_body"))
+                .unwrap_or(false);
+            let mut cursor = node.walk();
+            let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+            let is_field = in_body
+                && kids
+                    .iter()
+                    .any(|c| matches!(c.kind(), "initialized_identifier_list" | "static_final_declaration_list"));
+            if is_field {
+                let owner = self.top_row();
+                for child in kids {
+                    match child.kind() {
+                        "initialized_identifier_list" => self.initializer_type_refs_dart(child, owner),
+                        "static_final_declaration_list" => {}
+                        _ => self.type_refs_dart(child, owner),
+                    }
+                }
+            }
+        } else {
+            let top_level_type =
+                matches!(node.kind(), "type_identifier" | "type_arguments" | "function_type" | "record_type");
+            if (top_level_type || node.kind() == "initialized_identifier_list")
+                && node.parent().map(|p| p.kind() == "program").unwrap_or(false)
+            {
+                let owner = self.top_row();
+                if top_level_type {
+                    self.type_refs_dart(node, owner);
+                } else {
+                    self.initializer_type_refs_dart(node, owner);
+                }
+            }
         }
 
         // maybeCaptureFnRefs (:990) — the double-walk fn-ref twin source.
@@ -1190,6 +1239,14 @@ impl<'t> Walker<'t> {
     // --- extractInheritance — the dart rows (:5368-5393, :5437-5459) ------
 
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
+        // The type an extension is `on` — a `references` edge (#2327).
+        if node.kind() == "extension_declaration" {
+            let mut oc = node.walk();
+            let on_types: Vec<Node<'t>> = node.children_by_field_name("class", &mut oc).collect();
+            for on_type in on_types {
+                self.type_refs_dart(on_type, class_row);
+            }
+        }
         let mut cursor = node.walk();
         let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
         for child in kids {
@@ -1287,6 +1344,100 @@ impl<'t> Walker<'t> {
         }
     }
 
+    // --- type positions outside signatures (#2327; dart.ts pushDartTypeRefs) ---
+
+    /// isDartTypeName (dart.ts) — UpperCamelCase (`/^[_$]*[A-Z]/`: lowercase
+    /// is a built-in or an error-recovery artifact), not a built-in, not an
+    /// import prefix (`p` in `p.Foo`), not the class a `new`/`const`
+    /// constructor call names.
+    fn is_type_name_dart(&self, node: Node<'t>) -> bool {
+        let text = self.text(node);
+        let upper = text
+            .trim_start_matches(&['_', '$'][..])
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false);
+        if !upper || is_builtin_type(text) {
+            return false;
+        }
+        if node.next_sibling().map(|s| s.kind() == ".").unwrap_or(false) {
+            return false;
+        }
+        !node
+            .parent()
+            .map(|p| matches!(p.kind(), "new_expression" | "const_object_expression"))
+            .unwrap_or(false)
+    }
+
+    /// pushDartTypeRefs (dart.ts) — every type named inside `node`.
+    fn type_refs_dart(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
+        if node.kind() == "type_identifier" {
+            if self.is_type_name_dart(node) {
+                let name = self.text(node).to_string();
+                self.push_ref_at(from_row, &name, "references", node);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        for c in kids {
+            self.type_refs_dart(c, from_row);
+        }
+    }
+
+    /// pushDartInitializerTypeRefs (dart.ts) — each `initialized_identifier`'s
+    /// value (every named child after its name).
+    fn initializer_type_refs_dart(&mut self, list: Node<'t>, from_row: u32) {
+        let mut cursor = list.walk();
+        let entries: Vec<Node<'t>> = list.named_children(&mut cursor).collect();
+        for entry in entries {
+            if entry.kind() != "initialized_identifier" {
+                continue;
+            }
+            let mut ec = entry.walk();
+            let parts: Vec<Node<'t>> = entry.named_children(&mut ec).skip(1).collect();
+            for part in parts {
+                self.type_refs_dart(part, from_row);
+            }
+        }
+    }
+
+    /// dartMemberRead (dart.ts) — `x.area` / `x?.area` not followed by a call's
+    /// argument part, receiver a plain name: a `references` ref `x.area` on
+    /// `area`, which the resolver links to a getter only (#2338).
+    fn extract_member_read(&mut self, node: Node<'t>) {
+        if node.kind() != "selector" {
+            return;
+        }
+        let mut cursor = node.walk();
+        let accessor = node.named_children(&mut cursor).find(|c| {
+            matches!(c.kind(), "unconditional_assignable_selector" | "conditional_assignable_selector")
+        });
+        let member = accessor.and_then(|a| {
+            let mut ac = a.walk();
+            let found = a.named_children(&mut ac).find(|c| c.kind() == "identifier");
+            found
+        });
+        let Some(member) = member else { return };
+        let Some(receiver) = node.prev_named_sibling() else { return };
+        if receiver.kind() != "identifier" {
+            return;
+        }
+        if let Some(next) = node.next_named_sibling() {
+            if next.kind() == "selector" {
+                let mut nc = next.walk();
+                if next.named_children(&mut nc).any(|c| c.kind() == "argument_part") {
+                    return;
+                }
+            }
+        }
+        let name = format!("{}.{}", self.text(receiver), self.text(member));
+        let reader = self.top_row();
+        self.push_ref_at(reader, &name, "references", member);
+    }
+
     // --- visitFunctionBody (:5129-5286) — dart rows -----------------------
 
     fn visit_body(&mut self, node: Node<'t>) {
@@ -1307,6 +1458,14 @@ impl<'t> Walker<'t> {
         }
 
         self.extract_static_member_ref(node);
+
+        // A getter read `x.area` (#2338); a type the body names (#2327).
+        self.extract_member_read(node);
+        if kind == "type_identifier" && self.is_type_name_dart(node) {
+            let name = self.text(node).to_string();
+            let owner = self.top_row();
+            self.push_ref_at(owner, &name, "references", node);
+        }
 
         if kind == "function_signature" {
             // Nested named functions (:5245) — extractFunction walks the

@@ -3001,6 +3001,162 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const DART_LINEAGES = new WeakMap<ResolutionContext, Map<string, Map<string, number>>>();
+const DART_EXTENSION_OWNERS = new WeakMap<ResolutionContext, Map<string, { on: string[]; named: boolean } | null>>();
+const DART_GETTERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** A Dart type and every type it extends, mixes in or implements, by supertype distance (at most 40). */
+function dartLineage(typeName: string, context: ResolutionContext): Map<string, number> {
+  let memo = DART_LINEAGES.get(context);
+  if (!memo) DART_LINEAGES.set(context, (memo = new Map()));
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const depths = new Map<string, number>();
+  const queue: Array<[string, number]> = [[typeName, 0]];
+  while (queue.length > 0 && depths.size < 40) {
+    const [name, depth] = queue.shift()!;
+    if (depths.has(name)) continue;
+    depths.set(name, depth);
+    for (const sup of dartSupertypesOf(name, context)) queue.push([sup, depth + 1]);
+  }
+  memo.set(typeName, depths);
+  return depths;
+}
+
+/** The extension a Dart member is declared in — the types it is `on`, and whether it is named — or null for a class's, mixin's or enum's member. */
+function dartExtensionOwner(member: Node, context: ResolutionContext): { on: string[]; named: boolean } | null {
+  let memo = DART_EXTENSION_OWNERS.get(context);
+  if (!memo) DART_EXTENSION_OWNERS.set(context, (memo = new Map()));
+  const hit = memo.get(member.id);
+  if (hit !== undefined) return hit;
+  let found: { on: string[]; named: boolean } | null = null;
+  const cut = member.qualifiedName.lastIndexOf('::');
+  if (cut > 0) {
+    const ownerQn = member.qualifiedName.slice(0, cut);
+    const owner = context.getNodesInFile(member.filePath).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
+      n.startLine <= member.startLine && n.endLine >= member.startLine);
+    const decl = owner ? dartExtensionDecl(owner, context) : null;
+    if (owner && decl) found = { on: dartHeadOf(owner, context).supers, named: decl.named };
+  }
+  memo.set(member.id, found);
+  return found;
+}
+
+/** Whether a Dart member is a getter — declared `get <name>`, a method its readers run. */
+function isDartGetter(n: Node, context: ResolutionContext): boolean {
+  if (n.language !== 'dart' || n.kind !== 'method') return false;
+  let memo = DART_GETTERS.get(context);
+  if (!memo) DART_GETTERS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  // The declaration from its start, and the next line for a return type that wraps.
+  const head = `${(lines[n.startLine - 1] ?? '').slice(n.startColumn)} ${lines[n.startLine] ?? ''}`;
+  const getter = new RegExp(String.raw`^[^={;]*?\bget\s+${n.name.replace(/\$/g, '\\$')}(?![\w$])`).test(head);
+  memo.set(n.id, getter);
+  return getter;
+}
+
+/**
+ * The Dart member `name` a value of type `typeName` reaches, as Dart finds it:
+ * the nearest one the type or a type it extends, mixes in or implements
+ * declares, else one an extension on such a type adds — an extension applies
+ * only where no instance member answers, and an unnamed one only in its own
+ * library. `accept` narrows the candidates (a read wants a getter). Ties go to
+ * the call site's own file, then the nearest directory — riverpod's translated
+ * docs carry their own copy of each example's extension.
+ */
+function dartMemberOf(
+  typeName: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  accept: (n: Node) => boolean,
+): { node: Node; viaExtension: boolean } | null {
+  const lineage = dartLineage(typeName, context);
+  let best: Node[] = [];
+  let bestRank = Infinity;
+  for (const m of context.getNodesByName(name)) {
+    if (m.language !== 'dart' || !isDartMember(m) || !accept(m)) continue;
+    const extension = dartExtensionOwner(m, context);
+    let rank: number;
+    if (extension) {
+      if (!extension.named && m.filePath !== ref.filePath) continue;
+      const on = Math.min(...extension.on.map((t) => lineage.get(t) ?? Infinity));
+      if (on === Infinity) continue;
+      rank = DART_EXTENSION_RANK + on;
+    } else {
+      const owner = m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split('::').pop()!;
+      const depth = lineage.get(owner);
+      if (depth === undefined) continue;
+      rank = depth;
+    }
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = [m];
+    } else if (rank === bestRank) {
+      best.push(m);
+    }
+  }
+  if (best.length === 0) return null;
+  const node = best.find((n) => n.filePath === ref.filePath) ??
+    best.reduce((a, b) => (computePathProximity(ref.filePath, b.filePath) > computePathProximity(ref.filePath, a.filePath) ? b : a));
+  return { node, viaExtension: bestRank >= DART_EXTENSION_RANK };
+}
+
+/** `x.area` / `Config.instance`: the receiver and member of a Dart member read. */
+const DART_MEMBER_READ = /^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/;
+
+/**
+ * Whether a ref is a Dart member read — `x.area`, which the extractor records
+ * as a `references` ref named `<receiver>.<member>`. No other Dart reference
+ * carries a dotted name: a type is one identifier, a static read names only
+ * its type.
+ */
+export function isDartMemberRead(ref: UnresolvedRef): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'references' && DART_MEMBER_READ.test(ref.referenceName);
+}
+
+/**
+ * A Dart member read runs code only when the member is a getter, so it links
+ * — as a call — the getter the receiver's type reaches: declared on the type, a
+ * type it extends, mixes in or implements, or added by an extension on one of
+ * them (`s.label` on an enum `Shape` through `extension ShapeInfo on Shape`),
+ * or nothing: a field read, a getter of a type outside the project, a receiver
+ * whose type is not written down. Never a same-named getter found by name alone
+ * (#2338).
+ */
+export function matchDartMemberRead(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const parts = DART_MEMBER_READ.exec(ref.referenceName);
+  if (!parts) return null;
+  const receiver = parts[1]!;
+  const member = parts[2]!;
+  // Most reads are of fields, which mint no nodes: check for a getter first.
+  if (!context.getNodesByName(member).some((n) => isDartGetter(n, context))) return null;
+  // A type named directly reads its static getter (`Config.instance`); a
+  // variable is typed by its declaration — a parameter or local in scope, else
+  // a field of the class the read is written in (`final Box box;`).
+  const typeName = /^[A-Z]/.test(receiver) &&
+    context.getNodesByName(receiver).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind))
+    ? receiver
+    : inferLocalReceiverType(receiver, ref, context) ?? inferMemberReceiverType(receiver, ref, context);
+  if (!typeName) return null;
+  const found = dartMemberOf(typeName, member, ref, context, (n) => isDartGetter(n, context));
+  if (!found) return null;
+  return { original: ref, targetNodeId: found.node.id, confidence: 0.9, resolvedBy: 'instance-method', edgeKind: 'calls' };
+}
+
+/**
+ * A member an extension adds to `typeName` — `s.shout()` on an enum `Shape`
+ * through `extension ShapeInfo on Shape` — when the type itself declares none
+ * (#2338). An inherited instance member is left to the strategies that
+ * resolve it today.
+ */
+function dartExtensionMemberOf(typeName: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const found = dartMemberOf(typeName, name, ref, context, () => true);
+  return found?.viaExtension ? found.node : null;
+}
+
 /**
  * How a bare Rust or Go name is written at its call: `path` after `::` (left
  * to the path strategies), `chained` after a `.` — with the receiver it is
@@ -6182,6 +6338,13 @@ export function resolveMethodOnType(
       });
       if (viaSupers) return viaSupers;
     }
+    // A Dart extension's member: no declaration of the type has it, so an
+    // extension `on` the type (or a supertype) supplies it — `s.shout()` on an
+    // enum through `extension ShapeInfo on Shape` (#2338).
+    if (ref.language === 'dart' && depth === 0) {
+      const viaExtension = dartExtensionMemberOf(typeName, methodName, ref, context);
+      if (viaExtension) return { original: ref, targetNodeId: viaExtension.id, confidence, resolvedBy };
+    }
     return null;
   }
 
@@ -6796,6 +6959,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PHP_SUPERS.delete(context);
   DART_SUPERS.delete(context);
   DART_HIERARCHIES.delete(context);
+  DART_LINEAGES.delete(context);
+  DART_EXTENSION_OWNERS.delete(context);
+  DART_GETTERS.delete(context);
   SWIFT_DECLS.delete(context);
   KOTLIN_RECEIVER_TYPES.delete(context);
   KOTLIN_HIERARCHIES.delete(context);

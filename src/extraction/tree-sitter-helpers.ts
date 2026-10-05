@@ -61,6 +61,27 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
+ * Built-in/primitive type names that shouldn't create references. Shared by the
+ * core type-annotation walker and the per-language ones (Dart's), so every type
+ * position skips the same names.
+ */
+export const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
+  'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
+  'object', 'symbol', 'bigint', 'true', 'false',
+  // Rust
+  'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
+  // Java/C#
+  'int', 'long', 'short', 'byte', 'float', 'double', 'char',
+  // Go
+  'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
+  'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+  // Scala (capitalized primitives + ubiquitous stdlib aliases)
+  'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
+  'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
+]);
+
+/**
  * Node types that *wrap* a declaration so a leading comment is a sibling of the
  * wrapper, not of the emitted (inner) declaration node. CodeGraph emits the
  * inner node, so before looking for its preceding comment we climb out through

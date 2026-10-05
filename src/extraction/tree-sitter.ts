@@ -16,13 +16,14 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -6214,6 +6215,40 @@ export class TreeSitterExtractor {
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
 
+      // A member read that may run code — Dart's `x.area` calls the getter
+      // `area` (#2338). The resolver links it to a getter, as a call, or to
+      // nothing: a plain field read stays a reference that names no symbol.
+      const read = this.extractor!.extractMemberRead?.(node);
+      if (read) {
+        const readerId = this.nodeStack[this.nodeStack.length - 1];
+        if (readerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: readerId,
+            referenceName: read.name,
+            referenceKind: 'references',
+            line: read.node.startPosition.row + 1,
+            column: read.node.startPosition.column,
+          });
+        }
+      }
+
+      // A type a Dart body names — a local's declared type, a generic argument
+      // (`Future<Report?>.value(null)`, `context.read<Report>()`), a cast, a
+      // type test — is the function's dependency, as a TS local's annotation
+      // is just below (#2327).
+      if (this.language === 'dart' && nodeType === 'type_identifier' && isDartTypeName(node)) {
+        const ownerId = this.nodeStack[this.nodeStack.length - 1];
+        if (ownerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: getNodeText(node, this.source),
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+      }
+
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
       // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for
       // locals (that would explode the graph — the data-flow frontier we leave
@@ -6362,6 +6397,15 @@ export class TreeSitterExtractor {
         }
       }
       return;
+    }
+
+    // Dart: the type an extension is `on` is one it depends on — `extension
+    // ReportX on Report`, `on List<Report>` (#2327). Not a supertype: a
+    // `references` edge, as a C# extension method's `this Report r` gets.
+    if (this.language === 'dart' && node.type === 'extension_declaration') {
+      for (const onType of node.childrenForFieldName('class')) {
+        if (onType) pushDartTypeRefs(onType, classId, (ref) => this.unresolvedReferences.push(ref));
+      }
     }
 
     // Look for extends/implements clauses
@@ -6805,21 +6849,7 @@ export class TreeSitterExtractor {
   /**
    * Built-in/primitive type names that shouldn't create references
    */
-  private readonly BUILTIN_TYPES = new Set([
-    'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
-    'object', 'symbol', 'bigint', 'true', 'false',
-    // Rust
-    'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
-    'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
-    // Java/C#
-    'int', 'long', 'short', 'byte', 'float', 'double', 'char',
-    // Go
-    'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
-    'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
-    // Scala (capitalized primitives + ubiquitous stdlib aliases)
-    'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
-    'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
-  ]);
+  private readonly BUILTIN_TYPES = BUILTIN_TYPE_NAMES;
 
   /**
    * Extract type references from type annotations on a function/method/field node.

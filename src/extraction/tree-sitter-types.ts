@@ -312,6 +312,15 @@ export interface LanguageExtractor {
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * Detect a member read that may run code — Dart's `x.area`, which calls the
+   * getter `area` when `area` is one. Returns the ref name (`x.area`) and the
+   * node to position it on, or undefined. Emitted as a `references` ref from
+   * the function the read is in; the resolver links it only to a getter, with
+   * a `calls` edge (a plain field read links nothing).
+   */
+  extractMemberRead?: (node: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
+
+  /**
    * Node types representing a file-level package/namespace declaration
    * (e.g. Kotlin `package_header`, Java `package_declaration`). When set,
    * the core wraps every top-level declaration in an implicit `namespace`
