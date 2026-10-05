@@ -383,9 +383,21 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
  * VB.NET (#2305) sends the member with its receiver instead, and its resolver
  * decides whether the receiver is a type (see extractVbMemberRead).
+ * Rust imports too, but a variant is usually written through a path that names
+ * its module, not its enum (`mode::Mode::A` under `use crate::mode;`), so no
+ * `use` names the enum at all (#2328).
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet', 'rust',
+]);
+
+/**
+ * Parents of a Rust `scoped_identifier` that is not a member written as a
+ * value or a pattern: the prefix of a longer path, or a `use` tree.
+ */
+const RUST_NON_MEMBER_PATH_PARENTS: ReadonlySet<string> = new Set([
+  'scoped_identifier', 'scoped_type_identifier',
+  'use_declaration', 'use_list', 'scoped_use_list', 'use_as_clause', 'use_wildcard',
 ]);
 
 /**
@@ -5528,7 +5540,7 @@ export class TreeSitterExtractor {
    * where types are Capitalized by convention, and skipped when the access is a
    * call's callee (the call extractor already links the method).
    */
-  private extractStaticMemberRef(node: SyntaxNode): void {
+  private extractStaticMemberRef(node: SyntaxNode, knownParent?: SyntaxNode): void {
     if (!STATIC_MEMBER_LANGS.has(this.language)) return;
     if (this.nodeStack.length === 0) return;
     const ownerId = this.nodeStack[this.nodeStack.length - 1];
@@ -5544,6 +5556,35 @@ export class TreeSitterExtractor {
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
         this.pushStaticMemberRef(prev.text, ownerId, prev);
       }
+      return;
+    }
+
+    // Rust writes an enum variant as a path: read (`Mode::A`, `mode::Mode::B`,
+    // `xs.map(Mode::C)`), matched (`Mode::C(x) =>`, `Mode::D { .. } =>`), or
+    // `Self::A` in an impl (#2328). The receiver — the segment before the
+    // member — is referenced where it is written, so a `mode::` / `other::`
+    // prefix scopes it as it scopes a type annotation, and the resolver keeps it
+    // only on an enum that declares the member (an associated const read the
+    // same way, `Limits::MAX`, links nothing). A lowercase receiver is a module
+    // and a lowercase member a function (`util::take`, `Foo::new`); a call's
+    // callee (`Mode::C(1)`) and a struct literal's name are already linked to
+    // their member; the prefix of a longer path and a `use` tree name no member.
+    // Mirrored by the native kernel's `extract_static_member_ref` — change both.
+    if (this.language === 'rust') {
+      if (node.type !== 'scoped_identifier' && node.type !== 'scoped_type_identifier') return;
+      // Looked up only at a body's root (a `const X: M = M::A;` value).
+      const parent = knownParent ?? node.parent;
+      if (!parent) return;
+      if (node.type === 'scoped_type_identifier' ? parent.type !== 'struct_pattern'
+        : RUST_NON_MEMBER_PATH_PARENTS.has(parent.type)) return;
+      if (parent.type === 'call_expression' && getChildByField(parent, 'function')?.startIndex === node.startIndex) return;
+      const member = getChildByField(node, 'name');
+      let recv = getChildByField(node, 'path');
+      if (recv?.type === 'scoped_identifier') recv = getChildByField(recv, 'name');
+      if (!member || recv?.type !== 'identifier' || !/^[A-Z]/.test(getNodeText(member, this.source))) return;
+      let text = getNodeText(recv, this.source);
+      if (text === 'Self') text = this.extractor!.getReceiverType?.(node, this.source) ?? '';
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
       return;
     }
 
@@ -6098,7 +6139,9 @@ export class TreeSitterExtractor {
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
-    const visitForCallsAndStructure = (node: SyntaxNode): void => {
+    // `parent` is handed down by the walk (absent at the body's root): reading
+    // `node.parent` walks down from the tree's root on every call.
+    const visitForCallsAndStructure = (node: SyntaxNode, parent?: SyntaxNode): void => {
       const nodeType = node.type;
 
       // A function-like macro defined inside a body is still a macro (#1838).
@@ -6213,7 +6256,7 @@ export class TreeSitterExtractor {
       }
 
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
-      this.extractStaticMemberRef(node);
+      this.extractStaticMemberRef(node, parent);
 
       // A member read that may run code — Dart's `x.area` calls the getter
       // `area` (#2338). The resolver links it to a getter, as a call, or to
@@ -6351,7 +6394,7 @@ export class TreeSitterExtractor {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child) {
-          visitForCallsAndStructure(child);
+          visitForCallsAndStructure(child, node);
         }
       }
     };
