@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1049,6 +1049,10 @@ export class ReferenceResolver {
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
     );
+    // A Dart class whose field holds its own type (`class Node { Node? next; }`)
+    // names itself: a self-edge that says nothing (#2327).
+    if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
+        resolved.targetNodeId === ref.fromNodeId) return null;
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -1070,6 +1074,10 @@ export class ReferenceResolver {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+
+    // A Dart member read (`x.area`) links the getter the receiver's type
+    // reaches, as a call, or nothing — never a guess by name (#2338).
+    if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {

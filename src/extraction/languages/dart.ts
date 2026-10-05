@@ -1,6 +1,88 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import type { UnresolvedReference } from '../../types';
+import { getNodeText, BUILTIN_TYPE_NAMES } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+
+/**
+ * Whether a Dart `type_identifier` names a type a reference should point at.
+ * Dart writes types in UpperCamelCase (`_Private`, `$Generated` too), so a
+ * lowercase one is a built-in like `num` or `dynamic` — or no type at all:
+ * error recovery around syntax the grammar predates (dot shorthands like
+ * `.leading`) turns argument names into `type_identifier`s. Two more are not
+ * types of their own: the import prefix of `p.Foo` (it names a library), and
+ * the class a `new` / `const` constructor call names (the call links it).
+ */
+export function isDartTypeName(node: SyntaxNode): boolean {
+  if (!/^[_$]*[A-Z]/.test(node.text) || BUILTIN_TYPE_NAMES.has(node.text)) return false;
+  if (node.nextSibling?.type === '.') return false;
+  const parent = node.parent;
+  return parent?.type !== 'new_expression' && parent?.type !== 'const_object_expression';
+}
+
+/**
+ * A `references` ref from `fromNodeId` for every type named inside `node` — a
+ * declared type, a generic argument, a cast or a type test (#2327).
+ */
+export function pushDartTypeRefs(
+  node: SyntaxNode,
+  fromNodeId: string,
+  push: (ref: UnresolvedReference) => void,
+): void {
+  if (node.type === 'type_identifier') {
+    if (isDartTypeName(node)) {
+      push({
+        fromNodeId,
+        referenceName: node.text,
+        referenceKind: 'references',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+    return;
+  }
+  for (const child of node.namedChildren) pushDartTypeRefs(child, fromNodeId, push);
+}
+
+/** The bodies a Dart field `declaration` can sit in: a class's or mixin's, an extension's, an enum's. */
+const DART_MEMBER_BODIES: ReadonlySet<string> = new Set(['class_body', 'extension_body', 'enum_body']);
+
+/** The named nodes a top-level variable's declared type is written as (`Report? x;`, `List<Report> xs = [];`). */
+const DART_TOP_LEVEL_TYPES: ReadonlySet<string> = new Set(['type_identifier', 'type_arguments', 'function_type', 'record_type']);
+
+/** Type refs from `fromNodeId` for the initializers in an `initialized_identifier_list` (each entry is its name, then its value). */
+function pushDartInitializerTypeRefs(
+  list: SyntaxNode,
+  fromNodeId: string,
+  push: (ref: UnresolvedReference) => void,
+): void {
+  for (const entry of list.namedChildren) {
+    if (entry.type !== 'initialized_identifier') continue;
+    for (const part of entry.namedChildren.slice(1)) pushDartTypeRefs(part, fromNodeId, push);
+  }
+}
+
+/**
+ * A Dart member read — `x.area`, `s?.label`, `Config.instance` — as the ref
+ * `<receiver>.<member>`, positioned on the member's name. Reading a getter runs
+ * it, so the resolver links the read to a getter, as a call, and to nothing
+ * else (#2338). The receiver must be a plain name, the one shape whose type the
+ * resolver can look up; a member that is called (`x.grow()`) is the call's.
+ */
+export function dartMemberRead(node: SyntaxNode): { name: string; node: SyntaxNode } | undefined {
+  if (node.type !== 'selector') return undefined;
+  const accessor = node.namedChildren.find((c: SyntaxNode) =>
+    c.type === 'unconditional_assignable_selector' || c.type === 'conditional_assignable_selector'
+  );
+  const member = accessor?.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+  if (!member) return undefined;
+  const receiver = node.previousNamedSibling;
+  if (receiver?.type !== 'identifier') return undefined;
+  const next = node.nextNamedSibling;
+  if (next?.type === 'selector' && next.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
+    return undefined;
+  }
+  return { name: `${receiver.text}.${member.text}`, node: member };
+}
 
 /**
  * The `function_signature` carrying a method's return type — unwrapped from a
@@ -147,16 +229,47 @@ export const dartExtractor: LanguageExtractor = {
   // parent scope (`file:` top-level / `class:` static member) comes from the
   // node stack, both of which the value-reference target gate accepts.
   visitNode: (node, ctx) => {
+    const push = (ref: UnresolvedReference) => ctx.addUnresolvedReference(ref);
     if (node.type === 'static_final_declaration') {
       const nameNode = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
       if (nameNode) {
         const valueNode = nameNode.nextNamedSibling;
         const initValue = valueNode ? getNodeText(valueNode, ctx.source).slice(0, 100) : undefined;
-        ctx.createNode('constant', getNodeText(nameNode, ctx.source), node, {
+        const constant = ctx.createNode('constant', getNodeText(nameNode, ctx.source), node, {
           signature: initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined,
         });
+        // The types its initializer names are the constant's — riverpod's
+        // `final reportProvider = Family<Report?, String>();` (#2327).
+        if (constant) {
+          for (let value = valueNode; value; value = value.nextNamedSibling) pushDartTypeRefs(value, constant.id, push);
+        }
       }
       return true;
+    }
+    // A field's declared type, and the types its initializer names, are its
+    // class's: Dart fields mint no nodes of their own (`final Report report;`,
+    // #2327). A `static final` / `const` field's initializer is its constant's.
+    if (node.type === 'declaration') {
+      const owner = ctx.nodeStack[ctx.nodeStack.length - 1];
+      const inBody = node.parent !== null && DART_MEMBER_BODIES.has(node.parent.type);
+      const isField = inBody && node.namedChildren.some((c: SyntaxNode) =>
+        c.type === 'initialized_identifier_list' || c.type === 'static_final_declaration_list'
+      );
+      if (owner && isField) {
+        for (const child of node.namedChildren) {
+          if (child.type === 'initialized_identifier_list') pushDartInitializerTypeRefs(child, owner, push);
+          else if (child.type !== 'static_final_declaration_list') pushDartTypeRefs(child, owner, push);
+        }
+      }
+      return false;
+    }
+    // A top-level variable's declared type and its (non-constant) initializer
+    // are the file's — the grammar lays them out directly under `program`.
+    const topLevelType = DART_TOP_LEVEL_TYPES.has(node.type);
+    if ((topLevelType || node.type === 'initialized_identifier_list') && node.parent?.type === 'program') {
+      const owner = ctx.nodeStack[ctx.nodeStack.length - 1];
+      if (owner && topLevelType) pushDartTypeRefs(node, owner, push);
+      else if (owner) pushDartInitializerTypeRefs(node, owner, push);
     }
     return false;
   },
@@ -389,4 +502,5 @@ export const dartExtractor: LanguageExtractor = {
 
     return undefined;
   },
+  extractMemberRead: dartMemberRead,
 };
