@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -3112,6 +3113,9 @@ const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
   'ForEach', 'Sort', 'Reverse', 'Clone', 'Seek', 'SetLength',
 ]);
 
+/** The same .NET names as VB.NET writes them — in any case. */
+const VBNET_STD_METHODS: ReadonlySet<string> = new Set([...CSHARP_STD_METHODS].map((m) => m.toLowerCase()));
+
 /**
  * A request handler the web framework dispatches to: a Django / DRF / Flask
  * view's `get` / `post` / …, a controller's `index` / `store` / `update` /
@@ -3156,9 +3160,15 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'rust': return RUST_STD_METHODS;
     case 'kotlin': return KOTLIN_STD_METHODS;
     case 'csharp': return CSHARP_STD_METHODS;
+    case 'vbnet': return VBNET_STD_METHODS;
     case 'dart': return DART_STD_METHODS;
     default: return null;
   }
+}
+
+/** Whether `name` is one of `language`'s standard-library method names (VB.NET's in any case). */
+function isStdMethodName(language: string, name: string): boolean {
+  return stdMethodNames(language)?.has(language === 'vbnet' ? name.toLowerCase() : name) ?? false;
 }
 
 /** Methods of Dart's String, List, Iterable, Map and Set — names a project type rarely carries itself. */
@@ -4657,7 +4667,13 @@ function vbReceiverOf(ref: UnresolvedRef, context: ResolutionContext): string | 
   const name = ref.referenceName.toLowerCase();
   let start = lower.startsWith(name, ref.column) ? ref.column : -1;
   if (start < 0) {
-    const m = new RegExp(`(?<![\\w])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).exec(lower);
+    // The reference starts at its receiver or its `New`, so the name is the
+    // first one there or after: `st.Language = New Language(…)` constructs
+    // a Language through no receiver, and `Me.Size = New System.Drawing.Size(…)`
+    // through `System.Drawing`, not `Me`.
+    const at = new RegExp(`(?<![\\w])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`, 'g');
+    at.lastIndex = Math.max(0, ref.column);
+    const m = at.exec(lower) ?? (at.lastIndex = 0, at.exec(lower));
     start = m ? m.index : -1;
   }
   if (start < 0) return null;
@@ -4686,6 +4702,22 @@ function isVbMemberReachable(n: Node, receiver: string): boolean {
   if (/^(?:me|mybase|myclass)$/.test(last) && !receiver.includes('.')) return true;
   const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!.toLowerCase();
   return last !== '' && last === owner;
+}
+
+/**
+ * Whether a VB.NET call has no receiver, or one the extractor drops (`Me`,
+ * `MyClass`, `MyBase`) — a call isVbMemberInScope judges. A name its line
+ * doesn't show (a link of a chain continued from the line above) is not.
+ */
+function isVbScopedCall(ref: UnresolvedRef, receiver: string | null, context: ResolutionContext): boolean {
+  if (ref.language !== 'vbnet' || ref.referenceKind !== 'calls' || !/^\w+$/.test(ref.referenceName)) return false;
+  return receiver === null ? hasNoReceiverOnLine(ref, context) : /^(?:me|mybase|myclass)$/i.test(receiver);
+}
+
+/** Whether a VB.NET call or construction names its target with nothing before it (`New Point(4, 285)`). */
+function isVbUnqualifiedName(ref: UnresolvedRef, receiver: string | null, context: ResolutionContext): boolean {
+  if (ref.language !== 'vbnet' || (ref.referenceKind !== 'calls' && ref.referenceKind !== 'instantiates')) return false;
+  return receiver === null && /^\w+$/.test(ref.referenceName) && hasNoReceiverOnLine(ref, context);
 }
 
 const CFML_CHAINS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
@@ -5536,6 +5568,8 @@ export function matchByExactName(
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const vbScoped = isVbScopedCall(ref, vbReceiver, context);
+  const vbUnqualified = isVbUnqualifiedName(ref, vbReceiver, context);
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
@@ -5557,6 +5591,9 @@ export function matchByExactName(
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
+    !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
+    !(vbUnqualified && !isVbNestedTypeInScope(n, ref, context)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
@@ -7817,6 +7854,14 @@ export function matchMethodCall(
   // shared source-based inferrer. resolveMethodOnType validates the method
   // exists on the inferred type, so a mis-inference produces no edge.
   if (inferableReceiver) {
+    // A VB.NET receiver's declared type decides the call, or that there is no
+    // project method to call: SCrawler's `ThumbnailFile.Delete(…)` on an
+    // external `SFile` went to a nested class's `Delete` by a shared word.
+    if (ref.language === 'vbnet' && dotMatch) {
+      const typed = nmTimedT('mc-vbtyped', ref, () =>
+        matchVbTypedCall(objectOrClass!, methodName!, ref, context, (name) => isStdMethodName('vbnet', name)));
+      if (typed !== undefined) return typed;
+    }
     let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
@@ -8024,6 +8069,9 @@ export function matchMethodCall(
       const visible = classCandidates.filter((c) => c.language !== 'csharp' || isCsharpTypeVisible(c, typeRef, context));
       classCandidates = [...visible, ...classCandidates.filter((c) => !visible.includes(c))];
     }
+    // A VB.NET type declared in two projects is the caller's own project's:
+    // staxrip's `FrameServerFactory.Create(…)` went to its AutoCrop tool's copy.
+    if (ref.language === 'vbnet') classCandidates = preferVbProject(classCandidates, ref, context);
 
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
@@ -8213,10 +8261,10 @@ export function matchMethodCall(
         // `json` of its `MockedResponse`.
         !isUnnamedTestDouble(targetMethods[0]!, objectOrClass!, ref, context) &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
-        // Rust / Go / Kotlin / C#: a standard-library method name on an
-        // untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
+        // Rust / Go / Kotlin / C# / VB.NET: a standard-library method name on
+        // an untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
         // `reader.Value.ToString()`) is the library type's.
-        !(stdMethodNames(ref.language)?.has(methodName!) &&
+        !(isStdMethodName(ref.language, methodName!) &&
           !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
@@ -8238,11 +8286,12 @@ export function matchMethodCall(
       const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
+      let tied: typeof targetMethods = [];
 
       // Same-file candidates first, so a score tie (`score > bestScore` keeps
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
-      const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
+      const std = isStdMethodName(ref.language, methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
         if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
@@ -8265,8 +8314,16 @@ export function matchMethodCall(
         if (score > bestScore) {
           bestScore = score;
           bestMatch = method;
+          tied = [method];
+        } else if (score === bestScore) {
+          tied.push(method);
         }
       }
+      // VB.NET: between equally good guesses, the caller's own file, then its
+      // project, then the nearer directory — and no guess when none of them
+      // decides. staxrip's main app and its AutoCrop tool each declare a
+      // `ColorHSL`, and the first indexed took about 90 of the app's calls.
+      if (ref.language === 'vbnet' && tied.length > 1 && bestScore >= 2) bestMatch = breakVbTie(tied, ref, context) ?? undefined;
 
       // A wrapper handing its call on — BookStack's `FileStorage::delete` doing
       // `$storage->delete($path)`, `CommentRepo::delete` doing
@@ -9229,7 +9286,7 @@ function computePathProximity(filePath1: string, filePath2: string): number {
 function findBestMatch(
   ref: UnresolvedRef,
   candidates: Node[],
-  _context: ResolutionContext
+  context: ResolutionContext
 ): Node | null {
   // Prioritization rules:
   // 1. Same file > different file
@@ -9268,6 +9325,13 @@ function findBestMatch(
 
     // Directory proximity bonus — strongly prefer same module/package
     score += pathProximityFromDirs(refDirs, candidate.filePath);
+
+    // A VB.NET project compiles its own files: the caller's project weighs as
+    // much as the nearest a directory can be. staxrip's `New ColorHSL(…)` went
+    // to its AutoCrop tool's copy.
+    if (ref.language === 'vbnet' && candidate.language === 'vbnet' && sameVbProject(candidate.filePath, ref.filePath, context)) {
+      score += 80;
+    }
 
     // Language matching: strongly prefer same language, penalize cross-language
     if (candidate.language === ref.language) {
@@ -9353,6 +9417,8 @@ export function matchFuzzy(
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const vbScoped = isVbScopedCall(ref, vbReceiver, context);
+  const vbUnqualified = isVbUnqualifiedName(ref, vbReceiver, context);
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
@@ -9388,6 +9454,9 @@ export function matchFuzzy(
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
+    !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
+    !(vbUnqualified && !isVbNestedTypeInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
