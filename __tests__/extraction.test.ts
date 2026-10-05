@@ -1180,7 +1180,7 @@ export const exported = { handler: () => target() };
       return result.unresolvedReferences
         .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
         .map((u) => byId.get(u.fromNodeId))
-        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .map((n) => (n ? `${n.kind}:${n.qualifiedName}` : '?'))
         .sort();
     };
 
@@ -1191,14 +1191,14 @@ export const exported = { handler: () => target() };
     });
 
     it('a non-exported object literal contributes calls (it was skipped outright)', () => {
-      // `exported`'s members are minted as their own function nodes, so its
-      // arrow's call comes from `handler`; the non-exported ones attribute to
-      // the declared constant.
+      // A named literal's function members are its own nodes, exported or not
+      // (#2300), so each arrow's call comes from its `handler`; the literal's
+      // eager value and the array's arrow attribute to the declared constant.
       expect(callersOf('target')).toEqual([
         'constant:list',
         'constant:obj',
-        'constant:obj',
-        'function:handler',
+        'function:exported::handler',
+        'function:obj::handler',
       ]);
     });
   });

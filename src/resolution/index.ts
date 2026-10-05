@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1292,7 +1292,8 @@ export class ReferenceResolver {
     if (isUnresolvedJsMemberCall(ref)) {
       const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
       const namespace = this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.isNamespace && m.localName === root);
-      if (!namespace) return null;
+      // `App.utils.fmt()` through a path an object literal was hung on (#2300).
+      if (!namespace) return this.gateLanguage(matchObjectPathCall(ref, this.context), ref);
       const viaNamespace = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       const target = viaNamespace ? this.nodeById(viaNamespace.targetNodeId) : null;
       return target && (target.kind === 'function' || target.kind === 'method' || target.kind === 'class' || target.kind === 'constant' || target.kind === 'variable')
@@ -2797,8 +2798,11 @@ export class ReferenceResolver {
   private resolveThisMemberFnRef(ref: UnresolvedRef): ResolvedRef | null {
     const member = ref.referenceName.slice('this.'.length);
     if (!member) return null;
-    const fromNode = this.nodeById(ref.fromNodeId);
-    if (!fromNode) return null;
+    const written = this.nodeById(ref.fromNodeId);
+    if (!written) return null;
+    // Inside an object literal: its own method's `this` is the object, an
+    // arrow member's is the method around the literal (#2300).
+    const fromNode = thisScopeCaller(written, this.context);
     // A hook declared at class-body level (Ruby `before_action :authenticate`)
     // attributes to the CLASS node itself — its qualified name IS the scope.
     // For members, strip the member segment.
@@ -2885,8 +2889,9 @@ export class ReferenceResolver {
     for (const ref of deferred) {
       await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
-      const fromNode = this.nodeById(ref.fromNodeId);
-      if (!fromNode || !member) continue;
+      const written = this.nodeById(ref.fromNodeId);
+      if (!written || !member) continue;
+      const fromNode = thisScopeCaller(written, this.context);
       // Class-body-level hooks (Ruby) attribute to the CLASS node itself.
       let className: string;
       if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {

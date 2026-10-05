@@ -1215,6 +1215,17 @@ export function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
+  // An object literal's member is reached through its object (#2300): a bare
+  // `load()` or `setTimeout(load)` never means `App.load`, whatever shares
+  // the name — see isObjectMemberReachableByName for the ways that do.
+  if (candidate.kind === 'function' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) &&
+      !isObjectMemberReachableByName(candidate, ref, context)) return false;
+  // An object hung on a path (`App.utils = {…}`, `$.event.special.swipe =
+  // {…}`) is a property, not a binding: no bare name reaches it — a
+  // `this.swipe()` elsewhere is not that object. One hung on the global object
+  // (`window.App = {…}`) is the global `App`.
+  if (isPathHolder(candidate) && isObjectLiteralOwner(candidate) && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) &&
+      !HOST_GLOBAL_PREFIX.test(lastQualifiedSegment(candidate.qualifiedName))) return false;
   // A `val` / `const` declared in a function body is that body's alone —
   // okio's `(source as Source).buffer()` bound to a `val buffer = Buffer()`
   // inside another test file's `pipe()`.
@@ -6115,9 +6126,10 @@ export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] 
 
 /**
  * Languages whose object literals declare callable members — `export const
- * api = { call() {…}, get: () => {…} }` used as a namespace (#1573).
+ * api = { call() {…}, get: () => {…} }` used as a namespace (#1573) — including
+ * the script blocks of single-file components (#2300).
  */
-const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'vue', 'svelte', 'astro']);
 
 /** True when `inner`'s source range lies within `outer`'s (lines, then columns on a shared line). */
 function rangeWithin(inner: Node, outer: Node): boolean {
@@ -6341,6 +6353,533 @@ export function resolveObjectLiteralBinding(
     return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
   return null;
+}
+
+// ── Object literals that own their members (#2300) ──────────────────────────────
+//
+// A named object literal — `const App = {…}`, the same inside an IIFE or a
+// function, `App = {…}`, or one hung on a path (`window.App = {…}`, `App.utils
+// = {…}`) — makes each function member a node qualified under its owner
+// (`App::init`, `window.App::init`). An owner is a constant or variable whose
+// initializer is an object literal. A member is reached THROUGH its object:
+// `App.init()`, `window.App.init()`, `App.utils.fmt()`, a sibling's
+// `this.init()`, a `const { init } = App` binding — never by its name alone.
+
+/**
+ * A path on the global object — `window.`, `globalThis.`. (`self` is the
+ * global only in a worker; in page code it is far more often `var self = this`.)
+ */
+const HOST_GLOBAL_PREFIX = /^(?:window|globalThis)\./;
+
+/** The last `::` segment of a qualified name. */
+function lastQualifiedSegment(qualifiedName: string): string {
+  const cut = qualifiedName.lastIndexOf('::');
+  return cut < 0 ? qualifiedName : qualifiedName.slice(cut + 2);
+}
+
+/**
+ * The path a constant or variable is reached by: its name, or — for an object
+ * hung on a path by assignment — that path, any global-object root dropped
+ * (`window.App = {…}` defines the global `App`; `App.utils = {…}` is `App.utils`).
+ */
+function holderPath(n: Node): string {
+  const last = lastQualifiedSegment(n.qualifiedName);
+  return last.includes('.') ? last.replace(HOST_GLOBAL_PREFIX, '') : n.name;
+}
+
+/** Whether a constant or variable was hung on a dotted path by assignment rather than declared. */
+function isPathHolder(n: Node): boolean {
+  return lastQualifiedSegment(n.qualifiedName).includes('.');
+}
+
+/** Whether `n` holds an object literal: an owner its members can belong to. */
+function isObjectLiteralOwner(n: Node): boolean {
+  return (n.kind === 'constant' || n.kind === 'variable') && JS_FAMILY.has(n.language) && /^=\s*\{/.test(n.signature ?? '');
+}
+
+const OBJECT_OWNER_OF = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/**
+ * The object literal a function node is a member of — its qualified parent,
+ * an owner in its file whose extent holds it — or null for every other
+ * function: a declaration, a helper nested in a function, a function inside
+ * an initializer that is not an object literal (a module IIFE's own helpers).
+ */
+function objectLiteralOwnerOf(n: Node, context: ResolutionContext): Node | null {
+  if (n.kind !== 'function' || !JS_FAMILY.has(n.language)) return null;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return null;
+  let memo = OBJECT_OWNER_OF.get(context);
+  if (!memo) OBJECT_OWNER_OF.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const parent = n.qualifiedName.slice(0, cut);
+  const owner = context.getNodesByQualifiedName(parent).find((o) =>
+    o.filePath === n.filePath && o.id !== n.id && isObjectLiteralOwner(o) && rangeWithin(n, o)) ?? null;
+  memo.set(n.id, owner);
+  return owner;
+}
+
+/** The node a qualified name's parent names, in `n`'s file and holding it. */
+function qualifiedParentOf(n: Node, context: ResolutionContext): Node | null {
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return null;
+  return context.getNodesByQualifiedName(n.qualifiedName.slice(0, cut))
+    .find((p) => p.filePath === n.filePath && p.id !== n.id && rangeWithin(n, p)) ?? null;
+}
+
+/** An arrow function's text: `(a) =>`, `async (a) =>`, `a =>`, `<T>(a: T) =>` — not `name(…) {`, `function …`. */
+const ARROW_HEAD = /^(?:async\s*)?(?:[(<]|[A-Za-z_$][\w$]*\s*=>)/;
+
+/** Whether an object literal's member is an arrow function — one that has no `this` of its own. */
+function isArrowMember(n: Node, context: ResolutionContext): boolean {
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split('\n'))?.[n.startLine - 1] ?? '';
+  return ARROW_HEAD.test(line.slice(n.startColumn));
+}
+
+const THIS_CALLERS = new WeakMap<ResolutionContext, Map<string, Node>>();
+
+/**
+ * The caller whose scope `this` belongs to, for code written in `caller`
+ * (#2300). An object literal's own method — `load() {…}`, `load: function () {…}`
+ * — has the object: it is returned as is, so its qualified parent is the
+ * owner. An arrow member has no `this` of its own, and a value written in the
+ * literal runs where the literal is: both take the `this` of the code around
+ * the literal, a class method's in `class App { api() { return { load: () =>
+ * this.x() } } }`. Any other caller is its own scope.
+ */
+export function thisScopeCaller(caller: Node, context: ResolutionContext): Node {
+  if (!JS_FAMILY.has(caller.language)) return caller;
+  let memo = THIS_CALLERS.get(context);
+  if (!memo) THIS_CALLERS.set(context, (memo = new Map()));
+  const hit = memo.get(caller.id);
+  if (hit) return hit;
+  let cur = caller;
+  for (let depth = 0; depth < 8; depth++) {
+    const owner = isObjectLiteralOwner(cur) ? cur
+      : objectLiteralOwnerOf(cur, context) !== null && isArrowMember(cur, context) ? objectLiteralOwnerOf(cur, context) : null;
+    if (!owner) break;
+    const up = qualifiedParentOf(owner, context);
+    if (!up) break;
+    cur = up;
+  }
+  memo.set(caller.id, cur);
+  return cur;
+}
+
+/** The object literal `this` is inside `caller`, when it is one: the owner of an object's own method. */
+function thisObjectOf(caller: Node, context: ResolutionContext): Node | null {
+  const scope = thisScopeCaller(caller, context);
+  const owner = objectLiteralOwnerOf(scope, context);
+  return owner && !isArrowMember(scope, context) ? owner : null;
+}
+
+/** Whether (line, column) falls inside `n`'s source range. */
+function positionWithin(line: number, column: number, n: Node): boolean {
+  const end = n.endLine ?? n.startLine;
+  if (line < n.startLine || line > end) return false;
+  if (line === n.startLine && column < n.startColumn) return false;
+  return !(line === end && column >= n.endColumn);
+}
+
+/**
+ * What the object-literal lookups read from a JS/TS file (#2300), each part
+ * built on first use: its source with comments and string contents blanked
+ * (offsets kept), its `{…}` blocks, the scopes it binds a name in and the
+ * names it destructures off a path. References arrive file by file, so only
+ * the last few files' are kept: no file is read twice in a row, and a large
+ * project's files are never all held at once (#2334).
+ */
+interface JsFileScan {
+  source: string | null;
+  code?: string | null;
+  blocks?: JsBlockIndex | null;
+  bindings?: Map<string, Array<[number, number]>>;
+  destructured?: Map<string, Set<string>>;
+}
+
+const JS_FILE_SCANS = new WeakMap<ResolutionContext, Map<string, JsFileScan>>();
+const JS_FILE_SCANS_KEEP = 32;
+
+function jsFileScan(filePath: string, context: ResolutionContext): JsFileScan {
+  let files = JS_FILE_SCANS.get(context);
+  if (!files) JS_FILE_SCANS.set(context, (files = new Map()));
+  let scan = files.get(filePath);
+  if (scan) {
+    files.delete(filePath); // re-added below: the most recently read goes last
+  } else {
+    const source = context.readFile(filePath);
+    scan = { source: typeof source === 'string' ? source : null };
+    if (files.size >= JS_FILE_SCANS_KEEP) files.delete(files.keys().next().value!);
+  }
+  files.set(filePath, scan);
+  return scan;
+}
+
+function scannedCode(scan: JsFileScan): string | null {
+  if (scan.code === undefined) {
+    scan.code = scan.source === null ? null : blankStringContents(stripCommentsForRegex(scan.source, 'typescript'));
+  }
+  return scan.code;
+}
+
+/** A JS/TS file's source with comments and string contents blanked, offsets kept. */
+function maskedJsSource(filePath: string, context: ResolutionContext): string | null {
+  return scannedCode(jsFileScan(filePath, context));
+}
+
+/**
+ * Whether a reference by NAME alone can mean an object literal's member. Only
+ * three ways write one: the owner's own `this.load()` (a sibling member), a
+ * named function expression calling itself (`load: function load() { load() }`),
+ * and a binding destructured off the owner (`const { load } = App`). A bare
+ * `load()`, a callback `setTimeout(load)`, `window.Other.load()` mean a
+ * function of that name — or nothing.
+ */
+function isObjectMemberReachableByName(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const owner = objectLiteralOwnerOf(n, context);
+  if (!owner) return true;
+  if (ref.filePath === n.filePath) {
+    if (ref.referenceKind === 'calls' && positionWithin(ref.line, ref.column, owner) &&
+        bareCallReceiver(ref, context)?.receiver === 'self') {
+      // `this` must be that object: written in one of its own methods, not in an arrow member.
+      const caller = context.getNodeById?.(ref.fromNodeId);
+      if (caller && thisObjectOf(caller, context)?.id === owner.id) return true;
+    }
+    if (positionWithin(ref.line, ref.column, n)) {
+      const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split('\n'))?.[n.startLine - 1] ?? '';
+      const self = new RegExp(`^(?:async\\s+)?function\\s*\\*?\\s*${n.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`);
+      if (self.test(line.slice(n.startColumn))) return true;
+    }
+  }
+  return destructuresMember(ref.filePath, holderPath(owner), n.name, context);
+}
+
+/** `{ … } = App` / `= window.App.utils`: a pattern destructured off a plain path (the whole right-hand side). */
+const DESTRUCTURED_OFF_PATH = /\{([^{}]*)\}\s*=\s*(?:(?:window|globalThis)\s*\.\s*)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)(?![\w$])(?!\s*[.(\[])/g;
+/**
+ * A `}` then `=` with only space and comments between — what any such pattern
+ * holds, read off the raw text. Each comment form matches one way only (a
+ * line comment through its newline, a block comment to its first `*\/`), so
+ * a `////////` banner can't make the match backtrack without end.
+ */
+const CLOSE_THEN_ASSIGN = /\}(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\n]*\n)*=(?!=)/;
+
+/**
+ * Whether a file binds `member` by destructuring it off the object at `path`:
+ * `{ load }` or `{ a, load = fallback }` off `App` — not `{ x: load }`, which
+ * binds `load` to `App.x`. The file's patterns are read once, on first use.
+ */
+function destructuresMember(filePath: string, path: string, member: string, context: ResolutionContext): boolean {
+  const scan = jsFileScan(filePath, context);
+  if (!scan.destructured) {
+    const paths = new Map<string, Set<string>>();
+    const code = scan.source !== null && CLOSE_THEN_ASSIGN.test(scan.source) ? scannedCode(scan) : null;
+    for (const m of code?.matchAll(DESTRUCTURED_OFF_PATH) ?? []) {
+      const own = [...destructuredKeys(m[1]!)].filter(([name, key]) => name === key).map(([name]) => name);
+      if (own.length === 0) continue;
+      const at = m[2]!.replace(/\s+/g, '');
+      const names = paths.get(at);
+      if (names) for (const name of own) names.add(name);
+      else paths.set(at, new Set(own));
+    }
+    scan.destructured = paths;
+  }
+  return scan.destructured.get(path)?.has(member) ?? false;
+}
+
+/** A file's `{…}` blocks: for any offset, the innermost one open there (see jsBlockAt). */
+interface JsBlockIndex {
+  lineStarts: number[];
+  /** Offsets of every `{` and `}`, in order. */
+  events: number[];
+  /** The innermost block still open just after each event (its `{` offset), -1 at the top level. */
+  open: number[];
+  close: Map<number, number>;
+  length: number;
+}
+
+function jsBlockIndex(filePath: string, context: ResolutionContext): JsBlockIndex | null {
+  const scan = jsFileScan(filePath, context);
+  if (scan.blocks === undefined) {
+    const code = scannedCode(scan);
+    scan.blocks = code === null ? null : readJsBlocks(code);
+  }
+  return scan.blocks;
+}
+
+function readJsBlocks(code: string): JsBlockIndex {
+  const lineStarts = [0];
+  const events: number[] = [];
+  const open: number[] = [];
+  const close = new Map<number, number>();
+  const stack: number[] = [];
+  for (let i = 0; i < code.length; i++) {
+    const ch = code.charCodeAt(i);
+    if (ch === 10) { lineStarts.push(i + 1); continue; }
+    if (ch === 123) stack.push(i);
+    else if (ch === 125) {
+      const at = stack.pop();
+      if (at !== undefined) close.set(at, i);
+    } else continue;
+    events.push(i);
+    open.push(stack.length > 0 ? stack[stack.length - 1]! : -1);
+  }
+  return { lineStarts, events, open, close, length: code.length };
+}
+
+/** The offset of (line, column) in a file. */
+function jsOffset(index: JsBlockIndex, line: number, column: number): number {
+  return (index.lineStarts[line - 1] ?? index.length) + column;
+}
+
+/** The innermost `{…}` holding an offset, as [open, close] — null at the file's top level. */
+function jsBlockAt(index: JsBlockIndex, offset: number): [number, number] | null {
+  let lo = 0;
+  let hi = index.events.length - 1;
+  let at = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (index.events[mid]! < offset) { at = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  const open = at < 0 ? -1 : index.open[at]!;
+  return open < 0 ? null : [open, index.close.get(open) ?? index.length];
+}
+
+/**
+ * The offset ranges a JS/TS file binds `name` in: a declaration's or a
+ * function/class name's enclosing block (the whole file at the top level), a
+ * parameter's function body (an expression-bodied arrow's, to the end of its
+ * enclosing block). The patterns are isLocallyBoundJsName's; only the scope is
+ * added, so one function's parameter does not shadow a global in another.
+ */
+function bindingScopes(name: string, filePath: string, context: ResolutionContext): Array<[number, number]> {
+  const scan = jsFileScan(filePath, context);
+  const memo = (scan.bindings ??= new Map());
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const scopes: Array<[number, number]> = [];
+  const code = scannedCode(scan);
+  const index = jsBlockIndex(filePath, context);
+  if (code && index && code.includes(name)) {
+    const blockOf = (at: number): [number, number] => jsBlockAt(index, at) ?? [-1, code.length];
+    // The body a parameter list (ending in `{` or `=>`) opens.
+    const bodyAfter = (start: number, end: number): [number, number] => {
+      if (code[end - 1] === '{') return [end - 1, index.close.get(end - 1) ?? code.length];
+      let i = end;
+      while (i < code.length && /\s/.test(code[i]!)) i++;
+      if (code[i] === '{') return [i, index.close.get(i) ?? code.length];
+      return [start, blockOf(start)[1]];
+    };
+    const { decl, fn, param } = localBindingPatterns(name, 'g');
+    for (const m of code.matchAll(decl)) scopes.push(blockOf(m.index!));
+    for (const m of code.matchAll(fn)) scopes.push(blockOf(m.index!));
+    for (const m of code.matchAll(param)) scopes.push(bodyAfter(m.index!, m.index! + m[0].length));
+    const arrow = new RegExp(`(?<![\\w$.])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=>`, 'g');
+    for (const m of code.matchAll(arrow)) scopes.push(bodyAfter(m.index!, m.index! + m[0].length));
+  }
+  memo.set(name, scopes);
+  return scopes;
+}
+
+/** Whether a binding of `name` in the reference's own file encloses the reference. */
+function bindsNameAt(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const index = jsBlockIndex(ref.filePath, context);
+  if (!index) return false;
+  const at = jsOffset(index, ref.line, ref.column);
+  return bindingScopes(name, ref.filePath, context).some(([start, end]) => at > start && at < end);
+}
+
+/**
+ * Where a same-file holder of an object can be seen from: the block it is
+ * declared in (an IIFE's, a function's), or the whole file for one at the top
+ * level — and for a path hung by assignment, which is a property of its root
+ * object wherever that is. Returns the depth to rank by (the block's `{`
+ * offset; -1 for the whole file), or null when the reference cannot see it —
+ * outside its block, or where the calling function binds the root name itself.
+ */
+function holderScopeAt(holder: Node, ref: UnresolvedRef, viaGlobal: boolean, context: ResolutionContext): number | null {
+  let depth = -1;
+  // A single-file component's source holds its template and styles too, whose
+  // braces are not blocks: a holder there is read as the script's top level.
+  if (!isPathHolder(holder) && JS_TS.has(holder.language)) {
+    const index = jsBlockIndex(holder.filePath, context);
+    const block = index ? jsBlockAt(index, jsOffset(index, holder.startLine, holder.startColumn)) : null;
+    if (index && block) {
+      const at = jsOffset(index, ref.line, ref.column);
+      if (at <= block[0] || at >= block[1]) return null;
+      depth = block[0];
+    }
+  }
+  const root = viaGlobal ? null : holderPath(holder).split('.')[0]!;
+  const local = root ? jsFunctionLocalScope(root, ref, context) : null;
+  if (local && !(holder.filePath === ref.filePath && holder.startLine >= local.start && holder.startLine <= local.end)) return null;
+  return depth;
+}
+
+const CLASSIC_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a JS/TS file is a classic script — no `import`, `export`, CommonJS
+ * export or `require(…)` — whose top-level names are globals every other
+ * script on the page shares (#2300).
+ */
+function isClassicScript(filePath: string, context: ResolutionContext): boolean {
+  let memo = CLASSIC_SCRIPTS.get(context);
+  if (!memo) CLASSIC_SCRIPTS.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath);
+  let classic = false;
+  if (typeof source === 'string' && !/\.mjs$|\.cjs$/i.test(filePath) && !HAS_CJS_EXPORT.test(source)) {
+    const code = maskedJsSource(filePath, context) ?? '';
+    classic = !HAS_IMPORT_STATEMENT.test(code) && !HAS_ESM_EXPORT.test(code) && !/(?:^|[^\w$.])require\s*\(/.test(code);
+  }
+  memo.set(filePath, classic);
+  return classic;
+}
+
+const GLOBAL_HOLDERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether a holder in another file is a global: on the global object, or at the top level of a classic script. */
+function isGlobalHolder(n: Node, context: ResolutionContext): boolean {
+  let memo = GLOBAL_HOLDERS.get(context);
+  if (!memo) GLOBAL_HOLDERS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  let global: boolean;
+  if (HOST_GLOBAL_PREFIX.test(lastQualifiedSegment(n.qualifiedName))) global = true;
+  else if (!JS_TS.has(n.language) || !isClassicScript(n.filePath, context)) global = false;
+  else if (!isPathHolder(n)) {
+    const index = jsBlockIndex(n.filePath, context);
+    global = !!index && jsBlockAt(index, jsOffset(index, n.startLine, n.startColumn)) === null;
+  } else {
+    // `App.utils = {…}` is global when `App` is: declared at a classic script's top level, or on the global object.
+    const root = holderPath(n).split('.')[0]!;
+    global = context.getNodesByName(root).some((r) => (r.kind === 'constant' || r.kind === 'variable') &&
+      JS_FAMILY.has(r.language) && holderPath(r) === root && r.id !== n.id && isGlobalHolder(r, context));
+  }
+  memo.set(n.id, global);
+  return global;
+}
+
+/**
+ * Resolve `member` on the object a dotted `path` names, at `ref` (#2300):
+ * `App` for `App.init()` / `window.App.init()`, `App.utils` for
+ * `App.utils.fmt()`. A same-file holder the reference can see comes first, the
+ * innermost; then — when the file neither imports nor binds the path's root —
+ * a global one: `window.App = {…}` anywhere, or a classic script's top-level
+ * `App`. Several equally near holders that all have the member are no answer.
+ * `host` is the global object the call was written on (`window.App.init()`),
+ * null for a bare `App.init()`. Undefined when no holder of the path exists at
+ * all (so a caller can try its other strategies), null when one exists but
+ * none has the member.
+ */
+function resolveObjectPathMember(
+  path: string,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  host: string | null,
+): ResolvedRef | null | undefined {
+  const viaGlobal = host !== null;
+  const tail = path.slice(path.lastIndexOf('.') + 1);
+  const named = context.getNodesByName(tail).filter((n) =>
+    (n.kind === 'constant' || n.kind === 'variable') && OBJECT_LITERAL_LANGUAGES.has(n.language) &&
+    sameLanguageFamily(n.language, ref.language) && holderPath(n) === path);
+  if (named.length === 0) return undefined;
+  const hitOn = (holder: Node): ResolvedRef | null =>
+    resolveObjectLiteralMember(holder, member, ref, context, 0.85, 'instance-method') ??
+    resolveObjectLiteralBinding(holder, member, ref, context);
+
+  const local = named
+    .filter((n) => n.filePath === ref.filePath)
+    .map((n) => ({ n, depth: holderScopeAt(n, ref, viaGlobal, context) }))
+    .filter((e): e is { n: Node; depth: number } => e.depth !== null)
+    .sort((a, b) => b.depth - a.depth);
+  if (local.length > 0) {
+    // The nearest holders only: an outer one is shadowed where an inner one exists.
+    const nearest = local.filter((e) => e.depth === local[0]!.depth);
+    for (const { n } of nearest) {
+      const hit = hitOn(n);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  const hits = named
+    .filter((n) => n.filePath !== ref.filePath && isObjectLiteralOwner(n) && isGlobalHolder(n, context))
+    .map((n) => ({ n, hit: hitOn(n) }))
+    .filter((e): e is { n: Node; hit: ResolvedRef } => e.hit !== null);
+  if (hits.length === 0) return null;
+  // A global is what the call names only where nothing nearer binds the name:
+  // the file's own import of it, a parameter or local around the call — or,
+  // for `window.App`, a `window` of its own. (Checked once a global holder has
+  // the member: it reads the calling file.)
+  const root = path.split('.')[0]!;
+  if (host !== null ? bindsNameAt(host, ref, context)
+    : isImportBinding(root, ref, context) || bindsNameAt(root, ref, context)) return null;
+  const targets = new Set(hits.map((e) => e.hit.targetNodeId));
+  if (targets.size === 1) return { ...hits[0]!.hit, confidence: 0.8 };
+  // The same namespace defined twice (a page's copy and a build's): the caller's own directory decides, or nothing does.
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  const near = hits.filter((e) => e.n.filePath.startsWith(dir) && !e.n.filePath.slice(dir.length).includes('/'));
+  return new Set(near.map((e) => e.hit.targetNodeId)).size === 1 ? { ...near[0]!.hit, confidence: 0.75 } : null;
+}
+
+/**
+ * `a.b.m()` through a namespace an object literal was hung on (`App.utils =
+ * {…}` then `App.utils.fmt()`, #2300). Identifier-rooted chains carry no type
+ * (#1566), so nothing else may resolve them: this answers only when a holder
+ * of exactly that path exists, and is null otherwise.
+ */
+export function matchObjectPathCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language)) return null;
+  const dot = ref.referenceName.lastIndexOf('.');
+  if (dot <= 0) return null;
+  let path = ref.referenceName.slice(0, dot);
+  const host = HOST_GLOBAL_PREFIX.test(path) ? path.slice(0, path.indexOf('.')) : null;
+  if (host !== null) path = path.slice(host.length + 1);
+  if (!path.includes('.') && host === null) return null;
+  return resolveObjectPathMember(path, ref.referenceName.slice(dot + 1), ref, context, host) ?? null;
+}
+
+/** `(` after optional space, at `lastIndex`. */
+const OPEN_PAREN_AT = /\s*\(/y;
+
+/** `window.App.utils` at the end of a receiver's text → host `window`, path `App.utils`. */
+const HOST_GLOBAL_RECEIVER =/(?:^|[^\w$.])(window|globalThis)\s*\??\.\s*([A-Za-z_$][\w$]*(?:\s*\??\.\s*[A-Za-z_$][\w$]*)*)$/;
+
+/**
+ * A call the extractor recorded by its bare name although it was written on
+ * an object (#2300): `window.App.init()` — the `window` chain keeps its bare
+ * name as the project-global escape (#1707) — and `this.render()` inside an
+ * object literal's member. Both name the owner of the member they call, which
+ * is tried first. Undefined when the call is neither, or no such owner has the
+ * member (the bare-name strategies then run as before).
+ */
+export function matchCollapsedObjectCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | undefined {
+  if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language) || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return undefined;
+  // A call written bare starts with its own name and `(`: no receiver to read.
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (line?.startsWith(ref.referenceName, ref.column)) {
+    OPEN_PAREN_AT.lastIndex = ref.column + ref.referenceName.length;
+    if (OPEN_PAREN_AT.test(line)) return undefined;
+  }
+  const written = bareCallReceiver(ref, context);
+  if (!written) return undefined;
+  if (written.receiver === 'self') {
+    // The object literal `this` is — the owner of the method the call is
+    // written in (an arrow member's `this` is the code around the literal's) —
+    // when it has the member.
+    const caller = context.getNodeById?.(ref.fromNodeId);
+    const owner = caller ? thisObjectOf(caller, context) : null;
+    const hit = owner ? resolveObjectLiteralMember(owner, ref.referenceName, ref, context, 0.85, 'instance-method') : null;
+    return hit ?? undefined;
+  }
+  const host = HOST_GLOBAL_RECEIVER.exec(written.receiver);
+  if (!host) return undefined;
+  return resolveObjectPathMember(host[2]!.replace(/[\s?]/g, ''), ref.referenceName, ref, context, host[1]!) ?? undefined;
 }
 
 // Exported for the precedence unit tests (#1079): they assert the
@@ -7078,6 +7617,11 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
+  JS_FILE_SCANS.delete(context);
+  OBJECT_OWNER_OF.delete(context);
+  THIS_CALLERS.delete(context);
+  GLOBAL_HOLDERS.delete(context);
+  CLASSIC_SCRIPTS.delete(context);
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
   JVM_PACKAGES.delete(context);
@@ -8342,26 +8886,17 @@ export function matchMethodCall(
   }
 
   // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
-  // same-file `const api = { call() {…}, get: () => {…} }`. Its members are
-  // plain functions with bare names inside the constant's extent — no
-  // `Container::member` qualified name — so none of the class-shaped
-  // strategies below can see them (Strategy 3 only considers `method`
-  // kinds) and the call resolved to nothing at all. Same file only: a
-  // cross-file use reaches the same helper through the import path.
+  // `const api = { call() {…}, get: () => {…} }`. Its members are functions
+  // inside the constant's extent, found by containment — none of the
+  // class-shaped strategies below can see them (Strategy 3 only considers
+  // `method` kinds). The holder is the one the call can see: in its own file,
+  // the nearest enclosing declaration (an IIFE's `const App` before the file's);
+  // otherwise a global — `window.App = {…}`, or a classic script's top-level
+  // `App` — when the file doesn't import or bind the name itself (#2300). An
+  // imported holder reaches the same member through the import path.
   if (dotMatch && !objectOrClass!.includes('.') && OBJECT_LITERAL_LANGUAGES.has(ref.language)) {
-    const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null => {
-      // Same-file holders only, so the call-site-first ordering is moot.
-      const holders = context.getNodesByName(objectOrClass!).filter(
-        (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
-      );
-      for (const holder of holders) {
-        const hit =
-          resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method') ??
-          resolveObjectLiteralBinding(holder, methodName!, ref, context);
-        if (hit) return hit;
-      }
-      return null;
-    });
+    const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null =>
+      resolveObjectPathMember(objectOrClass!, methodName!, ref, context, null) ?? null);
     if (literalMatch) return literalMatch;
   }
 
@@ -9258,8 +9793,11 @@ function matchTsThisFieldCall(
   context: ResolutionContext,
 ): ResolvedRef | null {
   if (!field || field.includes('.')) return null;
-  const caller = context.getNodeById?.(ref.fromNodeId);
-  if (!caller) return null;
+  const written = context.getNodeById?.(ref.fromNodeId);
+  if (!written) return null;
+  // An arrow member of an object literal written in a method has that
+  // method's `this` (#2300).
+  const caller = thisScopeCaller(written, context);
   const sep = caller.qualifiedName.lastIndexOf('::');
   if (sep <= 0) return null; // not inside a class
   const owner = caller.qualifiedName.slice(0, sep).split('::').pop();
@@ -10568,7 +11106,14 @@ function matchReferenceInner(
     }
   }
 
-  if (isUnresolvedJsMemberCall(ref)) return null;
+  // An identifier-rooted chain has no type to resolve through (#1566) — unless
+  // its receiver is a path an object literal was hung on (#2300).
+  if (isUnresolvedJsMemberCall(ref)) return matchObjectPathCall(ref, context);
+
+  // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
+  // name: the object they are written on comes first (#2300).
+  const collapsed = matchCollapsedObjectCall(ref, context);
+  if (collapsed) return collapsed;
 
   // A Swift call through a type path (`API.PackageController.GetRoute.query`)
   // resolves on the type the path names, or not at all: the strategies below

@@ -98,6 +98,43 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('named object literals own their members: %s (#2300)', (ext, language) => {
+    const source = [
+      '/* é😀 */ const Api = { read() { helper(); }, close: () => helper(), gen: function* () { yield 1; }, \'quoted-key\': function () {}, [dyn()]() { helper(); }, eager: helper(), alias: helper, helper };',
+      'function helper() {}',
+      '/** Saved. */',
+      'export const Exported = { save() { helper(); } };',
+      '(function () { const Local = { run() { helper(); } }, data = { x: 1 }; Local.run(); window.WS = { ws() { Local.run(); } }; })();',
+      'App.utils = { pad(s) { return s; } };',
+      '// The page.',
+      'dw_page = { start() { helper(); } };',
+      'function setup() { ns.late = { go() {} }; let h; h = { on() {} }; }',
+      'module.exports = { cjs() {} };',
+      'Foo.prototype = { proto() {} };',
+      'self.handlers = { click() {} };',
+      'consume({ ephemeral() {} });',
+      '',
+    ].join('\n');
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`literal.${ext}`, source.replace(/\n/g, ending), language);
+      expect(result.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining([
+        'Api::read', 'Api::close', 'Api::gen', 'Api::quoted-key', 'Exported::save', 'Local::run', 'window.WS',
+        'window.WS::ws', 'App.utils::pad', 'dw_page::start', 'ns.late::go', 'self.handlers::click',
+      ]));
+      // A plain name reassigned inside a function is a local, not a namespace.
+      for (const name of ['cjs', 'proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+    }
+  });
+
+  it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {
+    // Mostly long lines dense with code punctuation, as a minifier writes them.
+    const line = `var a={b:function(){return c(1,2)},d:function(e){return e}};window.L={f:function(){return a.b()}};`.repeat(40);
+    const result = assertParity(file, `${line}\n${line}\n`, 'javascript');
+    expect(result.nodes.some((n) => n.kind === 'function' && (n.name === 'b' || n.name === 'f'))).toBe(false);
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('same-line accessors retain distinct identities after Unicode: %s (#1349)', (ext, language) => {
     const source = 'class Point { /* é😀 */ get x() { return read(); } set x(v) { write(v); } }';
     const result = assertParity(`point.${ext}`, source, language);

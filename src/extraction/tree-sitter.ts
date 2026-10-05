@@ -18,7 +18,7 @@ import {
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
-import { isGeneratedFile } from './generated-detection';
+import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
@@ -456,6 +456,25 @@ const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
+
+/**
+ * A named object literal owns its function members (#2300): `const api = {
+ * load() {…}, save: () => {…} }`, the same object inside an IIFE or another
+ * function, or one hung on a path — `window.App = {…}`, `App.utils = {…}`.
+ * Each member is a `function` node qualified under its owner (`api::load`,
+ * `window.App::init`), and the calls written in it are its own. These are the
+ * values a member can hold, and the keys that name one — a computed `[expr]`
+ * key names nothing static, so its member's code stays with the owner.
+ * Mirrored in the kernel (tsjs/extractors.rs).
+ */
+const OBJECT_MEMBER_FUNCTION_TYPES: ReadonlySet<string> = new Set(['arrow_function', 'function_expression', 'generator_function']);
+const STATIC_OBJECT_KEY_TYPES: ReadonlySet<string> = new Set(['property_identifier', 'string', 'number']);
+/**
+ * Path roots that are the global object: `window.App = {…}` defines the global
+ * `App`. (`self` is the global only in a worker; in page code it is far more
+ * often `var self = this`, so `self.x = {…}` stays an ordinary path.)
+ */
+const HOST_GLOBAL_ROOTS: ReadonlySet<string> = new Set(['window', 'globalThis']);
 /** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
 const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
 /** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
@@ -590,6 +609,12 @@ export class TreeSitterExtractor {
   private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
   // Memoized "is this a Vue store file" verdict (per-extractor = per-file).
   private vueStoreFile: boolean | null = null;
+  // An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`) is
+  // named by the path's last link but qualified by the whole path, which its
+  // members are then qualified under (see buildQualifiedName, #2300).
+  private objectPathOwners = new Map<string, string>();
+  // Memoized ownsObjectLiterals verdict (per-extractor = per-file).
+  private ownsObjects: boolean | null = null;
   // Source already went through the extractor's preParse at the kernel route
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
@@ -920,7 +945,7 @@ export class TreeSitterExtractor {
    * distinctive names become reference targets; function/method/const/var symbols become reader
    * scopes whose bodies flushValueRefs scans.
    */
-  private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode): void {
+  private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode, valueTarget = true): void {
     // Pascal targets `constant` only: its extractor emits function PARAMETERS
     // (`Dest: TBufferWriter`) and class fields (`declField`) as `variable` at the
     // enclosing scope, which would otherwise become noisy targets (a param name
@@ -929,7 +954,7 @@ export class TreeSitterExtractor {
     // `var` globals are the rare cost; the parameter/field noise dominates.)
     const targetKindOk =
       this.language === 'pascal' ? kind === 'constant' : kind === 'constant' || kind === 'variable';
-    if (targetKindOk && name.length >= 3 && /[A-Z_]/.test(name)) {
+    if (valueTarget && targetKindOk && name.length >= 3 && /[A-Z_]/.test(name)) {
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       // file-scope OR class/module/struct/enum-scope constants are targets.
       // Class/module scope matters for languages (Ruby) that keep nearly all
@@ -1223,6 +1248,10 @@ export class TreeSitterExtractor {
     // below (the captured container types have no other handler there), so it
     // can never shadow or be shadowed by an extraction branch.
     this.maybeCaptureFnRefs(node, nodeType);
+
+    // `window.App = {…}` / `App.utils = {…}`: the object's functions are the
+    // path's members (#2300). Its whole subtree is handled there.
+    if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, true)) return;
 
     // Check for function declarations
     // For Python/Ruby, function_definition inside a class should be treated as method
@@ -1573,7 +1602,10 @@ export class TreeSitterExtractor {
     kind: NodeKind,
     name: string,
     node: SyntaxNode,
-    extra?: Partial<Node>
+    extra?: Partial<Node>,
+    // False for a value no other scope names by this name — a local, or an
+    // object hung on a dotted path (see captureValueRefScope).
+    valueTarget = true
   ): Node | null {
     // Skip nodes with empty/missing names — they are not meaningful symbols
     // and would cause FK violations when edges reference them (see issue #42)
@@ -1635,7 +1667,7 @@ export class TreeSitterExtractor {
       }
     }
 
-    if (this.valueRefsEnabled) this.captureValueRefScope(kind, name, id, node);
+    if (this.valueRefsEnabled) this.captureValueRefScope(kind, name, id, node, valueTarget);
 
     return newNode;
   }
@@ -1714,6 +1746,13 @@ export class TreeSitterExtractor {
     // C/C++ enclosing namespaces prefix first (empty for every other language).
     const parts: string[] = [...this.namespacePrefix];
     for (const nodeId of this.nodeStack) {
+      // An object literal hung on a path qualifies what it holds by that path
+      // (`window.App::init`), which already carries its own scope.
+      const pathOwner = this.objectPathOwners.get(nodeId);
+      if (pathOwner !== undefined) {
+        parts.splice(0, parts.length, pathOwner);
+        continue;
+      }
       const node = this.nodes.find((n) => n.id === nodeId);
       if (node && node.kind !== 'file') {
         parts.push(node.name);
@@ -2563,6 +2602,164 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Whether a named object literal in this file owns its function members
+   * (#2300). TS/JS only; a generated or minified bundle — named so
+   * (`*.min.js`) or not (a vendored `bundle.js`, by its content) — keeps the
+   * old shape, so its single-letter objects don't become hundreds of nodes.
+   * Mirrored in the kernel (tsjs/extractors.rs owns_object_literals).
+   */
+  private ownsObjectLiterals(): boolean {
+    this.ownsObjects ??= TS_JS_CHAIN_LANGUAGES.has(this.language) && !isGeneratedFile(this.filePath) &&
+      !isMinifiedContent(this.filePath, this.source);
+    return this.ownsObjects;
+  }
+
+  /**
+   * The function an owned literal's member becomes, named by its static key:
+   * `load() {…}`, `load: () => {…}`, `load: function () {…}`, `load: function* () {…}`.
+   * Null for every other member — a computed key, a value, a shorthand, a spread.
+   */
+  private ownedMemberFunction(member: SyntaxNode): { fn: SyntaxNode; name: string } | null {
+    if (member.type === 'method_definition') {
+      const key = getChildByField(member, 'name');
+      return key && STATIC_OBJECT_KEY_TYPES.has(key.type) ? { fn: member, name: this.objectKeyName(key) } : null;
+    }
+    if (member.type !== 'pair') return null;
+    const key = getChildByField(member, 'key');
+    const value = getChildByField(member, 'value');
+    if (!key || !value || !STATIC_OBJECT_KEY_TYPES.has(key.type) || !OBJECT_MEMBER_FUNCTION_TYPES.has(value.type)) return null;
+    return { fn: value, name: this.objectKeyName(key) };
+  }
+
+  /** `value` when it is an object literal that owns at least one function member, else null. */
+  private ownedObjectValue(value: SyntaxNode | null): SyntaxNode | null {
+    if (!value || (value.type !== 'object' && value.type !== 'object_expression') || !this.ownsObjectLiterals()) return null;
+    for (let i = 0; i < value.namedChildCount; i++) {
+      const member = value.namedChild(i);
+      if (member && this.ownedMemberFunction(member)) return value;
+    }
+    return null;
+  }
+
+  /**
+   * Extract an owned literal's members: each function member becomes a node
+   * of its own, qualified under the owner (at file scope for one on the global
+   * object, `global`). Every other member — a value, a computed key, a spread —
+   * runs where the literal is written, so it is walked there: under the owner
+   * for a module-scope declaration (`valuesUnderOwner`, its initializer's calls
+   * are the constant's, #693), under the enclosing function for a local or an
+   * assignment, as they were before members had nodes. The literal's shorthand
+   * members (`{ load }`) go to the function-as-value capture the same way.
+   */
+  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean): void {
+    const enclosing = this.nodeStack;
+    const ownerStack = [...(global ? enclosing.slice(0, 1) : enclosing), ownerId];
+    const valueStack = valuesUnderOwner ? ownerStack : enclosing;
+    this.nodeStack = valueStack;
+    this.maybeCaptureFnRefs(obj, obj.type);
+    for (let i = 0; i < obj.namedChildCount; i++) {
+      const member = obj.namedChild(i);
+      if (!member) continue;
+      const owned = this.ownedMemberFunction(member);
+      this.nodeStack = owned ? ownerStack : valueStack;
+      if (owned) this.extractFunction(owned.fn, owned.name);
+      else this.visitFunctionBody(member, '');
+    }
+    this.nodeStack = enclosing;
+  }
+
+  /**
+   * `const api = { load() {…} }` written in a function body or an IIFE: the
+   * owner gets the node a module-scope declaration would, and its members are
+   * extracted under it (#2300). Returns false when the declarator holds no
+   * owned literal, leaving it to the walker.
+   */
+  private extractLocalObjectOwner(declarator: SyntaxNode): boolean {
+    const nameNode = getChildByField(declarator, 'name');
+    if (nameNode?.type !== 'identifier') return false;
+    const obj = this.ownedObjectValue(getChildByField(declarator, 'value'));
+    if (!obj) return false;
+    const declaration = declarator.parent;
+    const isConst = declaration ? (this.extractor?.isConst?.(declaration) ?? false) : false;
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    // A local: never the target of another scope's value read.
+    const owner = this.createNode(isConst ? 'constant' : 'variable', getNodeText(nameNode, this.source), declarator, {
+      docstring: this.docstringFor(declarator),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: false,
+    }, false);
+    if (!owner) return false;
+    this.extractVariableTypeAnnotation(declarator, owner.id);
+    this.extractOwnedObjectMembers(obj, owner.id, false, false);
+    return true;
+  }
+
+  /**
+   * `window.App = {…}` / `App.utils = {…}` / `dw_page = {…}`: an object
+   * literal assigned to a name owns its function members like a declared one
+   * (#2300). Assigned to a plain identifier — an implicit global, or a binding
+   * declared elsewhere — it is qualified like a declaration. Hung on a path,
+   * the owner is named by the path's last link and qualified by the path as
+   * written — `window.App`, `App.utils` — so its members read
+   * `window.App::init`: a property is reached through its object, not through
+   * the function that happened to assign it (Lua's `M.helpers::a` reads the
+   * same way). A path on the global object is global wherever it is written,
+   * so it is also contained by the file. CommonJS export objects and
+   * prototypes are not namespaces and are left alone. Returns false (nothing
+   * extracted) for any other assignment.
+   */
+  private extractAssignedObjectOwner(node: SyntaxNode, moduleLevel: boolean): boolean {
+    const obj = this.ownedObjectValue(getChildByField(node, 'right'));
+    if (!obj) return false;
+    const path = this.objectOwnerPath(getChildByField(node, 'left'));
+    // A plain name assigned at module level is a global (`dw_page = {…}`); in
+    // a function it is a local being reassigned (`e = {…}` in a bundle's IIFE).
+    if (!path || (path.length === 1 && !moduleLevel)) return false;
+    const qualifiedName = path.length > 1 ? path.join('.') : undefined;
+    const global = path.length > 1 && HOST_GLOBAL_ROOTS.has(path[0]!);
+    const saved = this.nodeStack;
+    if (global) this.nodeStack = saved.slice(0, 1);
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    const statement = node.parent?.type === 'expression_statement' ? node.parent : node;
+    // `App.utils` is read as `App.utils`, never as a bare `utils`: only a name
+    // the code reads by that name is a value-read target.
+    const owner = this.createNode('variable', path[path.length - 1]!, node, {
+      docstring: this.docstringFor(statement),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: false,
+      ...(qualifiedName !== undefined ? { qualifiedName } : {}),
+    }, path.length === 1 || global);
+    this.nodeStack = saved;
+    if (!owner) return false;
+    if (qualifiedName !== undefined) this.objectPathOwners.set(owner.id, qualifiedName);
+    this.extractOwnedObjectMembers(obj, owner.id, false, global);
+    return true;
+  }
+
+  /**
+   * The links of an assignment target written as plain names — `dw_page` →
+   * `['dw_page']`, `window.App` → `['window', 'App']`, `App.utils.dom` →
+   * `['App', 'utils', 'dom']` — or null for anything else: `this.x`, a
+   * computed `a[k]`, a call, CommonJS's `module.exports` / `exports.x`, or a
+   * prototype.
+   */
+  private objectOwnerPath(left: SyntaxNode | null): string[] | null {
+    const path: string[] = [];
+    let cur = left;
+    while (cur?.type === 'member_expression') {
+      const property = getChildByField(cur, 'property');
+      if (property?.type !== 'property_identifier') return null;
+      path.unshift(getNodeText(property, this.source));
+      cur = getChildByField(cur, 'object');
+    }
+    if (cur?.type !== 'identifier') return null;
+    const root = getNodeText(cur, this.source);
+    if (root === 'module' || root === 'exports' || path.includes('prototype')) return null;
+    path.unshift(root);
+    return path;
+  }
+
+  /**
    * Extract function-valued properties of an object literal as named function
    * nodes (named by their property key). Shared by the two object-of-functions
    * shapes in extractVariable: the object as a direct const value, and the
@@ -3052,6 +3249,17 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+            }
+
+            // A named object literal owns its function members, exported or
+            // not (#2300): `const api = { load() {…} }` gives `api::load`, and
+            // the calls written in a member are the member's. The rest of the
+            // literal is walked under the owner. (The same literal inside a
+            // function or an IIFE goes through visitFunctionBody.)
+            const ownedObject = varNode ? this.ownedObjectValue(valueNode) : null;
+            if (varNode && ownedObject) {
+              this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false);
+              continue;
             }
 
             // Exported const object-of-functions — extract each function-valued
@@ -6153,6 +6361,13 @@ export class TreeSitterExtractor {
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
       this.maybeCaptureFnRefs(node, nodeType);
+
+      // A named object literal in a body — an IIFE's `const App = {…}`, a
+      // handler map in a function — owns its function members as one at
+      // module scope does, and so does `window.App = {…}` written in here
+      // (#2300). Each handles its whole subtree.
+      if (nodeType === 'variable_declarator' && this.extractLocalObjectOwner(node)) return;
+      if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, false)) return;
 
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
