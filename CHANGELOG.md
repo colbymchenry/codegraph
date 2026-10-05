@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Indexing large Python projects is much faster again and needs less memory: since 1.6.2, resolving Python references re-read source files over and over, so a project the size of CPython took several times as long to index. The graph it builds is unchanged. Thanks @bompus for the report. (#2332)
 
 ## [1.6.2] - 2026-10-03
 

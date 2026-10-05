@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
@@ -659,32 +659,46 @@ function pythonGlobalClasses(global: Node, ref: UnresolvedRef, context: Resoluti
   let memo = PYTHON_GLOBAL_CLASSES.get(context);
   if (!memo) { memo = new Map(); PYTHON_GLOBAL_CLASSES.set(context, memo); }
   if (memo.has(global.id)) return memo.get(global.id)!;
-  const file = global.filePath;
-  const external = pythonExternalWrites(global, context);
+  const own = pythonOwnGlobalWrites(global, context);
+  const external = own && pythonExternalWrites(global, context);
   // Each type is resolved in the file that wrote it (its imports name the class).
-  const writes: Array<{ type: string; file: string }> = [...external.writes];
-  let classes: Node[] | null = external.unknown || pythonDynamicGlobalWrite(global.name, file, context) ? null : [];
-  for (const b of classes ? pythonGlobalBindings(global.name, file, context) : []) {
-    if (b.kind !== 'assign') { classes = null; break; }
-    const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
-    if (b.type) {
-      // `conn: Base = make()` trusts the annotation; `conn: A = B()` contradicts it.
-      if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) { classes = null; break; }
-      writes.push({ type: b.type, file });
-      continue;
-    }
-    if (b.value === 'None') continue;
-    if (!constructor) { classes = null; break; }
-    writes.push({ type: constructor, file });
-  }
+  const writes = external && !external.unknown ? [...external.writes, ...own!] : null;
+  let classes: Node[] | null = writes && [];
   const seen = new Set<string>();
-  for (const write of classes ? writes : []) {
+  for (const write of writes ?? []) {
     const cls = pythonRefClass(write.type, { ...ref, filePath: write.file }, context);
     if (!cls) { classes = null; break; }
     if (!seen.has(cls.id)) { seen.add(cls.id); classes!.push(cls); }
   }
   memo.set(global.id, classes);
   return classes;
+}
+
+/**
+ * The types the global's own module writes to it, or null when a binding
+ * there leaves its type unknown — whatever other modules write, so they are
+ * not read (#2332).
+ */
+function pythonOwnGlobalWrites(global: Node, context: ResolutionContext): Array<{ type: string; file: string }> | null {
+  return pythonNameScan(context, `own\0${global.id}`, () => {
+    const file = global.filePath;
+    if (pythonDynamicGlobalWrite(global.name, file, context)) return null;
+    const writes: Array<{ type: string; file: string }> = [];
+    for (const b of pythonGlobalBindings(global.name, file, context)) {
+      if (b.kind !== 'assign') return null;
+      const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
+      if (b.type) {
+        // `conn: Base = make()` trusts the annotation; `conn: A = B()` contradicts it.
+        if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) return null;
+        writes.push({ type: b.type, file });
+        continue;
+      }
+      if (b.value === 'None') continue;
+      if (!constructor) return null;
+      writes.push({ type: constructor, file });
+    }
+    return writes;
+  });
 }
 
 /**
@@ -722,9 +736,7 @@ function pythonModuleAliases(filePath: string, moduleFile: string, context: Reso
   const aliases = new Set<string>();
   const ambiguous = new Set<string>();
   for (const m of context.getImportMappings(filePath, 'python')) {
-    const dotted = m.isNamespace ? m.source
-      : /^\.+$/.test(m.source) ? `${m.source}${m.exportedName}` : `${m.source}.${m.exportedName}`;
-    const files = pythonModuleFiles(dotted, filePath, context);
+    const files = pythonImportedFiles(m, filePath, context);
     if (!files.includes(moduleFile)) continue;
     // The mapping cannot tell `import a.b` from `import a.b as b`; the source line can.
     // Exactly this module (not `other.a.b`), outside string literals.
@@ -734,6 +746,24 @@ function pythonModuleAliases(filePath: string, moduleFile: string, context: Reso
     (files.length === 1 ? aliases : ambiguous).add(plainDotted ? m.source : m.localName);
   }
   return { aliases: [...aliases], ambiguous: [...ambiguous] };
+}
+
+const PYTHON_IMPORTED_FILES = new WeakMap<ResolutionContext, WeakMap<ImportMapping, string[]>>();
+/**
+ * The repo files an import of `filePath` can name. Every global's write scan
+ * asks again of the same files (#2332); kept for as long as the resolver keeps
+ * the mapping itself, so the memo never outlives its import cache.
+ */
+function pythonImportedFiles(m: ImportMapping, filePath: string, context: ResolutionContext): string[] {
+  let memo = PYTHON_IMPORTED_FILES.get(context);
+  if (!memo) PYTHON_IMPORTED_FILES.set(context, (memo = new WeakMap()));
+  let files = memo.get(m);
+  if (!files) {
+    const dotted = m.isNamespace ? m.source
+      : /^\.+$/.test(m.source) ? `${m.source}${m.exportedName}` : `${m.source}.${m.exportedName}`;
+    memo.set(m, (files = pythonModuleFiles(dotted, filePath, context)));
+  }
+  return files;
 }
 
 const PYTHON_MAIN_GUARD = /^if\s+(?:__name__\s*==\s*(['"])__main__\1|(['"])__main__\2\s*==\s*__name__)\s*:/;
@@ -775,8 +805,8 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
     const out = { writes: [] as Array<{ type: string; file: string }>, unknown: false, writers: new Set<string>() };
     const name = global.name;
     const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    for (const file of context.getAllFiles()) {
-      if (file === global.filePath || !/\.pyi?$/.test(file) || !context.readFile(file)?.includes(name)) continue;
+    for (const file of pythonWriteCandidates(name, context)) {
+      if (file === global.filePath) continue;
       const test = isPythonTestFile(file);
       const { aliases, ambiguous } = pythonModuleAliases(file, global.filePath, context);
       if (!test && !aliases.length && !ambiguous.length) continue;
@@ -810,6 +840,41 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
     }
     return out;
   });
+}
+
+/**
+ * The Python files that can write a module global named `name`, in path
+ * order: those that spell it after a dot (`settings.conn = X`) or a quote
+ * (`setattr(settings, "conn", X)`), and those that write through `.__dict__`,
+ * whose statement may spell it anywhere. Comment stripping only blanks text,
+ * so whatever a stripped statement spells, the file's text spells too. The
+ * files are indexed once per pass, instead of every global reading every
+ * Python file (#2332).
+ */
+function pythonWriteCandidates(name: string, context: ResolutionContext): string[] {
+  const index = pythonNameScan(context, 'write-candidates', () => {
+    const files = context.getAllFiles().filter(f => /\.pyi?$/.test(f));
+    const spelled = new Map<string, number[]>();
+    const dict: Array<{ at: number; words: string }> = [];
+    files.forEach((file, at) => {
+      const source = context.readFile(file) ?? '';
+      const names = new Set<string>();
+      for (const m of source.matchAll(/[.'"](\w+)/g)) names.add(m[1]!);
+      for (const n of names) {
+        const list = spelled.get(n);
+        // A capture is a sliced view that would pin the file's whole text: key a flat copy.
+        if (list) list.push(at); else spelled.set(Buffer.from(n).toString(), [at]);
+      }
+      // A word-only name is in the text exactly when it is in one of its words.
+      if (names.has('__dict__')) dict.push({ at, words: [...new Set(source.match(/\w+/g))].join('\n') });
+    });
+    return { files, spelled, dict };
+  });
+  // The index holds ASCII words; any other name is looked for in every file's text.
+  if (!/^\w+$/.test(name)) return index.files.filter(f => context.readFile(f)?.includes(name));
+  const hits = new Set(index.spelled.get(name));
+  for (const { at, words } of index.dict) if (words.includes(name)) hits.add(at);
+  return [...hits].sort((a, b) => a - b).map(at => index.files[at]!);
 }
 
 /**
@@ -853,6 +918,8 @@ function pythonDynamicGlobalWrite(name: string, filePath: string, context: Resol
  * as a base-typed receiver does. Otherwise, no edge.
  */
 function pythonGlobalMembers(global: Node, member: string, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  // Unknown from its own module alone: no edge, and no other module to read.
+  if (!pythonOwnGlobalWrites(global, context)) return [];
   // A test that installs its own double sees the double, not the production type.
   if (pythonExternalWrites(global, context).writers.has(ref.filePath)) return [];
   const classes = pythonGlobalClasses(global, ref, context);
@@ -2538,6 +2605,14 @@ function isDecoratedFixture(n: Node, context: ResolutionContext): boolean {
 }
 
 const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+/**
+ * The file isPythonLocallyBound last read: its code lines, and per name
+ * whether its module binds it. Refs arrive grouped by file, so one file per
+ * context spares re-stripping the file for every function and name (#2332).
+ */
+const PY_LOCAL_FILE = new WeakMap<ResolutionContext, { filePath: string; lines: string[]; module: Map<string, boolean> }>();
+/** The ref isPythonLocallyBound last answered, and the answer. */
+const PY_LOCAL_LAST = new WeakMap<ResolutionContext, { ref: UnresolvedRef; name: string; bound: boolean }>();
 
 /**
  * Whether the function around a Python call — or its module, at top level —
@@ -2547,6 +2622,17 @@ const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
  * every such call went to one test file's `def view`.
  */
 function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // fitsPythonCallShape asks once per same-named candidate, and finding the
+  // function around the call reads every node in the file: answer a ref once (#2332).
+  const last = PY_LOCAL_LAST.get(context);
+  if (last?.ref === ref && last.name === name) return last.bound;
+  const bound = pythonLocalBinding(name, ref, context);
+  PY_LOCAL_LAST.set(context, { ref, name, bound });
+  return bound;
+}
+
+/** isPythonLocallyBound's answer, kept per calling function and name. */
+function pythonLocalBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const fn = context.getNodesInFile(ref.filePath)
     .filter((f) => (f.kind === 'function' || f.kind === 'method') && f.startLine <= ref.line && f.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -2561,7 +2647,12 @@ function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: Resolut
     return false;
   }
   // Code only: `{% user_display user as user_display %}` in a docstring binds nothing.
-  const lines = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'python').split(/\r?\n/);
+  let file = PY_LOCAL_FILE.get(context);
+  if (file?.filePath !== ref.filePath) {
+    const lines = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'python').split(/\r?\n/);
+    PY_LOCAL_FILE.set(context, (file = { filePath: ref.filePath, lines, module: new Map() }));
+  }
+  const lines = file.lines;
   const n = name;
   const assigns = new RegExp(`^\\s*(?:[\\w\\s,*()\\[\\]]*,\\s*)?\\(?\\*?${n}\\)?\\s*(?:,[\\w\\s,*()\\[\\]]*)?(?::[^=]+)?=(?!=)`);
   const targets = new RegExp(`\\bfor\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\s+in\\b|\\bas\\s+${n}\\b`);
@@ -2582,8 +2673,15 @@ function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: Resolut
     }
   }
   // A module-level binding (`view = api_view(['GET'])(handler)`).
-  const top = new RegExp(`^(?:[\\w,\\s]*,\\s*)?${n}\\s*(?:,[\\w\\s,]*)?(?::[^=]+)?=(?!=)`);
-  for (let line = 0; !bound && line < lines.length; line++) bound = top.test(lines[line] ?? '');
+  if (!bound) {
+    let module = file.module.get(n);
+    if (module === undefined) {
+      const top = new RegExp(`^(?:[\\w,\\s]*,\\s*)?${n}\\s*(?:,[\\w\\s,]*)?(?::[^=]+)?=(?!=)`);
+      module = lines.some(line => top.test(line));
+      file.module.set(n, module);
+    }
+    bound = module;
+  }
   memo.set(key, bound);
   return bound;
 }
@@ -6606,6 +6704,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PYTHON_STATEMENT_STARTS.delete(context);
   PYTHON_GLOBAL_CLASSES.delete(context);
   PYTHON_NAME_SCANS.delete(context);
+  PYTHON_IMPORTED_FILES.delete(context);
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
@@ -6664,6 +6763,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JVM_PACKAGES.delete(context);
   MINIFIED_SCRIPTS.delete(context);
   PY_LOCAL_BINDS.delete(context);
+  PY_LOCAL_FILE.delete(context);
+  PY_LOCAL_LAST.delete(context);
   OVERLOAD_SETS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
