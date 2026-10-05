@@ -713,4 +713,49 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     expect(writerLock()).toMatchObject({ pid: newer.pid, mode: 'daemon' });
     await status(newer.session, 3, 'a tool call through the newer daemon');
   }, 90000);
+
+  it('a session whose own install was upgraded serves reads only once its daemon exits', async () => {
+    // An upgrade in place: the daemon notices its package.json changed and
+    // exits (its install check), and its session falls back in-process. As
+    // the project's writer that session — running code the upgrade replaced —
+    // would only keep a daemon from the new install from starting.
+    const install = makeInstall('0.0.2');
+    try {
+      const before = await sessionWithDaemon(install, '0.0.2', {
+        CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200',
+        CODEGRAPH_DAEMON_RETRY_MS: '0',
+      });
+      fs.writeFileSync(path.join(install, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: '0.0.3' }) + '\n');
+      expect(await waitProcessExit(before.pid, 10000)).toBe(true);
+      expect(daemonLog()).toContain('Install replaced by v0.0.3');
+      await waitFor(
+        () => before.session.stderr.some((l) => l.includes('Shared daemon connection lost')),
+        10000, 'the session to lose its daemon',
+      );
+
+      await status(before.session, 3, 'a tool call after the daemon exited');
+      const stderr = before.session.stderr.join('\n');
+      expect(stderr).toContain("this session's CodeGraph install was upgraded or removed");
+      expect(stderr).not.toContain('File watcher active');
+      expect(writerLock()).toBeNull();
+
+      // So a session from the current install gets a daemon straight away.
+      const after = startSession(null);
+      await waitFor(() => attachedLine(after), 20000, 'the new session to attach');
+      const lock = daemonLock();
+      daemonPids.add(lock.pid);
+      expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
+    } finally {
+      // On Windows a process still running from the install blocks its removal.
+      for (const { child } of sessions) {
+        if (child.exitCode === null && child.signalCode === null) {
+          const exited = once(child, 'exit');
+          child.kill('SIGKILL');
+          await exited;
+        }
+      }
+      try { fs.unlinkSync(path.join(install, 'node_modules')); } catch { /* not created */ }
+      await fs.promises.rm(install, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  }, 90000);
 });

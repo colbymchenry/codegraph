@@ -44,12 +44,13 @@ import { MCPSession } from './session';
 import {
   Daemon,
   clearStaleDaemonLock,
+  installChangedReason,
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { CodeGraphPackageVersion } from './version';
+import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
   assertNoRebuild,
@@ -149,6 +150,14 @@ function makeFallbackEngine(root: string): MCPEngine {
   }
   if (existing && isProcessAlive(existing.pid)) {
     return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+  }
+  // This session's own install was upgraded or removed underneath it (#2335):
+  // its code no longer loads whole, so as the project's writer it would only
+  // keep a daemon from the current install from starting. Its daemon exits
+  // for the same reason, which is how it got here.
+  if (CodeGraphPackageVersion !== '0.0.0-unknown' &&
+      installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
+    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
   }
   return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
 }
