@@ -432,9 +432,9 @@ function typesAround(file: string, line: number, context: ResolutionContext): No
   return types.filter((n) => n.startLine <= line && n.endLine >= line);
 }
 
-/** The project's VB.NET types (classes, modules, structures, interfaces) named `name`, case aside. */
-function projectTypesNamed(name: string, context: ResolutionContext): Node[] {
-  return context.getNodesByLowerName(name.toLowerCase()).filter((n) => n.language === 'vbnet' && VB_TYPE_KINDS.has(n.kind));
+/** The project's VB.NET types (classes, modules, structures, interfaces — or `kinds`) named `name`, case aside. */
+function projectTypesNamed(name: string, context: ResolutionContext, kinds: ReadonlySet<string> = VB_TYPE_KINDS): Node[] {
+  return context.getNodesByLowerName(name.toLowerCase()).filter((n) => n.language === 'vbnet' && kinds.has(n.kind));
 }
 
 const VB_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
@@ -768,11 +768,16 @@ export function isVbTypeQualifiedBy(n: Node, qualifier: string, file: string, co
  * SCrawler declares
  * a `SiteSettings` in each site's namespace (`API.Pinterest`, `API.Bluesky`,
  * …); a member typed `SiteSettings` in `API.Pinterest.UserData` is
- * Pinterest's. `ambiguous` when what is left are different types.
+ * Pinterest's. `ambiguous` when what is left are different types. `kinds`
+ * widens the types looked for (an `Enum` a value is read through).
  */
-function typesNamedAt(written: VbType, context: ResolutionContext): { owners: Node[]; ambiguous: boolean } {
+function typesNamedAt(
+  written: VbType,
+  context: ResolutionContext,
+  kinds: ReadonlySet<string> = VB_TYPE_KINDS,
+): { owners: Node[]; ambiguous: boolean } {
   const t = written.file ? unalias(written, written.file, context) : written;
-  let candidates = projectTypesNamed(t.name, context);
+  let candidates = projectTypesNamed(t.name, context, kinds);
   // `System.Drawing.Color` is not the project's `Color`; `API.Base.UserDataBase` is that one.
   if (t.qualifier) candidates = candidates.filter((c) => endsWith(fullSegments(c, context).slice(0, -1), t.qualifier!));
   if (candidates.length === 0 || !t.file) return { owners: candidates, ambiguous: false };
@@ -993,9 +998,9 @@ function ownersOf(t: VbType, context: ResolutionContext): Node[] | null {
 }
 
 /**
- * A method — or, `withValues`, a field or property — named `name` on one of
- * `owners` (the type `typed` names) or a project type they inherit, with what
- * the type parameters of the type declaring it stand for.
+ * A method — or, `withValues`, a field or property; or what `fits` — named
+ * `name` on one of `owners` (the type `typed` names) or a project type they
+ * inherit, with what the type parameters of the type declaring it stand for.
  */
 function memberOn(
   owners: Node[],
@@ -1004,8 +1009,8 @@ function memberOn(
   context: ResolutionContext,
   withValues: boolean,
   typed?: VbType,
+  fits: (n: Node) => boolean = (n) => n.kind === 'method' || (withValues && VB_VALUE_KINDS.has(n.kind)),
 ): { node: Node; args: Map<string, VbType> } | null {
-  const fits = (n: Node) => n.kind === 'method' || (withValues && VB_VALUE_KINDS.has(n.kind));
   for (const level of [0, 1]) {
     for (const owner of preferVbProject(owners, ref, context)) {
       // What the owner's own parameters are, as the receiver's type writes them (`Repo(Of Foo)`).
@@ -1238,7 +1243,11 @@ export function matchVbTypedCall(
     if (named.owners.length === 0) return undefined;
     if (named.ambiguous) return null;
     const shared = memberOn(named.owners, method, ref, context, false);
-    return shared ? { original: ref, targetNodeId: shared.node.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
+    if (shared) return { original: ref, targetNodeId: shared.node.id, confidence: 0.85, resolvedBy: 'qualified-name' };
+    // `AppSession.Items(0)`: an index into a shared field or property, which
+    // VB.NET writes as a call — a read of the member and of its type (#2305).
+    const indexed = memberOn(named.owners, method, ref, context, true);
+    return indexed ? readThrough(indexed.node, named.owners, ref, context, { edgeKind: 'references' }) : null;
   }
   if (!type || typeKey(type) === 'object') return undefined;
   const owners = ownersOf(type, context);
@@ -1249,6 +1258,115 @@ export function matchVbTypedCall(
     if (own) return { original: ref, targetNodeId: own.node.id, confidence: 0.9, resolvedBy: 'instance-method' };
   }
   return extensionFor(type, owners, method, ref, context, isStdMethod);
+}
+
+/** The types a value is read through: those a shared call is made on, and an `Enum`. */
+const VB_READ_TYPE_KINDS: ReadonlySet<string> = new Set([...VB_TYPE_KINDS, 'enum']);
+
+/**
+ * What a read through a type names: a value it holds or gives (a field, a
+ * property, a constant, an `Enum` case, an event), a method — which VB.NET
+ * runs when it is named without parentheses — or a type nested in it.
+ */
+const VB_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'enum_member', 'method', ...VB_TYPE_LIKE_KINDS]);
+
+/** `Name.Member`, as the extractor sends a VB.NET value read through a name (extractVbMemberRead). */
+const VB_MEMBER_READ = /^([A-Za-z_]\w*)\.(\[?[A-Za-z_]\w*\]?)$/;
+
+/** Whether a reference is a VB.NET value read through a name, which matchVbMemberRead alone resolves. */
+export function isVbMemberRead(ref: UnresolvedRef): boolean {
+  return ref.language === 'vbnet' && ref.referenceKind === 'references' && VB_MEMBER_READ.test(ref.referenceName);
+}
+
+/**
+ * The project types `name` means where a value is read through it
+ * (`AppSession` in `AppSession.SessionId`): a class, module, structure,
+ * interface or enum. Null when the name holds a value there — a local, a
+ * parameter, a member of a type around the read or of a module — or names
+ * no project type, or two. A member typed as the type of its own name
+ * (`Public Property Settings As Settings`) reaches that type's members
+ * either way, as VB.NET's "Color Color" rule has it.
+ */
+function typesReadThrough(name: string, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
+  const bound = receiverType(name, ref, context, 0);
+  const written: VbType | null = bound === undefined ? { name, array: false, file: ref.filePath, line: ref.line }
+    : bound && !bound.array && bound.name.toLowerCase() === name.toLowerCase() ? bound : null;
+  if (!written) return null;
+  const found = typesNamedAt(written, context, VB_READ_TYPE_KINDS);
+  return found.ambiguous || found.owners.length === 0 ? null : found.owners;
+}
+
+/**
+ * A read of `member` through one of `owners` (the parts of the type its
+ * receiver names): the member, and the type as a second target — unless the
+ * read is written inside that type, which doesn't depend on itself.
+ */
+function readThrough(
+  member: Node,
+  owners: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  extra: Partial<ResolvedRef> = {},
+): ResolvedRef | null {
+  if (member.id === ref.fromNodeId) return null;
+  const owner = owners.find((o) => o.filePath === member.filePath) ?? owners[0]!;
+  const from = context.getNodeById?.(ref.fromNodeId)?.qualifiedName.toLowerCase();
+  const own = owner.qualifiedName.toLowerCase();
+  const inside = owner.id === ref.fromNodeId || (from !== undefined && (from === own || from.startsWith(`${own}::`)));
+  return {
+    original: ref,
+    targetNodeId: member.id,
+    confidence: 0.85,
+    resolvedBy: 'qualified-name',
+    ...extra,
+    ...(inside ? {} : { alsoTargets: [{ targetNodeId: owner.id }] }),
+  };
+}
+
+/** Whether a method is named at a reference without being run: `AddressOf Type.Method`, `NameOf(Type.Method)`. */
+function namesWithoutRunning(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  return /\b(?:AddressOf\s+|NameOf\s*\(\s*)$/i.test(line.slice(0, Math.max(0, ref.column)));
+}
+
+/**
+ * Resolve a VB.NET value read or write through a name (#2305) —
+ * `AppSession.SessionId`, `AppSession.CurrentUser = "demo"`, `Logger.Level`,
+ * `Mode.Fast` — to the member that the type the name means declares or
+ * inherits, and to the type. A method named this way is called (no type is
+ * linked, as for a call written with parentheses), unless `AddressOf` or
+ * `NameOf` only names it. Null when the name holds a value there (an
+ * instance's members are not read through its type), names no project type,
+ * or names one without that member: `Color.Red` is not a project `Color`'s.
+ */
+export function matchVbMemberRead(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = VB_MEMBER_READ.exec(ref.referenceName);
+  if (!m) return null;
+  const owners = typesReadThrough(m[1]!, ref, context);
+  if (!owners) return null;
+  // Not the member the read is written in: staxrip's `Overrides ReadOnly
+  // Property Package` returns the class's `Shared ReadOnly Property Package`.
+  const fits = (n: Node) => VB_READ_KINDS.has(n.kind) && n.id !== ref.fromNodeId;
+  // `MySettings.Default` reads the property declared `[Default]`, and back.
+  const name = m[2]!.replace(/^\[(.*)\]$/, '$1');
+  let member = (memberOn(owners, name, ref, context, true, undefined, fits) ??
+    memberOn(owners, `[${name}]`, ref, context, true, undefined, fits))?.node;
+  if (!member) return null;
+  // Of a `Shared` member and an instance one of the same name, a type's name reads the `Shared` one.
+  if (!member.isStatic) {
+    const found = member;
+    member = context.getNodesByQualifiedName(found.qualifiedName).find((n) => n.isStatic && n.filePath === found.filePath && fits(n)) ?? found;
+  }
+  if (member.kind === 'method') {
+    return {
+      original: ref,
+      targetNodeId: member.id,
+      confidence: 0.85,
+      resolvedBy: 'qualified-name',
+      ...(namesWithoutRunning(ref, context) ? {} : { edgeKind: 'calls' as const }),
+    };
+  }
+  return readThrough(member, owners, ref, context, { confidence: 0.9 });
 }
 
 const VB_TYPE_IMPORTS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();

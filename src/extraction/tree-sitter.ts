@@ -361,7 +361,7 @@ const PHP_TYPE_NODES: ReadonlySet<string> = new Set([
  */
 const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
   'field_access',                       // java (`Foo.BAR`)
-  'member_access_expression',           // c#  (`Foo.Bar`)
+  'member_access_expression',           // c# / vb.net (`Foo.Bar`)
   'navigation_expression',              // kotlin / swift (`Foo.bar`)
   'field_expression',                   // scala (`Foo.bar`)
   'class_constant_access_expression',   // php (`Foo::CONST`, `Foo::class`)
@@ -380,10 +380,20 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * static read is pure duplication) — while adding real graph noise (+1813 edges /
  * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
+ * VB.NET (#2305) sends the member with its receiver instead, and its resolver
+ * decides whether the receiver is a type (see extractVbMemberRead).
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet',
 ]);
+
+/**
+ * VB.NET receivers no project type can be named: the namespace roots
+ * (`System.IO.Path`, `My.Settings`, `Global.X`) and the built-in type keywords
+ * (`String.Empty`, `Integer.MaxValue`). A read through one is never sent.
+ */
+const VB_NON_TYPE_RECEIVERS =
+  /^(?:Global|System|Microsoft|My|Boolean|Byte|Char|Date|Decimal|Double|Integer|Long|Object|SByte|Short|Single|String|UInteger|ULong|UShort)$/i;
 
 /**
  * Tree-sitter node kinds that represent constructor invocations
@@ -5557,6 +5567,10 @@ export class TreeSitterExtractor {
       getChildByField(node, 'scope') ??
       node.namedChild(0);
     if (!recv) return;
+    if (this.language === 'vbnet') {
+      this.extractVbMemberRead(node, recv, ownerId);
+      return;
+    }
     const t = recv.type;
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
@@ -5571,6 +5585,31 @@ export class TreeSitterExtractor {
     this.unresolvedReferences.push({
       fromNodeId: ownerId,
       referenceName: name,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /**
+   * VB.NET: a value read or write through a name — `AppSession.SessionId`,
+   * `AppSession.CurrentUser = "demo"`, `Logger.Level`, `Mode.Fast` — is a use
+   * of the member as well as of what the name names (#2305). One `references`
+   * ref carries both, as `Name.Member` (the receiver kept, as a call's is);
+   * the resolver links the member and the type when the name means a project
+   * type or module there, and nothing when it holds a value (a local, a
+   * parameter, a field), which only it can tell in case-insensitive VB.NET
+   * (see vbnet-receivers' matchVbMemberRead). Its types are Capitalized all
+   * the same, so a lowercase receiver — a local, nearly always — is skipped.
+   */
+  private extractVbMemberRead(node: SyntaxNode, recv: SyntaxNode, ownerId: string): void {
+    const member = getChildByField(node, 'member');
+    if (recv.type !== 'identifier' || member?.type !== 'identifier') return;
+    const name = getNodeText(recv, this.source);
+    if (!/^[A-Z]\w*$/.test(name) || VB_NON_TYPE_RECEIVERS.test(name)) return;
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: `${name}.${getNodeText(member, this.source)}`,
       referenceKind: 'references',
       line: node.startPosition.row + 1,
       column: node.startPosition.column,

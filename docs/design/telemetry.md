@@ -232,9 +232,9 @@ Full documentation is [`telemetry-dashboard/README.md`](../../telemetry-dashboar
   `telemetry-worker/scripts/smoke-cutover.sh` exists to cover — a mismatch there is silent,
   showing up as a panel that reads zero forever rather than as an error.
 - **Reads rollups, not raw events**, so a chart stays correct for days whose raw rows have
-  been purged. `/api/activation` is the one exception — "did this machine ever run an index"
-  is not a daily aggregate — so it reads raw `events` and is bounded by the retention window,
-  which it reports as `raw_events_from`.
+  been purged. The activation funnel's "did this machine ever run an index" is not a daily
+  aggregate, so it reads `machine_first_seen.first_index_day` instead, which the ingest Worker
+  lowers as each index event is stored and the nightly cron re-derives from raw `events`.
 - **Auth is a shared password and a signed cookie**, sized for exactly two people:
   `ADMIN_PASSWORD` + `SESSION_SECRET` as Worker secrets, constant-time compare, HMAC-signed
   cookie with no session store, everything except `/login` and `robots.txt` gated. Rotating

@@ -9,12 +9,13 @@
  * 1. ROLL UP the just-completed UTC day into `daily_machines`, `daily_event_counts`,
  *    `daily_dim_counts` and `machine_first_seen.first_index_day` — plus the two days
  *    before it, because clients buffer offline and ship completed-day rollups late, so
- *    a day keeps growing after it ends, plus any earlier day a failed run missed. Every
- *    write is an upsert that OVERWRITES the recomputed value rather than adding to it
- *    (or, for first_index_day, only ever lowers it), so re-running a day is a no-op
- *    and never double-counts.
+ *    a day keeps growing after it ends, plus any earlier day a failed run missed, as
+ *    many as fit in the run's time budget. Every write is an upsert that OVERWRITES
+ *    the recomputed value rather than adding to it (or, for first_index_day, only ever
+ *    lowers it), so re-running a day is a no-op and never double-counts.
  *
- * 2. PURGE raw `events` past the retention window, in bounded batches. Rollups are
+ * 2. PURGE raw `events` past the retention window, in bounded batches — first, so a
+ *    long catch-up can never push it past the cron's wall-clock limit. Rollups are
  *    kept forever, so only ad-hoc drill-down has a horizon; `machine_days` and
  *    `machine_first_seen` are never purged, because retention cohorts need the full
  *    history and they are two orders of magnitude smaller than the raw rows.
@@ -32,6 +33,15 @@ export const ROLLUP_LOOKBACK_DAYS = 3;
 export const MAX_MANUAL_DAYS = 31;
 /** Most missed days one nightly run catches up on, newest first; the next night takes the rest. */
 export const MAX_CATCHUP_DAYS = 31;
+/**
+ * How long into a nightly run it still starts rollup work. Cloudflare ends a Cron
+ * Trigger after 15 minutes of wall-clock time, and catching up a day that still holds
+ * millions of legacy usage rows takes minutes, so a backlog can run straight into that
+ * limit. Past this point the run starts no new day and no new fold chunk; the 5
+ * minutes left cover the one statement already in flight and the summary line. What
+ * did not fit stays a missed day, so the next night carries on from there.
+ */
+export const NIGHTLY_BUDGET_MS = 10 * 60_000;
 
 /** Rows per purge DELETE — bounded so one statement stays well inside D1's limits. */
 const PURGE_BATCH_ROWS = 5_000;
@@ -148,6 +158,10 @@ const DAILY_MACHINES = `INSERT INTO daily_machines (day, machines, prod_machines
  * it straight off `machine_first_seen`, which keeps the funnel off raw `events` (a
  * cohort join there took most of a minute per week of cohorts) and past the purge.
  *
+ * The ingest path lowers it the same way as each index event is stored (src/index.ts),
+ * because a run that uploads late lands on a day this cron has stopped re-rolling. This
+ * statement is what fills it for events stored before that, and what a backfill re-runs.
+ *
  * Only rows that actually move are written, so re-running a day is free. `?1` is the
  * day — still the one bound parameter, used three times.
  */
@@ -221,6 +235,11 @@ export interface DayResult {
   rows: number;
   /** Day is past the retention window — a `reset` on it is ignored (see below). */
   pastRetention: boolean;
+  /**
+   * The deadline passed before the day's legacy usage rows were all folded, so nothing
+   * was rolled up: the next run finishes the fold and rolls the day up then.
+   */
+  deferred: boolean;
 }
 
 /**
@@ -236,14 +255,20 @@ export interface DayResult {
  * exists would otherwise linger. It is IGNORED past the retention window, where it
  * would delete rows and then find no events to rebuild them from: silently blanking a
  * real day is the one irreversible thing this file could do.
+ *
+ * `deadline` (epoch ms) bounds the legacy fold that runs first. If it stops the fold
+ * partway, the day is not rolled up at all — usage counted from a half-folded day would
+ * be short, and its `daily_machines` row would stop the nightly run from ever coming
+ * back to it. The chunks already folded are committed, so the next call carries on.
  */
 export async function rollupDay(
   env: Env,
   day: string,
-  opts: { cutoff: string; reset?: boolean },
+  opts: { cutoff: string; reset?: boolean; deadline?: number },
 ): Promise<DayResult> {
   const pastRetention = day < opts.cutoff;
-  await foldLegacyUsage(env, day);
+  const fold = await foldLegacyUsage(env, day, opts.deadline);
+  if (!fold.complete) return { day, rows: 0, pastRetention, deferred: true };
   const statements: D1PreparedStatement[] = [];
 
   if (opts.reset && !pastRetention) {
@@ -257,7 +282,7 @@ export async function rollupDay(
 
   const results = await env.DB.batch(statements);
   const rows = results.reduce((total, r) => total + (r.meta?.changes ?? 0), 0);
-  return { day, rows, pastRetention };
+  return { day, rows, pastRetention, deferred: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,15 +323,32 @@ const LEGACY_FOLD = `INSERT INTO usage_daily (
 
 const LEGACY_DELETE = `DELETE FROM events WHERE day = ?1 AND event = 'usage_rollup' AND id < ?2`;
 
-/** Folds any legacy usage rows for `day` into usage_daily. Returns how many rows it moved. */
-export async function foldLegacyUsage(env: Env, day: string): Promise<number> {
+export interface FoldResult {
+  /** Legacy rows moved into usage_daily by this call. */
+  moved: number;
+  /** False when the deadline stopped it with rows still to fold; the next call carries on. */
+  complete: boolean;
+}
+
+/**
+ * Folds any legacy usage rows for `day` into usage_daily, a chunk per transaction.
+ * With a `deadline` (epoch ms) it starts no chunk once that has passed: each chunk
+ * commits on its own and always takes the oldest rows left, so stopping between two
+ * loses nothing and the next call simply continues.
+ */
+export async function foldLegacyUsage(
+  env: Env,
+  day: string,
+  deadline = Number.POSITIVE_INFINITY,
+): Promise<FoldResult> {
   const any = await env.DB.prepare(`SELECT 1 AS hit FROM events WHERE day = ? AND event = 'usage_rollup' LIMIT 1`)
     .bind(day)
     .first<{ hit: number }>();
-  if (!any) return 0;
+  if (!any) return { moved: 0, complete: true };
 
   let moved = 0;
   for (let chunk = 0; chunk < LEGACY_MAX_CHUNKS; chunk++) {
+    if (Date.now() >= deadline) return { moved, complete: false };
     // Always the oldest remaining rows: everything below the next chunk's first id.
     // Rows folded by earlier chunks are gone, so there is no cursor to carry.
     const next = await env.DB.prepare(
@@ -320,7 +362,7 @@ export async function foldLegacyUsage(env: Env, day: string): Promise<number> {
       env.DB.prepare(LEGACY_DELETE).bind(day, below),
     ]);
     moved += deleted?.meta?.changes ?? 0;
-    if (!next) return moved;
+    if (!next) return { moved, complete: true };
   }
   throw new Error(`legacy usage fold for ${day} did not finish within ${LEGACY_MAX_CHUNKS} chunks`);
 }
@@ -399,43 +441,29 @@ async function missedDays(env: Env, cutoff: string, before: string): Promise<str
 }
 
 /**
- * The cron body: roll up the completed day and the two before it, catch up any
- * earlier day a past run missed, then purge.
+ * The cron body: purge, roll up the completed day and the two before it, then catch
+ * up any earlier day a past run missed, for as long as the time budget lasts.
+ *
+ * The purge goes first. It is bounded, it deletes only days past the window (which
+ * nothing below reads), and it is the job that must not slip: a database that stops
+ * purging grows until D1's size cap refuses every write. Run last, it was what
+ * Cloudflare's 15-minute limit cut off whenever a catch-up ran long, night after night.
+ *
+ * Rollups then start until NIGHTLY_BUDGET_MS has passed. A day the budget stops —
+ * before it starts, or partway through its legacy fold — gets no rollup at all, so it
+ * is still a missed day tomorrow and picks up where it stopped (each fold chunk is
+ * already committed).
  *
  * Logs one line of counts — never a day's contents, never a machine id. Throws if
  * anything failed so the invocation is marked failed (and retried) rather than
- * quietly skipping a day; every write here is idempotent, so a retry is safe.
+ * quietly skipping a day; every write here is idempotent, so a retry is safe. A day
+ * left for tomorrow is not a failure.
  */
 export async function runNightly(env: Env, atMs: number): Promise<void> {
   const started = Date.now();
+  const deadline = started + NIGHTLY_BUDGET_MS;
   const keepDays = retentionDays(env);
   const cutoff = retentionCutoff(atMs, keepDays);
-
-  const days: string[] = [];
-  for (let back = 1; back <= ROLLUP_LOOKBACK_DAYS; back++) days.push(utcDay(atMs - back * DAY_MS));
-
-  // A failure to find the missed days must not cost tonight's regular rollup.
-  let caughtUp = 0;
-  try {
-    const missed = await missedDays(env, cutoff, days[days.length - 1] ?? utcDay(atMs));
-    days.push(...missed);
-    caughtUp = missed.length;
-  } catch (err) {
-    console.error(JSON.stringify({ msg: 'missed-day scan failed', err: String(err) }));
-  }
-
-  const rolled: string[] = [];
-  const failed: string[] = [];
-  let rows = 0;
-  for (const day of days) {
-    try {
-      rows += (await rollupDay(env, day, { cutoff })).rows;
-      rolled.push(day);
-    } catch (err) {
-      failed.push(day);
-      console.error(JSON.stringify({ msg: 'rollup day failed', day, err: String(err) }));
-    }
-  }
 
   let purge: PurgeResult | null = null;
   try {
@@ -444,11 +472,50 @@ export async function runNightly(env: Env, atMs: number): Promise<void> {
     console.error(JSON.stringify({ msg: 'purge failed', cutoff, err: String(err) }));
   }
 
+  const regular: string[] = [];
+  for (let back = 1; back <= ROLLUP_LOOKBACK_DAYS; back++) regular.push(utcDay(atMs - back * DAY_MS));
+
+  // A failure to find the missed days must not cost tonight's regular rollup.
+  let missed: string[] = [];
+  try {
+    missed = await missedDays(env, cutoff, regular[regular.length - 1] ?? utcDay(atMs));
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'missed-day scan failed', err: String(err) }));
+  }
+
+  const rolled: string[] = [];
+  const failed: string[] = [];
+  const deferred: string[] = [];
+  let caughtUp = 0;
+  let rows = 0;
+  for (const day of [...regular, ...missed]) {
+    if (Date.now() >= deadline) {
+      deferred.push(day);
+      continue;
+    }
+    try {
+      const result = await rollupDay(env, day, { cutoff, deadline });
+      if (result.deferred) {
+        deferred.push(day);
+        continue;
+      }
+      rows += result.rows;
+      rolled.push(day);
+      if (!regular.includes(day)) caughtUp++;
+    } catch (err) {
+      failed.push(day);
+      console.error(JSON.stringify({ msg: 'rollup day failed', day, err: String(err) }));
+    }
+  }
+
   console.log(
     JSON.stringify({
       msg: 'nightly rollup',
       days: rolled,
+      /** Missed days rolled up tonight. */
       caught_up: caughtUp,
+      /** Days the time budget left for the next run. */
+      deferred: deferred.length,
       rows,
       failed: failed.length,
       retention_days: keepDays,

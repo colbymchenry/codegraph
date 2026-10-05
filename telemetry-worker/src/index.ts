@@ -200,9 +200,18 @@ const INSERT_EVENT = `INSERT INTO events (
 const UPSERT_MACHINE_DAY = `INSERT INTO machine_days (machine_id, day, prod) VALUES (?, ?, ?)
   ON CONFLICT (machine_id, day) DO UPDATE SET prod = max(machine_days.prod, excluded.prod)`;
 
-// A late-arriving offline buffer can move a machine's first day earlier, never later.
-const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day) VALUES (?, ?)
-  ON CONFLICT (machine_id) DO UPDATE SET first_day = min(machine_first_seen.first_day, excluded.first_day)`;
+// A late-arriving offline buffer can move a machine's first day earlier, never later —
+// and its first index day (the activation funnel's input) the same way. That one is set
+// here as well as by the nightly rollup because the rollup only re-rolls the last three
+// days, while this path accepts events up to 30 days old: an index run that uploads a
+// week late would otherwise never count. SQLite's multi-argument min() is NULL when
+// either side is, hence the coalesce: a batch with no index run leaves the stored day
+// alone, and the first index run on record sets it.
+const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day, first_index_day) VALUES (?, ?, ?)
+  ON CONFLICT (machine_id) DO UPDATE SET
+    first_day = min(machine_first_seen.first_day, excluded.first_day),
+    first_index_day = coalesce(min(machine_first_seen.first_index_day, excluded.first_index_day),
+                               machine_first_seen.first_index_day, excluded.first_index_day)`;
 
 // usage_rollup counters ADD into one row per machine × day × tool (migrations/0003):
 // clients upload the same counter many times over — once per process — so storing
@@ -305,10 +314,13 @@ async function writeToD1(
       }
     }
 
+    // The earliest day this batch indexed on, if it did — see UPSERT_FIRST_SEEN.
+    let firstIndexDay: string | null = null;
     for (const e of batch) {
       if (e.event === 'usage_rollup') continue;
       const day = (e.ts ?? receivedAt).slice(0, 10);
       days.add(day);
+      if (e.event === 'index' && (firstIndexDay === null || day < firstIndexDay)) firstIndexDay = day;
       stmts.push(
         insertEvent.bind(
           receivedAt,
@@ -328,7 +340,7 @@ async function writeToD1(
 
     const firstDay = [...days].sort()[0];
     if (firstDay !== undefined) {
-      stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay));
+      stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay, firstIndexDay));
     }
 
     await env.DB.batch(stmts);

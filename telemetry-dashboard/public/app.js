@@ -408,7 +408,8 @@ function drawDataWarning() {
 
   if (meta?.ingest_stalled) {
     lines.push([
-      `No new events since ${shortDay(meta.latest_raw_day)}.`,
+      // The last day anything was stored, lifecycle event or usage counter.
+      `No new events since ${shortDay(meta.latest_ingest_day ?? meta.latest_raw_day)}.`,
       ' The ingest worker at telemetry.getcodegraph.com is not storing anything; its logs and the D1 database are where to look.',
     ]);
   }
