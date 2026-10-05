@@ -5509,9 +5509,30 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
   if (hit !== undefined) return hit;
   let scope: { start: number; end: number } | null = null;
   const fn = context.getNodeById?.(ref.fromNodeId);
-  if (fn && (fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line) {
-    const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-    const text = stripCommentsForRegex(lines.slice(fn.startLine - 1, ref.line).join('\n'), 'javascript');
+  if (fn && (fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
+      jsCodeBindsName(name, fn, ref, context)) {
+    scope = { start: fn.startLine, end: fn.endLine };
+  }
+  memo.set(key, scope);
+  return scope;
+}
+
+/**
+ * Per context, by `file\0first line\0reference line\0name`: whether the code
+ * from a function's first line through a reference's binds the name. Every
+ * function that starts on the same line has that code — all of a minified
+ * script's do — so they share the answer (#2334).
+ */
+const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether the function's code through the reference's line declares `name`, or names it in a parameter list. */
+function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  let memo = JS_CODE_BINDS.get(context);
+  if (!memo) JS_CODE_BINDS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${fn.startLine}\0${ref.line}\0${name}`;
+  let binds = memo.get(key);
+  if (binds === undefined) {
+    const text = jsFunctionCodeThrough(fn, ref, context);
     const { param } = localBindingPatterns(name, 'g');
     const n = name.replace(/\$/g, '\\$');
     // A plain declaration. Destructuring re-binds what a call returns under
@@ -5521,10 +5542,46 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
     // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
     // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
     const parameter = new RegExp(`(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
-    if (declared || parameter.test(text)) scope = { start: fn.startLine, end: fn.endLine };
+    binds = declared || parameter.test(text);
+    memo.set(key, binds);
   }
-  memo.set(key, scope);
-  return scope;
+  return binds;
+}
+
+/**
+ * Per context: the comment-stripped lines of the functions jsFunctionLocalScope
+ * read last, and where each line ends in that text, most recent last.
+ */
+const JS_FN_CODE = new WeakMap<ResolutionContext, Map<string, { code: string; lineEnds: number[] }>>();
+const JS_FN_CODE_KEEP = 64;
+
+/**
+ * The function's lines from its first through the reference's, comments
+ * blanked. Stripping looks at most one character ahead — past a line's end,
+ * a newline, which completes no comment marker — so this is the whole
+ * function's stripped text cut at that line's end. Stripping the lines again
+ * for every reference took time in the square of a large function's length;
+ * in a minified script, every function's text runs to the end of its one
+ * line (#2334).
+ */
+function jsFunctionCodeThrough(fn: Node, ref: UnresolvedRef, context: ResolutionContext): string {
+  let fns = JS_FN_CODE.get(context);
+  if (!fns) JS_FN_CODE.set(context, (fns = new Map()));
+  const key = `${ref.filePath}\0${fn.startLine}\0${fn.endLine}`;
+  let own = fns.get(key);
+  if (own) {
+    fns.delete(key);
+  } else {
+    const lines = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [])
+      .slice(fn.startLine - 1, fn.endLine);
+    let end = -1;
+    own = { code: stripCommentsForRegex(lines.join('\n'), 'javascript'), lineEnds: lines.map((line) => (end += line.length + 1)) };
+    if (fns.size >= JS_FN_CODE_KEEP) fns.delete(fns.keys().next().value!);
+  }
+  fns.set(key, own);
+  // Through the reference's line, or the file's last when it ends sooner.
+  const last = Math.min(ref.line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
+  return last < 0 ? '' : own.code.slice(0, own.lineEnds[last]);
 }
 
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -7017,6 +7074,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LOCAL_BINDING_SITES.delete(context);
   SELECTOR_NAMES.delete(context);
   GET_STATE_FILES.delete(context);
+  DESTRUCTURED_FILES.delete(context);
+  JS_FN_LOCAL_MEMO.delete(context);
+  JS_CODE_BINDS.delete(context);
+  JS_FN_CODE.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TARGET_LANGUAGE.delete(context);
@@ -9366,15 +9427,225 @@ function matchDestructuredStoreCall(ref: UnresolvedRef, context: ResolutionConte
  * and its source must return the key; a later declaration of the name at the
  * call's scope shadows the binding. The local binding otherwise ruled out
  * every cross-file candidate, so the call resolved to nothing.
+ *
+ * The file is read once (#2334): stripping and scanning all the text above
+ * each call took time in the square of the file's size — seconds for each
+ * bundled library (pdf.js, d3) a project ships. The text above a call,
+ * blanked on its own, is the file's blanked code up to the call: blanking
+ * reads past a character only for a comment opener's second character (a
+ * call's name never starts with one) and for the `/` that closes a regex
+ * literal (calls inside one: matchDestructuredCallInLiteral). Its bindings
+ * are then the file's that end at or before the call: the pattern finds a
+ * statement the same way wherever the two texts agree up to its `(`, and
+ * one running past the call holds no `{` followed by a `(` to start another.
  */
 function matchDestructuredCallResult(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const source = context.readFile(ref.filePath);
-  if (!source || !/\b(?:const|let|var)\s*\{/.test(source)) return null;
-  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!source) return null;
+  const file = destructuredBindings(ref.filePath, source, context);
+  if (!file) return null;
+  const cut = destructuredCallOffset(file, source, ref);
+  if (cut < 0) return matchDestructuredCallAbove(ref, source, context);
+  const literal = regexLiteralAround(file.literals, cut);
+  if (literal >= 0) {
+    const depth = file.literalDepths[literal]!;
+    return depth < 0 ? matchDestructuredCallAbove(ref, source, context)
+      : matchDestructuredCallInLiteral(ref, file, file.literals[2 * literal]!, depth, cut, context);
+  }
+  const bindings = file.byName.get(ref.referenceName) ?? [];
+  // The nearest binding above the call whose block is still open at the call.
+  for (let i = bindings.length - 1; i >= 0; i--) {
+    const { binding, key } = bindings[i]!;
+    if (binding.end > cut || binding.scopeEnd < cut) continue;
+    return destructuredCallTarget(binding.callee, key, file.code.slice(binding.end, cut), ref, context);
+  }
+  return null;
+}
+
+/** A `const { … } = f(…)` statement. */
+interface DestructuredBinding {
+  /** Just past its `(`. */
+  end: number;
+  /** The function it calls. */
+  callee: string;
+  /** The `{` of the block it sits in: its place on the stack of open blocks (-1 at top level), and where its `}` is (Infinity if nowhere). */
+  depth: number;
+  scopeEnd: number;
+}
+
+/** What matchDestructuredCallResult needs of a file, read once. */
+interface DestructuredFile {
+  /** The file with comments and string contents blanked. */
+  code: string;
+  /** Where each line starts. */
+  lineStarts: number[];
+  /** Each name a binding introduces → those bindings, in file order, with the key it reads. */
+  byName: Map<string, Array<{ binding: DestructuredBinding; key: string }>>;
+  /** The opening and closing offset of each span the blanking read as a regex literal, in order. */
+  literals: number[];
+  /** Per literal: how many blocks are open at its `/`, or -1 when a binding statement could run across that `/`. */
+  literalDepths: number[];
+}
+
+const DESTRUCTURED_BINDING = /\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g;
+/** Per context: the files matchDestructuredCallResult read last (calls arrive file by file); null for one without destructuring. */
+const DESTRUCTURED_FILES = new WeakMap<ResolutionContext, Map<string, DestructuredFile | null>>();
+const DESTRUCTURED_FILES_KEEP = 16;
+
+function destructuredBindings(filePath: string, source: string, context: ResolutionContext): DestructuredFile | null {
+  let files = DESTRUCTURED_FILES.get(context);
+  if (!files) DESTRUCTURED_FILES.set(context, (files = new Map()));
+  let file = files.get(filePath);
+  if (file !== undefined) return file;
+  file = /\b(?:const|let|var)\s*\{/.test(source) ? readDestructuredBindings(source) : null;
+  if (files.size >= DESTRUCTURED_FILES_KEEP) files.delete(files.keys().next().value!);
+  files.set(filePath, file);
+  return file;
+}
+
+function readDestructuredBindings(source: string): DestructuredFile {
+  const literals: number[] = [];
+  const code = blankStringContents(stripCommentsForRegex(source, 'typescript'), literals);
+  const lineStarts = [0];
+  for (let at = source.indexOf('\n'); at !== -1; at = source.indexOf('\n', at + 1)) lineStarts.push(at + 1);
+  const found = Array.from(code.matchAll(DESTRUCTURED_BINDING), (m) => ({
+    index: m.index!,
+    binding: { end: m.index! + m[0].length, callee: m[2]!, depth: -1, scopeEnd: Infinity },
+    keys: destructuredKeys(m[1]!),
+  }));
+  // The `{` after every `const`, `let` and `var`: where a binding statement's pattern opens.
+  const patterns = new Set(Array.from(code.matchAll(/\b(?:const|let|var)\s*\{/g), (m) => m.index! + m[0].length - 1));
+  const literalDepths: number[] = [];
+  const stack: number[] = [];
+  const scoped = new Map<number, DestructuredBinding[]>();
+  let lastBrace = -1;
+  let lastBracket = -1; // the last `<`, `>`, `(` or `)`
+  for (let i = 0, next = 0, literal = 0; i < code.length; i++) {
+    if (found[next]?.index === i) {
+      const { binding } = found[next++]!;
+      // In scope until the `}` that closes the block it sits in.
+      binding.depth = stack.length - 1;
+      const open = stack[binding.depth];
+      if (open !== undefined) {
+        const list = scoped.get(open);
+        if (list) list.push(binding);
+        else scoped.set(open, [binding]);
+      }
+    }
+    if (literals[2 * literal] === i) {
+      // A binding statement holds a `/` only in its pattern `{ … }` or its type arguments `< … >`.
+      literalDepths.push(patterns.has(lastBrace) || code[lastBracket] === '<' ? -1 : stack.length);
+      literal++;
+    }
+    const c = code.charCodeAt(i);
+    if (c === 123 /* { */) {
+      stack.push(i);
+      lastBrace = i;
+    } else if (c === 125 /* } */) {
+      lastBrace = i;
+      const open = stack.pop();
+      for (const binding of (open !== undefined && scoped.get(open)) || []) binding.scopeEnd = i;
+    } else if (c === 60 /* < */ || c === 62 /* > */ || c === 40 /* ( */ || c === 41 /* ) */) {
+      lastBracket = i;
+    }
+  }
+  const byName = new Map<string, Array<{ binding: DestructuredBinding; key: string }>>();
+  for (const { binding, keys } of found) {
+    for (const [name, key] of keys) {
+      const list = byName.get(name);
+      if (list) list.push({ binding, key });
+      else byName.set(name, [{ binding, key }]);
+    }
+  }
+  return { code, lineStarts, byName, literals, literalDepths };
+}
+
+/** Each name a destructuring pattern binds → the key it reads (`{ a, b: c = 1 }`); a later entry for a name wins. */
+function destructuredKeys(pattern: string): Map<string, string> {
+  const keys = new Map<string, string>();
+  for (const part of pattern.split(',')) {
+    const [k, v] = part.split(':').map((x) => x.trim().replace(/\s*=.*$/, ''));
+    if (/^[A-Za-z_$][\w$]*$/.test(k ?? '')) keys.set(v ?? k!, k!);
+  }
+  return keys;
+}
+
+/**
+ * Where the text above a call ends in `source` (that text is
+ * `source.slice(0, cut)`), or -1 when the call's line or column lies outside
+ * the file, or that text ends in a `/` that opens a comment in the file.
+ */
+function destructuredCallOffset(file: DestructuredFile, source: string, ref: UnresolvedRef): number {
+  const { line, column } = ref;
+  const starts = file.lineStarts;
+  if (!Number.isInteger(line) || !Number.isInteger(column) || line < 1 || line > starts.length || column < 0) return -1;
+  const cut = Math.min(starts[line - 1]! + column, line < starts.length ? starts[line]! - 1 : source.length);
+  return source[cut - 1] === '/' && (source[cut] === '/' || source[cut] === '*') ? -1 : cut;
+}
+
+/** The regex literal (its index) that opens before `cut` and closes at or after it, or -1. */
+function regexLiteralAround(literals: number[], cut: number): number {
+  let lo = 0;
+  let hi = literals.length / 2;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (literals[2 * mid]! < cut) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo > 0 && literals[2 * lo - 1]! >= cut ? lo - 1 : -1;
+}
+
+/**
+ * matchDestructuredCallResult for a call inside what the file's blanking read
+ * as a regex literal opening at `start`. Blanked on its own, the text above
+ * the call reads that `/` as division: it is the file's code up to there,
+ * then `tail` — the rest, blanked as text of its own. No binding statement
+ * runs across the `/` (literalDepths), so the call sees the file's bindings
+ * that end before it, then any in `tail`; and of the `depth` blocks open at
+ * the `/`, those `tail` does not close.
+ */
+function matchDestructuredCallInLiteral(
+  ref: UnresolvedRef, file: DestructuredFile, start: number, depth: number, cut: number, context: ResolutionContext
+): ResolvedRef | null {
+  const tail = blankStringContents(file.code.slice(start, cut));
+  const atCall = blocksThrough(tail, depth);
+  for (const m of Array.from(tail.matchAll(DESTRUCTURED_BINDING)).reverse()) {
+    const key = destructuredKeys(m[1]!).get(ref.referenceName);
+    if (!key) continue;
+    const atBinding = blocksThrough(tail.slice(0, m.index), depth);
+    const block = atBinding.opened[atBinding.opened.length - 1];
+    if (block !== undefined ? !atCall.opened.includes(block) : atBinding.enclosing > atCall.enclosing) continue;
+    return destructuredCallTarget(m[2]!, key, tail.slice(m.index! + m[0].length), ref, context);
+  }
+  const bindings = file.byName.get(ref.referenceName) ?? [];
+  for (let i = bindings.length - 1; i >= 0; i--) {
+    const { binding, key } = bindings[i]!;
+    if (binding.end > start) continue;
+    if (binding.depth >= 0 && (binding.scopeEnd < start || binding.depth >= atCall.enclosing)) continue;
+    return destructuredCallTarget(binding.callee, key, file.code.slice(binding.end, start) + tail, ref, context);
+  }
+  return null;
+}
+
+/** After `text`'s braces: how many of the `enclosing` blocks open before it are still open, and which it opened are. */
+function blocksThrough(text: string, enclosing: number): { enclosing: number; opened: number[] } {
+  const opened: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 123 /* { */) opened.push(i);
+    else if (c === 125 /* } */) {
+      if (opened.length > 0) opened.pop();
+      else if (enclosing > 0) enclosing--;
+    }
+  }
+  return { enclosing, opened };
+}
+
+/** matchDestructuredCallResult by scanning the text above the call, where the whole file's reading may not hold. */
+function matchDestructuredCallAbove(ref: UnresolvedRef, source: string, context: ResolutionContext): ResolvedRef | null {
   const lines = source.split('\n');
   const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]?.slice(0, ref.column) ?? '').join('\n');
   const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
-  const binding = /\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g;
   const stackAt = (end: number): number[] => {
     const stack: number[] = [];
     for (let i = 0; i < end; i++) {
@@ -9384,42 +9655,53 @@ function matchDestructuredCallResult(ref: UnresolvedRef, context: ResolutionCont
     return stack;
   };
   const callScope = stackAt(code.length);
-  for (const m of [...code.matchAll(binding)].reverse()) {
-    let key: string | null = null;
-    for (const part of m[1]!.split(',')) {
-      const [k, v] = part.split(':').map((x) => x.trim().replace(/\s*=.*$/, ''));
-      if ((v ?? k) === ref.referenceName && /^[A-Za-z_$][\w$]*$/.test(k ?? '')) key = k!;
-    }
+  for (const m of [...code.matchAll(DESTRUCTURED_BINDING)].reverse()) {
+    const key = destructuredKeys(m[1]!).get(ref.referenceName);
     if (!key) continue;
     if (!stackAt(m.index!).every((pos, i) => callScope[i] === pos)) continue;
-    const rest = code.slice(m.index! + m[0].length);
-    if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(rest)) return null;
-    const calleeName = m[2]!;
-    const imported = context.resolveImport?.({ ...ref, referenceName: calleeName, referenceKind: 'calls' });
-    // Through the import; else the same file's; else the one function of that
-    // name in the project (an alias the import resolver can't follow, like
-    // Nuxt's `~/composables/…`) — the returned key is checked below either way.
-    const holders = context.getNodesByName(calleeName).filter((n) =>
-      (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language));
-    const callee = (imported && context.getNodeById?.(imported.targetNodeId)) ??
-      holders.find((n) => n.filePath === ref.filePath) ??
-      (holders.length === 1 ? holders[0] : undefined);
-    if (!callee || !sameLanguageFamily(callee.language, ref.language)) return null;
-    const calleeText = (context.getFileLines?.(callee.filePath) ?? context.readFile(callee.filePath)?.split('\n') ?? [])
-      .slice(callee.startLine - 1, callee.endLine).join('\n');
-    if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${key}\\b`).test(calleeText)) return null;
-    const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
-    const inFile = context.getNodesInFile(callee.filePath);
-    const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
-      !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
-        rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
-    const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
-      !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
-    const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
-    if (!target) return null;
-    return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
+    return destructuredCallTarget(m[2]!, key, code.slice(m.index! + m[0].length), ref, context);
   }
   return null;
+}
+
+/**
+ * The function `calleeName` returns under `key`, unless a declaration in
+ * `rest` (the code between the binding and the call) shadows the binding.
+ * The callee is resolved first: most callees (`require`) return no such
+ * function, and then the shadowing scan is not needed.
+ */
+function destructuredCallTarget(calleeName: string, key: string, rest: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = destructuredKeyTarget(calleeName, key, ref, context);
+  if (!target) return null;
+  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(rest) ? null : target;
+}
+
+/** The function `calleeName` returns under `key`: one declared in its body, else a top-level one of its module. */
+function destructuredKeyTarget(calleeName: string, key: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const imported = context.resolveImport?.({ ...ref, referenceName: calleeName, referenceKind: 'calls' });
+  // Through the import; else the same file's; else the one function of that
+  // name in the project (an alias the import resolver can't follow, like
+  // Nuxt's `~/composables/…`) — the returned key is checked below either way.
+  const holders = context.getNodesByName(calleeName).filter((n) =>
+    (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language));
+  const callee = (imported && context.getNodeById?.(imported.targetNodeId)) ??
+    holders.find((n) => n.filePath === ref.filePath) ??
+    (holders.length === 1 ? holders[0] : undefined);
+  if (!callee || !sameLanguageFamily(callee.language, ref.language)) return null;
+  const calleeText = (context.getFileLines?.(callee.filePath) ?? context.readFile(callee.filePath)?.split('\n') ?? [])
+    .slice(callee.startLine - 1, callee.endLine).join('\n');
+  if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${key}\\b`).test(calleeText)) return null;
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
+  const inFile = context.getNodesInFile(callee.filePath);
+  const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
+    !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
+      rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
+  const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
+    !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
+  const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
 }
 
 /** Bound action names need not have a same-named definition (selectors may

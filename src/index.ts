@@ -514,6 +514,7 @@ export class CodeGraph {
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
+      const startedAt = Date.now();
       try {
         this.fileLock.acquire();
       } catch {
@@ -775,6 +776,10 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        // The time covers the whole run, like the totals above. The
+        // orchestrator's covers extraction alone, and the summary printed it
+        // as the run's, leaving out resolution and linking (#2334).
+        result.durationMs = Date.now() - startedAt;
         return result;
       } finally {
         // Restore the auto-checkpoint interval AFTER the fold-up above so the
@@ -827,6 +832,7 @@ export class CodeGraph {
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
+      const startedAt = Date.now();
       try {
         this.fileLock.acquire();
       } catch (err) {
@@ -1146,6 +1152,8 @@ export class CodeGraph {
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
+        // The whole sync, as for indexAll: resolution and linking included (#2334).
+        result.durationMs = Date.now() - startedAt;
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the

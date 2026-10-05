@@ -27,8 +27,10 @@
  * Blank string contents while preserving quotes and offsets. Template
  * interpolations are blanked too; callers checking executable expressions
  * must conservatively inspect those expressions in the original source.
+ * `regexLiterals`, when given, receives the offsets of the opening and
+ * closing `/` of every span read as a regex literal (left as is).
  */
-export function blankStringContents(text: string): string {
+export function blankStringContents(text: string, regexLiterals?: number[]): string {
   const out = text.split('');
   let i = 0;
   const n = text.length;
@@ -45,7 +47,11 @@ export function blankStringContents(text: string): string {
         if (text[end] === ']') inClass = false;
         if (text[end] === '/' && !inClass) break;
       }
-      if (end < n && text[end] === '/') { i = end + 1; continue; }
+      if (end < n && text[end] === '/') {
+        regexLiterals?.push(i, end);
+        i = end + 1;
+        continue;
+      }
     }
     if (c === '"' || c === "'" || c === '`') {
       const quote = c;
