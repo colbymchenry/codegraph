@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Upgrading CodeGraph while an agent session is open no longer leaves the old version's background server in charge of your project: the first session started from the new install stops it and starts a current one in its place, even while sessions opened before the upgrade are still running. That old server could no longer load the language parsers the upgrade removed, so it saved every file it re-indexed with no symbols, while new sessions could only read the index beside it without keeping it up to date. A background server from a newer install is never stopped, and sessions opened before the upgrade keep the old version until you restart them. Thanks @lipchey for the report. (#2335)
 
 ## [1.6.2] - 2026-10-03
 

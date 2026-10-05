@@ -57,9 +57,11 @@ import {
 import { CodeGraphPackageVersion } from './version';
 import {
   releaseWriterLock,
+  swapWriterLock,
   tryAcquireWriterLock,
   assertNoRebuild,
   writerLockHeldMessage,
+  type WriterLockInfo,
 } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
@@ -187,15 +189,18 @@ export class Daemon {
   private stopping = false;
   private socketPath: string;
   private pidPath: string;
+  /** The launcher holding the writer slot for this daemon, when it replaced an older one (#2335). */
+  private handoverFrom: number | null;
 
   constructor(
     private projectRoot: string,
-    opts: { idleTimeoutMs?: number; maxIdleMs?: number } = {},
+    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null } = {},
   ) {
     this.socketPath = getDaemonSocketPath(projectRoot);
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
+    this.handoverFrom = opts.handoverFrom ?? null;
     // Daemon mode serves many concurrent clients on one event loop, so off-load
     // read-tool dispatch to a worker pool — otherwise concurrent explores
     // serialize and starve the MCP transport (clients time out). Direct mode
@@ -214,7 +219,17 @@ export class Daemon {
     // #1740: claim the project writer lock before opening/watching so a
     // concurrent direct-mode serve --mcp cannot start a second watcher.
     assertNoRebuild(this.projectRoot);
-    const writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
+    let writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
+    // The launcher that stopped an older daemon has held the slot for us since
+    // (#2335); take it over without letting it fall free.
+    if (writer.kind === 'taken' && this.handoverFrom !== null &&
+        writer.existing?.pid === this.handoverFrom && writer.existing.mode === 'handover') {
+      const info: WriterLockInfo = { pid: process.pid, mode: 'daemon', startedAt: Date.now(), ready: false };
+      if (swapWriterLock(this.projectRoot, this.handoverFrom, info)) {
+        writer = { kind: 'acquired', pidPath: writer.pidPath, info };
+        process.stderr.write(`[CodeGraph daemon] Took over the writer lock from launcher pid ${this.handoverFrom}, which stopped an older daemon.\n`);
+      }
+    }
     if (writer.kind === 'taken') {
       const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
       process.stderr.write(`[CodeGraph daemon] ${msg}\n`);
