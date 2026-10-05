@@ -14,7 +14,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
+- In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
+- In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.
 - Upgrading CodeGraph while an agent session is open no longer leaves the old version's background server in charge of your project: the first session started from the new install stops it and starts a current one in its place, even while sessions opened before the upgrade are still running. That old server could no longer load the language parsers the upgrade removed, so it saved every file it re-indexed with no symbols, while new sessions could only read the index beside it without keeping it up to date. A background server from a newer install is never stopped, and sessions opened before the upgrade keep the old version until you restart them. Thanks @lipchey for the report. (#2335)
+
 
 ## [1.6.2] - 2026-10-03
 
