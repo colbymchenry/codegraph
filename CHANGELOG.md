@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In C#, `new Station` now links to the `Station` class instead of failing to resolve when another class declares a `const` with the same name (#2337).
 
 ## [1.6.2] - 2026-10-03
 

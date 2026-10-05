@@ -2371,10 +2371,11 @@ function isDotNetTypeRef(ref: UnresolvedRef, context: ResolutionContext): boolea
  * method (a constructor is one) or an enum case shares the type's name, not
  * its meaning: AutoMapper's `Type sourceType` bound to an attribute's `Type`
  * property and `TypeMap typeMap` to a `TypeMap` property beside the `TypeMap`
- * class. A field never names a type either.
+ * class. A field or a constant never names a type either: `new Station`
+ * is not `private const string Station`.
  */
 function canNameInTypePosition(n: Node): boolean {
-  return !(n.kind === 'property' || n.kind === 'method' || n.kind === 'enum_member' || n.kind === 'field');
+  return !(n.kind === 'property' || n.kind === 'method' || n.kind === 'enum_member' || n.kind === 'field' || n.kind === 'constant');
 }
 
 /**
