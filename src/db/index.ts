@@ -204,36 +204,35 @@ export class DatabaseConnection {
   }
 
   /**
-   * FTS maintenance triggers dropped/recreated around a bulk load.
-   * Names must match schema.sql.
-   */
-  private static readonly FTS_TRIGGER_NAMES = ['nodes_ai', 'nodes_ad', 'nodes_au'] as const;
-
-  /**
-   * Enter bulk-load mode: drop the per-row FTS sync triggers so mass node
-   * inserts skip per-row tokenization. MUST be paired with endBulkNodeLoad()
-   * (use try/finally); a crash inside the window is healed on the next open().
-   * The window is DB-wide (triggers are schema objects), which is safe because
-   * endBulkNodeLoad() rebuilds nodes_fts from the nodes table wholesale — any
-   * row written by anyone during the window is captured by the rebuild.
+   * Enter bulk-load mode: drop the per-row FTS and trigram sync triggers so
+   * mass node inserts skip per-row tokenization. MUST be paired with
+   * endBulkNodeLoad() (use try/finally); a crash inside the window is healed on
+   * the next open(). The window is DB-wide (triggers are schema objects), which
+   * is safe because endBulkNodeLoad() rebuilds both indexes from the nodes
+   * table wholesale — any row written by anyone during the window is captured
+   * by the rebuild.
    */
   beginBulkNodeLoad(): void {
     if (!this.fts5Available) return;
-    for (const t of DatabaseConnection.FTS_TRIGGER_NAMES) {
-      this.db.exec(`DROP TRIGGER IF EXISTS ${t}`);
+    for (const { name } of DatabaseConnection.schemaTriggers()) {
+      this.db.exec(`DROP TRIGGER IF EXISTS ${name}`);
     }
   }
 
   /**
-   * Leave bulk-load mode: rebuild the whole FTS index from the nodes table in
-   * one pass (far cheaper than per-row trigger firings), then recreate the
-   * triggers by re-running schema.sql (idempotent — everything in it is
-   * IF NOT EXISTS).
+   * Leave bulk-load mode: rebuild the FTS and trigram indexes from the nodes
+   * table in one pass (far cheaper than per-row trigger firings), then
+   * recreate the triggers from schema.sql.
    */
   endBulkNodeLoad(): void {
     if (!this.fts5Available) return;
     this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
-    this.recreateFtsTriggers();
+    // A database migrated on a Node build without FTS5 never got nodes_tri.
+    this.db.exec(DatabaseConnection.schemaDdl(/CREATE VIRTUAL TABLE IF NOT EXISTS nodes_tri[\s\S]*?\);/));
+    this.db.exec(`INSERT INTO nodes_tri(nodes_tri) VALUES('rebuild')`);
+    for (const { ddl } of DatabaseConnection.schemaTriggers()) {
+      this.db.exec(ddl);
+    }
   }
 
   /**
@@ -425,12 +424,12 @@ export class DatabaseConnection {
   /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
   private healBulkNodeLoad(): void {
     if (!this.fts5Available) return;
+    const expected = DatabaseConnection.schemaTriggers().map(t => t.name);
+    const placeholders = expected.map(() => '?').join(',');
     const row = this.db
-      .prepare(
-        `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
-      )
-      .get() as { c: number } | undefined;
-    if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
+      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN (${placeholders})`)
+      .get(...expected) as { c: number } | undefined;
+    if ((row?.c ?? 0) >= expected.length) return;
     this.endBulkNodeLoad();
   }
 
@@ -456,26 +455,21 @@ export class DatabaseConnection {
     }
   }
 
-  /**
-   * Recreate the FTS sync triggers from schema.sql — extracted from the file
-   * rather than duplicated here so the DDL cannot drift from the schema.
-   * (Re-execing the whole schema is not an option: it contains data INSERTs
-   * that are not idempotent, e.g. schema_versions.)
-   */
-  private recreateFtsTriggers(): void {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-    const triggerDdls = schema.match(
-      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
-    );
-    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
-      throw new Error(
-        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
-      );
-    }
-    for (const ddl of triggerDdls) {
-      this.db.exec(ddl);
-    }
+  /** First schema.sql statement matching `pattern`; the DDL cannot drift from the schema. */
+  private static schemaDdl(pattern: RegExp): string {
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
+    const ddl = schema.match(pattern)?.[0];
+    if (!ddl) throw new Error(`schema.sql: ${pattern} not found`);
+    return ddl;
+  }
+
+  /** Every trigger in schema.sql (all keep nodes_fts / nodes_tri in sync). */
+  private static schemaTriggers(): Array<{ name: string; ddl: string }> {
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
+    return [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)\b[\s\S]*?END;/g)].map(m => ({
+      name: m[1]!,
+      ddl: m[0],
+    }));
   }
 
   /**

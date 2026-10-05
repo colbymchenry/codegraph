@@ -124,6 +124,34 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     content_rowid='rowid'
 );
 
+-- Trigram index for substring search: `name LIKE '%x%'` is a full table scan
+-- on a large index; with this table it is an index lookup (see
+-- QueryBuilder.triCandidates). Kept in sync by the same write path as nodes_fts.
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_tri USING fts5(
+    name,
+    qualified_name,
+    content='nodes',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_tri(rowid, name, qualified_name)
+    VALUES (NEW.rowid, NEW.name, NEW.qualified_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_tri(nodes_tri, rowid, name, qualified_name)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_tri(nodes_tri, rowid, name, qualified_name)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name);
+    INSERT INTO nodes_tri(rowid, name, qualified_name)
+    VALUES (NEW.rowid, NEW.name, NEW.qualified_name);
+END;
+
 -- Triggers to keep FTS index in sync
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
     INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)

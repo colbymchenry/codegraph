@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Migration definition
@@ -213,6 +213,40 @@ const migrations: Migration[] = [
         CREATE INDEX idx_edges_synthesis_site
           ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
           WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description: 'Add nodes_tri trigram index for substring name search',
+    up: (db) => {
+      // Same optional-FTS5 contract as open(): a Node build without FTS5
+      // cannot read nodes_fts, so it gets no trigram index either (#1532).
+      // The next bulk load on an FTS5 build creates it.
+      try {
+        db.exec('SELECT * FROM nodes_fts LIMIT 0');
+      } catch {
+        return;
+      }
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS nodes_tri USING fts5(
+          name, qualified_name, content='nodes', content_rowid='rowid', tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS nodes_tri_ai AFTER INSERT ON nodes BEGIN
+          INSERT INTO nodes_tri(rowid, name, qualified_name)
+          VALUES (NEW.rowid, NEW.name, NEW.qualified_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_tri_ad AFTER DELETE ON nodes BEGIN
+          INSERT INTO nodes_tri(nodes_tri, rowid, name, qualified_name)
+          VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_tri_au AFTER UPDATE ON nodes BEGIN
+          INSERT INTO nodes_tri(nodes_tri, rowid, name, qualified_name)
+          VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name);
+          INSERT INTO nodes_tri(rowid, name, qualified_name)
+          VALUES (NEW.rowid, NEW.name, NEW.qualified_name);
+        END;
+        INSERT INTO nodes_tri(nodes_tri) VALUES('rebuild');
       `);
     },
   },
