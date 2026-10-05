@@ -40,7 +40,7 @@ renders. Bad input is a `400` with a message, never a guess. Chart data carries
 
 | Endpoint | Answers |
 |---|---|
-| `/api/meta` | How current the data is: `today`, the rollup's last day (`latest_rollup_day`), the last day an event arrived, machines active yesterday, and two flags — `ingest_stalled` and `rollup_behind` — that put a warning above the panels when either writer stops. Cached 60 s. |
+| `/api/meta` | How current the data is: `today`, the rollup's last day (`latest_rollup_day`), the last day ingest stored anything (`latest_ingest_day` — a lifecycle event or a usage counter), machines active yesterday, and two flags — `ingest_stalled` and `rollup_behind` — that put a warning above the panels when either writer stops. Cached 60 s. |
 | `/api/summary` | Big numbers: production users, active machines, new machines, installs, uninstalls, indexing runs, tool calls. |
 | `/api/timeseries?metric=` | `installs_uninstalls`, `new_installs`, `production_users`, `indexing_activity`, `tool_calls`, `duration_buckets`. One dense point per day — a day with nothing is a zero, not a gap. Days after the rollup's last day are `null` ("not counted yet") and `covered_through` says where that is; `new_installs` is written live and runs through today. |
 | `/api/breakdown?dim=` | `os`, `arch`, `codegraph_version`, `node_major`, `language`, `file_count_bucket`, `duration_bucket`, `target`, `scope`, `kind`, `name`, `client_name`, `name_error`. Optional `&event=`, `&metric=count\|machines`, `&limit=`. |
@@ -53,7 +53,8 @@ kept forever, so a chart stays correct for days whose raw events have been purge
 panel reads raw `events`.** D1 runs one query at a time per database: the activation funnel
 used to join every cohort machine against `events`, which took ~55 s for one week of
 cohorts in production and failed every panel queued behind it. It now reads
-`machine_first_seen.first_index_day`, which the nightly rollup maintains.
+`machine_first_seen.first_index_day`, which the ingest worker lowers as each index event is
+stored and the nightly rollup re-derives from raw events.
 
 The presets end on **today** (UTC — every event and rollup is keyed on the UTC day). Live
 numbers — production users, new machines, retention — run through today; rolled-up ones
@@ -137,6 +138,10 @@ npm run smoke:render             # the panels, in a browser (79 assertions)
 
 Each suite starts its own throwaway `wrangler dev` on its own port and cleans up after
 itself, so they can be run in any order (`DASH_PORT` overrides the port).
+
+The repo's own test suite also runs `src/api.ts`, with the ingest worker feeding it, against
+the writer's migrations in an in-memory SQLite database — no wrangler needed. From the repo
+root (it is part of `npm test` there): `npx vitest run __tests__/telemetry-services.test.ts`.
 
 **`smoke-auth.sh`** is the regression net for the gate: unauthenticated requests reach
 nothing (pages, API *and* static assets), the cookie is persistent and correctly flagged,

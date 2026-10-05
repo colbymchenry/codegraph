@@ -36,6 +36,7 @@ DELETE FROM daily_machines;
 DELETE FROM machine_days;
 DELETE FROM machine_first_seen;
 DELETE FROM events;
+DELETE FROM usage_daily;
 
 -- ---------------------------------------------------------------------------
 -- install — 12, one per machine on its first day

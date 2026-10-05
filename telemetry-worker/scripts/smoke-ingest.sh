@@ -214,6 +214,14 @@ is "machine_days: each backdated batch gets its own day" "$BACK_DAY,$RECENT_DAY"
 is "machine_first_seen recorded" "$RECENT_DAY" "$(q "select first_day from machine_first_seen where machine_id='$M_OK'")"
 is "machine_first_seen only moves earlier" "$BACK_DAY" \
    "$(q "select first_day from machine_first_seen where machine_id='$M_BACK'")"
+# The activation funnel's input is kept here too, not only by the nightly rollup: an
+# index run that uploads after the cron stopped re-rolling its day must still count.
+is "first_index_day recorded as the index run is stored" "$RECENT_DAY" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='$M_OK'")"
+is "first_index_day only moves earlier, like first_day" "$BACK_DAY" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='$M_BACK'")"
+is "a machine that never sent an index run has none" "null" \
+   "$(q "select coalesce(first_index_day, 'null') from machine_first_seen where machine_id='$M_USE'")"
 
 echo
 echo "usage counters add up instead of piling up"

@@ -235,11 +235,14 @@ ts "tool calls (sums the prop)" tool_calls       '[20]' '[2]'
 MET=$(api "meta")
 is "meta reports the rolled-up day"     "$DAY" "$(jget "$MET" latest_day)"
 is "meta reports the rollup ran"       "$DAY" "$(jget "$MET" latest_rollup_day)"
+# Usage lands in usage_daily rather than events; the stalled-ingest check reads both.
+is "meta reports the last day ingest stored" "$DAY" "$(jget "$MET" latest_ingest_day)"
 
-# The funnel reads machine_first_seen.first_index_day, which only the nightly
-# rollup writes (from raw `index` events). This is the seam that pins it: ingest
-# writes the events, the rollup sets the column, the dashboard reads it. If the
-# rollup stopped setting it, "activated" here would read 0.
+# The funnel reads machine_first_seen.first_index_day. The ingest worker sets it as
+# each index event is stored, and the nightly rollup re-derives it from raw `index`
+# events (smoke-rollup.sh pins that half, on events it seeds past the ingest path).
+# This is the seam: ingest writes the column, the dashboard reads it. If neither
+# writer set it, "activated" here would read 0.
 #
 # Its denominator is FIRST-SEEN MACHINES, not `install` events (api.ts: "a machine
 # that reinstalls does not re-enter the funnel"). m3 is the discriminator: it never
