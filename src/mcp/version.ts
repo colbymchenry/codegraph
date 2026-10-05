@@ -20,10 +20,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/** The `package.json` of the install this process runs from. */
+export const CodeGraphPackageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+
 function readPackageVersion(): string {
   try {
-    const pkgPath = path.join(__dirname, '..', '..', 'package.json');
-    const raw = fs.readFileSync(pkgPath, 'utf8');
+    const raw = fs.readFileSync(CodeGraphPackageJsonPath, 'utf8');
     const parsed = JSON.parse(raw);
     if (typeof parsed?.version === 'string' && parsed.version.length > 0) {
       return parsed.version;

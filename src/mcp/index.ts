@@ -295,6 +295,12 @@ function spawnDetachedDaemon(root: string, handover = false): void {
         env,
       },
     );
+    // An upgrade can delete the install this launcher runs from — its daemon
+    // then exits (#2335) and a respawn finds no executable. spawn reports that
+    // as an asynchronous 'error' event, which would crash this process if
+    // nobody listened. No daemon binds either way; the caller's poll gives up
+    // and the session is served in-process.
+    child.on('error', () => { /* no daemon — see above */ });
     child.unref();
   } finally {
     // The child holds its own dup of the log fd now; the launcher doesn't need it.

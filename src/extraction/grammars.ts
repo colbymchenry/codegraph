@@ -9,7 +9,7 @@
 import * as path from 'path';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
-import { Language } from '../types';
+import { ExtractionError, Language } from '../types';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -826,6 +826,21 @@ export function getUnavailableGrammarErrors(): Partial<Record<Language, string>>
     out[language] = message;
   }
   return out;
+}
+
+/**
+ * Whether these extraction errors say the file was never parsed because its
+ * grammar was not available (`parser_error`, recorded by the extractor when
+ * `getParser` has nothing for the language).
+ *
+ * That is a fact about the running process, not about the file: a daemon whose
+ * install was upgraded or deleted underneath it fails every lazy grammar load
+ * (#2335). Such a result must never replace a file's index data, and a row an
+ * older engine stored that way must be re-indexed — not treated as current
+ * because its content hash still matches.
+ */
+export function hasGrammarLoadFailure(errors: readonly ExtractionError[] | undefined): boolean {
+  return !!errors && errors.some((e) => e.code === 'parser_error');
 }
 
 /**
