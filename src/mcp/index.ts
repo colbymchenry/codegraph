@@ -44,12 +44,13 @@ import { MCPSession } from './session';
 import {
   Daemon,
   clearStaleDaemonLock,
+  installChangedReason,
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { CodeGraphPackageVersion } from './version';
+import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
   assertNoRebuild,
@@ -149,6 +150,14 @@ function makeFallbackEngine(root: string): MCPEngine {
   }
   if (existing && isProcessAlive(existing.pid)) {
     return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+  }
+  // This session's own install was upgraded or removed underneath it (#2335):
+  // its code no longer loads whole, so as the project's writer it would only
+  // keep a daemon from the current install from starting. Its daemon exits
+  // for the same reason, which is how it got here.
+  if (CodeGraphPackageVersion !== '0.0.0-unknown' &&
+      installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
+    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
   }
   return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
 }
@@ -295,6 +304,12 @@ function spawnDetachedDaemon(root: string, handover = false): void {
         env,
       },
     );
+    // An upgrade can delete the install this launcher runs from — its daemon
+    // then exits (#2335) and a respawn finds no executable. spawn reports that
+    // as an asynchronous 'error' event, which would crash this process if
+    // nobody listened. No daemon binds either way; the caller's poll gives up
+    // and the session is served in-process.
+    child.on('error', () => { /* no daemon — see above */ });
     child.unref();
   } finally {
     // The child holds its own dup of the log fd now; the launcher doesn't need it.

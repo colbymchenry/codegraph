@@ -3254,6 +3254,18 @@ export class QueryBuilder {
   }
 
   /**
+   * Files stored with no nodes or with recorded extraction errors — the only
+   * rows that can be missing their symbols (`CodeGraph.getIndexHealth`). A
+   * healthy index returns few or none, so this stays cheap on a large one.
+   */
+  getFilesWithoutNodesOrWithErrors(): FileRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM files WHERE node_count = 0 OR errors IS NOT NULL ORDER BY path')
+      .all() as FileRow[];
+    return rows.map(rowToFileRecord);
+  }
+
+  /**
    * Most recent index timestamp (ms since epoch) across all tracked files, or
    * null when nothing is indexed yet. One indexed aggregate, no per-row scan. (#329)
    */

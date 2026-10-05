@@ -265,6 +265,24 @@ export interface FileRecord {
   generated?: boolean;
 }
 
+/**
+ * Indexed files whose symbols are missing even though their content hash is
+ * current — what a hash comparison alone calls "up to date" (#2336). Paths are
+ * project-relative and sorted.
+ */
+export interface IndexHealth {
+  /**
+   * Files `sync` re-indexes: stored while their grammar could not load (#2335)
+   * or stored with no nodes and no recorded reason (#1541).
+   */
+  needsReindex: string[];
+  /**
+   * Files with a recorded parse error and no symbols from it. Deterministic:
+   * they stay this way until the file (or the parser) changes.
+   */
+  parseErrors: string[];
+}
+
 // =============================================================================
 // Extraction Types
 // =============================================================================

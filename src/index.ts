@@ -25,6 +25,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
   UnresolvedReference,
+  IndexHealth,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
@@ -43,6 +44,7 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
+import { hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
   createResolver,
@@ -2063,6 +2065,34 @@ export class CodeGraph {
   /** How many indexed files are flagged tool-generated. Reported by `status`. */
   getGeneratedFileCount(): number {
     return this.queries.countGeneratedFiles();
+  }
+
+  /**
+   * Indexed files whose symbols are missing although their content is current
+   * — rows a content-hash comparison calls up to date (#2336). Reported by
+   * `status`; `sync` repairs the `needsReindex` group.
+   */
+  getIndexHealth(): IndexHealth {
+    const needsReindex: string[] = [];
+    const parseErrors: string[] = [];
+    for (const file of this.queries.getFilesWithoutNodesOrWithErrors()) {
+      const errors = file.errors ?? [];
+      if (hasGrammarLoadFailure(errors)) {
+        // Stored without being parsed — its grammar could not load (#2335).
+        needsReindex.push(file.path);
+      } else if (file.nodeCount === 0) {
+        // Every parse stores at least the file node, so zero nodes means a
+        // wiped row (#1541) or a recorded failure — except file-level-only
+        // languages and files over the size limit, which are empty on purpose.
+        if (isFileLevelOnlyLanguage(file.language)) continue;
+        if (errors.length === 0) needsReindex.push(file.path);
+        else if (errors.some((e) => e.severity === 'error' || e.code === 'parse_error')) parseErrors.push(file.path);
+      } else if (errors.some((e) => e.code === 'parse_error')) {
+        // Parsed, but the tree had errors and no symbols survived.
+        parseErrors.push(file.path);
+      }
+    }
+    return { needsReindex, parseErrors };
   }
 
   // ===========================================================================
