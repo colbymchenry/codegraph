@@ -300,8 +300,12 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
   }
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
-    const type = inferLocalReceiverType(receiver, ref, context);
-    if (type) return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref');
+    const decl: { raw?: string } = {};
+    const type = inferLocalReceiverType(receiver, ref, context, decl);
+    if (type) {
+      return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
+        goDeclaredTypePackage(decl.raw, ref.filePath, context));
+    }
     const types = context.getNodesByName(receiver).filter(n => n.language === 'go' && (n.kind === 'struct' || n.kind === 'interface'));
     if (types.length) return types.length === 1 ? resolveMethodOnType(receiver, member, ref, context, 0.9, 'function-ref') : null;
   } else {
@@ -1864,40 +1868,61 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
-const GO_EXTERNAL_QUALIFIED = new WeakMap<ResolutionContext, Map<string, boolean>>();
+const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, ImportMapping | null>>();
 
 /**
- * Whether a Go reference is written through an imported package from outside
- * the module — `context.Context`, `fmt.Errorf`, a third-party `gin.H` — read
- * from its line, since the index keeps only the name.
+ * The import a Go reference is written through — `context` in
+ * `context.Context`, `store` in `store.Manager` — read from its line, since
+ * the index keeps only the name. Undefined for a name written bare, or
+ * through anything that isn't one of the file's imports.
  */
-function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.referenceKind === 'imports') return false;
+export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): ImportMapping | undefined {
+  if (ref.referenceKind === 'imports') return undefined;
   const name = ref.referenceName.split('.').pop()!;
-  if (!/^[A-Za-z_]\w*$/.test(name)) return false;
-  let memo = GO_EXTERNAL_QUALIFIED.get(context);
-  if (!memo) GO_EXTERNAL_QUALIFIED.set(context, (memo = new Map()));
+  if (!/^[A-Za-z_]\w*$/.test(name)) return undefined;
+  let memo = GO_QUALIFIERS.get(context);
+  if (!memo) GO_QUALIFIERS.set(context, (memo = new Map()));
   const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
   const hit = memo.get(key);
-  if (hit !== undefined) return hit;
-  let external = false;
+  if (hit !== undefined) return hit ?? undefined;
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
   const at = Math.max(0, ref.column);
   // The qualifier right before the name at the reference's column, or the
   // line's only spelling of the name.
   const before = line.startsWith(name, at) ? /(?:^|[^\w.])([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
     : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.])([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
-  if (before) {
-    const imported = context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before);
-    if (imported) {
-      const mod = context.getGoModule?.();
-      const local = imported.source.startsWith('.') || imported.source.includes('/internal/') ||
-        (mod !== undefined && mod !== null && (imported.source === mod.modulePath || imported.source.startsWith(`${mod.modulePath}/`)));
-      external = !local;
-    }
-  }
-  memo.set(key, external);
-  return external;
+  const imported = before ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before) : undefined;
+  memo.set(key, imported ?? null);
+  return imported;
+}
+
+/**
+ * Whether a Go reference is written through an imported package from outside
+ * the project's modules — `context.Context`, `fmt.Errorf`, a third-party
+ * `gin.H`.
+ */
+function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const imported = goRefQualifier(ref, context);
+  if (!imported) return false;
+  return !(imported.source.startsWith('.') || imported.source.includes('/internal/') ||
+    context.getGoPackageDir?.(imported.source, ref.filePath) != null);
+}
+
+/**
+ * Whether `candidate` lives in the project package a Go reference is written
+ * through, when it is one: `store.Manager` names the `Manager` of the
+ * directory the `store` import maps to, never a same-named symbol of another
+ * package (#2322).
+ */
+function isInGoQualifierPackage(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // A package never holds a method: a call or method value landing on one is
+  // made through a variable that shadows the import — prometheus's
+  // `labels := &maxHeap{}`, then `labels.get()`.
+  if (candidate.kind === 'method' && (ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref')) return true;
+  const imported = goRefQualifier(ref, context);
+  if (!imported) return true;
+  const pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath);
+  return pkgDir == null || goPackageDir(candidate.filePath) === pkgDir;
 }
 
 const PHP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'trait', 'enum']);
@@ -2163,7 +2188,10 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // Go's `context.Context`, `http.Handler`: written through a package from
   // outside the module, so nothing in it — not even the same file's method
   // `Stream.Context` (fiber's 85 `context.Context` parameters went there).
-  if (ref.language === 'go' && candidate.language === 'go' && isGoExternalQualified(ref, context)) return false;
+  // Through one of the project's packages, only that package's symbol: a
+  // `job.OPCommand` result type is not the method `Context.OPCommand`.
+  if (ref.language === 'go' && candidate.language === 'go' &&
+      (isGoExternalQualified(ref, context) || !isInGoQualifierPackage(candidate, ref, context))) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -6097,6 +6125,8 @@ export function resolveMethodOnType(
    * `dao/converter/` and `service/converter/`), the FQN's
    * file-path-suffix picks the right one — the disambiguation
    * signal Java imports carry but the call site doesn't (#314).
+   * For Go it is the project-relative directory of the package that
+   * declares `typeName`, when that is known (resolveGoMethodInPackage).
    */
   preferredFqn?: string,
   /** Recursion guard for the supertype/conformance walk. */
@@ -6128,6 +6158,10 @@ export function resolveMethodOnType(
       }
     }
   }
+  if (ref.language === 'go' && preferredFqn !== undefined) {
+    const scoped = resolveGoMethodInPackage(typeName, methodName, preferredFqn, matches, ref, context, confidence, resolvedBy, depth);
+    if (scoped !== undefined) return scoped;
+  }
   if (matches.length === 0) {
     // Conformance fallback: the method may be defined on a supertype `typeName`
     // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
@@ -6151,7 +6185,7 @@ export function resolveMethodOnType(
     return null;
   }
 
-  if (matches.length > 1 && preferredFqn) {
+  if (matches.length > 1 && preferredFqn && ref.language !== 'go') {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
@@ -6713,7 +6747,7 @@ const PATTERN_MEMO_CAP = 8192;
  * ReferenceResolver.clearCaches calls clearNameMatcherMemos alongside
  * clearImportResolverMemos.
  */
-type InferScanState = { hi: number; ansIdx: number; ansType: string | null };
+type InferScanState = { hi: number; ansIdx: number; ansType: string | null; ansRaw?: string };
 const INFER_SCAN_STATES = new WeakMap<ResolutionContext, Map<string, InferScanState>>();
 
 /** Awaited inference caches are scoped to the resolver's stable-source window.
@@ -6793,7 +6827,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_FIXTURE_TYPES.delete(context);
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
-  GO_EXTERNAL_QUALIFIED.delete(context);
+  GO_QUALIFIERS.delete(context);
+  GO_EMBEDS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -6912,6 +6947,14 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       return [
         new RegExp(`\\b${r}\\b\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*{`), // lg := Logger{} / &Logger{}
         new RegExp(`\\bvar\\s+${r}\\s+\\*?([A-Za-z_][\\w.]*)`), // var lg Logger / *Logger
+        // A method receiver or parameter of an unexported type — `func (s
+        // *server)`, `func (c *cache[T])`, `func handle(h *handler)`, a line
+        // of a multi-line parameter list or `var (…)` block. Lowercase types
+        // are accepted only where a parameter list puts them: after `(`, `,`
+        // or nothing, and before `,`, `)` or the line's end — unlike the
+        // keyword-free pattern below, which a lowercase `ident type` pair in
+        // ordinary code would satisfy (#2323).
+        new RegExp(`(?:^|[(,])\\s*${r}\\s+\\*?([a-z_]\\w*)\\s*(?:\\[[^\\]]*\\])?\\s*(?:[,)]|$)`), // func (s *server) / f(h *handler)
         // A typed parameter / method receiver (`func use(lg Logger)`,
         // `func (l Logger) M()`) — name-before-type with no `var`/`:=` (#1125).
         // PascalCase-guarded (unlike the anchored patterns above) to keep the
@@ -7372,6 +7415,13 @@ function inferLocalReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  /**
+   * Receives the found type as the declaration spells it, before the
+   * normalization the return value gets: Go's package qualifier (`pkg.Type`
+   * vs a bare `server`) says which package declares it. Set on the
+   * incremental-scan path only, the one every Go receiver takes.
+   */
+  decl?: { raw?: string },
 ): string | null {
   // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
   // field whose assignment or `property` declaration usually lives outside the
@@ -7430,6 +7480,8 @@ function inferLocalReceiverType(
     ? 0
     : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
 
+  // The raw capture behind matchLine's latest non-null answer (see `decl`).
+  let lastRaw: string | undefined;
   const matchLine = (i: number): string | null => {
     const line = lines[i];
     if (!line) return null;
@@ -7441,7 +7493,10 @@ function inferLocalReceiverType(
       const m = line.match(re);
       if (m && m[1]) {
         const type = normalizeInferredTypeName(m[1]);
-        if (type) return type;
+        if (type) {
+          lastRaw = m[1];
+          return type;
+        }
       }
     }
     return null;
@@ -7468,7 +7523,8 @@ function inferLocalReceiverType(
       for (let i = callIdx; i >= startIdx; i--) {
         const type = matchLine(i);
         if (type) {
-          states.set(key, { hi: callIdx, ansIdx: i, ansType: type });
+          states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw });
+          if (decl) decl.raw = lastRaw;
           return type;
         }
       }
@@ -7481,15 +7537,21 @@ function inferLocalReceiverType(
         if (type) {
           state.ansIdx = i;
           state.ansType = type;
+          state.ansRaw = lastRaw;
           break;
         }
       }
       state.hi = callIdx;
-      return state.ansIdx >= startIdx ? state.ansType : null;
+      if (state.ansIdx < startIdx) return null;
+      if (decl) decl.raw = state.ansRaw;
+      return state.ansType;
     }
     for (let i = callIdx; i >= startIdx; i--) {
       const type = matchLine(i);
-      if (type) return type;
+      if (type) {
+        if (decl) decl.raw = lastRaw;
+        return type;
+      }
     }
     return null;
   }
@@ -7862,10 +7924,11 @@ export function matchMethodCall(
         matchVbTypedCall(objectOrClass!, methodName!, ref, context, (name) => isStdMethodName('vbnet', name)));
       if (typed !== undefined) return typed;
     }
+    const decl: { raw?: string } = {};
     let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
-        : inferLocalReceiverType(objectOrClass!, ref, context));
+        : inferLocalReceiverType(objectOrClass!, ref, context, decl));
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
@@ -7889,13 +7952,16 @@ export function matchMethodCall(
     }
     if (inferredType) {
       // Java/Kotlin: when two classes share the simple name, the file's import
-      // pins WHICH one (#314). Other languages disambiguate by call-site file.
+      // pins WHICH one (#314); Go: the package that declares the type (#2323).
+      // Other languages disambiguate by call-site file.
       const importedFqn =
         ref.language === 'java' || ref.language === 'kotlin'
           ? context
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
-          : undefined;
+          : ref.language === 'go'
+            ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
+            : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
@@ -8381,6 +8447,128 @@ function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: Resolutio
   return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
 }
 
+/** The directory of a Go file, which is its package: Go keeps one package per directory. */
+function goPackageDir(filePath: string): string {
+  return path.posix.dirname(filePath.replace(/\\/g, '/'));
+}
+
+/**
+ * The project directory of the package `filePath` imports as `qualifier`:
+ * undefined when the file has no such import, null when the import is not a
+ * package of one of the project's modules.
+ */
+function goImportPackageDir(qualifier: string, filePath: string, context: ResolutionContext): string | null | undefined {
+  const imp = context.getImportMappings(filePath, 'go').find((i) => i.localName === qualifier);
+  if (!imp) return undefined;
+  return context.getGoPackageDir?.(imp.source, filePath) ?? null;
+}
+
+/**
+ * The package directory that declares a Go type spelled `raw` in `filePath`:
+ * the file's own package for a bare name (`server`, `*Store`), the imported
+ * package for a qualified one (`store.Manager`) when it is a project package.
+ * Undefined when that can't be told, which leaves resolution as it was.
+ */
+function goDeclaredTypePackage(raw: string | undefined, filePath: string, context: ResolutionContext): string | undefined {
+  if (!raw) return undefined;
+  const name = raw.replace(/[*&\s]/g, '');
+  const dot = name.indexOf('.');
+  if (dot < 0) return goPackageDir(filePath);
+  return goImportPackageDir(name.slice(0, dot), filePath, context) ?? undefined;
+}
+
+/** The node kinds a Go `type` declaration produces. */
+const GO_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface', 'type_alias']);
+
+/**
+ * `methodName` on the Go type `typeName` that the package in directory
+ * `pkgDir` declares (#2323). Go type names are unique only within a package —
+ * each package may have its own `server`, `handler` or `DAO` — and a type's
+ * methods are always declared in its own package, so `matches` (every
+ * `<typeName>::<methodName>` in the project) counts only from `pkgDir`. A
+ * method the type doesn't declare is promoted from a type it embeds, which
+ * its declaration names (`BaseAPI`, `*cached.BaseManager`, `ReadView`); the
+ * name-based supertype walk would mix in every same-named type's embeddings.
+ * Undefined when the package declares no such type (a dot import, a file
+ * that isn't indexed): the caller then resolves by name as before.
+ */
+function resolveGoMethodInPackage(
+  typeName: string,
+  methodName: string,
+  pkgDir: string,
+  matches: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+  depth: number,
+): ResolvedRef | null | undefined {
+  const own = matches.filter((m) => goPackageDir(m.filePath) === pkgDir);
+  if (own.length > 0) {
+    if (ref.referenceKind === 'function_ref' && own.length !== 1) return null;
+    return { original: ref, targetNodeId: preferCallSiteFile(own, ref.filePath)[0]!.id, confidence, resolvedBy };
+  }
+  const types = goPackageTypes(typeName, pkgDir, context);
+  if (types.length === 0) return undefined;
+  if (depth >= 4) return null;
+  for (const t of types) {
+    for (const embedded of goEmbeddedTypes(t, context)) {
+      const via = resolveMethodOnType(
+        embedded.name, methodName, ref, context, confidence, resolvedBy, embedded.pkgDir, depth + 1,
+      );
+      if (via) return via;
+    }
+  }
+  return null;
+}
+
+/** The declarations of Go type `typeName` in the package at directory `pkgDir`. */
+function goPackageTypes(typeName: string, pkgDir: string, context: ResolutionContext): Node[] {
+  return context.getNodesByName(typeName).filter(
+    (n) => n.language === 'go' && GO_TYPE_KINDS.has(n.kind) && goPackageDir(n.filePath) === pkgDir
+  );
+}
+
+const GO_EMBEDS = new WeakMap<ResolutionContext, Map<string, Array<{ name: string; pkgDir: string }>>>();
+
+/**
+ * The project types a Go struct or interface embeds, read from its own
+ * declaration — a member that is nothing but a type (`BaseAPI`,
+ * `*cached.BaseManager`, `ReadView`, optionally tagged), one per line or
+ * `;`-separated (`type EphemeralKV struct{ RemoteKV }`) — each with the
+ * directory of the package that declares it. An embedded type from outside
+ * the module (`suite.Suite`, `sync.Mutex`) has no project methods and is left
+ * out, as is anything whose package can't be told.
+ */
+function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ name: string; pkgDir: string }> {
+  let memo = GO_EMBEDS.get(context);
+  if (!memo) GO_EMBEDS.set(context, (memo = new Map()));
+  const hit = memo.get(typeNode.id);
+  if (hit) return hit;
+  const embedded: Array<{ name: string; pkgDir: string }> = [];
+  const lines = context.getFileLines?.(typeNode.filePath) ?? context.readFile(typeNode.filePath)?.split(/\r?\n/) ?? [];
+  const decl = lines
+    .slice(Math.max(0, typeNode.startLine - 1), typeNode.endLine ?? typeNode.startLine)
+    .map((l) => l.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+    .join('\n');
+  const open = decl.indexOf('{');
+  const close = decl.lastIndexOf('}');
+  if (open >= 0 && close > open) {
+    let body = decl.slice(open + 1, close);
+    // Members of a nested anonymous struct are not this type's.
+    while (/\{[^{}]*\}/.test(body)) body = body.replace(/\{[^{}]*\}/g, '');
+    for (const member of body.split(/[\n;]/)) {
+      const m = /^\s*\*?\s*([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?\s*(?:\[[^\]]*\])?\s*(?:`[^`]*`|"[^"]*")?\s*$/.exec(member);
+      if (!m) continue;
+      const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+      if (pkgDir == null) continue;
+      embedded.push({ name: m[2] ?? m[1]!, pkgDir });
+    }
+  }
+  memo.set(typeNode.id, embedded);
+  return embedded;
+}
+
 /** Go builtin/primitive field types that can never carry a project method. */
 const GO_BUILTIN_FIELD_TYPES = new Set([
   'string', 'bool', 'byte', 'rune', 'error', 'any',
@@ -8413,15 +8601,25 @@ function matchGoFieldChainCall(
   if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
   const [base, field] = segs;
 
-  const baseType = inferLocalReceiverType(base!, ref, context);
+  const decl: { raw?: string } = {};
+  const baseType = inferLocalReceiverType(base!, ref, context, decl);
   if (!baseType) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
 
-  const structs = preferCallSiteFile(context.getNodesByName(baseType), ref.filePath).filter(
+  let structs = context.getNodesByName(baseType).filter(
     (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
   );
+  // The struct the declaring package has is the one the base's type means (a
+  // method receiver's type is always the call site's own package's): Go type
+  // names repeat across packages — harbor has a `daoTestSuite` in every DAO
+  // package — and another package's same-named struct with a same-named
+  // field is not this one (#2323).
+  const basePkg = goDeclaredTypePackage(decl.raw, ref.filePath, context);
+  const declared = structs.filter((n) => goPackageDir(n.filePath) === basePkg);
+  if (declared.length > 0) structs = declared;
+  structs = preferCallSiteFile(structs, ref.filePath);
   for (const s of structs) {
     const source = context.readFile(s.filePath);
     if (!source) continue;
@@ -8436,23 +8634,19 @@ function matchGoFieldChainCall(
       const m = line.match(fieldTypeRe);
       if (!m || !m[1]) continue;
       const rawType = m[1];
+      // The package that declares the field's type: the struct's own for a
+      // bare type name, the imported one for a package-qualified name.
+      let pkgDir = goPackageDir(s.filePath);
       // A package-qualified field type (`http.Handler`, `sql.DB`) is only
-      // followed when the package is IN-MODULE: stripping the qualifier and
-      // matching the bare name would conflate a stdlib/third-party type with
-      // any same-named project type — on chi, `handler http.Handler` bound
-      // to an example app's unrelated local `Handler`. That is the exact
-      // fabrication this matcher exists to prevent (#1276).
+      // followed when the package is one of the project's: stripping the
+      // qualifier and matching the bare name would conflate a stdlib or
+      // third-party type with any same-named project type — on chi, `handler
+      // http.Handler` bound to an example app's unrelated local `Handler`.
+      // That is the exact fabrication this matcher exists to prevent (#1276).
       if (rawType.includes('.')) {
-        const pkg = rawType.split('.')[0]!;
-        const mod = context.getGoModule?.();
-        const imp = context
-          .getImportMappings(s.filePath, 'go')
-          .find((i) => i.localName === pkg);
-        const inModule =
-          !!mod &&
-          !!imp &&
-          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
-        if (!inModule) continue;
+        const imported = goImportPackageDir(rawType.split('.')[0]!, s.filePath, context);
+        if (imported == null) continue;
+        pkgDir = imported;
       }
       // Unexported (lowercase) types are idiomatic Go and stay eligible —
       // chi's `mx.tree.FindRoute()` chains through `tree *node`. A
@@ -8460,7 +8654,7 @@ function matchGoFieldChainCall(
       // validated `<type>::<method>` match.
       const fieldType = rawType.split('.').pop();
       if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
-      const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+      const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method', pkgDir);
       if (resolved) return resolved;
     }
   }

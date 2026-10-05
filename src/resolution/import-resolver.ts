@@ -18,6 +18,7 @@ import {
   resolveObjectLiteralBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
+  goRefQualifier,
 } from './name-matcher';
 
 /**
@@ -464,9 +465,10 @@ export function isExternalImport(
     }
     // In-module imports look like `<module-path>/sub/pkg` — local to
     // this project. Without the module-path check we'd flag every
-    // cross-package call in a Go monorepo as external (issue #388).
-    const mod = context?.getGoModule?.();
-    if (mod && (importPath === mod.modulePath || importPath.startsWith(mod.modulePath + '/'))) {
+    // cross-package call in a Go monorepo as external (issue #388) — and,
+    // for a module whose go.mod is below the root or beside other modules,
+    // every import of it (#2322).
+    if (context?.getGoPackageDir?.(importPath) != null) {
       return false;
     }
     // `internal/` packages stay local even when go.mod is missing —
@@ -2470,57 +2472,63 @@ function resolveJavaImportedReference(
 
 /**
  * Resolve a Go cross-package qualified reference (`pkga.FuncX`) by matching
- * the package alias against an in-module import, stripping the module prefix
- * to a project-relative directory, and locating the exported symbol in any
- * `.go` file under that directory. Returns `null` for stdlib / third-party
- * imports (no `go.mod`-relative match) so the rest of `resolveViaImport`
- * can still try the file-based path.
+ * the package alias against an in-project import, mapping the import to the
+ * package's project directory, and locating the exported symbol in a `.go`
+ * file directly in that directory. Returns `null` for stdlib / third-party
+ * imports (no project module declares them) so the rest of
+ * `resolveViaImport` can still try the file-based path.
  */
 function resolveGoCrossPackageReference(
   ref: UnresolvedRef,
   imports: ImportMapping[],
   context: ResolutionContext
 ): ResolvedRef | null {
-  const mod = context.getGoModule?.();
-  if (!mod) return null;
-
   // Qualified call: receiver before `.`, member after. A bare reference
-  // (no dot) is a same-file/in-package call — handled elsewhere.
+  // (no dot) is a same-package name — unless the source spells a package in
+  // front of it: `store.Manager` in a field or a signature, which the index
+  // keeps as `Manager` (#2322).
   const dotIdx = ref.referenceName.indexOf('.');
-  if (dotIdx <= 0) return null;
+  if (dotIdx <= 0) {
+    const imp = goRefQualifier(ref, context);
+    return imp ? findGoPackageMember(ref.referenceName, imp, ref, context) : null;
+  }
   const receiver = ref.referenceName.substring(0, dotIdx);
   const memberName = ref.referenceName.substring(dotIdx + 1);
   if (!memberName) return null;
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
-    // Only in-module imports map to a known directory.
-    if (imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/')) {
-      continue;
-    }
-    const pkgDir = imp.source === mod.modulePath
-      ? ''
-      : imp.source.substring(mod.modulePath.length + 1);
+    const found = findGoPackageMember(memberName, imp, ref, context);
+    if (found) return found;
+  }
+  return null;
+}
 
-    // Look up the member by name and pick the candidate whose file lives
-    // directly in the package directory. Match the immediate parent dir
-    // exactly so a call to `pkga.FuncX` doesn't accidentally land on a
-    // `FuncX` declared in `pkga/subpkg/`.
-    const candidates = context.getNodesByName(memberName);
-    for (const node of candidates) {
-      if (node.language !== 'go') continue;
-      if (!node.isExported) continue;
-      const fp = node.filePath.replace(/\\/g, '/');
-      const lastSlash = fp.lastIndexOf('/');
-      const fileDir = lastSlash >= 0 ? fp.substring(0, lastSlash) : '';
-      if (fileDir === pkgDir) {
-        return {
-          original: ref,
-          targetNodeId: node.id,
-          confidence: 0.9,
-          resolvedBy: 'import',
-        };
-      }
+/**
+ * The exported `memberName` of the project package `imp` names, looked up in
+ * the package's directory: its module's directory followed by the rest of
+ * the import path (#2322). Matched on the immediate directory so `pkga.FuncX`
+ * never lands on a `FuncX` declared in `pkga/subpkg/`. Null when the import
+ * is no project package.
+ */
+function findGoPackageMember(
+  memberName: string,
+  imp: ImportMapping,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const pkgDir = context.getGoPackageDir?.(imp.source, ref.filePath);
+  if (pkgDir == null) return null;
+  for (const node of context.getNodesByName(memberName)) {
+    if (node.language !== 'go') continue;
+    if (!node.isExported) continue;
+    if (path.posix.dirname(node.filePath.replace(/\\/g, '/')) === pkgDir) {
+      return {
+        original: ref,
+        targetNodeId: node.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
     }
   }
   return null;

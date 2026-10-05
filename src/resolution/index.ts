@@ -35,7 +35,7 @@ import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
-import { loadGoModule, type GoModule } from './go-module';
+import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
@@ -310,8 +310,17 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
   private dirAliases = new Map<string, AliasMap | null>();
-  // go.mod module path. Same lazy/immutable convention as projectAliases.
-  private goModule: GoModule | null | undefined = undefined;
+  // Per project-relative directory ('' = the root): the module of the nearest
+  // go.mod at or above it, up to the project root. Same lazy/immutable
+  // convention as dirAliases.
+  private goModuleByDir = new Map<string, GoModule | null>();
+  // The project's Go modules: the root one plus every module that owns an
+  // indexed .go file. Depends on the file set, like knownFiles, so
+  // clearCaches drops it.
+  private goModules: GoModule[] | null = null;
+  // getGoPackageDir answers, keyed by import path and the importing file's
+  // module. Derived from goModules, so dropped with it.
+  private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
@@ -450,6 +459,8 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
+    this.goModules = null;
+    this.goPackageDirs.clear();
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
@@ -461,6 +472,49 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
     }
+  }
+
+  /**
+   * The module of the nearest `go.mod` at or above project-relative `dir`
+   * ('' = the root), never above the project root (#2322). Each directory
+   * is read at most once: every directory the walk passes is memoized.
+   */
+  private nearestGoModule(dir: string): GoModule | null {
+    const walked: string[] = [];
+    let found: GoModule | null | undefined;
+    for (;;) {
+      found = this.goModuleByDir.get(dir);
+      if (found !== undefined) break;
+      walked.push(dir);
+      found = loadGoModule(path.join(this.projectRoot, dir));
+      if (found || dir === '') break;
+      dir = goDirOf(dir);
+    }
+    for (const d of walked) this.goModuleByDir.set(d, found);
+    return found;
+  }
+
+  /**
+   * The project's Go modules: the root `go.mod`'s, and the nearest `go.mod`
+   * of every directory holding an indexed `.go` file — so an ignored or
+   * vendored tree, which holds no indexed file, adds none, and nothing walks
+   * the disk. The go tool ignores `testdata/` and `_`/`.`-prefixed
+   * directories, so a module there serves only its own files (#2322).
+   */
+  private getGoModules(): GoModule[] {
+    if (this.goModules) return this.goModules;
+    const dirs = new Set<string>(['']);
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      if (file.endsWith('.go')) dirs.add(goDirOf(file));
+    }
+    const modules = new Set<GoModule>();
+    for (const dir of dirs) {
+      const mod = this.nearestGoModule(dir);
+      const modDir = mod ? path.relative(this.projectRoot, mod.rootDir).split(path.sep).join('/') : '';
+      if (mod && !/(?:^|\/)(?:testdata|[_.][^/]*)(?:\/|$)/.test(modDir)) modules.add(mod);
+    }
+    this.goModules = [...modules];
+    return this.goModules;
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -805,11 +859,15 @@ export class ReferenceResolver {
         return found;
       },
 
-      getGoModule: () => {
-        if (this.goModule === undefined) {
-          this.goModule = loadGoModule(this.projectRoot);
-        }
-        return this.goModule;
+      getGoPackageDir: (importPath: string, fromFile?: string) => {
+        const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
+        const key = `${importPath}\0${own?.rootDir ?? ''}`;
+        const hit = this.goPackageDirs.get(key);
+        if (hit !== undefined) return hit;
+        const mod = findGoModuleForImport(importPath, this.getGoModules(), own);
+        const dir = mod ? goModulePackageDir(importPath, mod, this.projectRoot) : null;
+        this.goPackageDirs.set(key, dir);
+        return dir;
       },
 
       getWorkspacePackages: () => {
@@ -3080,6 +3138,12 @@ export class ReferenceResolver {
     if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
+}
+
+/** The project-relative directory holding `p` ('' for the project root). */
+function goDirOf(p: string): string {
+  const dir = path.posix.dirname(p.replace(/\\/g, '/'));
+  return dir === '.' || dir === '/' ? '' : dir;
 }
 
 /**
