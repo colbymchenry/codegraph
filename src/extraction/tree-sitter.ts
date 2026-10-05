@@ -2874,6 +2874,10 @@ export class TreeSitterExtractor {
               if (nameNode.type === 'object_pattern' && valueNode?.type === 'identifier') {
                 this.extractRtkHookBindings(nameNode, isExported);
               }
+              // No symbol is declared for a pattern, but its initializer still
+              // runs: walk it with the enclosing scope on the stack so a call in
+              // it (`const { a } = useFoo()`) is recorded (#2340).
+              if (valueNode) this.visitFunctionBody(valueNode, '');
               continue;
             }
             const name = getNodeText(nameNode, this.source);

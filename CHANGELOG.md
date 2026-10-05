@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- A call made in a destructuring declaration (`const { a } = useFoo()`) is now recorded in TypeScript, JavaScript and Vue `<script setup>`, so the function it calls no longer shows no callers (#2340).
+
 
 ## [1.6.2] - 2026-10-03
 

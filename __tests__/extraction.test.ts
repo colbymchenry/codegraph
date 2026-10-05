@@ -1167,6 +1167,22 @@ const token = getTokenMp();
     expect(call).toBeDefined();
   });
 
+  it('should extract calls from a top-level destructuring declaration (issue #2340)', () => {
+    const callsTo = (file: string, code: string) =>
+      extractFromSource(file, code).unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'useFoo'
+      );
+
+    // module scope in a .ts file, object and array patterns
+    expect(callsTo('g.ts', 'const { a } = useFoo(1)\nexport const g = a\n')).toHaveLength(1);
+    expect(callsTo('g.ts', 'const [b] = useFoo(1)\nexport const g = b\n')).toHaveLength(1);
+    // Vue <script setup>
+    expect(callsTo('A.vue', '<script setup lang="ts">\nconst { a } = useFoo(1)\n</script>\n')).toHaveLength(1);
+    expect(callsTo('F.vue', '<script setup lang="ts">\nconst [b] = useFoo(1)\n</script>\n')).toHaveLength(1);
+    // a destructuring inside a function still yields exactly one edge
+    expect(callsTo('d.ts', 'export function probe() { const { a } = useFoo(1); return a }\n')).toHaveLength(1);
+  });
+
   describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
     const code = `
 const eager = load();
