@@ -188,6 +188,30 @@ async function exprReceivers(x, y) {
       ]);
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('walks a module-scope destructuring declaration like a body does: %s (#2340)', (ext, language) => {
+    const typed = language === 'typescript' || language === 'tsx';
+    const result = assertParity(`fixture.${ext}`, `
+import { handler } from './h';
+const { a } = useFoo(1);
+let [b, c] = pair();
+var { d: { e } } = nested();
+const { f = fallback() } = withDefault(handler);
+const [g = other(), ...rest] = list(() => inArrow(handler));
+export const { h } = exported(new Store());
+export const { useGetUserQuery } = api;
+${typed ? 'const { k }: Shape = make();' : ''}
+function probe() { const { j } = inner(); return j; }
+export function second() { return probe(); }
+`, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining([
+      'useFoo', 'pair', 'nested', 'fallback', 'withDefault', 'other', 'list', 'inArrow', 'exported', 'inner',
+      ...(typed ? ['make'] : []),
+    ]));
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');

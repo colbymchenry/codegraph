@@ -2979,6 +2979,14 @@ export class TreeSitterExtractor {
               if (nameNode.type === 'object_pattern' && valueNode?.type === 'identifier') {
                 this.extractRtkHookBindings(nameNode, isExported);
               }
+              // A pattern declares no symbol of its own, but its initializer
+              // (and any default value in the pattern) still runs. Walk the
+              // declarator the way a function body walks it, with the
+              // enclosing scope on the stack: the file for module code, which
+              // a `<script setup>` block hands to its component. Without this
+              // `const { data } = useFetch()` recorded no call at all (#2340).
+              // Mirrored in the kernel (tsjs/extractors.rs extract_variable).
+              this.visitFunctionBody(child, '');
               continue;
             }
             const name = getNodeText(nameNode, this.source);

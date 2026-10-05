@@ -387,7 +387,7 @@ impl<'t> Walker<'t> {
             let Some(name_node) = child.child_by_field_name("name") else { continue };
             let value = child.child_by_field_name("value");
 
-            // Destructured patterns are skipped — except RTK Query generated
+            // Destructured patterns mint no node — except RTK Query generated
             // hooks (`export const { useGetXQuery } = api`).
             if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
                 if name_node.kind() == "object_pattern"
@@ -395,6 +395,11 @@ impl<'t> Walker<'t> {
                 {
                     self.extract_rtk_hook_bindings(name_node, is_exported);
                 }
+                // The initializer (and any default in the pattern) still runs:
+                // walk the declarator as a function body walks it, with the
+                // enclosing scope on the stack (#2340). Mirrors
+                // TreeSitterExtractor.extractVariable.
+                self.visit_function_body(child);
                 continue;
             }
             let name = self.text(name_node).to_string();

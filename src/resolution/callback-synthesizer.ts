@@ -1443,9 +1443,14 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       const event = m[1]!;
       const expr = m[2]!.trim();
       if (expr.includes('=>') || expr.startsWith('$')) continue; // inline arrow / $emit
-      const name = expr.match(/^([A-Za-z_]\w*)/)?.[1];
+      // `@click="save"` names a method Vue calls with the event. A handler that
+      // is an expression — `save(item)`, `emit('close')`, `open = true` — is
+      // the template's own code: the Vue extractor records its calls, on their
+      // line (#2340), so resolving its leading name here too doubled those
+      // edges and bound `emit(…)` / `open = …` to any function of that name.
+      const name = expr.match(/^([A-Za-z_$][\w$]*)\s*(?:\(|$)/)?.[1];
       if (!name) continue;
-      const direct = resolve(name, HANDLER_KINDS);
+      const direct = name === expr ? resolve(name, HANDLER_KINDS) : undefined;
       if (direct) { addEdge(direct, { synthesizedBy: 'vue-handler', event }); continue; }
       // Composable-destructure handler → resolve to the composable's returned fn.
       const d = destructured.get(name);

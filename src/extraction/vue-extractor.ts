@@ -4,6 +4,7 @@ import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
 import { foldScriptResult, sfcFileNode } from './sfc-script';
 import { vueOptionsMembers } from './vue-options-api';
+import { vueTemplateCalls } from './vue-template-calls';
 
 /**
  * Vue built-in components — skipped so a `<Transition>` / `<KeepAlive>` in the
@@ -74,6 +75,11 @@ export class VueExtractor {
       // markup (incl. through a barrel import) is invisible to callers /
       // impact (#629 follow-up).
       this.extractTemplateComponents(componentNode.id);
+
+      // Calls the template makes — `{{ useBar(link) }}`, `:to="localePath(x)"`,
+      // `@click="save(item)"` — are the component's, like the calls its
+      // `<script setup>` makes (#2340).
+      this.extractTemplateCalls(componentNode.id);
     } catch (error) {
       this.errors.push({
         message: `Vue extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -324,6 +330,52 @@ export class VueExtractor {
           language: 'vue',
         });
       }
+    }
+  }
+
+  /**
+   * Calls written in the `<template>` (see ./vue-template-calls), each made by
+   * the component at the line it is written on — the same `calls` reference a
+   * call in `<script setup>` makes, so a composable or helper used only in
+   * markup has its callers.
+   *
+   * A template calls an Options API component's own methods by their bare
+   * name (`{{ price(item) }}`, `@click="save(form)"`), where script code
+   * writes `this.save()`. Resolution only binds a bare call to a component
+   * method when it reads `this.` at the call site, so these are linked here,
+   * where the method is known to be this component's.
+   */
+  private extractTemplateCalls(componentNodeId: string): void {
+    const calls = vueTemplateCalls(this.source);
+    if (calls.length === 0) return;
+    const component = this.nodes.find((n) => n.id === componentNodeId);
+    const ownMethods = new Map<string, string>();
+    for (const n of this.nodes) {
+      if (n.kind === 'method' && n.qualifiedName === `${component?.name}::${n.name}`) ownMethods.set(n.name, n.id);
+    }
+    const lineStarts = [0];
+    for (let i = 0; i < this.source.length; i++) {
+      if (this.source.charCodeAt(i) === 10) lineStarts.push(i + 1);
+    }
+    let line = 0;
+    for (const call of calls) {
+      // Calls come in source order, so the line only moves forward.
+      while (line + 1 < lineStarts.length && lineStarts[line + 1]! <= call.offset) line++;
+      const column = call.offset - lineStarts[line]!;
+      const ownMethod = call.name.includes('.') ? undefined : ownMethods.get(call.name);
+      if (ownMethod) {
+        this.edges.push({ source: componentNodeId, target: ownMethod, kind: 'calls', line: line + 1, column });
+        continue;
+      }
+      this.unresolvedReferences.push({
+        fromNodeId: componentNodeId,
+        referenceName: call.name,
+        referenceKind: 'calls',
+        line: line + 1, // 1-indexed
+        column,
+        filePath: this.filePath,
+        language: 'vue',
+      });
     }
   }
 }

@@ -121,8 +121,10 @@ export const vueResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 2: Nuxt auto-imported composables
-    if (NUXT_AUTO_IMPORTS.has(ref.referenceName)) {
+    // Pattern 2: Nuxt auto-imported composables — unless the file declares
+    // its own function of that name, which shadows the auto-import: elk's
+    // lists page calls its own `clearError(true)`, not Nuxt's (#2340).
+    if (NUXT_AUTO_IMPORTS.has(ref.referenceName) && !declaresOwnFunction(ref, context)) {
       return {
         original: ref,
         targetNodeId: ref.fromNodeId,
@@ -300,6 +302,13 @@ export const nuxtResolver: FrameworkResolver = {
     return { nodes, references };
   },
 };
+
+/** Does the reference's own file declare a function (or a const holding one) by that name? */
+function declaresOwnFunction(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return context
+    .getNodesInFile(ref.filePath)
+    .some((n) => n.name === ref.referenceName && (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable'));
+}
 
 /**
  * Check if string is PascalCase
