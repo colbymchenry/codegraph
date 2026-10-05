@@ -52,6 +52,7 @@ import {
 } from './resolution';
 import { hasSynthesisPattern } from './resolution/callback-synthesizer';
 import { GraphTraverser, GraphQueryManager } from './graph';
+import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
@@ -1783,6 +1784,15 @@ export class CodeGraph {
   /** Lexical evidence for an empty explore result; does not alter retrieval. */
   getExploreMissDiagnostics(query: string) {
     return this.queries.getExploreMissDiagnostics(query);
+  }
+
+  /**
+   * The COBOL copybooks a query names (`CVACT01Y`, `MYCOPYBOOK`): each
+   * member's indexed copybook file(s) and every `COPY` / `EXEC SQL INCLUDE`
+   * statement that includes it. Empty for a query that names none.
+   */
+  findNamedCopybooks(query: string): NamedCopybook[] {
+    return findNamedCopybooks(this.queries, query);
   }
 
   /**
