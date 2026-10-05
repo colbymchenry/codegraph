@@ -57,7 +57,12 @@ describe('dominant file — computed once per index state (#1864)', () => {
   }
 
   it('reuses the answer across explores while the database is unchanged', async () => {
-    const cg = await setup();
+    // indexAll warmed the memo in memory and in the sidecar; start from neither.
+    (await setup()).close();
+    open.splice(0);
+    fs.rmSync(getDatabasePath(dir) + '.memo.json', { force: true });
+    const cg = await CodeGraph.open(dir);
+    open.push(cg);
     const compute = spyCompute(cg);
 
     for (const q of ['engine step', 'plugin step', 'how does the engine run']) {
