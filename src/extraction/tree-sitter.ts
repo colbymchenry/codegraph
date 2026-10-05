@@ -240,6 +240,29 @@ function scalaBaseTypeName(node: SyntaxNode | null, source: string): string | nu
 }
 
 /**
+ * The class a C# declared type names, as `new T()` would name it: `Foo`,
+ * `List<Foo>` → `List`, `Ns.Foo` / `global::Foo` → `Foo`, `Foo?` → `Foo`.
+ * Predefined, array, tuple and pointer types name no class → null. Mirrored
+ * in the kernel (csharp.rs class_type_name).
+ */
+function csharpClassTypeName(node: SyntaxNode | null, source: string): string | null {
+  if (!node) return null;
+  switch (node.type) {
+    case 'identifier':
+      return getNodeText(node, source) || null;
+    case 'generic_name':
+      return csharpClassTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier') ?? null, source);
+    case 'qualified_name':
+    case 'alias_qualified_name':
+      return csharpClassTypeName(getChildByField(node, 'name'), source);
+    case 'nullable_type':
+      return csharpClassTypeName(getChildByField(node, 'type'), source);
+    default:
+      return null;
+  }
+}
+
+/**
  * Resolve the declared identifier inside a C declarator. A `declaration`'s
  * `declarator` field nests the name through `init_declarator` (with value),
  * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
@@ -1287,22 +1310,27 @@ export class TreeSitterExtractor {
       const bodies = propNode ? this.propertyBodies(node) : [];
       if (propNode && bodies.length > 0) {
         this.nodeStack.push(propNode.id);
-        for (const body of bodies) this.visitFunctionBody(body, propNode.id);
+        const declaredType = getChildByField(node, 'type');
+        for (const body of bodies) {
+          this.extractTargetTypedNew(body, declaredType);
+          this.visitFunctionBody(body, propNode.id);
+        }
         this.nodeStack.pop();
       }
-      // Whatever the body walk didn't cover (a C# `= initializer`, any other
-      // language's whole declaration) is scanned for function-as-value
+      // Whatever the body walk didn't cover (a C# property's attributes, any
+      // other language's whole declaration) is scanned for function-as-value
       // candidates (#756); the bodies captured their own.
       this.scanFnRefSubtree(node, 0, new Set(bodies.map((b) => b.id)));
       skipChildren = true;
     }
     // Check for class fields (e.g. Java field_declaration, C# field_declaration)
     else if (this.extractor.fieldTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
-      this.extractField(node);
-      // Field initializers aren't walked — scan for function-as-value
-      // candidates (#756): Java `List<IntConsumer> table = List.of(Main::cb)`,
-      // C# `List<Action<int>> table = new() { TargetCb }`.
-      this.scanFnRefSubtree(node, 0);
+      const walked = this.extractField(node);
+      // Scan the declaration for function-as-value candidates (#756): Java
+      // `List<IntConsumer> table = List.of(Main::cb)`. A C# declarator
+      // extractField walked captured its own (`List<Action<int>> table =
+      // new() { TargetCb }` is the field's), so the scan skips it.
+      this.scanFnRefSubtree(node, 0, walked);
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
@@ -2324,9 +2352,9 @@ export class TreeSitterExtractor {
    * VB.NET writes its `Get` / `Set` blocks, `= initializer` and `As New T`
    * as children of the declaration itself, so the declaration is walked
    * whole, the way its methods are (resolveBody). C# runs code in each
-   * accessor's body (`get { … }`, `set => …`) and in an expression-bodied
-   * property's `=> …`; its `= initializer`, like a field's, stays unwalked.
-   * Mirrored in the kernel (csharp.rs property_bodies).
+   * accessor's body (`get { … }`, `set => …`) and in the property's `value`:
+   * an expression body's `=> …` or an `= initializer`. Its attributes are
+   * not walked. Mirrored in the kernel (csharp.rs property_bodies).
    */
   private propertyBodies(node: SyntaxNode): SyntaxNode[] {
     if (this.language === 'vbnet') return [node];
@@ -2337,16 +2365,41 @@ export class TreeSitterExtractor {
       if (body) bodies.push(body);
     }
     const value = getChildByField(node, 'value');
-    if (value?.type === 'arrow_expression_clause') bodies.push(value);
+    if (value) bodies.push(value);
     return bodies;
+  }
+
+  /**
+   * A C# target-typed `new()` names no type, which is why INSTANTIATION_KINDS
+   * leaves `implicit_object_creation_expression` out. As a field's or
+   * property's initializer, though, it constructs the declared type:
+   * `private readonly List<Foo> _items = new();` instantiates List, as
+   * `new List<Foo>()` does. Emitted from the node-stack top (the member).
+   * Mirrored in the kernel (csharp.rs extract_target_typed_new).
+   */
+  private extractTargetTypedNew(value: SyntaxNode | null, declaredType: SyntaxNode | null): void {
+    if (this.language !== 'csharp' || value?.type !== 'implicit_object_creation_expression') return;
+    const className = declaredType ? csharpClassTypeName(declaredType, this.source) : null;
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!className || !fromNodeId) return;
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: className,
+      referenceKind: 'instantiates',
+      line: value.startPosition.row + 1,
+      column: value.startPosition.column,
+    });
   }
 
   /**
    * Extract a class field declaration (e.g. Java field_declaration, C# field_declaration).
    * Extracts each declarator as a 'field' kind node inside the owning class.
+   * Returns the C# declarators it walked, for the function-as-value scan to
+   * skip.
    */
-  private extractField(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractField(node: SyntaxNode): Set<number> {
+    const walked = new Set<number>();
+    if (!this.extractor) return walked;
 
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
@@ -2401,7 +2454,7 @@ export class TreeSitterExtractor {
             isStatic,
           });
         }
-        return;
+        return walked;
       }
     }
 
@@ -2447,11 +2500,24 @@ export class TreeSitterExtractor {
           // edge at all and `target` looked callerless. Keyed on the `value`
           // FIELD, which only Java's `variable_declarator` carries. VB.NET
           // writes `= expr` (the declarator's `initializer`) or `As New T(…)`
-          // (inside its as_clause), so its whole declarator is walked. C#
-          // and PHP spell their initializer differently and are untouched.
-          const valueNode = this.language === 'vbnet' ? decl : getChildByField(decl, 'value');
+          // (inside its as_clause), and C# writes `= expr` as the
+          // declarator's last, unnamed child, so both walk the whole
+          // declarator. PHP spells its initializer differently and is
+          // untouched.
+          const wholeDeclarator = this.language === 'vbnet' || this.language === 'csharp';
+          const valueNode = wholeDeclarator ? decl : getChildByField(decl, 'value');
           if (valueNode) {
             this.nodeStack.push(fieldNode.id);
+            if (this.language === 'csharp') {
+              this.extractTargetTypedNew(
+                decl.namedChild(decl.namedChildCount - 1),
+                varDecl ? getChildByField(varDecl, 'type') : null,
+              );
+              // Its function-as-value candidates are the field's, captured
+              // here once. (VB.NET captures none; Java's scan still takes
+              // its initializers for the class as well.)
+              walked.add(decl.id);
+            }
             this.visitFunctionBody(valueNode, fieldNode.id);
             this.nodeStack.pop();
           }
@@ -2470,6 +2536,7 @@ export class TreeSitterExtractor {
         });
       }
     }
+    return walked;
   }
 
   /**
