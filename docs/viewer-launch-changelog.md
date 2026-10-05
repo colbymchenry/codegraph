@@ -205,6 +205,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - A viewer trail now holds up to 64 hops everywhere — the trail bar, saved trails and "Read as flow". Thanks @inth3shadows for the report and @danusha2345. (#1976)
 
+- **`codegraph ui` on Windows moves on from a port another program holds.** Windows refuses a port that another program keeps for itself, or one inside a range it reserves, with a different error than a port that is simply in use, so the viewer gave up at the first such port instead of trying the next one, and blamed ports below 1024 needing elevated privileges — a rule Windows doesn't have. It now moves on to the next free port, and when none is left, or the port you pinned with `--port` is refused, it says what Windows did and how to list the reserved ranges. Thanks @ijbranch for the report and @sx4im. (#2299)
+
 ## Entries whose graph and `codegraph_explore` half already shipped
 
 The release notes carry a reworded version of each of these. Keep only the viewer half at launch.
