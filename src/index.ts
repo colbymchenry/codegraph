@@ -45,7 +45,7 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
-import { hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
+import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
   createResolver,
@@ -1415,7 +1415,9 @@ export class CodeGraph {
    * Extract nodes and edges from source code (without storing)
    */
   extractFromSource(filePath: string, source: string): ExtractionResult {
-    return extractFromSource(filePath, source);
+    // The project root is what tells a Shopify theme's JSON templates (Liquid)
+    // apart from other JSON.
+    return extractFromSource(filePath, source, detectLanguage(filePath, source, undefined, this.projectRoot));
   }
 
   // ===========================================================================
