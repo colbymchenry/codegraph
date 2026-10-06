@@ -2817,8 +2817,12 @@ export class TreeSitterExtractor {
     // not the character. Escaped as the kernel's `regex::escape` does, so
     // both paths decide the same.
     const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Inside `{ … }` the name is bounded by a character that can't continue
+    // an identifier, not by `\b`, which takes a `$` for a separator: it can't
+    // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
+    // kernel spells it, since the kernel's `\w` is Unicode.
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{[^}]*\\b${n}\\b[^}]*\\})`,
+      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
       'm'
     );
     return re.test(this.source);

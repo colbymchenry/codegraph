@@ -366,8 +366,12 @@ impl<'t> Walker<'t> {
         // `R` (CRLF mode): JS's multiline `^`/`$` treat `\r` as a line end as
         // well as `\n`; `(?m)` alone sees only `\n`, and would miss `export
         // default NAME;\r\n` on every Windows autocrlf checkout.
+        // Inside `{ … }` the name is bounded by a character that can't
+        // continue an identifier, not by `\b`, which takes a `$` for a
+        // separator. The crate has no look-around, so the bounds consume.
+        // ASCII classes, not `\w`: this crate's `\w` is Unicode, JS's is not.
         let pattern = format!(
-            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
+            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{n}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})",
             n = n
         );
         match regex::Regex::new(&pattern) {
