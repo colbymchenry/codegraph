@@ -19,13 +19,17 @@
  * and the exact duplicated-ref interleave; TortureFnrefDart.dart: fn-ref
  * capture channels incl. named-argument non-capture and the file/class
  * twins; TortureMini/TortureSigs/TortureCtors/TortureVrefDart: signatures
- * verbatim, prefixed-return-type prefix bug, const factories invisible,
+ * verbatim, prefixed-return-type prefix bug, a const factory as a method,
  * value-ref matrix with `$X` vs `${X}` asymmetry; TortureReadsTypes.dart:
  * getter-read refs and the type positions outside signatures — #2338/#2327;
  * TortureInitializers.dart: initializers walked as the code their constant,
  * class or file runs, every member-body kind, and a local declaration's
- * second variable left to its function; TortureGenericCalls.dart: generic
- * calls parsed as two comparisons, recovered as calls) and their CRLF variants
+ * second variable left to its function; TortureConstCtors.dart: `const`
+ * constructors and redirecting factories as methods with the unnamed ones
+ * skipped, every redirect-target form, and constructors called with type
+ * arguments, as statements and as expressions; TortureGenericCalls.dart:
+ * generic calls parsed as two comparisons, recovered as calls) and their CRLF
+ * variants
  * (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
@@ -123,6 +127,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // instantiations, reads, closures with block bodies and local functions,
     // and function values captured once, for the declaration.
     ['TortureInitializers.dart', 30],
+    // `const` constructors and redirecting factories as methods (the unnamed
+    // ones skipped), every redirect-target form, and constructors called
+    // with type arguments in statements and expressions.
+    ['TortureConstCtors.dart', 20],
     // Generic calls the grammar parses as two comparisons (`ref.read<Repo>(p)`
     // as `(ref.read < Repo) > (p)`): every callee, type-argument and argument
     // shape, in bodies and initializers, and the comparisons that look alike.

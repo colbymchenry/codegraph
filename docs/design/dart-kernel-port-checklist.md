@@ -190,7 +190,9 @@ change dart's grammar, which is exactly the hazard this vendor kills.
 
 Types: functionTypes=[`function_signature`] (:119); classTypes=
 [`class_definition`] (:120); methodTypes=[`method_signature`,
-`constructor_signature`] (:126); interfaceTypes=[] ; structTypes=[];
+`constructor_signature`, `constant_constructor_signature`,
+`redirecting_factory_constructor_signature`] (:126 — the last two since
+2026-10-06); interfaceTypes=[] ; structTypes=[];
 enumTypes=[`enum_declaration`] (:129); enumMemberTypes=[`enum_constant`]
 (:130); typeAliasTypes=[`type_alias`] (:131); importTypes=[`import_or_export`]
 (:132); **callTypes=[] (:133 — extractCall NEVER runs for dart; all call refs
@@ -237,9 +239,14 @@ Grammar-shape facts the config leans on (all probed, `mini-cst.txt` /
   initializers]`) — reached by the walker via plain recursion into
   `declaration`. `const` constructors are `declaration >
   constant_constructor_signature` and redirecting factories are
-  `declaration > redirecting_factory_constructor_signature` — **NEITHER is
-  in methodTypes → const ctors and `const factory X.r() = Impl;` are
-  INVISIBLE (no node, no refs)**. Fields are `declaration >
+  `declaration > redirecting_factory_constructor_signature` — both carry
+  NO fields (children: `const_builtin`? `"factory"`? identifier [`.`
+  identifier] formal_parameter_list, then for a redirect `=` and the
+  target: `type_identifier` [type_arguments] [`.` name], where the target
+  constructor's name is a `type_identifier` without type arguments and an
+  `identifier` after them). Until 2026-10-06 neither was in methodTypes
+  (no node, no refs); now both mint methods exactly like the bare
+  `constructor_signature` (§isMisparsedFunction, §resolveName). Fields are `declaration >
   (static)? (final|const|type|var) > initialized_identifier_list |
   static_final_declaration_list` (§Constants).
 - **Statements/expressions:** calls have NO call node — a postfix chain is
@@ -349,7 +356,12 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   extension_declaration/enum_declaration and reads ITS name field) and
   `reduce` ≠ `Action` → treated as the method it is (pinned:
   `extract-probe4.txt` — method `reduce`, position starting AT `reduce`,
-  sig/ret undefined, decorates override intact).
+  sig/ret undefined, decorates override intact). dartCtorInfo reads only the
+  identifiers BEFORE the formal_parameter_list, so a redirecting factory's
+  target (`factory Foo() = _Impl.named;`) never names it. A
+  `constant_constructor_signature` / `redirecting_factory_constructor_signature`
+  that dartCtorInfo rejects (names no enclosing type — error recovery) is
+  skipped too: it can be nothing else.
 - **getSignature (:189-208)** — method_signature unwraps to
   function/getter/setter signature (NOT ctor/factory/operator); params =
   find namedChild `formal_parameter_list`; retType = find namedChild
@@ -365,7 +377,9 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   formal_parameter_list on method_signature); **bodiless named ctor
   (declaration > constructor_signature) → `"()"`-style params-only sig**
   (node IS the ctor signature; its formal_parameter_list is found by type) —
-  pin BOTH ctor sig shapes; operators → undefined.
+  pin BOTH ctor sig shapes; operators → undefined. `const` ctors and
+  redirecting factories → params only too: no retType is looked up for them
+  (a redirect's `= _Impl` type_identifier is its target, not a return type).
 - **getVisibility (:209-222)** — method_signature → unwrap to
   function/getter/setter signature → its first `identifier` child; other
   nodes → childForFieldName('name'). Name starts `_` → 'private', else
@@ -386,9 +400,9 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   children for type `'static'` → true; else false. `static WidgetT make()`
   → true ✓ (the `static` keyword is an anon child of method_signature);
   bare constructor_signature → false. Top-level functions → false.
-- **resolveName (:244-260)** — dartCtorInfo: named ctor/factory → the ctor
-  name (`named`, `create`, `_`); unnamed ctor or non-ctor → undefined (falls
-  to extractName §below).
+- **resolveName (:244-260)** — dartCtorInfo: named ctor/factory (`const`
+  and redirecting ones included) → the ctor name (`named`, `create`, `_`);
+  unnamed ctor or non-ctor → undefined (falls to extractName §below).
 - **extractImport (:261-304)** — importText = trimmed full node slice;
   moduleName = the URI string content: `library_import >
   import_specification > configurable_uri > uri > string_literal` (else the
@@ -442,7 +456,7 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 | `import_or_export` | importTypes:1209 → extractImport:3170 | §Extractor config |
 | `new_expression` | INSTANTIATION_KINDS:1255 (`new_expression` ∈ :354-361) | extractInstantiation:4610 → ctor field lookups null → namedChild(0) = type_identifier → `instantiates` ref from stack top; `<`-strip + last-`.`-segment apply (`new p.Foo<T>()` → `Foo`). findAnonymousClassBody → always null for dart. Children still recursed |
 | `function_body` (sibling of a consumed signature) | **no branch** | recursed → THE DOUBLE-WALK (§below) |
-| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature hits methodTypes; each field `initialized_identifier` hits the hook (body-walked for the class); constant_constructor_signature, redirecting_factory_constructor_signature, initializers, annotations-in-place: nothing |
+| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature, constant_constructor_signature and redirecting_factory_constructor_signature hit methodTypes; each field `initialized_identifier` hits the hook (body-walked for the class); initializers, annotations-in-place: nothing |
 | `getter_signature` / `setter_signature` BARE (top level) | no branch | **top-level getters/setters are INVISIBLE** (no node; their sibling function_body is visitNode-recursed where calls don't extract) — in classes they're method_signature-wrapped → methods |
 | `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
 | `property_signature`/`method_signature` TS branch (:1282) | **shadowed** | method_signature is consumed at :1027 first; property_signature isn't a dart kind — branch unreachable |
@@ -643,8 +657,9 @@ chain → FIRST value child only); `static final sharedInst = WidgetT(0)` →
 constant under the class, sig `= WidgetT`; multi-declarations → one node
 each with own columns. **NO nodes ever**: instance fields (typed/untyped/
 late/var), `static var`, top-level var/typed vars, top-level getters/
-setters, const constructors, redirecting factories, extension_type
-containers, `part`/`part of`/`library`/deferred imports. **Initializers
+setters, extension_type containers, `part`/`part of`/`library`/deferred
+imports. (Named `const` constructors and redirecting factories mint
+methods since 2026-10-06; the unnamed ones still mint nothing.) **Initializers
 are code:** every initializer is walked with the body walker — a
 constant's for the constant (riverpod's `final repoProvider =
 Provider((ref) => Repository(ref.watch(dioProvider)));` → calls
@@ -682,7 +697,9 @@ extract-mini.txt):
 | `w?.render()` | conditional_assignable_selector | `w.render` — **`?.` is encoded exactly like `.`** |
 | `y2..add(1)..add(2)` (cascades) | cascade_section (argument_part NOT inside a selector) | **NOTHING — cascade calls are completely invisible** |
 | `new WidgetT(2)` | new_expression → INSTANTIATION branch :5145 FIRST | `instantiates WidgetT` (extractBareCall's new_expression arm :363-367 is DEAD — the else-if never reaches it); args still recursed |
-| `pad(const EdgeInsetsT.all(8.0))` | const_object_expression :369-376 | `EdgeInsetsT.all` at the CONST node position (typeId + '.' + nameId; type-only form → `EdgeInsetsT`); children recursed after |
+| `pad(const EdgeInsetsT.all(8.0))` | const_object_expression :369-376 | `EdgeInsetsT.all` at the CONST node position (typeId + '.' + nameId; type-only form → `EdgeInsetsT`); children recursed after. The FIRST type_identifier: `const p.X.named()` → `p.named` (prefix bug, preserved) |
+| `BlocProviderT<CounterT>.value(…);` as a statement | args selector; prev = `.value` selector; accessorPrev = a selector holding only `type_arguments`, whose prev is the identifier | `BlocProviderT.value` (dartTypeArgumentsReceiver, since 2026-10-06 — bare `value` before); the `.value().tail` re-encode reads it the same way |
+| `=> BlocProviderT<CounterT>.value(…)`, and as an initializer, argument or `return` value | `constructor_invocation` (type_identifier [`.` type_identifier] type_arguments `.` identifier arguments) | `BlocProviderT.value` at the node position — the LAST type_identifier, so `p.X<T>.named()` → `X.named` (since 2026-10-06; nothing before) |
 | `generic<int>(5)` | args selector (type args ride argument_part) | bare `generic` |
 | `ref.read<Repo>(p)`, `Provider<int>((ref) => 0)`, `X<T>(name: v)` parsed as two comparisons, `(ref.read < Repo) > (p)` (§Misparsed generic calls) | the `<` relational_operator (dartMisparsedGenericCall) | the parsed call's ref — `ref.read` / `Provider` / `X`, at the `<` |
 | `await fetch()` | recursion through unary/await_expression | `fetch` at the selector |
@@ -787,7 +804,12 @@ BUILTIN_TYPES (:5768-5782), at each leaf's position. Consequences (pinned):
   = constructor_signature → param types emit (`Widget.named(WidgetT w)` →
   references WidgetT); `this.`-params (constructor_param) hold no
   type_identifier → nothing. Bodiless declaration-wrapped ctors: extractMethod
-  runs on the bare constructor_signature → sig = node → same.
+  runs on the bare constructor_signature → sig = node → same; so do `const`
+  ctors. A redirecting factory walks its named children one by one and
+  skips a DIRECT type_identifier that is not UpperCamel (`/^[_$]*[A-Z]/`):
+  after `=` those are an import prefix (`= p.Impl`) or the target
+  constructor's name (`= _$QuestionImpl.fromJson`, where `fromJson` is a
+  type_identifier) — `references _$QuestionImpl` only.
 - Getters: references from the getter's TYPE (suppressed if builtin —
   `int get area` → nothing; `WidgetT get w` → references WidgetT).
 - extractVariableTypeAnnotation (:6074) needs a `type_annotation` child —

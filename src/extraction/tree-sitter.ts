@@ -7288,6 +7288,18 @@ export class TreeSitterExtractor {
             c.type === 'factory_constructor_signature'
         ) ?? node;
       }
+      // A redirecting factory names the class it constructs after `=`, then
+      // perhaps that class's constructor (`= _$QuestionImpl.fromJson`, which
+      // parses as two type_identifiers). Neither the constructor nor an import
+      // prefix is a type, and Dart writes types UpperCamel.
+      if (sig.type === 'redirecting_factory_constructor_signature') {
+        for (const child of sig.namedChildren) {
+          if (child.type !== 'type_identifier' || /^[_$]*[A-Z]/.test(child.text)) {
+            this.extractTypeRefsFromSubtree(child, nodeId);
+          }
+        }
+        return;
+      }
       this.extractTypeRefsFromSubtree(sig, nodeId);
       return;
     }

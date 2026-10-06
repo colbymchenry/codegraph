@@ -218,13 +218,26 @@ function dartInnerSignature(node: SyntaxNode): SyntaxNode {
 }
 
 /**
+ * The constructors that never have a body — `const Foo.bar();` and a
+ * redirecting factory `const factory Foo.bar() = _Bar;` — each parse as a
+ * signature kind of its own, inside a `declaration`.
+ */
+const DART_BODILESS_CTORS: ReadonlySet<string> = new Set([
+  'constant_constructor_signature',
+  'redirecting_factory_constructor_signature',
+]);
+
+/**
  * The factory/named-constructor signature inside a node, if any. A constructor
  * parses as `method_signature > {factory_,}constructor_signature` (e.g.
  * `factory Foo.create()` or `Foo._()`), whose children are the class identifier
  * and — for a named ctor — the constructor-name identifier.
  */
 function dartConstructorSignature(node: SyntaxNode): SyntaxNode | undefined {
-  if (node.type === 'factory_constructor_signature' || node.type === 'constructor_signature') {
+  if (
+    node.type === 'factory_constructor_signature' || node.type === 'constructor_signature' ||
+    DART_BODILESS_CTORS.has(node.type)
+  ) {
     return node;
   }
   if (node.type === 'method_signature') {
@@ -263,7 +276,13 @@ function dartEnclosingTypeName(node: SyntaxNode): string | undefined {
 function dartCtorInfo(node: SyntaxNode): { className: string; ctorName: string } | undefined {
   const ctor = dartConstructorSignature(node);
   if (!ctor) return undefined;
-  const ids = ctor.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier');
+  // The names before the parameters: a redirecting factory names its target
+  // after them (`factory Foo() = _Impl.named;`).
+  const ids: SyntaxNode[] = [];
+  for (const c of ctor.namedChildren) {
+    if (c.type === 'formal_parameter_list') break;
+    if (c.type === 'identifier') ids.push(c);
+  }
   const className = dartEnclosingTypeName(node);
   if (!className || !ids[0]) return undefined;
   if (ids[0].text !== className) return undefined; // misparsed method, not a ctor
@@ -294,6 +313,19 @@ function extractDartReturnType(node: SyntaxNode, source: string): string | undef
 }
 
 /**
+ * The type a call written with type arguments goes through — `BlocProvider`
+ * in `BlocProvider<CounterCubit>.value(…)`, when `selector` is the `<…>`
+ * between the type and `.value`. Only a constructor is called that way.
+ */
+function dartTypeArgumentsReceiver(selector: SyntaxNode | null): string | undefined {
+  if (selector?.type !== 'selector' || selector.namedChildCount !== 1 || selector.namedChild(0)?.type !== 'type_arguments') {
+    return undefined;
+  }
+  const type = selector.previousNamedSibling;
+  return type?.type === 'identifier' ? type.text : undefined;
+}
+
+/**
  * The callee name of the Dart call whose `argument_part` selector is `argPart`
  * — mirrors the main extractBareCall accessor logic so a chained receiver
  * (`Foo.create()` in `Foo.create().bar()`) can be reconstructed. Returns
@@ -311,6 +343,8 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
     if (methodId) {
       const accessorPrev = prev.previousNamedSibling;
       if (accessorPrev?.type === 'identifier') return accessorPrev.text + '.' + methodId.text;
+      const typeName = dartTypeArgumentsReceiver(accessorPrev);
+      if (typeName) return typeName + '.' + methodId.text;
       return methodId.text;
     }
   }
@@ -341,6 +375,10 @@ function dartCallee(prev: SyntaxNode): string | undefined {
         if (accessorPrev?.type === 'identifier') {
           return accessorPrev.text + '.' + methodId.text;
         }
+        // A constructor called with type arguments names its type all the
+        // same: `BlocProvider<CounterCubit>.value(…)` → `BlocProvider.value`.
+        const typeName = dartTypeArgumentsReceiver(accessorPrev);
+        if (typeName) return typeName + '.' + methodId.text;
         // Chained static-factory / fluent call: the receiver is itself a call
         // (`Foo.create().bar()`), so accessorPrev is that call's argument_part
         // selector. Encode `<innerCallee>().<method>` so resolution can infer
@@ -378,7 +416,11 @@ export const dartExtractor: LanguageExtractor = {
   // constructor `Foo._()` parses as a bare `constructor_signature`, so include
   // it too — resolveName names it by the ctor name and getReturnType gives it
   // the class as its return type, so `Foo._().bar()` chains resolve (#750).
-  methodTypes: ['method_signature', 'constructor_signature'],
+  // `const` constructors and redirecting factories have signature kinds of
+  // their own: flutter_bloc's `const BlocProvider.value(…)` is one, and
+  // without its node a `BlocProvider.value(…)` call went to another class's
+  // `value`.
+  methodTypes: ['method_signature', 'constructor_signature', ...DART_BODILESS_CTORS],
   interfaceTypes: [],
   structTypes: [],
   enumTypes: ['enum_declaration'],
@@ -484,7 +526,10 @@ export const dartExtractor: LanguageExtractor = {
     // tree-sitter misparsed as a ctor (`@override (T) m()`) is NOT skipped here.
     // (isMisparsedFunction skips node creation but still visits the body.)
     const ctor = dartCtorInfo(node);
-    return ctor != null && ctor.ctorName === ctor.className;
+    // A `const` constructor or redirecting factory is nothing else, so one
+    // that names no enclosing type is error recovery's, and skipped.
+    if (!ctor) return DART_BODILESS_CTORS.has(node.type);
+    return ctor.ctorName === ctor.className;
   },
   getSignature: (node, source) => {
     // For function_signature: extract params + return type
@@ -497,7 +542,9 @@ export const dartExtractor: LanguageExtractor = {
       if (inner) sig = inner;
     }
     const params = sig.namedChildren.find((c: SyntaxNode) => c.type === 'formal_parameter_list');
-    const retType = sig.namedChildren.find((c: SyntaxNode) =>
+    // A constructor has no return type: the type a redirecting factory names
+    // is its target (`= _Impl`).
+    const retType = DART_BODILESS_CTORS.has(sig.type) ? undefined : sig.namedChildren.find((c: SyntaxNode) =>
       c.type === 'type_identifier' || c.type === 'void_type'
     );
     if (!params && !retType) return undefined;
@@ -637,6 +684,17 @@ export const dartExtractor: LanguageExtractor = {
     // const EdgeInsets.all(8.0) — const constructor call
     if (node.type === 'const_object_expression') {
       const typeId = node.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      const nameId = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+      if (typeId && nameId) return typeId.text + '.' + nameId.text;
+      if (typeId) return typeId.text;
+      return undefined;
+    }
+
+    // `=> BlocProvider<CounterCubit>.value(…)` — a constructor called with type
+    // arguments, as most expressions parse it. The type is the last
+    // `type_identifier`: an import prefix (`p.X<T>.named`) is one too.
+    if (node.type === 'constructor_invocation') {
+      const typeId = node.namedChildren.filter((c: SyntaxNode) => c.type === 'type_identifier').pop();
       const nameId = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
       if (typeId && nameId) return typeId.text + '.' + nameId.text;
       if (typeId) return typeId.text;
