@@ -246,7 +246,11 @@ Grammar-shape facts the config leans on (all probed, `mini-cst.txt` /
   constructor's name is a `type_identifier` without type arguments and an
   `identifier` after them). Until 2026-10-06 neither was in methodTypes
   (no node, no refs); now both mint methods exactly like the bare
-  `constructor_signature` (§isMisparsedFunction, §resolveName). Fields are `declaration >
+  `constructor_signature` (§isMisparsedFunction, §resolveName). Abstract and
+  `external` members are `declaration > function_signature` too (an anon
+  `external`/`static` keyword may precede the signature). In every one of
+  these the member's dartdoc and annotations are siblings of the
+  `declaration`, not of the signature — §getDeclarationWrapper. Fields are `declaration >
   (static)? (final|const|type|var) > initialized_identifier_list |
   static_final_declaration_list` (§Constants).
 - **Statements/expressions:** calls have NO call node — a postfix chain is
@@ -327,6 +331,16 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   **LIVE and load-bearing for dart**: the comment there names Dart; a
   method/function node's endLine extends to the sibling body's end, e.g.
   `named` L123-125 spans its body).
+- **getDeclarationWrapper** — node's parent is a `declaration` AND node is
+  that declaration's FIRST named child (`firstNamedChild.equals(node)`;
+  kernel `named_child(0) == node` — an anon `external`/`static` keyword
+  before the signature doesn't count) → the `declaration`, else undefined.
+  Read by tree-sitter.ts's `docstringFor` (every docstring lookup, so the
+  kernel's `docstring_of` wraps all five `preceding_docstring` calls) and
+  by extractDecoratorsFor's scan #2 (§Decorators); scan #1 and
+  `getBodyDocstring` keep the node itself. Only Dart defines it — never add
+  `declaration` to DOCSTRING_WRAPPER_TYPES / docstring.rs `is_wrapper`,
+  which C/C++ (whose `declaration` wraps declarators) share.
 - **getReturnType = extractDartReturnType (:80-92)** — ctor = dartCtorInfo
   (§below): a validated ctor returns the CLASS name (named ctors, factories
   → ret = enclosing class). Else sig = dartInnerSignature (:9 —
@@ -848,12 +862,19 @@ enum emits nothing). Mechanics for dart:
 - For a method: the previous member's function_body (or any declaration)
   breaks the chain correctly. The annotation-BETWEEN-doc-and-decl also
   breaks the DOCSTRING chain (§Docstrings).
-- Bodiless ctors (declaration-wrapped): extractMethod runs on
-  constructor_signature whose PARENT is the `declaration` node — the
-  backward scan runs over declaration's children (constructor_signature is
-  namedChild(0) → declIdx 0 → no siblings scanned) → an annotation before
-  the declaration attaches to NOTHING. Annotated fields likewise emit
-  nothing (no extractor runs).
+- Members with no body (declaration-wrapped ctors, const ctors, redirecting
+  factories, abstract and `external` members): the signature's PARENT is the
+  `declaration`, so until 2026-10-06 the backward scan ran over the
+  declaration's own children (the signature is namedChild(0) → declIdx 0 →
+  nothing scanned) and an annotation before the declaration attached to
+  NOTHING (`@visibleForTesting Foo._();`, `@protected void m();`). Now scan
+  #2 starts at getDeclarationWrapper's `declaration`: same backward walk,
+  same reverse order, and a field's `declaration` in between still stops
+  it. Annotated fields themselves emit nothing (no extractor runs).
+  Validation (bloc @b9be1e2 / riverpod @4ba1be2): +10 / +186 `decorates`
+  refs, all SDK or package:meta names (`useResult`, `override`, `internal`,
+  `visibleForTesting`, …), so no edges; before #2380, riverpod's 23 new
+  `@internal` refs on `X.internal(…)` ctors resolved to the ctor itself.
 
 ### Docstrings (tree-sitter-helpers.ts:95-127) — dartdoc is KEPT, both forms
 
@@ -867,7 +888,11 @@ plain `//` comments all become docstrings and accumulate together** (pinned:
 strip + `^\/\/[/!]?\s?` + `^\s*\*\s?` gm strips fire — **all `gm` strips
 ride `js_multiline_strip` in docstring.rs (#1329 CRLF semantics) — call the
 shared code, port nothing**. DOCSTRING_WRAPPER_TYPES contains no dart kinds
-→ no anchor climbing. **An `annotation` between the comment run and the
+→ no anchor climbing; instead `docstringFor` starts from
+getDeclarationWrapper's `declaration` for a member with no body (until
+2026-10-06 those looked inside the wrapper and found nothing, e.g.
+`const BlocProvider.value(…)`'s dartdoc; validation added 32 docstrings on
+bloc and 126 on riverpod, none changed or removed). **An `annotation` between the comment run and the
 declaration BREAKS the chain** (pinned: `/// Broken by annotation.`
 `@deprecated` `void annotated()` → doc undefined — the dominant real-world
 loss since `@override` is ubiquitous). Docstrings attach to: functions,
