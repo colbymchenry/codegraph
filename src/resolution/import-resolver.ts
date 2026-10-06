@@ -1122,6 +1122,10 @@ function extractPythonImports(content: string): ImportMapping[] {
  */
 function extractGoImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
+  // A comment is not part of an import: the last word of `// memory cache`
+  // was read as the alias of the import on the next line, a quoted word in a
+  // comment as an import of its own, and a `)` in one ended the block early.
+  content = stripCommentsForRegex(content, 'go');
 
   // import "path" or import alias "path"
   const singleImportRegex = /import\s+(?:(\w+)\s+)?["']([^"']+)["']/g;
