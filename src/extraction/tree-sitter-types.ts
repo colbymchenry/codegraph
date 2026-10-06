@@ -174,6 +174,13 @@ export interface LanguageExtractor {
    * `void m();`) in a `declaration` node. Returns undefined when there is none.
    */
   getDeclarationWrapper?: (node: SyntaxNode) => SyntaxNode | undefined;
+  /**
+   * Node types that may stand between a declaration and the comments written
+   * above it without ending the comment run its docstring is read from. Dart
+   * writes annotations there (`/// Builds it.` `@override` `Widget build(…)`):
+   * each one is stepped over, and comments on either side of it still join.
+   */
+  docstringStepOverTypes?: string[];
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */

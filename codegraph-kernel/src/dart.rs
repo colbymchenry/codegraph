@@ -36,7 +36,7 @@ use crate::buffers::{
     RefRow, StrRef, Tables, FLAG_IS_ASYNC, FLAG_IS_EXPORTED, FLAG_IS_STATIC, FUNCTION_REF_CODE,
     NONE, NONE_STR,
 };
-use crate::docstring::preceding_docstring;
+use crate::docstring::preceding_docstring_stepping_over;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
@@ -45,6 +45,11 @@ use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
+
+/// docstringStepOverTypes (dart.ts) — a member's annotations stand between it
+/// and the dartdoc written above them (`/// Builds the widget.` `@override`
+/// `Widget build(…)`), so the docstring walk steps over them.
+const DOCSTRING_STEP_OVER: &[&str] = &["annotation"];
 
 /// NAME_STOPLIST (function-ref.ts).
 fn is_stoplisted(name: &str) -> bool {
@@ -625,9 +630,13 @@ impl<'t> Walker<'t> {
     }
 
     /// docstringFor (tree-sitter.ts) — the preceding comment run, looked up
-    /// from the declaration wrapper when there is one.
+    /// from the declaration wrapper when there is one, past annotations.
     fn docstring_of(&self, node: Node<'t>) -> Option<String> {
-        preceding_docstring(self.declaration_wrapper(node).unwrap_or(node), self.src)
+        preceding_docstring_stepping_over(
+            self.declaration_wrapper(node).unwrap_or(node),
+            self.src,
+            DOCSTRING_STEP_OVER,
+        )
     }
 
     /// resolveBody (dart.ts:158-171).

@@ -563,7 +563,11 @@ export class TreeSitterExtractor {
    */
   private docstringFor(node: SyntaxNode): string | undefined {
     const anchor = this.extractor?.getDeclarationWrapper?.(node) ?? node;
-    const preceding = getPrecedingDocstring(anchor, this.source);
+    const preceding = getPrecedingDocstring(
+      anchor,
+      this.source,
+      this.extractor?.docstringStepOverTypes
+    );
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
     return body || preceding;

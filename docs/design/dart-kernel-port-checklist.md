@@ -855,14 +855,21 @@ BUILTIN_TYPES (:5768-5782), at each leaf's position. Consequences (pinned):
 Dart annotations are `annotation` (with `name:` field; args form has an
 `arguments` child) or `marker_annotation`-free — probed: both `@override`
 (bare) and `@Deprecated('x')` (args) are node type `annotation`, PRECEDING
-SIBLINGS of the declaration they decorate (inside program / class_body).
+SIBLINGS of the function or method they decorate (inside program /
+class_body); a class-like declaration's annotations open its own node
+instead (scan #1).
 extractDecoratorsFor (:4897) is called for classes (:1710), functions
 (:1599), methods (:1819) — NOT for hook-minted constants, enums(!), or
 type aliases (extractEnum/extractTypeAlias never call it — an annotated
 enum emits nothing). Mechanics for dart:
 
 - Scan #1 (direct children :4976-4988): annotations are never children of
-  the signature → inert (no `modifiers` node either).
+  the signature → inert for functions and methods (no `modifiers` node
+  either). A class-like declaration is different: class, mixin, extension
+  and extension type nodes START at their first annotation, which is the
+  node's own leading child, so scan #1 emits it (`@immutable class Foo` →
+  decorates `immutable`). Enums and typedefs are built the same way, but
+  nothing scans them.
 - Scan #2 (preceding siblings :5002-5023): walk BACKWARD from the
   declaration; `annotation` is in the accepted set (:5017); stop at the
   first non-annotation sibling. consider(): target = first namedChild of
@@ -876,8 +883,24 @@ enum emits nothing). Mechanics for dart:
   `@Deprecated('x')\n@pragma('vm:entry-point')\nvoid f()` → decorates
   `pragma` FIRST, then `Deprecated` (pinned).
 - For a method: the previous member's function_body (or any declaration)
-  breaks the chain correctly. The annotation-BETWEEN-doc-and-decl also
-  breaks the DOCSTRING chain (§Docstrings).
+  breaks the chain correctly. (The docstring walk steps OVER annotations
+  since 2026-10-06 — §Docstrings.)
+- **A comment between an annotation and the declaration ends the scan**, so
+  the annotation above it attaches to nothing: `@override` `// ignore:
+  must_call_super` `void f()`, `@x` `/// Doc below.` `void f()` (pinned in
+  TortureAnnotatedDocs.dart). Measured 2026-10-06: bloc @b9be1e2 hides 7
+  annotations this way (all `@override`), riverpod @4ba1be2 55 on 49
+  declarations (`@override` 33, `@riverpod` 16 in the lint fixtures,
+  `@internal` 6). Left as is ON PURPOSE: stepping over comments here is
+  right for Dart (an annotation always belongs to the next declaration), but
+  Dart nodes store no decorator list, so the only effect would be edges, and
+  `override`/`internal` resolve to nothing, while `decorates` scoring prefers
+  function/method candidates (name-matcher.ts), so `@riverpod` lands on the
+  analyzer getter `RiverpodAnnotatedAnnotatedNodeOfX::riverpod` (0.4)
+  instead of `const riverpod = Riverpod()`. That is already true of
+  riverpod's 506 existing `@riverpod` edges. Fix that ranking for Dart (a
+  const or a class, never a method) first, then add `comment` /
+  `documentation_comment` to scan #2's step-over in both arms.
 - Members with no body (declaration-wrapped ctors, const ctors, redirecting
   factories, abstract and `external` members): the signature's PARENT is the
   `declaration`, so until 2026-10-06 the backward scan ran over the
@@ -908,10 +931,55 @@ shared code, port nothing**. DOCSTRING_WRAPPER_TYPES contains no dart kinds
 getDeclarationWrapper's `declaration` for a member with no body (until
 2026-10-06 those looked inside the wrapper and found nothing, e.g.
 `const BlocProvider.value(…)`'s dartdoc; validation added 32 docstrings on
-bloc and 126 on riverpod, none changed or removed). **An `annotation` between the comment run and the
-declaration BREAKS the chain** (pinned: `/// Broken by annotation.`
-`@deprecated` `void annotated()` → doc undefined — the dominant real-world
-loss since `@override` is ubiquitous). Docstrings attach to: functions,
+bloc and 126 on riverpod, none changed or removed).
+
+**The walk steps OVER `annotation` siblings** (since 2026-10-06). Until then
+an annotation between the comment run and the declaration ended the walk:
+`/// Builds it.` `@override` `Widget build(…)` lost its dartdoc, the
+dominant real-world loss since `@override` is everywhere. Now dart.ts sets
+`docstringStepOverTypes: ['annotation']`, which docstringFor hands to
+getPrecedingDocstring's `stepOver`. The kernel's `docstring_of` calls
+docstring.rs's `preceding_docstring_stepping_over(…, &["annotation"])`.
+`preceding_docstring` and every other language keep the empty list.
+- Stepped over: stacked annotations, multi-line ones (`@Deprecated(` …
+  `)`), inline ones (`/* c */ @x void f()`, freezed's `@optionalTypeArgs
+  TResult maybeMap…` on the declaration line), and blank lines, which are
+  not nodes. This works from a `declaration` wrapper too.
+- Comments on either side of an annotation keep the join semantics:
+  `/// a` `@x` `// b` `void f()` → `a\nb` (was `b`), and `/// Doc.`
+  `@override` `// ignore: …` → `Doc.\nignore: …`.
+- Still ends the walk: any other named sibling, such as the previous
+  member's `function_body`, a field's or a bodiless member's `declaration`,
+  a top-level variable (`static_final_declaration_list` /
+  `initialized_identifier_list`), an `import_or_export` or `part_directive`,
+  or a class-like declaration. A comment trailing the previous member on its
+  line (`void a() {} // note`) is collected, as it already was for a member
+  with no annotation.
+- Class-like declarations needed nothing. A class, mixin, extension,
+  extension type, enum or typedef node starts at its first annotation
+  (§Decorators), so the dartdoc above the annotations is the node's previous
+  sibling and was always kept. A comment written BETWEEN such an annotation
+  and the keyword (`@JsonEnum(…)` `/// The state…` `enum LinterRuleState`)
+  is inside the node and is NOT read (pinned). bloc has 1 such dartdoc,
+  riverpod none (23 `// ignore:` lines and 1 plain comment). A member's
+  comment below its annotation IS read: it is the signature's previous
+  sibling.
+- Local functions get no docstring with or without annotations: the
+  signature sits in `local_function_declaration > lambda_expression`, with
+  no previous sibling.
+- Validation (bloc @b9be1e2 / riverpod @4ba1be2, 3f96f80f plus the
+  declaration-wrapper fix, kernel loaded): docstrings +26 / +1,072, changed
+  0 / 9 (each a `// ignore:` line below the annotation, now joined after
+  the dartdoc above), removed 0. Everything else in the dumps (nodes,
+  edges, refs, files) is byte-identical; kernel and wasm full-index dumps
+  are byte-identical; the parity sweeps show 0 diffs. bloc's 26 are all
+  hand-written dartdoc, mostly behind `@mustCallSuper` / `@override`. Of
+  riverpod's 1,072, 667 runs hold a dartdoc (401 in generated
+  `.freezed.dart` / `.g.dart` files, 266 hand-written) and 405 are plain
+  comments only (`// ignore: riverpod_lint/…` in the lint fixtures, the
+  website's snippet markers).
+
+Docstrings attach to: functions,
 methods (incl. `<anonymous>` operators), classes/mixins/extensions, enums,
 type aliases. NOT to: hook-minted constants (extra carries only signature —
 pinned drop), enum members, imports, the file node. No comment-gluing into
@@ -1152,7 +1220,7 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
    `extract-torture.txt` is the expected-output pin). Inventory by branch:
    imports (dart:, package: with `as`+`show`, export with `hide`,
    **deferred → invisible**, part → invisible); doc shapes (`///` run,
-   `/** */` kept, `//` kept, annotation-broken chain); annotations (bare,
+   `/** */` kept, `//` kept, a `///` above an annotation); annotations (bare,
    with-args, stacked → reverse order, on class); top-level constants
    (CAPS/lowercase/multi/typed/derived, sig truncation ≥100 chars);
    top-level var/typed-var/getter/setter (all invisible); async vs

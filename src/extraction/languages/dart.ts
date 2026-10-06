@@ -532,6 +532,13 @@ export const dartExtractor: LanguageExtractor = {
     if (parent?.type !== 'declaration') return undefined;
     return parent.firstNamedChild?.equals(node) ? parent : undefined;
   },
+  // A member's annotations stand between it and the dartdoc written above them
+  // (`/// Builds the widget.` `@override` `Widget build(…)`), so the docstring
+  // walk steps over them instead of stopping there. A class-like declaration
+  // (class, mixin, extension, extension type, enum, typedef) needs none of
+  // this: its annotations open its own node, and the dartdoc above them is
+  // that node's previous sibling.
+  docstringStepOverTypes: ['annotation'],
   resolveBody: (node, bodyField) => {
     // Dart: function_body is a next sibling of function_signature/method_signature
     if (node.type === 'function_signature' || node.type === 'method_signature') {

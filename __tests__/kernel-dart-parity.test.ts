@@ -6,8 +6,8 @@
  * ExtractionResult as the wasm TreeSitterExtractor — nodes, edges, and
  * unresolved refs compared as canonicalized multisets — over the checked-in
  * fixtures (torture.dart: the master inventory — imports incl. deferred
- * invisibility, dartdoc in all three comment forms with the
- * annotation-broken chain, stacked annotations in reverse order, the
+ * invisibility, dartdoc in all three comment forms and above an
+ * annotation, stacked annotations in reverse order, the
  * static_final_declaration constants hook, the full ctor set with the
  * unnamed-ctor skip and named-ctor renaming, operator methods as
  * `<anonymous>`, the extractBareCall matrix incl. cascade invisibility and
@@ -32,8 +32,10 @@
  * TortureDeclarationDocs.dart: the dartdoc and annotations of a
  * `declaration`-wrapped member with no body, read from before the wrapper;
  * TortureCommentChains.dart: comments between a member chain's parts skipped
- * by every sibling step) and their CRLF variants (derived in-memory — #1329),
- * plus defer and generated-file pins.
+ * by every sibling step; TortureAnnotatedDocs.dart: the dartdoc above a
+ * member's annotations, read past them, and what still ends the walk) and
+ * their CRLF variants (derived in-memory — #1329), plus defer and
+ * generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
  * with --max-deferral 0.3); this suite keeps the invariant alive in
@@ -146,6 +148,11 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // dartdoc, block comments, one between a member and its arguments — are
     // skipped by every sibling step: calls, chains, reads, static references.
     ['TortureCommentChains.dart', 10],
+    // The dartdoc above a member's annotations (stacked, multi-line, inline,
+    // with comments between them) is read past them; a field, a variable, an
+    // import or the previous member's body still ends the walk. Class-like
+    // declarations open with their annotations.
+    ['TortureAnnotatedDocs.dart', 40],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {
