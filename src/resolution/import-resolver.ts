@@ -906,6 +906,16 @@ export function isDartImportRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a Lua / Luau `require`? It names a module file (see
+ * resolveLuaRequire) or a module from outside the project, never a symbol:
+ * the name-matcher bound `local lfs = require "lfs"` and `local Signal =
+ * require(script.Parent.Signal)` to the local each is assigned to.
+ */
+export function isLuaRequireRef(ref: UnresolvedRef): boolean {
+  return (ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'imports';
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the

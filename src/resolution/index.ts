@@ -29,7 +29,7 @@ import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -1359,8 +1359,9 @@ export class ReferenceResolver {
     // Nix static path imports are file references for the same reason —
     // falling through would let "./x.nix" name-match an unrelated node. So
     // is a Dart import's URI: `package:flutter/foundation.dart` matched by
-    // its last segment went to riverpod's own foundation.dart.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isDartImportRef(ref) || ref.language === 'terraform') {
+    // its last segment went to riverpod's own foundation.dart. And a Lua
+    // `require`, whose leaf matched the local it is assigned to.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isDartImportRef(ref) || isLuaRequireRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1544,13 +1545,13 @@ export class ReferenceResolver {
    * ref's line), so a sibling must not inherit this row's failure (#1269).
    */
   private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
-    byRowId: Array<{ rowId: number; referenceName: string }>;
+    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }>;
     legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
   } {
-    const byRowId: Array<{ rowId: number; referenceName: string }> = [];
+    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }> = [];
     const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
     for (const r of unresolved) {
-      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName });
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind });
       else legacyKeys.push({
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
@@ -2993,7 +2994,8 @@ export class ReferenceResolver {
    * framework, import, name-match, chain, CFML component path.
    *
    * For `imports`: the target must be importable. A member that only exists
-   * inside a type never is.
+   * inside a type never is, and neither is the import statement the reference
+   * was written in.
    *
    * For `extends`/`implements`, it cannot be describing a real supertype when:
    *
@@ -3029,9 +3031,14 @@ export class ReferenceResolver {
     }
 
     // An `imports` reference names something importable — never a member that
-    // only exists inside a type.
+    // only exists inside a type, nor its own import statement. A module path
+    // that names no file (`./missing`, `stdio.h`, `pkg.mod`, a C# `using` of
+    // an outside namespace) reaches the statement by its qualified name; as an
+    // edge to itself it is never retried, while a failed ref is retried by the
+    // sync that adds the file it names.
     if (ref.referenceKind === 'imports') {
       const target = this.nodeById(result.targetNodeId);
+      if (target?.kind === 'import' && target.filePath === ref.filePath) return null;
       return target && !isImportableKind(target.kind) ? null : result;
     }
 

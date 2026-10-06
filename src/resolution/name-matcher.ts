@@ -7206,6 +7206,8 @@ export function matchByQualifiedName(
   let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
+  // That own using ends the lookup here, and resolveOne drops it (an import
+  // never names its own statement), so the ref parks as failed.
   if (ref.language === 'csharp' && ref.referenceKind === 'imports') {
     const namespaces = candidates.filter((n) => n.kind === 'namespace');
     candidates = namespaces.length > 0 ? preferCallSiteFile(namespaces, ref.filePath).slice(0, 1)

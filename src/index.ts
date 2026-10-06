@@ -30,6 +30,7 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { importPathKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -989,6 +990,20 @@ export class CodeGraph {
             const retryable = this.queries.getRetryableFailedReferences(
               this.queries.getNodeNamesByFiles(result.changedFilePaths)
             );
+            // A failed import waits for a file, a folder or a namespace, not a
+            // symbol: `package:app/b.dart` for a file named `b.dart`, `./ui`
+            // for `ui/index.ts`, `using Foo.Bar` for that namespace's node.
+            // Look those up by what the ADDED files can be imported as (a
+            // modified file was already there for any import of it), and by
+            // the namespaces and modules the changed files declare.
+            const retryRows = new Set(retryable.map((ref) => ref.rowId));
+            const importRetry = this.queries.getRetryableFailedImports(
+              (result.addedFilePaths ?? []).flatMap(importPathKeys),
+              this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module'])
+            );
+            for (const ref of importRetry) {
+              if (!retryRows.has(ref.rowId)) retryable.push(ref);
+            }
             if (retryable.length > 0) {
               options.onProgress?.({
                 phase: 'resolving',
