@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -2225,7 +2226,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (dartExtensionDecl(candidate, context)?.named === false) return false;
   // And it applies only in its own library: flutter_test's `find.text(…)` is
   // no other file's `extension on TaskStatus { String get text }`.
-  if (candidate.filePath !== ref.filePath && isDartUnnamedExtensionMember(candidate, context)) return false;
+  if (isDartUnnamedExtensionMember(candidate, context) && !inSameDartLibrary(ref.filePath, candidate.filePath, context)) return false;
   // A Scala package object's member is in scope in its package and those under
   // it, or through an import: cats.laws' `Eq` is the `cats` package object's
   // alias, not the `algebra` one's (752 refs went there).
@@ -2966,6 +2967,72 @@ function nearestDartMembers(candidates: Node[], ref: UnresolvedRef, context: Res
 /** A member of a Dart type — a method, or an abstract member written without a body (extracted as a `function` owned by the type). */
 function isDartMember(n: Node): boolean {
   return n.kind === 'method' || (n.kind === 'function' && n.qualifiedName.includes('::'));
+}
+
+/**
+ * A value a Dart type holds — an enum constant, a `static const` / `final` —
+ * which a bare name reaches only from inside the type, like its methods:
+ * bloc's brick hook calls `info(…)` on mason's `Logger`, and the call went to
+ * bloc_lint's enum constant `LinterRuleState.info`.
+ */
+function isDartTypeValue(n: Node): boolean {
+  return n.language === 'dart' && (n.kind === 'enum_member' || VALUE_KINDS.has(n.kind)) && n.qualifiedName.includes('::');
+}
+
+/** What a Dart library declares at its top level: a function, a type, a typedef, a top-level `final` / `const`. */
+const DART_LIBRARY_DECL_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'enum', 'type_alias', 'constant', 'variable', 'interface', 'struct', 'trait', 'mixin', 'extension']);
+
+function isDartLibraryDecl(n: Node): boolean {
+  return n.language === 'dart' && DART_LIBRARY_DECL_KINDS.has(n.kind) && !n.qualifiedName.includes('::');
+}
+
+/**
+ * Whether a Dart name written without a receiver — a call, a type — can mean
+ * `candidate` when it is declared at the top level of a library: the caller's
+ * own library declares it, or a library the caller imports without a prefix
+ * exports it, `show` / `hide` and `export` chains followed (see
+ * ./dart-libraries). A name written through an import prefix (`p.Report`)
+ * means only what the imports with that prefix export. riverpod's generated
+ * `async.g.dart` (`part of 'async.dart'`) calls the `family(…)` async.dart
+ * declares, and the call went to annotated.dart's `family` beside it; a test's
+ * `fakeAsync(…)` from package:fake_async went to a vendored copy no file imports.
+ */
+function isDartTopLevelVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext, prefix: string | null = null): boolean {
+  if (!isDartLibraryDecl(candidate)) return true;
+  return prefix === null
+    ? dartLibrarySees(ref.filePath, candidate.filePath, candidate.name, context)
+    : dartPrefixSees(ref.filePath, prefix, candidate.filePath, candidate.name, context);
+}
+
+/**
+ * The import prefix a Dart type name is written through — the `p` of
+ * `p.Report`, `p.Color.red` — or null. A type reference's column is the
+ * name's start; on a line with non-ASCII text before it the nearest whole-word
+ * occurrence stands in.
+ */
+function dartImportPrefixOf(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  const isWord = (at: number) => line.startsWith(name, at) && !/[\w$]/.test(line[at - 1] ?? '') && !/[\w$]/.test(line[at + name.length] ?? '');
+  let start = isWord(ref.column) ? ref.column : -1;
+  for (let at = line.indexOf(name); start < 0 && at >= 0; at = line.indexOf(name, at + 1)) {
+    if (isWord(at)) start = at;
+  }
+  if (start < 0) return null;
+  return /([A-Za-z_$][\w$]*)\s*\.\s*$/.exec(line.slice(0, start))?.[1] ?? null;
+}
+
+/**
+ * A library's own top-level declaration shadows every import of its name, so
+ * when the caller's library declares one, the imported namesakes are no
+ * candidates. (A function nested in another body is not the library's.)
+ */
+function preferOwnDartLibrary(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (candidates.filter(isDartLibraryDecl).length < 2) return candidates;
+  const own = candidates.filter((n) =>
+    isDartLibraryDecl(n) && inSameDartLibrary(ref.filePath, n.filePath, context) && isLexicallyReachable(n, ref, context));
+  return own.length === 0 ? candidates : candidates.filter((n) => !isDartLibraryDecl(n) || own.includes(n));
 }
 
 /**
@@ -3911,7 +3978,7 @@ function dartMemberOf(
     const extension = dartExtensionOwner(m, context);
     let rank: number;
     if (extension) {
-      if (!extension.named && m.filePath !== ref.filePath) continue;
+      if (!extension.named && !inSameDartLibrary(ref.filePath, m.filePath, context)) continue;
       // `extension ObjectX<T> on T` reaches every type, after every extension
       // that names one of its lineage — when the type is the project's, so
       // what it declares is known: a List's own `cast` is not ObjectX's.
@@ -4256,7 +4323,10 @@ function dartExtensionDecl(n: Node, context: ResolutionContext): { named: boolea
   const head = lines.slice(n.startLine - 1, Math.min(n.endLine, n.startLine + 5)).join('\n')
     .replace(/^\s*(?:(?:@[\w$.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?|\/\/[^\n]*)\s*)*/, '');
   if (!/^extension\b(?!\s+type\b)/.test(head)) return null;
-  return { named: !/^extension\s+on\b/.test(head) };
+  // A generic one has no name either: riverpod's `extension<PointerT extends
+  // _PointerBase, ProviderT extends ProviderOrFamily> on Map<…>` took the
+  // `Map` type references of riverpod's own library.
+  return { named: !/^extension\s*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*on\b/.test(head) };
 }
 
 /** Whether a Dart method belongs to an unnamed `extension on X`, visible only in its own library. */
@@ -6692,6 +6762,9 @@ export function matchByExactName(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  // A Dart type name — a declared type, a supertype, the `Color` of `Color.red` — is in scope as a call is, or through its import prefix.
+  const dartTypeRef = ref.language === 'dart' && (ref.referenceKind === 'references' || isInheritanceRef(ref)) && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartPrefix = dartTypeRef ? dartImportPrefixOf(ref, context) : null;
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
@@ -6737,6 +6810,8 @@ export function matchByExactName(
     // last link of a chain, not an annotation (riverpod's 210 `@internal`
     // annotations went to its providers' `internal` constructors).
     !(ref.language === 'dart' && isDartConstructor(n, context)) &&
+    !(dartBare && isDartTypeValue(n) && !isDartMethodInScope(n, ref, context)) &&
+    !((dartBare || dartTypeRef) && !isDartTopLevelVisible(n, ref, context, dartPrefix)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
@@ -6805,7 +6880,8 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
-  const candidates = dartBare ? nearestDartMembers(filtered, ref, context)
+  const candidates = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
+    : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : filtered;
 
@@ -9969,7 +10045,7 @@ export function matchMethodCall(
     // `tester.pumpApp(…)` is the imported `PumpApp`, not flutter_counter's
     // `extension on WidgetTester`.
     {
-      const kept = targetMethods.filter((m) => m.filePath === ref.filePath || !isDartUnnamedExtensionMember(m, context));
+      const kept = targetMethods.filter((m) => !isDartUnnamedExtensionMember(m, context) || inSameDartLibrary(ref.filePath, m.filePath, context));
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
@@ -11502,6 +11578,9 @@ export function matchFuzzy(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  // A Dart type name — a declared type, a supertype, the `Color` of `Color.red` — is in scope as a call is, or through its import prefix.
+  const dartTypeRef = ref.language === 'dart' && (ref.referenceKind === 'references' || isInheritanceRef(ref)) && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartPrefix = dartTypeRef ? dartImportPrefixOf(ref, context) : null;
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
@@ -11540,6 +11619,10 @@ export function matchFuzzy(
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(ref.language === 'dart' && isDartConstructor(n, context)) &&
+    !((dartBare || dartTypeRef) && !isDartTopLevelVisible(n, ref, context, dartPrefix)) &&
+    // A Dart `extension on Color` is no `Color`, here as in exact matching:
+    // flutter_weather's `Color brighten(…)` in that extension names Flutter's.
+    dartExtensionDecl(n, context)?.named !== false &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !isKotlinNumberBitwise(n, ref) &&
@@ -11563,7 +11646,8 @@ export function matchFuzzy(
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
-  const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const languageCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const finalCandidates = dartBare || (dartTypeRef && dartPrefix === null) ? preferOwnDartLibrary(languageCandidates, ref, context) : languageCandidates;
 
   // Both post-pipeline visibility guards (#1745 language-local + #1719 sealed
   // module). The sealed-module test rejects the survivor and never filters the
