@@ -63,17 +63,40 @@ function isDartFieldOrTopLevelEntry(node: SyntaxNode): boolean {
   return owner?.type === 'declaration' && owner.parent !== null && DART_MEMBER_BODIES.has(owner.parent.type);
 }
 
+/** The comments tree-sitter-dart keeps as named nodes: line and block comments, and dartdoc. */
+const DART_COMMENTS: ReadonlySet<string> = new Set(['comment', 'documentation_comment']);
+
 /**
- * The receiver of the member access `selector`: the node in front of it, or
- * the end of an arrow function's body when the grammar ended the arrow in
- * front of a generic call — `(ref) => ref.watch<int>(p)` comes out as
- * `((ref) => ref).watch<int>(p)`. Dart writes a member access on the arrow
- * itself in parentheses, so a receiver in that place is never the arrow. It
- * names the call (`ref.watch`) and a static member's class; a call chained on
- * that call keeps its bare name (see dartMisparsedGenericCall).
+ * The named sibling before `node`, past any comments. A Dart member chain is
+ * an identifier followed by sibling selectors, and the grammar keeps a comment
+ * as a sibling wherever it is written, so in `tester //` + newline +
+ * `.state(…)` (the empty `//` keeps dart format from joining the lines) the
+ * comment, not `tester`, is right before the `.state` selector.
+ */
+function dartPrevNamed(node: SyntaxNode): SyntaxNode | null {
+  let prev = node.previousNamedSibling;
+  while (prev && DART_COMMENTS.has(prev.type)) prev = prev.previousNamedSibling;
+  return prev;
+}
+
+/** The named sibling after `node`, past any comments (see dartPrevNamed). */
+function dartNextNamed(node: SyntaxNode): SyntaxNode | null {
+  let next = node.nextNamedSibling;
+  while (next && DART_COMMENTS.has(next.type)) next = next.nextNamedSibling;
+  return next;
+}
+
+/**
+ * The receiver of the member access `selector`: the node in front of it, past
+ * any comments, or the end of an arrow function's body when the grammar ended
+ * the arrow in front of a generic call — `(ref) => ref.watch<int>(p)` comes
+ * out as `((ref) => ref).watch<int>(p)`. Dart writes a member access on the
+ * arrow itself in parentheses, so a receiver in that place is never the
+ * arrow. It names the call (`ref.watch`) and a static member's class; a call
+ * chained on that call keeps its bare name (see dartMisparsedGenericCall).
  */
 export function dartReceiverOf(selector: SyntaxNode): SyntaxNode | null {
-  const prev = selector.previousNamedSibling;
+  const prev = dartPrevNamed(selector);
   const body = prev?.type === 'function_expression' ? prev.lastNamedChild : null;
   return body?.type === 'function_expression_body' ? body.lastNamedChild : prev;
 }
@@ -122,8 +145,10 @@ export function dartMisparsedGenericCall(lt: SyntaxNode): DartMisparsedCall | un
   const args = outer.namedChild(2);
   if (args?.type !== 'parenthesized_expression' && args?.type !== 'record_literal') return undefined;
   if (args.startIndex !== gt.endIndex) return undefined;
+  // A comment against the `<` (`ref.read /* c */<Repo>(p)`) is a sibling of
+  // its own, so the callee is not against it: not laid out as a call.
   const before = lt.previousNamedSibling;
-  if (!before || before.endIndex !== lt.startIndex) return undefined;
+  if (!before || DART_COMMENTS.has(before.type) || before.endIndex !== lt.startIndex) return undefined;
   // The type argument: `T`, `p.T`, `T<…>` or `p.T<…>`, and nothing else.
   const head = lt.nextNamedSibling;
   if (head?.type !== 'identifier') return undefined;
@@ -193,9 +218,9 @@ export function dartMemberRead(
   );
   const member = accessor?.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
   if (!member) return undefined;
-  const receiver = node.previousNamedSibling;
+  const receiver = dartPrevNamed(node);
   if (receiver?.type !== 'identifier') return undefined;
-  const next = node.nextNamedSibling;
+  const next = dartNextNamed(node);
   if (next?.type === 'selector' && next.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
     return undefined;
   }
@@ -321,7 +346,7 @@ function dartTypeArgumentsReceiver(selector: SyntaxNode | null): string | undefi
   if (selector?.type !== 'selector' || selector.namedChildCount !== 1 || selector.namedChild(0)?.type !== 'type_arguments') {
     return undefined;
   }
-  const type = selector.previousNamedSibling;
+  const type = dartPrevNamed(selector);
   return type?.type === 'identifier' ? type.text : undefined;
 }
 
@@ -332,7 +357,7 @@ function dartTypeArgumentsReceiver(selector: SyntaxNode | null): string | undefi
  * `Foo.create`, a bare `create`, or `Foo` (constructor) — or undefined.
  */
 function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
-  const prev = argPart.previousNamedSibling;
+  const prev = dartPrevNamed(argPart);
   if (!prev) return undefined;
   if (prev.type === 'identifier') return prev.text; // bare `Foo()` / `create()`
   if (prev.type === 'selector') {
@@ -341,7 +366,7 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
     );
     const methodId = accessor?.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
     if (methodId) {
-      const accessorPrev = prev.previousNamedSibling;
+      const accessorPrev = dartPrevNamed(prev);
       if (accessorPrev?.type === 'identifier') return accessorPrev.text + '.' + methodId.text;
       const typeName = dartTypeArgumentsReceiver(accessorPrev);
       if (typeName) return typeName + '.' + methodId.text;
@@ -663,7 +688,8 @@ export const dartExtractor: LanguageExtractor = {
       const hasArgPart = node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part');
       if (!hasArgPart) return undefined;
 
-      const prev = node.previousNamedSibling;
+      // Past comments: `box.grow /* by */ (3)` calls `box.grow`.
+      const prev = dartPrevNamed(node);
       return prev ? dartCallee(prev) : undefined;
     }
 

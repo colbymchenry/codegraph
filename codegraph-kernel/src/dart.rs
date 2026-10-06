@@ -120,6 +120,31 @@ fn is_prefixed(kind: &str) -> bool {
     matches!(kind, "unary_expression" | "await_expression")
 }
 
+/// DART_COMMENTS (dart.ts) — line and block comments, and dartdoc.
+fn is_comment(node: Node) -> bool {
+    matches!(node.kind(), "comment" | "documentation_comment")
+}
+
+/// dartPrevNamed (dart.ts) — the named sibling before `node`, past comments:
+/// `tester //` + newline + `.state(…)` puts the comment, not `tester`, right
+/// before the `.state` selector.
+fn prev_named<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev.filter(|p| is_comment(*p)) {
+        prev = p.prev_named_sibling();
+    }
+    prev
+}
+
+/// dartNextNamed (dart.ts) — the named sibling after `node`, past comments.
+fn next_named<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut next = node.next_named_sibling();
+    while let Some(n) = next.filter(|n| is_comment(*n)) {
+        next = n.next_named_sibling();
+    }
+    next
+}
+
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -1059,7 +1084,8 @@ impl<'t> Walker<'t> {
             if !has_arg_part {
                 return None;
             }
-            let prev = node.prev_named_sibling()?;
+            // Past comments: `box.grow /* by */ (3)` calls `box.grow`.
+            let prev = prev_named(node)?;
             return self.callee_name(prev);
         }
 
@@ -1114,11 +1140,11 @@ impl<'t> Walker<'t> {
     }
 
     /// dartReceiverOf (dart.ts) — the receiver of the member access
-    /// `selector`: the node in front of it, or the end of an arrow function's
-    /// body when the grammar ended the arrow in front of a generic call
-    /// (`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`).
+    /// `selector`: the node in front of it, past comments, or the end of an
+    /// arrow function's body when the grammar ended the arrow in front of a
+    /// generic call (`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`).
     fn receiver_of(&self, selector: Node<'t>) -> Option<Node<'t>> {
-        let prev = selector.prev_named_sibling();
+        let prev = prev_named(selector);
         let body = prev
             .filter(|p| p.kind() == "function_expression")
             .and_then(|p| p.named_child(p.named_child_count().checked_sub(1)?));
@@ -1219,8 +1245,10 @@ impl<'t> Walker<'t> {
         if !matches!(args.kind(), "parenthesized_expression" | "record_literal") || args.start_byte() != gt.end_byte() {
             return None;
         }
+        // A comment against the `<` (`ref.read /* c */<Repo>(p)`) is a
+        // sibling of its own, so the callee is not against it.
         let before = lt.prev_named_sibling()?;
-        if before.end_byte() != lt.start_byte() {
+        if is_comment(before) || before.end_byte() != lt.start_byte() {
             return None;
         }
         // The type argument: `T`, `p.T`, `T<…>` or `p.T<…>`, and nothing else.
@@ -1298,7 +1326,7 @@ impl<'t> Walker<'t> {
 
     /// dartCalleeOfArgPart (dart.ts:100-116).
     fn callee_of_arg_part(&self, arg_part: Node<'t>) -> Option<String> {
-        let prev = arg_part.prev_named_sibling()?;
+        let prev = prev_named(arg_part)?;
         if prev.kind() == "identifier" {
             return Some(self.text(prev).to_string());
         }
@@ -1316,7 +1344,7 @@ impl<'t> Walker<'t> {
                 found
             });
             if let Some(method_id) = method_id {
-                let accessor_prev = prev.prev_named_sibling();
+                let accessor_prev = prev_named(prev);
                 if let Some(ap) = accessor_prev {
                     if ap.kind() == "identifier" {
                         return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
@@ -1341,7 +1369,7 @@ impl<'t> Walker<'t> {
         if selector.named_child(0)?.kind() != "type_arguments" {
             return None;
         }
-        let type_node = selector.prev_named_sibling()?;
+        let type_node = prev_named(selector)?;
         if type_node.kind() != "identifier" {
             return None;
         }
@@ -1662,11 +1690,11 @@ impl<'t> Walker<'t> {
             found
         });
         let Some(member) = member else { return };
-        let Some(receiver) = node.prev_named_sibling() else { return };
+        let Some(receiver) = prev_named(node) else { return };
         if receiver.kind() != "identifier" {
             return;
         }
-        let next = node.next_named_sibling();
+        let next = next_named(node);
         if let Some(next) = next {
             if next.kind() == "selector" {
                 let mut nc = next.walk();

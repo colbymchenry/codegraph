@@ -708,6 +708,18 @@ extract-mini.txt):
 | local-lambda body `final lam = (int a) { helper(a); }` | function_expression recursed transparently | `helper` attributed to the ENCLOSING function; `lam(5)` → `lam` |
 | `final p = Provider((ref) => Repo(ref.watch(d)))`, `static var s = make()`, `final _c = Controller();` in a class, `var v = load();` | the hook's walkInitializer (§Constants) | the full matrix, from the constant / the class / the file |
 | ctor initializers (`: size = seed()`), enum-constant args (`ok(200)`), default param values | never body-walked | NOTHING |
+| `tester //` + newline + `.state(x)`, `box.grow /* by */ (3)` | comments are named SIBLINGS between the chain's parts | `tester.state` / `box.grow` — every sibling step skips `comment` and `documentation_comment` (dartPrevNamed / dartNextNamed; kernel `prev_named` / `next_named`), so a comment changes nothing |
+
+Every sibling step along a member chain goes past comments: the callee before
+an argument part, dartReceiverOf / receiver_of, dartCalleeOfArgPart's two,
+dartTypeArgumentsReceiver's type, and dartMemberRead's receiver and its
+next-selector check. tree-sitter-dart keeps a comment as a named node wherever
+it is written, so before (2026-10-06) a comment between a member and its
+arguments lost the call and emitted a member read, a getter read or static
+access after a comment (`Config //`, dart format's line-break idiom) was lost,
+and a call after one kept only its bare name. The misparsed-generic-call
+layout checks below still read the raw siblings: a comment there means the
+code is not laid out as a call.
 
 extractCall (:3684), LITERAL_RECEIVER_TYPES (:373-388), SKIP_RECEIVERS, the
 parenthesized-conversion regex (:4530), template-strip — ALL UNREACHABLE for
@@ -729,7 +741,10 @@ selector (`p.Repo`) and/or a type_arguments-only selector (`Map<K, V>`); the
 callee part sits under `unary_expression` / `await_expression` for `await` and
 prefix operators. Recovered at the `<` when the type names a type (`/^[_$]*[A-Z]/`
 or `int double num bool dynamic void`), `<` touches the callee and `(` touches
-the `>`; `a < B > (c)`, `a<b>(c)` and `a <B>(c)` stay comparisons. The
+the `>`; `a < B > (c)`, `a<b>(c)` and `a <B>(c)` stay comparisons, and so does
+`a.b /* c */<B>(c)`: the comment is a sibling of its own against the `<`, so
+it is rejected as the callee (else the gate passed with no call, and the
+comment-skipping member read was suppressed). The
 recovered form emits what the parsed call does:
 
 - `calls` at the `<` (the parsed call's argument_part starts there);
@@ -757,8 +772,9 @@ do not, so `() => BlocProvider.of<CounterCubit>(context).increment()` keeps
 
 Called from the body walker only (:5218). The DART-SPECIFIC branch (the
 shared MEMBER_ACCESS_TYPES path is never reached — it returns first):
-node.type === `selector` AND it has NO `argument_part` child AND
-previousNamedSibling is an `identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
+node.type === `selector` AND it has NO `argument_part` child AND the
+receiver (dartReceiverOf: the previous named sibling past comments) is an
+`identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
 `references <identifier text>` from the enclosing symbol at the
 **IDENTIFIER's (receiver's) position** (pushStaticMemberRef :4800). Pins:
 

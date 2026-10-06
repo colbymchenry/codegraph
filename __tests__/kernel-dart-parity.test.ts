@@ -28,9 +28,10 @@
  * constructors and redirecting factories as methods with the unnamed ones
  * skipped, every redirect-target form, and constructors called with type
  * arguments, as statements and as expressions; TortureGenericCalls.dart:
- * generic calls parsed as two comparisons, recovered as calls) and their CRLF
- * variants
- * (derived in-memory — #1329), plus defer and generated-file pins.
+ * generic calls parsed as two comparisons, recovered as calls;
+ * TortureCommentChains.dart: comments between a member chain's parts skipped
+ * by every sibling step) and their CRLF variants (derived in-memory — #1329),
+ * plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
  * with --max-deferral 0.3); this suite keeps the invariant alive in
@@ -135,6 +136,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // as `(ref.read < Repo) > (p)`): every callee, type-argument and argument
     // shape, in bodies and initializers, and the comparisons that look alike.
     ['TortureGenericCalls.dart', 10],
+    // Comments between a chain's parts — `tester //` + newline + `.state(…)`,
+    // dartdoc, block comments, one between a member and its arguments — are
+    // skipped by every sibling step: calls, chains, reads, static references.
+    ['TortureCommentChains.dart', 10],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {
