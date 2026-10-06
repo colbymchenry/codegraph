@@ -2812,8 +2812,12 @@ export class TreeSitterExtractor {
    */
   private isExportedLater(name: string): boolean {
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) return false;
+    // Unescaped, a `$` in the name (`items$`, `$store`) is a line-end anchor,
+    // not the character. Escaped as the kernel's `regex::escape` does, so
+    // both paths decide the same.
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${name}\\s*;?[ \\t]*$|\\{[^}]*\\b${name}\\b[^}]*\\})`,
+      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{[^}]*\\b${n}\\b[^}]*\\})`,
       'm'
     );
     return re.test(this.source);

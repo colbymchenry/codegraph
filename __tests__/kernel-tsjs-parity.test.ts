@@ -151,6 +151,33 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     });
   });
 
+  describe.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a store whose name has a `$`, exported by a later statement: %s', (ext, language) => {
+    // The later-export check builds a regex from the name. Its `$` must match
+    // the character, as the kernel's escaped pattern does, not a line end.
+    const store = (name: string, ...exportLines: string[]) => [
+      'import { create } from "zustand";',
+      `const ${name} = create((set) => ({ inc: () => set({}) }));`,
+      ...exportLines,
+      '',
+    ].join('\n');
+
+    it.each([
+      ['items$', 'export default items$;'],
+      ['$store', 'export default $store;'],
+      ['a$b', 'export { a$b };'],
+    ])('keeps its actions (%s)', (name, exportLine) => {
+      const result = assertParity(`store.${ext}`, store(name, exportLine), language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(true);
+    });
+
+    it('is not exported by a different name at a line end', () => {
+      const result = assertParity(`store.${ext}`, store('items$', 'const items = 1;', 'export {', '  items', '};'), language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(false);
+    });
+  });
+
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('same-line accessors retain distinct identities after Unicode: %s (#1349)', (ext, language) => {
