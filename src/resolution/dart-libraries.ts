@@ -15,11 +15,11 @@
  * .dart file, never above the project root. When packages share a name
  * (example apps), the importing file's own package wins, then the one
  * enclosing it, then the one its package depends on by `path:`, else all of
- * them count. An `import` / `export` edge links the one file its URI names
- * (`dartDirectiveFile`).
+ * them count. An `import`, `export` or `part` edge links the one file its URI
+ * names (`dartDirectiveFile`).
  *
- * Directives are read from the head of each file at resolution time;
- * extraction, and the kernel's, are unchanged. Where the library cannot be
+ * Directives are read from the head of each file at resolution time, not from
+ * what extraction recorded of them. Where the library cannot be
  * established — a `part of` naming no library this can find, a file it cannot
  * read, a file in no package — every file counts as visible, so the rule only
  * narrows where the library is known.
@@ -542,9 +542,10 @@ function resolveDartUri(from: string, uri: string, context: ResolutionContext, m
 }
 
 /**
- * The project file a Dart `import` or `export` in `from` names by `uri`, or
- * null: a `dart:` library, a package from outside the project, a path out of
- * it, or a package name the project repeats with nothing to say which.
+ * The project file a Dart `import`, `export` or `part` in `from` names by
+ * `uri`, or null: a `dart:` library, a package from outside the project, a
+ * path out of it, or a package name the project repeats with nothing to say
+ * which.
  */
 export function dartDirectiveFile(from: string, uri: string, context: ResolutionContext): string | null {
   const files = resolveDartUri(from, uri, context, memoFor(context));

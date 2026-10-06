@@ -35,8 +35,10 @@
  * by every sibling step; TortureAnnotatedDocs.dart: the dartdoc above a
  * member's annotations, read past them, and what still ends the walk;
  * TortureAnnotatedComments.dart: the comments between annotations and their
- * declaration, stepped over by the decorator scan) and their CRLF variants
- * (derived in-memory — #1329), plus defer and generated-file pins.
+ * declaration, stepped over by the decorator scan; TortureDirectives.dart /
+ * TorturePartOfName.dart: `part` as an import of the part's file, `part of`
+ * as nothing, and the arguments of annotated directives) and their CRLF
+ * variants (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
  * with --max-deferral 0.3); this suite keeps the invariant alive in
@@ -159,6 +161,12 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // body — are stepped over by the decorator scan; a field, a variable, an
     // import or the previous member's body still ends it.
     ['TortureAnnotatedComments.dart', 30],
+    // A library's directives: imports and exports in every form, and `part`
+    // in every URI and quote form — each an import node and an `imports` ref
+    // — with the arguments of an annotated directive walked for fn-refs.
+    ['TortureDirectives.dart', 20],
+    // `part of` a library named by its library name records nothing.
+    ['TorturePartOfName.dart', 3],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

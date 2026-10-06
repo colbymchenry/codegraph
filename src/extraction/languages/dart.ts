@@ -434,6 +434,12 @@ function dartCallee(prev: SyntaxNode): string | undefined {
   return undefined;
 }
 
+/** The URI a directive's `uri` node holds, quotes stripped: `x.g.dart` for `'x.g.dart'`. */
+function dartUriText(uri: SyntaxNode | undefined, source: string): string {
+  const literal = uri?.namedChildren.find((c: SyntaxNode) => c.type === 'string_literal');
+  return literal ? getNodeText(literal, source).replace(/['"]/g, '') : '';
+}
+
 export const dartExtractor: LanguageExtractor = {
   functionTypes: ['function_signature'],
   classTypes: ['class_definition'],
@@ -452,7 +458,12 @@ export const dartExtractor: LanguageExtractor = {
   enumTypes: ['enum_declaration'],
   enumMemberTypes: ['enum_constant'],
   typeAliasTypes: ['type_alias'],
-  importTypes: ['import_or_export'],
+  // `part 'x.g.dart';` is a library naming one of its own files — a generated
+  // part, often. Its URI resolves as an import's does, so the library links
+  // the part's file the way it links a file it imports, and a change to the
+  // part reaches whatever depends on the library. `part of` adds nothing to
+  // that edge, and stays out.
+  importTypes: ['import_or_export', 'part_directive'],
   callTypes: [],  // Dart calls use identifier+selector, handled via extractBareCall
   variableTypes: [],
   // `extension_type_declaration` is Dart 3's extension type. It sits beside the
@@ -662,6 +673,11 @@ export const dartExtractor: LanguageExtractor = {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
     let moduleName = '';
 
+    // A part: part 'x.g.dart';
+    if (node.type === 'part_directive') {
+      moduleName = dartUriText(node.namedChildren.find((c: SyntaxNode) => c.type === 'uri'), source);
+    }
+
     // Dart imports: import 'dart:async'; import 'package:foo/bar.dart' as bar;
     const libraryImport = node.namedChildren.find((c: SyntaxNode) => c.type === 'library_import');
     if (libraryImport) {
@@ -669,13 +685,7 @@ export const dartExtractor: LanguageExtractor = {
       if (importSpec) {
         const configurableUri = importSpec.namedChildren.find((c: SyntaxNode) => c.type === 'configurable_uri');
         if (configurableUri) {
-          const uri = configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri');
-          if (uri) {
-            const stringLiteral = uri.namedChildren.find((c: SyntaxNode) => c.type === 'string_literal');
-            if (stringLiteral) {
-              moduleName = getNodeText(stringLiteral, source).replace(/['"]/g, '');
-            }
-          }
+          moduleName = dartUriText(configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri'), source);
         }
       }
     }
@@ -686,13 +696,7 @@ export const dartExtractor: LanguageExtractor = {
       if (libraryExport) {
         const configurableUri = libraryExport.namedChildren.find((c: SyntaxNode) => c.type === 'configurable_uri');
         if (configurableUri) {
-          const uri = configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri');
-          if (uri) {
-            const stringLiteral = uri.namedChildren.find((c: SyntaxNode) => c.type === 'string_literal');
-            if (stringLiteral) {
-              moduleName = getNodeText(stringLiteral, source).replace(/['"]/g, '');
-            }
-          }
+          moduleName = dartUriText(configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri'), source);
         }
       }
     }

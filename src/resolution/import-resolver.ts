@@ -894,11 +894,12 @@ export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
 }
 
 /**
- * Is this a Dart `import` / `export`? Its name is the URI, which names one
- * library file (see ./dart-libraries) or none — `dart:async`, a package from
- * outside the project — and never a symbol: the name-matcher took the URI's
- * last segment for a file name (`package:flutter/foundation.dart` went to
- * riverpod's own foundation.dart) or bound it to the file's own `import` node.
+ * Is this a Dart `import`, `export` or `part`? Its name is the URI, which
+ * names one file (see ./dart-libraries) or none — `dart:async`, a package from
+ * outside the project, a generated part nobody committed — and never a
+ * symbol: the name-matcher took the URI's last segment for a file name
+ * (`package:flutter/foundation.dart` went to riverpod's own foundation.dart)
+ * or bound it to the file's own `import` node.
  */
 export function isDartImportRef(ref: UnresolvedRef): boolean {
   return ref.language === 'dart' && ref.referenceKind === 'imports';
@@ -1651,8 +1652,9 @@ export function resolveViaImport(
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
   }
-  // A Dart `import` / `export` URI names a library file: `package:app/x.dart`
-  // is app's lib/x.dart, any other path is from the importing file.
+  // A Dart `import` / `export` URI names a library file, and a `part` URI one
+  // of the library's own files: `package:app/x.dart` is app's lib/x.dart, any
+  // other path is from the file the directive is in.
   if (isDartImportRef(ref)) {
     const file = dartDirectiveFile(ref.filePath, ref.referenceName, context);
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;

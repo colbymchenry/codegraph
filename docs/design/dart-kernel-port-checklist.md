@@ -194,8 +194,8 @@ Types: functionTypes=[`function_signature`] (:119); classTypes=
 `redirecting_factory_constructor_signature`] (:126 — the last two since
 2026-10-06); interfaceTypes=[] ; structTypes=[];
 enumTypes=[`enum_declaration`] (:129); enumMemberTypes=[`enum_constant`]
-(:130); typeAliasTypes=[`type_alias`] (:131); importTypes=[`import_or_export`]
-(:132); **callTypes=[] (:133 — extractCall NEVER runs for dart; all call refs
+(:130); typeAliasTypes=[`type_alias`] (:131); importTypes=[`import_or_export`,
+`part_directive`] (:132 — the second since 2026-10-06); **callTypes=[] (:133 — extractCall NEVER runs for dart; all call refs
 ride `extractBareCall` in the body walker)**; variableTypes=[] (:134 —
 extractVariable never runs); extraClassNodeTypes=[`mixin_declaration`,
 `extension_declaration`] (:135). nameField=`name` (:172), bodyField=`body`
@@ -420,20 +420,26 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
 - **extractImport (:261-304)** — importText = trimmed full node slice;
   moduleName = the URI string content: `library_import >
   import_specification > configurable_uri > uri > string_literal` (else the
-  same chain under `library_export`), quotes stripped via
-  `.replace(/['"]/g,'')`. Returns {moduleName, signature} (no handledRefs)
+  same chain under `library_export`; a `part_directive` holds its `uri`
+  directly), quotes stripped via `.replace(/['"]/g,'')` (dartUriText).
+  Returns {moduleName, signature} (no handledRefs)
   → import NODE (name = the URI, e.g. `package:torture/other.dart`,
-  `dart:async`, `src/reexported.dart`) + the generic `imports` ref
+  `dart:async`, `src/reexported.dart`, `x.g.dart`) + the generic `imports` ref
   (tree-sitter.ts:3183-3194) {from: file node (no namespace exists), name =
-  URI, line/col of the import_or_export node}. `as alias`, `show`/`hide`
+  URI, line/col of the directive node — at its first annotation when it has
+  one}. `as alias`, `show`/`hide`
   combinators: IGNORED (not read). **`import 'x.dart' deferred as y;` is
   INVISIBLE** — the deferred form's import_specification holds a bare `uri`
   (NO configurable_uri wrapper) → hook returns null → falls through the
   multi-import inline handlers (none match import_or_export) → no node, no
-  ref (pinned, `extract-mini.txt`). `part`/`part of`/`library` directives
-  are different node types (part_directive, part_of_directive, library_name)
-  in NO type list → invisible. None of the TS/py/rust/php/ruby binding
-  emitters (:3197-3234) fire for dart.
+  ref (pinned, `extract-mini.txt`). **`part 'x.g.dart';` is an import since
+  2026-10-06** (signature `part 'x.g.dart';`): the resolver reads its URI by
+  the import/export rules (`dartDirectiveFile`), so the library's file links
+  the part's file and a change to the part reaches the library's dependents.
+  `part of` and `library` (part_of_directive, library_name) are in NO type
+  list → invisible: the library's `part` edge already joins the two files.
+  None of the TS/py/rust/php/ruby binding emitters (:3197-3234) fire for
+  dart.
 - **extractBareCall (:305-379)** — §Calls, the full matrix.
 
 Hooks ABSENT (the walker must NOT do these): `preParse`, `recoverMangledName`,
@@ -467,12 +473,12 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 | `method_signature`, `constructor_signature` | methodTypes:1027 | **NOT class-gated at the ladder** — extractMethod:1737 runs anywhere; its own gate :1747 (not class-like, no methodsAreTopLevel, no receiver) falls back: parent `object`/`object_expression`? (never in dart) else **extractFunction** — this is how extension-TYPE members and any stray non-class method_signature become plain `function` nodes (pinned: `extension type MetersT` → function `km`, bare QN) |
 | `enum_declaration` | enumTypes:1064 → extractEnum:1914 | §Class family |
 | `type_alias` | typeAliasTypes:1071 → extractTypeAlias:2890 | plain type_alias node; `getChildByField(node,'value')` → **null** (no fields) → **NO refs from the aliased type** (`typedef MapAlias = Map<String, WidgetT>` emits nothing); returns false → children re-visited (function_type/formal_parameter_list children match nothing) |
-| `import_or_export` | importTypes:1209 → extractImport:3170 | §Extractor config |
+| `import_or_export`, `part_directive` | importTypes:1209 → extractImport:3170 | §Extractor config. No skipChildren: the directive's children are still recursed, so an annotated directive's arguments are fn-ref capture points (`@Tag(f) import 'a.dart';` captures `f`). The kernel arm recurses too — since 2026-10-06; before, its `import_or_export` arm returned and missed those (TortureDirectives.dart pins both) |
 | `new_expression` | INSTANTIATION_KINDS:1255 (`new_expression` ∈ :354-361) | extractInstantiation:4610 → ctor field lookups null → namedChild(0) = type_identifier → `instantiates` ref from stack top; `<`-strip + last-`.`-segment apply (`new p.Foo<T>()` → `Foo`). findAnonymousClassBody → always null for dart. Children still recursed |
 | `function_body` (sibling of a consumed signature) | **no branch** | recursed → THE DOUBLE-WALK (§below) |
 | `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature, constant_constructor_signature and redirecting_factory_constructor_signature hit methodTypes; each field `initialized_identifier` hits the hook (body-walked for the class); initializers, annotations-in-place: nothing |
 | `getter_signature` / `setter_signature` BARE (top level) | no branch | **top-level getters/setters are INVISIBLE** (no node; their sibling function_body is visitNode-recursed where calls don't extract) — in classes they're method_signature-wrapped → methods |
-| `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
+| `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_of_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
 | `property_signature`/`method_signature` TS branch (:1282) | **shadowed** | method_signature is consumed at :1027 first; property_signature isn't a dart kind — branch unreachable |
 
 ### THE DOUBLE-WALK (sibling bodies) — reproduce it exactly
@@ -671,9 +677,10 @@ chain → FIRST value child only); `static final sharedInst = WidgetT(0)` →
 constant under the class, sig `= WidgetT`; multi-declarations → one node
 each with own columns. **NO nodes ever**: instance fields (typed/untyped/
 late/var), `static var`, top-level var/typed vars, top-level getters/
-setters, extension_type containers, `part`/`part of`/`library`/deferred
+setters, extension_type containers, `part of`/`library`/deferred
 imports. (Named `const` constructors and redirecting factories mint
-methods since 2026-10-06; the unnamed ones still mint nothing.) **Initializers
+methods since 2026-10-06, and a `part` directive an import; the unnamed
+constructors still mint nothing.) **Initializers
 are code:** every initializer is walked with the body walker — a
 constant's for the constant (riverpod's `final repoProvider =
 Provider((ref) => Repository(ref.watch(dioProvider)));` → calls
@@ -1270,7 +1277,9 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
    `svy-dart/torture.dart` (231 lines, parses clean; its
    `extract-torture.txt` is the expected-output pin). Inventory by branch:
    imports (dart:, package: with `as`+`show`, export with `hide`,
-   **deferred → invisible**, part → invisible); doc shapes (`///` run,
+   **deferred → invisible**, part → invisible — an import since
+   2026-10-06, pinned with every directive form in TortureDirectives.dart,
+   and `part of` by library name in TorturePartOfName.dart); doc shapes (`///` run,
    `/** */` kept, `//` kept, a `///` above an annotation); annotations (bare,
    with-args, stacked → reverse order, on class); top-level constants
    (CAPS/lowercase/multi/typed/derived, sig truncation ≥100 chars);

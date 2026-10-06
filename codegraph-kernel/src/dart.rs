@@ -826,9 +826,13 @@ impl<'t> Walker<'t> {
                     return;
                 }
             }
-            "import_or_export" => {
+            // importTypes (dart.ts): `import` / `export`, and `part
+            // 'x.g.dart';`, which links the library to the part's file. The
+            // TS ladder goes on into the directive's children, so this does
+            // too: an annotation's arguments are fn-ref capture points
+            // (`@Tag(bar) import 'a.dart';` captures `bar`).
+            "import_or_export" | "part_directive" => {
                 self.extract_import(node);
-                return;
             }
             "new_expression" => {
                 // INSTANTIATION_KINDS row — from the FILE/CLASS on the
@@ -1036,7 +1040,7 @@ impl<'t> Walker<'t> {
         false
     }
 
-    // --- extractImport (:3170; hook dart.ts:261-304) ----------------------
+    // --- extractImport (:3170; hook dart.ts extractImport) -----------------
 
     fn extract_import(&mut self, node: Node<'t>) {
         let find_child = |parent: Node<'t>, kind: &str| -> Option<Node<'t>> {
@@ -1050,6 +1054,12 @@ impl<'t> Walker<'t> {
             find_child(uri, "string_literal")
         };
         let mut module: Option<String> = None;
+        // A part: `part 'x.g.dart';` holds its `uri` directly.
+        if node.kind() == "part_directive" {
+            if let Some(sl) = find_child(node, "uri").and_then(|uri| find_child(uri, "string_literal")) {
+                module = Some(self.text(sl).replace(['\'', '"'], ""));
+            }
+        }
         if let Some(li) = find_child(node, "library_import") {
             if let Some(spec) = find_child(li, "import_specification") {
                 if let Some(sl) = uri_of(spec) {
