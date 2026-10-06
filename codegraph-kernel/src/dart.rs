@@ -18,8 +18,9 @@
 //! `.`); `ConfigT.load()` double-emits (calls + a static-member references
 //! ref — no callee-of-call skip in the dart branch); operator methods mint
 //! `method "<anonymous>"`; the unnamed constructor is skipped
-//! (isMisparsedFunction) while named ctors/factories are named by the CTOR
-//! name with the class as returnType; instance fields mint NO nodes (only
+//! (isMisparsedFunction) while named ctors/factories — `const` ones and
+//! redirecting factories included — are named by the CTOR name with the
+//! class as returnType; instance fields mint NO nodes (only
 //! static_final_declaration → constant, via the hook); every initializer is
 //! body-walked once — a constant's from the constant, a field's or a
 //! top-level variable's from the class or the file; prefixed return
@@ -88,6 +89,23 @@ fn starts_upper_re() -> &'static Regex {
 fn angle_args_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<[^>]*>").unwrap())
+}
+
+/// The UpperCamel test of isDartTypeName (`/^[_$]*[A-Z]/`) — how Dart writes
+/// a type, `_Private` and `$Generated` ones included.
+fn is_upper_camel(text: &str) -> bool {
+    text.trim_start_matches(&['_', '$'][..])
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+/// DART_BODILESS_CTORS (dart.ts) — `const Foo.bar();` and a redirecting
+/// factory `const factory Foo.bar() = _Bar;`, each a signature kind of its
+/// own inside a `declaration`.
+fn is_bodiless_ctor(kind: &str) -> bool {
+    matches!(kind, "constant_constructor_signature" | "redirecting_factory_constructor_signature")
 }
 
 struct Scope {
@@ -385,7 +403,9 @@ impl<'t> Walker<'t> {
 
     /// dartConstructorSignature (dart.ts:25-35).
     fn constructor_signature(&self, node: Node<'t>) -> Option<Node<'t>> {
-        if matches!(node.kind(), "factory_constructor_signature" | "constructor_signature") {
+        if matches!(node.kind(), "factory_constructor_signature" | "constructor_signature")
+            || is_bodiless_ctor(node.kind())
+        {
             return Some(node);
         }
         if node.kind() == "method_signature" {
@@ -415,9 +435,12 @@ impl<'t> Walker<'t> {
     /// dartCtorInfo (dart.ts:61-70).
     fn ctor_info(&self, node: Node<'t>) -> Option<(String, String)> {
         let ctor = self.constructor_signature(node)?;
+        // The names before the parameters: a redirecting factory names its
+        // target after them (`factory Foo() = _Impl.named;`).
         let mut cursor = ctor.walk();
         let ids: Vec<Node<'t>> = ctor
             .named_children(&mut cursor)
+            .take_while(|c| c.kind() != "formal_parameter_list")
             .filter(|c| c.kind() == "identifier")
             .collect();
         let class_name = self.enclosing_type_name(node)?;
@@ -448,11 +471,13 @@ impl<'t> Walker<'t> {
         Some(last.to_string())
     }
 
-    /// isMisparsedFunction (dart.ts:177-188) — skip the UNNAMED constructor.
-    fn is_unnamed_ctor(&self, node: Node<'t>) -> bool {
+    /// isMisparsedFunction (dart.ts:177-188) — skip the UNNAMED constructor,
+    /// and a `const` ctor / redirecting factory that names no enclosing type
+    /// (error recovery's).
+    fn is_misparsed_function(&self, node: Node<'t>) -> bool {
         match self.ctor_info(node) {
             Some((class_name, ctor_name)) => ctor_name == class_name,
-            None => false,
+            None => is_bodiless_ctor(node.kind()),
         }
     }
 
@@ -463,10 +488,15 @@ impl<'t> Walker<'t> {
         let params = sig
             .named_children(&mut c1)
             .find(|c| c.kind() == "formal_parameter_list");
+        // A constructor has no return type: the type a redirecting factory
+        // names is its target (`= _Impl`).
         let mut c2 = sig.walk();
-        let ret = sig
-            .named_children(&mut c2)
-            .find(|c| matches!(c.kind(), "type_identifier" | "void_type"));
+        let ret = if is_bodiless_ctor(sig.kind()) {
+            None
+        } else {
+            sig.named_children(&mut c2)
+                .find(|c| matches!(c.kind(), "type_identifier" | "void_type"))
+        };
         if params.is_none() && ret.is_none() {
             return None;
         }
@@ -704,7 +734,10 @@ impl<'t> Walker<'t> {
                 self.extract_class(node);
                 return;
             }
-            "method_signature" | "constructor_signature" => {
+            "method_signature"
+            | "constructor_signature"
+            | "constant_constructor_signature"
+            | "redirecting_factory_constructor_signature" => {
                 self.extract_method(node);
                 return;
             }
@@ -753,7 +786,7 @@ impl<'t> Walker<'t> {
         }
         // isMisparsedFunction: the unnamed constructor is skipped — node
         // suppressed, body still walked (attributed to the current stack top).
-        if self.is_unnamed_ctor(node) {
+        if self.is_misparsed_function(node) {
             if let Some(body) = self.resolve_body(node) {
                 self.visit_body(body);
             }
@@ -800,7 +833,7 @@ impl<'t> Walker<'t> {
         }
         let name = self.extract_name(node);
         // isMisparsedFunction — the unnamed ctor: body-only walk.
-        if self.is_unnamed_ctor(node) {
+        if self.is_misparsed_function(node) {
             if let Some(body) = self.resolve_body(node) {
                 self.visit_body(body);
             }
@@ -1035,6 +1068,11 @@ impl<'t> Walker<'t> {
                             if ap.kind() == "identifier" {
                                 return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
                             }
+                            // A constructor called with type arguments names
+                            // its type all the same (`BlocProvider<T>.value`).
+                            if let Some(type_name) = self.type_arguments_receiver(ap) {
+                                return Some(format!("{}.{}", type_name, self.text(method_id)));
+                            }
                             // Chained static-factory: the receiver is itself
                             // a call — re-encode `<inner>().<method>` when
                             // the chain starts capitalized (#750).
@@ -1091,6 +1129,21 @@ impl<'t> Walker<'t> {
             };
         }
 
+        // `=> BlocProvider<CounterCubit>.value(…)` — a constructor called
+        // with type arguments, as most expressions parse it. The type is the
+        // LAST type_identifier: an import prefix (`p.X<T>.named`) is one too.
+        if node.kind() == "constructor_invocation" {
+            let mut c1 = node.walk();
+            let type_id = node.named_children(&mut c1).filter(|c| c.kind() == "type_identifier").last();
+            let mut c2 = node.walk();
+            let name_id = node.named_children(&mut c2).find(|c| c.kind() == "identifier");
+            return match (type_id, name_id) {
+                (Some(t), Some(n)) => Some(format!("{}.{}", self.text(t), self.text(n))),
+                (Some(t), None) => Some(self.text(t).to_string()),
+                _ => None,
+            };
+        }
+
         None
     }
 
@@ -1119,11 +1172,31 @@ impl<'t> Walker<'t> {
                     if ap.kind() == "identifier" {
                         return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
                     }
+                    if let Some(type_name) = self.type_arguments_receiver(ap) {
+                        return Some(format!("{}.{}", type_name, self.text(method_id)));
+                    }
                 }
                 return Some(self.text(method_id).to_string());
             }
         }
         None
+    }
+
+    /// dartTypeArgumentsReceiver (dart.ts) — `BlocProvider` in
+    /// `BlocProvider<CounterCubit>.value(…)`, when `selector` is the `<…>`
+    /// between the type and `.value`. Only a constructor is called that way.
+    fn type_arguments_receiver(&self, selector: Node<'t>) -> Option<&'t str> {
+        if selector.kind() != "selector" || selector.named_child_count() != 1 {
+            return None;
+        }
+        if selector.named_child(0)?.kind() != "type_arguments" {
+            return None;
+        }
+        let type_node = selector.prev_named_sibling()?;
+        if type_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(type_node))
     }
 
     // --- extractStaticMemberRef — the dart branch (:4759-4767) ------------
@@ -1326,6 +1399,20 @@ impl<'t> Walker<'t> {
         } else {
             node
         };
+        // A redirecting factory names the class it constructs after `=`, then
+        // perhaps that class's constructor (`= _$QuestionImpl.fromJson`, two
+        // type_identifiers). Neither the constructor nor an import prefix is
+        // a type, and Dart writes types UpperCamel.
+        if sig.kind() == "redirecting_factory_constructor_signature" {
+            let mut cursor = sig.walk();
+            let kids: Vec<Node<'t>> = sig.named_children(&mut cursor).collect();
+            for child in kids {
+                if child.kind() != "type_identifier" || is_upper_camel(self.text(child)) {
+                    self.type_refs_from_subtree(child, row);
+                }
+            }
+            return;
+        }
         self.type_refs_from_subtree(sig, row);
     }
 
@@ -1354,13 +1441,7 @@ impl<'t> Walker<'t> {
     /// constructor call names.
     fn is_type_name_dart(&self, node: Node<'t>) -> bool {
         let text = self.text(node);
-        let upper = text
-            .trim_start_matches(&['_', '$'][..])
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_uppercase())
-            .unwrap_or(false);
-        if !upper || is_builtin_type(text) {
+        if !is_upper_camel(text) || is_builtin_type(text) {
             return false;
         }
         if node.next_sibling().map(|s| s.kind() == ".").unwrap_or(false) {

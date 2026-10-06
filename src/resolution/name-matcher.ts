@@ -1106,7 +1106,9 @@ export function matchFunctionRef(
   // defines inside `test_custom_auth`. Those still count against a lone
   // cross-file guess below — a name several functions use for themselves is
   // as likely a local's.
-  let candidates = named.filter((n) => isLexicallyReachable(n, ref, context));
+  let candidates = named.filter((n) => isLexicallyReachable(n, ref, context) &&
+    // A Dart constructor is torn off through its class, never by a bare name.
+    !isDartConstructor(n, context));
   if (candidates.length === 0) return null;
   // A Python name the function around it binds — a parameter, an assignment —
   // is that local's value: httpx's `auth_flow(self, request)` handing `request`
@@ -2866,6 +2868,32 @@ function isDartMethodInScope(method: Node, ref: UnresolvedRef, context: Resoluti
   return dartMemberDepth(method, ref, context) < Infinity;
 }
 
+const DART_CONSTRUCTORS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Dart method is a named constructor — `Foo.named(…)`, `factory
+ * Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read from
+ * its declaration. Dart reaches one only through its class (`Foo.value(…)`,
+ * the tear-off `Foo.value`), never by a bare name: a parameter `value` passed
+ * on is not `const BlocProvider.value(…)`.
+ */
+function isDartConstructor(n: Node, context: ResolutionContext): boolean {
+  if (n.language !== 'dart' || n.kind !== 'method') return false;
+  let memo = DART_CONSTRUCTORS.get(context);
+  if (!memo) DART_CONSTRUCTORS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
+  const escape = (name: string): string => name.replace(/\$/g, '\\$');
+  const constructor = owner !== '' &&
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escape(owner)}\s*\.\s*${escape(n.name)}(?![\w$])`).test(head);
+  memo.set(n.id, constructor);
+  return constructor;
+}
+
 /**
  * How many supertype steps separate the class a Dart call is written in from
  * `method`'s owner: 0 for its own member, Infinity when the owner is not in
@@ -3166,6 +3194,39 @@ export function matchDartMemberRead(ref: UnresolvedRef, context: ResolutionConte
 function dartExtensionMemberOf(typeName: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
   const found = dartMemberOf(typeName, name, ref, context, () => true);
   return found?.viaExtension ? found.node : null;
+}
+
+/**
+ * A Dart call through a type's name — `BlocProvider.value(…)`, riverpod's
+ * `FutureProvider.autoDispose(…)` — is to one of that type's own constructors
+ * or static members, or to nothing the project declares. Dart inherits none
+ * of them, so a guess past the type is always wrong: flutter_bloc's
+ * `BlocProvider.value(…)` went to `RepositoryProvider`'s `value` 89 times,
+ * riverpod's `Family2Family._()` to the `EmptyFamily2Family._` declared above
+ * it, and the SDK's `Uri.parse(…)`, past bloc_lint's `extension on Uri`, to a
+ * project `parse`. A static constant's callee is the value it holds (`static
+ * const autoDispose = AutoDisposeFutureProviderBuilder();`). Undefined when
+ * the receiver names no Dart type of the project.
+ */
+function matchDartTypeMemberCall(
+  typeName: string,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  const types = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
+  if (types.length === 0) return undefined;
+  for (const type of preferCallSiteFile(types, ref.filePath)) {
+    // An `extension on X` has no name to call a member through.
+    if (dartExtensionDecl(type, context)?.named === false) continue;
+    const qualifiedName = `${type.qualifiedName}::${member}`;
+    // Never an instance member of that name: riverpod's `AsyncValue.error(…)`
+    // is `const factory AsyncValue.error(…)`, not `Object? get error`.
+    const own = context.getNodesInFile(type.filePath).find((n) => n.qualifiedName === qualifiedName &&
+      (n.kind === 'constant' || (n.kind === 'method' && (n.isStatic === true || isDartConstructor(n, context)))));
+    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'qualified-name' };
+  }
+  return null;
 }
 
 /**
@@ -5875,6 +5936,11 @@ export function matchByExactName(
     !isKotlinNumberBitwise(n, ref) &&
     !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    // A Dart constructor is reached through its class (`Foo.named(…)`,
+    // `@Foo.named(…)`), never by its name alone: not a bare call, not the
+    // last link of a chain, not an annotation (riverpod's 210 `@internal`
+    // annotations went to its providers' `internal` constructors).
+    !(ref.language === 'dart' && isDartConstructor(n, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
@@ -8702,6 +8768,13 @@ export function matchMethodCall(
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
 
+  // A Dart call through a type's name is to that type's own member, or to
+  // nothing in the project.
+  if (ref.language === 'dart' && dotMatch) {
+    const typeMember = nmTimedT('mc-darttype', ref, () => matchDartTypeMemberCall(objectOrClass!, methodName!, ref, context));
+    if (typeMember !== undefined) return typeMember;
+  }
+
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
   // dedicated inferrer (header scan + `auto`); every other language uses the
@@ -8927,24 +9000,6 @@ export function matchMethodCall(
       if (classNode.language !== ref.language) continue;
 
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      // Dart: a call through a type's static constant invokes the value the
-      // constant holds. riverpod's `FutureProvider.autoDispose(…)` calls
-      // `static const autoDispose = AutoDisposeFutureProviderBuilder();`,
-      // which the lookups below gave to another builder's `autoDispose`
-      // method. A Dart type can't also declare a method of that name, and its
-      // static members are not inherited, so its own constant is the callee.
-      if (ref.language === 'dart') {
-        const holder = nodesInFile.find((n) =>
-          n.kind === 'constant' && n.name === methodName && n.qualifiedName === `${classNode.qualifiedName}::${methodName}`);
-        if (holder) {
-          return {
-            original: ref,
-            targetNodeId: holder.id,
-            confidence: 0.85,
-            resolvedBy: 'qualified-name',
-          };
-        }
-      }
       const methodNode = nodesInFile.find(
         (n) =>
           n.kind === 'method' &&
@@ -10667,6 +10722,7 @@ export function matchFuzzy(
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    !(ref.language === 'dart' && isDartConstructor(n, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !isKotlinNumberBitwise(n, ref) &&
