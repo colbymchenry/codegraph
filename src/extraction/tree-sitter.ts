@@ -23,7 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
-import { isDartTypeName, pushDartTypeRefs } from './languages/dart';
+import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -5787,8 +5787,12 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
-      const prev = node.previousNamedSibling;
+      const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
+        // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
+        // argument, which the body walker references as a type.
+        const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
+        if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
       }
       return;
@@ -6604,7 +6608,7 @@ export class TreeSitterExtractor {
       // A member read that may run code — Dart's `x.area` calls the getter
       // `area` (#2338). The resolver links it to a getter, as a call, or to
       // nothing: a plain field read stays a reference that names no symbol.
-      const read = this.extractor!.extractMemberRead?.(node);
+      const read = this.extractor!.extractMemberRead?.(node, parent);
       if (read) {
         const readerId = this.nodeStack[this.nodeStack.length - 1];
         if (readerId) {
@@ -6619,18 +6623,22 @@ export class TreeSitterExtractor {
       }
 
       // A type a Dart body names — a local's declared type, a generic argument
-      // (`Future<Report?>.value(null)`, `context.read<Report>()`), a cast, a
-      // type test — is the function's dependency, as a TS local's annotation
-      // is just below (#2327).
-      if (this.language === 'dart' && nodeType === 'type_identifier' && isDartTypeName(node)) {
+      // (`Future<Report?>.value(null)`, `context.read<Report>()`, and
+      // `ref.read<Report>(p)` when the grammar read that call as comparisons),
+      // a cast, a type test — is the function's dependency, as a TS local's
+      // annotation is just below (#2327).
+      if (this.language === 'dart') {
+        const typeNode = nodeType === 'type_identifier' ? node
+          : nodeType === 'relational_operator' ? dartMisparsedGenericCall(node)?.typeName
+          : undefined;
         const ownerId = this.nodeStack[this.nodeStack.length - 1];
-        if (ownerId) {
+        if (typeNode && ownerId && isDartTypeName(typeNode)) {
           this.unresolvedReferences.push({
             fromNodeId: ownerId,
-            referenceName: getNodeText(node, this.source),
+            referenceName: getNodeText(typeNode, this.source),
             referenceKind: 'references',
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column,
+            line: typeNode.startPosition.row + 1,
+            column: typeNode.startPosition.column,
           });
         }
       }
