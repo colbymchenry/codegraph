@@ -11,7 +11,8 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { dartLibrarySees, dartPrefixSees, inSameDartLibrary, isDartImportPrefix } from './dart-libraries';
+import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
+import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -3036,6 +3037,85 @@ function preferOwnDartLibrary(candidates: Node[], ref: UnresolvedRef, context: R
 }
 
 /**
+ * A Dart call through an import prefix — `http.get(…)` after `import
+ * 'package:http/http.dart' as http;`, `fmt.describe(…)`, `kit.Widget()` —
+ * calls a top-level declaration a library imported with that prefix exports,
+ * `export` chains and `show` / `hide` followed, or nothing of the project:
+ * never a member found by its name. riverpod's docs' 25 `http.get(…)` calls
+ * went to a docs example's `Http::get`, by their receiver's capitalized name.
+ * Undefined when the receiver is no import prefix there, or a parameter, local
+ * or member of that name hides it.
+ */
+function matchDartPrefixedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const parts = DART_MEMBER_READ.exec(ref.referenceName);
+  if (!parts || !dartImportPrefixes(ref.filePath, context).has(parts[1]!)) return undefined;
+  const prefix = parts[1]!;
+  const name = parts[2]!;
+  const at = dartPrefixedCallSite(ref, prefix, name, context);
+  // `const p.Box.named()` reaches here as `p.named`: no call of a top-level `named`.
+  if (at < 0) return null;
+  if (isDartNameHidden(prefix, ref, at, context)) return undefined;
+  const found = dartPrefixedDecls(prefix, name, ref, context);
+  return found.length === 1 ? { original: ref, targetNodeId: found[0]!.id, confidence: 0.9, resolvedBy: 'import' } : null;
+}
+
+/** The top-level Dart declarations named `name` that the imports written with `prefix` bring into the reference's library. */
+function dartPrefixedDecls(prefix: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  return context.getNodesByName(name).filter((n) => isDartLibraryDecl(n) && dartPrefixSees(ref.filePath, prefix, n.filePath, name, context));
+}
+
+/**
+ * Where `prefix` starts in the code of a Dart call written `prefix.name(…)`,
+ * or -1 when the call is written otherwise: `const p.Box.named()` arrives as
+ * `p.named`. (The reference's column sits just past `name`.)
+ */
+function dartPrefixedCallSite(ref: UnresolvedRef, prefix: string, name: string, context: ResolutionContext): number {
+  const code = dartCodeOf(ref.filePath, context);
+  const start = code ? dartNameStart({ ...ref, referenceName: name }, code) : -1;
+  if (!code || start < 0) return -1;
+  const text = code.text;
+  let k = start - 1;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  if (text[k] !== '.' || text[k - 1] === '.' || text[k - 1] === '?') return -1;
+  k--;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  const end = k + 1;
+  while (k >= 0 && /[\w$]/.test(text[k]!)) k--;
+  if (text.slice(k + 1, end) !== prefix) return -1;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  return text[k] === '.' ? -1 : end - prefix.length;
+}
+
+/**
+ * Whether a parameter or local around offset `at`, or a member of the type the
+ * reference is written in, is named `name`: it hides a library-level name
+ * there — an import prefix among them — as Dart's scopes nest.
+ */
+function isDartNameHidden(name: string, ref: UnresolvedRef, at: number, context: ResolutionContext): boolean {
+  if (isDartLocallyBound(ref.filePath, name, at, context)) return true;
+  const own = dartEnclosingType(ref, context);
+  return own !== null && (classMemberType(own, name, context) !== null ||
+    context.getNodesByName(name).some((n) => n.filePath === own.filePath && n.qualifiedName === `${own.qualifiedName}::${name}`));
+}
+
+/**
+ * The import prefix a Dart call through a type is written with — the `p` of
+ * `p.Box<int>.named(…)`, which arrives as `Box.named` with its column on the
+ * prefix — or null.
+ */
+function dartTypeCallPrefix(typeName: string, member: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const prefixes = dartImportPrefixes(ref.filePath, context);
+  if (prefixes.size === 0) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (line === undefined) return null;
+  const written = new RegExp(String.raw`(?<![\w$.])([A-Za-z_$][\w$]*)\s*\.\s*${typeName.replace(/\$/g, '\\$')}\s*` +
+    String.raw`(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*\.\s*${member.replace(/\$/g, '\\$')}(?![\w$])`, 'g');
+  // The one at the reference's column, else the first: a column counted in bytes misses after non-ASCII text.
+  const found = [...line.matchAll(written)].filter((m) => prefixes.has(m[1]!));
+  return (found.find((m) => m.index === ref.column) ?? found[0])?.[1] ?? null;
+}
+
+/**
  * Whether a bare Dart reference really is receiver-less at its call site. The
  * extractor keeps one receiver level, so the later links of a chain —
  * `LoginState().withEmail(e).withPassword(p)` — arrive as bare names; their
@@ -3096,7 +3176,7 @@ export function matchDartChainLink(ref: UnresolvedRef, context: ResolutionContex
   // Static members are the type's own: `p.Provider.autoDispose(…)` calls the
   // constant, as `Provider.autoDispose(…)` does.
   if (receiver.static) {
-    const member = dartStaticMember(receiver.type, ref.referenceName, ref, context);
+    const member = dartStaticMember(receiver.type, ref.referenceName, ref, context, dartOwnerOf(receiver));
     return member && member.kind !== 'enum_member'
       ? { original: ref, targetNodeId: member.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
   }
@@ -3127,25 +3207,29 @@ interface DartChainLink { name: string; typeArgs: string[]; call: boolean; index
 
 /**
  * What a Dart chain starts from: a name (`x`, `Foo`, `foo(…)`, `Foo<T>(…)`,
- * with the keyword written before it — `const`, `new`, `as`, `await`), a
- * string literal, or a parenthesized expression.
+ * with the keyword written before it — `const`, `new`, `as`, `await` — and
+ * where it starts), a string literal, or a parenthesized expression.
  */
 type DartChainHead =
-  | { kind: 'name'; name: string; typeArgs: string[]; call: boolean; keyword: string }
+  | { kind: 'name'; name: string; typeArgs: string[]; call: boolean; keyword: string; at: number }
   | { kind: 'string' }
   | { kind: 'paren'; open: number; close: number };
 
 interface DartChain { head: DartChainHead; links: DartChainLink[] }
 
-/** What a Dart chain evaluates to: an instance of `type`, or (`static`) the type itself, before a static member. */
-interface DartValue { type: string; static: boolean; viaSuper?: boolean }
+/**
+ * What a Dart chain evaluates to: an instance of `type`, or (`static`) the
+ * type itself, before a static member — of the type `owner` declares, when
+ * the chain says which file that is (`p.Box` names the one `p` brings in).
+ */
+interface DartValue { type: string; static: boolean; viaSuper?: boolean; owner?: string }
 
 /**
  * A Dart file's code with comments and string contents blanked, where each
- * line starts, the import prefixes it declares, and the files of its library
- * it names: its `part`s and the file it is `part of`.
+ * line starts, and the files of its library it names: its `part`s and the
+ * file it is `part of`.
  */
-interface DartCode { text: string; lineStarts: number[]; prefixes: Set<string>; parts: string[]; partOf: string | null }
+interface DartCode { text: string; lineStarts: number[]; parts: string[]; partOf: string | null }
 
 const DART_CODE = new WeakMap<ResolutionContext, Map<string, DartCode | null>>();
 
@@ -3160,11 +3244,10 @@ function dartCodeOf(filePath: string, context: ResolutionContext): DartCode | nu
     const text = blankDartCode(source);
     const lineStarts = [0];
     for (let i = 0; i < text.length; i++) if (text[i] === '\n') lineStarts.push(i + 1);
-    const prefixes = new Set([...text.matchAll(/^\s*import\s+['"][^'"]*['"]\s+(?:deferred\s+)?as\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]!));
     const sibling = (uri: string): string => path.posix.normalize(path.posix.join(path.posix.dirname(filePath), uri));
     const parts = [...source.matchAll(/^\s*part\s+['"]([^'"]+)['"]\s*;/gm)].map((m) => sibling(m[1]!));
     const partOf = /^\s*part\s+of\s+['"]([^'"]+)['"]\s*;/m.exec(source)?.[1];
-    code = { text, lineStarts, prefixes, parts, partOf: partOf ? sibling(partOf) : null };
+    code = { text, lineStarts, parts, partOf: partOf ? sibling(partOf) : null };
   }
   // Refs arrive file by file, so a few files' worth is enough.
   if (memo.size >= 64) memo.delete(memo.keys().next().value!);
@@ -3350,7 +3433,7 @@ function readDartChain(text: string, end: number): DartChain | null {
       continue;
     }
     const keyword = /([A-Za-z_]\w*)$/.exec(text.slice(Math.max(0, j - 10), j + 1))?.[1] ?? '';
-    return { head: { kind: 'name', name, typeArgs, call, keyword }, links: links.reverse() };
+    return { head: { kind: 'name', name, typeArgs, call, keyword, at: i + 1 }, links: links.reverse() };
   }
   return null;
 }
@@ -3364,17 +3447,18 @@ function typeDartChain(chain: DartChain, ref: UnresolvedRef, context: Resolution
   if (head.kind === 'string') value = { type: 'String', static: false };
   else if (head.kind === 'paren') value = typeDartParen(head, ref, context, depth);
   else {
-    let name = head;
     // `p.Provider.autoDispose`: an import prefix names a library, so the chain
-    // starts at the link after it.
+    // starts at the link after it, which names what that library exports.
     const first = links[0];
-    if (!name.call && name.typeArgs.length === 0 && first && !first.index && dartCodeOf(ref.filePath, context)?.prefixes.has(name.name)) {
-      name = { kind: 'name', name: first.name, typeArgs: first.typeArgs, call: first.call, keyword: '' };
+    if (!head.call && head.typeArgs.length === 0 && first && !first.index && dartImportPrefixes(ref.filePath, context).has(head.name) &&
+        !isDartNameHidden(head.name, ref, head.at, context)) {
+      value = typeDartPrefixedHead(head.name, first, ref, context, depth);
       links = links.slice(1);
+    } else {
+      // `const Foo.named(…)`: the named constructor is the head's own link.
+      if ((head.keyword === 'const' || head.keyword === 'new') && !head.call && links[0]?.call) links = links.slice(1);
+      value = typeDartHead(head, ref, context, depth);
     }
-    // `const Foo.named(…)`: the named constructor is the head's own link.
-    if ((name.keyword === 'const' || name.keyword === 'new') && !name.call && links[0]?.call) links = links.slice(1);
-    value = typeDartHead(name, ref, context, depth);
   }
   for (const link of links) {
     // Every Dart object's `toString()` returns a String, whatever it is.
@@ -3397,8 +3481,13 @@ function typeDartChain(chain: DartChain, ref: UnresolvedRef, context: Resolution
 /** Whether the type a Dart chain has reached declares the member a link names. */
 function dartLinkDeclared(value: DartValue, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext): boolean {
   return value.static
-    ? dartStaticMember(value.type, link.name, ref, context) !== null
+    ? dartStaticMember(value.type, link.name, ref, context, dartOwnerOf(value)) !== null
     : dartMemberOf(value.type, link.name, ref, context, (n) => !isDartSetter(n, context), value.viaSuper ? 1 : 0) !== null;
+}
+
+/** Which of the types named like a chain's value it is: the one its `owner` file declares, when the chain said. */
+function dartOwnerOf(value: DartValue): ((type: Node) => boolean) | undefined {
+  return value.owner === undefined ? undefined : (type) => type.filePath === value.owner;
 }
 
 /** `(x as Foo)` is a Foo; any other parenthesized expression is what its last operand is: `(a ?? Todo(…))`. */
@@ -3459,11 +3548,36 @@ function typeDartHead(
   return type ? { type, static: false } : null;
 }
 
+/**
+ * What the first link after an import prefix evaluates to — `p.Provider`
+ * before a static member, `p.Report(…)`, `p.make(…)`, `p.config` — read from
+ * the top-level declarations the prefixed import brings in, and nothing when
+ * it brings in none of that name: a package outside the repository, whatever
+ * the project declares under the name elsewhere.
+ */
+function typeDartPrefixedHead(prefix: string, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  const found = dartPrefixedDecls(prefix, link.name, ref, context);
+  const types = found.filter((n) => DART_TYPE_KINDS.has(n.kind));
+  if (types.length > 0) {
+    return { type: link.name, static: !link.call, owner: types.length === 1 ? types[0]!.filePath : undefined };
+  }
+  if (found.length !== 1) return null;
+  const decl = found[0]!;
+  if (decl.kind === 'function') {
+    const type = link.call ? dartReturnType(decl, link.typeArgs, context) : null;
+    return type ? { type, static: false } : null;
+  }
+  if (decl.kind !== 'constant' && decl.kind !== 'variable') return null;
+  const held = dartConstantType(decl, ref, context, depth);
+  if (!held) return null;
+  return link.call ? dartCallResult(held, link.typeArgs, ref, context) : { type: held, static: false };
+}
+
 /** What one link of a Dart chain makes of the value before it. */
 function typeDartLink(value: DartValue, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
   if (link.index) return null;
   if (value.static) {
-    const member = dartStaticMember(value.type, link.name, ref, context);
+    const member = dartStaticMember(value.type, link.name, ref, context, dartOwnerOf(value));
     if (!member) {
       // `BlocProvider.value(…)`, `AsyncValue.data(…)`: a constructor the index holds no node for.
       return link.call && context.getNodesByName(value.type).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind))
@@ -3548,10 +3662,17 @@ function dartEnclosingType(ref: UnresolvedRef, context: ResolutionContext): Node
  * The static member `name` the Dart type `typeName` itself declares — a
  * static method or getter, a named constructor or factory, a static
  * constant, an enum value — preferring the call site's file, then the
- * nearest. Static members are not inherited.
+ * nearest. Static members are not inherited. `isOwner` narrows the types of
+ * that name to the one meant (the one an import prefix brings in).
  */
-function dartStaticMember(typeName: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  const owners = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
+function dartStaticMember(
+  typeName: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  isOwner: (type: Node) => boolean = () => true,
+): Node | null {
+  const owners = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind) && isOwner(n));
   if (owners.length === 0) return null;
   const found = context.getNodesByName(name).filter((m) => m.language === 'dart' &&
     (m.kind === 'method' || m.kind === 'function' || m.kind === 'constant' || m.kind === 'enum_member') &&
@@ -4077,14 +4198,14 @@ export function matchDartAnnotation(ref: UnresolvedRef, context: ResolutionConte
   const { names, call } = written;
   let pool: Node[];
   let resolvedBy: ResolvedRef['resolvedBy'] = 'exact-match';
-  if (names.length === 1 || (names.length === 2 && isDartImportPrefix(ref.filePath, names[0]!, context))) {
+  if (names.length === 1 || (names.length === 2 && dartImportPrefixes(ref.filePath, context).has(names[0]!))) {
     const prefix = names.length === 2 ? names[0]! : null;
     const own = prefix === null && !call ? dartEnclosingStatic(name, ref, context) : null;
     if (own) return { original: ref, targetNodeId: own.id, confidence: 0.9, resolvedBy };
     pool = context.getNodesByName(name).filter((n) => isDartLibraryDecl(n) &&
       (call ? isDartAnnotationClass(n, context) : n.kind === 'constant') && isDartTopLevelVisible(n, ref, context, prefix));
     if (prefix === null) pool = preferOwnDartLibrary(pool, ref, context);
-  } else if (names.length === 2 || (names.length === 3 && isDartImportPrefix(ref.filePath, names[0]!, context))) {
+  } else if (names.length === 2 || (names.length === 3 && dartImportPrefixes(ref.filePath, context).has(names[0]!))) {
     const prefix = names.length === 3 ? names[0]! : null;
     let owners = context.getNodesByName(names[names.length - 2]!).filter((n) =>
       isDartLibraryDecl(n) && DART_TYPE_KINDS.has(n.kind) && isDartTopLevelVisible(n, ref, context, prefix));
@@ -4194,8 +4315,10 @@ function dartExtensionMemberOf(typeName: string, name: string, ref: UnresolvedRe
  * it, and the SDK's `Uri.parse(…)`, past bloc_lint's `extension on Uri`, to a
  * project `parse`. A static constant's callee is the value it holds (`static
  * const autoDispose = AutoDisposeFutureProviderBuilder();`). The member is
- * found as a chain's static link finds it (dartStaticMember). Undefined when
- * the receiver names no Dart type of the project.
+ * found as a chain's static link finds it (dartStaticMember). Written through
+ * an import prefix (`p.Box<int>.named(…)`, which arrives as `Box.named`), the
+ * type is the one that import brings in, if any. Undefined when the receiver
+ * names no Dart type of the project.
  */
 function matchDartTypeMemberCall(
   typeName: string,
@@ -4203,8 +4326,11 @@ function matchDartTypeMemberCall(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null | undefined {
-  if (!context.getNodesByName(typeName).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind))) return undefined;
-  const own = dartStaticMember(typeName, member, ref, context);
+  const types = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
+  const prefix = types.length > 0 || /^[_$]*[A-Z]/.test(typeName) ? dartTypeCallPrefix(typeName, member, ref, context) : null;
+  const isOwner = (n: Node): boolean => prefix === null || dartPrefixSees(ref.filePath, prefix, n.filePath, typeName, context);
+  if (!types.some(isOwner)) return prefix === null ? undefined : null;
+  const own = dartStaticMember(typeName, member, ref, context, isOwner);
   return own && own.kind !== 'enum_member'
     ? { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
 }
@@ -12220,6 +12346,14 @@ function matchReferenceInner(
   // would bind it by the member's name alone.
   if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_PATH_CALL.test(ref.referenceName)) {
     return nmTimed('swiftTypePath', ref, () => resolveSwiftTypePathCall(ref, context));
+  }
+
+  // A Dart call through an import prefix (`http.get(…)`) is to what the
+  // prefixed import exports, or to nothing: the strategies below would take
+  // the prefix for a receiver and guess a method by its name.
+  if (ref.language === 'dart' && ref.referenceKind === 'calls') {
+    const prefixed = nmTimedT('dartPrefixed', ref, () => matchDartPrefixedCall(ref, context));
+    if (prefixed !== undefined) return prefixed;
   }
 
   // Try strategies in order of confidence

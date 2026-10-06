@@ -78,6 +78,16 @@ export function gateDartLocal(resolved: ResolvedRef | null, ref: UnresolvedRef, 
 }
 
 /**
+ * Whether a parameter, local or local function `name` is bound at offset `at`
+ * of the file's source — where it hides a library name, an import prefix
+ * among them: `http.get(…)` with a parameter `http` calls the parameter's.
+ */
+export function isDartLocallyBound(filePath: string, name: string, at: number, context: ResolutionContext): boolean {
+  const bound = fileScopes(filePath, context)?.names.get(name);
+  return bound !== undefined && bound.some((scope) => at >= scope.start && at <= scope.end);
+}
+
+/**
  * Where on its line a reference's name starts. A Dart ref's column sits just
  * past the name (a function value's at it); a column counted in bytes misses
  * on a line with non-ASCII text before it, so the nearest whole-word

@@ -948,7 +948,7 @@ enum emits nothing). Mechanics for dart:
     the own library shadowing imports). `@X(…)`: a visible class `X`, not
     an extension.
   - `@p.x` / `@p.X(…)`, when `p` is an import prefix (dart-libraries.ts
-    `isDartImportPrefix`, the imports of the file's whole library): the same
+    `dartImportPrefixes`, the imports of the file's whole library): the same
     through that prefix. Otherwise `@T.x` → T's own `constant` /
     `enum_member` `x`, and `@T.named(…)` → T's named constructor (#2380's
     `isDartConstructor`); `@p.T.x` / `@p.T.named(…)` likewise through `p`.

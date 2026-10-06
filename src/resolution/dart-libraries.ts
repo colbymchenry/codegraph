@@ -368,6 +368,7 @@ interface Memo {
   members: Map<string, ReadonlySet<string>>;
   exports: Map<string, ReadonlyMap<string, readonly NameFilter[]>>;
   scopes: Map<string, FileScope | null>;
+  prefixes: Map<string, ReadonlySet<string>>;
 }
 
 const memos = new WeakMap<ResolutionContext, Memo>();
@@ -386,6 +387,7 @@ function memoFor(context: ResolutionContext): Memo {
       members: new Map(),
       exports: new Map(),
       scopes: new Map(),
+      prefixes: new Map(),
     };
     memos.set(context, memo);
   }
@@ -763,20 +765,31 @@ export function dartPrefixSees(fromFile: string, prefix: string, declFile: strin
   return filters === null || (!name.startsWith('_') && filters.some((f) => lets(f, name)));
 }
 
+/**
+ * The import prefixes written in `fromFile` can stand for — the `p` of
+ * `import '…' as p` and `deferred as p` — read from the imports of its
+ * library, which a part (`part of …`) takes from the file it is part of.
+ */
+export function dartImportPrefixes(fromFile: string, context: ResolutionContext): ReadonlySet<string> {
+  const memo = memoFor(context);
+  const hit = memo.prefixes.get(fromFile);
+  if (hit) return hit;
+  const prefixes = new Set<string>();
+  // Records each part's parent, a library in no package included.
+  libraryOf(fromFile, context, memo);
+  let file: string | undefined = fromFile;
+  for (let hops = 0; file !== undefined && hops < 32; file = memo.parentOf.get(file), hops++) {
+    for (const directive of directivesOf(file, context, memo)?.imports ?? []) {
+      if (directive.prefix !== null) prefixes.add(directive.prefix);
+    }
+  }
+  memo.prefixes.set(fromFile, prefixes);
+  return prefixes;
+}
+
 /** Whether `declFile` is a file of the library `fromFile` belongs to (false when that library is unknown). */
 export function inSameDartLibrary(fromFile: string, declFile: string, context: ResolutionContext): boolean {
   if (fromFile === declFile) return true;
   const scope = scopeOf(fromFile, context, memoFor(context));
   return scope !== null && scope.own.has(declFile);
-}
-
-/**
- * Whether `name` is an import prefix where `fromFile` is written: an import
- * of its library is `as name` (`p` in `p.Foo`, not the `Foo` of `Foo.bar`).
- * Where the library is unknown, the file's own imports say.
- */
-export function isDartImportPrefix(fromFile: string, name: string, context: ResolutionContext): boolean {
-  const memo = memoFor(context);
-  const importers = scopeOf(fromFile, context, memo)?.importers ?? [fromFile];
-  return importers.some((file) => (directivesOf(file, context, memo)?.imports ?? []).some((d) => d.prefix === name));
 }
