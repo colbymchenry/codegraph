@@ -905,7 +905,7 @@ program
         const { stopDaemonAt } = await import('../mcp/daemon-registry');
         const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath), { preserveUnverified: true });
         if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
-          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon stop` to stop it, then retry `codegraph index`.');
+          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon` to stop it, then retry `codegraph index`.');
         }
 
         // Keep the writer slot through recreation AND indexing. A reconnecting
