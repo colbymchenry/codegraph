@@ -166,6 +166,14 @@ export interface LanguageExtractor {
    * their own variants. Returns cleaned prose, or undefined when there is none.
    */
   getBodyDocstring?: (node: SyntaxNode, source: string) => string | undefined;
+  /**
+   * The node that wraps `node` and stands in its place among the declarations
+   * around it, when the grammar adds one. The doc comment and annotations
+   * written before the declaration precede that wrapper, so both are looked up
+   * from it. Dart wraps a member with no body (`Foo._();`, an abstract
+   * `void m();`) in a `declaration` node. Returns undefined when there is none.
+   */
+  getDeclarationWrapper?: (node: SyntaxNode) => SyntaxNode | undefined;
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */

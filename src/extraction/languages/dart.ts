@@ -497,6 +497,15 @@ export const dartExtractor: LanguageExtractor = {
     }
     return false;
   },
+  // A member with no body — a constructor like `Foo._();` or `const Foo.c();`,
+  // an abstract `void m();` — is a `declaration` wrapping its signature, and
+  // the member's `///` dartdoc and `@annotation`s come before the wrapper. A
+  // signature that opens the declaration takes both from there.
+  getDeclarationWrapper: (node) => {
+    const parent = node.parent;
+    if (parent?.type !== 'declaration') return undefined;
+    return parent.firstNamedChild?.equals(node) ? parent : undefined;
+  },
   resolveBody: (node, bodyField) => {
     // Dart: function_body is a next sibling of function_signature/method_signature
     if (node.type === 'function_signature' || node.type === 'method_signature') {
