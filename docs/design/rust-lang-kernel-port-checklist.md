@@ -317,10 +317,10 @@ trait_item — supertraits `trait Sub: Super + Display`). Per bound child:
 
 Each yields an `extends` ref from the trait node at the bound's position.
 Struct/enum extraction also calls extractInheritance; rust struct_item children
-include `field_declaration_list` → the 5652 recursion descends, but rust
-`field_declaration` always carries a `field_identifier` name so the Go
-struct-embedding branch (5496) never fires. Verify with the torture fixture
-anyway.
+include `field_declaration_list` → the 5652 recursion descends and finds
+nothing: the Go struct-embedding branch (5496) runs for Go only (it was inert
+here anyway — rust `field_declaration` always carries a `field_identifier`
+name), so rustlang.rs has no `field_declaration` arm.
 
 ### impl Trait for Type — extractRustImplItem (5690)
 

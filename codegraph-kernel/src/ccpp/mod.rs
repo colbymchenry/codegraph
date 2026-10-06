@@ -33,11 +33,6 @@
 //!    (loses uninit scalars by design); cpp declarations instead take the TS
 //!    GENERIC fallback (direct identifier children only → `int x;` extracts,
 //!    `int x = 5;` does not — bug-for-bug).
-//!  - inheritance quirk: extractInheritance recurses into
-//!    field_declaration_list, where a field_declaration with no DIRECT
-//!    field_identifier child (pointer/array/method members) but a direct
-//!    type_identifier emits an `extends` ref to that type (the Go-embedding
-//!    branch matching c/cpp shapes). Kept: the parity gate pins today's graph.
 //!  - static-member/value-read pass (cpp only): `field_expression` is in
 //!    MEMBER_ACCESS_TYPES (listed for Scala, same node kind in cpp), so
 //!    `Capitalized.member` / `Capitalized->member` VALUE reads emit
@@ -1866,8 +1861,10 @@ impl<'t> Walker<'t> {
     // --- inheritance ---------------------------------------------------------
 
     /// extractInheritance — the branches whose node kinds occur in the c/cpp
-    /// grammars: base_class_clause (#1043), the field_declaration Go-embedding
-    /// shape, and the field_declaration_list recursion that reaches it.
+    /// grammars: base_class_clause (#1043) and the field_declaration_list
+    /// recursion. A member `field_declaration` is never a supertype: the TS
+    /// Go-embedding check is gated to Go, since c/cpp members nest their
+    /// field_identifier inside a pointer/array/function declarator.
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
@@ -1883,20 +1880,6 @@ impl<'t> Walker<'t> {
                         ) {
                             let name = strip_cpp_template_args(self.text(t));
                             self.push_ref_at(class_row, &name, extends_kind, t);
-                        }
-                    }
-                }
-                "field_declaration" => {
-                    let has_field_identifier = (0..child.named_child_count())
-                        .filter_map(|j| child.named_child(j))
-                        .any(|c| c.kind() == "field_identifier");
-                    if !has_field_identifier {
-                        let type_id = (0..child.named_child_count())
-                            .filter_map(|j| child.named_child(j))
-                            .find(|c| c.kind() == "type_identifier");
-                        if let Some(type_id) = type_id {
-                            let name = self.text(type_id).to_string();
-                            self.push_ref_at(class_row, &name, extends_kind, type_id);
                         }
                     }
                 }
