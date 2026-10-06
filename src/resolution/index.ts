@@ -27,6 +27,7 @@ import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
+import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -471,6 +472,7 @@ export class ReferenceResolver {
       clearSwiftTypeVisibility(this.context);
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
+      clearDartLocalScopeMemos(this.context);
     }
   }
 
@@ -1096,9 +1098,14 @@ export class ReferenceResolver {
     // A Swift type reference never lands on an `extension X {}` node, nor on a
     // nested type it cannot name bare (see ./swift-type-visibility).
     // A name a declaration around the reference declares as a type parameter
-    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters).
-    const candidate = gateTypeParameter(
-      gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters),
+    // and a Dart call to a parameter or local calls that (./dart-local-scope).
+    const candidate = gateDartLocal(
+      gateTypeParameter(
+        gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+        ref,
+        this.context,
+      ),
       ref,
       this.context,
     );
