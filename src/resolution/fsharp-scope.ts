@@ -210,13 +210,24 @@ export function isFsharpCandidateReachable(ref: FsharpRefScope, candidate: Fshar
 
 interface FileScope {
   /** Paths the file opens: `open X`. */
-  opens: string[];
-  /** `module F = Other.Lib.Fn` aliases, alias → target. */
-  aliases: Map<string, string>;
+  opens: { node: Node; owner?: Node }[];
+  /** Module abbreviations, with the lexical scope that owns them. */
+  aliases: { node: Node; owner?: Node }[];
   /** Namespaces, modules and enums of the file by their qualified name. */
   scopes: Map<string, Node>;
   /** The same by dotted path: a file-level `module A.B.C` is one segment of the qualified name. */
   byPath: Map<string, Node>;
+}
+
+function containsPosition(node: Node, line: number, column: number): boolean {
+  return (line > node.startLine || (line === node.startLine && column >= node.startColumn)) &&
+    (line < node.endLine || (line === node.endLine && column <= node.endColumn));
+}
+
+/** An open or abbreviation applies only after its declaration, inside its owner. */
+function importApplies(entry: { node: Node; owner?: Node }, ref: UnresolvedRef): boolean {
+  return (ref.line > entry.node.endLine || (ref.line === entry.node.endLine && ref.column >= entry.node.endColumn)) &&
+    (!entry.owner || containsPosition(entry.owner, ref.line, ref.column));
 }
 
 const FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, FileScope>>();
@@ -227,16 +238,22 @@ function fileScopeOf(filePath: string, context: ResolutionContext): FileScope {
   if (!perFile) FILE_SCOPES.set(context, (perFile = new Map()));
   const cached = perFile.get(filePath);
   if (cached) return cached;
-  const scope: FileScope = { opens: [], aliases: new Map(), scopes: new Map(), byPath: new Map() };
-  for (const n of context.getNodesInFile(filePath)) {
+  const scope: FileScope = { opens: [], aliases: [], scopes: new Map(), byPath: new Map() };
+  const nodes = context.getNodesInFile(filePath);
+  const containers = nodes.filter((n) => n.kind === 'module' || n.kind === 'namespace');
+  for (const n of nodes) {
     if (n.kind === 'module' || n.kind === 'enum' || n.kind === 'namespace') {
       scope.scopes.set(n.qualifiedName, n);
       scope.byPath.set(n.qualifiedName.split('::').join('.'), n);
     }
     if (n.kind !== 'import') continue;
-    if (n.signature) scope.aliases.set(n.name, n.signature);
+    // Import qualifiedName deliberately names its target, so recover the
+    // lexical owner from source ranges rather than that qualifiedName.
+    const owner = containers.filter((c) => containsPosition(c, n.startLine, n.startColumn))
+      .sort((a, b) => b.startLine - a.startLine || b.startColumn - a.startColumn)[0];
+    if (n.signature) scope.aliases.push({ node: n, owner });
     // `#load "a.fsx"` is an import node too, but names a file, not a scope.
-    else if (!/[.]fsx?$/i.test(n.name)) scope.opens.push(n.name);
+    else if (!/[.]fsx?$/i.test(n.name)) scope.opens.push({ node: n, owner });
   }
   perFile.set(filePath, scope);
   return scope;
@@ -363,11 +380,13 @@ function scopeOfRef(ref: UnresolvedRef, context: ResolutionContext): FsharpRefSc
     : OWN_SCOPE_KINDS.has(from.kind)
       ? from.qualifiedName.split('::').join('.')
       : containerOfNode(from);
-  const qualifiers = writtenQualifiers(ref, file.aliases, context);
+  const aliases = new Map(file.aliases.filter((entry) => importApplies(entry, ref))
+    .map(({ node }) => [node.name, node.signature!]));
+  const qualifiers = writtenQualifiers(ref, aliases, context);
   const scope: FsharpRefScope = {
     container,
     namespace: from && from.kind !== 'file' ? declaredNamespace(from, context) : '',
-    opens: file.opens,
+    opens: file.opens.filter((entry) => importApplies(entry, ref)).map(({ node }) => node.name),
     qualifiers,
     externalQualifier: qualifiers.length > 0 && qualifiers.every((q) => isExternalPath(q, context)),
   };

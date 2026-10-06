@@ -243,9 +243,35 @@ function isParameterOf(node: SyntaxNode, name: string, source: string): boolean 
         collectPatternNames(left, source, params);
         for (const n of getBoundNames(left, source)) own.add(n);
         for (const n of own) params.delete(n);
+        // A recursive local function refers to itself in its initializer.
+        // Local definitions are not indexed as module-level symbols.
+        if (leadingKeywords(source.slice(p.startIndex, left.startIndex)).includes('rec')) {
+          for (let outer = p.parent; outer; outer = outer.parent) {
+            if (outer.type === 'function_or_value_defn' || outer.type === 'method_or_prop_defn' || outer.type === 'fun_expression') {
+              for (const n of own) params.add(n);
+              break;
+            }
+            if (outer.type === 'named_module' || outer.type === 'module_defn' || outer.type === 'type_definition') break;
+          }
+        }
       }
     } else if (p.type === 'fun_expression') {
       for (const c of p.namedChildren) if (c.type === 'argument_patterns') collectPatternNames(c, source, params);
+    } else if (p.type === 'declaration_expression') {
+      // A local let is visible in its continuation, but not in its own
+      // non-recursive initializer or outside this expression.
+      const continuation = p.childForFieldName('in');
+      if (continuation && node.startIndex >= continuation.startIndex && node.endIndex <= continuation.endIndex) {
+        for (const binding of p.namedChildren) {
+          if (binding.type !== 'function_or_value_defn') continue;
+          for (const { left } of splitBindings(binding)) {
+            for (const bound of getBoundNames(left, source)) params.add(bound);
+          }
+        }
+      }
+    } else if (childOfTypes(p, 'primary_constr_args')) {
+      // Primary-constructor parameters stay in scope throughout the type.
+      collectPatternNames(childOfTypes(p, 'primary_constr_args')!, source, params);
     } else if (p.type === 'method_or_prop_defn') {
       for (const c of p.namedChildren.slice(1, -1)) collectPatternNames(c, source, params);
     }
@@ -931,7 +957,7 @@ export const fsharpExtractor: LanguageExtractor = {
       // `module A = X.Y` is an alias (abbreviation), not a module definition.
       const block = node.childForFieldName('block');
       const isAbbreviation =
-        block !== null && (block.type === 'long_identifier' || block.type === 'dot_expression');
+        block !== null && (block.type === 'long_identifier' || block.type === 'long_identifier_or_op' || block.type === 'dot_expression');
 
       if (isAbbreviation) {
         const target = txt(block, source);
