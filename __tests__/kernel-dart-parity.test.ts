@@ -24,7 +24,8 @@
  * getter-read refs and the type positions outside signatures — #2338/#2327;
  * TortureInitializers.dart: initializers walked as the code their constant,
  * class or file runs, every member-body kind, and a local declaration's
- * second variable left to its function) and their CRLF variants
+ * second variable left to its function; TortureGenericCalls.dart: generic
+ * calls parsed as two comparisons, recovered as calls) and their CRLF variants
  * (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
@@ -122,6 +123,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // instantiations, reads, closures with block bodies and local functions,
     // and function values captured once, for the declaration.
     ['TortureInitializers.dart', 30],
+    // Generic calls the grammar parses as two comparisons (`ref.read<Repo>(p)`
+    // as `(ref.read < Repo) > (p)`): every callee, type-argument and argument
+    // shape, in bodies and initializers, and the comparisons that look alike.
+    ['TortureGenericCalls.dart', 10],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

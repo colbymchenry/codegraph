@@ -684,6 +684,7 @@ extract-mini.txt):
 | `new WidgetT(2)` | new_expression → INSTANTIATION branch :5145 FIRST | `instantiates WidgetT` (extractBareCall's new_expression arm :363-367 is DEAD — the else-if never reaches it); args still recursed |
 | `pad(const EdgeInsetsT.all(8.0))` | const_object_expression :369-376 | `EdgeInsetsT.all` at the CONST node position (typeId + '.' + nameId; type-only form → `EdgeInsetsT`); children recursed after |
 | `generic<int>(5)` | args selector (type args ride argument_part) | bare `generic` |
+| `ref.read<Repo>(p)`, `Provider<int>((ref) => 0)`, `X<T>(name: v)` parsed as two comparisons, `(ref.read < Repo) > (p)` (§Misparsed generic calls) | the `<` relational_operator (dartMisparsedGenericCall) | the parsed call's ref — `ref.read` / `Provider` / `X`, at the `<` |
 | `await fetch()` | recursion through unary/await_expression | `fetch` at the selector |
 | `throw StateError('bad')` | recursion | `StateError` |
 | `'sum ${a + compute()}'` | template_substitution recursion | `compute` (interpolation calls EMIT); `$name` → identifier_dollar_escaped → nothing |
@@ -694,6 +695,46 @@ extract-mini.txt):
 extractCall (:3684), LITERAL_RECEIVER_TYPES (:373-388), SKIP_RECEIVERS, the
 parenthesized-conversion regex (:4530), template-strip — ALL UNREACHABLE for
 dart (callTypes empty). Do not port them.
+
+#### Misparsed generic calls (dartMisparsedGenericCall / misparsed_generic_call)
+
+tree-sitter-dart parses a generic call with arguments as two comparisons about
+as often as it parses it as a call — the GLR tie goes either way with the code
+around it: `final a = ref.watch<int>(p);`, `ref.read<Repo>(p);`, `int g(Ref
+ref) => ref.read<int>(1);` and `Provider<int>((ref) => 0)` come out as
+`relational_expression(relational_expression(<callee> < <type>) > <args>)`,
+while `print(ref.watch<int>(p) + 1)`, `obj.a.b<Repo>(p)` and
+`ref.read<Repo>(a, b)` parse as calls (2,853 nests vs 2,836 parsed generic
+calls with arguments across bloc, riverpod and flutter/samples). The args are
+a `parenthesized_expression`, or a `record_literal` when named
+(`DropdownButton<String>(items: …)`); the type part is `identifier`, a `.Name`
+selector (`p.Repo`) and/or a type_arguments-only selector (`Map<K, V>`); the
+callee part sits under `unary_expression` / `await_expression` for `await` and
+prefix operators. Recovered at the `<` when the type names a type (`/^[_$]*[A-Z]/`
+or `int double num bool dynamic void`), `<` touches the callee and `(` touches
+the `>`; `a < B > (c)`, `a<b>(c)` and `a <B>(c)` stay comparisons. The
+recovered form emits what the parsed call does:
+
+- `calls` at the `<` (the parsed call's argument_part starts there);
+- `references <Type>` for the type argument, via isDartTypeName (§Type refs);
+  the static-member path skips `Map` in `<Map<K, V>>` so it is not doubled;
+- no member read of the callee (`ref.read`, also under `await`) or of a
+  prefixed type (`p.Repo`).
+
+A call chained on a recovered one keeps its bare name (`increment` in
+`BlocProvider.of<CounterCubit>(context).increment()`), unlike the parsed
+chain's `BlocProvider.of().increment`: that encoding resolves through `of`'s
+return type, which for generic factories is the type parameter, so it would
+lose the edge the bare name finds.
+
+The grammar can also end an arrow function in front of a generic call:
+`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`, in the
+relational and the selector form alike. dartReceiverOf / receiver_of read a
+receiver in that place from the end of the arrow's body (Dart writes a member
+access on an arrow itself in parentheses), for callee names and static-member
+refs: `ref.watch`, `BlocProvider.of`. dartCalleeOfArgPart / callee_of_arg_part
+do not, so `() => BlocProvider.of<CounterCubit>(context).increment()` keeps
+`increment` bare, for the reason above.
 
 ### Static-member / value-read refs — dart branch (:4759-4767), STATIC_MEMBER_LANGS:346
 

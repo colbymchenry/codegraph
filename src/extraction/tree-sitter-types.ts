@@ -323,9 +323,10 @@ export interface LanguageExtractor {
    * getter `area` when `area` is one. Returns the ref name (`x.area`) and the
    * node to position it on, or undefined. Emitted as a `references` ref from
    * the function the read is in; the resolver links it only to a getter, with
-   * a `calls` edge (a plain field read links nothing).
+   * a `calls` edge (a plain field read links nothing). `parent` is the node's
+   * parent, handed down by the body walker.
    */
-  extractMemberRead?: (node: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
+  extractMemberRead?: (node: SyntaxNode, parent?: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
 
   /**
    * Node types representing a file-level package/namespace declaration

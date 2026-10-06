@@ -90,6 +90,27 @@ fn angle_args_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"<[^>]*>").unwrap())
 }
 
+/// `/^[_$]*[A-Z]/` — how Dart writes a type's name (`Repo`, `_Box`, `$T`).
+fn type_cased(text: &str) -> bool {
+    text.trim_start_matches(&['_', '$'][..])
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+/// DART_LOWERCASE_TYPES (dart.ts) — Dart's lowercase built-in types, which a
+/// type argument can name: `<int>`, `<void>`.
+fn is_lowercase_type(name: &str) -> bool {
+    matches!(name, "int" | "double" | "num" | "bool" | "dynamic" | "void")
+}
+
+/// DART_PREFIXED (dart.ts) — what a callee can sit under in front of a
+/// generic call: `await`, `-`, `!`.
+fn is_prefixed(kind: &str) -> bool {
+    matches!(kind, "unary_expression" | "await_expression")
+}
+
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -1015,56 +1036,15 @@ impl<'t> Walker<'t> {
                 return None;
             }
             let prev = node.prev_named_sibling()?;
-            if prev.kind() == "identifier" {
-                return Some(self.text(prev).to_string());
-            }
-            if prev.kind() == "selector" {
-                let mut pc = prev.walk();
-                let accessor = prev.named_children(&mut pc).find(|c| {
-                    matches!(
-                        c.kind(),
-                        "unconditional_assignable_selector" | "conditional_assignable_selector"
-                    )
-                });
-                if let Some(accessor) = accessor {
-                    let mut ac = accessor.walk();
-                    let method_id = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
-                    if let Some(method_id) = method_id {
-                        let accessor_prev = prev.prev_named_sibling();
-                        if let Some(ap) = accessor_prev {
-                            if ap.kind() == "identifier" {
-                                return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
-                            }
-                            // Chained static-factory: the receiver is itself
-                            // a call — re-encode `<inner>().<method>` when
-                            // the chain starts capitalized (#750).
-                            if ap.kind() == "selector" {
-                                let mut apc = ap.walk();
-                                if ap.named_children(&mut apc).any(|c| c.kind() == "argument_part") {
-                                    if let Some(inner) = self.callee_of_arg_part(ap) {
-                                        if starts_upper_re().is_match(&inner) {
-                                            return Some(format!("{}().{}", inner, self.text(method_id)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        return Some(self.text(method_id).to_string());
-                    }
-                }
-            }
-            // super.method() / this.method(): prev is a bare accessor.
-            if matches!(
-                prev.kind(),
-                "unconditional_assignable_selector" | "conditional_assignable_selector"
-            ) {
-                let mut pc = prev.walk();
-                let id = prev.named_children(&mut pc).find(|c| c.kind() == "identifier");
-                if let Some(id) = id {
-                    return Some(self.text(id).to_string());
-                }
-            }
-            return None;
+            return self.callee_name(prev);
+        }
+
+        // A generic call the grammar read as two comparisons
+        // (`ref.read<Repo>(p)`), named at its `<`, where a parsed call's
+        // argument part starts.
+        if node.kind() == "relational_operator" {
+            let (callee, _) = self.misparsed_generic_call(node)?;
+            return self.callee_name(callee);
         }
 
         // new_expression arm — DEAD in practice (the INSTANTIATION branch
@@ -1092,6 +1072,184 @@ impl<'t> Walker<'t> {
         }
 
         None
+    }
+
+    /// dartReceiverOf (dart.ts) — the receiver of the member access
+    /// `selector`: the node in front of it, or the end of an arrow function's
+    /// body when the grammar ended the arrow in front of a generic call
+    /// (`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`).
+    fn receiver_of(&self, selector: Node<'t>) -> Option<Node<'t>> {
+        let prev = selector.prev_named_sibling();
+        let body = prev
+            .filter(|p| p.kind() == "function_expression")
+            .and_then(|p| p.named_child(p.named_child_count().checked_sub(1)?));
+        match body {
+            Some(body) if body.kind() == "function_expression_body" => {
+                body.named_child(body.named_child_count().checked_sub(1)?)
+            }
+            _ => prev,
+        }
+    }
+
+    /// dartCallee (dart.ts) — the callee name of the call whose argument part
+    /// follows `prev`.
+    fn callee_name(&self, prev: Node<'t>) -> Option<String> {
+        if prev.kind() == "identifier" {
+            return Some(self.text(prev).to_string());
+        }
+        if prev.kind() == "selector" {
+            let mut pc = prev.walk();
+            let accessor = prev.named_children(&mut pc).find(|c| {
+                matches!(
+                    c.kind(),
+                    "unconditional_assignable_selector" | "conditional_assignable_selector"
+                )
+            });
+            if let Some(accessor) = accessor {
+                let mut ac = accessor.walk();
+                let method_id = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
+                if let Some(method_id) = method_id {
+                    let accessor_prev = self.receiver_of(prev);
+                    if let Some(ap) = accessor_prev {
+                        if ap.kind() == "identifier" {
+                            return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
+                        }
+                        // Chained static-factory: the receiver is itself
+                        // a call — re-encode `<inner>().<method>` when
+                        // the chain starts capitalized (#750).
+                        if ap.kind() == "selector" {
+                            let mut apc = ap.walk();
+                            if ap.named_children(&mut apc).any(|c| c.kind() == "argument_part") {
+                                if let Some(inner) = self.callee_of_arg_part(ap) {
+                                    if starts_upper_re().is_match(&inner) {
+                                        return Some(format!("{}().{}", inner, self.text(method_id)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Some(self.text(method_id).to_string());
+                }
+            }
+        }
+        // super.method() / this.method(): prev is a bare accessor.
+        if matches!(
+            prev.kind(),
+            "unconditional_assignable_selector" | "conditional_assignable_selector"
+        ) {
+            let mut pc = prev.walk();
+            let id = prev.named_children(&mut pc).find(|c| c.kind() == "identifier");
+            if let Some(id) = id {
+                return Some(self.text(id).to_string());
+            }
+        }
+        None
+    }
+
+    /// dartMisparsedGenericCall (dart.ts) — a generic call tree-sitter-dart
+    /// parsed as two comparisons, `(ref.read < Repo) > (p)`, found from its
+    /// `<`: the node its callee ends with (under any `await` or prefix
+    /// operator) and the identifier naming its type argument. Recovered when
+    /// the type argument names a type and the code is laid out as a call —
+    /// `<` against the callee, `(` against the `>`. A call chained on it keeps
+    /// its bare name (the `X().m` encoding resolves through a generic
+    /// factory's type parameter and finds nothing).
+    fn misparsed_generic_call(&self, lt: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+        if lt.kind() != "relational_operator" || lt.child(0)?.kind() != "<" {
+            return None;
+        }
+        let inner = lt.parent()?;
+        let outer = inner.parent()?;
+        if inner.kind() != "relational_expression" || outer.kind() != "relational_expression" {
+            return None;
+        }
+        let left = outer.named_child(0)?;
+        if left.start_byte() != inner.start_byte() || left.end_byte() != inner.end_byte() {
+            return None;
+        }
+        let gt = outer.named_child(1)?;
+        if gt.kind() != "relational_operator" || gt.child(0)?.kind() != ">" {
+            return None;
+        }
+        let args = outer.named_child(2)?;
+        if !matches!(args.kind(), "parenthesized_expression" | "record_literal") || args.start_byte() != gt.end_byte() {
+            return None;
+        }
+        let before = lt.prev_named_sibling()?;
+        if before.end_byte() != lt.start_byte() {
+            return None;
+        }
+        // The type argument: `T`, `p.T`, `T<…>` or `p.T<…>`, and nothing else.
+        let head = lt.next_named_sibling()?;
+        if head.kind() != "identifier" {
+            return None;
+        }
+        let mut type_name = head;
+        let mut rest = head.next_named_sibling();
+        if let Some(sel) = rest {
+            let accessor = sel.named_child(0).filter(|a| a.kind() == "unconditional_assignable_selector");
+            if sel.kind() == "selector" {
+                if let Some(accessor) = accessor {
+                    let mut ac = accessor.walk();
+                    let name = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
+                    type_name = name?;
+                    rest = sel.next_named_sibling();
+                }
+            }
+        }
+        if let Some(sel) = rest {
+            let only_type_args = sel.named_child_count() == 1
+                && sel.named_child(0).map(|t| t.kind() == "type_arguments").unwrap_or(false);
+            if sel.kind() == "selector" && only_type_args {
+                rest = sel.next_named_sibling();
+            }
+        }
+        if rest.is_some() {
+            return None;
+        }
+        let name = self.text(type_name);
+        if !type_cased(name) && !is_lowercase_type(name) {
+            return None;
+        }
+        // `await repo.load<User>(id)` and `-x.size<int>(y)` put the callee
+        // under the prefix.
+        let mut callee = before;
+        while is_prefixed(callee.kind()) {
+            let count = callee.named_child_count();
+            callee = callee.named_child(count.checked_sub(1)?)?;
+        }
+        Some((callee, type_name))
+    }
+
+    /// dartInMisparsedGenericCall (dart.ts) — whether a member access
+    /// (`.member` on `receiver`, followed by `next` under `parent`) belongs to
+    /// a misparsed generic call: its callee is called, and a prefixed type
+    /// argument (`p.Repo`) names a type.
+    fn in_misparsed_generic_call(
+        &self,
+        receiver: Node<'t>,
+        next: Option<Node<'t>>,
+        parent: Option<Node<'t>>,
+    ) -> bool {
+        let mut after = next;
+        let mut up = parent;
+        while after.is_none() {
+            let Some(u) = up.filter(|u| is_prefixed(u.kind())) else { break };
+            after = u.next_named_sibling();
+            up = if after.is_some() { None } else { u.parent() };
+        }
+        if let Some(a) = after {
+            if a.kind() == "relational_operator" && self.misparsed_generic_call(a).is_some() {
+                return true;
+            }
+        }
+        if parent.map(|p| p.kind()) != Some("relational_expression") {
+            return false;
+        }
+        receiver
+            .prev_named_sibling()
+            .map(|b| b.kind() == "relational_operator" && self.misparsed_generic_call(b).is_some())
+            .unwrap_or(false)
     }
 
     /// dartCalleeOfArgPart (dart.ts:100-116).
@@ -1140,8 +1298,15 @@ impl<'t> Walker<'t> {
         if node.named_children(&mut cursor).any(|c| c.kind() == "argument_part") {
             return;
         }
-        let Some(prev) = node.prev_named_sibling() else { return };
+        let Some(prev) = self.receiver_of(node) else { return };
         if prev.kind() == "identifier" && cap_ident_re().is_match(self.text(prev)) {
+            // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
+            // argument, which the body walker references as a type.
+            if let Some(before) = prev.prev_named_sibling() {
+                if before.kind() == "relational_operator" && self.misparsed_generic_call(before).is_some() {
+                    return;
+                }
+            }
             let name = self.text(prev).to_string();
             // NO callee-of-call skip — `ConfigT.load()` double-emits
             // (references + calls). Position = the IDENTIFIER (receiver).
@@ -1429,13 +1594,19 @@ impl<'t> Walker<'t> {
         if receiver.kind() != "identifier" {
             return;
         }
-        if let Some(next) = node.next_named_sibling() {
+        let next = node.next_named_sibling();
+        if let Some(next) = next {
             if next.kind() == "selector" {
                 let mut nc = next.walk();
                 if next.named_children(&mut nc).any(|c| c.kind() == "argument_part") {
                     return;
                 }
             }
+        }
+        // The callee of a generic call the grammar read as comparisons
+        // (`ref.read<Repo>(p)`) is called; a prefixed type argument names a type.
+        if self.in_misparsed_generic_call(receiver, next, node.parent()) {
+            return;
         }
         let name = format!("{}.{}", self.text(receiver), self.text(member));
         let reader = self.top_row();
@@ -1463,12 +1634,18 @@ impl<'t> Walker<'t> {
 
         self.extract_static_member_ref(node);
 
-        // A getter read `x.area` (#2338); a type the body names (#2327).
+        // A getter read `x.area` (#2338); a type the body names (#2327) — the
+        // type argument of a generic call parsed as comparisons included.
         self.extract_member_read(node);
-        if kind == "type_identifier" && self.is_type_name_dart(node) {
-            let name = self.text(node).to_string();
+        let type_node = match kind {
+            "type_identifier" => Some(node),
+            "relational_operator" => self.misparsed_generic_call(node).map(|(_, type_name)| type_name),
+            _ => None,
+        };
+        if let Some(type_node) = type_node.filter(|t| self.is_type_name_dart(*t)) {
+            let name = self.text(type_node).to_string();
             let owner = self.top_row();
-            self.push_ref_at(owner, &name, "references", node);
+            self.push_ref_at(owner, &name, "references", type_node);
         }
 
         if kind == "function_signature" {

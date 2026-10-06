@@ -64,13 +64,129 @@ function isDartFieldOrTopLevelEntry(node: SyntaxNode): boolean {
 }
 
 /**
+ * The receiver of the member access `selector`: the node in front of it, or
+ * the end of an arrow function's body when the grammar ended the arrow in
+ * front of a generic call — `(ref) => ref.watch<int>(p)` comes out as
+ * `((ref) => ref).watch<int>(p)`. Dart writes a member access on the arrow
+ * itself in parentheses, so a receiver in that place is never the arrow. It
+ * names the call (`ref.watch`) and a static member's class; a call chained on
+ * that call keeps its bare name (see dartMisparsedGenericCall).
+ */
+export function dartReceiverOf(selector: SyntaxNode): SyntaxNode | null {
+  const prev = selector.previousNamedSibling;
+  const body = prev?.type === 'function_expression' ? prev.lastNamedChild : null;
+  return body?.type === 'function_expression_body' ? body.lastNamedChild : prev;
+}
+
+/** Dart's lowercase built-in types, which a type argument can name: `<int>`, `<void>`. */
+const DART_LOWERCASE_TYPES: ReadonlySet<string> = new Set(['int', 'double', 'num', 'bool', 'dynamic', 'void']);
+
+/** What a callee can sit under in front of a generic call: `await`, `-`, `!`. */
+const DART_PREFIXED: ReadonlySet<string> = new Set(['unary_expression', 'await_expression']);
+
+/** A generic call tree-sitter-dart parsed as two comparisons (dartMisparsedGenericCall). */
+interface DartMisparsedCall {
+  /** The node the callee ends with: what a parsed call's argument part follows. */
+  callee: SyntaxNode;
+  /** The identifier naming the type argument (`Repo` in `<Repo>` and `<p.Repo>`). */
+  typeName: SyntaxNode;
+}
+
+/**
+ * A generic call tree-sitter-dart parsed as two comparisons, found from its
+ * `<`. `ref.read<Repo>(repoProvider)`, `Provider<int>((ref) => 0)` and
+ * `DropdownButton<String>(items: items)` come out as `(ref.read < Repo) >
+ * (repoProvider)`: a `relational_expression` inside another, with the
+ * arguments as a `parenthesized_expression`, or a `record_literal` when they
+ * are named. That happens about as often as the call parses as one, because
+ * the grammar breaks the tie by the code around it. Dart reads it as a call,
+ * and so does this when the type argument names a type (`Repo`, `p.Repo`,
+ * `Map<K, V>`, `int`, `void`) and the code is laid out as a call: `<` against
+ * the callee and `(` against the `>`. A comparison is written `a < b`.
+ *
+ * A call chained on it keeps the bare name it had (`increment` in
+ * `BlocProvider.of<CounterCubit>(context).increment()`) rather than taking
+ * the `BlocProvider.of().increment` a parsed chain gets: that encoding
+ * resolves through what `of` returns, and a generic factory like this one
+ * returns its type parameter, so it would drop the edge the bare name finds.
+ */
+export function dartMisparsedGenericCall(lt: SyntaxNode): DartMisparsedCall | undefined {
+  if (lt.type !== 'relational_operator' || lt.firstChild?.type !== '<') return undefined;
+  const inner = lt.parent;
+  const outer = inner?.parent;
+  if (inner?.type !== 'relational_expression' || outer?.type !== 'relational_expression') return undefined;
+  const left = outer.namedChild(0);
+  if (left?.startIndex !== inner.startIndex || left.endIndex !== inner.endIndex) return undefined;
+  const gt = outer.namedChild(1);
+  if (gt?.type !== 'relational_operator' || gt.firstChild?.type !== '>') return undefined;
+  const args = outer.namedChild(2);
+  if (args?.type !== 'parenthesized_expression' && args?.type !== 'record_literal') return undefined;
+  if (args.startIndex !== gt.endIndex) return undefined;
+  const before = lt.previousNamedSibling;
+  if (!before || before.endIndex !== lt.startIndex) return undefined;
+  // The type argument: `T`, `p.T`, `T<…>` or `p.T<…>`, and nothing else.
+  const head = lt.nextNamedSibling;
+  if (head?.type !== 'identifier') return undefined;
+  let typeName = head;
+  let rest = head.nextNamedSibling;
+  if (rest?.type === 'selector' && rest.firstNamedChild?.type === 'unconditional_assignable_selector') {
+    const name = rest.firstNamedChild.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    if (!name) return undefined;
+    typeName = name;
+    rest = rest.nextNamedSibling;
+  }
+  if (rest?.type === 'selector' && rest.namedChildCount === 1 && rest.firstNamedChild?.type === 'type_arguments') {
+    rest = rest.nextNamedSibling;
+  }
+  if (rest) return undefined;
+  if (!/^[_$]*[A-Z]/.test(typeName.text) && !DART_LOWERCASE_TYPES.has(typeName.text)) return undefined;
+  // `await repo.load<User>(id)` and `-x.size<int>(y)` put the callee under the prefix.
+  let callee: SyntaxNode = before;
+  while (DART_PREFIXED.has(callee.type)) {
+    const last: SyntaxNode | null = callee.lastNamedChild;
+    if (!last) return undefined;
+    callee = last;
+  }
+  return { callee, typeName };
+}
+
+/**
+ * Whether a member access — `.member` on `receiver`, followed by `next` under
+ * `parent` — belongs to a misparsed generic call instead of reading a member:
+ * its callee (`ref.read` in `ref.read<Repo>(p)`, after an `await` too) is
+ * called, and the prefixed type argument (`p.Repo` in `x.read<p.Repo>(y)`)
+ * names a type.
+ */
+function dartInMisparsedGenericCall(
+  receiver: SyntaxNode,
+  next: SyntaxNode | null,
+  parent: SyntaxNode | null,
+): boolean {
+  let after = next;
+  let up = parent;
+  while (!after && up && DART_PREFIXED.has(up.type)) {
+    after = up.nextNamedSibling;
+    up = after ? null : up.parent;
+  }
+  if (after?.type === 'relational_operator' && dartMisparsedGenericCall(after)) return true;
+  if (parent?.type !== 'relational_expression') return false;
+  const before = receiver.previousNamedSibling;
+  return before?.type === 'relational_operator' && dartMisparsedGenericCall(before) !== undefined;
+}
+
+/**
  * A Dart member read — `x.area`, `s?.label`, `Config.instance` — as the ref
  * `<receiver>.<member>`, positioned on the member's name. Reading a getter runs
  * it, so the resolver links the read to a getter, as a call, and to nothing
  * else (#2338). The receiver must be a plain name, the one shape whose type the
- * resolver can look up; a member that is called (`x.grow()`) is the call's.
+ * resolver can look up; a member that is called (`x.grow()`, or `x.grow<T>(y)`
+ * parsed as comparisons) is the call's. `parent` is the node's parent when the
+ * walker has it: reading `.parent` walks down from the root.
  */
-export function dartMemberRead(node: SyntaxNode): { name: string; node: SyntaxNode } | undefined {
+export function dartMemberRead(
+  node: SyntaxNode,
+  parent: SyntaxNode | null = node.parent,
+): { name: string; node: SyntaxNode } | undefined {
   if (node.type !== 'selector') return undefined;
   const accessor = node.namedChildren.find((c: SyntaxNode) =>
     c.type === 'unconditional_assignable_selector' || c.type === 'conditional_assignable_selector'
@@ -83,6 +199,7 @@ export function dartMemberRead(node: SyntaxNode): { name: string; node: SyntaxNo
   if (next?.type === 'selector' && next.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
     return undefined;
   }
+  if (dartInMisparsedGenericCall(receiver, next, parent)) return undefined;
   return { name: `${receiver.text}.${member.text}`, node: member };
 }
 
@@ -197,6 +314,59 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
       return methodId.text;
     }
   }
+  return undefined;
+}
+
+/**
+ * The callee name of the Dart call whose argument part follows `prev`: `run`
+ * for `run(…)`, `obj.method` for `obj.method(…)`, `Foo.create().bar` for a
+ * chain off a capitalized call (#750), and a bare `method` otherwise.
+ */
+function dartCallee(prev: SyntaxNode): string | undefined {
+  // Simple function/constructor call: prev is identifier (e.g., runApp(...), MyWidget(...))
+  if (prev.type === 'identifier') {
+    return prev.text;
+  }
+
+  // Method call: prev is selector with accessor (e.g., obj.method(...), Navigator.push(...))
+  if (prev.type === 'selector') {
+    const accessor = prev.namedChildren.find((c: SyntaxNode) =>
+      c.type === 'unconditional_assignable_selector' || c.type === 'conditional_assignable_selector'
+    );
+    if (accessor) {
+      const methodId = accessor.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+      if (methodId) {
+        // Include receiver for first call in chain (receiver is a direct identifier)
+        const accessorPrev = dartReceiverOf(prev);
+        if (accessorPrev?.type === 'identifier') {
+          return accessorPrev.text + '.' + methodId.text;
+        }
+        // Chained static-factory / fluent call: the receiver is itself a call
+        // (`Foo.create().bar()`), so accessorPrev is that call's argument_part
+        // selector. Encode `<innerCallee>().<method>` so resolution can infer
+        // bar's class from what `Foo.create` RETURNS (#645/#608 mechanism) —
+        // but only when the chain starts with a capitalized type (a companion
+        // factory / static method / constructor); an instance chain
+        // (`obj.foo().bar()`) keeps the bare name (its receiver's type can't
+        // be recovered here).
+        if (accessorPrev?.type === 'selector' &&
+            accessorPrev.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
+          const innerCallee = dartCalleeOfArgPart(accessorPrev);
+          if (innerCallee && /^[A-Z]/.test(innerCallee)) {
+            return `${innerCallee}().${methodId.text}`;
+          }
+        }
+        return methodId.text;
+      }
+    }
+  }
+
+  // super.method() / this.method(): prev is bare unconditional_assignable_selector
+  if (prev.type === 'unconditional_assignable_selector' || prev.type === 'conditional_assignable_selector') {
+    const methodId = prev.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    if (methodId) return methodId.text;
+  }
+
   return undefined;
 }
 
@@ -447,53 +617,14 @@ export const dartExtractor: LanguageExtractor = {
       if (!hasArgPart) return undefined;
 
       const prev = node.previousNamedSibling;
-      if (!prev) return undefined;
+      return prev ? dartCallee(prev) : undefined;
+    }
 
-      // Simple function/constructor call: prev is identifier (e.g., runApp(...), MyWidget(...))
-      if (prev.type === 'identifier') {
-        return prev.text;
-      }
-
-      // Method call: prev is selector with accessor (e.g., obj.method(...), Navigator.push(...))
-      if (prev.type === 'selector') {
-        const accessor = prev.namedChildren.find((c: SyntaxNode) =>
-          c.type === 'unconditional_assignable_selector' || c.type === 'conditional_assignable_selector'
-        );
-        if (accessor) {
-          const methodId = accessor.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
-          if (methodId) {
-            // Include receiver for first call in chain (receiver is a direct identifier)
-            const accessorPrev = prev.previousNamedSibling;
-            if (accessorPrev?.type === 'identifier') {
-              return accessorPrev.text + '.' + methodId.text;
-            }
-            // Chained static-factory / fluent call: the receiver is itself a call
-            // (`Foo.create().bar()`), so accessorPrev is that call's argument_part
-            // selector. Encode `<innerCallee>().<method>` so resolution can infer
-            // bar's class from what `Foo.create` RETURNS (#645/#608 mechanism) —
-            // but only when the chain starts with a capitalized type (a companion
-            // factory / static method / constructor); an instance chain
-            // (`obj.foo().bar()`) keeps the bare name (its receiver's type can't
-            // be recovered here).
-            if (accessorPrev?.type === 'selector' &&
-                accessorPrev.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
-              const innerCallee = dartCalleeOfArgPart(accessorPrev);
-              if (innerCallee && /^[A-Z]/.test(innerCallee)) {
-                return `${innerCallee}().${methodId.text}`;
-              }
-            }
-            return methodId.text;
-          }
-        }
-      }
-
-      // super.method() / this.method(): prev is bare unconditional_assignable_selector
-      if (prev.type === 'unconditional_assignable_selector' || prev.type === 'conditional_assignable_selector') {
-        const methodId = prev.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
-        if (methodId) return methodId.text;
-      }
-
-      return undefined;
+    // A generic call the grammar read as two comparisons (`ref.read<Repo>(p)`),
+    // named at its `<`, where a parsed call's argument part starts.
+    if (node.type === 'relational_operator') {
+      const call = dartMisparsedGenericCall(node);
+      return call ? dartCallee(call.callee) : undefined;
     }
 
     // new MyWidget() — explicit constructor call
