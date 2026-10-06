@@ -87,9 +87,12 @@ export const vbnetExtractor: LanguageExtractor = {
   // this, calls inside every Sub/Function would be skipped.
   resolveBody: (node: SyntaxNode) => node,
   getReturnType: extractVbnetReturnType,
+  // `Protected Friend` and `Private Protected` are two modifiers each, so they
+  // read as protected and private, like C#'s `protected internal` and
+  // `private protected`.
   getVisibility: (node) => {
     if (hasModifier(node, /^private$/i)) return 'private';
-    if (hasModifier(node, /^protected(\s+friend)?$/i)) return 'protected';
+    if (hasModifier(node, /^protected$/i)) return 'protected';
     if (hasModifier(node, /^friend$/i)) return 'internal';
     return 'public'; // VB members default to Public in practice
   },
