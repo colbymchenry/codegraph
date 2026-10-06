@@ -8927,6 +8927,24 @@ export function matchMethodCall(
       if (classNode.language !== ref.language) continue;
 
       const nodesInFile = context.getNodesInFile(classNode.filePath);
+      // Dart: a call through a type's static constant invokes the value the
+      // constant holds. riverpod's `FutureProvider.autoDispose(…)` calls
+      // `static const autoDispose = AutoDisposeFutureProviderBuilder();`,
+      // which the lookups below gave to another builder's `autoDispose`
+      // method. A Dart type can't also declare a method of that name, and its
+      // static members are not inherited, so its own constant is the callee.
+      if (ref.language === 'dart') {
+        const holder = nodesInFile.find((n) =>
+          n.kind === 'constant' && n.name === methodName && n.qualifiedName === `${classNode.qualifiedName}::${methodName}`);
+        if (holder) {
+          return {
+            original: ref,
+            targetNodeId: holder.id,
+            confidence: 0.85,
+            resolvedBy: 'qualified-name',
+          };
+        }
+      }
       const methodNode = nodesInFile.find(
         (n) =>
           n.kind === 'method' &&

@@ -1160,8 +1160,9 @@ export class TreeSitterExtractor {
         // The hook consumed this subtree, so the walkers below never descend
         // into it — scan it for function-as-value candidates (#756). Scala's
         // hook handles val/var definitions (`val table = Seq(targetCb)`), for
-        // example. The scan is capture-only and halts at nested functions.
-        this.scanFnRefSubtree(node, 0);
+        // example. The scan is capture-only and halts at nested functions;
+        // an initializer the hook walked has captured its own.
+        this.scanFnRefSubtree(node, 0, ctx.walked ?? undefined);
         return;
       }
     }
@@ -1764,14 +1765,21 @@ export class TreeSitterExtractor {
 
   /**
    * Build an ExtractorContext for passing to language-specific visitNode hooks.
+   * `walked` collects the initializers the hook walks, for the dispatcher's
+   * function-as-value scan to skip.
    */
-  private makeExtractorContext(): ExtractorContext {
+  private makeExtractorContext(): ExtractorContext & { walked: Set<number> | null } {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
-    return {
+    const ctx: ExtractorContext & { walked: Set<number> | null } = {
+      walked: null,
       createNode: (kind, name, node, extra) => self.createNode(kind, name, node, extra),
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
+      walkInitializer: (node) => {
+        (ctx.walked ??= new Set()).add(node.id);
+        self.visitFunctionBody(node, '');
+      },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
@@ -1780,6 +1788,7 @@ export class TreeSitterExtractor {
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
     };
+    return ctx;
   }
 
   /**

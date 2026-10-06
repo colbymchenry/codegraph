@@ -269,12 +269,31 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   expression node); initValue = its text `.slice(0,100)` (UTF-16);
   `ctx.createNode('constant', name, node, { signature: initValue ? \`=
   ${initValue}${initValue.length >= 100 ? '...' : ''}\` : undefined })`.
-  Return **true** (consumed — even when nameNode missing? NO: name found is
-  required for createNode but the hook returns true for EVERY
+  When the constant is minted, the hook pushes it and walks the WHOLE
+  declaration with the body walker (`ctx.walkInitializer(node)` —
+  visitFunctionBody that records the node as walked), then pops: the
+  initializer's calls, instantiations, static and member reads, types,
+  closures (block bodies and local functions included) and fn-ref
+  candidates (the `varinit` capture of the declaration itself included) are
+  the CONSTANT's. Return **true** (consumed — even when nameNode missing? NO:
+  name found is required for createNode but the hook returns true for EVERY
   static_final_declaration reached, node minted or not — transcribe the
-  early-return shape exactly: `if (nameNode) {…}; return true`). The
-  dispatcher then runs `scanFnRefSubtree(node, 0)` and never descends →
-  §Function-as-value for what still gets captured. Everything else → false.
+  early-return shape exactly: `if (nameNode) {…; if (constant) walk}; return
+  true`). The dispatcher then runs `scanFnRefSubtree(node, 0, walked)` —
+  which skips a walked declaration outright, so only an unminted one is
+  scanned — and never descends.
+- **visitNode — the field / top-level variable branch.** `node.type ===
+  'initialized_identifier'` whose parent is an `initialized_identifier_list`
+  directly under `program`, or under a `declaration` in a
+  class_body/extension_body/enum_body → `ctx.walkInitializer(node)` with no
+  push (the stack top is the file or the class/enum), return **true**. These
+  declarations mint no node, so their initializers are the FILE's or the
+  CLASS's. An `initialized_identifier` anywhere else — the second variable of
+  a local `for (var i = 0, j = n(); …)`, under `initialized_variable_definition`
+  — is left to its function's body walk (the double-walk's pass 2a reaches it
+  too, so the parent check is load-bearing). The `declaration` and `program`
+  type rows push only the DECLARED type's refs; initializer types come from
+  the walk. Everything else → false.
   **Reality of the node type (probed, `probe2-cst.txt`):**
   `static_final_declaration` = a `final`/`const` declaration WITH an
   initializer that is **top-level** (`const SHARED_MAX = 10;`, `final
@@ -412,7 +431,7 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 
 | Node | Branch | Behavior |
 |---|---|---|
-| every node | visitNode hook first (:943) | `static_final_declaration` consumed (§Constants); handled → scanFnRefSubtree + STOP |
+| every node | visitNode hook first (:943) | `static_final_declaration` consumed and body-walked for its constant; a field's or top-level variable's `initialized_identifier` consumed and body-walked for the class/file (§Constants); handled → scanFnRefSubtree (skipping what was walked) + STOP |
 | every node | maybeCaptureFnRefs (:990) | fires for `arguments`/`assignment_expression`/`pair`/`list_literal`/`static_final_declaration` in visitNode context — the source of the file/class-attributed fn-ref twins (§double-walk) |
 | `function_signature` | functionTypes:994 | methodTypes does NOT include it → **always extractFunction:1517**, even inside a class (isInsideClassLike && !methodTypes.includes → else-arm). In-class function_signatures occur only for ABSTRACT/bodiless methods, reached via their `declaration` wrapper (`declaration > function_signature`, probed) → **kind `function` contained by the class** (pinned: `AbstractT::mustImpl` is a function; the sibling `declaration > getter_signature` abstract getter stays invisible). skipChildren |
 | `class_definition` | classTypes:1005 | no classifyClassNode → always extractClass:1679 (abstract/sealed/base/etc. included) |
@@ -423,7 +442,7 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 | `import_or_export` | importTypes:1209 → extractImport:3170 | §Extractor config |
 | `new_expression` | INSTANTIATION_KINDS:1255 (`new_expression` ∈ :354-361) | extractInstantiation:4610 → ctor field lookups null → namedChild(0) = type_identifier → `instantiates` ref from stack top; `<`-strip + last-`.`-segment apply (`new p.Foo<T>()` → `Foo`). findAnonymousClassBody → always null for dart. Children still recursed |
 | `function_body` (sibling of a consumed signature) | **no branch** | recursed → THE DOUBLE-WALK (§below) |
-| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature hits methodTypes; initialized_identifier/list, constant_constructor_signature, redirecting_factory_constructor_signature, initializers, annotations-in-place: nothing |
+| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature hits methodTypes; each field `initialized_identifier` hits the hook (body-walked for the class); constant_constructor_signature, redirecting_factory_constructor_signature, initializers, annotations-in-place: nothing |
 | `getter_signature` / `setter_signature` BARE (top level) | no branch | **top-level getters/setters are INVISIBLE** (no node; their sibling function_body is visitNode-recursed where calls don't extract) — in classes they're method_signature-wrapped → methods |
 | `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
 | `property_signature`/`method_signature` TS branch (:1282) | **shadowed** | method_signature is consumed at :1027 first; property_signature isn't a dart kind — branch unreachable |
@@ -625,14 +644,19 @@ constant under the class, sig `= WidgetT`; multi-declarations → one node
 each with own columns. **NO nodes ever**: instance fields (typed/untyped/
 late/var), `static var`, top-level var/typed vars, top-level getters/
 setters, const constructors, redirecting factories, extension_type
-containers, `part`/`part of`/`library`/deferred imports. **Initializer
-side-effects:** hook-consumed constants' initializers are NOT walked → no
-calls/instantiates from them (only scanFnRefSubtree capture — §fn-refs);
-initialized_identifier fields' initializers ARE recursed by visitNode but
-only INSTANTIATION_KINDS fires there → `int counter = 0;` emits nothing,
-but a field `final w = new Widget();` would emit `instantiates Widget` from
-the CLASS (and a top-level `var w = new Widget();` from the FILE). No
-static-member refs from any of these contexts (body-walker only).
+containers, `part`/`part of`/`library`/deferred imports. **Initializers
+are code:** every initializer is walked with the body walker — a
+constant's for the constant (riverpod's `final repoProvider =
+Provider((ref) => Repository(ref.watch(dioProvider)));` → calls
+`Provider`, `Repository`, `ref.watch` from `repoProvider`), a field's
+(instance, `static var`, typed, `late`) for its class, a top-level
+`var`/typed/`late final` one for the FILE. The full body matrix applies:
+calls, instantiates, static-member and member reads, type refs, closures
+with block bodies (a local function inside one mints a `function` under
+the constant, with the double-walk's pass 2b on its body), interpolation
+calls, fn-ref candidates. Each is walked ONCE: the hook consumes the entry,
+so the visitNode recursion that used to reach `new_expression` /
+maybeCaptureFnRefs inside a field initializer no longer does.
 
 ### Calls — extractBareCall (dart.ts:305-379) in the body walker (:5159-5173)
 
@@ -664,7 +688,8 @@ extract-mini.txt):
 | `throw StateError('bad')` | recursion | `StateError` |
 | `'sum ${a + compute()}'` | template_substitution recursion | `compute` (interpolation calls EMIT); `$name` → identifier_dollar_escaped → nothing |
 | local-lambda body `final lam = (int a) { helper(a); }` | function_expression recursed transparently | `helper` attributed to the ENCLOSING function; `lam(5)` → `lam` |
-| ctor initializers (`: size = seed()`), enum-constant args (`ok(200)`), default param values, hook-consumed constant initializers | never body-walked | NOTHING |
+| `final p = Provider((ref) => Repo(ref.watch(d)))`, `static var s = make()`, `final _c = Controller();` in a class, `var v = load();` | the hook's walkInitializer (§Constants) | the full matrix, from the constant / the class / the file |
+| ctor initializers (`: size = seed()`), enum-constant args (`ok(200)`), default param values | never body-walked | NOTHING |
 
 extractCall (:3684), LITERAL_RECEIVER_TYPES (:373-388), SKIP_RECEIVERS, the
 parenthesized-conversion regex (:4530), template-strip — ALL UNREACHABLE for
@@ -690,7 +715,8 @@ previousNamedSibling is an `identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
 - `this.x` → prev is a `this` node → nothing. Case patterns (`case
   ColorT.blue:`) → `constant_pattern > qualified` shape, no selector →
   NOTHING (pinned gap). Cascade sections → no selector → nothing.
-  Class-field/constant initializers and visitNode contexts → never called.
+  visitNode contexts → never called; initializers are body-walked, so a
+  read written in one emits from its constant / class / file.
 
 ### Type-annotation references — dart ∈ TYPE_ANNOTATION_LANGUAGES (:5753), the dart branch (:5819-5833) is LIVE
 
@@ -857,14 +883,17 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
 - `[topLevel, blockDoc]` list ✓ (locals' list_literals capture too — the
   dispatch fires wherever the node is walked); `{'k': topLevel}` pair ✓;
   `final aliasTop = aliased;` top-level/static → varinit bare-identifier ✓
-  (pinned from=file / from=class); a LOCAL `final alias = topLevel;` →
+  (from the constant `aliasTop` — the hook walks the declaration with it
+  pushed); a LOCAL `final alias = topLevel;` →
   initialized_variable_definition NOT in dispatch → not captured.
 - obj.method member values (`final g = obj.method`) → the last child is a
   selector → normalizeValue [] → nothing (no member special for dart).
-- Capture points: visitFunctionBody:5137 (bodies), visitNode:990 (the
-  §double-walk twins from file/class scope), scanFnRefSubtree (hook-consumed
-  constant initializers — halts at `function_expression` :609, so lambdas
-  inside a constant's initializer don't leak candidates).
+- Capture points: visitFunctionBody:5137 (bodies, and every initializer
+  the hook walks — from the constant / class / file, lambdas included),
+  visitNode:990 (the §double-walk twins from file/class scope),
+  scanFnRefSubtree (only a `static_final_declaration` whose constant wasn't
+  minted — the scan skips what the hook walked, so nothing is captured
+  twice; it halts at `function_expression` :609).
 - **Flush gate (:639-728): effectively "defined in this file" ONLY** — dart
   import refs are URIs (`package:foo/util.dart`, `dart:async`) which match
   neither SIMPLE_NAME nor QUALIFIED_IMPORT (`:` and `/` excluded) →

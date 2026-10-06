@@ -20,7 +20,9 @@
 //! `method "<anonymous>"`; the unnamed constructor is skipped
 //! (isMisparsedFunction) while named ctors/factories are named by the CTOR
 //! name with the class as returnType; instance fields mint NO nodes (only
-//! static_final_declaration → constant, via the hook); prefixed return
+//! static_final_declaration → constant, via the hook); every initializer is
+//! body-walked once — a constant's from the constant, a field's or a
+//! top-level variable's from the class or the file; prefixed return
 //! types keep the PREFIX (`other.OtherClass f()` → returnType `other` —
 //! bug, preserved); enum `with` mixins emit nothing while enum `implements`
 //! works; deferred imports are invisible; named-argument callbacks are NOT
@@ -629,24 +631,34 @@ impl<'t> Walker<'t> {
                 });
                 let name = self.text(name_node).to_string();
                 let constant = self.create_node("constant", &name, node, Extra { signature, ..Default::default() });
-                // The types its initializer names are the constant's (#2327).
+                // The initializer is code the constant runs — its calls,
+                // instantiations, reads and the types it names (#2327) are
+                // the constant's. walkInitializer: the body walk, and the
+                // dispatcher's fn-ref scan skips what it walked.
                 if let Some(constant) = constant {
-                    let mut value = name_node.next_named_sibling();
-                    while let Some(v) = value {
-                        self.type_refs_dart(v, constant);
-                        value = v.next_named_sibling();
-                    }
+                    self.stack.push(Scope { row: constant, kind: "constant", name });
+                    self.visit_body(node);
+                    self.stack.pop();
+                    return;
                 }
             }
             self.scan_fn_ref_subtree(node, 0);
             return;
         }
 
-        // A field's declared type and initializer types are its class's (Dart
-        // fields mint no nodes); a top-level variable's are the file's (#2327).
-        // The visitNode hook's `declaration` / `program` rows (dart.ts).
-        // (Parent lookups walk down from the root, so only the node kinds that
-        // can be these positions ask for theirs.)
+        // A field's or top-level variable's initializer is code its class or
+        // the file runs (neither mints a node) — the hook's
+        // `initialized_identifier` row, walked like a body (walkInitializer).
+        if node.kind() == "initialized_identifier" && self.is_field_or_top_level_entry(node) {
+            self.visit_body(node);
+            return;
+        }
+
+        // A field's declared type is its class's (Dart fields mint no nodes);
+        // a top-level variable's is the file's (#2327). The visitNode hook's
+        // `declaration` / `program` rows (dart.ts). (Parent lookups walk down
+        // from the root, so only the node kinds that can be these positions
+        // ask for theirs.)
         if node.kind() == "declaration" {
             let in_body = node
                 .parent()
@@ -661,26 +673,16 @@ impl<'t> Walker<'t> {
             if is_field {
                 let owner = self.top_row();
                 for child in kids {
-                    match child.kind() {
-                        "initialized_identifier_list" => self.initializer_type_refs_dart(child, owner),
-                        "static_final_declaration_list" => {}
-                        _ => self.type_refs_dart(child, owner),
+                    if !matches!(child.kind(), "initialized_identifier_list" | "static_final_declaration_list") {
+                        self.type_refs_dart(child, owner);
                     }
                 }
             }
-        } else {
-            let top_level_type =
-                matches!(node.kind(), "type_identifier" | "type_arguments" | "function_type" | "record_type");
-            if (top_level_type || node.kind() == "initialized_identifier_list")
-                && node.parent().map(|p| p.kind() == "program").unwrap_or(false)
-            {
-                let owner = self.top_row();
-                if top_level_type {
-                    self.type_refs_dart(node, owner);
-                } else {
-                    self.initializer_type_refs_dart(node, owner);
-                }
-            }
+        } else if matches!(node.kind(), "type_identifier" | "type_arguments" | "function_type" | "record_type")
+            && node.parent().map(|p| p.kind() == "program").unwrap_or(false)
+        {
+            let owner = self.top_row();
+            self.type_refs_dart(node, owner);
         }
 
         // maybeCaptureFnRefs (:990) — the double-walk fn-ref twin source.
@@ -1387,21 +1389,23 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// pushDartInitializerTypeRefs (dart.ts) — each `initialized_identifier`'s
-    /// value (every named child after its name).
-    fn initializer_type_refs_dart(&mut self, list: Node<'t>, from_row: u32) {
-        let mut cursor = list.walk();
-        let entries: Vec<Node<'t>> = list.named_children(&mut cursor).collect();
-        for entry in entries {
-            if entry.kind() != "initialized_identifier" {
-                continue;
-            }
-            let mut ec = entry.walk();
-            let parts: Vec<Node<'t>> = entry.named_children(&mut ec).skip(1).collect();
-            for part in parts {
-                self.type_refs_dart(part, from_row);
-            }
+    /// isDartFieldOrTopLevelEntry (dart.ts) — an `initialized_identifier`
+    /// declaring a field or a top-level variable, not the second variable of
+    /// a local declaration (`for (var i = 0, j = n(); …)`).
+    fn is_field_or_top_level_entry(&self, node: Node<'t>) -> bool {
+        let Some(list) = node.parent() else { return false };
+        if list.kind() != "initialized_identifier_list" {
+            return false;
         }
+        let Some(owner) = list.parent() else { return false };
+        if owner.kind() == "program" {
+            return true;
+        }
+        owner.kind() == "declaration"
+            && owner
+                .parent()
+                .map(|p| matches!(p.kind(), "class_body" | "extension_body" | "enum_body"))
+                .unwrap_or(false)
     }
 
     /// dartMemberRead (dart.ts) — `x.area` / `x?.area` not followed by a call's

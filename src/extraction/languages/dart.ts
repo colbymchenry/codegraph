@@ -49,16 +49,18 @@ const DART_MEMBER_BODIES: ReadonlySet<string> = new Set(['class_body', 'extensio
 /** The named nodes a top-level variable's declared type is written as (`Report? x;`, `List<Report> xs = [];`). */
 const DART_TOP_LEVEL_TYPES: ReadonlySet<string> = new Set(['type_identifier', 'type_arguments', 'function_type', 'record_type']);
 
-/** Type refs from `fromNodeId` for the initializers in an `initialized_identifier_list` (each entry is its name, then its value). */
-function pushDartInitializerTypeRefs(
-  list: SyntaxNode,
-  fromNodeId: string,
-  push: (ref: UnresolvedReference) => void,
-): void {
-  for (const entry of list.namedChildren) {
-    if (entry.type !== 'initialized_identifier') continue;
-    for (const part of entry.namedChildren.slice(1)) pushDartTypeRefs(part, fromNodeId, push);
-  }
+/**
+ * Whether an `initialized_identifier` declares a field or a top-level
+ * variable — `var cache = load();`, `final _ctl = TextEditingController();`
+ * in a class — rather than the second variable of a local declaration
+ * (`for (var i = 0, j = n(); …)`), which a function body's walk covers.
+ */
+function isDartFieldOrTopLevelEntry(node: SyntaxNode): boolean {
+  const list = node.parent;
+  if (list?.type !== 'initialized_identifier_list') return false;
+  const owner = list.parent;
+  if (owner?.type === 'program') return true;
+  return owner?.type === 'declaration' && owner.parent !== null && DART_MEMBER_BODIES.has(owner.parent.type);
 }
 
 /**
@@ -238,17 +240,21 @@ export const dartExtractor: LanguageExtractor = {
         const constant = ctx.createNode('constant', getNodeText(nameNode, ctx.source), node, {
           signature: initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined,
         });
-        // The types its initializer names are the constant's — riverpod's
-        // `final reportProvider = Family<Report?, String>();` (#2327).
+        // The initializer is code the constant runs: riverpod's `final
+        // repoProvider = Provider((ref) => Repository(ref.watch(dioProvider)));`
+        // calls `Provider`, `Repository` and `ref.watch`, and the types it
+        // names (`Family<Report?, String>()`, #2327) are the constant's too.
         if (constant) {
-          for (let value = valueNode; value; value = value.nextNamedSibling) pushDartTypeRefs(value, constant.id, push);
+          ctx.pushScope(constant.id);
+          ctx.walkInitializer(node);
+          ctx.popScope();
         }
       }
       return true;
     }
-    // A field's declared type, and the types its initializer names, are its
-    // class's: Dart fields mint no nodes of their own (`final Report report;`,
-    // #2327). A `static final` / `const` field's initializer is its constant's.
+    // A field's declared type is its class's: Dart fields mint no nodes of
+    // their own (`final Report report;`, #2327). Each initializer is walked
+    // as its entry is reached, below.
     if (node.type === 'declaration') {
       const owner = ctx.nodeStack[ctx.nodeStack.length - 1];
       const inBody = node.parent !== null && DART_MEMBER_BODIES.has(node.parent.type);
@@ -257,19 +263,25 @@ export const dartExtractor: LanguageExtractor = {
       );
       if (owner && isField) {
         for (const child of node.namedChildren) {
-          if (child.type === 'initialized_identifier_list') pushDartInitializerTypeRefs(child, owner, push);
-          else if (child.type !== 'static_final_declaration_list') pushDartTypeRefs(child, owner, push);
+          if (child.type !== 'initialized_identifier_list' && child.type !== 'static_final_declaration_list') {
+            pushDartTypeRefs(child, owner, push);
+          }
         }
       }
       return false;
     }
-    // A top-level variable's declared type and its (non-constant) initializer
-    // are the file's — the grammar lays them out directly under `program`.
-    const topLevelType = DART_TOP_LEVEL_TYPES.has(node.type);
-    if ((topLevelType || node.type === 'initialized_identifier_list') && node.parent?.type === 'program') {
+    // A field's initializer, or a top-level variable's, is code its class or
+    // the file runs — neither declaration mints a node to own it. A `static
+    // final` / `const` one is its constant's (above).
+    if (node.type === 'initialized_identifier' && isDartFieldOrTopLevelEntry(node)) {
+      ctx.walkInitializer(node);
+      return true;
+    }
+    // A top-level variable's declared type is the file's — the grammar lays
+    // it out directly under `program`.
+    if (DART_TOP_LEVEL_TYPES.has(node.type) && node.parent?.type === 'program') {
       const owner = ctx.nodeStack[ctx.nodeStack.length - 1];
-      if (owner && topLevelType) pushDartTypeRefs(node, owner, push);
-      else if (owner) pushDartInitializerTypeRefs(node, owner, push);
+      if (owner) pushDartTypeRefs(node, owner, push);
     }
     return false;
   },

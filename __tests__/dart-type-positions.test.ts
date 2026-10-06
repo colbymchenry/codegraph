@@ -119,7 +119,8 @@ describe('Dart type positions (#2327)', () => {
     const body = cg.getNodesByQualifiedName('body')[0]!;
     const refs = cg.getOutgoingEdgesFrom([body.id], ['references']).filter((e) => cg.getNode(e.target)!.name === 'Score');
     expect([...new Set(refs.map((e) => e.line))].sort()).toEqual([26, 27]);
-    expect(referrers('Score', 'instantiates')).toEqual(['function body']);
+    // `static const Score zero = Score(0);` constructs one too, from its constant.
+    expect(referrers('Score', 'instantiates')).toEqual(['constant Board::zero', 'function body']);
     const prefixRefs = cg.getUnresolvedReferencesInFile('lib/more.dart').filter((r) => r.referenceName === 'm');
     expect(prefixRefs).toEqual([]);
   });

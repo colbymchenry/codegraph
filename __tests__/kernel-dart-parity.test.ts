@@ -21,8 +21,10 @@
  * twins; TortureMini/TortureSigs/TortureCtors/TortureVrefDart: signatures
  * verbatim, prefixed-return-type prefix bug, const factories invisible,
  * value-ref matrix with `$X` vs `${X}` asymmetry; TortureReadsTypes.dart:
- * getter-read refs and the type positions outside signatures — #2338/#2327)
- * and their CRLF variants
+ * getter-read refs and the type positions outside signatures — #2338/#2327;
+ * TortureInitializers.dart: initializers walked as the code their constant,
+ * class or file runs, every member-body kind, and a local declaration's
+ * second variable left to its function) and their CRLF variants
  * (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
@@ -116,6 +118,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // extension `on` types, field / enum-field / top-level types, constant and
     // field initializers, body types, and the read shapes that are not reads.
     ['TortureReadsTypes.dart', 20],
+    // Initializers (top-level, static and instance) walked as code: calls,
+    // instantiations, reads, closures with block bodies and local functions,
+    // and function values captured once, for the declaration.
+    ['TortureInitializers.dart', 30],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {
