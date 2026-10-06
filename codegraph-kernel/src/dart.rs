@@ -18,8 +18,9 @@
 //! `.`); `ConfigT.load()` double-emits (calls + a static-member references
 //! ref — no callee-of-call skip in the dart branch); operator methods mint
 //! `method "<anonymous>"`; the unnamed constructor is skipped
-//! (isMisparsedFunction) while named ctors/factories are named by the CTOR
-//! name with the class as returnType; instance fields mint NO nodes (only
+//! (isMisparsedFunction) while named ctors/factories — `const` ones and
+//! redirecting factories included — are named by the CTOR name with the
+//! class as returnType; instance fields mint NO nodes (only
 //! static_final_declaration → constant, via the hook); every initializer is
 //! body-walked once — a constant's from the constant, a field's or a
 //! top-level variable's from the class or the file; prefixed return
@@ -35,7 +36,7 @@ use crate::buffers::{
     RefRow, StrRef, Tables, FLAG_IS_ASYNC, FLAG_IS_EXPORTED, FLAG_IS_STATIC, FUNCTION_REF_CODE,
     NONE, NONE_STR,
 };
-use crate::docstring::preceding_docstring;
+use crate::docstring::preceding_docstring_stepping_over;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
@@ -44,6 +45,17 @@ use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
+
+/// docstringStepOverTypes (dart.ts) — a member's annotations stand between it
+/// and the dartdoc written above them (`/// Builds the widget.` `@override`
+/// `Widget build(…)`), so the docstring walk steps over them.
+const DOCSTRING_STEP_OVER: &[&str] = &["annotation"];
+
+/// decoratorStepOverTypes (dart.ts) — an annotation belongs to the next
+/// declaration, whatever comments come between them (`@override`
+/// `// ignore: must_call_super` `void f()`), so the decorator scan steps over
+/// them.
+const DECORATOR_STEP_OVER: &[&str] = &["comment", "documentation_comment"];
 
 /// NAME_STOPLIST (function-ref.ts).
 fn is_stoplisted(name: &str) -> bool {
@@ -88,6 +100,60 @@ fn starts_upper_re() -> &'static Regex {
 fn angle_args_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<[^>]*>").unwrap())
+}
+
+/// The UpperCamel test of isDartTypeName (`/^[_$]*[A-Z]/`) — how Dart writes
+/// a type, `_Private` and `$Generated` ones included.
+fn is_upper_camel(text: &str) -> bool {
+    text.trim_start_matches(&['_', '$'][..])
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+/// DART_BODILESS_CTORS (dart.ts) — `const Foo.bar();` and a redirecting
+/// factory `const factory Foo.bar() = _Bar;`, each a signature kind of its
+/// own inside a `declaration`.
+fn is_bodiless_ctor(kind: &str) -> bool {
+    matches!(kind, "constant_constructor_signature" | "redirecting_factory_constructor_signature")
+}
+
+/// DART_LOWERCASE_TYPES (dart.ts) — Dart's lowercase built-in types, which a
+/// type argument can name: `<int>`, `<void>`.
+fn is_lowercase_type(name: &str) -> bool {
+    matches!(name, "int" | "double" | "num" | "bool" | "dynamic" | "void")
+}
+
+/// DART_PREFIXED (dart.ts) — what a callee can sit under in front of a
+/// generic call: `await`, `-`, `!`.
+fn is_prefixed(kind: &str) -> bool {
+    matches!(kind, "unary_expression" | "await_expression")
+}
+
+/// DART_COMMENTS (dart.ts) — line and block comments, and dartdoc.
+fn is_comment(node: Node) -> bool {
+    matches!(node.kind(), "comment" | "documentation_comment")
+}
+
+/// dartPrevNamed (dart.ts) — the named sibling before `node`, past comments:
+/// `tester //` + newline + `.state(…)` puts the comment, not `tester`, right
+/// before the `.state` selector.
+fn prev_named<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev.filter(|p| is_comment(*p)) {
+        prev = p.prev_named_sibling();
+    }
+    prev
+}
+
+/// dartNextNamed (dart.ts) — the named sibling after `node`, past comments.
+fn next_named<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut next = node.next_named_sibling();
+    while let Some(n) = next.filter(|n| is_comment(*n)) {
+        next = n.next_named_sibling();
+    }
+    next
 }
 
 struct Scope {
@@ -385,7 +451,9 @@ impl<'t> Walker<'t> {
 
     /// dartConstructorSignature (dart.ts:25-35).
     fn constructor_signature(&self, node: Node<'t>) -> Option<Node<'t>> {
-        if matches!(node.kind(), "factory_constructor_signature" | "constructor_signature") {
+        if matches!(node.kind(), "factory_constructor_signature" | "constructor_signature")
+            || is_bodiless_ctor(node.kind())
+        {
             return Some(node);
         }
         if node.kind() == "method_signature" {
@@ -415,9 +483,12 @@ impl<'t> Walker<'t> {
     /// dartCtorInfo (dart.ts:61-70).
     fn ctor_info(&self, node: Node<'t>) -> Option<(String, String)> {
         let ctor = self.constructor_signature(node)?;
+        // The names before the parameters: a redirecting factory names its
+        // target after them (`factory Foo() = _Impl.named;`).
         let mut cursor = ctor.walk();
         let ids: Vec<Node<'t>> = ctor
             .named_children(&mut cursor)
+            .take_while(|c| c.kind() != "formal_parameter_list")
             .filter(|c| c.kind() == "identifier")
             .collect();
         let class_name = self.enclosing_type_name(node)?;
@@ -448,11 +519,13 @@ impl<'t> Walker<'t> {
         Some(last.to_string())
     }
 
-    /// isMisparsedFunction (dart.ts:177-188) — skip the UNNAMED constructor.
-    fn is_unnamed_ctor(&self, node: Node<'t>) -> bool {
+    /// isMisparsedFunction (dart.ts:177-188) — skip the UNNAMED constructor,
+    /// and a `const` ctor / redirecting factory that names no enclosing type
+    /// (error recovery's).
+    fn is_misparsed_function(&self, node: Node<'t>) -> bool {
         match self.ctor_info(node) {
             Some((class_name, ctor_name)) => ctor_name == class_name,
-            None => false,
+            None => is_bodiless_ctor(node.kind()),
         }
     }
 
@@ -463,10 +536,15 @@ impl<'t> Walker<'t> {
         let params = sig
             .named_children(&mut c1)
             .find(|c| c.kind() == "formal_parameter_list");
+        // A constructor has no return type: the type a redirecting factory
+        // names is its target (`= _Impl`).
         let mut c2 = sig.walk();
-        let ret = sig
-            .named_children(&mut c2)
-            .find(|c| matches!(c.kind(), "type_identifier" | "void_type"));
+        let ret = if is_bodiless_ctor(sig.kind()) {
+            None
+        } else {
+            sig.named_children(&mut c2)
+                .find(|c| matches!(c.kind(), "type_identifier" | "void_type"))
+        };
         if params.is_none() && ret.is_none() {
             return None;
         }
@@ -538,6 +616,33 @@ impl<'t> Walker<'t> {
             }
         }
         false
+    }
+
+    /// getDeclarationWrapper (dart.ts) — a member with no body (`Foo._();`,
+    /// `const Foo.c();`, an abstract `void m();`) is a `declaration` wrapping
+    /// its signature, and the member's `///` dartdoc and `@annotation`s come
+    /// before the wrapper. A signature that opens the declaration takes both
+    /// from there.
+    fn declaration_wrapper(&self, node: Node<'t>) -> Option<Node<'t>> {
+        let parent = node.parent()?;
+        if parent.kind() != "declaration" {
+            return None;
+        }
+        if parent.named_child(0)? == node {
+            Some(parent)
+        } else {
+            None
+        }
+    }
+
+    /// docstringFor (tree-sitter.ts) — the preceding comment run, looked up
+    /// from the declaration wrapper when there is one, past annotations.
+    fn docstring_of(&self, node: Node<'t>) -> Option<String> {
+        preceding_docstring_stepping_over(
+            self.declaration_wrapper(node).unwrap_or(node),
+            self.src,
+            DOCSTRING_STEP_OVER,
+        )
     }
 
     /// resolveBody (dart.ts:158-171).
@@ -704,7 +809,10 @@ impl<'t> Walker<'t> {
                 self.extract_class(node);
                 return;
             }
-            "method_signature" | "constructor_signature" => {
+            "method_signature"
+            | "constructor_signature"
+            | "constant_constructor_signature"
+            | "redirecting_factory_constructor_signature" => {
                 self.extract_method(node);
                 return;
             }
@@ -718,9 +826,13 @@ impl<'t> Walker<'t> {
                     return;
                 }
             }
-            "import_or_export" => {
+            // importTypes (dart.ts): `import` / `export`, and `part
+            // 'x.g.dart';`, which links the library to the part's file. The
+            // TS ladder goes on into the directive's children, so this does
+            // too: an annotation's arguments are fn-ref capture points
+            // (`@Tag(bar) import 'a.dart';` captures `bar`).
+            "import_or_export" | "part_directive" => {
                 self.extract_import(node);
-                return;
             }
             "new_expression" => {
                 // INSTANTIATION_KINDS row — from the FILE/CLASS on the
@@ -753,13 +865,13 @@ impl<'t> Walker<'t> {
         }
         // isMisparsedFunction: the unnamed constructor is skipped — node
         // suppressed, body still walked (attributed to the current stack top).
-        if self.is_unnamed_ctor(node) {
+        if self.is_misparsed_function(node) {
             if let Some(body) = self.resolve_body(node) {
                 self.visit_body(body);
             }
             return;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let signature = self.signature_of(node);
         let visibility = self.visibility_of(node);
         let is_async = self.is_async_of(node);
@@ -800,13 +912,13 @@ impl<'t> Walker<'t> {
         }
         let name = self.extract_name(node);
         // isMisparsedFunction — the unnamed ctor: body-only walk.
-        if self.is_unnamed_ctor(node) {
+        if self.is_misparsed_function(node) {
             if let Some(body) = self.resolve_body(node) {
                 self.visit_body(body);
             }
             return;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let signature = self.signature_of(node);
         let visibility = self.visibility_of(node);
         let is_async = self.is_async_of(node);
@@ -848,7 +960,7 @@ impl<'t> Walker<'t> {
         // fallback finds the ON type's type_identifier — a class named after
         // the extended type (preserved).
         let name = self.extract_name(node);
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let visibility = self.visibility_of(node);
         let row = self.create_node(
             "class",
@@ -879,7 +991,7 @@ impl<'t> Walker<'t> {
             None => return,
         };
         let name = self.extract_name(node);
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let visibility = self.visibility_of(node);
         let row = self.create_node(
             "enum",
@@ -921,14 +1033,14 @@ impl<'t> Walker<'t> {
         if name == "<anonymous>" {
             return false;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         // `value` field is null (type_alias has no fields) → no refs from
         // the aliased type; returns false → children re-visited.
         self.create_node("type_alias", &name, node, Extra { docstring, ..Default::default() });
         false
     }
 
-    // --- extractImport (:3170; hook dart.ts:261-304) ----------------------
+    // --- extractImport (:3170; hook dart.ts extractImport) -----------------
 
     fn extract_import(&mut self, node: Node<'t>) {
         let find_child = |parent: Node<'t>, kind: &str| -> Option<Node<'t>> {
@@ -942,6 +1054,12 @@ impl<'t> Walker<'t> {
             find_child(uri, "string_literal")
         };
         let mut module: Option<String> = None;
+        // A part: `part 'x.g.dart';` holds its `uri` directly.
+        if node.kind() == "part_directive" {
+            if let Some(sl) = find_child(node, "uri").and_then(|uri| find_child(uri, "string_literal")) {
+                module = Some(self.text(sl).replace(['\'', '"'], ""));
+            }
+        }
         if let Some(li) = find_child(node, "library_import") {
             if let Some(spec) = find_child(li, "import_specification") {
                 if let Some(sl) = uri_of(spec) {
@@ -1014,57 +1132,17 @@ impl<'t> Walker<'t> {
             if !has_arg_part {
                 return None;
             }
-            let prev = node.prev_named_sibling()?;
-            if prev.kind() == "identifier" {
-                return Some(self.text(prev).to_string());
-            }
-            if prev.kind() == "selector" {
-                let mut pc = prev.walk();
-                let accessor = prev.named_children(&mut pc).find(|c| {
-                    matches!(
-                        c.kind(),
-                        "unconditional_assignable_selector" | "conditional_assignable_selector"
-                    )
-                });
-                if let Some(accessor) = accessor {
-                    let mut ac = accessor.walk();
-                    let method_id = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
-                    if let Some(method_id) = method_id {
-                        let accessor_prev = prev.prev_named_sibling();
-                        if let Some(ap) = accessor_prev {
-                            if ap.kind() == "identifier" {
-                                return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
-                            }
-                            // Chained static-factory: the receiver is itself
-                            // a call — re-encode `<inner>().<method>` when
-                            // the chain starts capitalized (#750).
-                            if ap.kind() == "selector" {
-                                let mut apc = ap.walk();
-                                if ap.named_children(&mut apc).any(|c| c.kind() == "argument_part") {
-                                    if let Some(inner) = self.callee_of_arg_part(ap) {
-                                        if starts_upper_re().is_match(&inner) {
-                                            return Some(format!("{}().{}", inner, self.text(method_id)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        return Some(self.text(method_id).to_string());
-                    }
-                }
-            }
-            // super.method() / this.method(): prev is a bare accessor.
-            if matches!(
-                prev.kind(),
-                "unconditional_assignable_selector" | "conditional_assignable_selector"
-            ) {
-                let mut pc = prev.walk();
-                let id = prev.named_children(&mut pc).find(|c| c.kind() == "identifier");
-                if let Some(id) = id {
-                    return Some(self.text(id).to_string());
-                }
-            }
-            return None;
+            // Past comments: `box.grow /* by */ (3)` calls `box.grow`.
+            let prev = prev_named(node)?;
+            return self.callee_name(prev);
+        }
+
+        // A generic call the grammar read as two comparisons
+        // (`ref.read<Repo>(p)`), named at its `<`, where a parsed call's
+        // argument part starts.
+        if node.kind() == "relational_operator" {
+            let (callee, _) = self.misparsed_generic_call(node)?;
+            return self.callee_name(callee);
         }
 
         // new_expression arm — DEAD in practice (the INSTANTIATION branch
@@ -1091,12 +1169,212 @@ impl<'t> Walker<'t> {
             };
         }
 
+        // `=> BlocProvider<CounterCubit>.value(…)` — a constructor called
+        // with type arguments, as most expressions parse it. The type is the
+        // LAST type_identifier: an import prefix (`p.X<T>.named`) is one too.
+        if node.kind() == "constructor_invocation" {
+            let mut c1 = node.walk();
+            let type_id = node.named_children(&mut c1).filter(|c| c.kind() == "type_identifier").last();
+            let mut c2 = node.walk();
+            let name_id = node.named_children(&mut c2).find(|c| c.kind() == "identifier");
+            return match (type_id, name_id) {
+                (Some(t), Some(n)) => Some(format!("{}.{}", self.text(t), self.text(n))),
+                (Some(t), None) => Some(self.text(t).to_string()),
+                _ => None,
+            };
+        }
+
         None
+    }
+
+    /// dartReceiverOf (dart.ts) — the receiver of the member access
+    /// `selector`: the node in front of it, past comments, or the end of an
+    /// arrow function's body when the grammar ended the arrow in front of a
+    /// generic call (`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`).
+    fn receiver_of(&self, selector: Node<'t>) -> Option<Node<'t>> {
+        let prev = prev_named(selector);
+        let body = prev
+            .filter(|p| p.kind() == "function_expression")
+            .and_then(|p| p.named_child(p.named_child_count().checked_sub(1)?));
+        match body {
+            Some(body) if body.kind() == "function_expression_body" => {
+                body.named_child(body.named_child_count().checked_sub(1)?)
+            }
+            _ => prev,
+        }
+    }
+
+    /// dartCallee (dart.ts) — the callee name of the call whose argument part
+    /// follows `prev`.
+    fn callee_name(&self, prev: Node<'t>) -> Option<String> {
+        if prev.kind() == "identifier" {
+            return Some(self.text(prev).to_string());
+        }
+        if prev.kind() == "selector" {
+            let mut pc = prev.walk();
+            let accessor = prev.named_children(&mut pc).find(|c| {
+                matches!(
+                    c.kind(),
+                    "unconditional_assignable_selector" | "conditional_assignable_selector"
+                )
+            });
+            if let Some(accessor) = accessor {
+                let mut ac = accessor.walk();
+                let method_id = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
+                if let Some(method_id) = method_id {
+                    let accessor_prev = self.receiver_of(prev);
+                    if let Some(ap) = accessor_prev {
+                        if ap.kind() == "identifier" {
+                            return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
+                        }
+                        // A constructor called with type arguments names
+                        // its type all the same (`BlocProvider<T>.value`).
+                        if let Some(type_name) = self.type_arguments_receiver(ap) {
+                            return Some(format!("{}.{}", type_name, self.text(method_id)));
+                        }
+                        // Chained static-factory: the receiver is itself
+                        // a call — re-encode `<inner>().<method>` when
+                        // the chain starts capitalized (#750).
+                        if ap.kind() == "selector" {
+                            let mut apc = ap.walk();
+                            if ap.named_children(&mut apc).any(|c| c.kind() == "argument_part") {
+                                if let Some(inner) = self.callee_of_arg_part(ap) {
+                                    if starts_upper_re().is_match(&inner) {
+                                        return Some(format!("{}().{}", inner, self.text(method_id)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Some(self.text(method_id).to_string());
+                }
+            }
+        }
+        // super.method() / this.method(): prev is a bare accessor.
+        if matches!(
+            prev.kind(),
+            "unconditional_assignable_selector" | "conditional_assignable_selector"
+        ) {
+            let mut pc = prev.walk();
+            let id = prev.named_children(&mut pc).find(|c| c.kind() == "identifier");
+            if let Some(id) = id {
+                return Some(self.text(id).to_string());
+            }
+        }
+        None
+    }
+
+    /// dartMisparsedGenericCall (dart.ts) — a generic call tree-sitter-dart
+    /// parsed as two comparisons, `(ref.read < Repo) > (p)`, found from its
+    /// `<`: the node its callee ends with (under any `await` or prefix
+    /// operator) and the identifier naming its type argument. Recovered when
+    /// the type argument names a type and the code is laid out as a call —
+    /// `<` against the callee, `(` against the `>`. A call chained on it keeps
+    /// its bare name, which the resolver types from the chain written before
+    /// it, as it types a parsed chain's `X().m` (#750).
+    fn misparsed_generic_call(&self, lt: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+        if lt.kind() != "relational_operator" || lt.child(0)?.kind() != "<" {
+            return None;
+        }
+        let inner = lt.parent()?;
+        let outer = inner.parent()?;
+        if inner.kind() != "relational_expression" || outer.kind() != "relational_expression" {
+            return None;
+        }
+        let left = outer.named_child(0)?;
+        if left.start_byte() != inner.start_byte() || left.end_byte() != inner.end_byte() {
+            return None;
+        }
+        let gt = outer.named_child(1)?;
+        if gt.kind() != "relational_operator" || gt.child(0)?.kind() != ">" {
+            return None;
+        }
+        let args = outer.named_child(2)?;
+        if !matches!(args.kind(), "parenthesized_expression" | "record_literal") || args.start_byte() != gt.end_byte() {
+            return None;
+        }
+        // A comment against the `<` (`ref.read /* c */<Repo>(p)`) is a
+        // sibling of its own, so the callee is not against it.
+        let before = lt.prev_named_sibling()?;
+        if is_comment(before) || before.end_byte() != lt.start_byte() {
+            return None;
+        }
+        // The type argument: `T`, `p.T`, `T<…>` or `p.T<…>`, and nothing else.
+        let head = lt.next_named_sibling()?;
+        if head.kind() != "identifier" {
+            return None;
+        }
+        let mut type_name = head;
+        let mut rest = head.next_named_sibling();
+        if let Some(sel) = rest {
+            let accessor = sel.named_child(0).filter(|a| a.kind() == "unconditional_assignable_selector");
+            if sel.kind() == "selector" {
+                if let Some(accessor) = accessor {
+                    let mut ac = accessor.walk();
+                    let name = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
+                    type_name = name?;
+                    rest = sel.next_named_sibling();
+                }
+            }
+        }
+        if let Some(sel) = rest {
+            let only_type_args = sel.named_child_count() == 1
+                && sel.named_child(0).map(|t| t.kind() == "type_arguments").unwrap_or(false);
+            if sel.kind() == "selector" && only_type_args {
+                rest = sel.next_named_sibling();
+            }
+        }
+        if rest.is_some() {
+            return None;
+        }
+        let name = self.text(type_name);
+        if !is_upper_camel(name) && !is_lowercase_type(name) {
+            return None;
+        }
+        // `await repo.load<User>(id)` and `-x.size<int>(y)` put the callee
+        // under the prefix.
+        let mut callee = before;
+        while is_prefixed(callee.kind()) {
+            let count = callee.named_child_count();
+            callee = callee.named_child(count.checked_sub(1)?)?;
+        }
+        Some((callee, type_name))
+    }
+
+    /// dartInMisparsedGenericCall (dart.ts) — whether a member access
+    /// (`.member` on `receiver`, followed by `next` under `parent`) belongs to
+    /// a misparsed generic call: its callee is called, and a prefixed type
+    /// argument (`p.Repo`) names a type.
+    fn in_misparsed_generic_call(
+        &self,
+        receiver: Node<'t>,
+        next: Option<Node<'t>>,
+        parent: Option<Node<'t>>,
+    ) -> bool {
+        let mut after = next;
+        let mut up = parent;
+        while after.is_none() {
+            let Some(u) = up.filter(|u| is_prefixed(u.kind())) else { break };
+            after = u.next_named_sibling();
+            up = if after.is_some() { None } else { u.parent() };
+        }
+        if let Some(a) = after {
+            if a.kind() == "relational_operator" && self.misparsed_generic_call(a).is_some() {
+                return true;
+            }
+        }
+        if parent.map(|p| p.kind()) != Some("relational_expression") {
+            return false;
+        }
+        receiver
+            .prev_named_sibling()
+            .map(|b| b.kind() == "relational_operator" && self.misparsed_generic_call(b).is_some())
+            .unwrap_or(false)
     }
 
     /// dartCalleeOfArgPart (dart.ts:100-116).
     fn callee_of_arg_part(&self, arg_part: Node<'t>) -> Option<String> {
-        let prev = arg_part.prev_named_sibling()?;
+        let prev = prev_named(arg_part)?;
         if prev.kind() == "identifier" {
             return Some(self.text(prev).to_string());
         }
@@ -1114,16 +1392,36 @@ impl<'t> Walker<'t> {
                 found
             });
             if let Some(method_id) = method_id {
-                let accessor_prev = prev.prev_named_sibling();
+                let accessor_prev = prev_named(prev);
                 if let Some(ap) = accessor_prev {
                     if ap.kind() == "identifier" {
                         return Some(format!("{}.{}", self.text(ap), self.text(method_id)));
+                    }
+                    if let Some(type_name) = self.type_arguments_receiver(ap) {
+                        return Some(format!("{}.{}", type_name, self.text(method_id)));
                     }
                 }
                 return Some(self.text(method_id).to_string());
             }
         }
         None
+    }
+
+    /// dartTypeArgumentsReceiver (dart.ts) — `BlocProvider` in
+    /// `BlocProvider<CounterCubit>.value(…)`, when `selector` is the `<…>`
+    /// between the type and `.value`. Only a constructor is called that way.
+    fn type_arguments_receiver(&self, selector: Node<'t>) -> Option<&'t str> {
+        if selector.kind() != "selector" || selector.named_child_count() != 1 {
+            return None;
+        }
+        if selector.named_child(0)?.kind() != "type_arguments" {
+            return None;
+        }
+        let type_node = prev_named(selector)?;
+        if type_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(type_node))
     }
 
     // --- extractStaticMemberRef — the dart branch (:4759-4767) ------------
@@ -1140,8 +1438,15 @@ impl<'t> Walker<'t> {
         if node.named_children(&mut cursor).any(|c| c.kind() == "argument_part") {
             return;
         }
-        let Some(prev) = node.prev_named_sibling() else { return };
+        let Some(prev) = self.receiver_of(node) else { return };
         if prev.kind() == "identifier" && cap_ident_re().is_match(self.text(prev)) {
+            // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
+            // argument, which the body walker references as a type.
+            if let Some(before) = prev.prev_named_sibling() {
+                if before.kind() == "relational_operator" && self.misparsed_generic_call(before).is_some() {
+                    return;
+                }
+            }
             let name = self.text(prev).to_string();
             // NO callee-of-call skip — `ConfigT.load()` double-emits
             // (references + calls). Position = the IDENTIFIER (receiver).
@@ -1168,8 +1473,11 @@ impl<'t> Walker<'t> {
         }
         // Scan 2: preceding siblings, backward, stop at the first
         // non-annotation — stacked annotations emit in REVERSE source order.
-        if let Some(parent) = decl.parent() {
-            let decl_start = decl.start_byte();
+        // A `declaration`-wrapped member's annotations precede the wrapper,
+        // and the comments between annotations and declaration are stepped over.
+        let anchor = self.declaration_wrapper(decl).unwrap_or(decl);
+        if let Some(parent) = anchor.parent() {
+            let decl_start = anchor.start_byte();
             let mut decl_idx: Option<usize> = None;
             for i in 0..parent.named_child_count() {
                 if let Some(sib) = parent.named_child(i) {
@@ -1182,6 +1490,9 @@ impl<'t> Walker<'t> {
             if let Some(di) = decl_idx {
                 for j in (0..di).rev() {
                     let Some(sib) = parent.named_child(j) else { continue };
+                    if DECORATOR_STEP_OVER.contains(&sib.kind()) {
+                        continue;
+                    }
                     if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
                         break;
                     }
@@ -1326,6 +1637,20 @@ impl<'t> Walker<'t> {
         } else {
             node
         };
+        // A redirecting factory names the class it constructs after `=`, then
+        // perhaps that class's constructor (`= _$QuestionImpl.fromJson`, two
+        // type_identifiers). Neither the constructor nor an import prefix is
+        // a type, and Dart writes types UpperCamel.
+        if sig.kind() == "redirecting_factory_constructor_signature" {
+            let mut cursor = sig.walk();
+            let kids: Vec<Node<'t>> = sig.named_children(&mut cursor).collect();
+            for child in kids {
+                if child.kind() != "type_identifier" || is_upper_camel(self.text(child)) {
+                    self.type_refs_from_subtree(child, row);
+                }
+            }
+            return;
+        }
         self.type_refs_from_subtree(sig, row);
     }
 
@@ -1354,13 +1679,7 @@ impl<'t> Walker<'t> {
     /// constructor call names.
     fn is_type_name_dart(&self, node: Node<'t>) -> bool {
         let text = self.text(node);
-        let upper = text
-            .trim_start_matches(&['_', '$'][..])
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_uppercase())
-            .unwrap_or(false);
-        if !upper || is_builtin_type(text) {
+        if !is_upper_camel(text) || is_builtin_type(text) {
             return false;
         }
         if node.next_sibling().map(|s| s.kind() == ".").unwrap_or(false) {
@@ -1425,17 +1744,23 @@ impl<'t> Walker<'t> {
             found
         });
         let Some(member) = member else { return };
-        let Some(receiver) = node.prev_named_sibling() else { return };
+        let Some(receiver) = prev_named(node) else { return };
         if receiver.kind() != "identifier" {
             return;
         }
-        if let Some(next) = node.next_named_sibling() {
+        let next = next_named(node);
+        if let Some(next) = next {
             if next.kind() == "selector" {
                 let mut nc = next.walk();
                 if next.named_children(&mut nc).any(|c| c.kind() == "argument_part") {
                     return;
                 }
             }
+        }
+        // The callee of a generic call the grammar read as comparisons
+        // (`ref.read<Repo>(p)`) is called; a prefixed type argument names a type.
+        if self.in_misparsed_generic_call(receiver, next, node.parent()) {
+            return;
         }
         let name = format!("{}.{}", self.text(receiver), self.text(member));
         let reader = self.top_row();
@@ -1463,12 +1788,18 @@ impl<'t> Walker<'t> {
 
         self.extract_static_member_ref(node);
 
-        // A getter read `x.area` (#2338); a type the body names (#2327).
+        // A getter read `x.area` (#2338); a type the body names (#2327) — the
+        // type argument of a generic call parsed as comparisons included.
         self.extract_member_read(node);
-        if kind == "type_identifier" && self.is_type_name_dart(node) {
-            let name = self.text(node).to_string();
+        let type_node = match kind {
+            "type_identifier" => Some(node),
+            "relational_operator" => self.misparsed_generic_call(node).map(|(_, type_name)| type_name),
+            _ => None,
+        };
+        if let Some(type_node) = type_node.filter(|t| self.is_type_name_dart(*t)) {
+            let name = self.text(type_node).to_string();
             let owner = self.top_row();
-            self.push_ref_at(owner, &name, "references", node);
+            self.push_ref_at(owner, &name, "references", type_node);
         }
 
         if kind == "function_signature" {

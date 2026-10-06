@@ -166,6 +166,28 @@ export interface LanguageExtractor {
    * their own variants. Returns cleaned prose, or undefined when there is none.
    */
   getBodyDocstring?: (node: SyntaxNode, source: string) => string | undefined;
+  /**
+   * The node that wraps `node` and stands in its place among the declarations
+   * around it, when the grammar adds one. The doc comment and annotations
+   * written before the declaration precede that wrapper, so both are looked up
+   * from it. Dart wraps a member with no body (`Foo._();`, an abstract
+   * `void m();`) in a `declaration` node. Returns undefined when there is none.
+   */
+  getDeclarationWrapper?: (node: SyntaxNode) => SyntaxNode | undefined;
+  /**
+   * Node types that may stand between a declaration and the comments written
+   * above it without ending the comment run its docstring is read from. Dart
+   * writes annotations there (`/// Builds it.` `@override` `Widget build(…)`):
+   * each one is stepped over, and comments on either side of it still join.
+   */
+  docstringStepOverTypes?: string[];
+  /**
+   * Node types that may stand between a declaration and the decorators written
+   * before it without ending the scan for them. Dart writes comments there
+   * (`@override` `// ignore: must_call_super` `void f()`), and an annotation
+   * always belongs to the declaration that follows it.
+   */
+  decoratorStepOverTypes?: string[];
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */
@@ -323,9 +345,10 @@ export interface LanguageExtractor {
    * getter `area` when `area` is one. Returns the ref name (`x.area`) and the
    * node to position it on, or undefined. Emitted as a `references` ref from
    * the function the read is in; the resolver links it only to a getter, with
-   * a `calls` edge (a plain field read links nothing).
+   * a `calls` edge (a plain field read links nothing). `parent` is the node's
+   * parent, handed down by the body walker.
    */
-  extractMemberRead?: (node: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
+  extractMemberRead?: (node: SyntaxNode, parent?: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
 
   /**
    * Node types representing a file-level package/namespace declaration

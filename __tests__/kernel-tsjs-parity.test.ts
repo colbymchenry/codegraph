@@ -149,6 +149,26 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
       const result = assertParity(`store.${ext}`, source, language);
       expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(true);
     });
+
+    it.each([
+      ['items$', 'export { items$ };', true],
+      ['$items', 'export { $items as default };', true],
+      ['items', 'export { items$ };', false],
+      ['items', 'export { $items };', false],
+    ] as const)('an export clause names %s only whole: `%s`', (name, exportLine, kept) => {
+      // `\b` takes a `$` for a separator: it can't bound `items$` or
+      // `$items`, and it finds `items` inside both. `other` keeps the
+      // negative cases above assertParity's node floor.
+      const source = [
+        'import { create } from "zustand";',
+        `const ${name} = create((set) => ({ inc: () => set({}) }));`,
+        'const other = 1;',
+        exportLine,
+        '',
+      ].join('\n');
+      const result = assertParity(`store.${ext}`, source, language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(kept);
+    });
   });
 
   describe.each([

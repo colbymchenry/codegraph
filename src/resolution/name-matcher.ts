@@ -11,6 +11,8 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
+import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -1107,7 +1109,9 @@ export function matchFunctionRef(
   // defines inside `test_custom_auth`. Those still count against a lone
   // cross-file guess below — a name several functions use for themselves is
   // as likely a local's.
-  let candidates = named.filter((n) => isLexicallyReachable(n, ref, context));
+  let candidates = named.filter((n) => isLexicallyReachable(n, ref, context) &&
+    // A Dart constructor is torn off through its class, never by a bare name.
+    !isDartConstructor(n, context));
   if (candidates.length === 0) return null;
   // A Python name the function around it binds — a parameter, an assignment —
   // is that local's value: httpx's `auth_flow(self, request)` handing `request`
@@ -2226,7 +2230,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (dartExtensionDecl(candidate, context)?.named === false) return false;
   // And it applies only in its own library: flutter_test's `find.text(…)` is
   // no other file's `extension on TaskStatus { String get text }`.
-  if (candidate.filePath !== ref.filePath && isDartUnnamedExtensionMember(candidate, context)) return false;
+  if (isDartUnnamedExtensionMember(candidate, context) && !inSameDartLibrary(ref.filePath, candidate.filePath, context)) return false;
   // A Scala package object's member is in scope in its package and those under
   // it, or through an import: cats.laws' `Eq` is the `cats` package object's
   // alias, not the `algebra` one's (752 refs went there).
@@ -2869,6 +2873,32 @@ function isDartMethodInScope(method: Node, ref: UnresolvedRef, context: Resoluti
   return dartMemberDepth(method, ref, context) < Infinity;
 }
 
+const DART_CONSTRUCTORS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Dart method is a named constructor — `Foo.named(…)`, `factory
+ * Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read from
+ * its declaration. Dart reaches one only through its class (`Foo.value(…)`,
+ * the tear-off `Foo.value`), never by a bare name: a parameter `value` passed
+ * on is not `const BlocProvider.value(…)`.
+ */
+function isDartConstructor(n: Node, context: ResolutionContext): boolean {
+  if (n.language !== 'dart' || n.kind !== 'method') return false;
+  let memo = DART_CONSTRUCTORS.get(context);
+  if (!memo) DART_CONSTRUCTORS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
+  const escape = (name: string): string => name.replace(/\$/g, '\\$');
+  const constructor = owner !== '' &&
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escape(owner)}\s*\.\s*${escape(n.name)}(?![\w$])`).test(head);
+  memo.set(n.id, constructor);
+  return constructor;
+}
+
 /**
  * How many supertype steps separate the class a Dart call is written in from
  * `method`'s owner: 0 for its own member, Infinity when the owner is not in
@@ -2896,6 +2926,8 @@ function dartMemberDepth(method: Node, ref: UnresolvedRef, context: ResolutionCo
 
 /** Past any real member's depth: an extension member only applies when no instance member does. */
 const DART_EXTENSION_RANK = 1000;
+/** Past any lineage's depth (at most 40): an extension on a type parameter is the least specific. */
+const DART_UNIVERSAL_RANK = 100;
 const DART_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Map<string, number>>>();
 
 /** Every type the classes around a Dart call site are, by supertype distance (at most 40). */
@@ -2942,11 +2974,157 @@ function isDartMember(n: Node): boolean {
 }
 
 /**
+ * A value a Dart type holds — an enum constant, a `static const` / `final` —
+ * which a bare name reaches only from inside the type, like its methods:
+ * bloc's brick hook calls `info(…)` on mason's `Logger`, and the call went to
+ * bloc_lint's enum constant `LinterRuleState.info`.
+ */
+function isDartTypeValue(n: Node): boolean {
+  return n.language === 'dart' && (n.kind === 'enum_member' || VALUE_KINDS.has(n.kind)) && n.qualifiedName.includes('::');
+}
+
+/** What a Dart library declares at its top level: a function, a type, a typedef, a top-level `final` / `const`. */
+const DART_LIBRARY_DECL_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'enum', 'type_alias', 'constant', 'variable', 'interface', 'struct', 'trait', 'mixin', 'extension']);
+
+function isDartLibraryDecl(n: Node): boolean {
+  return n.language === 'dart' && DART_LIBRARY_DECL_KINDS.has(n.kind) && !n.qualifiedName.includes('::');
+}
+
+/**
+ * Whether a Dart name written without a receiver — a call, a type — can mean
+ * `candidate` when it is declared at the top level of a library: the caller's
+ * own library declares it, or a library the caller imports without a prefix
+ * exports it, `show` / `hide` and `export` chains followed (see
+ * ./dart-libraries). A name written through an import prefix (`p.Report`)
+ * means only what the imports with that prefix export. riverpod's generated
+ * `async.g.dart` (`part of 'async.dart'`) calls the `family(…)` async.dart
+ * declares, and the call went to annotated.dart's `family` beside it; a test's
+ * `fakeAsync(…)` from package:fake_async went to a vendored copy no file imports.
+ */
+function isDartTopLevelVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext, prefix: string | null = null): boolean {
+  if (!isDartLibraryDecl(candidate)) return true;
+  return prefix === null
+    ? dartLibrarySees(ref.filePath, candidate.filePath, candidate.name, context)
+    : dartPrefixSees(ref.filePath, prefix, candidate.filePath, candidate.name, context);
+}
+
+/**
+ * The import prefix a Dart type name is written through — the `p` of
+ * `p.Report`, `p.Color.red` — or null. A type reference's column is the
+ * name's start; on a line with non-ASCII text before it the nearest whole-word
+ * occurrence stands in.
+ */
+function dartImportPrefixOf(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  const isWord = (at: number) => line.startsWith(name, at) && !/[\w$]/.test(line[at - 1] ?? '') && !/[\w$]/.test(line[at + name.length] ?? '');
+  let start = isWord(ref.column) ? ref.column : -1;
+  for (let at = line.indexOf(name); start < 0 && at >= 0; at = line.indexOf(name, at + 1)) {
+    if (isWord(at)) start = at;
+  }
+  if (start < 0) return null;
+  return /([A-Za-z_$][\w$]*)\s*\.\s*$/.exec(line.slice(0, start))?.[1] ?? null;
+}
+
+/**
+ * A library's own top-level declaration shadows every import of its name, so
+ * when the caller's library declares one, the imported namesakes are no
+ * candidates. (A function nested in another body is not the library's.)
+ */
+function preferOwnDartLibrary(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (candidates.filter(isDartLibraryDecl).length < 2) return candidates;
+  const own = candidates.filter((n) =>
+    isDartLibraryDecl(n) && inSameDartLibrary(ref.filePath, n.filePath, context) && isLexicallyReachable(n, ref, context));
+  return own.length === 0 ? candidates : candidates.filter((n) => !isDartLibraryDecl(n) || own.includes(n));
+}
+
+/**
+ * A Dart call through an import prefix — `http.get(…)` after `import
+ * 'package:http/http.dart' as http;`, `fmt.describe(…)`, `kit.Widget()` —
+ * calls a top-level declaration a library imported with that prefix exports,
+ * `export` chains and `show` / `hide` followed, or nothing of the project:
+ * never a member found by its name. riverpod's docs' 25 `http.get(…)` calls
+ * went to a docs example's `Http::get`, by their receiver's capitalized name.
+ * Undefined when the receiver is no import prefix there, or a parameter, local
+ * or member of that name hides it.
+ */
+function matchDartPrefixedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const parts = DART_MEMBER_READ.exec(ref.referenceName);
+  if (!parts || !dartImportPrefixes(ref.filePath, context).has(parts[1]!)) return undefined;
+  const prefix = parts[1]!;
+  const name = parts[2]!;
+  const at = dartPrefixedCallSite(ref, prefix, name, context);
+  // `const p.Box.named()` reaches here as `p.named`: no call of a top-level `named`.
+  if (at < 0) return null;
+  if (isDartNameHidden(prefix, ref, at, context)) return undefined;
+  const found = dartPrefixedDecls(prefix, name, ref, context);
+  return found.length === 1 ? { original: ref, targetNodeId: found[0]!.id, confidence: 0.9, resolvedBy: 'import' } : null;
+}
+
+/** The top-level Dart declarations named `name` that the imports written with `prefix` bring into the reference's library. */
+function dartPrefixedDecls(prefix: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  return context.getNodesByName(name).filter((n) => isDartLibraryDecl(n) && dartPrefixSees(ref.filePath, prefix, n.filePath, name, context));
+}
+
+/**
+ * Where `prefix` starts in the code of a Dart call written `prefix.name(…)`,
+ * or -1 when the call is written otherwise: `const p.Box.named()` arrives as
+ * `p.named`. (The reference's column sits just past `name`.)
+ */
+function dartPrefixedCallSite(ref: UnresolvedRef, prefix: string, name: string, context: ResolutionContext): number {
+  const code = dartCodeOf(ref.filePath, context);
+  const start = code ? dartNameStart({ ...ref, referenceName: name }, code) : -1;
+  if (!code || start < 0) return -1;
+  const text = code.text;
+  let k = start - 1;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  if (text[k] !== '.' || text[k - 1] === '.' || text[k - 1] === '?') return -1;
+  k--;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  const end = k + 1;
+  while (k >= 0 && /[\w$]/.test(text[k]!)) k--;
+  if (text.slice(k + 1, end) !== prefix) return -1;
+  while (k >= 0 && /\s/.test(text[k]!)) k--;
+  return text[k] === '.' ? -1 : end - prefix.length;
+}
+
+/**
+ * Whether a parameter or local around offset `at`, or a member of the type the
+ * reference is written in, is named `name`: it hides a library-level name
+ * there — an import prefix among them — as Dart's scopes nest.
+ */
+function isDartNameHidden(name: string, ref: UnresolvedRef, at: number, context: ResolutionContext): boolean {
+  if (isDartLocallyBound(ref.filePath, name, at, context)) return true;
+  const own = dartEnclosingType(ref, context);
+  return own !== null && (classMemberType(own, name, context) !== null ||
+    context.getNodesByName(name).some((n) => n.filePath === own.filePath && n.qualifiedName === `${own.qualifiedName}::${name}`));
+}
+
+/**
+ * The import prefix a Dart call through a type is written with — the `p` of
+ * `p.Box<int>.named(…)`, which arrives as `Box.named` with its column on the
+ * prefix — or null.
+ */
+function dartTypeCallPrefix(typeName: string, member: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const prefixes = dartImportPrefixes(ref.filePath, context);
+  if (prefixes.size === 0) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (line === undefined) return null;
+  const written = new RegExp(String.raw`(?<![\w$.])([A-Za-z_$][\w$]*)\s*\.\s*${typeName.replace(/\$/g, '\\$')}\s*` +
+    String.raw`(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*\.\s*${member.replace(/\$/g, '\\$')}(?![\w$])`, 'g');
+  // The one at the reference's column, else the first: a column counted in bytes misses after non-ASCII text.
+  const found = [...line.matchAll(written)].filter((m) => prefixes.has(m[1]!));
+  return (found.find((m) => m.index === ref.column) ?? found[0])?.[1] ?? null;
+}
+
+/**
  * Whether a bare Dart reference really is receiver-less at its call site. The
  * extractor keeps one receiver level, so the later links of a chain —
  * `LoginState().withEmail(e).withPassword(p)` — arrive as bare names; their
  * line shows `.withPassword(` all the same. (A Dart ref's column sits just
- * past the name; the name's start is found either way.)
+ * past the name; the name's start is found either way.) A spread's
+ * `...items()` is no receiver.
  */
 function isReceiverLessDartCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
@@ -2957,7 +3135,804 @@ function isReceiverLessDartCall(ref: UnresolvedRef, context: ResolutionContext):
   else if (ref.column >= name.length && line.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
   else start = line.indexOf(name);
   if (start < 0) return true;
-  return !/\.\s*$/.test(line.slice(0, start));
+  const before = line.slice(0, start);
+  return !/\.\s*$/.test(before) || /(?:^|[^.])\.\.\.\s*$/.test(before);
+}
+
+/**
+ * A later link of a Dart call chain — `Provider.autoDispose.family<…>(…)`,
+ * `events.map(mapper).transform(…)`, `const LoginState().withEmail(e)` — which
+ * the extractor records by its bare name, its receiver dropped.
+ */
+export function isDartChainLink(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) &&
+    !isReceiverLessDartCall(ref, context);
+}
+
+/**
+ * A Dart chain link calls a member of what the chain before it evaluates to,
+ * typed from evidence alone: the chain's head (a type, a constructor call, a
+ * string, `this` / `super`, a variable, field or getter with a declared type)
+ * and each link's declared type (a method's or getter's return type, a
+ * field's type, what a static constant is initialized with). Without that
+ * evidence it links nothing — never a member found by its name: bloc's
+ * `events.map(mapper).transform(…)` is a Stream's, not angular_bloc's
+ * `BlocPipe.transform`, and riverpod's `FutureProvider.autoDispose.family(…)`
+ * is the `family` getter of the builder `autoDispose` holds, not whichever
+ * builder's `family` sat nearest (#750).
+ */
+export function matchDartChainLink(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (!context.getNodesByName(ref.referenceName).some((n) => n.language === 'dart')) return null;
+  const code = dartCodeOf(ref.filePath, context);
+  const start = code ? dartNameStart(ref, code) : -1;
+  if (!code || start < 0) return null;
+  // `x.name` / `x?.name`: the receiver ends before the dot. `..name` is a cascade's.
+  let end = start - 1;
+  while (end >= 0 && /\s/.test(code.text[end]!)) end--;
+  if (code.text[end] !== '.' || code.text[end - 1] === '.') return null;
+  end--;
+  if (code.text[end] === '?') end--;
+  while (end >= 0 && /\s/.test(code.text[end]!)) end--;
+  const chain = readDartChain(code.text, end);
+  const receiver = chain ? typeDartChain(chain, ref, context, 0) : null;
+  if (!receiver) return null;
+  // Static members are the type's own: `p.Provider.autoDispose(…)` calls the
+  // constant, as `Provider.autoDispose(…)` does.
+  if (receiver.static) {
+    const member = dartStaticMember(receiver.type, ref.referenceName, ref, context, dartOwnerOf(receiver));
+    return member && member.kind !== 'enum_member'
+      ? { original: ref, targetNodeId: member.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
+  }
+  const member = dartMemberOf(receiver.type, ref.referenceName, ref, context, (n) => !isDartSetter(n, context), receiver.viaSuper ? 1 : 0)?.node;
+  return member ? { original: ref, targetNodeId: member.id, confidence: 0.85, resolvedBy: 'instance-method' } : null;
+}
+
+/**
+ * Lookups that hand back an instance of the one type they are given:
+ * provider's and flutter_bloc's `context.read<T>()` / `watch<T>()` /
+ * `BlocProvider.of<T>(context)`, get_it's `get<T>()`, GetX's `find<T>()`, and
+ * Flutter's `findAncestorStateOfType<T>()` family.
+ */
+const DART_TYPE_ARGUMENT_LOOKUPS: ReadonlySet<string> = new Set([
+  'read', 'watch', 'get', 'find', 'of', 'maybeOf', 'call', 'dependOnInheritedWidgetOfExactType',
+  'getInheritedWidgetOfExactType', 'findAncestorStateOfType', 'findAncestorWidgetOfExactType', 'findRootAncestorStateOfType',
+]);
+
+/** Words that can stand before a Dart name without being its declared type. */
+const DART_NON_TYPE_WORDS: ReadonlySet<string> = new Set([
+  'final', 'var', 'late', 'const', 'required', 'covariant', 'static', 'external', 'return', 'await', 'yield', 'throw',
+  'new', 'in', 'is', 'as', 'case', 'else', 'if', 'for', 'while', 'do', 'switch', 'assert', 'this', 'super', 'get', 'set',
+  'operator', 'async', 'sync', 'show', 'hide', 'typedef', 'extends', 'with', 'implements', 'on',
+]);
+
+/** A link of a Dart chain: `.name`, `.name<…>(…)` (`call`), or a subscript `[…]` (`index`). */
+interface DartChainLink { name: string; typeArgs: string[]; call: boolean; index: boolean }
+
+/**
+ * What a Dart chain starts from: a name (`x`, `Foo`, `foo(…)`, `Foo<T>(…)`,
+ * with the keyword written before it — `const`, `new`, `as`, `await` — and
+ * where it starts), a string literal, or a parenthesized expression.
+ */
+type DartChainHead =
+  | { kind: 'name'; name: string; typeArgs: string[]; call: boolean; keyword: string; at: number }
+  | { kind: 'string' }
+  | { kind: 'paren'; open: number; close: number };
+
+interface DartChain { head: DartChainHead; links: DartChainLink[] }
+
+/**
+ * What a Dart chain evaluates to: an instance of `type`, or (`static`) the
+ * type itself, before a static member — of the type `owner` declares, when
+ * the chain says which file that is (`p.Box` names the one `p` brings in).
+ */
+interface DartValue { type: string; static: boolean; viaSuper?: boolean; owner?: string }
+
+/**
+ * A Dart file's code with comments and string contents blanked, where each
+ * line starts, and the files of its library it names: its `part`s and the
+ * file it is `part of`.
+ */
+interface DartCode { text: string; lineStarts: number[]; parts: string[]; partOf: string | null }
+
+const DART_CODE = new WeakMap<ResolutionContext, Map<string, DartCode | null>>();
+
+function dartCodeOf(filePath: string, context: ResolutionContext): DartCode | null {
+  let memo = DART_CODE.get(context);
+  if (!memo) DART_CODE.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath);
+  let code: DartCode | null = null;
+  if (source !== null) {
+    const text = blankDartCode(source);
+    const lineStarts = [0];
+    for (let i = 0; i < text.length; i++) if (text[i] === '\n') lineStarts.push(i + 1);
+    const sibling = (uri: string): string => path.posix.normalize(path.posix.join(path.posix.dirname(filePath), uri));
+    const parts = [...source.matchAll(/^\s*part\s+['"]([^'"]+)['"]\s*;/gm)].map((m) => sibling(m[1]!));
+    const partOf = /^\s*part\s+of\s+['"]([^'"]+)['"]\s*;/m.exec(source)?.[1];
+    code = { text, lineStarts, parts, partOf: partOf ? sibling(partOf) : null };
+  }
+  // Refs arrive file by file, so a few files' worth is enough.
+  if (memo.size >= 64) memo.delete(memo.keys().next().value!);
+  memo.set(filePath, code);
+  return code;
+}
+
+/**
+ * Dart source with comments and string contents blanked, offsets kept: a
+ * literal keeps its quotes, and an interpolation's code (`'${a.b()}'`) stays,
+ * so a chain inside one reads like any other.
+ */
+function blankDartCode(source: string): string {
+  const out = source.split('');
+  const n = source.length;
+  const blank = (from: number, to: number): void => {
+    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
+  };
+  type Literal = { quote: string; triple: boolean; raw: boolean };
+  // The literals an open `${…}` returns to, with the brace depth around each.
+  const outer: Array<{ literal: Literal; depth: number }> = [];
+  let literal: Literal | null = null;
+  let depth = 0;
+  let i = 0;
+  while (i < n) {
+    const c = source[i]!;
+    if (literal) {
+      if (!literal.raw && c === '\\') {
+        blank(i, i + 2);
+        i += 2;
+      } else if (!literal.raw && c === '$' && source[i + 1] === '{') {
+        blank(i, i + 2);
+        outer.push({ literal, depth });
+        literal = null;
+        depth = 0;
+        i += 2;
+      } else if (source.startsWith(literal.triple ? literal.quote.repeat(3) : literal.quote, i)) {
+        i += literal.triple ? 3 : 1;
+        literal = null;
+      } else if (!literal.triple && c === '\n') {
+        literal = null;
+        i++;
+      } else {
+        blank(i, i + 1);
+        i++;
+      }
+      continue;
+    }
+    if (c === '/' && source[i + 1] === '/') {
+      const eol = source.indexOf('\n', i);
+      const stop = eol < 0 ? n : eol;
+      blank(i, stop);
+      i = stop;
+    } else if (c === '/' && source[i + 1] === '*') {
+      let nest = 1;
+      let j = i + 2;
+      while (j < n && nest > 0) {
+        if (source[j] === '/' && source[j + 1] === '*') { nest++; j += 2; }
+        else if (source[j] === '*' && source[j + 1] === '/') { nest--; j += 2; }
+        else j++;
+      }
+      blank(i, j);
+      i = j;
+    } else if (c === "'" || c === '"') {
+      const triple = source.startsWith(c.repeat(3), i);
+      literal = { quote: c, triple, raw: source[i - 1] === 'r' && !/[\w$]/.test(source[i - 2] ?? '') };
+      i += triple ? 3 : 1;
+    } else {
+      if (outer.length > 0 && c === '{') depth++;
+      else if (outer.length > 0 && c === '}') {
+        if (depth === 0) {
+          blank(i, i + 1);
+          ({ literal, depth } = outer.pop()!);
+          i++;
+          continue;
+        }
+        depth--;
+      }
+      i++;
+    }
+  }
+  return out.join('');
+}
+
+/** Where a Dart ref's name starts in its file's code. Its column sits just past the name (or on it). */
+function dartNameStart(ref: UnresolvedRef, code: DartCode): number {
+  const from = code.lineStarts[ref.line - 1];
+  if (from === undefined) return -1;
+  const line = code.text.slice(from, code.lineStarts[ref.line] ?? code.text.length);
+  const name = ref.referenceName;
+  let start = -1;
+  if (line.startsWith(name, ref.column)) start = ref.column;
+  else if (ref.column >= name.length && line.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
+  else start = line.indexOf(name);
+  return start < 0 ? -1 : from + start;
+}
+
+/** The offset of the `open` bracket matching the `close` one at `at`, read backwards; -1 past `limit` characters. */
+function dartOpening(text: string, at: number, open: string, close: string, limit = 20000): number {
+  let depth = 0;
+  for (let k = at; k >= 0 && at - k < limit; k--) {
+    if (text[k] === close) depth++;
+    else if (text[k] === open && --depth === 0) return k;
+    else if (open === '<' && /[;{}=]/.test(text[k]!)) return -1;
+  }
+  return -1;
+}
+
+/** The simple name a Dart type is written as: `Foo` for `p.Foo<Bar>?`. */
+function dartSimpleTypeName(text: string): string | null {
+  const name = text.replace(/<[\s\S]*$/, '').replace(/\?/g, '').trim().split('.').pop()!.trim();
+  return /^[A-Za-z_$][\w$]*$/.test(name) ? name : null;
+}
+
+/**
+ * The links and head of the Dart expression whose last character is at
+ * `end`, read backwards: `FutureProvider.autoDispose` → `FutureProvider`
+ * then `.autoDispose`; `events.map(mapper)` → `events` then `.map(…)`. Null
+ * for a shape the walk does not read — a cascade section, a number, a call
+ * of an expression.
+ */
+function readDartChain(text: string, end: number): DartChain | null {
+  const links: DartChainLink[] = [];
+  let i = end;
+  const skip = (): void => {
+    while (i >= 0 && /\s/.test(text[i]!)) i--;
+  };
+  for (let step = 0; step < 32; step++) {
+    skip();
+    while (text[i] === '!') {
+      i--;
+      skip();
+    }
+    if (text[i] === ']') {
+      const open = dartOpening(text, i, '[', ']');
+      if (open < 0) return null;
+      links.push({ name: '', typeArgs: [], call: false, index: true });
+      i = open - 1;
+      continue;
+    }
+    if (text[i] === "'" || text[i] === '"') return { head: { kind: 'string' }, links: links.reverse() };
+    let call = false;
+    let typeArgs: string[] = [];
+    if (text[i] === ')') {
+      const close = i;
+      const open = dartOpening(text, i, '(', ')');
+      if (open < 0) return null;
+      i = open - 1;
+      skip();
+      if (text[i] === '>') {
+        const lt = dartOpening(text, i, '<', '>', 400);
+        if (lt < 0) return null;
+        typeArgs = splitCppTopLevel(text.slice(lt + 1, i));
+        i = lt - 1;
+        skip();
+      }
+      if (!/[\w$]/.test(text[i] ?? '')) {
+        // `(…)` with no name before it is the head — unless an expression is called: `f()(…)`.
+        if (typeArgs.length > 0 || text[i] === ')' || text[i] === ']') return null;
+        return { head: { kind: 'paren', open, close }, links: links.reverse() };
+      }
+      call = true;
+    } else if (text[i] === '>') {
+      // `BlocProvider<CounterCubit>.value(…)`: a type written with its arguments.
+      const lt = dartOpening(text, i, '<', '>', 400);
+      if (lt < 0) return null;
+      typeArgs = splitCppTopLevel(text.slice(lt + 1, i));
+      i = lt - 1;
+      skip();
+    }
+    const nameEnd = i + 1;
+    while (i >= 0 && /[\w$]/.test(text[i]!)) i--;
+    const name = text.slice(i + 1, nameEnd);
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+    let j = i;
+    while (j >= 0 && /\s/.test(text[j]!)) j--;
+    if (text[j] === '.') {
+      // `obj..a().b()`: a cascade section's receiver is the cascade's target.
+      if (text[j - 1] === '.') return null;
+      links.push({ name, typeArgs, call, index: false });
+      i = j - 1;
+      if (text[i] === '?') i--;
+      continue;
+    }
+    const keyword = /([A-Za-z_]\w*)$/.exec(text.slice(Math.max(0, j - 10), j + 1))?.[1] ?? '';
+    return { head: { kind: 'name', name, typeArgs, call, keyword, at: i + 1 }, links: links.reverse() };
+  }
+  return null;
+}
+
+/** What a Dart chain evaluates to, link by link, or null where the evidence runs out. */
+function typeDartChain(chain: DartChain, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  if (depth > 3) return null;
+  const head = chain.head;
+  let links = chain.links;
+  let value: DartValue | null;
+  if (head.kind === 'string') value = { type: 'String', static: false };
+  else if (head.kind === 'paren') value = typeDartParen(head, ref, context, depth);
+  else {
+    // `p.Provider.autoDispose`: an import prefix names a library, so the chain
+    // starts at the link after it, which names what that library exports.
+    const first = links[0];
+    if (!head.call && head.typeArgs.length === 0 && first && !first.index && dartImportPrefixes(ref.filePath, context).has(head.name) &&
+        !isDartNameHidden(head.name, ref, head.at, context)) {
+      value = typeDartPrefixedHead(head.name, first, ref, context, depth);
+      links = links.slice(1);
+    } else {
+      // `const Foo.named(…)`: the named constructor is the head's own link.
+      if ((head.keyword === 'const' || head.keyword === 'new') && !head.call && links[0]?.call) links = links.slice(1);
+      value = typeDartHead(head, ref, context, depth);
+    }
+  }
+  for (const link of links) {
+    // Every Dart object's `toString()` returns a String, whatever it is.
+    if (link.name === 'toString' && link.call && link.typeArgs.length === 0) {
+      value = { type: 'String', static: false };
+      continue;
+    }
+    const next = value ? typeDartLink(value, link, ref, context, depth) : null;
+    // A lookup nothing declared answers for hands back the type it is given,
+    // whatever it is called on: `context.read<LoginCubit>()` on Flutter's
+    // BuildContext, or on an untyped `(context) =>` parameter.
+    const given = !next && link.call && link.typeArgs.length === 1 && DART_TYPE_ARGUMENT_LOOKUPS.has(link.name) &&
+      !(value && dartLinkDeclared(value, link, ref, context)) ? dartSimpleTypeName(link.typeArgs[0]!) : null;
+    // An untyped value stays untyped until a link says what it makes.
+    value = next ?? (given ? { type: given, static: false } : null);
+  }
+  return value;
+}
+
+/** Whether the type a Dart chain has reached declares the member a link names. */
+function dartLinkDeclared(value: DartValue, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return value.static
+    ? dartStaticMember(value.type, link.name, ref, context, dartOwnerOf(value)) !== null
+    : dartMemberOf(value.type, link.name, ref, context, (n) => !isDartSetter(n, context), value.viaSuper ? 1 : 0) !== null;
+}
+
+/** Which of the types named like a chain's value it is: the one its `owner` file declares, when the chain said. */
+function dartOwnerOf(value: DartValue): ((type: Node) => boolean) | undefined {
+  return value.owner === undefined ? undefined : (type) => type.filePath === value.owner;
+}
+
+/** `(x as Foo)` is a Foo; any other parenthesized expression is what its last operand is: `(a ?? Todo(…))`. */
+function typeDartParen(head: { open: number; close: number }, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  const code = dartCodeOf(ref.filePath, context);
+  if (!code) return null;
+  const inner = code.text.slice(head.open + 1, head.close);
+  const cast = /\bas\s+((?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*)\s*(?:<[^()]*>)?\s*\??\s*$/.exec(inner);
+  if (cast) {
+    const type = dartSimpleTypeName(cast[1]!);
+    return type ? { type, static: false } : null;
+  }
+  let end = head.close - 1;
+  while (end > head.open && /\s/.test(code.text[end]!)) end--;
+  return dartExpressionValue(code.text, end, ref, context, depth);
+}
+
+/** The value of the Dart expression ending at `end`: an instance, never a type, and never an awaited one. */
+function dartExpressionValue(text: string, end: number, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  const chain = readDartChain(text, end);
+  if (!chain || (chain.head.kind === 'name' && chain.head.keyword === 'await')) return null;
+  const value = typeDartChain(chain, ref, context, depth + 1);
+  return value && !value.static ? value : null;
+}
+
+/** What a Dart chain's head evaluates to. */
+function typeDartHead(
+  head: { name: string; typeArgs: string[]; call: boolean; keyword: string },
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth: number,
+): DartValue | null {
+  const name = head.name;
+  if (name === 'this' || name === 'super') {
+    const own = dartEnclosingType(ref, context);
+    return own ? { type: own.name, static: false, viaSuper: name === 'super' } : null;
+  }
+  if (head.keyword === 'const' || head.keyword === 'new' || head.keyword === 'as') return { type: name, static: false };
+  if (head.keyword === 'is') return null;
+  const isType = context.getNodesByName(name).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
+  if (head.call) {
+    // `Foo(…)` constructs a Foo; `foo(…)` is what the function says it returns,
+    // or — a variable holding a callable, riverpod's `family(0)` — what its `call` does.
+    if (isType) return { type: name, static: false };
+    const fn = dartFunctionNamed(name, ref, context);
+    if (fn) {
+      const type = dartReturnType(fn, head.typeArgs, context);
+      return type ? { type, static: false } : null;
+    }
+    const held = dartVariableType(name, ref, context, depth);
+    return held ? dartCallResult(held, head.typeArgs, ref, context) : null;
+  }
+  // `Foo.` before a static member — a type outside the project included, whose members nothing reaches.
+  if (isType || (/^[A-Z]/.test(name) && !context.getNodesByName(name).some((n) => n.language === 'dart' && (n.kind === 'constant' || n.kind === 'variable')))) {
+    return { type: name, static: true };
+  }
+  const type = dartVariableType(name, ref, context, depth);
+  return type ? { type, static: false } : null;
+}
+
+/**
+ * What the first link after an import prefix evaluates to — `p.Provider`
+ * before a static member, `p.Report(…)`, `p.make(…)`, `p.config` — read from
+ * the top-level declarations the prefixed import brings in, and nothing when
+ * it brings in none of that name: a package outside the repository, whatever
+ * the project declares under the name elsewhere.
+ */
+function typeDartPrefixedHead(prefix: string, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  const found = dartPrefixedDecls(prefix, link.name, ref, context);
+  const types = found.filter((n) => DART_TYPE_KINDS.has(n.kind));
+  if (types.length > 0) {
+    return { type: link.name, static: !link.call, owner: types.length === 1 ? types[0]!.filePath : undefined };
+  }
+  if (found.length !== 1) return null;
+  const decl = found[0]!;
+  if (decl.kind === 'function') {
+    const type = link.call ? dartReturnType(decl, link.typeArgs, context) : null;
+    return type ? { type, static: false } : null;
+  }
+  if (decl.kind !== 'constant' && decl.kind !== 'variable') return null;
+  const held = dartConstantType(decl, ref, context, depth);
+  if (!held) return null;
+  return link.call ? dartCallResult(held, link.typeArgs, ref, context) : { type: held, static: false };
+}
+
+/** What one link of a Dart chain makes of the value before it. */
+function typeDartLink(value: DartValue, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext, depth: number): DartValue | null {
+  if (link.index) return null;
+  if (value.static) {
+    const member = dartStaticMember(value.type, link.name, ref, context, dartOwnerOf(value));
+    if (!member) {
+      // `BlocProvider.value(…)`, `AsyncValue.data(…)`: a constructor the index holds no node for.
+      return link.call && context.getNodesByName(value.type).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind))
+        ? { type: value.type, static: false } : null;
+    }
+    if (member.kind === 'enum_member') return link.call ? null : { type: value.type, static: false };
+    if (member.kind === 'constant') {
+      // `FutureProvider.autoDispose`: the value the static constant holds.
+      const held = dartConstantType(member, ref, context, depth);
+      if (!held) return null;
+      return link.call ? dartCallResult(held, link.typeArgs, ref, context) : { type: held, static: false };
+    }
+    return typeDartMemberUse(member, link, ref, context);
+  }
+  const member = dartMemberOf(value.type, link.name, ref, context, (n) => !isDartSetter(n, context), value.viaSuper ? 1 : 0)?.node;
+  if (member) return typeDartMemberUse(member, link, ref, context);
+  // A field mints no node: its declared type is read from its class.
+  if (link.call) return null;
+  const field = dartFieldType(value.type, link.name, ref, context, depth);
+  return field ? { type: field, static: false } : null;
+}
+
+/** What using a member makes: a method's call or a getter's read is its declared return type; a getter called is its value called. */
+function typeDartMemberUse(member: Node, link: DartChainLink, ref: UnresolvedRef, context: ResolutionContext): DartValue | null {
+  const getter = isDartGetter(member, context);
+  const type = dartReturnType(member, getter ? [] : link.typeArgs, context);
+  if (!type) return null;
+  if (getter) return link.call ? dartCallResult(type, link.typeArgs, ref, context) : { type, static: false };
+  // A method named without a call is a tear-off: a function, not its result.
+  return link.call ? { type, static: false } : null;
+}
+
+/** What calling a value of `type` returns — its `call` method's declared return type. */
+function dartCallResult(type: string, typeArgs: string[], ref: UnresolvedRef, context: ResolutionContext): DartValue | null {
+  const call = dartMemberOf(type, 'call', ref, context, (n) => !isDartGetter(n, context))?.node;
+  const result = call ? dartReturnType(call, typeArgs, context) : null;
+  return result ? { type: result, static: false } : null;
+}
+
+const DART_RETURN_TYPES = new WeakMap<ResolutionContext, Map<string, { type: string; own: string[] } | null>>();
+
+/**
+ * A Dart function's declared return type as a simple name, a type parameter
+ * of its own replaced by the type argument the call gives (`T read<T>()`
+ * called as `read<Foo>()` is a Foo); a type parameter of its class
+ * (`State get state` in `BlocBase<State>`) says nothing without the
+ * receiver's own arguments.
+ */
+function dartReturnType(fn: Node, typeArgs: string[], context: ResolutionContext): string | null {
+  let memo = DART_RETURN_TYPES.get(context);
+  if (!memo) DART_RETURN_TYPES.set(context, (memo = new Map()));
+  let info = memo.get(fn.id);
+  if (info === undefined) {
+    info = null;
+    const type = fn.returnType ? dartSimpleTypeName(fn.returnType) : null;
+    if (type) {
+      // `static T of<T …>(…)` in `BlocProvider<T …>`: the function's own parameter is the one meant.
+      const own = declaredTypeParameters(fn, context);
+      const cut = fn.qualifiedName.lastIndexOf('::');
+      const owner = cut > 0 && !own.includes(type) ? context.getNodesInFile(fn.filePath).find((n) => DART_TYPE_KINDS.has(n.kind) &&
+        n.qualifiedName === fn.qualifiedName.slice(0, cut) && n.startLine <= fn.startLine && n.endLine >= fn.endLine) : undefined;
+      if (!owner || !declaredTypeParameters(owner, context).includes(type)) info = { type, own };
+    }
+    memo.set(fn.id, info);
+  }
+  if (!info) return null;
+  const at = info.own.indexOf(info.type);
+  if (at < 0) return info.type;
+  return typeArgs[at] ? dartSimpleTypeName(typeArgs[at]!) : null;
+}
+
+/** The innermost Dart class, mixin, enum or extension a reference sits in. */
+function dartEnclosingType(ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  let own: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (DART_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line && (!own || n.startLine >= own.startLine)) own = n;
+  }
+  return own;
+}
+
+/**
+ * The static member `name` the Dart type `typeName` itself declares — a
+ * static method or getter, a named constructor or factory, a static
+ * constant, an enum value — preferring the call site's file, then the
+ * nearest. Static members are not inherited. `isOwner` narrows the types of
+ * that name to the one meant (the one an import prefix brings in).
+ */
+function dartStaticMember(
+  typeName: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  isOwner: (type: Node) => boolean = () => true,
+): Node | null {
+  const owners = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind) && isOwner(n));
+  if (owners.length === 0) return null;
+  const found = context.getNodesByName(name).filter((m) => m.language === 'dart' &&
+    (m.kind === 'method' || m.kind === 'function' || m.kind === 'constant' || m.kind === 'enum_member') &&
+    owners.some((o) => o.filePath === m.filePath && m.qualifiedName === `${o.qualifiedName}::${name}`) &&
+    !isDartSetter(m, context) && isDartStaticMember(m, context));
+  if (found.length <= 1) return found[0] ?? null;
+  return found.find((m) => m.filePath === ref.filePath) ??
+    found.reduce((a, b) => (computePathProximity(ref.filePath, b.filePath) > computePathProximity(ref.filePath, a.filePath) ? b : a));
+}
+
+/**
+ * Whether a member of a Dart type is reached through the type itself: a
+ * static member, constant or enum value, or a named constructor or factory
+ * (`factory ProviderContainer.test(…)`) — not an instance member sharing a
+ * constructor's name (`AsyncValue`'s `error` getter beside its
+ * `AsyncValue.error(…)` factory, even declared on the line above it).
+ */
+function isDartStaticMember(m: Node, context: ResolutionContext): boolean {
+  return m.isStatic === true || m.kind === 'constant' || m.kind === 'enum_member' || isDartConstructor(m, context);
+}
+
+/**
+ * The function a bare Dart call `name(…)` means: a member of the type around
+ * it (an implicit `this.`), else a function of the file, else the one
+ * function of that name the project declares.
+ */
+function dartFunctionNamed(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const own = dartEnclosingType(ref, context);
+  const member = own ? dartMemberOf(own.name, name, ref, context, (n) => !isDartGetter(n, context) && !isDartSetter(n, context))?.node : undefined;
+  if (member) return member;
+  return dartLibraryPick(context.getNodesByName(name).filter((n) => n.language === 'dart' && n.kind === 'function' && !n.qualifiedName.includes('::')), ref, context);
+}
+
+/**
+ * Of same-named top-level Dart declarations, the one the call's library
+ * holds — its own file, then a `part` of it (riverpod_generator's
+ * `depFamilyProvider` in `missing_dependencies.g.dart`) — else the only one.
+ */
+function dartLibraryPick(nodes: Node[], ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const own = nodes.find((n) => n.filePath === ref.filePath);
+  if (own) return own;
+  const library = dartLibraryFiles(ref.filePath, context);
+  const shared = nodes.filter((n) => library.has(n.filePath));
+  if (shared.length === 1) return shared[0]!;
+  return nodes.length === 1 ? nodes[0]! : null;
+}
+
+/** The files of a Dart file's library: itself, its `part`s, and the file it is `part of` with that file's parts. */
+function dartLibraryFiles(filePath: string, context: ResolutionContext): Set<string> {
+  const files = new Set([filePath]);
+  const code = dartCodeOf(filePath, context);
+  for (const part of code?.parts ?? []) files.add(part);
+  if (code?.partOf) {
+    files.add(code.partOf);
+    for (const part of dartCodeOf(code.partOf, context)?.parts ?? []) files.add(part);
+  }
+  return files;
+}
+
+/**
+ * The declared type of a Dart variable a chain starts from: a local or
+ * parameter the code around the call declares (the nearest declaration wins,
+ * and an untyped one ends the search), a field or getter of the class around
+ * it, or a top-level variable.
+ */
+function dartVariableType(name: string, ref: UnresolvedRef, context: ResolutionContext, depth: number): string | null {
+  const local = dartLocalType(name, ref, context, depth);
+  if (local !== undefined) return local;
+  const field = inferMemberReceiverType(name, ref, context);
+  if (field) return dartSimpleTypeName(field);
+  const own = dartEnclosingType(ref, context);
+  const getter = own ? dartMemberOf(own.name, name, ref, context, (n) => isDartGetter(n, context))?.node : undefined;
+  if (getter) return dartReturnType(getter, [], context);
+  const top = dartLibraryPick(context.getNodesByName(name).filter((n) => n.language === 'dart' && n.kind === 'constant' && !n.qualifiedName.includes('::')), ref, context);
+  return top ? dartConstantType(top, ref, context, depth) : null;
+}
+
+/**
+ * The type of the nearest declaration of `name` before the call, within the
+ * function around it: its declared type (`final Ticker _ticker`, `Foo? x`,
+ * `(BuildContext context)`), else what its initializer evaluates to (`final
+ * todo = Todo(…)`). Null for a declaration that says no type (a `for (final
+ * x in …)` variable, an untyped closure parameter); undefined for none.
+ */
+function dartLocalType(name: string, ref: UnresolvedRef, context: ResolutionContext, depth: number): string | null | undefined {
+  const code = dartCodeOf(ref.filePath, context);
+  const at = code ? dartNameStart(ref, code) : -1;
+  if (!code || at < 0) return undefined;
+  const start = code.lineStarts[enclosingScopeStartLine(ref, context) - 1] ?? 0;
+  const scope = code.text.slice(start, at);
+  const uses = dartNameUses(code, ref.filePath, name, context);
+  // The last use before the call: uses are in file order.
+  let lo = 0;
+  let hi = uses.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (uses[mid]! < at) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let u = lo - 1; u >= 0 && uses[u]! >= start; u--) {
+    const pos = uses[u]! - start;
+    const before = scope.slice(Math.max(0, pos - 120), pos);
+    const after = scope.slice(pos + name.length);
+    const declared = /([A-Za-z_$][\w$]*)\s*(<[^;{}()=]*>)?\s*\??\s+$/.exec(before);
+    const typed = declared && !DART_NON_TYPE_WORDS.has(declared[1]!) && /^\s*(?:[=;,)}]|in\b)/.test(after) &&
+      !/^\s*==/.test(after) ? declared[1]! : null;
+    if (typed) return typed;
+    // `final x = …`, `var x = …`: the initializer says the type.
+    if (/(?:^|[^\w$])(?:final|var|late|const)\s+$/.test(before)) {
+      const init = /^\s*=(?![=>])/.exec(after);
+      return init ? dartInitializerType(code.text, start + pos + name.length + init[0].length, ref, context, depth) : null;
+    }
+    // A closure's untyped parameter — `(context, state) =>` — or a `catch (e)`;
+    // not an argument of a call, `foo(x, (a) {…})`, nor an `if (x) {`.
+    if (/^\s*[,)]/.test(after) && /[(,]\s*$/.test(before)) {
+      const open = dartGroupOpen(code.text, start + pos);
+      const close = open < 0 ? -1 : dartGroupClose(code.text, open);
+      const callee = /([\w$]*)\s*(?:<[^;{}()]*>)?\s*$/.exec(code.text.slice(Math.max(0, open - 60), Math.max(0, open)))?.[1] ?? '';
+      if (callee === 'catch') return null;
+      if (close >= 0 && !/[\w$>)\]]\s*$/.test(code.text.slice(Math.max(0, open - 60), Math.max(0, open))) &&
+          /^\)\s*(?:async\s*\*?|sync\s*\*)?\s*(?:=>|\{)/.test(code.text.slice(close, close + 30))) return null;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The `>` closing a Dart type argument list opened at `open` — one followed
+ * by a call, a member or another `>`, which a comparison's `<` never is — or -1.
+ */
+function dartTypeArgumentsEnd(text: string, open: number): number {
+  let depth = 0;
+  for (let k = open; k < text.length && k - open < 400; k++) {
+    const ch = text[k];
+    if (ch === '<') depth++;
+    else if (ch === '>' && --depth === 0) return /^\s*[(.>?]/.test(text.slice(k + 1, k + 4)) ? k : -1;
+    else if (ch === ';' || ch === '{' || ch === '}' || ch === '=') return -1;
+  }
+  return -1;
+}
+
+/** The `(` of the parenthesized group around offset `at`, read backwards; -1 when there is none nearby. */
+function dartGroupOpen(text: string, at: number): number {
+  let parens = 0;
+  let braces = 0;
+  for (let k = at - 1; k >= 0 && at - k < 4000; k--) {
+    const ch = text[k];
+    if (ch === '}') braces++;
+    else if (ch === '{') {
+      if (braces-- === 0) return -1;
+    } else if (braces > 0) continue;
+    else if (ch === ')') parens++;
+    else if (ch === '(') {
+      if (parens-- === 0) return k;
+    } else if (ch === ';') return -1;
+  }
+  return -1;
+}
+
+/** The `)` closing the `(` at `open`; -1 when it is not found nearby. */
+function dartGroupClose(text: string, open: number): number {
+  let depth = 0;
+  for (let k = open; k < text.length && k - open < 8000; k++) {
+    if (text[k] === '(') depth++;
+    else if (text[k] === ')' && --depth === 0) return k;
+  }
+  return -1;
+}
+
+const DART_NAME_USES = new WeakMap<ResolutionContext, Map<string, number[]>>();
+
+/** Where a name is written in a Dart file's code — not as a member (`.name`) — read once per file and name. */
+function dartNameUses(code: DartCode, filePath: string, name: string, context: ResolutionContext): number[] {
+  let memo = DART_NAME_USES.get(context);
+  if (!memo) DART_NAME_USES.set(context, (memo = new Map()));
+  const key = `${filePath}|${name}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  const uses = [...code.text.matchAll(new RegExp(`(?<![\\w$.])${name.replace(/\$/g, '\\$')}(?![\\w$])`, 'g'))].map((m) => m.index!);
+  if (memo.size >= 4096) memo.delete(memo.keys().next().value!);
+  memo.set(key, uses);
+  return uses;
+}
+
+/** What the Dart expression starting at `from` evaluates to, read back from where its statement ends. */
+function dartInitializerType(text: string, from: number, ref: UnresolvedRef, context: ResolutionContext, depth: number): string | null {
+  let nest = 0;
+  let k = from;
+  for (; k < text.length && k - from < 4000; k++) {
+    const ch = text[k]!;
+    // `AsyncNotifierProvider.family<A, B, C>(…)`: a type argument list's commas end nothing.
+    if (ch === '<' && /[\w$]/.test(text[k - 1] ?? '')) {
+      const close = dartTypeArgumentsEnd(text, k);
+      if (close > 0) {
+        k = close;
+        continue;
+      }
+    }
+    if (ch === '(' || ch === '[' || ch === '{') nest++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (nest === 0) break;
+      nest--;
+    } else if ((ch === ';' || ch === ',') && nest === 0) break;
+  }
+  let end = k - 1;
+  while (end >= from && /\s/.test(text[end]!)) end--;
+  if (end < from) return null;
+  return dartExpressionValue(text, end, ref, context, depth)?.type ?? null;
+}
+
+/**
+ * The type a Dart constant is declared with — `static const Foo x = …`,
+ * `final Foo? x` — or, with none written, what its initializer evaluates to:
+ * riverpod's `static const autoDispose = AutoDisposeFutureProviderBuilder();`.
+ */
+function dartConstantType(constant: Node, ref: UnresolvedRef, context: ResolutionContext, depth: number): string | null {
+  const code = dartCodeOf(constant.filePath, context);
+  const from = code?.lineStarts[constant.startLine - 1];
+  if (!code || from === undefined) return null;
+  const head = new RegExp(`\\b(?:const|final|var)\\s+(?:([A-Za-z_$][\\w$.]*)\\s*(?:<[^;=]*>)?\\s*\\??\\s+)?${constant.name.replace(/\$/g, '\\$')}\\s*=(?![=>])`)
+    .exec(code.text.slice(from, from + 600));
+  if (!head) return null;
+  if (head[1] && !DART_NON_TYPE_WORDS.has(head[1])) return dartSimpleTypeName(head[1]);
+  const site: UnresolvedRef = { ...ref, filePath: constant.filePath, line: constant.startLine, column: 0 };
+  return dartInitializerType(code.text, from + head.index + head[0].length, site, context, depth + 1);
+}
+
+/**
+ * The type a Dart class — or a type it extends, mixes in or implements —
+ * declares a field `name` with (`final ProviderPointerManager _pointerManager`),
+ * or what the field is initialized with (`final _cache = Cache()`).
+ */
+function dartFieldType(typeName: string, name: string, ref: UnresolvedRef, context: ResolutionContext, depth: number): string | null {
+  const lineage = [...dartLineage(typeName, context)].sort((a, b) => a[1] - b[1]);
+  for (const [owner] of lineage) {
+    for (const decl of context.getNodesByName(owner)) {
+      if (decl.language !== 'dart' || !DART_TYPE_KINDS.has(decl.kind)) continue;
+      const declared = classMemberType(decl, name, context);
+      if (declared) return dartSimpleTypeName(declared);
+      // An abstract getter mints no node: `ProviderElement? get _listenedElement;`.
+      const getter = new RegExp(String.raw`(?:^|[\s;{}])([A-Za-z_$][\w$]*)\s*(?:<[^;{}=]*>)?\s*\??\s+get\s+${name.replace(/\$/g, '\\$')}\s*;`);
+      for (const { text } of classMemberLines(decl, context)) {
+        const m = text.includes(name) ? getter.exec(text) : null;
+        if (m && !DART_NON_TYPE_WORDS.has(m[1]!)) return dartSimpleTypeName(m[1]!);
+      }
+      const code = dartCodeOf(decl.filePath, context);
+      const from = code?.lineStarts[decl.startLine - 1];
+      const to = code?.lineStarts[decl.endLine];
+      if (!code || from === undefined) continue;
+      const init = new RegExp(`\\b(?:final|var|late)\\s+${name.replace(/\$/g, '\\$')}\\s*=(?![=>])`).exec(code.text.slice(from, to));
+      if (init) {
+        const site: UnresolvedRef = { ...ref, filePath: decl.filePath, line: decl.startLine, column: 0 };
+        return dartInitializerType(code.text, from + init.index + init[0].length, site, context, depth + 1);
+      }
+    }
+  }
+  return null;
 }
 
 /** The simple names a Dart type's declarations extend, mix in, implement, or (an extension / mixin) sit `on`. */
@@ -3016,7 +3991,7 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
 }
 
 const DART_LINEAGES = new WeakMap<ResolutionContext, Map<string, Map<string, number>>>();
-const DART_EXTENSION_OWNERS = new WeakMap<ResolutionContext, Map<string, { on: string[]; named: boolean } | null>>();
+const DART_EXTENSION_OWNERS = new WeakMap<ResolutionContext, Map<string, DartExtensionOwner | null>>();
 const DART_GETTERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /** A Dart type and every type it extends, mixes in or implements, by supertype distance (at most 40). */
@@ -3037,20 +4012,30 @@ function dartLineage(typeName: string, context: ResolutionContext): Map<string, 
   return depths;
 }
 
-/** The extension a Dart member is declared in — the types it is `on`, and whether it is named — or null for a class's, mixin's or enum's member. */
-function dartExtensionOwner(member: Node, context: ResolutionContext): { on: string[]; named: boolean } | null {
+/**
+ * The extension a Dart member is declared in — the types it is `on`, whether
+ * it is named, and whether it is `on` a type parameter of its own (`extension
+ * ObjectX<T> on T`, which every type has) — or null for a class's, mixin's or
+ * enum's member.
+ */
+interface DartExtensionOwner { on: string[]; named: boolean; universal: boolean }
+
+function dartExtensionOwner(member: Node, context: ResolutionContext): DartExtensionOwner | null {
   let memo = DART_EXTENSION_OWNERS.get(context);
   if (!memo) DART_EXTENSION_OWNERS.set(context, (memo = new Map()));
   const hit = memo.get(member.id);
   if (hit !== undefined) return hit;
-  let found: { on: string[]; named: boolean } | null = null;
+  let found: DartExtensionOwner | null = null;
   const cut = member.qualifiedName.lastIndexOf('::');
   if (cut > 0) {
     const ownerQn = member.qualifiedName.slice(0, cut);
     const owner = context.getNodesInFile(member.filePath).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
       n.startLine <= member.startLine && n.endLine >= member.startLine);
     const decl = owner ? dartExtensionDecl(owner, context) : null;
-    if (owner && decl) found = { on: dartHeadOf(owner, context).supers, named: decl.named };
+    if (owner && decl) {
+      const on = dartHeadOf(owner, context).supers;
+      found = { on, named: decl.named, universal: on.length === 1 && declaredTypeParameters(owner, context).includes(on[0]!) };
+    }
   }
   memo.set(member.id, found);
   return found;
@@ -3071,6 +4056,21 @@ function isDartGetter(n: Node, context: ResolutionContext): boolean {
   return getter;
 }
 
+const DART_SETTERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether a Dart member is a setter — declared `set <name>(…)`, which no call or read runs. */
+function isDartSetter(n: Node, context: ResolutionContext): boolean {
+  if (n.language !== 'dart' || n.kind !== 'method') return false;
+  let memo = DART_SETTERS.get(context);
+  if (!memo) DART_SETTERS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [])[n.startLine - 1] ?? '';
+  const setter = new RegExp(String.raw`^[^={;]*?\bset\s+${n.name.replace(/\$/g, '\\$')}\s*\(`).test(line.slice(n.startColumn));
+  memo.set(n.id, setter);
+  return setter;
+}
+
 /**
  * The Dart member `name` a value of type `typeName` reaches, as Dart finds it:
  * the nearest one the type or a type it extends, mixes in or implements
@@ -3078,7 +4078,8 @@ function isDartGetter(n: Node, context: ResolutionContext): boolean {
  * only where no instance member answers, and an unnamed one only in its own
  * library. `accept` narrows the candidates (a read wants a getter). Ties go to
  * the call site's own file, then the nearest directory — riverpod's translated
- * docs carry their own copy of each example's extension.
+ * docs carry their own copy of each example's extension. `minDepth` 1 skips
+ * the type's own members, as `super.` does.
  */
 function dartMemberOf(
   typeName: string,
@@ -3086,23 +4087,35 @@ function dartMemberOf(
   ref: UnresolvedRef,
   context: ResolutionContext,
   accept: (n: Node) => boolean,
+  minDepth = 0,
 ): { node: Node; viaExtension: boolean } | null {
   const lineage = dartLineage(typeName, context);
+  const depthOf = (t: string): number => {
+    const depth = lineage.get(t);
+    return depth === undefined || depth < minDepth ? Infinity : depth;
+  };
   let best: Node[] = [];
   let bestRank = Infinity;
+  let isProjectType: boolean | undefined;
   for (const m of context.getNodesByName(name)) {
     if (m.language !== 'dart' || !isDartMember(m) || !accept(m)) continue;
     const extension = dartExtensionOwner(m, context);
     let rank: number;
     if (extension) {
-      if (!extension.named && m.filePath !== ref.filePath) continue;
-      const on = Math.min(...extension.on.map((t) => lineage.get(t) ?? Infinity));
+      if (!extension.named && !inSameDartLibrary(ref.filePath, m.filePath, context)) continue;
+      // `extension ObjectX<T> on T` reaches every type, after every extension
+      // that names one of its lineage — when the type is the project's, so
+      // what it declares is known: a List's own `cast` is not ObjectX's.
+      const on = extension.universal
+        ? (isProjectType ??= context.getNodesByName(typeName).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind)))
+          ? DART_UNIVERSAL_RANK : Infinity
+        : Math.min(...extension.on.map(depthOf));
       if (on === Infinity) continue;
       rank = DART_EXTENSION_RANK + on;
     } else {
       const owner = m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split('::').pop()!;
-      const depth = lineage.get(owner);
-      if (depth === undefined) continue;
+      const depth = depthOf(owner);
+      if (depth === Infinity) continue;
       rank = depth;
     }
     if (rank < bestRank) {
@@ -3161,6 +4174,130 @@ export function matchDartMemberRead(ref: UnresolvedRef, context: ResolutionConte
 }
 
 /**
+ * Whether a ref is a Dart annotation — `@riverpod`, `@Riverpod(keepAlive:
+ * true)`, `@meta.immutable` — which the extractor records by its last name, at
+ * the `@`.
+ */
+export function isDartAnnotation(ref: UnresolvedRef): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'decorates';
+}
+
+/**
+ * A Dart annotation is a constant expression: a `const` variable, or a call of
+ * a `const` constructor. So it links, as it is written, a constant or (called)
+ * a class its library can see, through the import prefix it is written with;
+ * a static constant, an enum value or (called) a named constructor of the
+ * type it is written through (`@Foo.value`, `@Foo.named(…)`); or, on a
+ * member, a static constant of the type around it. Never a method, a
+ * getter or a function: riverpod's 506 `@riverpod` annotations went to
+ * riverpod_analyzer_utils' extension getter `riverpod`, not riverpod_annotation's
+ * `const riverpod = Riverpod();`.
+ */
+export function matchDartAnnotation(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!context.getNodesByName(name).some((n) => n.language === 'dart')) return null;
+  const written = dartAnnotationAt(ref, context);
+  if (!written) return null;
+  const { names, call } = written;
+  let pool: Node[];
+  let resolvedBy: ResolvedRef['resolvedBy'] = 'exact-match';
+  if (names.length === 1 || (names.length === 2 && dartImportPrefixes(ref.filePath, context).has(names[0]!))) {
+    const prefix = names.length === 2 ? names[0]! : null;
+    const own = prefix === null && !call ? dartEnclosingStatic(name, ref, context) : null;
+    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.9, resolvedBy };
+    pool = context.getNodesByName(name).filter((n) => isDartLibraryDecl(n) &&
+      (call ? isDartAnnotationClass(n, context) : n.kind === 'constant') && isDartTopLevelVisible(n, ref, context, prefix));
+    if (prefix === null) pool = preferOwnDartLibrary(pool, ref, context);
+  } else if (names.length === 2 || (names.length === 3 && dartImportPrefixes(ref.filePath, context).has(names[0]!))) {
+    const prefix = names.length === 3 ? names[0]! : null;
+    let owners = context.getNodesByName(names[names.length - 2]!).filter((n) =>
+      isDartLibraryDecl(n) && DART_TYPE_KINDS.has(n.kind) && isDartTopLevelVisible(n, ref, context, prefix));
+    if (prefix === null) owners = preferOwnDartLibrary(owners, ref, context);
+    pool = context.getNodesByName(name).filter((m) => m.language === 'dart' &&
+      owners.some((o) => o.filePath === m.filePath && m.qualifiedName === `${o.qualifiedName}::${name}`) &&
+      (call ? isDartConstructor(m, context) : m.kind === 'constant' || m.kind === 'enum_member'));
+    resolvedBy = 'qualified-name';
+  } else {
+    return null;
+  }
+  if (pool.length <= 1) return pool[0] ? { original: ref, targetNodeId: pool[0].id, confidence: 0.9, resolvedBy } : null;
+  // Libraries this cannot establish see every file's declarations.
+  const best = findBestMatch(ref, pool, context);
+  return best
+    ? { original: ref, targetNodeId: best.id, confidence: computePathProximity(ref.filePath, best.filePath) >= 30 ? 0.7 : 0.4, resolvedBy }
+    : null;
+}
+
+/** A class a Dart annotation can call a constructor of: not an extension, which has none. */
+function isDartAnnotationClass(n: Node, context: ResolutionContext): boolean {
+  return n.kind === 'class' && dartExtensionDecl(n, context) === null;
+}
+
+/**
+ * The static constant or enum value `name` of the type a Dart annotation is
+ * written in, which a member's annotation names bare. A class's own
+ * annotations stand outside its body.
+ */
+function dartEnclosingStatic(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  let own: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (DART_TYPE_KINDS.has(n.kind) && n.id !== ref.fromNodeId && n.startLine <= ref.line && n.endLine >= ref.line &&
+        (!own || n.startLine >= own.startLine)) own = n;
+  }
+  if (!own) return null;
+  const qualifiedName = `${own.qualifiedName}::${name}`;
+  return context.getNodesByName(name).find((m) => m.language === 'dart' && m.filePath === ref.filePath &&
+    m.qualifiedName === qualifiedName && (m.kind === 'constant' || m.kind === 'enum_member')) ?? null;
+}
+
+/**
+ * How a Dart annotation is written — the names of `@p.Foo.named(…)` up to the
+ * one its ref records, and whether it is called — read from its `@`. The
+ * extractor records the last name, or the one a type argument list follows
+ * (`@Foo<int>.named(…)` is `Foo`'s).
+ */
+function dartAnnotationAt(ref: UnresolvedRef, context: ResolutionContext): { names: string[]; call: boolean } | null {
+  const code = dartCodeOf(ref.filePath, context);
+  const from = code?.lineStarts[ref.line - 1];
+  if (!code || from === undefined) return null;
+  const to = code.lineStarts[ref.line] ?? code.text.length;
+  // On a line with non-ASCII text before it, the `@` whose names fit stands in.
+  const ats = [from + ref.column];
+  for (let k = code.text.indexOf('@', from); k >= 0 && k < to; k = code.text.indexOf('@', k + 1)) {
+    if (k !== from + ref.column) ats.push(k);
+  }
+  for (const at of ats) {
+    const read = code.text[at] === '@' ? readDartAnnotation(code.text, at + 1) : null;
+    const end = read ? (read.typeArgsAt >= 0 ? read.typeArgsAt : read.names.length - 1) : -1;
+    if (read && read.names[end] === ref.referenceName) return { names: read.names.slice(0, end + 1), call: read.call };
+  }
+  return null;
+}
+
+/** A Dart annotation's dotted names, which of them a type argument list follows, and whether `(` comes next on its line. */
+function readDartAnnotation(text: string, i: number): { names: string[]; typeArgsAt: number; call: boolean } | null {
+  const names: string[] = [];
+  let typeArgsAt = -1;
+  const identifier = /[ \t]*([A-Za-z_$][\w$]*)[ \t]*/y;
+  while (names.length < 8) {
+    identifier.lastIndex = i;
+    const m = identifier.exec(text);
+    if (!m) return null;
+    names.push(m[1]!);
+    i = identifier.lastIndex;
+    if (text[i] === '<' && typeArgsAt < 0) {
+      const close = dartTypeArgumentsEnd(text, i);
+      if (close < 0) return null;
+      typeArgsAt = names.length - 1;
+      for (i = close + 1; text[i] === ' ' || text[i] === '\t'; i++);
+    }
+    if (text[i] !== '.') break;
+    i++;
+  }
+  return { names, typeArgsAt, call: text[i] === '(' };
+}
+
+/**
  * A member an extension adds to `typeName` — `s.shout()` on an enum `Shape`
  * through `extension ShapeInfo on Shape` — when the type itself declares none
  * (#2338). An inherited instance member is left to the strategies that
@@ -3169,6 +4306,36 @@ export function matchDartMemberRead(ref: UnresolvedRef, context: ResolutionConte
 function dartExtensionMemberOf(typeName: string, name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
   const found = dartMemberOf(typeName, name, ref, context, () => true);
   return found?.viaExtension ? found.node : null;
+}
+
+/**
+ * A Dart call through a type's name — `BlocProvider.value(…)`, riverpod's
+ * `FutureProvider.autoDispose(…)` — is to one of that type's own constructors
+ * or static members, or to nothing the project declares. Dart inherits none
+ * of them, so a guess past the type is always wrong: flutter_bloc's
+ * `BlocProvider.value(…)` went to `RepositoryProvider`'s `value` 89 times,
+ * riverpod's `Family2Family._()` to the `EmptyFamily2Family._` declared above
+ * it, and the SDK's `Uri.parse(…)`, past bloc_lint's `extension on Uri`, to a
+ * project `parse`. A static constant's callee is the value it holds (`static
+ * const autoDispose = AutoDisposeFutureProviderBuilder();`). The member is
+ * found as a chain's static link finds it (dartStaticMember). Written through
+ * an import prefix (`p.Box<int>.named(…)`, which arrives as `Box.named`), the
+ * type is the one that import brings in, if any. Undefined when the receiver
+ * names no Dart type of the project.
+ */
+function matchDartTypeMemberCall(
+  typeName: string,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  const types = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
+  const prefix = types.length > 0 || /^[_$]*[A-Z]/.test(typeName) ? dartTypeCallPrefix(typeName, member, ref, context) : null;
+  const isOwner = (n: Node): boolean => prefix === null || dartPrefixSees(ref.filePath, prefix, n.filePath, typeName, context);
+  if (!types.some(isOwner)) return prefix === null ? undefined : null;
+  const own = dartStaticMember(typeName, member, ref, context, isOwner);
+  return own && own.kind !== 'enum_member'
+    ? { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
 }
 
 /**
@@ -3365,7 +4532,7 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
 }
 
 /** Whether `name` is one of `language`'s standard-library method names (VB.NET's in any case). */
-function isStdMethodName(language: string, name: string): boolean {
+export function isStdMethodName(language: string, name: string): boolean {
   return stdMethodNames(language)?.has(language === 'vbnet' ? name.toLowerCase() : name) ?? false;
 }
 
@@ -3397,12 +4564,22 @@ function receiverNamesOwner(receiver: string, method: Node, context: ResolutionC
   return sharesReceiverWord(receiver, method);
 }
 
-/** The Dart `extension` declaration a class node stands for, read from its line: `named` false for `extension on X`. */
+/**
+ * The Dart `extension` declaration a class node stands for, read from its
+ * head past the annotations the node starts with (riverpod's `@internal
+ * extension ContainerReadElement on ProviderContainer`): `named` false for
+ * `extension on X`.
+ */
 function dartExtensionDecl(n: Node, context: ResolutionContext): { named: boolean } | null {
   if (n.language !== 'dart' || n.kind !== 'class') return null;
-  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [])[n.startLine - 1] ?? '';
-  if (!/^\s*extension\b(?!\s+type\b)/.test(line)) return null;
-  return { named: !/^\s*extension\s+on\b/.test(line) };
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(n.startLine - 1, Math.min(n.endLine, n.startLine + 5)).join('\n')
+    .replace(/^\s*(?:(?:@[\w$.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?|\/\/[^\n]*)\s*)*/, '');
+  if (!/^extension\b(?!\s+type\b)/.test(head)) return null;
+  // A generic one has no name either: riverpod's `extension<PointerT extends
+  // _PointerBase, ProviderT extends ProviderOrFamily> on Map<…>` took the
+  // `Map` type references of riverpod's own library.
+  return { named: !/^extension\s*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*on\b/.test(head) };
 }
 
 /** Whether a Dart method belongs to an unnamed `extension on X`, visible only in its own library. */
@@ -5838,6 +7015,9 @@ export function matchByExactName(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  // A Dart type name — a declared type, a supertype, the `Color` of `Color.red` — is in scope as a call is, or through its import prefix.
+  const dartTypeRef = ref.language === 'dart' && (ref.referenceKind === 'references' || isInheritanceRef(ref)) && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartPrefix = dartTypeRef ? dartImportPrefixOf(ref, context) : null;
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
@@ -5878,6 +7058,13 @@ export function matchByExactName(
     !isKotlinNumberBitwise(n, ref) &&
     !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    // A Dart constructor is reached through its class (`Foo.named(…)`,
+    // `@Foo.named(…)`), never by its name alone: not a bare call, not the
+    // last link of a chain, not an annotation (riverpod's 210 `@internal`
+    // annotations went to its providers' `internal` constructors).
+    !(ref.language === 'dart' && isDartConstructor(n, context)) &&
+    !(dartBare && isDartTypeValue(n) && !isDartMethodInScope(n, ref, context)) &&
+    !((dartBare || dartTypeRef) && !isDartTopLevelVisible(n, ref, context, dartPrefix)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
@@ -5949,7 +7136,8 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
-  const candidates = dartBare ? nearestDartMembers(filtered, ref, context)
+  const candidates = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
+    : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : filtered;
 
@@ -7359,6 +8547,21 @@ export function matchDottedCallChain(
   const factoryMethod = inner.slice(lastDot + 1);
   if (!factoryClass || !factoryMethod) return null;
   const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
+  if (ref.language === 'dart') {
+    const declared = ret
+      ? resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context))
+      : null;
+    if (declared) return declared;
+    // A generic factory returns its type parameter — `static T of<T>(…)` in
+    // flutter_bloc's BlocProvider — and one outside the project declares
+    // nothing here, so `BlocProvider.of<CounterCubit>(context).increment()`
+    // had no type to look `increment` up on. The call site has it: read the
+    // chain there as a later link of a chain is read (#750), where `of<T>`'s
+    // T is the type argument the call gives. The edge belongs to this ref, not
+    // to the bare name it was looked up by (see the gin runaway above).
+    const link = matchDartChainLink({ ...ref, referenceName: method }, context);
+    return link ? { ...link, original: ref } : null;
+  }
   if (!ret) {
     // Objective-C: a class-message factory — `[X alloc]`, `[X new]`,
     // `[X sharedFoo]` — returns an instance of the RECEIVER class `X` by
@@ -7585,6 +8788,11 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_LINEAGES.delete(context);
   DART_EXTENSION_OWNERS.delete(context);
   DART_GETTERS.delete(context);
+  DART_CONSTRUCTORS.delete(context);
+  DART_SETTERS.delete(context);
+  DART_CODE.delete(context);
+  DART_RETURN_TYPES.delete(context);
+  DART_NAME_USES.delete(context);
   SWIFT_DECLS.delete(context);
   KOTLIN_RECEIVER_TYPES.delete(context);
   KOTLIN_HIERARCHIES.delete(context);
@@ -8709,6 +9917,13 @@ export function matchMethodCall(
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
 
+  // A Dart call through a type's name is to that type's own member, or to
+  // nothing in the project.
+  if (ref.language === 'dart' && dotMatch) {
+    const typeMember = nmTimedT('mc-darttype', ref, () => matchDartTypeMemberCall(objectOrClass!, methodName!, ref, context));
+    if (typeMember !== undefined) return typeMember;
+  }
+
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
   // dedicated inferrer (header scan + `auto`); every other language uses the
@@ -8934,24 +10149,6 @@ export function matchMethodCall(
       if (classNode.language !== ref.language) continue;
 
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      // Dart: a call through a type's static constant invokes the value the
-      // constant holds. riverpod's `FutureProvider.autoDispose(…)` calls
-      // `static const autoDispose = AutoDisposeFutureProviderBuilder();`,
-      // which the lookups below gave to another builder's `autoDispose`
-      // method. A Dart type can't also declare a method of that name, and its
-      // static members are not inherited, so its own constant is the callee.
-      if (ref.language === 'dart') {
-        const holder = nodesInFile.find((n) =>
-          n.kind === 'constant' && n.name === methodName && n.qualifiedName === `${classNode.qualifiedName}::${methodName}`);
-        if (holder) {
-          return {
-            original: ref,
-            targetNodeId: holder.id,
-            confidence: 0.85,
-            resolvedBy: 'qualified-name',
-          };
-        }
-      }
       const methodNode = nodesInFile.find(
         (n) =>
           n.kind === 'method' &&
@@ -9105,7 +10302,7 @@ export function matchMethodCall(
     // `tester.pumpApp(…)` is the imported `PumpApp`, not flutter_counter's
     // `extension on WidgetTester`.
     {
-      const kept = targetMethods.filter((m) => m.filePath === ref.filePath || !isDartUnnamedExtensionMember(m, context));
+      const kept = targetMethods.filter((m) => !isDartUnnamedExtensionMember(m, context) || inSameDartLibrary(ref.filePath, m.filePath, context));
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
@@ -10366,7 +11563,8 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
     return stack;
   };
   const scope = stackAt(code.length);
-  const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`, 'g');
+  // Not `\b`: there is no word boundary beside the `$` of `items$` or `$store`.
+  const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}(?![\\w$])|\\{[^}]*(?<![\\w$])${escaped}(?![\\w$]))`, 'g');
   return [...code.matchAll(declarations)].some(m => stackAt(m.index!).every((p, i) => scope[i] === p));
 }
 
@@ -10374,8 +11572,8 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
  * parentheses must not make the outer shadow invisible. Conservative when a
  * parameter's type mentions the same name: leave that call unresolved. */
 function hasParameterBinding(code: string, escapedName: string): boolean {
-  const name = new RegExp(`\\b${escapedName}\\b`);
-  if (new RegExp(`\\b${escapedName}\\s*=>`).test(code)) return true;
+  const name = new RegExp(`(?<![\\w$])${escapedName}(?![\\w$])`);
+  if (new RegExp(`(?<![\\w$])${escapedName}\\s*=>`).test(code)) return true;
   for (let i = 0; i < code.length; i++) {
     if (code[i] !== '(' || /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(0, i))) continue;
     let depth = 1, j = i + 1;
@@ -10589,7 +11787,8 @@ function findBestMatch(
 
     // For decorator references (`@Foo`), prefer functions. Class
     // decorators (Python `@SomeClass`, Java annotation interfaces)
-    // also resolve here, hence the smaller class bonus.
+    // also resolve here, hence the smaller class bonus. (A Dart annotation,
+    // a constant or a constructor call, is matchDartAnnotation's.)
     if (ref.referenceKind === 'decorates') {
       if (candidate.kind === 'function' || candidate.kind === 'method') {
         score += 25;
@@ -10637,6 +11836,9 @@ export function matchFuzzy(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  // A Dart type name — a declared type, a supertype, the `Color` of `Color.red` — is in scope as a call is, or through its import prefix.
+  const dartTypeRef = ref.language === 'dart' && (ref.referenceKind === 'references' || isInheritanceRef(ref)) && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const dartPrefix = dartTypeRef ? dartImportPrefixOf(ref, context) : null;
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
@@ -10674,6 +11876,11 @@ export function matchFuzzy(
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    !(ref.language === 'dart' && isDartConstructor(n, context)) &&
+    !((dartBare || dartTypeRef) && !isDartTopLevelVisible(n, ref, context, dartPrefix)) &&
+    // A Dart `extension on Color` is no `Color`, here as in exact matching:
+    // flutter_weather's `Color brighten(…)` in that extension names Flutter's.
+    dartExtensionDecl(n, context)?.named !== false &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !isKotlinNumberBitwise(n, ref) &&
@@ -10697,7 +11904,8 @@ export function matchFuzzy(
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
-  const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const languageCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const finalCandidates = dartBare || (dartTypeRef && dartPrefix === null) ? preferOwnDartLibrary(languageCandidates, ref, context) : languageCandidates;
 
   // Both post-pipeline visibility guards (#1745 language-local + #1719 sealed
   // module). The sealed-module test rejects the survivor and never filters the
@@ -11145,6 +12353,14 @@ function matchReferenceInner(
   // would bind it by the member's name alone.
   if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_PATH_CALL.test(ref.referenceName)) {
     return nmTimed('swiftTypePath', ref, () => resolveSwiftTypePathCall(ref, context));
+  }
+
+  // A Dart call through an import prefix (`http.get(…)`) is to what the
+  // prefixed import exports, or to nothing: the strategies below would take
+  // the prefix for a receiver and guess a method by its name.
+  if (ref.language === 'dart' && ref.referenceKind === 'calls') {
+    const prefixed = nmTimedT('dartPrefixed', ref, () => matchDartPrefixedCall(ref, context));
+    if (prefixed !== undefined) return prefixed;
   }
 
   // Try strategies in order of confidence

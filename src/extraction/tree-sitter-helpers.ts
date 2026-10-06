@@ -129,8 +129,17 @@ function cleanCommentMarkers(comment: string): string {
 
 /**
  * Get the docstring/comment preceding a node
+ *
+ * `stepOver` lists node types that may stand between the comments and the
+ * declaration without ending the run: Dart's annotations, in `/// Builds it.`
+ * `@override` `Widget build(…)`. They are not part of the docstring, and the
+ * comments on either side of one join as if it weren't there. Default: none.
  */
-export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
+export function getPrecedingDocstring(
+  node: SyntaxNode,
+  source: string,
+  stepOver: readonly string[] = []
+): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
   // The emitted node's own `previousNamedSibling` is empty (export/const) or a
@@ -152,6 +161,8 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
       sibling.type === 'documentation_comment'
     ) {
       comments.unshift(getNodeText(sibling, source));
+      sibling = sibling.previousNamedSibling;
+    } else if (stepOver.includes(sibling.type)) {
       sibling = sibling.previousNamedSibling;
     } else {
       break;
