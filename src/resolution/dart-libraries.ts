@@ -14,7 +14,9 @@
  * pubspec.yaml says `name: <name>`: the nearest pubspec.yaml above an indexed
  * .dart file, never above the project root. When packages share a name
  * (example apps), the importing file's own package wins, then the one
- * enclosing it, else all of them count.
+ * enclosing it, then the one its package depends on by `path:`, else all of
+ * them count. An `import` / `export` edge links the one file its URI names
+ * (`dartDirectiveFile`).
  *
  * Directives are read from the head of each file at resolution time;
  * extraction, and the kernel's, are unchanged. Where the library cannot be
@@ -357,6 +359,8 @@ interface Memo {
   directives: Map<string, DartDirectives | null>;
   packageOfDir: Map<string, PubPackage | null>;
   packages: Map<string, PubPackage[]> | null;
+  /** By package root and dependency name, the directories its `path:` dependencies of that name point at. */
+  pathDependencies: Map<string, readonly string[]>;
   libraryNames: Map<string, string[]> | null;
   libraryOf: Map<string, string | null>;
   /** A part's parent: the file its `part of` names. */
@@ -375,6 +379,7 @@ function memoFor(context: ResolutionContext): Memo {
       directives: new Map(),
       packageOfDir: new Map(),
       packages: null,
+      pathDependencies: new Map(),
       libraryNames: null,
       libraryOf: new Map(),
       parentOf: new Map(),
@@ -450,6 +455,62 @@ function packagesNamed(name: string, context: ResolutionContext, memo: Memo): re
   return memo.packages.get(name) ?? [];
 }
 
+/**
+ * The `path:` a pubspec gives its dependency `name`, written as a block
+ * (`name:`, then `path: x` below it) or a flow mapping (`name: {path: x}`).
+ * A git dependency's `path:` (inside its `git:` mapping) is a path in that
+ * repository, so only `path:` directly under the name counts.
+ */
+function yamlPathDependencies(text: string, name: string): string[] {
+  const out: string[] = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const key = /^([ \t]+)(['"]?)([A-Za-z_]\w*)\2[ \t]*:(?:[ \t]+(.*))?$/.exec(lines[i]!);
+    if (!key || key[3] !== name) continue;
+    const value = (key[4] ?? '').replace(/(?:^|[ \t])#.*$/, '').trim();
+    if (value !== '') {
+      const flow = /^\{[^{}]*\}$/.test(value)
+        ? /[{,][ \t]*path[ \t]*:[ \t]*(?:"([^"]*)"|'([^']*)'|([^,}\s]+))/.exec(value)
+        : null;
+      if (flow) out.push(flow[1] ?? flow[2] ?? flow[3]!);
+      continue;
+    }
+    let childIndent = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j]!;
+      if (/^[ \t]*(?:#.*)?$/.test(line)) continue;
+      const indent = /^[ \t]*/.exec(line)![0].length;
+      if (indent <= key[1]!.length) break;
+      if (childIndent < 0) childIndent = indent;
+      const dep = indent === childIndent ? /^[ \t]*path[ \t]*:[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/.exec(line) : null;
+      if (dep) out.push(dep[1] ?? dep[2] ?? dep[3]!);
+    }
+  }
+  return out;
+}
+
+/** The project directories `pkg`'s pubspec_overrides.yaml and pubspec.yaml give as the `path:` of its dependency `name`. */
+function pathDependencies(pkg: PubPackage, name: string, context: ResolutionContext, memo: Memo): readonly string[] {
+  const key = `${pkg.root}\0${name}`;
+  const hit = memo.pathDependencies.get(key);
+  if (hit) return hit;
+  const dirs: string[] = [];
+  for (const file of ['pubspec_overrides.yaml', 'pubspec.yaml']) {
+    const pubspec = pkg.root ? `${pkg.root}/${file}` : file;
+    const text = context.fileExists(pubspec) ? context.readFile(pubspec) : null;
+    for (const written of text ? yamlPathDependencies(text, name) : []) {
+      const dep = written.replace(/\\/g, '/');
+      if (dep.startsWith('/') || /^[A-Za-z]:/.test(dep)) continue;
+      const dir = path.posix.normalize(path.posix.join(pkg.root || '.', dep)).replace(/\/+$/, '');
+      if (dir === '..' || dir.startsWith('../')) continue;
+      const root = dir === '.' ? '' : dir;
+      if (!dirs.includes(root)) dirs.push(root);
+    }
+  }
+  memo.pathDependencies.set(key, dirs);
+  return dirs;
+}
+
 /** The project files a URI written in `from` names: none for `dart:` and other schemes, or a package outside the project. */
 function resolveDartUri(from: string, uri: string, context: ResolutionContext, memo: Memo): string[] {
   if (uri.startsWith('package:')) {
@@ -463,12 +524,29 @@ function resolveDartUri(from: string, uri: string, context: ResolutionContext, m
       const enclosing = chosen.filter((p) => p.root === '' || from.startsWith(`${p.root}/`));
       if (own && own.name === name) chosen = [own];
       else if (enclosing.length > 0) chosen = [enclosing.reduce((a, b) => (b.root.length > a.root.length ? b : a))];
+      else if (own) {
+        // Example apps that each keep a same-named package (bloc's two
+        // authentication_repository) name theirs as a path dependency.
+        const dirs = pathDependencies(own, name, context, memo);
+        const declared = chosen.filter((p) => dirs.includes(p.root));
+        if (declared.length === 1) chosen = declared;
+      }
     }
     return chosen.map((p) => path.posix.normalize(p.root ? `${p.root}/lib/${rest}` : `lib/${rest}`));
   }
   if (/^[A-Za-z][\w+.-]*:/.test(uri)) return [];
   const joined = path.posix.normalize(path.posix.join(parentDir(from) || '.', uri));
   return joined === '..' || joined.startsWith('../') || joined.startsWith('/') ? [] : [joined];
+}
+
+/**
+ * The project file a Dart `import` or `export` in `from` names by `uri`, or
+ * null: a `dart:` library, a package from outside the project, a path out of
+ * it, or a package name the project repeats with nothing to say which.
+ */
+export function dartDirectiveFile(from: string, uri: string, context: ResolutionContext): string | null {
+  const files = resolveDartUri(from, uri, context, memoFor(context));
+  return files.length === 1 ? files[0]! : null;
 }
 
 /** The files declaring `library <name>;`. */
