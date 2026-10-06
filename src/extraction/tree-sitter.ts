@@ -6213,8 +6213,10 @@ export class TreeSitterExtractor {
     //
     //    A grammar that wraps the declaration (Dart's `declaration`
     //    around a member with no body) puts the annotations before the
-    //    wrapper, so the scan starts there.
+    //    wrapper, so the scan starts there. One that lets comments sit
+    //    between the annotations and the declaration (Dart) steps over them.
     const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
+    const stepOver = this.extractor?.decoratorStepOverTypes;
     const parent = anchor.parent;
     if (parent) {
       const declStart = anchor.startIndex;
@@ -6230,6 +6232,7 @@ export class TreeSitterExtractor {
         for (let j = declIdx - 1; j >= 0; j--) {
           const sibling = parent.namedChild(j);
           if (!sibling) continue;
+          if (stepOver?.includes(sibling.type)) continue;
           if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
             break; // non-decorator separator → stop consuming
           }

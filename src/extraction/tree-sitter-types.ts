@@ -181,6 +181,13 @@ export interface LanguageExtractor {
    * each one is stepped over, and comments on either side of it still join.
    */
   docstringStepOverTypes?: string[];
+  /**
+   * Node types that may stand between a declaration and the decorators written
+   * before it without ending the scan for them. Dart writes comments there
+   * (`@override` `// ignore: must_call_super` `void f()`), and an annotation
+   * always belongs to the declaration that follows it.
+   */
+  decoratorStepOverTypes?: string[];
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */

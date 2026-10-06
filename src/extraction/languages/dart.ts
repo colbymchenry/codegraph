@@ -539,6 +539,10 @@ export const dartExtractor: LanguageExtractor = {
   // this: its annotations open its own node, and the dartdoc above them is
   // that node's previous sibling.
   docstringStepOverTypes: ['annotation'],
+  // An annotation belongs to the next declaration, whatever comments come
+  // between them: `@override` `// ignore: must_call_super` `void f()`, or a
+  // dartdoc written below the annotations. The decorator scan steps over them.
+  decoratorStepOverTypes: ['comment', 'documentation_comment'],
   resolveBody: (node, bodyField) => {
     // Dart: function_body is a next sibling of function_signature/method_signature
     if (node.type === 'function_signature' || node.type === 'method_signature') {

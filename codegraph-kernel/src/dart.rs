@@ -51,6 +51,12 @@ const MAX_VALUE_REF_NODES: usize = 20_000;
 /// `Widget build(…)`), so the docstring walk steps over them.
 const DOCSTRING_STEP_OVER: &[&str] = &["annotation"];
 
+/// decoratorStepOverTypes (dart.ts) — an annotation belongs to the next
+/// declaration, whatever comments come between them (`@override`
+/// `// ignore: must_call_super` `void f()`), so the decorator scan steps over
+/// them.
+const DECORATOR_STEP_OVER: &[&str] = &["comment", "documentation_comment"];
+
 /// NAME_STOPLIST (function-ref.ts).
 fn is_stoplisted(name: &str) -> bool {
     matches!(
@@ -1457,7 +1463,8 @@ impl<'t> Walker<'t> {
         }
         // Scan 2: preceding siblings, backward, stop at the first
         // non-annotation — stacked annotations emit in REVERSE source order.
-        // A `declaration`-wrapped member's annotations precede the wrapper.
+        // A `declaration`-wrapped member's annotations precede the wrapper,
+        // and the comments between annotations and declaration are stepped over.
         let anchor = self.declaration_wrapper(decl).unwrap_or(decl);
         if let Some(parent) = anchor.parent() {
             let decl_start = anchor.start_byte();
@@ -1473,6 +1480,9 @@ impl<'t> Walker<'t> {
             if let Some(di) = decl_idx {
                 for j in (0..di).rev() {
                     let Some(sib) = parent.named_child(j) else { continue };
+                    if DECORATOR_STEP_OVER.contains(&sib.kind()) {
+                        continue;
+                    }
                     if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
                         break;
                     }

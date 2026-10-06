@@ -33,9 +33,10 @@
  * `declaration`-wrapped member with no body, read from before the wrapper;
  * TortureCommentChains.dart: comments between a member chain's parts skipped
  * by every sibling step; TortureAnnotatedDocs.dart: the dartdoc above a
- * member's annotations, read past them, and what still ends the walk) and
- * their CRLF variants (derived in-memory — #1329), plus defer and
- * generated-file pins.
+ * member's annotations, read past them, and what still ends the walk;
+ * TortureAnnotatedComments.dart: the comments between annotations and their
+ * declaration, stepped over by the decorator scan) and their CRLF variants
+ * (derived in-memory — #1329), plus defer and generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
  * with --max-deferral 0.3); this suite keeps the invariant alive in
@@ -153,6 +154,11 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // import or the previous member's body still ends the walk. Class-like
     // declarations open with their annotations.
     ['TortureAnnotatedDocs.dart', 40],
+    // Comments of every form between annotations and the declaration they
+    // belong to — stacked, on the annotation's line, before members with no
+    // body — are stepped over by the decorator scan; a field, a variable, an
+    // import or the previous member's body still ends it.
+    ['TortureAnnotatedComments.dart', 30],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

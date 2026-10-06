@@ -871,12 +871,16 @@ enum emits nothing). Mechanics for dart:
   decorates `immutable`). Enums and typedefs are built the same way, but
   nothing scans them.
 - Scan #2 (preceding siblings :5002-5023): walk BACKWARD from the
-  declaration; `annotation` is in the accepted set (:5017); stop at the
-  first non-annotation sibling. consider(): target = first namedChild of
-  accepted types → the `identifier` (`override`, `deprecated`, `pragma`,
-  `immutable`, `Deprecated`) → `<`-strip + last-`.`-segment (`@ui.Widget`
-  style would strip to `Widget`) → **`decorates` ref {from the decorated
-  node, name, line/col of the ANNOTATION node}**. With-args annotations
+  declaration; `annotation` is in the accepted set (:5017); step over
+  `comment` / `documentation_comment` siblings (since 2026-10-06, below);
+  stop at the first other non-annotation sibling. consider(): target =
+  first namedChild of accepted types → the `identifier` (`override`,
+  `deprecated`, `pragma`, `immutable`, `Deprecated`) or `scoped_identifier`
+  (`meta.immutable`, `Foo.named`, `p.Foo.named`) → `<`-strip + last-`.`-segment
+  (`@meta.immutable` → `immutable`, `@p.Foo.named(…)` → `named`; the strip
+  runs first, so `@Foo<int>.named(…)`, which parses with an ERROR inside the
+  name, → `Foo`) → **`decorates` ref {from the decorated node, name,
+  line/col of the ANNOTATION node, i.e. its `@`}**. With-args annotations
   emit their NAME; the argument expressions are never visited (no refs from
   `@Deprecated('use other')`'s string).
 - **Stacked annotations emit in REVERSE source order** (the backward walk):
@@ -885,22 +889,34 @@ enum emits nothing). Mechanics for dart:
 - For a method: the previous member's function_body (or any declaration)
   breaks the chain correctly. (The docstring walk steps OVER annotations
   since 2026-10-06 — §Docstrings.)
-- **A comment between an annotation and the declaration ends the scan**, so
-  the annotation above it attaches to nothing: `@override` `// ignore:
-  must_call_super` `void f()`, `@x` `/// Doc below.` `void f()` (pinned in
-  TortureAnnotatedDocs.dart). Measured 2026-10-06: bloc @b9be1e2 hides 7
-  annotations this way (all `@override`), riverpod @4ba1be2 55 on 49
-  declarations (`@override` 33, `@riverpod` 16 in the lint fixtures,
-  `@internal` 6). Left as is ON PURPOSE: stepping over comments here is
-  right for Dart (an annotation always belongs to the next declaration), but
-  Dart nodes store no decorator list, so the only effect would be edges, and
-  `override`/`internal` resolve to nothing, while `decorates` scoring prefers
-  function/method candidates (name-matcher.ts), so `@riverpod` lands on the
-  analyzer getter `RiverpodAnnotatedAnnotatedNodeOfX::riverpod` (0.4)
-  instead of `const riverpod = Riverpod()`. That is already true of
-  riverpod's 506 existing `@riverpod` edges. Fix that ranking for Dart (a
-  const or a class, never a method) first, then add `comment` /
-  `documentation_comment` to scan #2's step-over in both arms.
+- **Comments between the annotations and the declaration are stepped over**
+  (since 2026-10-06). An annotation always belongs to the next declaration,
+  so dart.ts sets `decoratorStepOverTypes: ['comment',
+  'documentation_comment']`, which scan #2 skips, and the kernel's
+  `extract_decorators_for` skips the same `DECORATOR_STEP_OVER` list. No
+  other language sets one. Until then the comment ended the scan and the
+  annotation above it attached to nothing. Now these all attach: `@override`
+  `// ignore: must_call_super` `void f()`, `@x` `/// Doc below.` `void f()`,
+  `@x /* c */ void f()`, a comment on the annotation's own line, and comments
+  between stacked annotations (still in reverse order). Pinned in
+  TortureAnnotatedComments.dart and dart-annotation-comments.test.ts.
+  - Still ends the scan, comments or not: a field's `declaration`, a
+    top-level variable, an import, the previous member's body (`void a() {}
+    // note` `@x void b()` gives `b` only `x`), a class-like declaration.
+  - Class-likes are unaffected. Their leading annotations are scan #1's,
+    which reads every child, comments among them included.
+  - Validation (bloc @b9be1e2 / riverpod @4ba1be2, kernel loaded, on top of
+    the annotation resolution below): `decorates` refs +7 / +54, edges +0 /
+    +16, nothing else in the dumps changed. bloc's 7 are all `@override`.
+    riverpod's 54 (on 48 declarations) are `@override` 32, `@internal` 6 and
+    `@riverpod` 16 (lint fixtures and one website snippet), and each
+    `@riverpod` links `const riverpod`. Kernel and wasm full-index dumps are
+    byte-identical, and the parity sweeps show 0 diffs.
+  - The AST scan's 55th riverpod site is `@override` `// ignore: …` on a
+    FIELD, which no extractor records. A scan that also counts annotation →
+    comment runs INSIDE class-like nodes finds riverpod's 24 `@riverpod`
+    `// ignore: …` `class X` lint fixtures and bloc's `@JsonEnum(…)` `/// …`
+    `enum`. Scan #1 already reads those (an enum's, never: see above).
 - Members with no body (declaration-wrapped ctors, const ctors, redirecting
   factories, abstract and `external` members): the signature's PARENT is the
   `declaration`, so until 2026-10-06 the backward scan ran over the
@@ -914,6 +930,41 @@ enum emits nothing). Mechanics for dart:
   refs, all SDK or package:meta names (`useResult`, `override`, `internal`,
   `visibleForTesting`, …), so no edges; before #2380, riverpod's 23 new
   `@internal` refs on `X.internal(…)` ctors resolved to the ctor itself.
+- **Resolution is TS-side and Dart-specific** (since 2026-10-06):
+  resolveOneInner hands every Dart `decorates` ref to name-matcher.ts's
+  `matchDartAnnotation` before any other strategy, and nothing falls
+  through. A Dart annotation is a const variable or a const constructor
+  call, never a method, getter or function, so the shared decorator ranking
+  (findBestMatch: +25 function/method, +15 class, nothing for a constant)
+  never sees one. That ranking sent riverpod's 506 `@riverpod` to the
+  analyzer's extension getter `RiverpodAnnotatedAnnotatedNodeOfX::riverpod`
+  (0.4) instead of `const riverpod = Riverpod();`.
+  - The matcher re-reads the written form from the `@` in comment-blanked
+    source. It is a call only when `(` follows on the same line, so a record
+    return type on the next line is not taken for arguments.
+  - `@x`: on a member, the enclosing type's own static `constant` /
+    `enum_member` `x` (a class-like's own annotations stand outside its
+    body); else a top-level `constant` the library can see (#2386's model,
+    the own library shadowing imports). `@X(…)`: a visible class `X`, not
+    an extension.
+  - `@p.x` / `@p.X(…)`, when `p` is an import prefix (dart-libraries.ts
+    `isDartImportPrefix`, the imports of the file's whole library): the same
+    through that prefix. Otherwise `@T.x` → T's own `constant` /
+    `enum_member` `x`, and `@T.named(…)` → T's named constructor (#2380's
+    `isDartConstructor`); `@p.T.x` / `@p.T.named(…)` likewise through `p`.
+  - A sole candidate links at 0.9 (`exact-match`, or `qualified-name`
+    through a type). Several (only where the library model can't establish
+    the library) fall back to findBestMatch's proximity at 0.7 / 0.4.
+  - Not modelled: a `final` is not told apart from a `const` (compiling code
+    never annotates with a visible `final`), nor a typedef used to call a
+    constructor.
+  - Validation (main 99246848, kernel loaded): bloc 0 edges changed (no
+    annotation there names a project declaration); riverpod exactly the 506
+    `@riverpod` edges retargeted to `const riverpod` at 0.9, every other
+    `decorates` edge (`$internal`, `Riverpod`, `Dependencies`, …) identical,
+    nodes, refs and files identical. Every extracted annotation in both
+    repos is written with one name, so the prefixed and `T.x` forms are
+    pinned by dart-annotation-targets.test.ts only.
 
 ### Docstrings (tree-sitter-helpers.ts:95-127) — dartdoc is KEPT, both forms
 

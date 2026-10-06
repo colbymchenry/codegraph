@@ -691,3 +691,14 @@ export function inSameDartLibrary(fromFile: string, declFile: string, context: R
   const scope = scopeOf(fromFile, context, memoFor(context));
   return scope !== null && scope.own.has(declFile);
 }
+
+/**
+ * Whether `name` is an import prefix where `fromFile` is written: an import
+ * of its library is `as name` (`p` in `p.Foo`, not the `Foo` of `Foo.bar`).
+ * Where the library is unknown, the file's own imports say.
+ */
+export function isDartImportPrefix(fromFile: string, name: string, context: ResolutionContext): boolean {
+  const memo = memoFor(context);
+  const importers = scopeOf(fromFile, context, memo)?.importers ?? [fromFile];
+  return importers.some((file) => (directivesOf(file, context, memo)?.imports ?? []).some((d) => d.prefix === name));
+}

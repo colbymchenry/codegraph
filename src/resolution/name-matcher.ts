@@ -11,7 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
+import { dartLibrarySees, dartPrefixSees, inSameDartLibrary, isDartImportPrefix } from './dart-libraries';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -4047,6 +4047,130 @@ export function matchDartMemberRead(ref: UnresolvedRef, context: ResolutionConte
   const found = dartMemberOf(typeName, member, ref, context, (n) => isDartGetter(n, context));
   if (!found) return null;
   return { original: ref, targetNodeId: found.node.id, confidence: 0.9, resolvedBy: 'instance-method', edgeKind: 'calls' };
+}
+
+/**
+ * Whether a ref is a Dart annotation — `@riverpod`, `@Riverpod(keepAlive:
+ * true)`, `@meta.immutable` — which the extractor records by its last name, at
+ * the `@`.
+ */
+export function isDartAnnotation(ref: UnresolvedRef): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'decorates';
+}
+
+/**
+ * A Dart annotation is a constant expression: a `const` variable, or a call of
+ * a `const` constructor. So it links, as it is written, a constant or (called)
+ * a class its library can see, through the import prefix it is written with;
+ * a static constant, an enum value or (called) a named constructor of the
+ * type it is written through (`@Foo.value`, `@Foo.named(…)`); or, on a
+ * member, a static constant of the type around it. Never a method, a
+ * getter or a function: riverpod's 506 `@riverpod` annotations went to
+ * riverpod_analyzer_utils' extension getter `riverpod`, not riverpod_annotation's
+ * `const riverpod = Riverpod();`.
+ */
+export function matchDartAnnotation(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!context.getNodesByName(name).some((n) => n.language === 'dart')) return null;
+  const written = dartAnnotationAt(ref, context);
+  if (!written) return null;
+  const { names, call } = written;
+  let pool: Node[];
+  let resolvedBy: ResolvedRef['resolvedBy'] = 'exact-match';
+  if (names.length === 1 || (names.length === 2 && isDartImportPrefix(ref.filePath, names[0]!, context))) {
+    const prefix = names.length === 2 ? names[0]! : null;
+    const own = prefix === null && !call ? dartEnclosingStatic(name, ref, context) : null;
+    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.9, resolvedBy };
+    pool = context.getNodesByName(name).filter((n) => isDartLibraryDecl(n) &&
+      (call ? isDartAnnotationClass(n, context) : n.kind === 'constant') && isDartTopLevelVisible(n, ref, context, prefix));
+    if (prefix === null) pool = preferOwnDartLibrary(pool, ref, context);
+  } else if (names.length === 2 || (names.length === 3 && isDartImportPrefix(ref.filePath, names[0]!, context))) {
+    const prefix = names.length === 3 ? names[0]! : null;
+    let owners = context.getNodesByName(names[names.length - 2]!).filter((n) =>
+      isDartLibraryDecl(n) && DART_TYPE_KINDS.has(n.kind) && isDartTopLevelVisible(n, ref, context, prefix));
+    if (prefix === null) owners = preferOwnDartLibrary(owners, ref, context);
+    pool = context.getNodesByName(name).filter((m) => m.language === 'dart' &&
+      owners.some((o) => o.filePath === m.filePath && m.qualifiedName === `${o.qualifiedName}::${name}`) &&
+      (call ? isDartConstructor(m, context) : m.kind === 'constant' || m.kind === 'enum_member'));
+    resolvedBy = 'qualified-name';
+  } else {
+    return null;
+  }
+  if (pool.length <= 1) return pool[0] ? { original: ref, targetNodeId: pool[0].id, confidence: 0.9, resolvedBy } : null;
+  // Libraries this cannot establish see every file's declarations.
+  const best = findBestMatch(ref, pool, context);
+  return best
+    ? { original: ref, targetNodeId: best.id, confidence: computePathProximity(ref.filePath, best.filePath) >= 30 ? 0.7 : 0.4, resolvedBy }
+    : null;
+}
+
+/** A class a Dart annotation can call a constructor of: not an extension, which has none. */
+function isDartAnnotationClass(n: Node, context: ResolutionContext): boolean {
+  return n.kind === 'class' && dartExtensionDecl(n, context) === null;
+}
+
+/**
+ * The static constant or enum value `name` of the type a Dart annotation is
+ * written in, which a member's annotation names bare. A class's own
+ * annotations stand outside its body.
+ */
+function dartEnclosingStatic(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  let own: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (DART_TYPE_KINDS.has(n.kind) && n.id !== ref.fromNodeId && n.startLine <= ref.line && n.endLine >= ref.line &&
+        (!own || n.startLine >= own.startLine)) own = n;
+  }
+  if (!own) return null;
+  const qualifiedName = `${own.qualifiedName}::${name}`;
+  return context.getNodesByName(name).find((m) => m.language === 'dart' && m.filePath === ref.filePath &&
+    m.qualifiedName === qualifiedName && (m.kind === 'constant' || m.kind === 'enum_member')) ?? null;
+}
+
+/**
+ * How a Dart annotation is written — the names of `@p.Foo.named(…)` up to the
+ * one its ref records, and whether it is called — read from its `@`. The
+ * extractor records the last name, or the one a type argument list follows
+ * (`@Foo<int>.named(…)` is `Foo`'s).
+ */
+function dartAnnotationAt(ref: UnresolvedRef, context: ResolutionContext): { names: string[]; call: boolean } | null {
+  const code = dartCodeOf(ref.filePath, context);
+  const from = code?.lineStarts[ref.line - 1];
+  if (!code || from === undefined) return null;
+  const to = code.lineStarts[ref.line] ?? code.text.length;
+  // On a line with non-ASCII text before it, the `@` whose names fit stands in.
+  const ats = [from + ref.column];
+  for (let k = code.text.indexOf('@', from); k >= 0 && k < to; k = code.text.indexOf('@', k + 1)) {
+    if (k !== from + ref.column) ats.push(k);
+  }
+  for (const at of ats) {
+    const read = code.text[at] === '@' ? readDartAnnotation(code.text, at + 1) : null;
+    const end = read ? (read.typeArgsAt >= 0 ? read.typeArgsAt : read.names.length - 1) : -1;
+    if (read && read.names[end] === ref.referenceName) return { names: read.names.slice(0, end + 1), call: read.call };
+  }
+  return null;
+}
+
+/** A Dart annotation's dotted names, which of them a type argument list follows, and whether `(` comes next on its line. */
+function readDartAnnotation(text: string, i: number): { names: string[]; typeArgsAt: number; call: boolean } | null {
+  const names: string[] = [];
+  let typeArgsAt = -1;
+  const identifier = /[ \t]*([A-Za-z_$][\w$]*)[ \t]*/y;
+  while (names.length < 8) {
+    identifier.lastIndex = i;
+    const m = identifier.exec(text);
+    if (!m) return null;
+    names.push(m[1]!);
+    i = identifier.lastIndex;
+    if (text[i] === '<' && typeArgsAt < 0) {
+      const close = dartTypeArgumentsEnd(text, i);
+      if (close < 0) return null;
+      typeArgsAt = names.length - 1;
+      for (i = close + 1; text[i] === ' ' || text[i] === '\t'; i++);
+    }
+    if (text[i] !== '.') break;
+    i++;
+  }
+  return { names, typeArgsAt, call: text[i] === '(' };
 }
 
 /**
@@ -11530,7 +11654,8 @@ function findBestMatch(
 
     // For decorator references (`@Foo`), prefer functions. Class
     // decorators (Python `@SomeClass`, Java annotation interfaces)
-    // also resolve here, hence the smaller class bonus.
+    // also resolve here, hence the smaller class bonus. (A Dart annotation,
+    // a constant or a constructor call, is matchDartAnnotation's.)
     if (ref.referenceKind === 'decorates') {
       if (candidate.kind === 'function' || candidate.kind === 'method') {
         score += 25;
