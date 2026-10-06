@@ -83,7 +83,9 @@ describe('writer lock (#1740)', () => {
       const msg = writerLockHeldMessage(r.existing, r.pidPath);
       expect(msg).toMatch(/writer lock held/i);
       expect(msg).toMatch(/CODEGRAPH_NO_DAEMON/);
-      expect(msg).toMatch(/daemon stop/);
+      // `codegraph daemon` is the picker that stops one; it takes no arguments.
+      expect(msg).toMatch(/codegraph daemon\b/);
+      expect(msg).not.toMatch(/daemon stop/);
     }
   });
 
