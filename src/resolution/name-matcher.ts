@@ -3489,25 +3489,21 @@ function dartStaticMember(typeName: string, name: string, ref: UnresolvedRef, co
   const found = context.getNodesByName(name).filter((m) => m.language === 'dart' &&
     (m.kind === 'method' || m.kind === 'function' || m.kind === 'constant' || m.kind === 'enum_member') &&
     owners.some((o) => o.filePath === m.filePath && m.qualifiedName === `${o.qualifiedName}::${name}`) &&
-    !isDartSetter(m, context) && isDartStaticMember(m, typeName, context));
+    !isDartSetter(m, context) && isDartStaticMember(m, context));
   if (found.length <= 1) return found[0] ?? null;
   return found.find((m) => m.filePath === ref.filePath) ??
     found.reduce((a, b) => (computePathProximity(ref.filePath, b.filePath) > computePathProximity(ref.filePath, a.filePath) ? b : a));
 }
 
 /**
- * Whether a member of the Dart type `owner` is reached through the type
- * itself: a static member, constant or enum value, or a named constructor or
- * factory (`factory ProviderContainer.test(…)`) — not an instance member
- * sharing a constructor's name (`AsyncValue`'s `error` getter beside its
- * `AsyncValue.error(…)` factory).
+ * Whether a member of a Dart type is reached through the type itself: a
+ * static member, constant or enum value, or a named constructor or factory
+ * (`factory ProviderContainer.test(…)`) — not an instance member sharing a
+ * constructor's name (`AsyncValue`'s `error` getter beside its
+ * `AsyncValue.error(…)` factory, even declared on the line above it).
  */
-function isDartStaticMember(m: Node, owner: string, context: ResolutionContext): boolean {
-  if (m.isStatic || m.kind === 'constant' || m.kind === 'enum_member') return true;
-  const lines = context.getFileLines?.(m.filePath) ?? context.readFile(m.filePath)?.split(/\r?\n/) ?? [];
-  const head = `${(lines[m.startLine - 1] ?? '').slice(m.startColumn)} ${lines[m.startLine] ?? ''} ${lines[m.startLine + 1] ?? ''}`;
-  const esc = (s: string): string => s.replace(/\$/g, '\\$');
-  return new RegExp(`(?:^|[^\\w$.])${esc(owner)}\\s*\\.\\s*${esc(m.name)}\\s*[(<]`).test(head);
+function isDartStaticMember(m: Node, context: ResolutionContext): boolean {
+  return m.isStatic === true || m.kind === 'constant' || m.kind === 'enum_member' || isDartConstructor(m, context);
 }
 
 /**
@@ -4006,7 +4002,8 @@ function dartExtensionMemberOf(typeName: string, name: string, ref: UnresolvedRe
  * riverpod's `Family2Family._()` to the `EmptyFamily2Family._` declared above
  * it, and the SDK's `Uri.parse(…)`, past bloc_lint's `extension on Uri`, to a
  * project `parse`. A static constant's callee is the value it holds (`static
- * const autoDispose = AutoDisposeFutureProviderBuilder();`). Undefined when
+ * const autoDispose = AutoDisposeFutureProviderBuilder();`). The member is
+ * found as a chain's static link finds it (dartStaticMember). Undefined when
  * the receiver names no Dart type of the project.
  */
 function matchDartTypeMemberCall(
@@ -4015,19 +4012,10 @@ function matchDartTypeMemberCall(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null | undefined {
-  const types = context.getNodesByName(typeName).filter((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind));
-  if (types.length === 0) return undefined;
-  for (const type of preferCallSiteFile(types, ref.filePath)) {
-    // An `extension on X` has no name to call a member through.
-    if (dartExtensionDecl(type, context)?.named === false) continue;
-    const qualifiedName = `${type.qualifiedName}::${member}`;
-    // Never an instance member of that name: riverpod's `AsyncValue.error(…)`
-    // is `const factory AsyncValue.error(…)`, not `Object? get error`.
-    const own = context.getNodesInFile(type.filePath).find((n) => n.qualifiedName === qualifiedName &&
-      (n.kind === 'constant' || (n.kind === 'method' && (n.isStatic === true || isDartConstructor(n, context)))));
-    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'qualified-name' };
-  }
-  return null;
+  if (!context.getNodesByName(typeName).some((n) => n.language === 'dart' && DART_TYPE_KINDS.has(n.kind))) return undefined;
+  const own = dartStaticMember(typeName, member, ref, context);
+  return own && own.kind !== 'enum_member'
+    ? { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
 }
 
 /**
@@ -8453,6 +8441,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_LINEAGES.delete(context);
   DART_EXTENSION_OWNERS.delete(context);
   DART_GETTERS.delete(context);
+  DART_CONSTRUCTORS.delete(context);
   DART_SETTERS.delete(context);
   DART_CODE.delete(context);
   DART_RETURN_TYPES.delete(context);
