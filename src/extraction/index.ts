@@ -1845,10 +1845,13 @@ export class ExtractionOrchestrator {
   private rootDir: string;
   private hdlContext: HdlIndexContext | null = null;
   private hdlForce = false;
+  /** A source the changed profile re-reads was not stored, so that profile is not the indexed one yet. */
+  private hdlForceUnstored = false;
   private hdlTouched = new Set<string>();
 
   private prepareHdlContext(): void {
     this.hdlTouched.clear();
+    this.hdlForceUnstored = false;
     const previous = this.queries.getMetadata('hdl_profile_fingerprint');
     this.hdlContext = new HdlIndexContext(this.rootDir, !!this.queries.getMetadata('hdl_profile_name'));
     this.hdlForce = previous !== this.hdlContext.fingerprint && (!!this.hdlContext.profile || !!this.queries.getMetadata('hdl_profile_name'));
@@ -1859,7 +1862,7 @@ export class ExtractionOrchestrator {
     return this.hdlContext!.source(file, content);
   }
   commitHdlProfile(): void {
-    if (!this.hdlContext) return;
+    if (!this.hdlContext || this.hdlForceUnstored) return;
     this.queries.setMetadata('hdl_profile_name', this.hdlContext.profile?.name ?? '');
     this.queries.setMetadata('hdl_profile_fingerprint', this.hdlContext.fingerprint);
     const context = JSON.parse(this.hdlContext.context());
@@ -2985,7 +2988,10 @@ export class ExtractionOrchestrator {
     // this would replace the file's symbols with an empty row under the new
     // content hash, which no hash-based sync revisits. Keep whatever the index
     // has; the stale (or missing) row makes the next sync retry the file.
-    if (hasGrammarLoadFailure(result.errors)) return;
+    if (hasGrammarLoadFailure(result.errors)) {
+      if (this.forceHdlFile(filePath)) this.hdlForceUnstored = true;
+      return;
+    }
 
     // A kernel result can arrive as an undecoded buffer transport (empty
     // node/edge arrays, tables riding in kernelBuffers). Decode it before
