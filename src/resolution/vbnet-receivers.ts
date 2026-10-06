@@ -17,7 +17,9 @@
  *    `Dim x = obj.GetString(…)` returns. A typed receiver's call is the
  *    type's own method or one it inherits, else an extension method declared
  *    for the type, else nothing of the project's: a type the project does
- *    not define (`SFile`, `String`, `List(Of T)`) has none of its methods.
+ *    not define (`SFile`, `String`, `List(Of T)`) has none of its methods. A
+ *    member read through it (`x.Normal`, `Me._h.Title`, a `With` block's
+ *    `.Value`) is the type's member in the same way, link by link.
  * 2. Which type a name means where it is written: the namespaces around it,
  *    outward, then its file's and project's `Imports` (aliases included),
  *    then the project a file belongs to — the `.vbproj` above it, whose
@@ -437,16 +439,46 @@ function projectTypesNamed(name: string, context: ResolutionContext, kinds: Read
   return context.getNodesByLowerName(name.toLowerCase()).filter((n) => n.language === 'vbnet' && kinds.has(n.kind));
 }
 
+const VB_FILE_QNS = new WeakMap<ResolutionContext, Map<string, Map<string, Node[]>>>();
+
+/** A file's VB.NET nodes by lowercased qualified name, indexed once. */
+function nodesByQualifiedName(file: string, context: ResolutionContext): Map<string, Node[]> {
+  let memo = VB_FILE_QNS.get(context);
+  if (!memo) VB_FILE_QNS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const index = new Map<string, Node[]>();
+  for (const n of context.getNodesInFile(file)) {
+    if (n.language !== 'vbnet') continue;
+    const key = n.qualifiedName.toLowerCase();
+    const list = index.get(key);
+    if (list) list.push(n);
+    else index.set(key, [n]);
+  }
+  if (memo.size >= 1024) memo.delete(memo.keys().next().value!);
+  memo.set(file, index);
+  return index;
+}
+
 const VB_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 
-/** Members named `name` declared directly in `type` (any partial part of it), case aside. */
+/**
+ * Members named `name` declared directly in `type` (any partial part of it),
+ * case aside. A member is declared inside a part of its type, so it is looked
+ * up in those parts' files: one lookup per type name, not one per member name.
+ */
 function membersNamed(type: Node, name: string, context: ResolutionContext): Node[] {
   let memo = VB_MEMBERS.get(context);
   if (!memo) VB_MEMBERS.set(context, (memo = new Map()));
   const qn = `${type.qualifiedName}::${name}`.toLowerCase();
   const hit = memo.get(qn);
   if (hit) return hit;
-  const members = context.getNodesByLowerName(name.toLowerCase()).filter((n) => n.language === 'vbnet' && n.qualifiedName.toLowerCase() === qn);
+  const own = type.qualifiedName.toLowerCase();
+  const files = new Set([type.filePath]);
+  for (const part of context.getNodesByLowerName(type.name.toLowerCase())) {
+    if (part.language === 'vbnet' && part.qualifiedName.toLowerCase() === own) files.add(part.filePath);
+  }
+  const members = [...files].flatMap((file) => nodesByQualifiedName(file, context).get(qn) ?? []);
   if (memo.size >= 65536) memo.delete(memo.keys().next().value!);
   memo.set(qn, members);
   return members;
@@ -1253,9 +1285,31 @@ export function matchVbTypedCall(
   const owners = ownersOf(type, context);
   // A type name that leaves two of the project's types: no guess between them.
   if (owners === null) return null;
+  return callOnValue(type, owners, method, ref, context, isStdMethod);
+}
+
+/**
+ * A call of `method` on a value of type `type` (`owners`, the project type
+ * it names; none for an outside type): the type's own method or one it
+ * inherits; an index into its field or property (`x.Items(0)`), which VB.NET
+ * writes as a call, reads the member; else an extension method for the type.
+ */
+function callOnValue(
+  type: VbType,
+  owners: Node[],
+  method: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  isStdMethod: (name: string) => boolean,
+): ResolvedRef | null {
   if (owners.length > 0) {
     const own = memberOn(owners, method, ref, context, false, type);
     if (own) return { original: ref, targetNodeId: own.node.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    const indexed = memberOn(owners, method, ref, context, true, type);
+    if (indexed) {
+      return indexed.node.id === ref.fromNodeId ? null
+        : { original: ref, targetNodeId: indexed.node.id, confidence: 0.9, resolvedBy: 'instance-method', edgeKind: 'references' };
+    }
   }
   return extensionFor(type, owners, method, ref, context, isStdMethod);
 }
@@ -1270,30 +1324,129 @@ const VB_READ_TYPE_KINDS: ReadonlySet<string> = new Set([...VB_TYPE_KINDS, 'enum
  */
 const VB_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'enum_member', 'method', ...VB_TYPE_LIKE_KINDS]);
 
-/** `Name.Member`, as the extractor sends a VB.NET value read through a name (extractVbMemberRead). */
-const VB_MEMBER_READ = /^([A-Za-z_]\w*)\.(\[?[A-Za-z_]\w*\]?)$/;
+/** What a read through a value names: a field, property, constant or event of its type, or a method it runs. */
+const VB_INSTANCE_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'method']);
 
-/** Whether a reference is a VB.NET value read through a name, which matchVbMemberRead alone resolves. */
-export function isVbMemberRead(ref: UnresolvedRef): boolean {
-  return ref.language === 'vbnet' && ref.referenceKind === 'references' && VB_MEMBER_READ.test(ref.referenceName);
+/** Members that belong to a type, not an instance, besides those declared `Shared`: a constant, an `Enum` case, a nested type. */
+const VB_SHARED_READ_KINDS: ReadonlySet<string> = new Set(['constant', 'enum_member', ...VB_TYPE_LIKE_KINDS]);
+
+/**
+ * Whether a member belongs to its type rather than to an instance: `Shared`,
+ * an `Enum` case, a nested type, or a `Const` — Shared without saying so,
+ * which a VB.NET field's node doesn't record, so its declaration is read.
+ */
+function isSharedMember(n: Node, context: ResolutionContext): boolean {
+  if (n.isStatic || VB_SHARED_READ_KINDS.has(n.kind)) return true;
+  if (n.kind !== 'field') return false;
+  const code = codeLines(n.filePath, context).slice(n.startLine - 1, n.startLine + 2).join(' ');
+  return new RegExp(`\\bConst\\s+(?:[^=]*,\\s*)?${escapeRegex(n.name)}(?![\\w$%&!#@])`, 'i').test(code);
 }
 
 /**
- * The project types `name` means where a value is read through it
- * (`AppSession` in `AppSession.SessionId`): a class, module, structure,
- * interface or enum. Null when the name holds a value there — a local, a
- * parameter, a member of a type around the read or of a module — or names
- * no project type, or two. A member typed as the type of its own name
- * (`Public Property Settings As Settings`) reaches that type's members
- * either way, as VB.NET's "Color Color" rule has it.
+ * A member read (or a `With` block's call) as the extractor sends it
+ * (extractVbMemberRead): the receiver — a name, `Me` / `MyClass` / `MyBase`,
+ * or `{T}` for a value of a type the code writes — then each member read
+ * through it, the last the one used: `AppSession.SessionId`, `x.Normal`,
+ * `Me._h.Title`, `{BoolParam}.Switch`.
  */
-function typesReadThrough(name: string, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
+const VB_MEMBER_PATH = /^(\{[^{}]+\}|\[?[A-Za-z_]\w*\]?)((?:\.\[?[A-Za-z_]\w*\]?)*)\.(\[?[A-Za-z_]\w*\]?)$/;
+
+/** Whether a reference is a VB.NET member read through a receiver, which matchVbMemberRead alone resolves. */
+export function isVbMemberRead(ref: UnresolvedRef): boolean {
+  return ref.language === 'vbnet' && ref.referenceKind === 'references' && VB_MEMBER_PATH.test(ref.referenceName);
+}
+
+/**
+ * Whether a reference is a VB.NET call through a receiver path, which only a
+ * `With` block sends (`.Run()` in `With Me._h`, `With DirectCast(o, T)`) and
+ * matchVbPathCall alone resolves. A call through a name (`x.Run`) is the
+ * name matcher's, which types it with matchVbTypedCall.
+ */
+export function isVbPathCall(ref: UnresolvedRef): boolean {
+  if (ref.language !== 'vbnet' || ref.referenceKind !== 'calls') return false;
+  const m = VB_MEMBER_PATH.exec(ref.referenceName);
+  return m !== null && (m[2] !== '' || m[1]!.startsWith('{') || /^(?:Me|MyClass|MyBase)$/i.test(m[1]!));
+}
+
+/** What a receiver path reaches: the project type whose members are read through it, and how. */
+interface VbReceiver {
+  /** The parts of the project type the receiver names or holds a value of; none for an outside type. */
+  owners: Node[];
+  /** The type a value is declared as, with the type arguments it gives; absent through a type's name. */
+  typed?: VbType;
+  /** The receiver names a type (`AppSession`, `Outer.Mode`), whose own members are read, not a value. */
+  throughType: boolean;
+  /** The name is a value whose type has the same name (`theme As Theme`): VB.NET's "Color Color" rule. */
+  colorColor?: boolean;
+}
+
+/** `Name` for an escaped `[Name]`. */
+function unescaped(name: string): string {
+  return name.replace(/^\[(.*)\]$/, '$1');
+}
+
+/** A receiver holding a value of type `t`; null when that type isn't known, is `Object` (late-bound), or names two types. */
+function valueReceiver(t: VbType | null | undefined, context: ResolutionContext): VbReceiver | null {
+  if (!t || typeKey(t) === 'object') return null;
+  const owners = ownersOf(t, context);
+  return owners ? { owners, typed: t, throughType: false } : null;
+}
+
+/**
+ * What a receiver path's first link is where a member is read through it:
+ * `Me` / `MyClass` the type around the read, `MyBase` the class that type
+ * inherits, `{T}` a value of `T`. A name holds a value of its declared type
+ * when it is a local, a parameter, or a member of a type around the read or
+ * of a Module; any other name means the class, module, structure, interface
+ * or enum it names there. A value whose type has its name (`Public Property
+ * Settings As Settings`, `theme As Theme`) may mean either, by VB.NET's
+ * "Color Color" rule: the member read through it decides (matchVbMemberRead).
+ */
+function receiverAt(head: string, ref: UnresolvedRef, context: ResolutionContext): VbReceiver | null {
+  if (head.startsWith('{')) {
+    const owner = context.getNodeById?.(ref.fromNodeId) ?? null;
+    return valueReceiver(resolveTypeParameter(sited(readType(head.slice(1, -1), 0), ref.filePath, ref.line), owner, context), context);
+  }
+  if (/^(?:Me|MyClass|MyBase)$/i.test(head)) {
+    const own = typesAround(ref.filePath, ref.line, context)[0];
+    if (!own) return null;
+    if (/^MyBase$/i.test(head)) return valueReceiver(supertypesOf(own, context).find((s) => !s.implemented), context);
+    return { owners: [own], typed: { name: own.name, array: false }, throughType: false };
+  }
+  const name = unescaped(head);
   const bound = receiverType(name, ref, context, 0);
   const written: VbType | null = bound === undefined ? { name, array: false, file: ref.filePath, line: ref.line }
     : bound && !bound.array && bound.name.toLowerCase() === name.toLowerCase() ? bound : null;
-  if (!written) return null;
+  if (!written) return valueReceiver(bound, context);
   const found = typesNamedAt(written, context, VB_READ_TYPE_KINDS);
-  return found.ambiguous || found.owners.length === 0 ? null : found.owners;
+  return found.ambiguous || found.owners.length === 0 ? null
+    : { owners: found.owners, throughType: true, ...(bound ? { colorColor: true } : {}) };
+}
+
+/**
+ * What `name`, read through `at`, is as a receiver in turn: a value of the
+ * type a field, property or function declares, or a type nested in a type
+ * named for it (`Outer.Mode`). Null where the member, or its type, is not
+ * known here.
+ */
+function memberAt(at: VbReceiver, name: string, ref: UnresolvedRef, context: ResolutionContext): VbReceiver | null {
+  if (at.owners.length === 0) return null;
+  const fits = (n: Node) => VB_INSTANCE_READ_KINDS.has(n.kind) || (at.throughType && VB_READ_TYPE_KINDS.has(n.kind));
+  const found = memberOn(at.owners, name, ref, context, true, at.typed, fits) ??
+    memberOn(at.owners, `[${name}]`, ref, context, true, at.typed, fits);
+  if (!found) return null;
+  if (VB_READ_TYPE_KINDS.has(found.node.kind)) return { owners: [found.node], throughType: true };
+  return valueReceiver(valueMemberType(found.node, context, found.args), context);
+}
+
+/** What the receiver path `head.links…` reaches (see receiverAt and memberAt), or null where a link has no type here. */
+function pathReceiver(head: string, links: string[], ref: UnresolvedRef, context: ResolutionContext): VbReceiver | null {
+  let at = receiverAt(head, ref, context);
+  for (const link of links) {
+    if (!at) return null;
+    at = memberAt(at, unescaped(link), ref, context);
+  }
+  return at;
 }
 
 /**
@@ -1330,43 +1483,92 @@ function namesWithoutRunning(ref: UnresolvedRef, context: ResolutionContext): bo
 }
 
 /**
- * Resolve a VB.NET value read or write through a name (#2305) —
- * `AppSession.SessionId`, `AppSession.CurrentUser = "demo"`, `Logger.Level`,
- * `Mode.Fast` — to the member that the type the name means declares or
- * inherits, and to the type. A method named this way is called (no type is
- * linked, as for a call written with parentheses), unless `AddressOf` or
- * `NameOf` only names it. Null when the name holds a value there (an
- * instance's members are not read through its type), names no project type,
- * or names one without that member: `Color.Red` is not a project `Color`'s.
+ * Resolve a VB.NET member read or write to the member the receiver's type
+ * declares or inherits. Through a type's name (#2305) — `AppSession.SessionId`,
+ * `AppSession.CurrentUser = "demo"`, `Logger.Level`, `Mode.Fast` — the read
+ * links the type as well, and a `Shared` member before a same-named instance
+ * one. Through a value — `x.Normal = 3` on a parameter `x As Holder`,
+ * `Me._h.Title`, a `With` block's `.Value`, an initializer's `.Switch` — it
+ * links the member of the type the value is declared as, whatever that
+ * type's name; never a member of the type the receiver's own name would
+ * mean. A value named like its type (`theme As Theme`) reads an instance
+ * member as a value does and a Shared one as the type does, by VB.NET's
+ * "Color Color" rule. A method named either way is called, as without
+ * parentheses VB.NET runs it, unless `AddressOf` or `NameOf` only names it.
+ * Null when a link of the path is not typed here (an outside type:
+ * `Color.Red`, `str.Length`), is late-bound (`Object`), or names two of the
+ * project's types.
  */
 export function matchVbMemberRead(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const m = VB_MEMBER_READ.exec(ref.referenceName);
+  const m = VB_MEMBER_PATH.exec(ref.referenceName);
   if (!m) return null;
-  const owners = typesReadThrough(m[1]!, ref, context);
-  if (!owners) return null;
+  const links = m[2] ? m[2].slice(1).split('.') : [];
+  const at = pathReceiver(m[1]!, links, ref, context);
+  if (!at || at.owners.length === 0) return null;
+  // `MySettings.Default` reads the property declared `[Default]`, and back.
+  const name = unescaped(m[3]!);
+  const calls = (member: Node) => member.kind === 'method' && !namesWithoutRunning(ref, context);
+  const throughValue = (member: Node): ResolvedRef => ({
+    original: ref,
+    targetNodeId: member.id,
+    confidence: 0.9,
+    resolvedBy: 'instance-method',
+    ...(calls(member) ? { edgeKind: 'calls' as const } : {}),
+  });
+  if (!at.throughType) {
+    // The member the name means: the nearest the type declares or inherits.
+    // The read's own member (`Return Me.Count` in `Count`) runs itself.
+    const fits = (n: Node) => VB_INSTANCE_READ_KINDS.has(n.kind);
+    const member = (memberOn(at.owners, name, ref, context, true, at.typed, fits) ??
+      memberOn(at.owners, `[${name}]`, ref, context, true, at.typed, fits))?.node;
+    return member && member.id !== ref.fromNodeId ? throughValue(member) : null;
+  }
   // Not the member the read is written in: staxrip's `Overrides ReadOnly
   // Property Package` returns the class's `Shared ReadOnly Property Package`.
   const fits = (n: Node) => VB_READ_KINDS.has(n.kind) && n.id !== ref.fromNodeId;
-  // `MySettings.Default` reads the property declared `[Default]`, and back.
-  const name = m[2]!.replace(/^\[(.*)\]$/, '$1');
-  let member = (memberOn(owners, name, ref, context, true, undefined, fits) ??
-    memberOn(owners, `[${name}]`, ref, context, true, undefined, fits))?.node;
+  let member = (memberOn(at.owners, name, ref, context, true, undefined, fits) ??
+    memberOn(at.owners, `[${name}]`, ref, context, true, undefined, fits))?.node;
   if (!member) return null;
   // Of a `Shared` member and an instance one of the same name, a type's name reads the `Shared` one.
   if (!member.isStatic) {
     const found = member;
     member = context.getNodesByQualifiedName(found.qualifiedName).find((n) => n.isStatic && n.filePath === found.filePath && fits(n)) ?? found;
   }
+  // "Color Color": a value named like its type (`theme As Theme`) reads an
+  // instance member through itself, and only a Shared one through the type.
+  if (at.colorColor && !isSharedMember(member, context)) return throughValue(member);
   if (member.kind === 'method') {
     return {
       original: ref,
       targetNodeId: member.id,
       confidence: 0.85,
       resolvedBy: 'qualified-name',
-      ...(namesWithoutRunning(ref, context) ? {} : { edgeKind: 'calls' as const }),
+      ...(calls(member) ? { edgeKind: 'calls' as const } : {}),
     };
   }
-  return readThrough(member, owners, ref, context, { confidence: 0.9 });
+  // A type named through another (`Outer.Mode.Fast`) is linked by the read
+  // that names it (`Outer.Mode`), so only a type named itself is linked here.
+  return links.length === 0 ? readThrough(member, at.owners, ref, context, { confidence: 0.9 })
+    : { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+}
+
+/**
+ * Resolve a VB.NET call through a receiver path, which a `With` block sends
+ * for its `.Run()` (`With Me._h`, `With user.Settings`, `With
+ * DirectCast(o, T)`), as matchVbTypedCall resolves one through a typed name:
+ * the method the path's type has or inherits, a read of a field or property
+ * it indexes, or an extension method for the type. Null — never a guess by
+ * the method's name — when a link of the path is not typed here.
+ */
+export function matchVbPathCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  isStdMethod: (name: string) => boolean,
+): ResolvedRef | null {
+  const m = VB_MEMBER_PATH.exec(ref.referenceName);
+  if (!m) return null;
+  const at = pathReceiver(m[1]!, m[2] ? m[2].slice(1).split('.') : [], ref, context);
+  return at?.typed && !at.throughType ? callOnValue(at.typed, at.owners, unescaped(m[3]!), ref, context, isStdMethod) : null;
 }
 
 const VB_TYPE_IMPORTS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
@@ -1445,7 +1647,7 @@ export function isVbMemberInScope(n: Node, ref: UnresolvedRef, context: Resoluti
  * sync never reads a changed file's old declarations.
  */
 export function clearVbnetReceiverMemos(context: ResolutionContext): void {
-  for (const memo of [VB_CODE_LINES, VB_WORD_LINES, VB_BINDINGS, VB_FILE_TYPES, VB_MEMBERS, VB_MODULES, VB_SUPERS, VB_ANCESTRIES,
+  for (const memo of [VB_CODE_LINES, VB_WORD_LINES, VB_BINDINGS, VB_FILE_TYPES, VB_FILE_QNS, VB_MEMBERS, VB_MODULES, VB_SUPERS, VB_ANCESTRIES,
     VB_PROJECTS, VB_PROJECT_INFO, VB_FILE_IMPORTS, VB_ALIASES, VB_BASE_NAMES, VB_TYPE_PARAMS, VB_EXTENSIONS, VB_TYPE_IMPORTS,
     VB_SCOPES] as Array<WeakMap<ResolutionContext, unknown>>) {
     memo.delete(context);
