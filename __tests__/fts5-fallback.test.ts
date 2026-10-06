@@ -108,6 +108,7 @@ describe('FTS5 fallback (#1532)', () => {
     const nonFtsSchema = (connection: DatabaseConnection) => connection.getDb().prepare(`
       SELECT type, name, sql FROM sqlite_master
       WHERE name NOT LIKE 'nodes_fts%'
+        AND name NOT LIKE 'nodes_tri%'
         AND name NOT IN ('nodes_ai', 'nodes_ad', 'nodes_au')
       ORDER BY type, name
     `).all();
@@ -119,6 +120,30 @@ describe('FTS5 fallback (#1532)', () => {
 
     expect(fallback.fts5Available).toBe(false);
     expect(nonFtsSchema(fallback)).toEqual(expected);
+  });
+
+  it('opens a pre-trigram database without FTS5 and keeps substring search on LIKE', () => {
+    const connection = initialize();
+    const db = connection.getDb();
+    for (const sql of [
+      'DROP TRIGGER nodes_tri_ai', 'DROP TRIGGER nodes_tri_ad', 'DROP TRIGGER nodes_tri_au',
+      'DROP TABLE nodes_tri',
+      'DROP TRIGGER nodes_ai', 'DROP TRIGGER nodes_ad', 'DROP TRIGGER nodes_au',
+      'DROP TABLE nodes_fts',
+      'DELETE FROM schema_versions WHERE version = 12',
+      "INSERT INTO schema_versions (version, applied_at, description) VALUES (11, 0, 'test')",
+    ]) db.exec(sql);
+    new QueryBuilder(db).insertNodes([makeNode('getUserProfile'), makeNode('saveOrder')]);
+    connection.close();
+
+    const reopened = DatabaseConnection.open(path.join(dir, 'test.db'));
+    connections.push(reopened);
+
+    expect(reopened.fts5Available).toBe(false);
+    expect(reopened.getDb().prepare("SELECT name FROM sqlite_master WHERE name LIKE 'nodes_tri%'").all()).toEqual([]);
+    const queries = new QueryBuilder(reopened.getDb());
+    expect(queries.findNodesByNameSubstring('Profile').map(r => r.node.name)).toEqual(['getUserProfile']);
+    expect(queries.searchNodes('serPro').map(r => r.node.name)).toEqual(['getUserProfile']);
   });
 
   it.each(['initialization', 'reopening'])('uses real FTS5 after %s', (state) => {

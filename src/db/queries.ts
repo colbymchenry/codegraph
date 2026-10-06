@@ -267,6 +267,9 @@ export class QueryBuilder {
     | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
     | undefined;
 
+  // nodes_tri (trigram index) presence; databases migrated without FTS5 lack it.
+  private triAvailable: boolean | undefined;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -405,6 +408,7 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.triAvailable = undefined;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -1916,6 +1920,7 @@ export class QueryBuilder {
         name LIKE ?
       )
     `;
+    const tri = this.triCandidates(query, true);
 
     // Pattern variants for better matching
     const exactMatch = query;
@@ -1931,6 +1936,11 @@ export class QueryBuilder {
       contains,       // WHERE: qualified_name contains
       startsWith,     // WHERE: name starts with
     ];
+
+    if (tri) {
+      sql += ` AND ${tri.clause}`;
+      params.push(...tri.params);
+    }
 
     if (kinds && kinds.length > 0) {
       sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -2052,6 +2062,30 @@ export class QueryBuilder {
   }
 
   /**
+   * Trigram prefilter for a `%token%` LIKE: a rowid clause that narrows the
+   * scan to nodes_tri candidates. The caller keeps its own LIKE, so a coarser
+   * trigram fold can only add candidates, never results. Null (keep the plain
+   * scan) when the token is under 3 chars, has a LIKE wildcard, or the
+   * database has no nodes_tri.
+   */
+  private triCandidates(token: string, withQualifiedName: boolean): { clause: string; params: string[] } | null {
+    if ([...token].length < 3 || token.includes('_') || token.includes('%')) return null;
+    if (this.triAvailable === undefined) {
+      this.triAvailable = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'nodes_tri'").get();
+    }
+    if (!this.triAvailable) return null;
+    const pattern = `%${token}%`;
+    if (!withQualifiedName) {
+      return { clause: 'nodes.rowid IN (SELECT rowid FROM nodes_tri WHERE name LIKE ?)', params: [pattern] };
+    }
+    return {
+      clause: `nodes.rowid IN (SELECT rowid FROM nodes_tri WHERE name LIKE ?
+        UNION SELECT rowid FROM nodes_tri WHERE qualified_name LIKE ?)`,
+      params: [pattern, pattern],
+    };
+  }
+
+  /**
    * Find nodes whose name contains a substring (LIKE-based).
    * Useful for CamelCase-part matching where FTS fails because
    * e.g. "TransportSearchAction" is one FTS token, not matchable by "Search"*.
@@ -2070,6 +2104,12 @@ export class QueryBuilder {
       WHERE name LIKE ?
     `;
     const params: (string | number)[] = [`%${substring}%`];
+
+    const tri = this.triCandidates(substring, false);
+    if (tri) {
+      sql += ` AND ${tri.clause}`;
+      params.push(...tri.params);
+    }
 
     // Exclude prefix matches (handled by FTS-based prefix search in Step 2b)
     if (excludePrefix) {
