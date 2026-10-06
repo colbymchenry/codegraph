@@ -6,9 +6,10 @@
  * the class itself, came back empty.
  *
  * The name is looked up as VB.NET does, without regard to case: a local, a
- * parameter or a field of that name holds a value, and links nothing here (a
- * member typed as its own name's type, `Property Settings As Settings`, reads
- * that type's members either way); a type is the one the namespaces around
+ * parameter or a field of that name holds a value, read as the type it is
+ * declared as (vbnet-instance-member-refs.test.ts; a member typed as its own
+ * name's type, `Property Settings As Settings`, reads that type's members
+ * either way); a type is the one the namespaces around
  * the read, its `Imports` and aliases see — SCrawler declares a
  * `SiteSettings` in every site's namespace. A method named without
  * parentheses is called, unless `AddressOf` only names it, and an index into
@@ -199,8 +200,10 @@ describe('VB.NET Shared members read through their type (#2305)', () => {
     expect(linkedFrom('Mode', 'references')).toEqual(['Form1::Setup']);
   });
 
-  it('link nothing through a local, parameter or field, whatever its case', () => {
-    expect(linkedFrom('OtherSession::SessionId', 'references')).toEqual([]);
+  it('read through a local, parameter or field, whatever its case, the type it holds', () => {
+    // `AppSession.SessionId` in `Shadowed(ByVal appSession As OtherSession)`
+    // reads the parameter: OtherSession's field, never AppSession's.
+    expect(linkedFrom('OtherSession::SessionId', 'references')).toEqual(['Form1::Shadowed']);
     expect(linkedFrom('OtherSession::Size', 'references')).toEqual([]);
     expect(linkedFrom('Size', 'references')).toEqual([]);
     expect(linkedFrom('OtherSession', 'references')).toEqual([]);

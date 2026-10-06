@@ -964,7 +964,11 @@ function extractJSImports(content: string): ImportMapping[] {
   // type-only form, not a default import named `type` — which every such
   // line used to add, making `type.innerType()` a call on an import.
   // (`import type from './x'` still binds `type`: backtracking gives it back.)
-  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from\b)\w))?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
+  // A binding is any JS identifier, `$` included: `\w` stops at the `$` of
+  // `import $store from './store'`, failing the whole statement. A default
+  // binding is never followed by `{`, so the `${` of a code generator's
+  // `` `import ${name} from '${src}'` `` is no binding.
+  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from(?![\w$]))[A-Za-z_$]))?(?:([A-Za-z_$][\w$]*)(?![\w${])\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
 
   let match;
   while ((match = importRegex.exec(content)) !== null) {
@@ -984,9 +988,9 @@ function extractJSImports(content: string): ImportMapping[] {
     // Named imports
     if (namedImports) {
       // `{ util, type objectUtil }`: an inline `type` modifier is not part of the name.
-      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=\w)/, ''));
+      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=[A-Za-z_$])/, ''));
       for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
+        const aliasMatch = name.match(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/);
         if (aliasMatch) {
           mappings.push({
             localName: aliasMatch[2]!,
@@ -1038,7 +1042,7 @@ function extractJSImports(content: string): ImportMapping[] {
     if (destructured) {
       const names = destructured.split(',').map((s) => s.trim());
       for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s*:\s*(\w+)/);
+        const aliasMatch = name.match(/([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)/);
         if (aliasMatch) {
           mappings.push({
             localName: aliasMatch[2]!,
@@ -1373,7 +1377,7 @@ export function extractReExports(content: string, language: Language): ReExport[
     for (const raw of inner.split(',')) {
       const item = raw.trim();
       if (!item) continue;
-      const aliasMatch = item.match(/^(\w+)\s+as\s+(\w+)$/);
+      const aliasMatch = item.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
       if (aliasMatch) {
         out.push({
           kind: 'named',
@@ -1381,7 +1385,7 @@ export function extractReExports(content: string, language: Language): ReExport[
           originalName: aliasMatch[1]!,
           source,
         });
-      } else if (/^\w+$/.test(item)) {
+      } else if (/^[A-Za-z_$][\w$]*$/.test(item)) {
         out.push({
           kind: 'named',
           exportedName: item,
