@@ -135,6 +135,24 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   describe.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a store exported by a later statement: %s', (ext, language) => {
+    it.each(['LF', 'CRLF'])('keeps its actions (%s)', (ending) => {
+      // `export default useStore;` is found by a multiline regex over the
+      // source. JS's `$` matches before the `\r` of a CRLF line ending; the
+      // kernel's must too, or a Windows checkout loses the store's actions.
+      const source = [
+        'import { create } from "zustand";',
+        'const useStore = create((set) => ({ inc: () => set({}) }));',
+        'export default useStore;',
+        '',
+      ].join(ending === 'CRLF' ? '\r\n' : '\n');
+      const result = assertParity(`store.${ext}`, source, language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(true);
+    });
+  });
+
+  describe.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('a store whose name has a `$`, exported by a later statement: %s', (ext, language) => {
     // The later-export check builds a regex from the name. Its `$` must match
     // the character, as the kernel's escaped pattern does, not a line end.
