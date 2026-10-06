@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **F#** (`.fs` and `.fsx`): namespaces, modules, functions, values, active patterns, unions, records, enums, classes with their members and exceptions become searchable symbols.
+- In F#, `inherit` and `interface ... with` link a type to what it extends and implements, `open` and script `#load` are recorded as imports, and calls are followed through application, pipes, operators and qualified names.
+- In F#, a name resolves the way F# scopes it, through `open`, a module or type written before it, `[<AutoOpen>]` modules and `namespace global`, so a `map` or `format` in an unrelated namespace is never taken for yours, and an `open` counts only after the line it is written on and inside its own module, while a local `let` or a constructor parameter hides a function of the same name.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
