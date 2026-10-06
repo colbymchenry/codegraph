@@ -363,8 +363,11 @@ impl<'t> Walker<'t> {
             return false;
         }
         let n = regex::escape(name);
+        // `R` (CRLF mode): JS's multiline `^`/`$` treat `\r` as a line end as
+        // well as `\n`; `(?m)` alone sees only `\n`, and would miss `export
+        // default NAME;\r\n` on every Windows autocrlf checkout.
         let pattern = format!(
-            r"(?m)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
+            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
             n = n
         );
         match regex::Regex::new(&pattern) {
