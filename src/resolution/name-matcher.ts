@@ -4163,7 +4163,7 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
 }
 
 /** Whether `name` is one of `language`'s standard-library method names (VB.NET's in any case). */
-function isStdMethodName(language: string, name: string): boolean {
+export function isStdMethodName(language: string, name: string): boolean {
   return stdMethodNames(language)?.has(language === 'vbnet' ? name.toLowerCase() : name) ?? false;
 }
 
