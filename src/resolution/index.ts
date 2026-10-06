@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1136,6 +1136,10 @@ export class ReferenceResolver {
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
+    // So does a later link of a Dart call chain (`X.autoDispose.family(…)`,
+    // `events.map(f).transform(…)`), which arrives by its bare name: a member
+    // of what the chain's head and links are declared to be, or nothing (#750).
+    if (isDartChainLink(ref, this.context)) return matchDartChainLink(ref, this.context);
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
