@@ -562,7 +562,8 @@ export class TreeSitterExtractor {
    * same symbol, and the column holds free text (#1905).
    */
   private docstringFor(node: SyntaxNode): string | undefined {
-    const preceding = getPrecedingDocstring(node, this.source);
+    const anchor = this.extractor?.getDeclarationWrapper?.(node) ?? node;
+    const preceding = getPrecedingDocstring(anchor, this.source);
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
     return body || preceding;
@@ -6201,9 +6202,14 @@ export class TreeSitterExtractor {
     //    wrapper objects from `parent`/`namedChild` navigation, so
     //    `sibling === declNode` is unreliable — `startIndex` does
     //    the matching instead.
-    const parent = declNode.parent;
+    //
+    //    A grammar that wraps the declaration (Dart's `declaration`
+    //    around a member with no body) puts the annotations before the
+    //    wrapper, so the scan starts there.
+    const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
+    const parent = anchor.parent;
     if (parent) {
-      const declStart = declNode.startIndex;
+      const declStart = anchor.startIndex;
       let declIdx = -1;
       for (let i = 0; i < parent.namedChildCount; i++) {
         const sibling = parent.namedChild(i);

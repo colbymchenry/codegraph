@@ -582,6 +582,29 @@ impl<'t> Walker<'t> {
         false
     }
 
+    /// getDeclarationWrapper (dart.ts) — a member with no body (`Foo._();`,
+    /// `const Foo.c();`, an abstract `void m();`) is a `declaration` wrapping
+    /// its signature, and the member's `///` dartdoc and `@annotation`s come
+    /// before the wrapper. A signature that opens the declaration takes both
+    /// from there.
+    fn declaration_wrapper(&self, node: Node<'t>) -> Option<Node<'t>> {
+        let parent = node.parent()?;
+        if parent.kind() != "declaration" {
+            return None;
+        }
+        if parent.named_child(0)? == node {
+            Some(parent)
+        } else {
+            None
+        }
+    }
+
+    /// docstringFor (tree-sitter.ts) — the preceding comment run, looked up
+    /// from the declaration wrapper when there is one.
+    fn docstring_of(&self, node: Node<'t>) -> Option<String> {
+        preceding_docstring(self.declaration_wrapper(node).unwrap_or(node), self.src)
+    }
+
     /// resolveBody (dart.ts:158-171).
     fn resolve_body(&self, node: Node<'t>) -> Option<Node<'t>> {
         if matches!(node.kind(), "function_signature" | "method_signature") {
@@ -804,7 +827,7 @@ impl<'t> Walker<'t> {
             }
             return;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let signature = self.signature_of(node);
         let visibility = self.visibility_of(node);
         let is_async = self.is_async_of(node);
@@ -851,7 +874,7 @@ impl<'t> Walker<'t> {
             }
             return;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let signature = self.signature_of(node);
         let visibility = self.visibility_of(node);
         let is_async = self.is_async_of(node);
@@ -893,7 +916,7 @@ impl<'t> Walker<'t> {
         // fallback finds the ON type's type_identifier — a class named after
         // the extended type (preserved).
         let name = self.extract_name(node);
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let visibility = self.visibility_of(node);
         let row = self.create_node(
             "class",
@@ -924,7 +947,7 @@ impl<'t> Walker<'t> {
             None => return,
         };
         let name = self.extract_name(node);
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let visibility = self.visibility_of(node);
         let row = self.create_node(
             "enum",
@@ -966,7 +989,7 @@ impl<'t> Walker<'t> {
         if name == "<anonymous>" {
             return false;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         // `value` field is null (type_alias has no fields) → no refs from
         // the aliased type; returns false → children re-visited.
         self.create_node("type_alias", &name, node, Extra { docstring, ..Default::default() });
@@ -1397,8 +1420,10 @@ impl<'t> Walker<'t> {
         }
         // Scan 2: preceding siblings, backward, stop at the first
         // non-annotation — stacked annotations emit in REVERSE source order.
-        if let Some(parent) = decl.parent() {
-            let decl_start = decl.start_byte();
+        // A `declaration`-wrapped member's annotations precede the wrapper.
+        let anchor = self.declaration_wrapper(decl).unwrap_or(decl);
+        if let Some(parent) = anchor.parent() {
+            let decl_start = anchor.start_byte();
             let mut decl_idx: Option<usize> = None;
             for i in 0..parent.named_child_count() {
                 if let Some(sib) = parent.named_child(i) {
