@@ -8215,6 +8215,21 @@ export function matchDottedCallChain(
   const factoryMethod = inner.slice(lastDot + 1);
   if (!factoryClass || !factoryMethod) return null;
   const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
+  if (ref.language === 'dart') {
+    const declared = ret
+      ? resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context))
+      : null;
+    if (declared) return declared;
+    // A generic factory returns its type parameter — `static T of<T>(…)` in
+    // flutter_bloc's BlocProvider — and one outside the project declares
+    // nothing here, so `BlocProvider.of<CounterCubit>(context).increment()`
+    // had no type to look `increment` up on. The call site has it: read the
+    // chain there as a later link of a chain is read (#750), where `of<T>`'s
+    // T is the type argument the call gives. The edge belongs to this ref, not
+    // to the bare name it was looked up by (see the gin runaway above).
+    const link = matchDartChainLink({ ...ref, referenceName: method }, context);
+    return link ? { ...link, original: ref } : null;
+  }
   if (!ret) {
     // Objective-C: a class-message factory — `[X alloc]`, `[X new]`,
     // `[X sharedFoo]` — returns an instance of the RECEIVER class `X` by

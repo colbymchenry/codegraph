@@ -562,7 +562,8 @@ export class TreeSitterExtractor {
    * same symbol, and the column holds free text (#1905).
    */
   private docstringFor(node: SyntaxNode): string | undefined {
-    const preceding = getPrecedingDocstring(node, this.source);
+    const anchor = this.extractor?.getDeclarationWrapper?.(node) ?? node;
+    const preceding = getPrecedingDocstring(anchor, this.source);
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
     return body || preceding;
@@ -2817,8 +2818,12 @@ export class TreeSitterExtractor {
     // not the character. Escaped as the kernel's `regex::escape` does, so
     // both paths decide the same.
     const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Inside `{ … }` the name is bounded by a character that can't continue
+    // an identifier, not by `\b`, which takes a `$` for a separator: it can't
+    // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
+    // kernel spells it, since the kernel's `\w` is Unicode.
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{[^}]*\\b${n}\\b[^}]*\\})`,
+      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
       'm'
     );
     return re.test(this.source);
@@ -6201,9 +6206,14 @@ export class TreeSitterExtractor {
     //    wrapper objects from `parent`/`namedChild` navigation, so
     //    `sibling === declNode` is unreliable — `startIndex` does
     //    the matching instead.
-    const parent = declNode.parent;
+    //
+    //    A grammar that wraps the declaration (Dart's `declaration`
+    //    around a member with no body) puts the annotations before the
+    //    wrapper, so the scan starts there.
+    const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
+    const parent = anchor.parent;
     if (parent) {
-      const declStart = declNode.startIndex;
+      const declStart = anchor.startIndex;
       let declIdx = -1;
       for (let i = 0; i < parent.namedChildCount; i++) {
         const sibling = parent.namedChild(i);

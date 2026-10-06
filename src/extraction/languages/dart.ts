@@ -128,10 +128,11 @@ interface DartMisparsedCall {
  * the callee and `(` against the `>`. A comparison is written `a < b`.
  *
  * A call chained on it keeps the bare name it had (`increment` in
- * `BlocProvider.of<CounterCubit>(context).increment()`) rather than taking
- * the `BlocProvider.of().increment` a parsed chain gets: that encoding
- * resolves through what `of` returns, and a generic factory like this one
- * returns its type parameter, so it would drop the edge the bare name finds.
+ * `BlocProvider.of<CounterCubit>(context).increment()`), where a parsed
+ * chain gets `BlocProvider.of().increment`. The resolver gives both the same
+ * method: it types a bare link from the chain written before it, and an
+ * encoded chain the same way when `of` declares no type of its own to return
+ * (`static T of<T>(…)`, or a factory outside the project) (#750).
  */
 export function dartMisparsedGenericCall(lt: SyntaxNode): DartMisparsedCall | undefined {
   if (lt.type !== 'relational_operator' || lt.firstChild?.type !== '<') return undefined;
@@ -521,6 +522,15 @@ export const dartExtractor: LanguageExtractor = {
       if (owner) pushDartTypeRefs(node, owner, push);
     }
     return false;
+  },
+  // A member with no body — a constructor like `Foo._();` or `const Foo.c();`,
+  // an abstract `void m();` — is a `declaration` wrapping its signature, and
+  // the member's `///` dartdoc and `@annotation`s come before the wrapper. A
+  // signature that opens the declaration takes both from there.
+  getDeclarationWrapper: (node) => {
+    const parent = node.parent;
+    if (parent?.type !== 'declaration') return undefined;
+    return parent.firstNamedChild?.equals(node) ? parent : undefined;
   },
   resolveBody: (node, bodyField) => {
     // Dart: function_body is a next sibling of function_signature/method_signature

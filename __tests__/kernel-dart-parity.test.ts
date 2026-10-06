@@ -29,6 +29,8 @@
  * skipped, every redirect-target form, and constructors called with type
  * arguments, as statements and as expressions; TortureGenericCalls.dart:
  * generic calls parsed as two comparisons, recovered as calls;
+ * TortureDeclarationDocs.dart: the dartdoc and annotations of a
+ * `declaration`-wrapped member with no body, read from before the wrapper;
  * TortureCommentChains.dart: comments between a member chain's parts skipped
  * by every sibling step) and their CRLF variants (derived in-memory — #1329),
  * plus defer and generated-file pins.
@@ -136,6 +138,10 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // as `(ref.read < Repo) > (p)`): every callee, type-argument and argument
     // shape, in bodies and initializers, and the comparisons that look alike.
     ['TortureGenericCalls.dart', 10],
+    // Members with no body (`declaration`-wrapped constructors, abstract and
+    // external members) take their dartdoc and annotations from before the
+    // wrapper; a field's stay with the field.
+    ['TortureDeclarationDocs.dart', 20],
     // Comments between a chain's parts — `tester //` + newline + `.state(…)`,
     // dartdoc, block comments, one between a member and its arguments — are
     // skipped by every sibling step: calls, chains, reads, static references.
