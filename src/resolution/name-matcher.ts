@@ -4163,7 +4163,7 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
 }
 
 /** Whether `name` is one of `language`'s standard-library method names (VB.NET's in any case). */
-function isStdMethodName(language: string, name: string): boolean {
+export function isStdMethodName(language: string, name: string): boolean {
   return stdMethodNames(language)?.has(language === 'vbnet' ? name.toLowerCase() : name) ?? false;
 }
 
@@ -11171,7 +11171,8 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
     return stack;
   };
   const scope = stackAt(code.length);
-  const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`, 'g');
+  // Not `\b`: there is no word boundary beside the `$` of `items$` or `$store`.
+  const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}(?![\\w$])|\\{[^}]*(?<![\\w$])${escaped}(?![\\w$]))`, 'g');
   return [...code.matchAll(declarations)].some(m => stackAt(m.index!).every((p, i) => scope[i] === p));
 }
 
@@ -11179,8 +11180,8 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
  * parentheses must not make the outer shadow invisible. Conservative when a
  * parameter's type mentions the same name: leave that call unresolved. */
 function hasParameterBinding(code: string, escapedName: string): boolean {
-  const name = new RegExp(`\\b${escapedName}\\b`);
-  if (new RegExp(`\\b${escapedName}\\s*=>`).test(code)) return true;
+  const name = new RegExp(`(?<![\\w$])${escapedName}(?![\\w$])`);
+  if (new RegExp(`(?<![\\w$])${escapedName}\\s*=>`).test(code)) return true;
   for (let i = 0; i < code.length; i++) {
     if (code[i] !== '(' || /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(0, i))) continue;
     let depth = 1, j = i + 1;
