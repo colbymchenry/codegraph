@@ -754,9 +754,11 @@ recovered form emits what the parsed call does:
 
 A call chained on a recovered one keeps its bare name (`increment` in
 `BlocProvider.of<CounterCubit>(context).increment()`), unlike the parsed
-chain's `BlocProvider.of().increment`: that encoding resolves through `of`'s
-return type, which for generic factories is the type parameter, so it would
-lose the edge the bare name finds.
+chain's `BlocProvider.of().increment`. The resolver gives both the same
+method: a bare link is typed from the chain written before it, and so is an
+encoded chain whose inner call declares no type of its own to return — a
+generic factory's type parameter (`static T of<T>`) or a factory outside the
+project (#750). Nothing is gained by re-encoding the recovered chain.
 
 The grammar can also end an arrow function in front of a generic call:
 `(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`, in the
@@ -765,7 +767,7 @@ receiver in that place from the end of the arrow's body (Dart writes a member
 access on an arrow itself in parentheses), for callee names and static-member
 refs: `ref.watch`, `BlocProvider.of`. dartCalleeOfArgPart / callee_of_arg_part
 do not, so `() => BlocProvider.of<CounterCubit>(context).increment()` keeps
-`increment` bare, for the reason above.
+`increment` bare, which resolves as above.
 
 ### Static-member / value-read refs — dart branch (:4759-4767), STATIC_MEMBER_LANGS:346
 

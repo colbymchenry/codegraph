@@ -1219,8 +1219,8 @@ impl<'t> Walker<'t> {
     /// operator) and the identifier naming its type argument. Recovered when
     /// the type argument names a type and the code is laid out as a call —
     /// `<` against the callee, `(` against the `>`. A call chained on it keeps
-    /// its bare name (the `X().m` encoding resolves through a generic
-    /// factory's type parameter and finds nothing).
+    /// its bare name, which the resolver types from the chain written before
+    /// it, as it types a parsed chain's `X().m` (#750).
     fn misparsed_generic_call(&self, lt: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
         if lt.kind() != "relational_operator" || lt.child(0)?.kind() != "<" {
             return None;
