@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Go, a call into one of your own packages that shares its name with a standard-library package, like a project's `lib/errors`, `pkg/log` or `model/user`, now links: `errors.New(…)` or `log.Infof(…)` in a file that imports your package reaches your function, so its callers and impact are no longer nearly empty. The same goes for a struct built from such a package, like `types.Policy{…}`. A file that imports the standard library's package of that name is unaffected. Re-index Go projects after upgrading. (#2368)
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn for the report. (#2600)
