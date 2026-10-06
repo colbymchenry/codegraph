@@ -6,13 +6,17 @@
  * `type.innerType()` (a parameter named `type`) was taken for a call on an
  * import. An inline `{ util, type objectUtil }` named its binding
  * `type objectUtil`.
+ *
+ * A binding is any JS identifier, `$` included. The import regexes matched
+ * names with `\w`, which stops at a `$`: `import items$ from './store'` and
+ * `import * as ns$` yielded no binding at all, and `{ a as b$ }` bound `b`.
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
-import { extractImportMappings } from '../src/resolution/import-resolver';
+import { extractImportMappings, extractReExports } from '../src/resolution/import-resolver';
 
 const bindings = (source: string) =>
   extractImportMappings('src/a.ts', source, 'typescript').map((m) => `${m.localName}<${m.exportedName}${m.isNamespace ? ' ns' : ''}`);
@@ -31,6 +35,90 @@ describe('import mappings and TypeScript type modifiers', () => {
 
   it('a default import that is named `type` is still one', () => {
     expect(bindings(`import type from './type';\n`)).toEqual(['type<default']);
+  });
+});
+
+describe('import bindings whose names contain `$`', () => {
+  it('default, namespace and mixed imports bind the whole name', () => {
+    expect(bindings(`import items$ from './store';\n`)).toEqual(['items$<default']);
+    expect(bindings(`import $store from './store';\n`)).toEqual(['$store<default']);
+    expect(bindings(`import * as ns$ from './ns';\n`)).toEqual(['ns$<* ns']);
+    expect(bindings(`import $, { ajax } from 'jquery';\n`)).toEqual(['$<default', 'ajax<ajax']);
+    expect(bindings(`import dflt$, * as $ns from './both';\n`)).toEqual(['dflt$<default', '$ns<* ns']);
+  });
+
+  it('aliased and type-only imports bind the whole name', () => {
+    expect(bindings(`import { a$ as b$, a as $b, default as items$ } from './ab';\n`)).toEqual(['b$<a$', '$b<a', 'items$<default']);
+    expect(bindings(`import type $T from './t';\n`)).toEqual(['$T<default']);
+    expect(bindings(`import { type $T, type U$ as V$ } from './t';\n`)).toEqual(['$T<$T', 'V$<U$']);
+    // `from$` is a name, not the `from` that ends a bare `import type from …`.
+    expect(bindings(`import type from$ from './t';\n`)).toEqual(['from$<default']);
+  });
+
+  it("a code generator's `${…}` is no binding", () => {
+    expect(bindings("const code = `import ${name} from '${src}'`;\n")).toEqual([]);
+    expect(bindings("const code = `import type ${name} from '${src}'`;\n")).toEqual([]);
+  });
+
+  it('a CommonJS destructuring binds the whole name', () => {
+    expect(bindings(`const { a$: b$, a: $c, d$ } = require('./r');\n`)).toEqual(['b$<a$', '$c<a', 'd$<d$']);
+  });
+
+  it('a re-export names the whole name', () => {
+    expect(extractReExports(`export { a$, $b as c$, default as $store } from './x';\n`, 'typescript')).toEqual([
+      { kind: 'named', exportedName: 'a$', originalName: 'a$', source: './x' },
+      { kind: 'named', exportedName: 'c$', originalName: '$b', source: './x' },
+      { kind: 'named', exportedName: '$store', originalName: 'default', source: './x' },
+    ]);
+  });
+});
+
+describe('a `$` binding imported from another file', () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  it('`items$.getState().inc()` reaches the store action unless a local or parameter shadows `items$`', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-import-dollar-'));
+    roots.push(root);
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'shop', dependencies: { zustand: '*' } }),
+      'src/store.ts': `import { create } from 'zustand';
+
+const items$ = create((set) => ({ inc: () => set({}) }));
+export default items$;
+`,
+      'src/util.ts': `export function helper() { return 1; }
+`,
+      'src/decoy.ts': `export function helper() { return 2; }
+`,
+      'src/use.ts': `import items$ from './store';
+import * as util$ from './util';
+
+export function clickInc() { items$.getState().inc(); }
+export function shadowed() { const items$ = other(); items$.getState().inc(); }
+export function param(items$: Store) { items$.getState().inc(); }
+export function run() { return util$.helper(); }
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const callers = (file: string, name: string) => {
+        const target = cg.getNodesInFile(file).find((n) => n.kind === 'function' && n.name === name);
+        expect(target, `${file}: ${name}`).toBeDefined();
+        return cg.getCallers(target!.id).filter((c) => c.edge.kind === 'calls').map((c) => c.node.name).sort();
+      };
+      expect(callers('src/store.ts', 'inc')).toEqual(['clickInc']);
+      expect(callers('src/util.ts', 'helper')).toEqual(['run']);
+      expect(callers('src/decoy.ts', 'helper')).toEqual([]);
+    } finally {
+      cg.close();
+    }
   });
 });
 
