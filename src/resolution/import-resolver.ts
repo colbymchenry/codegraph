@@ -1019,7 +1019,9 @@ function extractJSImports(content: string): ImportMapping[] {
             localName: aliasMatch[2]!,
             exportedName: aliasMatch[1]!,
             source: source!,
-            isDefault: false,
+            // `{ default as X }` is the default import spelled as a named one;
+            // no module declares an export named `default` to find.
+            isDefault: aliasMatch[1] === 'default',
             isNamespace: false,
           });
         } else if (name) {
