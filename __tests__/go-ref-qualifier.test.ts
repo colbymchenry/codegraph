@@ -360,4 +360,39 @@ describe('a Go parameter or local named like an import', () => {
     expect(reachedAt('jobs/job.go', 'logger.Error(err)')).toEqual(['Interface::Error']);
     expect(reachedAt('scan/job_test.go', 'robot.ToJSON()')).toEqual(['Robot::ToJSON']);
   });
+
+  it('is read from the file as a sync leaves it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-go-ref-qualifier-sync-'));
+    const write = (rel: string, content: string): void => {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    };
+    write('go.mod', 'module example.com/app\n\ngo 1.22\n');
+    write('auth/jwt.go', files['auth/jwt.go']!);
+    // The same lines either way: a stale reading would still see the local.
+    const use = (decl: string) => `package auth
+
+import "github.com/golang-jwt/jwt/v5"
+
+func use() {
+	${decl}
+	jwt.assign("user")
+}
+`;
+    write('auth/use.go', use('jwt, _ := newTokenProviderJWT("key")'));
+    const synced = await CodeGraph.init(dir, { index: true });
+    try {
+      const assigns = (): string[] => {
+        const ids = synced.getNodesInFile('auth/use.go').map((n) => n.id);
+        return synced.getOutgoingEdgesFrom(ids).filter((e) => e.line === 7).map((e) => synced.getNode(e.target)!.qualifiedName);
+      };
+      expect(assigns()).toEqual(['tokenJWT::assign']);
+      write('auth/use.go', use('_, _ = jwt.Parse("key", nil)'));
+      await synced.sync();
+      expect(assigns()).toEqual([]);
+    } finally {
+      synced.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

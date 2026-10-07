@@ -9610,6 +9610,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_QUALIFIERS.delete(context);
+  GO_SCOPE_INDEXES.delete(context);
   GO_EMBEDS.delete(context);
   GO_ALIAS_TARGETS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
