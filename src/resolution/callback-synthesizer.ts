@@ -803,10 +803,99 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'arkts',
 ]);
 /**
+ * The top-level items of the Go bracketed list opening at `text[open]` — the
+ * parameters of `(ctx context.Context, a, b int)` are `ctx context.Context`, `a`
+ * and `b int` — and the offset where the list closes. Nested brackets, string
+ * literals and comments are skipped whole. Null when the list never closes.
+ */
+function goListItems(text: string, open: number): { items: string[]; end: number } | null {
+  const items: string[] = [];
+  let depth = 0;
+  let item = '';
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+      const end = text[i + 1] === '/' ? text.indexOf('\n', i) : text.indexOf('*/', i + 2) + 1;
+      if (end <= 0) return null;
+      i = end;
+      item += ' ';
+      continue;
+    }
+    if (c === '"' || c === '`' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) j += c !== '`' && text[j] === '\\' ? 2 : 1;
+      if (j >= text.length) return null;
+      item += text.slice(i, j + 1);
+      i = j;
+      continue;
+    }
+    if (c === '(' || c === '[' || c === '{') {
+      if (depth++ === 0) continue;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) {
+        if (item.trim()) items.push(item.trim());
+        return { items, end: i };
+      }
+    } else if (c === ',' && depth === 1) {
+      if (item.trim()) items.push(item.trim());
+      item = '';
+      continue;
+    }
+    item += c;
+  }
+  return null;
+}
+
+/**
+ * A Go signature as extraction stores it for a function or method — the
+ * parameter list's text, then the result's — split into its parameters and
+ * results: `(ctx context.Context, a, b int) (int, error)` has the parameters
+ * `ctx context.Context`, `a` and `b int`. Null when the text has another shape.
+ */
+function goSignatureParts(signature: string | undefined): { params: string[]; results: string[] } | null {
+  const sig = signature?.trim();
+  if (!sig || sig[0] !== '(') return null;
+  const params = goListItems(sig, 0);
+  if (!params) return null;
+  const rest = sig.slice(params.end + 1).trim();
+  if (rest[0] !== '(') return { params: params.items, results: rest ? [rest] : [] };
+  const results = goListItems(rest, 0);
+  if (!results || rest.slice(results.end + 1).trim()) return null;
+  return { params: params.items, results: results.items };
+}
+
+/**
+ * How many parameters and results a Go signature has, as `params/results`:
+ * `(ctx context.Context, keys ...string) (int, error)` is `2/2`, and a grouped
+ * `a, b int` is two parameters. Null when the signature doesn't read.
+ */
+export function goSignatureArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  return parts ? `${parts.params.length}/${parts.results.length}` : null;
+}
+
+/**
+ * The arity a gRPC server implements an RPC with, read off the signature the
+ * generated client has for it. A unary call (`Range(ctx, in *RangeRequest,
+ * opts ...grpc.CallOption) (*RangeResponse, error)`) is served without the
+ * call options (`Range(ctx, *RangeRequest) (*RangeResponse, error)`); a
+ * streaming one (`Watch(ctx, opts ...grpc.CallOption) (Watch_WatchClient,
+ * error)`) gets its stream in their place and returns an error
+ * (`Watch(Watch_WatchServer) error`). Null when it isn't a client's.
+ */
+function goGrpcServerArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  const opts = parts?.params[parts.params.length - 1];
+  if (!parts || !opts || !/^(?:[A-Za-z_]\w*\s+)?\.\.\.\s*(?:grpc\.)?CallOption$/.test(opts)) return null;
+  const unary = parts.results.length === 2 && parts.results[0]!.startsWith('*');
+  return `${parts.params.length - 1}/${unary ? 2 : 1}`;
+}
+
+/**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
  * struct satisfies an interface structurally when its method set covers the
  * interface's. Synthesize the missing `implements` edge (struct → interface) by
- * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * matching method sets, so impl-navigation works and the interface-dispatch
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
  * method call to the concrete overrides.
  *
@@ -820,12 +909,19 @@ const IFACE_OVERRIDE_LANGS = new Set([
  * never followed (this pass writes them), and an embedding that resolved to
  * nothing (`io.Closer`) adds nothing.
  *
- * Name-only matching (signatures ignored, and a promoted name counted even
- * where Go finds it ambiguous or hidden by a field) — over-approximation
- * accepted, in line with the other dispatch synthesizers; capped per
- * interface. Empty interfaces (`any`) are skipped so they don't match every
- * struct, and a struct that embeds the interface keeps the edge its embedding
- * already is.
+ * Each wanted method also needs a declaration with its parameter and result
+ * counts, read off the stored signatures: Go wants the signatures identical,
+ * and the counts are what the text settles for certain — a cache's `Get(ctx,
+ * key, opts ...OpOption)` is no `Get(id types.ID) Peer`. A signature that
+ * doesn't read rules nothing out. A gRPC client interface also takes the
+ * structs serving its service (see `wantedArities`), the bridge a client's
+ * call crosses to reach its handler.
+ *
+ * Types are not compared, and a promoted name counts even where Go finds it
+ * ambiguous or hidden by a field — over-approximation accepted, in line with
+ * the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every struct, and a struct that
+ * embeds the interface keeps the edge its embedding already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
@@ -861,19 +957,25 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     return kind;
   };
 
-  // Memoized: an embedded base is read once, however many types embed it.
+  // Memoized: an embedded base is read once, however many types embed it. Each
+  // method's stored signature rides along for the arity check below.
   const ownMemo = new Map<string, Set<string>>();
+  const ownSignatures = new Map<string, Map<string, (string | undefined)[]>>();
   const ownMethods = (id: string): Set<string> => {
     let names = ownMemo.get(id);
     if (!names) {
-      names = new Set(
-        queries
-          .getOutgoingEdges(id, ['contains'])
-          .map((e) => queries.getNodeById(e.target))
-          .filter((n): n is Node => !!n && n.kind === 'method')
-          .map((n) => n.name),
-      );
+      names = new Set();
+      const signatures = new Map<string, (string | undefined)[]>();
+      for (const e of queries.getOutgoingEdges(id, ['contains'])) {
+        const n = queries.getNodeById(e.target);
+        if (!n || n.kind !== 'method') continue;
+        names.add(n.name);
+        const list = signatures.get(n.name);
+        if (list) list.push(n.signature);
+        else signatures.set(n.name, [n.signature]);
+      }
       ownMemo.set(id, names);
+      ownSignatures.set(id, signatures);
     }
     return names;
   };
@@ -906,22 +1008,29 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     return targets;
   };
 
-  // Own methods plus every embedded type's, down to the last level. Go allows
-  // a struct to embed a pointer to itself, or to one embedding it back.
-  const methodSet = (id: string): Set<string> => {
-    if (embeds(id).length === 0) return ownMethods(id);
-    const names = new Set<string>();
+  // The type and every type it embeds, down to the last level. Go allows a
+  // struct to embed a pointer to itself, or to one embedding it back.
+  const embedClosure = (id: string): string[] => {
+    if (embeds(id).length === 0) return [id];
     const reached = new Set<string>([id]);
     const pending = [id];
     while (pending.length > 0) {
       const at = pending.pop()!;
-      for (const m of ownMethods(at)) names.add(m);
       for (const t of embeds(at)) {
         if (reached.has(t)) continue;
         reached.add(t);
         pending.push(t);
       }
     }
+    return [...reached];
+  };
+
+  // Own methods plus every embedded type's.
+  const methodSet = (id: string): Set<string> => {
+    const types = embedClosure(id);
+    if (types.length === 1) return ownMethods(id);
+    const names = new Set<string>();
+    for (const t of types) for (const m of ownMethods(t)) names.add(m);
     return names;
   };
 
@@ -929,6 +1038,77 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     if (have.size < want.size) return false;
     for (const m of want) {
       if (!have.has(m)) return false;
+    }
+    return true;
+  };
+
+  // Each method name in a type's method set → the arities (`params/results`)
+  // its declarations there have, or null when one of their signatures doesn't
+  // read (then the name rules nothing out). Built only for the pairs whose
+  // names already match.
+  const arityMemo = new Map<string, Map<string, Set<string> | null>>();
+  const methodArities = (id: string): Map<string, Set<string> | null> => {
+    let arities = arityMemo.get(id);
+    if (arities) return arities;
+    arities = new Map();
+    for (const t of embedClosure(id)) {
+      ownMethods(t);
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let known = arities.get(name);
+        if (known === null) continue;
+        if (!known) arities.set(name, (known = new Set()));
+        for (const signature of signatures) {
+          const arity = goSignatureArity(signature);
+          if (arity === null) {
+            arities.set(name, null);
+            break;
+          }
+          known.add(arity);
+        }
+      }
+    }
+    arityMemo.set(id, arities);
+    return arities;
+  };
+  // The arities an implementer may declare each of an interface's methods
+  // with: the interface's own. A gRPC client interface (every method takes
+  // `opts ...grpc.CallOption` last) also takes its service's server side, so
+  // the structs serving it (etcd's `kvServer` for `KVClient`) stay linked and
+  // a client's call keeps reaching the handler that serves it.
+  const wantedArities = (iface: Node): Map<string, Set<string> | null> => {
+    const own = methodArities(iface.id);
+    const wanted = new Map<string, Set<string> | null>();
+    for (const t of embedClosure(iface.id)) {
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let arities = wanted.get(name);
+        if (!arities) wanted.set(name, (arities = new Set(own.get(name))));
+        for (const signature of signatures) {
+          const served = goGrpcServerArity(signature);
+          if (served === null) return own;
+          arities.add(served);
+        }
+      }
+    }
+    return wanted;
+  };
+
+  // Go accepts an implementation only when each method's signature is the
+  // interface's. The stored text settles how many parameters and results
+  // there are: a struct with no declaration of a wanted name at a wanted
+  // arity can't satisfy it.
+  const aritiesFit = (structId: string, wanted: Map<string, Set<string> | null>): boolean => {
+    const have = methodArities(structId);
+    for (const [name, arities] of wanted) {
+      const got = have.get(name);
+      if (!arities || !got) continue;
+      let fits = false;
+      for (const arity of arities) {
+        if (got.has(arity)) {
+          fits = true;
+          break;
+        }
+      }
+      if (!fits) return false;
     }
     return true;
   };
@@ -962,11 +1142,14 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     // them: under the cap, those are what the interface-dispatch bridge links
     // a call through the interface to.
     const throughEmbedding: Node[] = [];
+    let wanted: Map<string, Set<string> | null> | undefined;
     for (const s of goStructs) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       const have = structMethods.get(s.id);
       if (!have || !covers(have, want)) continue;
       if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      if (!wanted) wanted = wantedArities(iface);
+      if (!aritiesFit(s.id, wanted)) continue;
       const own = ownMethods(s.id);
       if (own !== have && !covers(own, want)) throughEmbedding.push(s);
       else link(s);
