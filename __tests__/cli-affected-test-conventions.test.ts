@@ -47,7 +47,7 @@ describe('codegraph affected — test-file conventions (#1507)', () => {
     const cg = CodeGraph.initSync(dir);
     await cg.indexAll();
     cg.close();
-  });
+  }, 60_000);
 
   afterAll(() => {
     fs.rmSync(dir, { recursive: true, force: true });

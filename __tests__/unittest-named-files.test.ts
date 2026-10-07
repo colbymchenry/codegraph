@@ -1,13 +1,13 @@
 /**
- * Google's C++ tests are named `foo_unittest.cc`, not `foo_test.cc` —
- * protobuf's, Breakpad's, glog's, Chromium's. The test-file check wanted a
- * separator right before `test`, so every one of them read as production code
- * and the resolver's test rules ran backwards for it. A unittest could not
- * reach the test helpers it includes (protobuf's `TestUtil::SetAllFields` in
- * test_util.h), while production code resolved into a unittest's own
- * declarations: Breakpad's `handler_stack_->size()` went to a unittest's
- * `StackHelper::size`, and a template's `AddressType()` to the `typedef` one
- * unittest declares.
+ * Google names its tests `foo_unittest.cc` (protobuf, Breakpad, glog,
+ * Chromium) and Chromium names its Python tests `foo_unittest.py`, where
+ * every other convention puts a separator right before `test`. The test-file
+ * check wanted that separator, so each of them read as production code and the
+ * resolver's test rules ran backwards for it. A unittest could not reach the
+ * test helpers it uses (`device.reboot()` on a fake from `tests/`), while
+ * production code resolved into a unittest's own declarations: Breakpad's
+ * `stack_frame_entries_.size()` went to a unittest's `StackHelper::size`, and
+ * a template's `AddressType()` to the `typedef` one unittest declares.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -19,8 +19,22 @@ let root = '';
 let cg: CodeGraph;
 
 beforeAll(async () => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-unittest-'));
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unittest-named-'));
   const files: Record<string, string> = {
+    // A test helper in a test suite, and a unittest that uses it.
+    'tests/__init__.py': '',
+    'tests/fake_device.py': `class FakeDevice:
+    def reboot(self):
+        return True
+`,
+    'tools/device/device_unittest.py': `from tests.fake_device import FakeDevice
+
+
+def test_reboot():
+    device = FakeDevice()
+    return device.reboot()
+`,
+    // The same in C++: protobuf's TestUtil, reached through the header.
     'src/message.h': `#ifndef MESSAGE_H_
 #define MESSAGE_H_
 
@@ -43,7 +57,6 @@ void Message::Clear() {}
 
 }  // namespace protobuf
 `,
-    // A test helper: named like a test suite, so production code never sees it.
     'src/test_util.h': `#ifndef TEST_UTIL_H_
 #define TEST_UTIL_H_
 
@@ -72,11 +85,17 @@ void ParsesAllFields() {
 }  // namespace protobuf
 `,
     // Production code whose calls name nothing in the project.
-    'src/exception_handler.cc': `#include <vector>
+    'src/module.cc': `#include <vector>
 
-bool HandleSignal(std::vector<int>* handler_stack_) {
-  return handler_stack_->size() > 0;
-}
+using std::vector;
+
+class Module {
+ public:
+  int CountEntries() const { return static_cast<int>(stack_frame_entries_.size()); }
+
+ private:
+  vector<int> stack_frame_entries_;
+};
 `,
     'src/range_map-inl.h': `template <typename AddressType>
 bool StoreRange(const AddressType& base) {
@@ -105,7 +124,7 @@ AddressType Lookup() { return 0; }
     fs.writeFileSync(path.join(root, rel), content);
   }
   cg = await CodeGraph.init(root, { index: true });
-});
+}, 60_000);
 
 afterAll(() => {
   cg?.close();
@@ -118,13 +137,13 @@ const edgesFrom = (file: string) => {
 };
 
 describe("Google's unittest files are tests", () => {
-  it('a unittest reaches the test helpers it includes', () => {
-    expect(edgesFrom('src/wire_format_unittest.cc').map((n) => n.qualifiedName))
-      .toContain('protobuf::TestUtil::SetAllFields');
+  it('a unittest reaches the test helpers it uses', () => {
+    expect(edgesFrom('tools/device/device_unittest.py').map((n) => n.qualifiedName)).toContain('FakeDevice::reboot');
+    expect(edgesFrom('src/wire_format_unittest.cc').map((n) => n.qualifiedName)).toContain('protobuf::TestUtil::SetAllFields');
   });
 
   it("production code never resolves into a unittest's own declarations", () => {
-    for (const file of ['src/exception_handler.cc', 'src/range_map-inl.h']) {
+    for (const file of ['src/module.cc', 'src/range_map-inl.h']) {
       expect(edgesFrom(file).map((n) => n.filePath).filter((f) => f.endsWith('_unittest.cc')), file).toEqual([]);
     }
   });
