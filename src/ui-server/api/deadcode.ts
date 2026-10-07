@@ -95,7 +95,7 @@ export interface WireDeadCode {
 const EXCLUSION_LABELS: Record<keyof DeadCodeExclusions, string> = {
   tests: 'in test files',
   generated: 'in generated files',
-  exported: 'exported, or declared in a header',
+  exported: 'exported, declared in a header, or merged into a library or global type',
   exportsUnknown: 'in languages this index records no exports for',
   declarations: 'abstract, or declared on an interface',
   decorated: 'carrying a decorator, so a framework registers them',
