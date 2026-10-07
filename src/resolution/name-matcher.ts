@@ -6859,7 +6859,7 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
   let scope: { start: number; end: number } | null = null;
   const fn = context.getNodeById?.(ref.fromNodeId);
   if (fn && (fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
-      jsCodeBindsName(name, fn, ref, context)) {
+      jsCodeBindsName(name, fn, ref.filePath, ref.line, context)) {
     scope = { start: fn.startLine, end: fn.endLine };
   }
   memo.set(key, scope);
@@ -6874,14 +6874,18 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
  */
 const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
-/** Whether the function's code through the reference's line declares `name`, or names it in a parameter list. */
-function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+/**
+ * Whether the function's code in `filePath`, from its first line through
+ * `line` (a reference's, or a JSX tag's), declares `name`, or names it in a
+ * parameter list.
+ */
+export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: number, context: ResolutionContext): boolean {
   let memo = JS_CODE_BINDS.get(context);
   if (!memo) JS_CODE_BINDS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${fn.startLine}\0${ref.line}\0${name}`;
+  const key = `${filePath}\0${fn.startLine}\0${line}\0${name}`;
   let binds = memo.get(key);
   if (binds === undefined) {
-    const text = jsFunctionCodeThrough(fn, ref, context);
+    const text = jsFunctionCodeThrough(fn, filePath, line, context);
     const { param } = localBindingPatterns(name, 'g');
     const n = name.replace(/\$/g, '\\$');
     // A plain declaration. Destructuring re-binds what a call returns under
@@ -6906,38 +6910,38 @@ function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: Re
 }
 
 /**
- * Per context: the comment-stripped lines of the functions jsFunctionLocalScope
+ * Per context: the comment-stripped lines of the functions jsCodeBindsName
  * read last, and where each line ends in that text, most recent last.
  */
 const JS_FN_CODE = new WeakMap<ResolutionContext, Map<string, { code: string; lineEnds: number[] }>>();
 const JS_FN_CODE_KEEP = 64;
 
 /**
- * The function's lines from its first through the reference's, comments
- * blanked. Stripping looks at most one character ahead — past a line's end,
- * a newline, which completes no comment marker — so this is the whole
+ * The function's lines from its first through `line`, comments blanked.
+ * Stripping looks at most one character ahead — past a line's end, a
+ * newline, which completes no comment marker — so this is the whole
  * function's stripped text cut at that line's end. Stripping the lines again
  * for every reference took time in the square of a large function's length;
  * in a minified script, every function's text runs to the end of its one
  * line (#2334).
  */
-function jsFunctionCodeThrough(fn: Node, ref: UnresolvedRef, context: ResolutionContext): string {
+function jsFunctionCodeThrough(fn: Node, filePath: string, line: number, context: ResolutionContext): string {
   let fns = JS_FN_CODE.get(context);
   if (!fns) JS_FN_CODE.set(context, (fns = new Map()));
-  const key = `${ref.filePath}\0${fn.startLine}\0${fn.endLine}`;
+  const key = `${filePath}\0${fn.startLine}\0${fn.endLine}`;
   let own = fns.get(key);
   if (own) {
     fns.delete(key);
   } else {
-    const lines = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [])
+    const lines = (context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [])
       .slice(fn.startLine - 1, fn.endLine);
     let end = -1;
-    own = { code: stripCommentsForRegex(lines.join('\n'), 'javascript'), lineEnds: lines.map((line) => (end += line.length + 1)) };
+    own = { code: stripCommentsForRegex(lines.join('\n'), 'javascript'), lineEnds: lines.map((text) => (end += text.length + 1)) };
     if (fns.size >= JS_FN_CODE_KEEP) fns.delete(fns.keys().next().value!);
   }
   fns.set(key, own);
-  // Through the reference's line, or the file's last when it ends sooner.
-  const last = Math.min(ref.line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
+  // Through `line`, or the file's last when it ends sooner.
+  const last = Math.min(line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
   return last < 0 ? '' : own.code.slice(0, own.lineEnds[last]);
 }
 
