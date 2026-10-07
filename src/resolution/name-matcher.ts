@@ -1549,9 +1549,10 @@ const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum
 
 /**
  * A test suite — a test source set, a `tests/` / `__tests__/` / `spec/`
- * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` file — as opposed
- * to test-support code a project ships (`testing/`, `fakes/`, a `*-test`
- * module like kotlinx-coroutines-test), which its own code may use.
+ * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc`
+ * file — as opposed to test-support code a project ships (`testing/`,
+ * `fakes/`, a `*-test` module like kotlinx-coroutines-test), which its own
+ * code may use.
  */
 function isTestSuitePath(filePath: string): boolean {
   if (!isTestPath(filePath)) return false;
@@ -1559,7 +1560,7 @@ function isTestSuitePath(filePath: string): boolean {
   const name = lower.slice(lower.lastIndexOf('/') + 1);
   const original = filePath.slice(filePath.lastIndexOf('/') + 1);
   // (`…Spec.java` alone is no test: halo's `IndexSpecs`, okhttp's `ConnectionSpec`.)
-  if (name.startsWith('test_') || /[._-](?:test|tests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
+  if (name.startsWith('test_') || /[._-](?:test|tests|unittest|unittests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
       // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
       /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
   return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
@@ -9189,6 +9190,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GO_QUALIFIERS.delete(context);
   GO_EMBEDS.delete(context);
   GO_ALIAS_TARGETS.delete(context);
+  GO_DOT_IMPORTS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -11012,6 +11014,162 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
   }
   memo.set(typeNode.id, embedded);
   return embedded;
+}
+
+/**
+ * A Go call made through a type assertion — `srv.(KVServer).Range(ctx, in)`,
+ * `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a method of
+ * the asserted type: its own, the one its interface declares, or one embedding
+ * promotes into it. The call reaches the resolver by its bare name, at the
+ * column where its receiver expression starts, and name matching took any
+ * method of that name: every gRPC handler etcd generates went to the
+ * `UnimplementedKVServer` stub beside the `KVServer` interface. The type is
+ * the one Go finds: in the call's own package or a package it dot-imports for
+ * a bare name, in the imported package for a qualified one, and an alias is
+ * the type it names. A type found in none — one from outside the project
+ * (`http.Flusher`), a predeclared one (`error`) — an alias of such a type, or
+ * a type literal (`interface{ Flush() }`) links nothing.
+ * Undefined when the call is not made through an assertion.
+ */
+export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
+  const asserted = goAssertedType(ref, context);
+  if (asserted === undefined) return undefined;
+  // `KVServer`, `*pipe`, `storage.Store`, `*List[int]`: anything else is a type literal.
+  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(asserted);
+  if (!type) return null;
+  const [, qualifier, typeName] = type;
+  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(typeName!, dir, context).length > 0;
+  const dir = qualifier !== undefined
+    ? goImportPackageDir(qualifier, ref.filePath, context)
+    : [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
+  if (!declares(dir)) return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // has that type's methods, none the project declares.
+  if (goPackageTypes(typeName!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
+  return resolveMethodOnType(typeName!, ref.referenceName, ref, context, 0.9, 'instance-method', dir);
+}
+
+/** How many lines past a Go call's first its chain is read on. */
+const GO_CHAIN_LINES = 30;
+
+/**
+ * The type a Go call's receiver is asserted to, as written (`KVServer`,
+ * `*pipe`, `storage.Store`). Every call of a chain records the chain's start,
+ * so the call is a `.name(…)` link of the chain read from there, and the link
+ * before it is the assertion. Two links of one name in a chain
+ * (`b.(*Builder).Add(1).Add(2)`) are told apart by nothing, and both are taken
+ * for the one made through the assertion: that call is there either way.
+ * Undefined when no link of the name follows an assertion, or no chain
+ * starts at the column.
+ */
+function goAssertedType(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  if (!lines || line === undefined || ref.column >= line.length) return undefined;
+  // Most calls through an expression assert nothing: no `.(` after the
+  // column, nor a chain that goes on past the line.
+  if (line.indexOf('.(', ref.column) < 0 && !/\.\s*$/.test(line)) return undefined;
+  const links = goChainLinks(lines.slice(ref.line - 1, ref.line + GO_CHAIN_LINES).join('\n'), ref.column);
+  for (let k = 1; k + 1 < links.length; k++) {
+    if (links[k - 1]!.kind === 'assert' && links[k]!.kind === 'select' && links[k]!.text === ref.referenceName &&
+        links[k + 1]!.kind === 'call') return links[k - 1]!.text;
+  }
+  return undefined;
+}
+
+interface GoChainLink {
+  kind: 'operand' | 'select' | 'assert' | 'call' | 'index';
+  /** An operand's or selector's name, an assertion's type. */
+  text: string;
+}
+
+/**
+ * The links of the Go expression that starts at `start`: its operand (a name
+ * or a parenthesized expression), then each selector, type assertion, call
+ * and index. A line break ends it, except right after a `.`, where Go
+ * inserts no semicolon.
+ */
+function goChainLinks(text: string, start: number): GoChainLink[] {
+  const links: GoChainLink[] = [];
+  const NAME = /[A-Za-z_]\w*/y;
+  let i = start;
+  const name = (): string | null => {
+    NAME.lastIndex = i;
+    const m = NAME.exec(text);
+    if (m) i += m[0].length;
+    return m ? m[0] : null;
+  };
+  const group = (): string | null => {
+    const close = goClosingBracket(text, i);
+    if (close < 0) return null;
+    const inner = text.slice(i + 1, close);
+    i = close + 1;
+    return inner;
+  };
+  const operand = text[i] === '(' ? group() : name();
+  if (operand === null) return links;
+  links.push({ kind: 'operand', text: operand });
+  for (;;) {
+    while (text[i] === ' ' || text[i] === '\t') i++;
+    if (text[i] === '.') {
+      i++;
+      while (i < text.length && WHITESPACE.test(text[i]!)) i++;
+      const type = text[i] === '(' ? group() : null;
+      const member = type === null ? name() : null;
+      if (type !== null) links.push({ kind: 'assert', text: type.trim() });
+      else if (member !== null) links.push({ kind: 'select', text: member });
+      else break;
+    } else if (text[i] === '(' || text[i] === '[') {
+      // A call whose arguments run past what was read is still a call.
+      links.push({ kind: text[i] === '(' ? 'call' : 'index', text: '' });
+      if (group() === null) break;
+    } else break;
+  }
+  return links;
+}
+
+/** The bracket closing the one at `open`, past Go strings, runes and comments; -1 when it does not close. */
+function goClosingBracket(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === '\'') {
+      for (i++; i < text.length && text[i] !== c && text[i] !== '\n'; i++) if (text[i] === '\\') i++;
+    } else if (c === '`') {
+      i = text.indexOf('`', i + 1);
+      if (i < 0) return -1;
+    } else if (c === '/' && text[i + 1] === '/') {
+      i = text.indexOf('\n', i);
+      if (i < 0) return -1;
+    } else if (c === '/' && text[i + 1] === '*') {
+      i = text.indexOf('*/', i + 2);
+      if (i < 0) return -1;
+      i++;
+    } else if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+const GO_DOT_IMPORTS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/** The project packages a Go file dot-imports (`import . "example.com/app/storage"`), by directory: their names it reads bare. */
+function goDotImportDirs(filePath: string, context: ResolutionContext): string[] {
+  let memo = GO_DOT_IMPORTS.get(context);
+  if (!memo) GO_DOT_IMPORTS.set(context, (memo = new Map()));
+  let dirs = memo.get(filePath);
+  if (dirs) return dirs;
+  dirs = [];
+  for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
+    // The imports come before any other declaration.
+    if (/^(?:func|type|var|const)\b/.test(line)) break;
+    const dot = /^\s*(?:import\s+)?\.\s+"([^"]+)"/.exec(line);
+    const dir = dot ? context.getGoPackageDir?.(dot[1]!, filePath) : null;
+    if (dir) dirs.push(dir);
+  }
+  memo.set(filePath, dirs);
+  return dirs;
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
