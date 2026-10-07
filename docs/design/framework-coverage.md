@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-10-06) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-06) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -38,7 +38,7 @@ guessed.
 |---|---|---|---|---|
 | Expo Router | `frameworks/expo-router.ts` | `expo-router-synthesizer.ts` | `expo-router.test.ts` | — |
 | Next.js | `frameworks/nextjs.ts` | `next-router-synthesizer.ts` | `nextjs.test.ts` | next-saas-starter |
-| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates) |
+| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page) |
 | TanStack Router | `frameworks/tanstack-router.ts` | `tanstack-router-synthesizer.ts` | `tanstack-router.test.ts` | TanStack examples, fastapi-template frontend |
 | Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies |
 | SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
@@ -263,6 +263,26 @@ Each of these cost real debugging time; they are not hypothetical.
    template-bound handler there was listed as dead code. A new detector that
    gates on a dependency should ask `dependsOn`, not read a `package.json`
    itself, so it sees the same manifests every other detector does.
+13. **A route table can be named only by another file.** The ASP.NET Core
+   React template keeps its routes in `AppRoutes.js`, a file that never names
+   the router, and renders them from `App.js` with `AppRoutes.map(({ element,
+   ...rest }) => <Route {...rest} element={element} />)`; codedthemes' admin
+   kits put one route object per file and list them in
+   `createBrowserRouter([MainRoutes, LoginRoutes])`. Read on its own, such a
+   file cannot be told from a menu's `{ path, element }` list, and per-file
+   extraction cannot see the file that hands it over, nor run again when that
+   file changes. So React keeps those routes in the cross-file pass
+   (`FrameworkResolver.crossFileNodes`, reconciled in `runPostExtract` on every
+   index and sync, removals included): it starts from the files that import
+   React Router, takes only a `useRoutes` / `create*Router` argument or a
+   `.map` whose callback renders a `<Route>` from the item's own fields
+   (`{...route}`, `{...rest}`, `path={route.path}` — never
+   `path={r.layout + r.path}`), follows the import to the table and the tables
+   it names in turn, and owns its routes by id (`…:table:<path>`). Two limits
+   it shares with every router: a table rendered by a component that is
+   itself mounted under another file's `<Route path="/admin/*">` reads as if
+   at the root, and a navigation that failed while its route was gone is not
+   retried until a full index.
 
 ---
 
