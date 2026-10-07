@@ -486,6 +486,42 @@ function nodesInFileNamed(filePath: string, name: string, context: ResolutionCon
   return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
 }
 
+/**
+ * The node a module default-exports. A JS module's `export default`
+ * statements say it (the first that names a node; none when they all name
+ * nothing — see {@link defaultStatements}); a single-file component is its
+ * own default export; a module that says nothing falls back to its first
+ * exported function or class.
+ */
+function esmDefaultExport(
+  filePath: string,
+  idx: FileExportIndex,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
+  const statements = defaultStatements(filePath, idx, context);
+  if (statements.length === 0) return idx.defaultComponent ?? idx.defaultFnClass;
+  for (const statement of statements) {
+    const node = defaultStatementNode(filePath, statement, language, context, visited, depth);
+    if (node) return node;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the module has an ESM default export at all: a JS-family file with
+ * an `export default` statement or an `export { X as default }` clause, or a
+ * single-file component. A CommonJS module has none, though its `exports.x =
+ * function` declarations are exported and would feed the
+ * first-exported-function guess.
+ */
+function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): boolean {
+  if (!JS_FAMILY_FILE.test(filePath)) return idx.defaultComponent !== undefined;
+  return defaultStatements(filePath, idx, context).length > 0;
+}
+
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
 function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
   const direct = idx.byName.get(name);
@@ -740,11 +776,17 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * (tsconfig/jsconfig `paths`). Without that check, custom prefixes
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
+ *
+ * `aliasPrefixes: false` skips that check, for a caller that has already
+ * asked `resolveImportPath` whether an alias maps the specifier to a file.
+ * Matching a prefix proves nothing by itself: a catch-all `"*"` pattern
+ * (`"*": ["./typings/*"]`) has an empty prefix and matches every package.
  */
 export function isExternalImport(
   importPath: string,
   language: Language,
-  context?: ResolutionContext
+  context?: ResolutionContext,
+  options: { aliasPrefixes?: boolean } = {}
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
@@ -767,7 +809,7 @@ export function isExternalImport(
       return true;
     }
     // Project-defined alias prefix? Treat as local.
-    const aliases = context?.getProjectAliases?.();
+    const aliases = options.aliasPrefixes === false ? null : context?.getProjectAliases?.();
     if (aliases) {
       for (const pat of aliases.patterns) {
         if (importPath.startsWith(pat.prefix)) return false;
@@ -2896,6 +2938,9 @@ function resolveGoCrossPackageReference(
   const receiver = ref.referenceName.substring(0, dotIdx);
   const memberName = ref.referenceName.substring(dotIdx + 1);
   if (!memberName) return null;
+  // A parameter or local named like the import holds the call there:
+  // `store := newStore()`, then `store.Get(k)` is no call into package store.
+  if (!goRefQualifier(ref, context)) return null;
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
@@ -3011,13 +3056,8 @@ function findExportedSymbolWalk(
     // made every `import Vans from './Vans'` the loader. Of several
     // statements, the first that names a node is the module's own; one a
     // template only writes as text names none.
-    const statements = defaultStatements(filePath, exportIndex, context);
-    if (statements.length > 0) {
-      for (const statement of statements) {
-        const node = defaultStatementNode(filePath, statement, language, context, visited, depth);
-        if (node) return node;
-      }
-      return undefined;
+    if (defaultStatements(filePath, exportIndex, context).length > 0) {
+      return esmDefaultExport(filePath, exportIndex, language, context, visited, depth);
     }
     // Svelte/Vue single-file components ARE the module's default export,
     // but are extracted as kind 'component' (not function/class). Without
@@ -3043,6 +3083,22 @@ function findExportedSymbolWalk(
   } else {
     const direct = exportedOrForwarded(filePath, exportIndex, want.exportedName, language, context, visited, depth);
     if (direct) return direct;
+    // `require('./x').default` and `const { default: X } = require('./x')` read
+    // the `default` property of module.exports. A CommonJS module sets it by
+    // name (`exports.default = fn`, the dual `module.exports.default = X`),
+    // found just above. A module written as an ES module sets it to its
+    // default export, `export default class Foo`, which is no named export —
+    // the answer when the module has no such property. Only in the module
+    // asked for: `export * from` never forwards a default.
+    if (
+      depth === 0 &&
+      want.exportedName === 'default' &&
+      ESM_IMPORT_LANGUAGES.has(language) &&
+      hasEsmDefaultExport(filePath, exportIndex, context)
+    ) {
+      const esmDefault = esmDefaultExport(filePath, exportIndex, language, context, visited, depth);
+      if (esmDefault) return esmDefault;
+    }
   }
 
   // 2. Re-export hit: the file forwards the symbol to another module.
