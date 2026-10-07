@@ -7543,10 +7543,10 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(detectLanguage('shop/templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('liquid');
   });
 
-  const writeFiles = (files: Record<string, string>): void => {
+  const writeFiles = (files: Record<string, string>, root = tempDir): void => {
     for (const [file, text] of Object.entries(files)) {
-      fs.mkdirSync(path.dirname(path.join(tempDir, file)), { recursive: true });
-      fs.writeFileSync(path.join(tempDir, file), text);
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
     }
   };
   // A theme at the project root, a theme in a folder marked only by its settings
@@ -7626,7 +7626,7 @@ describe('Liquid Shopify JSON template section resolution', () => {
     await cg.indexAll();
     const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
       'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
-    const links = () => Object.fromEntries(naming.map((file) => [file, cg.getFileDependencies(file).sort()]));
+    const links = (graph = cg) => Object.fromEntries(naming.map((file) => [file, graph.getFileDependencies(file).sort()]));
     expect(links()).toEqual({
       'templates/404.json': [],
       'sections/header.liquid': [],
@@ -7647,8 +7647,18 @@ describe('Liquid Shopify JSON template section resolution', () => {
       'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
     });
     expect(cg.getPendingReferenceCount()).toBe(0);
-    await cg.indexAll();
-    expect(links()).toEqual(synced);
+    // A fresh index of the same files links the same. (Indexing again over
+    // this index would skip the unchanged files that name the new ones.)
+    const freshDir = createTempDir();
+    writeFiles({ ...severalThemes, 'templates/404.json': jsonTemplate('404'), ...later }, freshDir);
+    const fresh = CodeGraph.initSync(freshDir);
+    try {
+      await fresh.indexAll();
+      expect(links(fresh)).toEqual(synced);
+    } finally {
+      fresh.close();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
 
     // A deleted snippet's references wait for it the same way.
     fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
