@@ -310,10 +310,13 @@ describe('Go standard method names on a receiver nothing types', () => {
   it.each([
     // `for _, id := range ids`
     ['idsText', 'types/id.go::ID::String instance-method@0.65'],
-    // `urlsMap := types.NewURLsMap()`
-    ['urls', 'types/id.go::URLsMap::String instance-method@0.65'],
   ])('still guesses for %s through a receiver named after the owner type', (fn, target) => {
     expect(calls(fn)).toEqual([target]);
+  });
+
+  // `urlsMap := types.NewURLsMap()`: the type the package's function returns.
+  it('links urls through the type the call it is assigned from returns', () => {
+    expect(calls('urls')).toEqual(['types/id.go::URLsMap::String instance-method@0.9']);
   });
 
   it.each([

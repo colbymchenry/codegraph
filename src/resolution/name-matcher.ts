@@ -320,8 +320,10 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     // alias of one holds no project method to take.
     if (decl.declared === null || (decl.declared !== undefined && goHasNoProjectMethods(decl.declared, ref, context))) return null;
     if (type) {
+      const declFile = decl.file ?? ref.filePath;
+      if (isGoExternalType(decl.raw, declFile, context)) return null;
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
-        goDeclaredTypePackage(decl.raw, ref.filePath, context));
+        goDeclaredTypePackage(decl.raw, declFile, context));
     }
     const types = context.getNodesByName(receiver).filter(n => n.language === 'go' && (n.kind === 'struct' || n.kind === 'interface'));
     if (types.length) return types.length === 1 ? resolveMethodOnType(receiver, member, ref, context, 0.9, 'function-ref') : null;
@@ -17661,7 +17663,7 @@ const PATTERN_MEMO_CAP = 8192;
  * ReferenceResolver.clearCaches calls clearNameMatcherMemos alongside
  * clearImportResolverMemos.
  */
-type InferScanState = { hi: number; ansIdx: number; ansType: string | null; ansRaw?: string };
+type InferScanState = { hi: number; ansIdx: number; ansType: string | null; ansRaw?: string; ansFile?: string };
 const INFER_SCAN_STATES = new WeakMap<ResolutionContext, Map<string, InferScanState>>();
 
 /** Awaited inference caches are scoped to the resolver's stable-source window.
@@ -17967,8 +17969,9 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // are accepted only where a parameter list puts them: after `(`, `,`
         // or nothing, and before `,`, `)` or the line's end — unlike the
         // keyword-free pattern below, which a lowercase `ident type` pair in
-        // ordinary code would satisfy (#2323).
-        new RegExp(`(?:^|[(,])\\s*${r}\\s+\\*?([a-z_]\\w*)\\s*(?:\\[[^\\]]*\\])?\\s*(?:[,)]|$)`), // func (s *server) / f(h *handler)
+        // ordinary code would satisfy (#2323). The same slot holds a type of
+        // another package (`s *store.Store`, `conn net.Conn`).
+        new RegExp(`(?:^|[(,])\\s*${r}\\s+\\*?([a-z_]\\w*(?:\\.[A-Za-z_]\\w*)?)\\s*(?:\\[[^\\]]*\\])?\\s*(?:[,)]|$)`), // func (s *server) / f(h *handler) / f(s *store.Store)
         // A typed parameter / method receiver (`func use(lg Logger)`,
         // `func (l Logger) M()`) — name-before-type with no `var`/`:=` (#1125).
         // PascalCase-guarded (unlike the anchored patterns above) to keep the
@@ -18552,8 +18555,10 @@ export function inferLocalReceiverType(
     ? 0
     : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
 
-  // The raw capture behind matchLine's latest non-null answer (see `decl`).
+  // The raw capture behind matchLine's latest non-null answer (see `decl`),
+  // and the file it is spelled in when that is not the call's own.
   let lastRaw: string | undefined;
+  let lastFile: string | undefined;
   const matchLine = (i: number): string | null => {
     const line = lines[i];
     if (!line) return null;
@@ -18567,8 +18572,19 @@ export function inferLocalReceiverType(
         const type = normalizeInferredTypeName(m[1]);
         if (type) {
           lastRaw = m[1];
+          lastFile = undefined;
           return type;
         }
+      }
+    }
+    if (ref.language === 'go') {
+      // `r := newRing()` / `s, err := store.NewStore()`: what the callee returns.
+      const result = goBoundCallResult(lines, i, escapedReceiver, ref.filePath, context);
+      const type = result && normalizeInferredTypeName(result.raw);
+      if (type) {
+        lastRaw = result.raw;
+        lastFile = result.file;
+        return type;
       }
     }
     return null;
@@ -18595,9 +18611,10 @@ export function inferLocalReceiverType(
       for (let i = callIdx; i >= startIdx; i--) {
         const type = matchLine(i);
         if (type) {
-          states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw });
+          states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw, ansFile: lastFile });
           if (decl) {
             decl.raw = lastRaw;
+            decl.file = lastFile;
             decl.line = i + 1;
           }
           return type;
@@ -18613,6 +18630,7 @@ export function inferLocalReceiverType(
           state.ansIdx = i;
           state.ansType = type;
           state.ansRaw = lastRaw;
+          state.ansFile = lastFile;
           break;
         }
       }
@@ -18620,6 +18638,7 @@ export function inferLocalReceiverType(
       if (state.ansIdx < startIdx) return null;
       if (decl) {
         decl.raw = state.ansRaw;
+        decl.file = state.ansFile;
         decl.line = state.ansIdx + 1;
       }
       return state.ansType;
@@ -18629,6 +18648,7 @@ export function inferLocalReceiverType(
       if (type) {
         if (decl) {
           decl.raw = lastRaw;
+          decl.file = lastFile;
           decl.line = i + 1;
         }
         return type;
@@ -19216,6 +19236,11 @@ export function matchMethodCall(
     if (ref.language === 'rust' && inferredType === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
       return matchRustPinnedCall(objectOrClass!, methodName!, ref, context);
     }
+    // A Go receiver declared with a type from outside the project — `conn
+    // net.Conn`, `ctx context.Context`, `req *http.Request` — has no project
+    // method: `ctx.Done()` is not the one project type that declares a `Done`.
+    if (inferredType && ref.language === 'go' && decl.asserted === undefined &&
+        isGoExternalType(decl.raw, decl.file ?? ref.filePath, context)) return null;
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
       // finds for it, or nothing the project declares: `flusher.Flush()` after
@@ -19240,7 +19265,7 @@ export function matchMethodCall(
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
           : ref.language === 'go'
-            ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
+            ? goDeclaredTypePackage(decl.raw, decl.file ?? ref.filePath, context)
             : ESM_FAMILY.has(ref.language) && !awaited
               ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
               : undefined;
@@ -20060,6 +20085,95 @@ function goDeclaredTypePackage(raw: string | undefined, filePath: string, contex
   return goImportPackageDir(name.slice(0, dot), filePath, context) ?? undefined;
 }
 
+/**
+ * Whether a Go type spelled `raw` in `filePath` is declared outside the
+ * project: a type of a package from outside the project's modules
+ * (`net.Conn`, `*bytes.Buffer`), or an alias of one (`type Context =
+ * gin.Context`). Such a type has no method in the index.
+ */
+function isGoExternalType(raw: string | undefined, filePath: string, context: ResolutionContext, depth = 0): boolean {
+  if (!raw) return false;
+  const name = raw.replace(/[*&\s]/g, '').replace(/\[.*$/, '');
+  const dot = name.indexOf('.');
+  let pkgDir: string | null | undefined = goPackageDir(filePath);
+  if (dot >= 0) {
+    const imported = context.getImportMappings(filePath, 'go').find((i) => i.localName === name.slice(0, dot));
+    if (imported && isGoOutsideImport(imported, filePath, context)) return true;
+    pkgDir = imported && context.getGoPackageDir?.(imported.source, filePath);
+    if (pkgDir == null) return false;
+  }
+  if (depth >= 4) return false;
+  const types = goPackageTypes(name.slice(dot + 1), pkgDir, context);
+  return types.length > 0 && types.every((t) => isGoExternalType(goAliasedType(t, context), t.filePath, context, depth + 1));
+}
+
+/**
+ * The type a Go binding gives receiver `r` from a call, when line `i` binds
+ * it first — `r := newRing()`, `r, err := store.NewStore(cfg)`, `if r :=
+ * find(id); r != nil` — and the call is the whole right-hand side (`r :=
+ * newRing().Reader()` is typed by `Reader`, which isn't read). A call that
+ * takes `r` itself (`r := wrap(r.Inner())`) is skipped: on that line `r` is
+ * still the outer variable. The type is the callee's first result as its
+ * signature spells it, for a function of the call's own package or of an
+ * imported project package; the callee itself for a conversion (`list :=
+ * model.BotList(bots)`) and for a function of a package outside the
+ * project, whose result is a type from outside it too.
+ */
+function goBoundCallResult(
+  lines: string[],
+  i: number,
+  r: string,
+  filePath: string,
+  context: ResolutionContext,
+): { raw: string; file?: string } | null {
+  const [bind, self] = memoPatterns(`go-bind|${r}`, () => [
+    new RegExp(`(?:^|[;{]|\\b(?:if|switch)\\s)\\s*${r}\\s*(?:,\\s*[A-Za-z_]\\w*\\s*)*:=\\s*([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)?)\\s*\\(`),
+    new RegExp(`\\b${r}\\b`),
+  ]);
+  const m = bind!.exec(lines[i]!);
+  if (!m) return null;
+  // The call's closing parenthesis, up to a few lines down, ends the statement.
+  let args = '';
+  let closed = false;
+  for (let j = i, from = m.index + m[0].length - 1, depth = 0; j < Math.min(lines.length, i + 40) && !closed; j++, from = 0) {
+    const text = lines[j]!;
+    let k = from;
+    for (; k < text.length && !closed; k++) {
+      if (text[k] === '(') depth++;
+      else if (text[k] === ')' && --depth === 0) closed = true;
+    }
+    if (closed && !/^\s*(?:[;{}]|\/\/|$)/.test(text.slice(k))) return null;
+    args += text.slice(from, k) + '\n';
+  }
+  if (!closed || self!.test(args)) return null;
+
+  const callee = m[1]!;
+  const dot = callee.indexOf('.');
+  const name = callee.slice(dot + 1);
+  let pkgDir = goPackageDir(filePath);
+  if (dot >= 0) {
+    const imported = context.getImportMappings(filePath, 'go').find((imp) => imp.localName === callee.slice(0, dot));
+    if (!imported) return null;
+    if (isGoOutsideImport(imported, filePath, context)) return { raw: callee };
+    const dir = context.getGoPackageDir?.(imported.source, filePath);
+    if (dir == null) return null;
+    pkgDir = dir;
+  }
+  const fn = context.getNodesByName(name).find(
+    (n) => n.kind === 'function' && n.language === 'go' && goPackageDir(n.filePath) === pkgDir
+  );
+  if (!fn) return goPackageTypes(name, pkgDir, context).length > 0 ? { raw: callee } : null;
+  // `(params) *T`, `(params) (*T, error)`, `(params) (t *T, err error)`.
+  const results = /^\s*\((?:[^()]|\([^()]*\))*\)\s*\(?\s*([^,()]*)/.exec(fn.signature ?? '')?.[1]?.trim();
+  const raw = results?.split(/\s+/).pop()?.replace(/\[.*$/, '');
+  if (!raw || !/^\*?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/.test(raw)) return null;
+  // A value of an outside type that project code returns is usually an
+  // interface a project type implements (`http.RoundTripper`,
+  // `health.Checker`): unknown, where a pointer (`*os.File`) is that type.
+  if (!raw.startsWith('*') && isGoExternalType(raw, fn.filePath, context)) return null;
+  return { raw, file: fn.filePath };
+}
+
 /** The node kinds a Go `type` declaration produces. */
 export const GO_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface', 'type_alias']);
 
@@ -20141,6 +20255,27 @@ function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: stri
   let memo = GO_ALIAS_TARGETS.get(context);
   if (!memo) GO_ALIAS_TARGETS.set(context, (memo = new Map()));
   if (memo.has(typeNode.id)) return memo.get(typeNode.id);
+  const aliased = goAliasedType(typeNode, context);
+  // `T`, `*T`, `pkg.T`, each perhaps with type arguments.
+  const m = aliased !== undefined && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(aliased);
+  let target: { name: string; pkgDir: string } | null | undefined;
+  if (m) {
+    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goBareTypeDir(m[1]!, typeNode.filePath, context);
+    const name = m[2] ?? m[1]!;
+    target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
+  } else {
+    target = aliased !== undefined ? null : undefined;
+  }
+  memo.set(typeNode.id, target);
+  return target;
+}
+
+/**
+ * What a Go alias declaration writes after its `=` (`context.Context`,
+ * `*Local`, `func()`). Undefined when the node is no alias.
+ */
+function goAliasedType(typeNode: Node, context: ResolutionContext): string | undefined {
+  if (typeNode.kind !== 'type_alias') return undefined;
   const lines = context.getFileLines?.(typeNode.filePath) ?? context.readFile(typeNode.filePath)?.split(/\r?\n/) ?? [];
   // From the alias's name, where the node starts, to the end of its type.
   const decl = lines
@@ -20149,18 +20284,7 @@ function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: stri
     .join(' ');
   // `Name =` or `Name[T any] =`; a defined type has no `=` there.
   const head = /^\s*[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*=/.exec(decl);
-  // `T`, `*T`, `pkg.T`, each perhaps with type arguments.
-  const m = head && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(decl.slice(head[0].length));
-  let target: { name: string; pkgDir: string } | null | undefined;
-  if (m) {
-    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goBareTypeDir(m[1]!, typeNode.filePath, context);
-    const name = m[2] ?? m[1]!;
-    target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
-  } else {
-    target = head ? null : undefined;
-  }
-  memo.set(typeNode.id, target);
-  return target;
+  return head ? decl.slice(head[0].length) : undefined;
 }
 
 /** The declarations of Go type `typeName` in the package at directory `pkgDir`. */
@@ -20294,16 +20418,19 @@ interface GoProjectType {
 
 /**
  * What inferLocalReceiverType tells its caller besides the type: the type as
- * the declaration spells it (`raw`), and for a Go local bound from a type
- * assertion, the type goWrittenType finds for it (`asserted`; null for one
- * with no method the project declares). `asserted` is unset when the local
- * is declared some other way, or goWrittenType can't tell its type.
+ * the declaration spells it (`raw`), the file that spelling is read in when
+ * it is not the call's own (`file` — a callee's result type is written in the
+ * callee's file), and for a Go local bound from a type assertion, the type
+ * goWrittenType finds for it (`asserted`; null for one with no method the
+ * project declares). `asserted` is unset when the local is declared some
+ * other way, or goWrittenType can't tell its type.
  * `declared` is the named type a Go parameter or local's declaration in
  * scope writes, as the scope reader finds it (`clock.PassiveClock`, `Store`),
  * or null for a type literal; unset when that declaration writes no type.
  */
 interface GoReceiverDecl {
   raw?: string;
+  file?: string;
   asserted?: GoProjectType | null;
   declared?: string | null;
   /** The line the inference read the declaration on. */
@@ -23059,6 +23186,8 @@ function matchGoFieldChainCall(
   const asserted = decl.asserted;
   if (asserted === null) return null;
   if (decl.declared && goHasNoProjectMethods(decl.declared, ref, context)) return null;
+  const declFile = decl.file ?? ref.filePath;
+  if (!asserted && isGoExternalType(decl.raw, declFile, context)) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
@@ -23071,7 +23200,7 @@ function matchGoFieldChainCall(
   // names repeat across packages — harbor has a `daoTestSuite` in every DAO
   // package — and another package's same-named struct with a same-named
   // field is not this one (#2323).
-  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, ref.filePath, context);
+  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, declFile, context);
   const declared = structs.filter((n) => goPackageDir(n.filePath) === basePkg);
   if (declared.length > 0 || asserted) structs = declared;
   structs = preferCallSiteFile(structs, ref.filePath);
