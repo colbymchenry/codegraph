@@ -13,6 +13,7 @@ import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { dartDirectiveFile } from './dart-libraries';
+import { moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -3015,3 +3016,39 @@ export function isBoundToOutOfRepoImport(
   }
   return false;
 }
+
+/**
+ * The tail a reference that failed to resolve is parked under when its name
+ * is an import binding the module it imports does not declare by that name:
+ * a default import (`import tagsController from './tag/tag.controller'`, a
+ * CommonJS `require`), a namespace import, or an aliased one (`import {
+ * Component as Wrapper }`, `{ default as X }`). Resolution reaches it through
+ * the module, so a sync's retry has to find it by the module: under the
+ * module's {@link moduleTail} ('module:tag'), the key a sync looks up for
+ * every file it adds or changes. Its own name, the default tail, is one the
+ * module never declares, so the file that appears or gains the export never
+ * found it. A sync still looks it up by that name as well: a binding its
+ * module never resolves is linked by the name alone.
+ *
+ * Only a whole-name reference to the binding — the import itself, a call,
+ * `new`, a JSX tag, a value — and only for a module of the project: a member
+ * read (`NS.member`) waits for the member's name, and a package's binding
+ * keeps its tail. Undefined for every other reference.
+ */
+export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language) || !IDENTIFIER.test(ref.referenceName)) return undefined;
+  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === ref.referenceName);
+  if (!binding || (!binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
+  if (isExternalImport(binding.source, ref.language, context) &&
+      // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
+      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix))) {
+    return undefined;
+  }
+  // `..` names a folder through the importing file's own location.
+  const modulePath = binding.source.startsWith('.')
+    ? path.posix.join(path.posix.dirname(ref.filePath), binding.source)
+    : binding.source;
+  return moduleTail(modulePath) || undefined;
+}
+
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
