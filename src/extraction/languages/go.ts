@@ -168,4 +168,21 @@ export const goExtractor: LanguageExtractor = {
     const match = text.match(/\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/);
     return match?.[1];
   },
+  // A type declared on its own, `type Foo struct{…}`, is a `type_declaration`
+  // holding one spec, and its doc comment comes before the declaration, outside
+  // the spec. A member of a `type ( … )` group has its comment beside it in the
+  // parentheses, and the comment above the group is the group's. A group of one
+  // is that type's declaration, as go doc reads it, unless its member has a
+  // comment of its own.
+  getDeclarationWrapper: (node) => {
+    const parent = node.parent;
+    if (parent?.type !== 'type_declaration' || !parent.firstNamedChild?.equals(node)) return undefined;
+    const specs = parent.namedChildren.filter(
+      (c: SyntaxNode) => c.type === 'type_spec' || c.type === 'type_alias'
+    );
+    return specs.length === 1 ? parent : undefined;
+  },
+  // A comment after code on its line (`const sides = 4 // sides of a square.`)
+  // is that line's, never the doc of the declaration below it.
+  docstringSkipsTrailingComments: true,
 };
