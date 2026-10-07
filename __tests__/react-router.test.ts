@@ -1252,7 +1252,8 @@ export function NavMenu() {
     writeFiles(root, { 'src/App.js': MAPPED });
     await cg.sync();
     expect(routeNames(cg)).toEqual(['/', '/counter', '/fetch-data']);
-    expect(navigations(cg)).toContain('NavMenu -> /counter');
+    // `navigate('/')` failed while `/` was gone; the routes coming back retry it.
+    expect(navigations(cg)).toEqual(['NavMenu -> /counter', 'goHome -> /']);
   });
 
   it('deleting that file is a change too', async () => {

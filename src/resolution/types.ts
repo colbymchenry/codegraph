@@ -252,6 +252,26 @@ export interface CrossFileNodes extends FrameworkExtractionResult {
 }
 
 /**
+ * The navigation calls a router binds to its routes — `navigate('/login')`,
+ * `router.push('/x')` — described so a sync can find the ones a changed route
+ * may answer (see `FrameworkResolver.navigation`).
+ */
+export interface NavigationCalls {
+  /**
+   * The name tails of the calls `claimsReference` accepts as navigation —
+   * `push` for `history.push` — which find them through the failed-tail
+   * index; `claimsReference` then decides on the whole name.
+   */
+  tails: readonly string[];
+  /**
+   * The files whose navigation calls can name `route`: the path prefixes of
+   * the apps whose table it is in (`''` for every file), or null when it is
+   * not one of this router's routes.
+   */
+  scope(route: Node, context: ResolutionContext): readonly string[] | null;
+}
+
+/**
  * Framework-specific resolver
  */
 export interface FrameworkResolver {
@@ -317,6 +337,16 @@ export interface FrameworkResolver {
    * next run puts it back.
    */
   crossFileNodes?(context: ResolutionContext): CrossFileNodes;
+  /**
+   * Set by a router whose `resolve()` binds a navigation call to one of its
+   * route nodes. A call whose route did not exist yet was parked as failed, or
+   * bound to whatever answered it then (a catch-all, a parameter route), and
+   * the retry that matches a failed ref's name tail against the names a sync
+   * adds (#1240) never finds it: its name is the router's method, never the
+   * route's path. So a sync that adds, removes or renames a route puts the
+   * calls this describes back for its resolution sweep.
+   */
+  navigation?: NavigationCalls;
 }
 
 /**

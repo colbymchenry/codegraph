@@ -278,11 +278,23 @@ Each of these cost real debugging time; they are not hypothetical.
    `.map` whose callback renders a `<Route>` from the item's own fields
    (`{...route}`, `{...rest}`, `path={route.path}` — never
    `path={r.layout + r.path}`), follows the import to the table and the tables
-   it names in turn, and owns its routes by id (`…:table:<path>`). Two limits
+   it names in turn, and owns its routes by id (`…:table:<path>`). One limit
    it shares with every router: a table rendered by a component that is
    itself mounted under another file's `<Route path="/admin/*">` reads as if
-   at the root, and a navigation that failed while its route was gone is not
-   retried until a full index.
+   at the root. A sync that changes such a route resolves the calls it can
+   answer again (14), as for any other route.
+14. **A navigation call waits for a route, not for a name.** A call indexed
+   before its route existed is parked as failed (or bound to a catch-all, a
+   parameter route, the other arm of a conditional), and sync revisits a
+   failed reference only by matching its last name segment against the names
+   the synced files define — never `push` or `navigate`. Set the resolver's
+   `navigation`: `tails`, the method names its calls end in, and `scope`, the
+   apps whose calls one of its routes can answer (its own app's table, or every
+   file for a table the whole project shares). A sync that adds, removes or
+   renames a route — a cross-file table route included — then resolves those
+   calls again, failed or not; without it the synced index keeps an answer a
+   full index does not have. `sync-navigation-retry.test.ts` runs all seven
+   routers through it, and asserts each router's calls end in a declared tail.
 
 ---
 
