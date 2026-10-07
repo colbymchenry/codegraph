@@ -1927,9 +1927,10 @@ export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): 
 
 /**
  * Whether a Go reference is written through a package that is none of its
- * file's imports as the index knows them: `yaml` in `yaml.Node` under an
- * unaliased `import "go.yaml.in/yaml/v3"`, which is recorded under its last
- * path element, `v3`. Which package that is cannot be told from here.
+ * file's imports as the index knows them: `clientv3` in `clientv3.KV` under an
+ * unaliased `import "go.etcd.io/etcd/client/v3"`, a package named neither by
+ * its path's last element (`v3`) nor by the name goimports assumes for it
+ * (`client`). Which package that is cannot be told from here.
  */
 export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const { written, imported } = goRefQualification(ref, context);
