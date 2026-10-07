@@ -1078,18 +1078,20 @@ impl<'t> Walker<'t> {
                     row: p.row,
                 });
             }
-            // #1820: preserve the receiver of a method value.
+            // #1820: preserve the receiver of a method value. The name is
+            // rebuilt from operand and field, as normalizeSpecial does, so a
+            // comment or line break beside the dot keeps the candidate.
+            // NAME_STOPLIST applies to the whole name and holds no dotted
+            // word, so it never drops one: `raft.None` is a candidate even
+            // though a bare `None` is not.
             "selector_expression" => {
-                let field = v
-                    .child_by_field_name("field")
-                    .or_else(|| v.named_child(v.named_child_count().saturating_sub(1)));
-                let Some(field) = field else { return };
-                let name = self.text(field);
-                if name.is_empty() || is_stoplisted(name) {
+                let (Some(operand), Some(field)) =
+                    (v.child_by_field_name("operand"), v.child_by_field_name("field"))
+                else {
                     return;
-                }
-                let value = self.text(v);
-                if !value.split('.').all(|part| {
+                };
+                let name = format!("{}.{}", self.text(operand), self.text(field));
+                if !name.split('.').all(|part| {
                     !part.is_empty() && part.chars().enumerate().all(|(i, c)| {
                         c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
                     })
@@ -1097,7 +1099,7 @@ impl<'t> Walker<'t> {
                 let p = field.start_position();
                 self.fn_ref_cands.push(Cand {
                     from,
-                    name: value.to_string(),
+                    name,
                     line: p.row as u32 + 1,
                     column_byte: field.start_byte(),
                     row: p.row,

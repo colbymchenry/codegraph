@@ -262,13 +262,20 @@ type Declared =
   | { cls: string }
   /** An enum, namespace or other non-class type. */
   | 'other'
-  /** Aliases naming different types, none of them the calling file's. */
-  | 'ambiguous'
+  /**
+   * Aliases naming different types, none of them the calling file's: rocksdb's
+   * `using DBWithTTLImplBase = …;` in each arm of an `#if USE_COROUTINES`.
+   */
+  | { ambiguous: Node[] }
   | undefined;
 
+/** Which declarations a lookup can see; every one of them unless a caller narrows it. */
+type Visible = (n: Node) => boolean;
+
 /** C and C++ declarations named `name` that can stand for a type or scope. */
-function typeDeclarations(name: string, context: ResolutionContext): Node[] {
-  return context.getNodesByName(name).filter((n) => isCFamily(n) && (n.kind === 'type_alias' || DECLARING_KINDS.has(n.kind)));
+function typeDeclarations(name: string, context: ResolutionContext, visible?: Visible): Node[] {
+  return context.getNodesByName(name).filter((n) =>
+    isCFamily(n) && (n.kind === 'type_alias' || DECLARING_KINDS.has(n.kind)) && (!visible || visible(n)));
 }
 
 function declaredIn(
@@ -288,7 +295,7 @@ function declaredIn(
   if (here.some((n) => CLASS_KINDS.has(n.kind))) return { cls: qualified };
   if (here.some((n) => n.kind !== 'type_alias')) return 'other';
   const alias = pickAlias(here, ref, context);
-  return alias ? { alias } : 'ambiguous';
+  return alias ? { alias } : { ambiguous: here };
 }
 
 /**
@@ -429,8 +436,15 @@ function memberOf(
 }
 
 /** `name` looked up unqualified from `scopes`, innermost first; a class scope includes its bases. */
-function lookupUnqualified(name: string, templated: boolean, scopes: readonly string[], ref: UnresolvedRef, context: ResolutionContext): Declared {
-  const named = typeDeclarations(name, context);
+function lookupUnqualified(
+  name: string,
+  templated: boolean,
+  scopes: readonly string[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  visible?: Visible,
+): Declared {
+  const named = typeDeclarations(name, context, visible);
   if (named.length === 0) return undefined;
   for (const scope of scopes) {
     const found = scope ? memberOf(scope, name, named, templated, ref, context) : declaredIn('', name, named, templated, ref, context);
@@ -472,22 +486,95 @@ export function cppAliasedTypeName(resolved: CppAliasedType): string {
   return [resolved.target[resolved.target.length - 1]!, ...resolved.rest].join('::');
 }
 
-function follow(
-  name: TypeName,
-  scope: string,
+/** What a C++ type name names when it is looked up for a class (see cppClassNamed). */
+export type CppNamedClass =
+  /** A class, by its qualified name. */
+  | { cls: string }
+  /**
+   * An alias that leads to none of the project's classes: one of a type
+   * outside the project (`template <bool B> using bool_constant =
+   * std::integral_constant<bool, B>;`), of what a template argument decides,
+   * or one each `#if` arm declares differently (the first declaration).
+   */
+  | { alias: Node }
+  /** No particular class: an enum, a member of a type outside the project. */
+  | null
+  /** Nothing in the scopes looked in declares it. */
+  | undefined;
+
+/**
+ * The class a C++ type written as `written` names, looked up from `scopes`
+ * (innermost first) as a declared type is — a class scope with its bases, a
+ * qualified name a segment at a time — and followed through an alias it
+ * reaches: rocksdb's `InternalIterator` under `using InternalIterator =
+ * InternalIteratorBase<Slice>;` names `InternalIteratorBase`. `visible`
+ * narrows the declarations the lookup can see.
+ */
+export function cppClassNamed(
+  written: string,
+  scopes: readonly string[],
   ref: UnresolvedRef,
   context: ResolutionContext,
-  hops: number,
-): CppAliasedType | null | undefined {
-  const scopes = scopesWithin(scope);
-  let found = lookupUnqualified(name.names[0]!, name.templated[0]!, scopes, ref, context);
+  visible?: Visible,
+): CppNamedClass {
+  const name = cppTypeName(written);
+  if (!name) return null;
+  const { found, next } = lookupSegments(name, scopes, ref, context, visible);
+  if (found === undefined) return undefined;
+  if (typeof found !== 'object') return null;
+  if ('cls' in found) return found;
+  if ('ambiguous' in found) {
+    // An alias each `#if` arm declares differently: the first declaration.
+    const [first] = [...found.ambiguous].sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+    return next === name.names.length ? { alias: first! } : null;
+  }
+  const alias = found.alias;
+  const text = declarationText(alias, context);
+  // The aliased type is written in the alias's own scope.
+  const aliased = expand(text ? aliasedTypeIn(text, alias.name) : null, name.names.slice(next), name.templated.slice(next),
+    parentScope(alias.qualifiedName), ref, context, 1, templateParametersAround(alias, context));
+  const cls = aliased && !aliased.pointer && classNamed([...aliased.target, ...aliased.rest], scopesWithin(aliased.scope), context);
+  if (cls) return { cls };
+  // A member of a type outside the project (`Alias::Inner`) is not the alias.
+  return next === name.names.length ? { alias } : null;
+}
+
+/** The scopes visible from inside the scope `qualified`, innermost first, ending with the global scope. */
+export function cppScopesWithin(qualified: string): string[] {
+  return scopesWithin(qualified);
+}
+
+/** The scope a C++ declaration is declared in: `leveldb::MemTable` for `leveldb::MemTable::Table`. */
+export function cppParentScope(qualified: string): string {
+  return parentScope(qualified);
+}
+
+/** The template parameters in scope where `node` is declared: its own `template <…>` header and its class templates'. */
+export function cppTemplateParameters(node: Node, context: ResolutionContext): ReadonlySet<string> {
+  return templateParametersAround(node, context);
+}
+
+/**
+ * What a written name declares, looked up from `scopes` (innermost first), and
+ * how many of its segments that took: a class's member is looked up in the
+ * class, and an alias ends the walk (`next` is where the rest of the name
+ * starts).
+ */
+function lookupSegments(
+  name: TypeName,
+  scopes: readonly string[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  visible?: Visible,
+): { found: Declared; next: number } {
+  let found = lookupUnqualified(name.names[0]!, name.templated[0]!, scopes, ref, context, visible);
   let next = 1;
   if (found === undefined && name.names.length > 1) {
     // Namespaces are not indexed: `detail::buffer_t` from inside `fmt` is
     // found by its spelling in an enclosing scope, longest prefix first.
     for (let i = name.names.length; i >= 2 && found === undefined; i--) {
       const spelled = name.names.slice(0, i);
-      const named = typeDeclarations(spelled[spelled.length - 1]!, context);
+      const named = typeDeclarations(spelled[spelled.length - 1]!, context, visible);
       for (const s of scopes) {
         found = declaredIn(s ? `${s}::${spelled.slice(0, -1).join('::')}` : spelled.slice(0, -1).join('::'),
           spelled[spelled.length - 1]!, named, name.templated[i - 1]!, ref, context);
@@ -498,9 +585,20 @@ function follow(
   }
   // `MemTable::Table`, `Table::Iterator`: one segment at a time.
   while (found && typeof found === 'object' && 'cls' in found && next < name.names.length) {
-    found = memberOf(found.cls, name.names[next]!, typeDeclarations(name.names[next]!, context), name.templated[next]!, ref, context);
+    found = memberOf(found.cls, name.names[next]!, typeDeclarations(name.names[next]!, context, visible), name.templated[next]!, ref, context);
     next++;
   }
+  return { found, next };
+}
+
+function follow(
+  name: TypeName,
+  scope: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  hops: number,
+): CppAliasedType | null | undefined {
+  const { found, next } = lookupSegments(name, scopesWithin(scope), ref, context);
   if (!found || typeof found !== 'object' || !('alias' in found)) return undefined;
   const alias = found.alias;
   if (hops >= MAX_HOPS) return null;
