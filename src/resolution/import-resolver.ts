@@ -2565,6 +2565,9 @@ function resolveGoCrossPackageReference(
   const receiver = ref.referenceName.substring(0, dotIdx);
   const memberName = ref.referenceName.substring(dotIdx + 1);
   if (!memberName) return null;
+  // A parameter or local named like the import holds the call there:
+  // `store := newStore()`, then `store.Get(k)` is no call into package store.
+  if (!goRefQualifier(ref, context)) return null;
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
