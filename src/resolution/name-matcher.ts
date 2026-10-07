@@ -7349,6 +7349,26 @@ export function matchByQualifiedName(
         )
       : nodes;
 
+  // A C or C++ name written from the global scope (`::hpb::CreateMessage`,
+  // `::operator delete`) is the declaration of exactly that name. The suffix
+  // match below would take one nested in another namespace or class: for
+  // fmt's mock `test::open`, the `::open(…)` it wraps. Nor is it a declaration
+  // inside a namespace a macro opens, which only looks global in the index
+  // (fmt's `struct pipe`); step 5 of matchReference reads those.
+  if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.startsWith('::')) {
+    const global = keepForRef(context.getNodesByQualifiedName(ref.referenceName.slice(2))).filter((n) =>
+      (n.language === 'cpp' || n.language === 'c') &&
+      !cppMacroNamespaceFrames(n.filePath, context).some((f) => f.start <= n.startLine && f.end >= n.startLine));
+    const chosen = preferCallSiteFile(global, ref.filePath)[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: global.length === 1 || chosen.filePath === ref.filePath ? 0.95 : 0.85,
+      resolvedBy: 'qualified-name',
+    };
+  }
+
   let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
@@ -13069,6 +13089,8 @@ export function cppMacroNamespaceFrames(file: string, context: ResolutionContext
  */
 function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   let target = ref.referenceName.replace(/^::/, '');
+  // `::memset` names no namespace for a macro or an alias to open.
+  if (!target.includes('::')) return null;
   const head = target.slice(0, target.indexOf('::'));
   const alias = cppNamespaceAliases(context).get(head);
   // `py::str` under `namespace py = pybind11;` is `pybind11::str`.

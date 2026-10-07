@@ -1287,6 +1287,11 @@ export class ReferenceResolver {
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // A C or C++ name written from the global scope (`::_pbi::PrivateAccess::
+    // GenerateParseTable`, `::memset`) exists when the name under the `::` does.
+    if ((ref.language === 'cpp' || ref.language === 'c') && existenceName.startsWith('::')) {
+      existenceName = existenceName.slice(2);
+    }
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -1296,11 +1301,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      // Every detected framework's claim, not only those that resolve this
-      // language: the check above reads no leading `::`, and protobuf's C++
-      // `::_pbi::…` calls get past it only on the Swift ↔ Objective-C
-      // bridge's claim of any name with a `:` in it.
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -2819,12 +2820,15 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      // A leading `::` names the global scope: `::std::move` is `std::move`,
+      // `::memset` is `memset`.
+      const scoped = name.startsWith('::') ? name.slice(2) : name;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
-      if (name.startsWith('std::')) return true;
-      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
-        return !this.hasAnyPossibleMatch(name);
+      if (scoped.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(scoped) || CPP_BUILT_INS.has(scoped)) {
+        return !this.hasAnyPossibleMatch(scoped);
       }
     }
 
