@@ -25,8 +25,9 @@
  * Resolution keeps an embedded type in its package. A bare name is its own
  * package's type, not another package's struct of that name, which the Go
  * framework heuristics preferred (promql/parser's `Node` interface, etcd's
- * `Lease`). A package that is none of the file's imports as indexed (`yaml`
- * under an unaliased `go.yaml.in/yaml/v3`) leaves the type unresolved.
+ * `Lease`). A package that is none of the file's imports as indexed
+ * (`clientv3` under an unaliased `go.etcd.io/etcd/client/v3`, which goimports
+ * would call `client`) leaves the type unresolved.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -260,7 +261,7 @@ describe('the type hierarchy of an indexed Go module', () => {
         'func (b *Base) Close() error { return nil }',
         '',
       ].join('\n'),
-      // Named like io.Closer, io.Reader, sync.Mutex and yaml.Node: never what those name.
+      // Named like io.Closer, io.Reader, sync.Mutex, yaml.Node and clientv3.KV: never what those name.
       'other/other.go': [
         'package other',
         '',
@@ -272,6 +273,8 @@ describe('the type hierarchy of an indexed Go module', () => {
         '',
         'type Node struct{}',
         '',
+        'type KV interface{ Get(key string) string }',
+        '',
       ].join('\n'),
       'store/store.go': [
         'package store',
@@ -281,13 +284,19 @@ describe('the type hierarchy of an indexed Go module', () => {
         '\t"sync"',
         '',
         '\t"example.com/app/storage"',
+        '\t"go.etcd.io/etcd/client/v3"',
         '\t"go.yaml.in/yaml/v3"',
         ')',
         '',
-        '// The package is yaml, though the index knows its import as v3.',
+        '// The package is yaml, though its import path ends in v3.',
         'type RuleGroupNode struct {',
         '\tyaml.Node',
         '\tName string',
+        '}',
+        '',
+        '// The package is clientv3: not v3, nor the client goimports would assume.',
+        'type kvPrefix struct {',
+        '\tclientv3.KV',
         '}',
         '',
         'type Queryable interface{ Q() }',
@@ -367,6 +376,7 @@ describe('the type hierarchy of an indexed Go module', () => {
       one('Number', 'store/store.go'),
       one('Store', 'store/store.go'),
       one('RuleGroupNode', 'store/store.go'),
+      one('kvPrefix', 'store/store.go'),
       one('Reader', 'wrap/wrap.go'),
       one('IRouter', 'gin/routergroup.go'),
       one('Expr', 'parser/ast.go'),
@@ -381,8 +391,9 @@ describe('the type hierarchy of an indexed Go module', () => {
       .sort();
     // An embedded interface of a struct resolves as `implements`; one of an
     // interface stays `extends`. io.Closer, sync.Mutex, io.Reader and yaml.Node
-    // are outside the project, so nothing named like them is linked. A bare
-    // name is its own package's type, whatever kind another package's is.
+    // are outside the project, and clientv3 is no import the index knows, so
+    // nothing named like them is linked. A bare name is its own package's
+    // type, whatever kind another package's is.
     expect(supertypes).toEqual([
       'Expr extends Node@parser/ast.go',
       'IRouter extends IRoutes@gin/routergroup.go',
@@ -405,6 +416,7 @@ describe('the type hierarchy of an indexed Go module', () => {
     expect(unresolved(one('Querier', 'store/store.go'))).toEqual(['Closer']);
     expect(unresolved(one('Store', 'store/store.go'))).toEqual(['Mutex']);
     expect(unresolved(one('RuleGroupNode', 'store/store.go'))).toEqual(['Node']);
+    expect(unresolved(one('kvPrefix', 'store/store.go'))).toEqual(['KV']);
     expect(unresolved(one('Reader', 'wrap/wrap.go'))).toEqual(['Reader']);
 
     // What the viewer's Type hierarchy and codegraph_explore read. Declared
@@ -418,7 +430,7 @@ describe('the type hierarchy of an indexed Go module', () => {
     expect(subtypes(one('LabelQuerier', 'storage/storage.go'))).toEqual(['extends Querier@store/store.go']);
     expect(subtypes(one('Base', 'storage/storage.go'))).toEqual(['extends Store@store/store.go']);
     const declaredInto = graph
-      .getIncomingEdgesTo(['Closer', 'Mutex', 'Reader', 'Node'].map((name) => one(name, 'other/other.go').id), ['extends', 'implements'])
+      .getIncomingEdgesTo(['Closer', 'Mutex', 'Reader', 'Node', 'KV'].map((name) => one(name, 'other/other.go').id), ['extends', 'implements'])
       .filter((e) => e.provenance !== 'heuristic');
     expect(declaredInto).toEqual([]);
     expect(
