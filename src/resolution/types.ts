@@ -29,6 +29,9 @@ export interface UnresolvedRef {
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
+  /** The tail a ref that failed to resolve is parked under, when it is not
+   * the one its name gives (see `importBindingTail`). */
+  nameTail?: string;
 }
 
 /**
@@ -319,6 +322,7 @@ export interface FrameworkResolver {
    * an attribute/descriptor, not a declared symbol (e.g. Django's
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
+   * Asked only about references written in the languages `resolve()` sees.
    */
   claimsReference?(name: string): boolean;
   /**

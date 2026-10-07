@@ -203,6 +203,10 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_ta
 -- hide how many failed calls a common tail (`index`, `types`) has.
 CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_tail ON unresolved_refs(reference_kind, name_tail) WHERE status = 'failed' AND reference_kind = 'imports';
 CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_name ON unresolved_refs(reference_kind, reference_name) WHERE status = 'failed' AND reference_kind = 'imports';
+-- A failed ref through an import binding is parked under its module
+-- (`module:tag`) and looked up by its whole name as well. The leading status
+-- is the equality term that keeps the planner on this small index.
+CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_name ON unresolved_refs(status, reference_name) WHERE status = 'failed' AND name_tail GLOB 'module:*';
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 -- Sync's third-file wiring lookup must not scan every synthesized edge.
 -- CASE short-circuits malformed metadata; keep these expressions identical
