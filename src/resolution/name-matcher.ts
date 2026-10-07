@@ -2411,9 +2411,22 @@ function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { rec
   if (ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return null;
-  const text = lines.slice(ref.line - 1, ref.line + 7).join('\n').slice(Math.max(0, ref.column));
   const name = ref.referenceName.replace(/\$/g, '\\$');
-  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`).exec(text);
+  const call = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`);
+  // Search the ref's own line first: a minified bundle is one line, and
+  // joining it to the lines after it copied all of it for every call on it
+  // (about 1 MB a call on go-ethereum's graphiql.min.js). Every match starts
+  // with the name, so a match with no `name` before it on the line is where
+  // the joined lines match first too. Otherwise (no match, as for a call that
+  // continues on the next line, or the name earlier) the joined lines decide.
+  const span = lines.slice(ref.line - 1, ref.line + 7);
+  const from = Math.max(0, ref.column);
+  let text = span[0]?.slice(from) ?? '';
+  let at = call.exec(text);
+  if (!at || text.indexOf(ref.referenceName) < at.index) {
+    text = span.join('\n').slice(from);
+    at = call.exec(text);
+  }
   if (!at) return null;
   const before = text.slice(0, at.index).replace(/\s+$/, '');
   if (!/\??\.$/.test(before)) return null;
