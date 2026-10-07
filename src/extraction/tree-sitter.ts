@@ -22,8 +22,9 @@ import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
+import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { rustImplTypeName } from './languages/rust';
-import { goEmbeddedTypeName } from './languages/go';
+import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -570,11 +571,19 @@ export class TreeSitterExtractor {
   // files, and a node per block would flood search with same-named symbols
   // (the #1093 crowd-out failure mode). Always empty outside C/C++.
   private namespacePrefix: string[] = [];
+  // A C++ file whose tree has errors is walked in the scopes its braces
+  // open (see visitInCppBraceScope): the scan of them, null for every other
+  // file, and the class-like nodes extracted so far by the braces of their
+  // bodies.
+  private cppBraceScopes: CppBraceScopes | null = null;
+  private cppClassScopes = new NestedIntervals<string>();
+  private cppClassScopeIds = new Set<string>();
   // C/C++: whether a class, struct, union or enum defined in the type of a
   // declaration outside any body is walked (see visitNode). Not in a C++ file
-  // whose tree has errors: error recovery there can close a namespace or a
-  // class at the wrong `}`, or run a class past its own, so the walked class
-  // would land in the wrong scope.
+  // whose tree has errors and whose braces don't balance: error recovery can
+  // close a namespace or a class at the wrong `}`, or run a class past its
+  // own, and with no brace scopes to correct it the walked class would land
+  // in the wrong scope.
   private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
@@ -672,8 +681,12 @@ export class TreeSitterExtractor {
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      if (this.language === 'cpp' && this.tree.rootNode.hasError) {
+        this.cppBraceScopes = scanCppBraceScopes(this.source);
+      }
       this.walkDeclaredTypes =
-        this.language === 'c' || (this.language === 'cpp' && !this.tree.rootNode.hasError);
+        this.language === 'c' ||
+        (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
       const fileNode: Node = {
@@ -1132,6 +1145,65 @@ export class TreeSitterExtractor {
    * Visit a node and extract information
    */
   private visitNode(node: SyntaxNode): void {
+    if (this.cppBraceScopes) this.visitInCppBraceScope(node, this.cppBraceScopes);
+    else this.dispatchNode(node);
+  }
+
+  /**
+   * Walk a node of a C++ file whose tree has errors in the namespaces and
+   * classes its source braces put it in. That is where the tree put it unless
+   * error recovery closed a scope at the wrong `}` or ran one past its own —
+   * the rest of a class then parses as declarations of the namespace around
+   * it (rocksdb's `struct Opts`), and the rest of each namespace one level out
+   * (protobuf's `FieldDescriptor` at the top level). See cpp-brace-scopes.ts.
+   *
+   * The namespaces apply everywhere. The enclosing classes are set only at
+   * declaration level, where the stack above the file node holds nothing but
+   * class scopes; inside a function (a local class's members) the walk's own
+   * stack stands.
+   */
+  private visitInCppBraceScope(node: SyntaxNode, scopes: CppBraceScopes): void {
+    const at = node.startIndex;
+    const namespaces = this.namespacePrefix;
+    this.namespacePrefix = scopes.namespacesAt(at);
+    const stack = this.nodeStack;
+    let base = stack.length;
+    while (base > 1 && this.cppClassScopeIds.has(stack[base - 1]!)) base--;
+    let walked: string[] | null = null;
+    if (base === 1) {
+      const classes = this.cppClassScopes.at(at);
+      if (classes.length !== stack.length - base || classes.some((id, i) => stack[base + i] !== id)) {
+        walked = stack.splice(base);
+        stack.push(...classes);
+      }
+    }
+    this.dispatchNode(node);
+    if (walked) stack.splice(base, stack.length - base, ...walked);
+    this.namespacePrefix = namespaces;
+  }
+
+  /**
+   * The textual extent of a C++ class-like body while the file is walked in
+   * brace scopes: where the node ends (the `}` that closes its body) to pass
+   * to createNode, or null to keep the tree's.
+   */
+  private cppBodyEnd(body: SyntaxNode | null | undefined): Partial<Node> | null {
+    const close = body ? this.cppBraceScopes?.closeOf(body.startIndex) : undefined;
+    if (close === undefined) return null;
+    const end = this.cppBraceScopes!.positionOf(close + 1);
+    return { endLine: end.line, endColumn: end.column };
+  }
+
+  /** Open a class-like node's body as a scope for visitInCppBraceScope. */
+  private openCppClassScope(node: Node, body: SyntaxNode | null | undefined): void {
+    if (!body) return;
+    const close = this.cppBraceScopes?.closeOf(body.startIndex);
+    if (close !== undefined && this.cppClassScopes.add(body.startIndex, close, node.id)) {
+      this.cppClassScopeIds.add(node.id);
+    }
+  }
+
+  private dispatchNode(node: SyntaxNode): void {
     if (!this.extractor) return;
 
     const nodeType = node.type;
@@ -1335,8 +1407,9 @@ export class TreeSitterExtractor {
       skipChildren = true; // extractEnum visits body children
     }
     // Check for type alias declarations (e.g. `type X = ...` in TypeScript)
-    // For Go, type_spec wraps struct/interface definitions — resolveTypeAliasKind
-    // detects these and extractTypeAlias creates the correct node kind.
+    // For Go, type_spec (and type_alias, `type A = B`) wraps struct/interface
+    // definitions — resolveTypeAliasKind detects these and extractTypeAlias
+    // creates the correct node kind.
     else if (this.extractor.typeAliasTypes.includes(nodeType)) {
       skipChildren = this.extractTypeAlias(node);
     }
@@ -1384,9 +1457,11 @@ export class TreeSitterExtractor {
       // C/C++: a class, struct, union or enum defined in the declaration's
       // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
       // definition like one written on its own, and the variables keep their
-      // nodes beside it. In a class or function body the children walk
-      // reaches it; here, this branch skips that walk. Mirrored in the kernel
-      // (ccpp/mod.rs visit_node).
+      // nodes beside it. So is a class the tree reads as a declaration's type
+      // in a file walked in brace scopes (`class X {…}` glued to the tokens
+      // after it by error recovery). In a class or function body the children
+      // walk reaches it; here, this branch skips that walk. Mirrored in the
+      // kernel (ccpp/mod.rs visit_node).
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
@@ -2021,8 +2096,10 @@ export class TreeSitterExtractor {
       docstring,
       visibility,
       isExported,
+      ...this.cppBodyEnd(resolvedBody),
     });
     if (!classNode) return;
+    this.openCppClassScope(classNode, resolvedBody);
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
@@ -2235,8 +2312,10 @@ export class TreeSitterExtractor {
       docstring,
       visibility,
       isExported,
+      ...this.cppBodyEnd(body),
     });
     if (!aggregateNode) return;
+    this.openCppClassScope(aggregateNode, body);
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, aggregateNode.id);
@@ -3773,6 +3852,17 @@ export class TreeSitterExtractor {
           // `type List = [ Service<'name', Req, Resp>, … ]` — surface each
           // entry's string-literal name as a searchable member (issue #634).
           this.extractTsTupleContractNames(value, typeAliasNode);
+        }
+      } else if (this.language === 'go') {
+        // Go's `type Event = mvccpb.Event` names its type in the `type` field.
+        for (const type of goAliasTypeNames(node, this.source) ?? []) {
+          this.unresolvedReferences.push({
+            fromNodeId: typeAliasNode.id,
+            referenceName: getNodeText(type, this.source),
+            referenceKind: 'references',
+            line: type.startPosition.row + 1,
+            column: type.startPosition.column,
+          });
         }
       }
     }

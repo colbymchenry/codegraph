@@ -12,6 +12,9 @@ import { pickByNameAndKind } from './name-heuristic';
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
   languages: ['csharp'],
+  // A Razor page's `@model CheckoutModel` names the PageModel in the
+  // code-behind beside it (`Checkout.cshtml.cs`); these rules look there first.
+  resolveLanguages: ['csharp', 'razor'],
 
   detect(context: ResolutionContext): boolean {
     // Check for .csproj files with ASP.NET references

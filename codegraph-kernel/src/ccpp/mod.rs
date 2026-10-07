@@ -14,6 +14,10 @@
 //!  - cpp namespace prefix stack (#1291): named `namespace a::b {` pushes the
 //!    name AS WRITTEN onto the qualifiedName prefix; anonymous falls through.
 //!    No namespace NODE is minted (#1093 crowd-out).
+//!  - cpp brace scopes (brace_scopes.rs): when the tree has errors, each node
+//!    is walked in the namespaces, and at declaration level the classes, the
+//!    source's braces put it in, not the tree's (error recovery closes scopes
+//!    at the wrong `}`). Only the error-extract hatch reaches it here.
 //!  - out-of-line `Cls::method` defs: name = LAST `::` segment of the
 //!    declarator's qualified_identifier (BFS that skips parameter_list +
 //!    trailing_return_type), receiver = the template-stripped qualifier,
@@ -35,10 +39,11 @@
 //!    `int x = 5;` does not — bug-for-bug).
 //!  - a class/struct/union/enum defined in a declaration's `type`
 //!    (`struct Foo { … } foo;`) is walked before the variables — in C, and in
-//!    C++ unless the tree has errors (walkDeclaredTypes); an unnamed one takes
-//!    the name of the first declarator identifier (`static struct { … } SPT;`
-//!    → `SPT`, in function bodies too), and the comment above the declaration
-//!    is its docstring (c/cpp getDeclarationWrapper).
+//!    C++ unless the tree has errors and no brace scopes (walkDeclaredTypes);
+//!    an unnamed one takes the name of the first declarator identifier
+//!    (`static struct { … } SPT;` → `SPT`, in function bodies too), and the
+//!    comment above the declaration is its docstring (c/cpp
+//!    getDeclarationWrapper).
 //!  - static-member/value-read pass (cpp only): `field_expression` is in
 //!    MEMBER_ACCESS_TYPES (listed for Scala, same node kind in cpp), so
 //!    `Capitalized.member` / `Capitalized->member` VALUE reads emit
@@ -80,6 +85,9 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
+
+mod brace_scopes;
+use brace_scopes::{BraceScopes, NestedIntervals};
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
 
@@ -288,6 +296,7 @@ pub enum Variant {
     Cpp,
 }
 
+#[derive(Clone)]
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -303,6 +312,8 @@ struct Extra {
     is_abstract: Option<bool>,
     return_type: Option<String>,
     qualified_name: Option<String>,
+    /// (endLine, endColumn) in place of the node's own (brace scopes).
+    end: Option<(u32, u32)>,
 }
 
 struct ValueScope<'t> {
@@ -359,9 +370,15 @@ pub struct Walker<'t> {
     fs_values: HashMap<String, u32>,
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
+    /// A cpp file whose tree has errors is walked in the scopes its braces
+    /// open (visit_in_brace_scope; only under the error-extract hatch): the
+    /// scan, and the class-like nodes extracted so far by their bodies' braces.
+    brace_scopes: Option<BraceScopes>,
+    class_scopes: NestedIntervals<Scope>,
+    class_scope_rows: HashSet<u32>,
     /// walkDeclaredTypes (tree-sitter.ts): a class-like type defined in a
-    /// declaration is walked in C, and in C++ unless the tree has errors
-    /// (reachable here only under the error-extract hatch).
+    /// declaration is walked in C, and in C++ unless the tree has errors and
+    /// its braces don't balance (no brace scopes; only under the hatch).
     walk_declared_types: bool,
 }
 
@@ -388,6 +405,13 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
 
+    let brace_scopes = if variant == Variant::Cpp && tree.root_node().has_error() {
+        brace_scopes::scan(source)
+    } else {
+        None
+    };
+    let walk_declared_types =
+        variant == Variant::C || !tree.root_node().has_error() || brace_scopes.is_some();
     let mut w = Walker {
         src: source,
         file_path,
@@ -407,7 +431,10 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         fs_values: HashMap::new(),
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
-        walk_declared_types: variant == Variant::C || !tree.root_node().has_error(),
+        brace_scopes,
+        class_scopes: NestedIntervals::new(),
+        class_scope_rows: HashSet::new(),
+        walk_declared_types,
     };
 
     let line_count = source.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -506,8 +533,10 @@ impl<'t> Walker<'t> {
         let column = self.col_of(node);
         let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         // (c/cpp define no resolveBody hook, so createNode's endLine extension
-        // for sibling-body grammars never fires — endLine is the node's own.)
-        let end_line = node.end_position().row as u32 + 1;
+        // for sibling-body grammars never fires — endLine is the node's own,
+        // or the `}` of its body in brace scopes.)
+        let (end_line, end_column) =
+            extra.end.unwrap_or_else(|| (node.end_position().row as u32 + 1, self.end_col_of(node)));
 
         let qualified = extra.qualified_name.unwrap_or_else(|| {
             let mut parts: Vec<&str> = self.namespace_prefix.iter().map(|s| s.as_str()).collect();
@@ -544,7 +573,7 @@ impl<'t> Walker<'t> {
             start_line,
             end_line,
             start_column: self.col_of(node),
-            end_column: self.end_col_of(node),
+            end_column,
             name: name_ref,
             qualified_name: qn_ref,
             id: id_ref,
@@ -928,6 +957,59 @@ impl<'t> Walker<'t> {
     // --- visitNode -----------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        if self.brace_scopes.is_some() {
+            self.visit_in_brace_scope(node);
+        } else {
+            self.dispatch_node(node);
+        }
+    }
+
+    /// visitInCppBraceScope: walk `node` in the namespaces and classes its
+    /// source braces put it in (see brace_scopes.rs). The namespaces apply
+    /// everywhere; the enclosing classes only at declaration level, where the
+    /// stack above the file node holds nothing but class scopes.
+    fn visit_in_brace_scope(&mut self, node: Node<'t>) {
+        let at = node.start_byte();
+        let namespaces = self.brace_scopes.as_ref().map(|s| s.namespaces_at(at)).unwrap_or_default();
+        let saved = std::mem::replace(&mut self.namespace_prefix, namespaces);
+        let mut base = self.stack.len();
+        while base > 1 && self.class_scope_rows.contains(&self.stack[base - 1].row) {
+            base -= 1;
+        }
+        let mut walked: Option<Vec<Scope>> = None;
+        if base == 1 {
+            let classes = self.class_scopes.at(at);
+            let same = classes.len() == self.stack.len() - base
+                && classes.iter().zip(&self.stack[base..]).all(|(c, s)| c.row == s.row);
+            if !same {
+                walked = Some(self.stack.split_off(base));
+                self.stack.extend(classes);
+            }
+        }
+        self.dispatch_node(node);
+        if let Some(walked) = walked {
+            self.stack.truncate(base);
+            self.stack.extend(walked);
+        }
+        self.namespace_prefix = saved;
+    }
+
+    /// cppBodyEnd: where a class-like node ends in brace scopes — the `}`
+    /// that closes its body — or None to keep the tree's.
+    fn brace_body_end(&self, body: Node<'t>) -> Option<(u32, u32)> {
+        let close = self.brace_scopes.as_ref()?.close_of(body.start_byte())?;
+        Some(BraceScopes::position_of(self.src, &self.line_starts, close + 1))
+    }
+
+    /// openCppClassScope: a class-like node's body as a scope for visit_in_brace_scope.
+    fn open_class_scope(&mut self, scope: &Scope, body: Node<'t>) {
+        let Some(close) = self.brace_scopes.as_ref().and_then(|s| s.close_of(body.start_byte())) else { return };
+        if self.class_scopes.add(body.start_byte(), close, scope.clone()) {
+            self.class_scope_rows.insert(scope.row);
+        }
+    }
+
+    fn dispatch_node(&mut self, node: Node<'t>) {
         stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
@@ -996,7 +1078,9 @@ impl<'t> Walker<'t> {
         } else if kind == "declaration" && !self.inside_class_like() {
             // A class, struct, union or enum defined in the declaration's type
             // (`struct Foo { … } foo;`) is a definition like one written on its
-            // own, and the variables keep their nodes beside it. The fn-ref
+            // own, and the variables keep their nodes beside it — so is, in
+            // brace scopes, a class the tree reads as a declaration's type
+            // (glued to the tokens after it by error recovery). The fn-ref
             // scan skips the walked type, which captured its own (the TS
             // walked set).
             let defined_type = node
@@ -1179,11 +1263,14 @@ impl<'t> Walker<'t> {
         let extra = Extra {
             docstring: self.class_like_docstring(node),
             visibility: self.visibility_of(node),
+            end: self.brace_body_end(body),
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
+        let scope = Scope { row, kind: "class", name };
+        self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
-        self.stack.push(Scope { row, kind: "class", name });
+        self.stack.push(scope);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
                 self.visit_node(c);
@@ -1200,11 +1287,14 @@ impl<'t> Walker<'t> {
         let extra = Extra {
             docstring: self.class_like_docstring(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
+            end: self.brace_body_end(body),
             ..Extra::default()
         };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
+        let scope = Scope { row, kind, name };
+        self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
-        self.stack.push(Scope { row, kind, name });
+        self.stack.push(scope);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
                 self.visit_node(c);

@@ -169,19 +169,21 @@ describe('a type defined in a C/C++ declaration', () => {
       expect(symbols(result)).toEqual(['function hits', 'struct hits::local_stats']);
     });
 
-    it.each(backends)(`a file the parser misreads: C keeps the type, C++ leaves it alone: %s${label}`, (backend) => {
+    it.each(backends)(`a file the parser misreads: C keeps the type, C++ needs balanced braces: %s${label}`, (backend) => {
       // The kernel defers a file whose tree has errors to wasm; its
       // error-extract hatch walks one anyway, and must agree.
       process.env.CODEGRAPH_KERNEL_CCPP_ERROR_EXTRACT = '1';
-      const broken = 'int broken( { return 1; }\n';
-      const c = extract(backend, 'src/spt.c', eol(`static struct { int argc; } SPT;\n${broken}`), 'c');
+      const c = extract(backend, 'src/spt.c', eol('static struct { int argc; } SPT;\nint broken( { return 1; }\n'), 'c');
       expect(symbols(c)).toContain('struct SPT');
-      // In C++, error recovery can close a namespace or a class at the wrong
-      // `}`, so a class walked from a declaration could land in the wrong
-      // scope: the variable is kept and the class is not walked.
-      const source = `namespace n {\nstruct Config { int retries; void apply() {} } config;\n}\n${broken}`;
-      const cpp = extract(backend, 'src/config.cc', eol(source), 'cpp');
-      expect(symbols(cpp)).toEqual(['variable n::config']);
+      // A C++ file with errors is walked in the scopes its braces open, so the
+      // class lands in its namespace. When the braces don't balance there are
+      // no scopes to trust, and error recovery can close a namespace or a
+      // class at the wrong `}`: the variable is kept and the class not walked.
+      const config = 'namespace n {\nstruct Config { int retries; void apply() {} } config;\n}\n';
+      const balanced = extract(backend, 'src/config.cc', eol(`${config}int broken( { return 1; }\n`), 'cpp');
+      expect(symbols(balanced)).toEqual(['struct n::Config', 'method n::Config::apply', 'variable n::config']);
+      const unbalanced = extract(backend, 'src/config2.cc', eol(`${config}int broken() { return 1;\n`), 'cpp');
+      expect(symbols(unbalanced)).toEqual(['variable n::config', 'function broken']);
     });
 
     it.each(backends)(`a function value in the type's body is captured once, by the type: %s${label}`, (backend) => {

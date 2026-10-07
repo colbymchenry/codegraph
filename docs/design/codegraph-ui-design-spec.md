@@ -355,7 +355,7 @@ entry-points panel.
 
 **The caveat is part of the screen, not a note on it.** A persistent 11.5px `--ink-3` line sits above the rows, between two
 hairline rules, and never collapses or dismisses: *"No static reference in the index — dynamic use is possible."* Under the list,
-every reason a candidate was left off is printed with its count ("1 677 in test files", "378 exported, or declared in a header",
+every reason a candidate was left off is printed with its count ("1 677 in test files", "378 exported, declared in a header, or merged into a library or global type",
 "40 overriding a member declared further up"), preceded by the scale — *"2 494 symbols in this index carry no incoming reference
 at all; 2 474 of them were left off this list."* Twenty rows drawn from twenty candidates and twenty drawn from two and a half
 thousand are different screens and only that sentence tells them apart.
