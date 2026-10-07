@@ -22,8 +22,6 @@ export const reactResolver: FrameworkResolver = {
   // Includes 'tsx'/'jsx' so route extraction runs on JSX files (where
   // `<Route element={<X/>}>` routes live) — without them the .tsx/.jsx grammars
   // were filtered out of the extract pass and those routes were never indexed.
-  // (resolve() is unaffected — it runs for every detected framework regardless
-  // of language; only the extract pass filters on `languages`.)
   languages: ['javascript', 'typescript', 'tsx', 'jsx'],
 
   detect(context: ResolutionContext): boolean {
@@ -473,10 +471,18 @@ interface RouteScope {
   end: number;
   component?: string;
   lazy?: string;
-  /** A `<Route path>` element: a route even with nothing to render (a layout's path). */
+  /** A `<Route>` element: a route even with nothing to render (a `<Route path>` that only groups others). */
   jsx?: boolean;
-  /** `{ element: <Shell/>, children }`, with neither `path` nor `index`: a layout at no address of its own. */
+  /**
+   * A layout at no address of its own: `{ element: <Shell/>, children }`, with
+   * neither `path` nor `index`, or a `<Route element={<RequireAuth/>}>` (no
+   * `path`, or `path=""`) around other `<Route>`s.
+   */
   pathless?: boolean;
+  /** A `<Route index>` (or a `path=""` with nothing inside): the page at its parent's address. */
+  index?: boolean;
+  /** A `<Route path={paths.home}>`: an address the file does not spell out, so no route of its own. */
+  opaque?: boolean;
 }
 
 /**
@@ -500,12 +506,14 @@ interface TableUse {
   literal?: number;
   /** The routes around the site, outermost first: where the table is mounted. */
   prefix: RoutePart[];
+  /** The layouts around the site, outermost first: what the table's routes render inside. */
+  layouts: string[];
 }
 
 interface RouteScan {
   routes: RouteDeclaration[];
-  /** The tables a table names as more of its routes, each with the path parts it sits under. */
-  names: Array<TableName & { prefix: RoutePart[] }>;
+  /** The tables a table names as more of its routes, each with the path parts and layouts it sits under. */
+  names: Array<TableName & { prefix: RoutePart[]; layouts: string[] }>;
   /** Where the file hands a table to the router. */
   uses: TableUse[];
 }
@@ -516,6 +524,9 @@ interface RouteScan {
  * one is a route.
  */
 const ROUTER_CALL = /\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements|useRoutes)\b/;
+
+/** A router written as an element; the `<Route>`s at its top are at `/`. */
+const ROUTER_ELEMENT = /^(?:Browser|Hash|Memory|Native|Static|History|unstable_History)?Router$/;
 
 /** A route list's entry that names more routes: `MainRoutes`, `...authRoutes`, `...routes(user)`. */
 const NAMED_ENTRY = /^(?:\.\.\.\s*)?([A-Za-z_$][\w$]*)\s*(\([\s\S]*\))?$/;
@@ -532,22 +543,28 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
  *
  * With `objects`, every route object in the file is read. With `table`, only
  * the literal at that offset is — a table another file hands the router —
- * its routes sitting under `table.prefix`, and the identifiers it names as
- * more routes come back in `names`. With `uses`, the places the file hands
- * a table to the router come back too. A route object whose children render
- * something is the layout around them, and the address is theirs when one
- * of them claims it: an `index` route, or a `''` path.
+ * its routes sitting under `table.prefix` and inside `table.layouts`, and the
+ * identifiers it names as more routes come back in `names`. With `uses`, the
+ * places the file hands a table to the router come back too.
+ *
+ * A route that renders something around others — a route object with
+ * `children`, a `<Route element>` with `<Route>`s inside — is the layout they
+ * render inside, and the address is theirs when one of them claims it: an
+ * `index` route, or a `''` path. A `<Route path>` that renders nothing only
+ * groups them; it is a route of its own until one of them claims its address.
  */
 function scanRoutes(
   source: string,
   allowJsx: boolean,
-  options: { objects?: boolean; table?: { at: number; prefix: RoutePart[] }; uses?: boolean }
+  options: { objects?: boolean; table?: { at: number; prefix: RoutePart[]; layouts?: string[] }; uses?: boolean }
 ): RouteScan {
   const scopes: RouteScope[] = [];
   const names: TableName[] = [];
   const sites: Array<{ name?: TableName; literal?: number; at: number }> = [];
   /** Every `<Route>` tag: where it is, the props it spreads, its `path` expression. */
   const routeTags: Array<{ at: number; spreads: string[]; path?: string }> = [];
+  /** Where the router itself is written (`createRoutesFromElements(…)`, `<BrowserRouter>…</BrowserRouter>`): its routes start at `/`. */
+  const routers: Array<{ start: number; end: number }> = [];
   const objects = Boolean(options.objects || options.table);
   const literal = (value: string): string | undefined => {
     const match = /^(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)')$/.exec(value.trim());
@@ -560,10 +577,13 @@ function scanRoutes(
   const componentName = (value: string | undefined, jsx: boolean): string | undefined => {
     if (!value) return undefined;
     if (!jsx) return /^\s*([A-Z][\w]*)\s*$/.exec(value)?.[1];
-    const inner = value.replace(/^\s*\(\s*/, '');
+    const inner = value.replace(/^\s*(?:\(\s*)?/, '');
     if (!/^<\s*[A-Z]/.test(inner)) return undefined;
-    const tags = [...inner.matchAll(/<\s*([A-Z][\w]*)\s*(?=[\s/>])/g)].map((m) => m[1]!);
-    return tags.find((t) => !WRAPPER.test(t)) ?? tags[0];
+    const { own, props } = elementTags(inner);
+    const content = (t: string): boolean => !WRAPPER.test(t) && t !== 'Outlet';
+    // Then a page handed to a guard as a prop (`<PrivateRoute component={<Profile />} />`),
+    // then the innermost wrapper: `<RequireAuth><Outlet /></RequireAuth>` renders the guard.
+    return own.find(content) ?? props.find(content) ?? [...own].reverse().find((t) => t !== 'Outlet') ?? own[0];
   };
   // The few characters before `at`, trailing whitespace skipped: enough for the
   // end-anchored checks below without copying the whole prefix per `/` or `<`.
@@ -597,6 +617,12 @@ function scanRoutes(
     const map = /(?:^|[^\w$.])([A-Za-z_$][\w$]*)\s*\??\.\s*map\s*$/.exec(before);
     if (!map) return null;
     return { map: { name: map[1]!, call: false, at: at - before.length + map.index + map[0].indexOf(map[1]!) } };
+  };
+  const routesFromElements = (at: number): boolean => {
+    let j = at - 1;
+    while (j >= 0 && /\s/.test(source[j]!)) j--;
+    if (source[j] !== 's' && source[j] !== 'n') return false;
+    return /(?:^|[^\w$.])createRoutesFrom(?:Elements|Children)\s*$/.test(source.slice(Math.max(0, at - 40), at));
   };
   const settle = (call: { map?: TableName }, open: number, close: number): void => {
     const argAt = trivia(open + 1);
@@ -653,6 +679,7 @@ function scanRoutes(
     const close = ch === '{' ? '}' : ch === '[' ? ']' : ch === '(' ? ')' : undefined;
     if (!close) return at + 1;
     const call = ch === '(' ? routerCall(at) : null;
+    const router = ch === '(' && routesFromElements(at);
     let i = at + 1;
     const fields = new Map<string, { value: string; at: number }>();
     while ((i = trivia(i)) < source.length && source[i] !== close) {
@@ -706,6 +733,7 @@ function scanRoutes(
       }
     }
     if (call && i < source.length) settle(call, at, i);
+    if (router) routers.push({ start: at, end: i });
     return i < source.length ? i + 1 : i;
   }
   function jsx(at: number): number {
@@ -723,42 +751,76 @@ function scanRoutes(
         continue;
       }
       i = trivia(i + attr[0].length);
-      if (source[i] !== '=') continue;
+      // A bare attribute is `true`: `<Route index element={<Home/>}/>`.
+      if (source[i] !== '=') {
+        attrs.set(attr[0], '{true}');
+        continue;
+      }
       i = trivia(i + 1);
       const start = i;
       i = unit(i);
       attrs.set(attr[0], source.slice(start, i));
     }
     let scope: RouteScope | undefined;
+    // A `<Route>` with no address of its own, settled once its children are read.
+    let addressless: { scope: RouteScope; tags: number; page: boolean } | undefined;
+    // `<BrowserRouter>…</BrowserRouter>`: the routes at its top are at `/`.
+    const router = ROUTER_ELEMENT.test(tag[1]!) ? { start: at, end: source.length } : undefined;
+    if (router) routers.push(router);
     if (tag[1] === 'Route' && i < source.length) {
-      const path = literal(attrs.get('path') ?? '');
+      const pathText = attrs.get('path');
       const expression = (name: string) => attrs.get(name)?.replace(/^\{([\s\S]*)\}$/, '$1');
+      // `path="team"`, or the same string in braces: `path={"team"}`.
+      const path = literal(pathText ?? '') ?? literal(expression('path') ?? '');
       routeTags.push({ at, spreads, path: expression('path')?.trim() });
-      const component = componentName(expression('component'), false) ?? componentName(expression('element'), true);
+      // `element={<Outlet />}` renders the route inside it and nothing of its own.
+      const element = componentName(expression('element'), true)?.replace(/^Outlet$/, '') || undefined;
+      const component = componentName(expression('component'), false) ?? element;
       const lazy = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/.exec(expression('lazy') ?? '')?.[1];
-      if (path) {
-        scope = { part: { lit: path }, at, start: at, end: source.length, component, lazy, jsx: true };
-        scopes.push(scope);
+      const route: RouteScope = { part: { lit: path ?? '' }, at, start: at, end: source.length, component, lazy, jsx: true };
+      if (path) scope = route;
+      else if (pathText === undefined || path === '') {
+        // `<Route index element={<Home/>}/>` is the page at its parent's address.
+        if (/^\{\s*true\s*\}$/.test(attrs.get('index') ?? '')) {
+          if (component || lazy) scope = { ...route, index: true };
+        } else {
+          // Otherwise it is a layout at no address of its own when routes sit
+          // inside it (`<Route element={<RequireAuth/>}>`), and `path=""` with
+          // an `element` and nothing inside is the page at its parent's
+          // address. Version 5's `<Route path="" component={NotFound}/>` is a
+          // catch-all, which no address names.
+          addressless = { scope: route, tags: routeTags.length, page: path === '' && Boolean(element || lazy) };
+        }
+      } else {
+        // `path={paths.home}`: an address the file does not spell out.
+        scope = { ...route, opaque: true };
       }
+      if (scope) scopes.push(scope);
     }
-    if (source.startsWith('/>', i)) {
-      if (scope) scope.end = i + 2;
-      return i + 2;
-    }
+    const close = (end: number): number => {
+      if (scope) scope.end = end;
+      if (router) router.end = end;
+      if (addressless) {
+        const { scope: route, tags, page } = addressless;
+        route.end = end;
+        if (routeTags.length > tags) {
+          if (route.component || route.lazy) scopes.push({ ...route, pathless: true });
+        } else if (page) scopes.push({ ...route, index: true });
+      }
+      return end;
+    };
+    if (source.startsWith('/>', i)) return close(i + 2);
     i++;
     while (i < source.length) {
       if (source.startsWith('</', i)) {
         const end = source.indexOf('>', i + 2);
-        const after = end < 0 ? source.length : end + 1;
-        if (scope) scope.end = after;
-        return after;
+        return close(end < 0 ? source.length : end + 1);
       }
       if (source[i] === '<' && /^<(?:[A-Za-z]|>)/.test(source.slice(i))) i = jsx(i);
       else if (source[i] === '{') i = unit(i);
       else i++;
     }
-    if (scope) scope.end = i;
-    return i;
+    return close(i);
   }
   if (options.table) unit(trivia(options.table.at), true);
   else {
@@ -768,11 +830,13 @@ function scanRoutes(
   // A child route's path is relative to the routes around it: compose each
   // rendering route's path from the path-bearing scopes that contain it.
   const prefix = options.table?.prefix ?? [];
+  const inherited = options.table?.layouts ?? [];
   const renders = (s: RouteScope): boolean => Boolean(s.component || s.lazy);
   const holds = (outer: RouteScope, start: number, end: number): boolean => outer.start < start && outer.end >= end;
   const around = (start: number, end: number): RouteScope[] =>
     scopes.filter((outer) => holds(outer, start, end)).sort((a, b) => a.start - b.start);
   const shown = (p: RoutePart): string => p.lit ?? `{${p.expr}}`;
+  const layoutOf = (s: RouteScope): string => s.component ?? LAZY_ROUTE_PREFIX + s.lazy;
   const partsOf = new Map<RouteScope, RoutePart[]>();
   const pathOf = new Map<RouteScope, string>();
   for (const scope of scopes) {
@@ -780,23 +844,47 @@ function scanRoutes(
     partsOf.set(scope, parts);
     pathOf.set(scope, composeRoutePath(parts.map(shown)));
   }
+  // The page at its parent's address needs that address written down: a
+  // route around it whose path the file spells out, or the router itself. At
+  // the top of a component's own `<Routes>` it is wherever another route
+  // mounts the component (`<Route path="shop/*" element={<Shop/>}>`).
+  const inRouter = (s: RouteScope): boolean => routers.some((r) => r.start < s.start && r.end >= s.end);
+  const addressed = (s: RouteScope): boolean => {
+    if (!s.index) return true;
+    const outer = around(s.start, s.end);
+    return !outer.some((c) => c.opaque) && (outer.some((c) => Boolean(c.part.lit || c.part.expr)) || inRouter(s));
+  };
+  const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || renders(s)) && addressed(s)));
+  const layout = (c: RouteScope): boolean => renders(c) && !c.opaque;
   const routes: RouteDeclaration[] = [];
-  for (const scope of scopes) {
-    if (scope.pathless || (!renders(scope) && !scope.jsx)) continue;
+  for (const scope of pages) {
     const path = pathOf.get(scope)!;
-    // A route object around others is the layout they render inside; when one
-    // of them claims its address, the page there is that one, not the layout.
-    if (!scope.jsx && renders(scope) && scopes.some((inner) =>
-      !inner.jsx && !inner.pathless && renders(inner) && holds(scope, inner.start, inner.end) && pathOf.get(inner) === path)) continue;
-    const layouts = around(scope.start, scope.end)
-      .filter((c) => !c.jsx && renders(c))
-      .map((c) => c.component ?? LAZY_ROUTE_PREFIX + c.lazy);
+    // A route around others is the layout they render inside; when one of
+    // them claims its address, the page there is that one — not the layout,
+    // nor a `<Route path>` that only groups them.
+    if (scopes.some((inner) => pages.has(inner) && !inner.jsx === !scope.jsx && renders(inner) &&
+      holds(scope, inner.start, inner.end) && pathOf.get(inner) === path)) continue;
+    // A route object renders inside the route objects around it; a `<Route>`,
+    // inside the routes around it of either kind.
+    const layouts = [...inherited, ...around(scope.start, scope.end)
+      .filter((c) => layout(c) && (scope.jsx || !c.jsx))
+      .map(layoutOf)];
     routes.push({ path, parts: partsOf.get(scope)!, component: scope.component, lazy: scope.lazy, layouts, at: scope.at });
   }
+  const mount = (at: number): { parts: RoutePart[]; layouts: string[] } => {
+    const outer = around(at, at);
+    return { parts: outer.map((c) => c.part), layouts: outer.filter(layout).map(layoutOf) };
+  };
   return {
     routes: routes.sort((a, b) => a.at - b.at),
-    names: names.map((n) => ({ ...n, prefix: [...prefix, ...around(n.at, n.at).map((c) => c.part)] })),
-    uses: sites.map((s) => ({ name: s.name, literal: s.literal, prefix: around(s.at, s.at).map((c) => c.part) })),
+    names: names.map((n) => {
+      const { parts, layouts } = mount(n.at);
+      return { ...n, prefix: [...prefix, ...parts], layouts: [...inherited, ...layouts] };
+    }),
+    uses: sites.map((s) => {
+      const { parts, layouts } = mount(s.at);
+      return { name: s.name, literal: s.literal, prefix: parts, layouts };
+    }),
   };
 }
 
@@ -839,6 +927,45 @@ function mapsRouteFields(callback: string, tags: ReadonlyArray<{ spreads: string
   return tags.some((t) =>
     t.spreads.some((s) => s === param || rest.has(s)) ||
     (t.path !== undefined && (ownPath?.test(t.path) || paths.has(t.path))));
+}
+
+/**
+ * The component tags of a JSX element and of what it nests, outermost first
+ * (`own`), and apart from them a page handed over in a `component`,
+ * `element` or `page` attribute (`props`). Any other attribute's elements
+ * are neither: `<Suspense fallback={<Loader />}><AdminPanel /></Suspense>`
+ * renders AdminPanel, never Loader.
+ */
+function elementTags(text: string): { own: string[]; props: string[] } {
+  const own: string[] = [];
+  const props: string[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '<') continue;
+    const open = /^<\s*([A-Za-z][\w.:-]*)(?=[\s/>])/.exec(text.slice(i));
+    if (!open) continue;
+    if (/^[A-Z]\w*$/.test(open[1]!)) own.push(open[1]!);
+    // Skip the tag's attributes, expressions and strings whole.
+    let j = i + open[0].length;
+    let attr = '';
+    while (j < text.length && text[j] !== '>') {
+      const ch = text[j]!;
+      const name = /^[A-Za-z_$][\w$:-]*/.exec(text.slice(j, j + 64));
+      if (name) {
+        attr = name[0];
+        j += name[0].length;
+        continue;
+      }
+      const end = ch === '{' ? matchBracket(text, j) : ch === '"' || ch === "'" ? skipString(text, j) : j;
+      if (end < 0) break;
+      if (ch === '{' && /^(?:component|element|page)$/i.test(attr)) {
+        for (const m of text.slice(j, end).matchAll(/<\s*([A-Z]\w*)(?=[\s/>])/g)) props.push(m[1]!);
+      }
+      if (ch === '{' || ch === '"' || ch === "'") attr = '';
+      j = end + 1;
+    }
+    i = j;
+  }
+  return { own, props };
 }
 
 /** The comma-separated entries of a list's inside, nested brackets kept whole. */
@@ -909,8 +1036,11 @@ function routeReferences(route: RouteDeclaration, fromNodeId: string, filePath: 
  * from the item's own fields. From there the import leads to the table, which
  * is read the way a data router's is, and the tables it names in turn
  * (`...ApiAuthorizationRoutes`, `children: adminRoutes`) are read under the
- * path they sit at. A file that makes a router itself had its route objects
- * read when it was extracted; only the tables it names are new here.
+ * path they sit at — and inside the layouts around them (`<Route
+ * element={<DashboardLayout/>}>{DashboardRoutes.map(…)}</Route>`) when the
+ * table is written in the same file. A file that makes a router itself had
+ * its route objects read when it was extracted; only the tables it names are
+ * new here.
  */
 function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
   const nodes: Node[] = [];
@@ -922,14 +1052,17 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     }
   }
   if (consumers.size === 0) return { nodes, references };
-  const queue: Array<{ file: string; at: number; prefix: string[] }> = [];
+  const queue: Array<{ file: string; at: number; prefix: string[]; layouts: string[] }> = [];
   const queued = new Set<string>();
-  const enqueue = (table: { file: string; at: number } | null, prefix: string[]): void => {
+  // A table renders inside the layouts around the place that names it. A
+  // route's `layout:` reference is resolved in the route's own file, so they
+  // go along only when that place is in the table's file.
+  const enqueue = (table: { file: string; at: number } | null, prefix: string[], from: string, layouts: string[]): void => {
     if (!table || queued.size >= MAX_TABLES) return;
     const key = `${table.file}\0${table.at}\0${prefix.join('\0')}`;
     if (queued.has(key)) return;
     queued.add(key);
-    queue.push({ ...table, prefix });
+    queue.push({ ...table, prefix, layouts: table.file === from ? layouts : [] });
   };
   for (const file of [...consumers].sort()) {
     const source = context.readFile(file);
@@ -938,17 +1071,17 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     const scan = scanRoutes(source, allowsJsx(file), { objects: ROUTER_CALL.test(source), uses: true });
     for (const use of scan.uses) {
       const table = use.literal !== undefined ? { file, at: use.literal } : tableNamed(use.name!, file, context);
-      enqueue(table, pathValues(use.prefix, file, context));
+      enqueue(table, pathValues(use.prefix, file, context), file, use.layouts);
     }
   }
   const made = new Set<string>();
   const now = Date.now();
   for (let next = queue.shift(); next; next = queue.shift()) {
-    const { file, at, prefix } = next;
+    const { file, at, prefix, layouts } = next;
     const source = context.readFile(file);
     if (!source) continue;
-    const scan = scanRoutes(source, allowsJsx(file), { table: { at, prefix: prefix.map((lit) => ({ lit })) } });
-    for (const named of scan.names) enqueue(tableNamed(named, file, context), pathValues(named.prefix, file, context));
+    const scan = scanRoutes(source, allowsJsx(file), { table: { at, prefix: prefix.map((lit) => ({ lit })), layouts } });
+    for (const named of scan.names) enqueue(tableNamed(named, file, context), pathValues(named.prefix, file, context), file, named.layouts);
     if (ROUTER_CALL.test(source)) continue;
     const lineAt = makeLineAt(source, 1);
     for (const route of scan.routes) {

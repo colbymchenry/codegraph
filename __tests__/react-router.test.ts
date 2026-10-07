@@ -516,9 +516,10 @@ describe('react-router: route declaration boundaries (#1348)', () => {
     const routes = cg.getNodesByKind('route');
     return {
       paths: routes.map((route) => route.name).sort(),
+      // `->` what a route renders, `~>` a layout it renders inside.
       bindings: routes.flatMap((route) => cg!.getOutgoingEdges(route.id)
         .filter((edge) => edge.kind === 'references')
-        .map((edge) => `${route.name}->${cg!.getNode(edge.target)?.name}`)).sort(),
+        .map((edge) => `${route.name}${(edge.metadata as Record<string, unknown> | undefined)?.layout ? '~>' : '->'}${cg!.getNode(edge.target)?.name}`)).sort(),
     };
   }
 
@@ -548,9 +549,11 @@ describe('react-router: route declaration boundaries (#1348)', () => {
       }
     `, extension);
     expect(result).toEqual({
-      // A nested route's path is relative to its parent's (`settings` under `/dashboard`).
+      // A nested route's path is relative to its parent's (`settings` under
+      // `/dashboard`). The index route is the page at `/dashboard`; the `<Route
+      // path>` around it only groups, so it is not a second, empty `/dashboard`.
       paths: ['/dashboard', '/dashboard/settings', '/empty', '/legacy', '/long', '/no-element', '/sibling'],
-      bindings: ['/dashboard/settings->Settings', '/legacy->Settings', '/long->Shell', '/sibling->Settings'],
+      bindings: ['/dashboard->DashboardHome', '/dashboard/settings->Settings', '/legacy->Settings', '/long->Shell', '/sibling->Settings'],
     });
   });
 
@@ -577,6 +580,133 @@ describe('react-router: route declaration boundaries (#1348)', () => {
       // `{ index: true, Component: DataIndex }` is the page at its parent's address.
       paths: ['/', '/data', '/data/prefs', '/long', '/quoted', '/sibling'],
       bindings: ['/->DataSettings', '/data->DataIndex', '/data/prefs->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings'],
+    });
+  });
+
+  it.each(['tsx', 'jsx', 'js'])('reads what a route renders past placeholders, guards and line breaks in %s', async (extension) => {
+    const result = await index(`
+      import { Suspense } from 'react';
+      import { Routes, Route } from 'react-router-dom';
+      function Loader() { return null; }
+      function AdminPanel() { return null; }
+      function RequireAuth({ children }) { return children; }
+      function ProtectedPage() { return null; }
+      function PrivateRoot({ component }) { return component; }
+      function HomePage() { return null; }
+      function AuthPage() { return null; }
+      function RememberMe() { return null; }
+      export function App() {
+        return <Routes>
+          <Route path="/admin" element={<Suspense fallback={<Loader />}><AdminPanel /></Suspense>} />
+          <Route
+            path="/protected"
+            element={
+              <RequireAuth>
+                <ProtectedPage />
+              </RequireAuth>
+            }
+          />
+          <Route path="/home" element={<PrivateRoot component={<HomePage />} />} />
+          <Route path="/login" element={<Suspense fallback={<Loader />}><AuthPage /></Suspense>} />
+          <Route path="/signin" element={<AuthPage type="login" rememberMe={<RememberMe />} />} />
+        </Routes>;
+      }
+    `, extension);
+    expect(result.bindings).toEqual([
+      // A `fallback` is shown while the page loads; it is not the page.
+      '/admin->AdminPanel',
+      // A page handed to a guard as a prop.
+      '/home->HomePage',
+      // `AuthPage` reads like a guard's name (`Auth…`); when every tag does, the innermost is the page.
+      '/login->AuthPage',
+      // Prettier writes a long element on lines of its own.
+      '/protected->ProtectedPage',
+      // Only a `component`, `element` or `page` prop hands over a page.
+      '/signin->AuthPage',
+    ]);
+  });
+
+  it('reads an index route only where its parent’s address is written down', async () => {
+    const result = await index(`
+      import { Routes, Route } from 'react-router-dom';
+      import { paths } from './paths';
+      function Navigation() { return null; }
+      function Home() { return null; }
+      function CategoriesPreview() { return null; }
+      function Category() { return null; }
+      function ListAgents() { return null; }
+      function ListWorkspaces() { return null; }
+      // Mounted at \`shop/*\` below: its index is the page at \`/shop\`, which its own <Routes> does not say.
+      function Shop() {
+        return <Routes>
+          <Route index element={<CategoriesPreview />} />
+          <Route path=":category" element={<Category />} />
+        </Routes>;
+      }
+      export function App() {
+        return <Routes>
+          <Route path="/" element={<Navigation />}>
+            <Route index element={<Home />} />
+            <Route path="shop/*" element={<Shop />} />
+            <Route path={paths.agents}>
+              <Route index element={<ListAgents />} />
+            </Route>
+            <Route path={"workspaces"}>
+              <Route index element={<ListWorkspaces />} />
+            </Route>
+          </Route>
+        </Routes>;
+      }
+    `, 'jsx');
+    expect(result.paths.filter((p) => p === '/')).toEqual(['/']);
+    expect(result.bindings).toContain('/->Home');
+    // Neither a component's own <Routes> nor a path the file does not spell out says where these are.
+    expect(result.bindings.filter((b) => /CategoriesPreview|ListAgents/.test(b))).toEqual([]);
+    // A path in braces is still written down.
+    expect(result.bindings).toContain('/workspaces->ListWorkspaces');
+  });
+
+  it.each(['tsx', 'jsx'])('reads an index route at the top of the router itself as `/` in %s', async (extension) => {
+    const result = await index(`
+      import { BrowserRouter, createBrowserRouter, createRoutesFromElements, Routes, Route } from 'react-router-dom';
+      function Home() { return null; }
+      function About() { return null; }
+      function Dashboard() { return null; }
+      export function App() {
+        return <BrowserRouter>
+          <Routes>
+            <Route index element={<Home />} />
+            <Route path="about" element={<About />} />
+          </Routes>
+        </BrowserRouter>;
+      }
+      export const router = createBrowserRouter(createRoutesFromElements(<Route index element={<Dashboard />} />));
+    `, extension);
+    expect(result).toEqual({ paths: ['/', '/', '/about'], bindings: ['/->Dashboard', '/->Home', '/about->About'] });
+  });
+
+  it('keeps a version 5 catch-all out, and reads a version 3 parent route as the layout around its children', async () => {
+    const result = await index(`
+      import { Router, Route, Switch } from 'react-router';
+      function App() { return null; }
+      function About() { return null; }
+      function NotFound() { return null; }
+      export const routes = (
+        <Router>
+          <Route path="/" component={App}>
+            <Route path="about" component={About} />
+          </Route>
+          <Switch>
+            <Route path="" component={NotFound} />
+            <Route component={NotFound} />
+          </Switch>
+        </Router>
+      );
+    `, 'jsx');
+    expect(result).toEqual({
+      // No child claims `/`, so App is the page there as well as the layout around `/about`.
+      paths: ['/', '/about'],
+      bindings: ['/->App', '/about->About', '/about~>App'],
     });
   });
 
@@ -730,6 +860,9 @@ function navigations(cg: CodeGraph): string[] {
 const routeNames = (cg: CodeGraph): string[] => cg.getNodesByKind('route').map((r) => r.name).sort();
 
 const component = (name: string): string => `export function ${name}() {\n  return <div>${name}</div>;\n}\n`;
+
+/** A screen file whose component is its default export. */
+const screen = (name: string): string => `export default function ${name}() {\n  return <div>${name}</div>;\n}\n`;
 
 /** jasontaylordev/CleanArchitecture's ClientApp-React and the ASP.NET Core React template it comes from. */
 const ASPNET_TEMPLATE: Record<string, string> = {
@@ -1131,6 +1264,8 @@ describe('react-router: a table mapped inside <Route path> in the same file', ()
     ({ root, cg } = await indexProject({
       'ClientApp/package.json': JSON.stringify({ name: 'client', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
       'ClientApp/src/routes.js': `import { Routes, Route } from 'react-router-dom';
+import AdminLayout from './layouts/admin';
+import { adminRoutes } from './adminRoutes';
 import DashboardLayout from './layouts/dashboard';
 import DashboardApp from './pages/DashboardApp';
 import LandingPage from './pages/LandingPage';
@@ -1159,14 +1294,23 @@ export default function Router() {
                     return <Route key={index} {...rest} element={element}/>;
                 })}
             </Route>
+            <Route path="/admin" element={<AdminLayout/>}>
+                {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}
+            </Route>
         </Routes>
     );
 }
 `,
+      'ClientApp/src/adminRoutes.js': `import Reports from './pages/Reports';
+
+export const adminRoutes = [{ path: 'reports', element: <Reports/> }];
+`,
       'ClientApp/src/layouts/dashboard.js': 'export default function DashboardLayout() {\n  return <div />;\n}\n',
+      'ClientApp/src/layouts/admin.js': 'export default function AdminLayout() {\n  return <div />;\n}\n',
       'ClientApp/src/pages/DashboardApp.js': 'export default function DashboardApp() {\n  return <div />;\n}\n',
       'ClientApp/src/pages/LandingPage.js': 'export default function LandingPage() {\n  return <div />;\n}\n',
       'ClientApp/src/pages/TicketDetail.js': 'export default function TicketDetail() {\n  return <div />;\n}\n',
+      'ClientApp/src/pages/Reports.js': 'export default function Reports() {\n  return <div />;\n}\n',
     }));
   });
   afterAll(() => {
@@ -1174,11 +1318,17 @@ export default function Router() {
     if (root) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("composes the table's relative paths onto the <Route path> it is mapped inside", () => {
+  it("composes the table's relative paths onto the <Route path> it is mapped inside, and renders them inside its element", () => {
     expect(routeBindings(cg)).toEqual([
+      '/admin -> AdminLayout',
+      // A table written in another file keeps its routes there, where a layout
+      // named in this file would be looked up: they get no layout edge.
+      '/admin/reports -> Reports',
       '/dashboard -> DashboardLayout',
       '/dashboard/app -> DashboardApp',
+      '/dashboard/app ~> DashboardLayout',
       '/dashboard/tickets/:id -> TicketDetail',
+      '/dashboard/tickets/:id ~> DashboardLayout',
       '/landing -> LandingPage',
     ]);
   });
@@ -1252,7 +1402,8 @@ export function NavMenu() {
     writeFiles(root, { 'src/App.js': MAPPED });
     await cg.sync();
     expect(routeNames(cg)).toEqual(['/', '/counter', '/fetch-data']);
-    expect(navigations(cg)).toContain('NavMenu -> /counter');
+    // `navigate('/')` failed while `/` was gone; the routes coming back retry it.
+    expect(navigations(cg)).toEqual(['NavMenu -> /counter', 'goHome -> /']);
   });
 
   it('deleting that file is a change too', async () => {
@@ -1260,4 +1411,347 @@ export function NavMenu() {
     await cg.sync();
     expect(routeNames(cg)).toEqual([]);
   });
+});
+
+// =============================================================================
+// JSX index routes, and the <Route element> around other routes
+// =============================================================================
+
+/** React Router 6's own examples: a layout route at `/`, an index route inside it. */
+const JSX_LAYOUTS: Record<string, string> = {
+  'package.json': JSON.stringify({ name: 'app', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+  'src/App.jsx': `import { Routes, Route } from 'react-router-dom';
+import Layout from './Layout';
+import DashboardLayout from './DashboardLayout';
+import AdminLayout from './AdminLayout';
+import RequireAuth from './RequireAuth';
+import { Home, About, Login, DashboardHome, Stats, Account, Settings, NoMatch, Users } from './pages';
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Layout />}>
+        <Route index element={<Home />} />
+        <Route path="about" element={<About />} />
+        <Route path="login" element={<Login />} />
+        <Route path="dashboard" element={<DashboardLayout />}>
+          <Route index element={<DashboardHome />} />
+          <Route path="stats" element={<Stats />} />
+        </Route>
+        <Route element={<RequireAuth />}>
+          <Route path="account" element={<Account />} />
+        </Route>
+        <Route path="settings">
+          <Route index element={<Settings />} />
+        </Route>
+        <Route path="*" element={<NoMatch />} />
+      </Route>
+      <Route path="/admin" element={<AdminLayout />}>
+        <Route path="users" element={<Users />} />
+      </Route>
+    </Routes>
+  );
+}
+`,
+  'src/Layout.jsx': `import { Link, Outlet } from 'react-router-dom';
+export default function Layout() {
+  return (
+    <div>
+      <nav>
+        <Link to="/">Home</Link>
+        <Link to="/about">About</Link>
+        <Link to="/dashboard">Dashboard</Link>
+      </nav>
+      <Outlet />
+    </div>
+  );
+}
+`,
+  'src/DashboardLayout.jsx': `import { Link, Outlet } from 'react-router-dom';
+export default function DashboardLayout() {
+  return <section><Link to="/dashboard/stats">Stats</Link><Outlet /></section>;
+}
+`,
+  'src/AdminLayout.jsx': `import { Link, Outlet } from 'react-router-dom';
+export default function AdminLayout() {
+  return <div><Link to="/admin/users">Users</Link><Outlet /></div>;
+}
+`,
+  'src/RequireAuth.jsx': `import { Navigate, Outlet } from 'react-router-dom';
+export default function RequireAuth({ user }) {
+  return user ? <Outlet /> : <Navigate to="/login" replace />;
+}
+`,
+  'src/pages.jsx': `import { useNavigate } from 'react-router-dom';
+export function Home() { return <h1>Home</h1>; }
+export function About() { return <h1>About</h1>; }
+export function Login() { return <h1>Login</h1>; }
+export function DashboardHome() { return <h1>Dashboard</h1>; }
+export function Stats() { return <h1>Stats</h1>; }
+export function Account() {
+  const navigate = useNavigate();
+  const signOut = () => navigate('/');
+  return <button onClick={signOut}>Sign out</button>;
+}
+export function Settings() { return <h1>Settings</h1>; }
+export function NoMatch() { return <h1>Nothing here</h1>; }
+export function Users() { return <h1>Users</h1>; }
+`,
+};
+
+describe('react-router: a JSX index route is the page at its parent’s address, and the <Route element> around it the layout', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject(JSX_LAYOUTS));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('binds each address to its page, inside every layout around it', () => {
+    expect(routeBindings(cg)).toEqual([
+      '/ -> Home',
+      '/ ~> Layout',
+      '/* -> NoMatch',
+      '/* ~> Layout',
+      '/about -> About',
+      '/about ~> Layout',
+      // A `<Route element>` with no path is a layout at no address of its own.
+      '/account -> Account',
+      '/account ~> Layout',
+      '/account ~> RequireAuth',
+      // No child claims `/admin`, so AdminLayout is the page there as well.
+      '/admin -> AdminLayout',
+      '/admin/users -> Users',
+      '/admin/users ~> AdminLayout',
+      '/dashboard -> DashboardHome',
+      '/dashboard ~> DashboardLayout',
+      '/dashboard ~> Layout',
+      '/dashboard/stats -> Stats',
+      '/dashboard/stats ~> DashboardLayout',
+      '/dashboard/stats ~> Layout',
+      '/login -> Login',
+      '/login ~> Layout',
+      // `<Route path="settings">` renders nothing: it only groups its index route.
+      '/settings -> Settings',
+      '/settings ~> Layout',
+    ].sort());
+  });
+
+  it('puts one route at each address', () => {
+    expect(routeNames(cg)).toEqual(['/', '/*', '/about', '/account', '/admin', '/admin/users', '/dashboard', '/dashboard/stats', '/login', '/settings']);
+    const home = cg.getNodesByKind('route').find((r) => r.name === '/')!;
+    expect(home.startLine).toBe(12);
+  });
+
+  it('lands a navigation to a layout’s address on the page there', () => {
+    expect(navigations(cg)).toEqual([
+      'AdminLayout -> /admin/users',
+      'DashboardLayout -> /dashboard/stats',
+      'Layout -> /',
+      'Layout -> /about',
+      'Layout -> /dashboard',
+      'RequireAuth -> /login',
+      'signOut -> /',
+    ]);
+  });
+
+  it('draws a layout’s links on every screen inside it, and only there', async () => {
+    const screens = await buildScreens(cg, root);
+    expect(screens.routed).toBe(true);
+    const at = (p: string) => screens.screens.find((s) => s.path === p)!.id;
+    const linked = (from: string, to: string) => screens.links.some((l) => l.from === at(from) && l.to === at(to));
+    // Layout's nav bar is on every page it wraps, the deepest included.
+    for (const from of ['/', '/about', '/login', '/dashboard', '/dashboard/stats', '/account', '/settings']) {
+      expect(linked(from, '/about')).toBe(true);
+    }
+    expect(linked('/dashboard/stats', '/dashboard')).toBe(true);
+    // The guard's redirect happens on the page it guards.
+    expect(linked('/account', '/login')).toBe(true);
+    expect(linked('/about', '/login')).toBe(false);
+    // The admin pages are not inside Layout.
+    expect(linked('/admin/users', '/about')).toBe(false);
+    expect(linked('/admin', '/admin/users')).toBe(true);
+  });
+});
+
+describe('react-router: createRoutesFromElements with an index route and guards at path="" (proshop-v2)', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'package.json': JSON.stringify({ name: 'proshop', private: true }),
+      'frontend/package.json': JSON.stringify({ name: 'frontend', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+      'frontend/src/index.js': `import { createBrowserRouter, createRoutesFromElements, Route, RouterProvider } from 'react-router-dom';
+import App from './App';
+import PrivateRoute from './components/PrivateRoute';
+import AdminRoute from './components/AdminRoute';
+import HomeScreen from './screens/HomeScreen';
+import CartScreen from './screens/CartScreen';
+import LoginScreen from './screens/LoginScreen';
+import ShippingScreen from './screens/ShippingScreen';
+import OrderListScreen from './screens/admin/OrderListScreen';
+
+const router = createBrowserRouter(
+  createRoutesFromElements(
+    <Route path='/' element={<App />}>
+      <Route index={true} path='/' element={<HomeScreen />} />
+      <Route path='/cart' element={<CartScreen />} />
+      <Route path='/login' element={<LoginScreen />} />
+      {/* Registered users */}
+      <Route path='' element={<PrivateRoute />}>
+        <Route path='/shipping' element={<ShippingScreen />} />
+      </Route>
+      {/* Admin users */}
+      <Route path='' element={<AdminRoute />}>
+        <Route path='/admin/orderlist' element={<OrderListScreen />} />
+      </Route>
+    </Route>
+  )
+);
+
+export default function Root() {
+  return <RouterProvider router={router} />;
+}
+`,
+      'frontend/src/App.js': `import { Outlet } from 'react-router-dom';
+import Header from './components/Header';
+export default function App() {
+  return (
+    <>
+      <Header />
+      <main><Outlet /></main>
+    </>
+  );
+}
+`,
+      'frontend/src/components/Header.js': `import { Link } from 'react-router-dom';
+export default function Header() {
+  return <header><Link to='/cart'>Cart</Link></header>;
+}
+`,
+      'frontend/src/components/PrivateRoute.js': `import { Navigate, Outlet } from 'react-router-dom';
+export default function PrivateRoute({ userInfo }) {
+  return userInfo ? <Outlet /> : <Navigate to='/login' replace />;
+}
+`,
+      'frontend/src/components/AdminRoute.js': `import { Navigate, Outlet } from 'react-router-dom';
+export default function AdminRoute({ userInfo }) {
+  return userInfo && userInfo.isAdmin ? <Outlet /> : <Navigate to='/login' replace />;
+}
+`,
+      'frontend/src/screens/HomeScreen.js': screen('HomeScreen'),
+      'frontend/src/screens/CartScreen.js': screen('CartScreen'),
+      'frontend/src/screens/LoginScreen.js': screen('LoginScreen'),
+      'frontend/src/screens/ShippingScreen.js': screen('ShippingScreen'),
+      'frontend/src/screens/admin/OrderListScreen.js': screen('OrderListScreen'),
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('makes HomeScreen the page at `/` and App the layout around every screen, the guards around theirs', () => {
+    expect(routeBindings(cg)).toEqual([
+      '/ -> HomeScreen',
+      '/ ~> App',
+      '/admin/orderlist -> OrderListScreen',
+      '/admin/orderlist ~> AdminRoute',
+      '/admin/orderlist ~> App',
+      '/cart -> CartScreen',
+      '/cart ~> App',
+      '/login -> LoginScreen',
+      '/login ~> App',
+      '/shipping -> ShippingScreen',
+      '/shipping ~> App',
+      '/shipping ~> PrivateRoute',
+    ]);
+    // Neither App nor a guard is a second page at `/`.
+    expect(routeNames(cg)).toEqual(['/', '/admin/orderlist', '/cart', '/login', '/shipping']);
+  });
+
+  it('draws the header’s link from every screen, and a guard’s redirect from the screens it guards', async () => {
+    const screens = await buildScreens(cg, root);
+    const at = (p: string) => screens.screens.find((s) => s.path === p)!.id;
+    const linked = (from: string, to: string) => screens.links.some((l) => l.from === at(from) && l.to === at(to));
+    for (const from of ['/', '/login', '/shipping', '/admin/orderlist']) expect(linked(from, '/cart')).toBe(true);
+    expect(linked('/shipping', '/login')).toBe(true);
+    expect(linked('/admin/orderlist', '/login')).toBe(true);
+    expect(linked('/cart', '/login')).toBe(false);
+  });
+});
+
+describe('react-router: JSX index routes as the route file changes', () => {
+  let root: string;
+  let cg: CodeGraph;
+  const app = (index: boolean) => `import { Routes, Route } from 'react-router-dom';
+import Layout from './Layout';
+import { Home, About } from './pages';
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Layout />}>${index ? '\n        <Route index element={<Home />} />' : ''}
+        <Route path="about" element={<About />} />
+      </Route>
+    </Routes>
+  );
+}
+`;
+  const files = (index: boolean): Record<string, string> => ({
+    'package.json': JSON.stringify({ name: 'app', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+    'src/App.jsx': app(index),
+    'src/Layout.jsx': `import { Link, Outlet } from 'react-router-dom';
+export default function Layout() {
+  return <div><Link to="/about">About</Link><Outlet /></div>;
+}
+`,
+    'src/pages.jsx': `import { useNavigate } from 'react-router-dom';
+export function Home() { return <h1>Home</h1>; }
+export function About() {
+  const navigate = useNavigate();
+  const goHome = () => navigate('/');
+  return <button onClick={goHome}>Home</button>;
+}
+`,
+  });
+  /** What a fresh index of the same files says. */
+  const fresh = async (index: boolean): Promise<{ bindings: string[]; navigations: string[] }> => {
+    const project = await indexProject(files(index));
+    try {
+      return { bindings: routeBindings(project.cg), navigations: navigations(project.cg) };
+    } finally {
+      project.cg.close();
+      fs.rmSync(project.root, { recursive: true, force: true });
+    }
+  };
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject(files(false)));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('starts with the layout as the page at its own address', () => {
+    expect(routeBindings(cg)).toEqual(['/ -> Layout', '/about -> About', '/about ~> Layout']);
+    expect(navigations(cg)).toEqual(['Layout -> /about', 'goHome -> /']);
+  });
+
+  // Each also indexes the same files afresh, to compare with.
+  it('an index route added takes the address, and what navigated there follows it', async () => {
+    writeFiles(root, { 'src/App.jsx': app(true) });
+    await cg.sync();
+    expect(routeBindings(cg)).toEqual(['/ -> Home', '/ ~> Layout', '/about -> About', '/about ~> Layout']);
+    expect({ bindings: routeBindings(cg), navigations: navigations(cg) }).toEqual(await fresh(true));
+  }, 60_000);
+
+  it('taking it away gives the address back to the layout', async () => {
+    writeFiles(root, { 'src/App.jsx': app(false) });
+    await cg.sync();
+    expect({ bindings: routeBindings(cg), navigations: navigations(cg) }).toEqual(await fresh(false));
+  }, 60_000);
 });

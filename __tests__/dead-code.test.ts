@@ -763,3 +763,106 @@ public class App {
     expect(listed(report, 'DemoComponent::ngOnInit')).toBe(false);
   });
 });
+
+describe('a declaration that merges into a type outside the index', () => {
+  let root: string;
+  let graph: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-ambient-'));
+    // ghostfolio's chart.registry.ts: chart.js reads both interfaces through
+    // the types they extend, and nothing in the repository names either.
+    write(
+      root,
+      'src/chart.registry.ts',
+      `import { Chart, Tooltip, type ChartType } from 'chart.js';
+
+interface VerticalHoverLinePluginOptions {
+  color?: string;
+}
+
+declare module 'chart.js' {
+  interface PluginOptionsByType<TType extends ChartType> {
+    verticalHoverLine: TType extends 'line' ? VerticalHoverLinePluginOptions : never;
+  }
+  interface TooltipPositionerMap {
+    top: (items: unknown[]) => { x: number; y: number };
+  }
+}
+
+export function registerChartConfiguration(): void {
+  Chart.register(Tooltip);
+}
+
+function unusedChartHelper(): void {}
+`
+    );
+    // angular-realworld's app.config.ts, with a Node.js augmentation beside it.
+    write(
+      root,
+      'src/app.config.ts',
+      `declare global {
+  interface Window {
+    __conduit_debug__?: { token(): string | null };
+  }
+  namespace NodeJS {
+    interface ProcessEnv {
+      API_URL?: string;
+    }
+  }
+}
+
+// In a module file this namespace is the file's own: it merges with nothing.
+declare namespace Settings {
+  interface NotMergedAnywhere {
+    retries: number;
+  }
+}
+
+export const appConfig = { providers: [] };
+`
+    );
+    write(
+      root,
+      'src/main.ts',
+      `import { registerChartConfiguration } from './chart.registry';
+import { appConfig } from './app.config';
+
+registerChartConfiguration();
+export const config = appConfig;
+`
+    );
+    graph = CodeGraph.initSync(root, { config: { include: ['src/**/*.ts'], exclude: [] } });
+    await graph.indexAll();
+  }, 60_000);
+
+  afterAll(() => {
+    graph?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const merged = ['PluginOptionsByType', 'TooltipPositionerMap', 'Window', 'ProcessEnv'];
+
+  it('does not list what a declare module or declare global block declares', () => {
+    for (const readSource of [undefined, null] as const) {
+      const report = buildDeadCodeReport(graph, readSource === null ? { readSource } : {});
+      for (const name of merged) expect(names(report)).not.toContain(name);
+      // TypeScript exports them without the keyword, so the exported rule
+      // takes them, and counts them.
+      expect(report.excluded.exported).toBe(merged.length);
+    }
+  });
+
+  it('lists them with the outside-reach caveat when exported symbols are asked for', () => {
+    const report = buildDeadCodeReport(graph, { includeExported: true });
+    for (const name of merged) {
+      expect(report.entries.find((entry) => entry.node.name === name)?.exported).toBe(true);
+    }
+  });
+
+  it('still lists what nothing reaches beside them', () => {
+    const report = buildDeadCodeReport(graph);
+    expect(names(report)).toContain('unusedChartHelper');
+    expect(names(report)).toContain('NotMergedAnywhere');
+  });
+});

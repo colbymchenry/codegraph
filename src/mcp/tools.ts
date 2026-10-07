@@ -3405,6 +3405,14 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'interface-impl' && typeof m.promotedInto === 'string') {
+      // Go: the implementing struct gets this method from a type it embeds.
+      return {
+        label: `interface dispatch — runs the method \`${m.promotedInto}\` gets by embedding (dynamic dispatch)`,
+        compact: `dynamic: interface → method promoted into ${m.promotedInto}${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'interface-impl') {
       return {
         label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
