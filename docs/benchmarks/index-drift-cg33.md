@@ -125,6 +125,69 @@ named `push`, or a Rust method named `join`. **The full rebuild is the wrong one
 here** — converging would mean teaching sync to manufacture thousands of wrong
 edges. Left as is, deliberately.
 
+### Navigation waits on a route, not a name (2026-10)
+
+A router's navigation call — `history.push('/login')`, `navigate('/login')`,
+`router.push('/x')`, `goto('/x')` — names its route by path and its reference
+by the router's method, so a route that changes in another file is invisible
+to every pass above:
+
+- **A call parked while its route was missing.** The #1240 retry looks failed
+  refs up by the names the synced files define, and a call's name tail is
+  `push`, never a path. On proshop_mern, deleting and restoring
+  `<Route path='/login'>` left six `history.push('/login')` calls failed and
+  their six `navigates` edges missing.
+- **A call that bound elsewhere meanwhile.** It resolved, so nothing revisits
+  it: to a catch-all screen (Obytes' Expo starter: `router.replace('/login')`
+  stayed on `[...messing].tsx` after `login.tsx` came back), to a parameter
+  route (`/users/new` on `/users/:id`), or to the other arm of a conditional
+  (sveltekit-realworld's `redirect` lost its `/login` arm for good).
+- **A route renamed in place.** `runPostExtract` renames a route whose path is
+  built from a constant another file holds, an Angular route under its mount,
+  or a React Router table route, and keeps its node, so the calls bound to it
+  keep pointing at a path it no longer has. `definitionDelta` is read before
+  that pass.
+- **A link in markup.** `<Link to>`, `routerLink` and the like are a
+  synthesizer's edges, and a routes file that matches none of the synthesis
+  triggers (an Angular `Routes` array, Ghostfolio's `home-page.routes.ts`)
+  does not send a sync to the synthesizers.
+
+Sync now reads every route node at its first file change, only when a router
+that resolves navigation calls is detected, and again after `runPostExtract`.
+When a route is on one side only (`changedRoutes`), the calls that routers'
+`navigation` hooks say it can answer go back to the pending set for the
+orphan sweep: the failed ones, found by their method tails through
+`idx_unresolved_failed_tail`, and the resolved ones, whose `navigates` edges
+are turned back into the references that made them, as the rebind does. A
+call counts when the router's `claimsReference` accepts its whole name and its
+file is in an app whose table holds the route, and a name more such calls
+share than the same 500 ceiling is skipped. The sync also refreshes synthesis.
+A sync that changes no route reads the routes twice and stops there.
+
+Measured by deleting a route (or renaming it), syncing, restoring it and
+syncing again, with both states diffed against a fresh index of the same tree.
+On `main` each of ten scenarios drifted in one of the two states; with the fix
+all twenty match: proshop_mern (`<Route path='/login'>`), next-saas-starter
+(the `/sign-in` and `/pricing` pages), create-t3-turbo (`/`), vue-realworld
+(`/login` in the router config), sveltekit-realworld (`login/+page.svelte`),
+angular-realworld (`login` in `app.routes.ts`), Obytes' Expo starter
+(`app/login.tsx`), Ghostfolio (`home-page.routes.ts`), and bulletproof-react
+with its `/auth/login` path constant renamed and back — the one that drifts
+while the route is renamed rather than after it returns. CleanArchitecture's
+React client, whose routes are a table `App.jsx` maps into `<Route>`, drifted
+when `App.jsx` stopped mapping it and started again: its two
+`navigate('/login')` calls stayed failed, though `AppRoutes.jsx` itself never
+changed. With the fix every step of that replay matches. A sync that changes
+no route spends 0–3 ms on the two reads (proshop's 49 routes, Ghostfolio's
+203); a route change on Ghostfolio spends 12–17 ms putting 40–50 calls back.
+
+Known limits, deliberate: a call bound by name to a method while its route
+was missing (a `redirect` that matched a project method called `redirect`) is
+not revisited, since only `navigates` edges are looked at; a project's own
+wrapper (Expo's `safePush`) is not looked up, since its tail is its own name
+and the failed-tail index cannot find a suffix; and a Vue route whose `name:`
+alone changes changes no route node.
+
 ### `codegraph status` — decided: no drift metric
 
 The issue asked whether `status` should surface divergence. Decision: **no**.
