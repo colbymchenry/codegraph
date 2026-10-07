@@ -6,9 +6,10 @@
  *
  * tree-sitter-go wraps every type in a `type_declaration`, and the comment is
  * that declaration's previous sibling. The node is made from the spec inside
- * it, whose only predecessor is the `type` keyword, so the docstring walk
- * found nothing. A type inside a `type ( … )` group kept its comment, which
- * sits beside it in the parentheses.
+ * it (a `type_spec`, or a `type_alias` for `type A = B`), whose only
+ * predecessor is the `type` keyword, so the docstring walk found nothing. A
+ * type inside a `type ( … )` group kept its comment, which sits beside it in
+ * the parentheses.
  *
  * A declaration holding one spec is now read from outside, as go doc reads
  * it. A group's leading comment stays the group's: it documents the group,
@@ -60,6 +61,9 @@ type ID int
 
 // Set is a generic type documented on its own.
 type Set[T comparable] map[T]struct{}
+
+// Alias is an alias documented on its own.
+type Alias = Point
 
 /*
 Box is documented in a block comment.
@@ -167,6 +171,7 @@ describe('Go doc comments on types declared on their own', () => {
         Shape: doc('interface', 'Shape'),
         ID: doc('type_alias', 'ID'),
         Set: doc('type_alias', 'Set'),
+        Alias: doc('type_alias', 'Alias'),
         Box: doc('struct', 'Box'),
         // A group's comment is the group's; a member's own comment is found
         // beside it. A group of one is that type's declaration, as in go doc,
@@ -177,6 +182,7 @@ describe('Go doc comments on types declared on their own', () => {
         Own: doc('type_alias', 'Own'),
         // An alias is one of a group's members too.
         First: doc('type_alias', 'First'),
+        Second: doc('type_alias', 'Second'),
         // A comment after code is that line's, whatever comes below it.
         Celsius: doc('type_alias', 'Celsius'),
         Kelvin: doc('type_alias', 'Kelvin'),
@@ -192,12 +198,14 @@ describe('Go doc comments on types declared on their own', () => {
         Shape: 'Shape is an interface documented on its own.',
         ID: 'ID is a defined type documented on its own.',
         Set: 'Set is a generic type documented on its own.',
+        Alias: 'Alias is an alias documented on its own.',
         Box: 'Box is documented in a block comment.',
         Circle: null,
         Square: 'Square is documented inside the group.',
         Lone: 'Lone is the only member of its group.',
         Own: 'Own is documented inside its group.',
         First: null,
+        Second: null,
         Celsius: null,
         Kelvin: null,
         sides: 'sides is documented above its line.',
