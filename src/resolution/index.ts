@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, GO_TYPE_KINDS } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -44,7 +44,8 @@ import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule 
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
-import type { ReExport } from './types';
+import type { CrossFileNodes, ReExport } from './types';
+import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
@@ -386,8 +387,61 @@ export class ReferenceResolver {
         });
       }
     }
+    for (const fw of this.frameworks) {
+      if (!fw.crossFileNodes) continue;
+      try {
+        updated += this.reconcileCrossFileNodes(fw.crossFileNodes(this.context));
+      } catch (err) {
+        logDebug(`Framework '${fw.name}' crossFileNodes failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     if (updated > 0) this.clearCaches();
     return updated;
+  }
+
+  /**
+   * Bring a framework's cross-file nodes in line with what it wants now:
+   * insert the new ones with their references (pending, for the resolution
+   * that follows), rename the ones whose name changed, and remove the ones it
+   * no longer wants. A removed node's incoming resolution edges go back to
+   * being the references that made them, exactly as when a file is deleted,
+   * so they rebind elsewhere or park as failed. Unchanged nodes are not
+   * touched, so their edges survive. Returns the number of nodes changed.
+   */
+  private reconcileCrossFileNodes(result: CrossFileNodes): number {
+    const wanted = new Map<string, Node>();
+    for (const node of result.nodes) if (result.owns(node)) wanted.set(node.id, node);
+    const existing = new Map<string, Node>();
+    for (const node of this.queries.getNodesByKind(result.kind)) if (result.owns(node)) existing.set(node.id, node);
+    let changed = 0;
+    for (const [id, old] of existing) {
+      if (wanted.has(id)) continue;
+      const refs = this.queries.getCrossFileIncomingEdgesWithTarget(old.filePath)
+        .filter((e) => e.target === id)
+        .map((e) => resurrectRefFromDroppedEdge(e))
+        .filter((r): r is UnresolvedReference => r !== null);
+      if (refs.length > 0) this.queries.insertUnresolvedRefsBatch(refs);
+      this.queries.deleteNode(id);
+      changed++;
+    }
+    const added: Node[] = [];
+    for (const [id, node] of wanted) {
+      const old = existing.get(id);
+      if (!old) added.push(node);
+      else if (old.name !== node.name || old.qualifiedName !== node.qualifiedName) {
+        this.queries.updateNode(node);
+        changed++;
+      }
+    }
+    if (added.length > 0) {
+      this.queries.insertNodes(added);
+      const ids = new Set(added.map((n) => n.id));
+      this.queries.insertUnresolvedRefsBatch(result.references.filter((r) => ids.has(r.fromNodeId)));
+      changed += added.length;
+    }
+    return changed;
   }
 
   /**
@@ -3043,6 +3097,12 @@ export class ReferenceResolver {
     if (ref.referenceKind === 'calls') {
       const target = this.nodeById(result.targetNodeId);
       if (target?.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(target.signature ?? '')) return null;
+      // A Go call made through an expression — `h.Validate().Error()`, a
+      // `.Metrics()` chained onto the line above — calls a method of whatever
+      // the expression is. A type is called only bare (`T(x)`, `(*T)(x)`) or
+      // through its package; as a struct here it read as an instantiation.
+      if (target && ref.language === 'go' && GO_TYPE_KINDS.has(target.kind) &&
+          !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
     }
 
     // An `imports` reference names something importable — never a member that

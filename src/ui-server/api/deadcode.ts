@@ -100,6 +100,7 @@ const EXCLUSION_LABELS: Record<keyof DeadCodeExclusions, string> = {
   declarations: 'abstract, or declared on an interface',
   decorated: 'carrying a decorator, so a framework registers them',
   overriding: 'overriding a member declared further up',
+  hooks: 'framework hooks, called by name on classes that skip the interface',
   implicit: 'named something the language calls by itself',
   vendored: 'in vendored directories',
   testScope: 'inside a test module',
