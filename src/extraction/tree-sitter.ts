@@ -2011,7 +2011,8 @@ export class TreeSitterExtractor {
   /**
    * Detect a React component declared via an HOC wrapper whose result is itself a
    * component: `forwardRef(...)`, `memo(...)`, `React.forwardRef/memo(...)`, and
-   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``. These
+   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``, typed
+   * (`styled.tag<Props>\`…\``) or not. These
    * initializers are a call / tagged-template (not a bare arrow), so the const is
    * otherwise classified `constant` — and a constant is skipped by both the
    * JSX-render edge synthesizer and component resolution, so `<Button/>` usages
@@ -2023,6 +2024,7 @@ export class TreeSitterExtractor {
    * `undefined` when this initializer is not a recognized component wrapper.
    */
   private reactComponentHoc(valueNode: SyntaxNode): { inner: SyntaxNode | null } | undefined {
+    if (this.isTypedStyledTemplate(valueNode)) return { inner: null };
     if (valueNode.type !== 'call_expression') return undefined;
     const callee = getChildByField(valueNode, 'function');
     if (!callee) return undefined;
@@ -2048,6 +2050,42 @@ export class TreeSitterExtractor {
       }
     }
     return { inner };
+  }
+
+  /**
+   * A styled tag with type arguments: `styled.div<Props>\`…\``,
+   * `styled(Base)<Props>\`…\``. tree-sitter's tagged-template call takes no type
+   * arguments, so when the type argument also reads as an expression the
+   * initializer parses as comparisons around it: `(styled.div < Props) > \`…\``.
+   * (A type argument that can't be an expression, like `<{ open: boolean }>`,
+   * error-recovers into a call on the tag instead, which the callee test in
+   * reactComponentHoc takes.) The tag is the leftmost operand, against a `<`;
+   * the template is the rightmost, against a `>` (`>>` when the type argument
+   * ends in its own `<…>`). Operators in between belong to the type argument:
+   * `<A & B>` parses as `(styled.div < A) & (B > \`…\`)`. Mirrored in the
+   * kernel (tsjs/extractors.rs is_typed_styled_template).
+   */
+  private isTypedStyledTemplate(valueNode: SyntaxNode): boolean {
+    if (valueNode.type !== 'binary_expression') return false;
+    let tagParent = valueNode;
+    let tag = getChildByField(valueNode, 'left');
+    while (tag?.type === 'binary_expression') {
+      tagParent = tag;
+      tag = getChildByField(tag, 'left');
+    }
+    let templateParent = valueNode;
+    let template = getChildByField(valueNode, 'right');
+    while (template?.type === 'binary_expression') {
+      templateParent = template;
+      template = getChildByField(template, 'right');
+    }
+    return (
+      !!tag &&
+      template?.type === 'template_string' &&
+      getChildByField(tagParent, 'operator')?.type === '<' &&
+      /^>+$/.test(getChildByField(templateParent, 'operator')?.type ?? '') &&
+      /^styled\b/.test(getNodeText(tag, this.source))
+    );
   }
 
   /**
