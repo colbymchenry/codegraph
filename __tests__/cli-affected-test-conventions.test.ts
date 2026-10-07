@@ -41,10 +41,13 @@ describe('codegraph affected — test-file conventions (#1507)', () => {
     w('pkg/test_calc.py', 'from pkg.calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n');
     w('src/main/kotlin/app/Calc.kt', 'package app\n\nclass Calc {\n    fun add(a: Int, b: Int): Int = a + b\n}\n');
     w('src/test/kotlin/app/CalcTest.kt', 'package app\n\nclass CalcTest {\n    fun addsNumbers() { Calc().add(1, 2) }\n}\n');
+    w('src/wire_format.h', '#pragma once\n\nint ByteSize(int value);\n');
+    w('src/wire_format.cc', '#include "wire_format.h"\n\nint ByteSize(int value) { return value; }\n');
+    w('src/wire_format_unittest.cc', '#include "wire_format.h"\n\nvoid ComputesByteSize() { ByteSize(1); }\n');
     const cg = CodeGraph.initSync(dir);
     await cg.indexAll();
     cg.close();
-  });
+  }, 60_000);
 
   afterAll(() => {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -57,6 +60,10 @@ describe('codegraph affected — test-file conventions (#1507)', () => {
   it('reports the Python test_ module and the JVM FooTest class', () => {
     expect(affected(dir, ['pkg/calc.py'])).toEqual(['pkg/test_calc.py']);
     expect(affected(dir, ['src/main/kotlin/app/Calc.kt'])).toEqual(['src/test/kotlin/app/CalcTest.kt']);
+  });
+
+  it("reports Google's C++ _unittest.cc beside the code it tests", () => {
+    expect(affected(dir, ['src/wire_format.h', 'src/wire_format.cc'])).toEqual(['src/wire_format_unittest.cc']);
   });
 
   it('still honours an explicit --filter glob', () => {
