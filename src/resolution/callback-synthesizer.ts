@@ -1551,7 +1551,7 @@ function importedJsxChild(ctx: ResolutionContext, name: string, file: string, la
   if (!ctx.resolveImport || !ctx.getNodeById) return undefined;
   const mapping = ctx.getImportMappings(file, language).find((m) => m.localName === name);
   if (!mapping || mapping.isNamespace) return undefined;
-  const module = resolveImportPath(mapping.source, file, language, ctx);
+  const module = mapping.resolvedPath ?? resolveImportPath(mapping.source, file, language, ctx);
   if (!module) return undefined;
   const resolved = ctx.resolveImport({
     fromNodeId: '', referenceName: name, referenceKind: 'references', line: 0, column: 0, filePath: file, language,
