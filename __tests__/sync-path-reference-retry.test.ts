@@ -44,13 +44,14 @@ describe('referenceNameTail', () => {
     expect(referenceNameTail('snippets/price.liquid', 'references')).toBe('price.liquid');
     expect(referenceNameTail('sections/404.liquid', 'references')).toBe('404.liquid');
     expect(referenceNameTail('snippets/icon.logo.liquid', 'references')).toBe('icon.logo.liquid');
-    expect(referenceNameTail('lazy-import:./routes/about.tsx', 'references')).toBe('about.tsx');
   });
 
   it('keeps the symbol tail of a reference that names no file', () => {
-    // No path, a path with no file name at its end, or an Erlang arity.
+    // No path, a path with no file name at its end, or an Erlang arity. (A
+    // route's module, `lazy-import:./routes/about.tsx` or
+    // `import:./home.component#HomeComponent`, is sync-route-module-retry's.)
     expect(referenceNameTail('Foo.Bar', 'references')).toBe('Bar');
-    expect(referenceNameTail('import:./home.component#HomeComponent', 'references')).toBe('component#HomeComponent');
+    expect(referenceNameTail('snippets/price', 'references')).toBe('snippets/price');
     expect(referenceNameTail('lists::map/2', 'references')).toBe('map');
     // A call's slashes sit in its arguments, a comment or a division.
     expect(referenceNameTail('assert.logfile("logs/error.log").has.line', 'calls')).toBe('line');
