@@ -41,7 +41,7 @@ export const swiftUIResolver: FrameworkResolver = {
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
-    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model.
     if (ref.language !== 'swift') return null;
     // Pattern 1: View references (SwiftUI views are PascalCase ending in View)
     if (ref.referenceName.endsWith('View') && /^[A-Z]/.test(ref.referenceName)) {
@@ -110,7 +110,7 @@ export const uikitResolver: FrameworkResolver = {
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
-    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model.
     if (ref.language !== 'swift') return null;
     // Pattern 1: ViewController references
     if (ref.referenceName.endsWith('ViewController')) {
@@ -201,7 +201,7 @@ export const vaporResolver: FrameworkResolver = {
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
-    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model.
     if (ref.language !== 'swift') return null;
     // Pattern 0: a route's handler — `use: SearchController.show` arrives as
     // `SearchController@show`, `use: self.index` / `use: index` as `@index`.
