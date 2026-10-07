@@ -284,8 +284,21 @@ export interface NavigationCalls {
 export interface FrameworkResolver {
   /** Framework name */
   name: string;
-  /** Languages this framework applies to. If omitted, applies to all languages. */
+  /**
+   * Languages this framework applies to: `extract()` runs only on files in
+   * them, and `resolve()` sees only references written in them (unless
+   * `resolveLanguages` says otherwise). If omitted, applies to all languages.
+   */
   languages?: Language[];
+  /**
+   * The languages whose references `resolve()` sees, when they are not
+   * `languages`. For a resolver that reads references in languages it
+   * extracts nothing from: SvelteKit's `$lib/…` imports and Svelte 5 runes
+   * are written in `.ts` / `.js` modules too, but only a `.svelte` file holds
+   * a route. Widening `languages` instead would run `extract()` on those
+   * files.
+   */
+  resolveLanguages?: readonly Language[];
   /**
    * Packages an app declares when it is built on this framework. When set,
    * `extract()` runs only on files of an app whose package.json — the file's

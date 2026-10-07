@@ -282,7 +282,7 @@ Each of these cost real debugging time; they are not hypothetical.
    it shares with every router: a table rendered by a component that is
    itself mounted under another file's `<Route path="/admin/*">` reads as if
    at the root. A sync that changes such a route resolves the calls it can
-   answer again (15), as for any other route.
+   answer again (16), as for any other route.
 14. **An index route is at its parent's address, so it needs that address
    written down.** `<Route index element={<Home />} />` inside `<Route
    path="/" element={<Layout />}>` is the page at `/`, and Layout is the
@@ -306,7 +306,16 @@ Each of these cost real debugging time; they are not hypothetical.
    mapped inside a `<Route element>` gets no layout edge: the layout's name
    would be looked up in the table's file, and the cross-file pass compares
    only route names, so a changed layout would never reach the table's routes.
-15. **A navigation call waits for a route, not for a name.** A call indexed
+15. **`resolve()` sees only references written in the framework's own
+   languages** (`getResolvingFrameworks`): Express's `logger` middleware rule
+   once took etcd's Go `*zap.Logger` result types for a method. A navigation
+   written in markup (`.svelte`, `.vue`) needs that language in `languages`.
+   A resolver that reads a language it extracts nothing from lists it in
+   `resolveLanguages` instead — Svelte's `$lib/…` imports in `.ts` route
+   modules, ASP.NET's Razor `@model` — because widening `languages` also runs
+   `extract()` on those files. `claimsReference()` is still asked of every
+   detected framework.
+16. **A navigation call waits for a route, not for a name.** A call indexed
    before its route existed is parked as failed (or bound to a catch-all, a
    parameter route, the other arm of a conditional), and sync revisits a
    failed reference only by matching its last name segment against the names
