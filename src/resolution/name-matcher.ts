@@ -17,6 +17,7 @@ import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualified
 import { cppAliasedTypeName, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
 import { cppClassWritten } from './cpp-supertypes';
+import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -1375,8 +1376,9 @@ const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
  * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
  * and the bracket form; and `declare global` contributes names to every file
  * whether or not the module exports anything of its own. Kept as a source test
- * rather than a node scan precisely because `isExported` is set only from an
- * `export_statement` ancestor, so `const x = …; export { x }` and
+ * rather than a node scan precisely because `isExported` is set only where a
+ * declaration is written (an `export_statement` around it, or a `declare
+ * module` / `declare global` body), so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
 const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
@@ -1563,6 +1565,37 @@ function isTestSuitePath(filePath: string): boolean {
       // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
       /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
   return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
+}
+
+const fileStem = (filePath: string): string => {
+  const name = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(0, dot) : name;
+};
+
+/**
+ * Whether a C or C++ file named like a test suite is part of `ref`'s
+ * translation unit after all. A file is in every translation unit that
+ * includes it, whatever its name says: protobuf's conformance framework is
+ * `conformance_test.h` (`ConformanceTestSuite`) and `test_runner.h`, which the
+ * suites and runners include, so binary_json_conformance_suite.cc's
+ * `suite_.ReportFailure(…)` is `ConformanceTestSuite::ReportFailure`. A
+ * definition in a source file counts through the header it implements: the
+ * one named like it that it includes (`conformance_test.cc` →
+ * `conformance_test.h`), when that header is a test suite's too — jemalloc's
+ * test `test/unit/hash.c` includes the library's `hash.h` to test it.
+ */
+function isIncludedCppTestSuite(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if ((candidate.language !== 'c' && candidate.language !== 'cpp') || (ref.language !== 'c' && ref.language !== 'cpp')) return false;
+  if (cppIncluders(candidate.filePath, context).has(ref.filePath)) return true;
+  const stem = fileStem(candidate.filePath);
+  for (const include of context.getNodesInFile(candidate.filePath)) {
+    if (include.kind !== 'import' || fileStem(include.name) !== stem) continue;
+    const header = cppIncludedFile(include, context);
+    if (header && header !== candidate.filePath && fileStem(header) === stem && isTestSuitePath(header) &&
+        cppIncluders(header, context).has(ref.filePath)) return true;
+  }
+  return false;
 }
 
 const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -1940,6 +1973,48 @@ export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionCont
 }
 
 /**
+ * What a Go type position — a parameter or result type, a composite
+ * literal's type — names: a type, which Go reads from one package. A method
+ * or a function is never it; Go reaches those only through a value or a
+ * package. Whichever strategy found a declaration of the name, the type is
+ * the one of that name in the reference's own package for a bare name, or in
+ * the imported project package for `pkg.T`. Without one there, a method or
+ * function of the name is nothing the reference means. etcd's
+ * `func (ti *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex` linked both
+ * `keyIndex` types to the method `treeIndex.keyIndex` beside it,
+ * prometheus's `(ec2Client, error)` result to the method the line declares,
+ * and its `&config_util.URL{…}` (an outside package) to `Target.URL`. A bare
+ * name that found another package's type means its own package's type of
+ * that name when there is one: prometheus's `prompb` builds its own
+ * `Histogram_CountInt`, not the `write/v2` one.
+ */
+export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target || target.language !== 'go') return result;
+  const isType = GO_TYPE_KINDS.has(target.kind);
+  // A composite literal keeps its package in the name (`config_util.URL`);
+  // a parameter type leaves it on the line.
+  const dot = ref.referenceName.lastIndexOf('.');
+  const name = ref.referenceName.slice(dot + 1);
+  // The package's directory; null for a package outside the project,
+  // undefined for a qualifier that is none of the file's imports as indexed.
+  let pkgDir: string | null | undefined;
+  let bare = false;
+  if (dot >= 0) {
+    pkgDir = goImportPackageDir(ref.referenceName.slice(0, dot), ref.filePath, context);
+  } else {
+    const { written, imported } = goRefQualification(ref, context);
+    bare = written === undefined;
+    if (bare) pkgDir = goPackageDir(ref.filePath);
+    else if (imported) pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath) ?? null;
+  }
+  if (isType && (!bare || goPackageDir(target.filePath) === pkgDir)) return result;
+  const types = pkgDir ? goPackageTypes(name, pkgDir, context) : [];
+  if (types.length > 0) return { ...result, targetNodeId: preferCallSiteFile(types, ref.filePath)[0]!.id };
+  return isType ? result : null;
+}
+
+/**
  * Whether a Go reference is written through an imported package from outside
  * the project's modules — `context.Context`, `fmt.Errorf`, a third-party
  * `gin.H`.
@@ -2241,7 +2316,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (isMinifiedScript(candidate.filePath, context)) return false;
   // A test suite is not linked into the program: typeorm's `Record<K, V>` is
   // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
-  if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
+  // A C or C++ file the reference's translation unit includes is, whatever
+  // its name.
+  if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath) && !isIncludedCppTestSuite(candidate, ref, context)) return false;
   // A Svelte component's instance script, or a Vue SFC's `<script setup>`, is
   // private to the component: shadcn-svelte's 838 `<Item.Root>` (a namespace
   // import) went to a `type Item` one example component declares for itself.
@@ -6813,7 +6890,15 @@ function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: Re
     const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
     // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
     // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
-    const parameter = new RegExp(`(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
+    // The leading `(?=\()` (every match opens a list) keeps the lookbehind to
+    // where one opens. Node 22's V8 stops optimizing the regexes a process
+    // compiles once it has generated about a megabyte of regex code, which a
+    // resolver pool worker soon has, and then tried the lookbehind at every
+    // position, each time reading back through the run of blanks before it:
+    // go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
+    // stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
+    // never resolved.
+    const parameter = new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
     binds = declared || parameter.test(text);
     memo.set(key, binds);
   }
@@ -9177,6 +9262,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_QUALIFIERS.delete(context);
   GO_EMBEDS.delete(context);
+  GO_ALIAS_TARGETS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -10901,7 +10987,18 @@ function resolveGoMethodInPackage(
   const types = goPackageTypes(typeName, pkgDir, context);
   if (types.length === 0) return undefined;
   if (depth >= 4) return null;
+  let unplaced = 0;
   for (const t of types) {
+    // An alias is the type it names, and has that type's methods.
+    const aliased = goAliasTarget(t, context);
+    if (aliased !== undefined) {
+      const via = aliased && resolveMethodOnType(
+        aliased.name, methodName, ref, context, confidence, resolvedBy, aliased.pkgDir, depth + 1,
+      );
+      if (via) return via;
+      if (!aliased) unplaced++;
+      continue;
+    }
     for (const embedded of goEmbeddedTypes(t, context)) {
       const via = resolveMethodOnType(
         embedded.name, methodName, ref, context, confidence, resolvedBy, embedded.pkgDir, depth + 1,
@@ -10909,7 +11006,48 @@ function resolveGoMethodInPackage(
       if (via) return via;
     }
   }
-  return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // or of no named type declares nothing here: the method is looked up by name,
+  // as it was before aliases had nodes.
+  return unplaced === types.length ? undefined : null;
+}
+
+const GO_ALIAS_TARGETS = new WeakMap<ResolutionContext, Map<string, { name: string; pkgDir: string } | null | undefined>>();
+
+/**
+ * The type a Go alias names, with the directory of the package that declares
+ * it — `mvccpb.Event` for `type Event = mvccpb.Event`, `Local` for `type Ptr
+ * = *Local`, `List` for `type Items[T any] = List[T]` — read from the
+ * declaration, as an embedding is. Null for an alias of anything else: a type
+ * from outside the project's packages, a predeclared one, a `func(…)` or
+ * `map[…]…`. Undefined when the node is no alias: a struct, an interface, or a
+ * defined type (`type Dur int`), which declares a type of its own.
+ */
+function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: string; pkgDir: string } | null | undefined {
+  if (typeNode.kind !== 'type_alias') return undefined;
+  let memo = GO_ALIAS_TARGETS.get(context);
+  if (!memo) GO_ALIAS_TARGETS.set(context, (memo = new Map()));
+  if (memo.has(typeNode.id)) return memo.get(typeNode.id);
+  const lines = context.getFileLines?.(typeNode.filePath) ?? context.readFile(typeNode.filePath)?.split(/\r?\n/) ?? [];
+  // From the alias's name, where the node starts, to the end of its type.
+  const decl = lines
+    .slice(Math.max(0, typeNode.startLine - 1), typeNode.endLine ?? typeNode.startLine)
+    .map((l, i) => (i === 0 ? l.slice(typeNode.startColumn ?? 0) : l).replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+    .join(' ');
+  // `Name =` or `Name[T any] =`; a defined type has no `=` there.
+  const head = /^\s*[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*=/.exec(decl);
+  // `T`, `*T`, `pkg.T`, each perhaps with type arguments.
+  const m = head && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(decl.slice(head[0].length));
+  let target: { name: string; pkgDir: string } | null | undefined;
+  if (m) {
+    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+    const name = m[2] ?? m[1]!;
+    target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
+  } else {
+    target = head ? null : undefined;
+  }
+  memo.set(typeNode.id, target);
+  return target;
 }
 
 /** The declarations of Go type `typeName` in the package at directory `pkgDir`. */
