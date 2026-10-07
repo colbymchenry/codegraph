@@ -815,11 +815,20 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
 }
 /**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
- * struct satisfies an interface structurally when its method set covers the
- * interface's. Synthesize the missing `implements` edge (struct → interface) by
+ * type satisfies an interface structurally when its method set covers the
+ * interface's. Synthesize the missing `implements` edge (type → interface) by
  * matching method-NAME sets, so impl-navigation works and the interface-dispatch
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
  * method call to the concrete overrides, and to the methods embedding promotes.
+ *
+ * The implementers are structs and defined types. A defined type declares
+ * methods as a struct does — gin's `type formSource map[string][]string` has
+ * `TrySet`, prometheus's `type staticDiscoverer []*targetgroup.Group` has `Run`,
+ * an adapter `type HandlerFunc func(…)` has `ServeHTTP` — and is extracted as a
+ * `type_alias` that owns them through `contains` edges. Go gives it none of
+ * the methods declared on the type it is written over, so it is matched by
+ * the methods it declares. A true alias (`type A = B`) is B, not a type of its
+ * own, and is not extracted as one.
  *
  * Both method sets include what embedding brings in, read off the declared
  * `extends`/`implements` edge each embedded type is. An interface has the
@@ -835,7 +844,7 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * where Go finds it ambiguous or hidden by a field) — over-approximation
  * accepted, in line with the other dispatch synthesizers; capped per
  * interface. Empty interfaces (`any`) are skipped so they don't match every
- * struct, and a struct that embeds the interface keeps the edge its embedding
+ * type, and a struct that embeds the interface keeps the edge its embedding
  * already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
@@ -843,13 +852,15 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
-  // Materializes GO structs and interfaces only (the pass is language-gated by
-  // the caller), never the whole struct kind — that array is O(nodes) on
-  // struct-heavy repos like the Linux kernel (#1212).
-  const goStructs: Node[] = [];
-  for (const s of queries.iterateNodesByKindIn('struct', ['go'])) {
+  // Materializes GO types only (the pass is language-gated by the caller),
+  // never the whole struct kind — that array is O(nodes) on struct-heavy repos
+  // like the Linux kernel (#1212). Structs and defined types arrive
+  // interleaved in one canonical order, so the cap below takes implementers
+  // as the files declare them, whatever their kind.
+  const goImplementers: Node[] = [];
+  for (const n of queries.iterateNodesByKindIn(['struct', 'type_alias'], ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    goStructs.push(s);
+    goImplementers.push(n);
   }
   const goInterfaces: Node[] = [];
   for (const i of queries.iterateNodesByKindIn('interface', ['go'])) {
@@ -857,20 +868,12 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     goInterfaces.push(i);
   }
 
-  // The kinds of type whose methods embedding passes on. A defined type
-  // (`type HandlersChain []HandlerFunc`) is looked up when an embedding names one.
-  const typeKind = new Map<string, NodeKind | null>();
-  for (const s of goStructs) typeKind.set(s.id, 'struct');
+  // The kinds of type whose methods embedding passes on: a struct can embed a
+  // defined type (`type HandlersChain []HandlerFunc`) as well.
+  const typeKind = new Map<string, NodeKind>();
+  for (const n of goImplementers) typeKind.set(n.id, n.kind);
   for (const i of goInterfaces) typeKind.set(i.id, 'interface');
-  const kindOf = (id: string): NodeKind | null => {
-    let kind = typeKind.get(id);
-    if (kind === undefined) {
-      const n = queries.getNodeById(id);
-      kind = n?.language === 'go' && n.kind === 'type_alias' ? 'type_alias' : null;
-      typeKind.set(id, kind);
-    }
-    return kind;
-  };
+  const kindOf = (id: string): NodeKind | null => typeKind.get(id) ?? null;
 
   // Memoized: an embedded base is read once, however many types embed it.
   const ownMemo = new Map<string, Set<string>>();
@@ -890,8 +893,8 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   };
 
   // The types one embeds: an interface embeds interfaces, a struct any of the
-  // three. Every struct's and interface's are read up front in a few batched
-  // queries rather than one query per type; a defined type's, when reached.
+  // three. Every type's are read up front in a few batched queries rather than
+  // one query per type.
   const isEmbedding = (e: Edge): boolean => isGoEmbedding(e, kindOf);
   const NO_EMBEDS: string[] = [];
   const embedMemo = new Map<string, string[]>();
@@ -905,15 +908,7 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     }
     await onYield();
   }
-  const embeds = (id: string): string[] => {
-    let targets = embedMemo.get(id);
-    if (targets) return targets;
-    const kind = typeKind.get(id);
-    if (kind === 'struct' || kind === 'interface') return NO_EMBEDS;
-    targets = queries.getOutgoingEdges(id, ['extends', 'implements']).filter(isEmbedding).map((e) => e.target);
-    embedMemo.set(id, targets);
-    return targets;
-  };
+  const embeds = (id: string): string[] => embedMemo.get(id) ?? NO_EMBEDS;
 
   // Own methods plus every embedded type's, down to the last level. Go allows
   // a struct to embed a pointer to itself, or to one embedding it back.
@@ -942,10 +937,15 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     return true;
   };
 
-  const structMethods = new Map<string, Set<string>>();
-  for (const s of goStructs) {
+  // A type without a method satisfies no interface this pass looks at.
+  const candidates: Node[] = [];
+  const candidateMethods = new Map<string, Set<string>>();
+  for (const s of goImplementers) {
     if ((++scanned255 & 63) === 0) await onYield();
-    structMethods.set(s.id, methodSet(s.id));
+    const have = methodSet(s.id);
+    if (have.size === 0) continue;
+    candidates.push(s);
+    candidateMethods.set(s.id, have);
   }
 
   for (const iface of goInterfaces) {
@@ -967,14 +967,14 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
       });
       added++;
     };
-    // A struct that needs promoted methods waits for those declaring all of
-    // them: under the cap, those are what the interface-dispatch bridge links
-    // a call through the interface to.
+    // A struct that needs promoted methods waits for the types declaring all
+    // of them, every defined type among them: under the cap, those are what
+    // the interface-dispatch bridge links a call through the interface to.
     const throughEmbedding: Node[] = [];
-    for (const s of goStructs) {
+    for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-      const have = structMethods.get(s.id);
-      if (!have || !covers(have, want)) continue;
+      const have = candidateMethods.get(s.id)!;
+      if (!covers(have, want)) continue;
       if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
       const own = ownMethods(s.id);
       if (own !== have && !covers(own, want)) throughEmbedding.push(s);
@@ -1289,10 +1289,16 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
   const promoted: { cls: Node; methods: Node[]; left: number }[] = [];
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
-  // types that conform to protocols. Iterate both.
+  // types that conform to protocols. Iterate both. A Go defined type
+  // (`type HandlerFunc func(…)`) holds its methods as a struct does, as a
+  // `type_alias`; that kind is walked for Go alone.
   const concreteKinds = ['class', 'struct', 'union'] as const;
-  for (const kind of concreteKinds) {
-  for (const cls of queries.iterateNodesByKind(kind)) {
+  const concrete = [
+    ...concreteKinds.map((kind) => () => queries.iterateNodesByKind(kind)),
+    () => queries.iterateNodesByKindIn('type_alias', ['go']),
+  ];
+  for (const nodesOfKind of concrete) {
+  for (const cls of nodesOfKind()) {
     if ((++scanned255 & 63) === 0) await onYield();
     // A class can only emit here if it HAS a supertype edge — check that
     // (one edge query) before materializing its methods: most classes in a
