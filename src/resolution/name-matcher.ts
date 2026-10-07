@@ -1373,8 +1373,9 @@ const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
  * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
  * and the bracket form; and `declare global` contributes names to every file
  * whether or not the module exports anything of its own. Kept as a source test
- * rather than a node scan precisely because `isExported` is set only from an
- * `export_statement` ancestor, so `const x = …; export { x }` and
+ * rather than a node scan precisely because `isExported` is set only where a
+ * declaration is written (an `export_statement` around it, or a `declare
+ * module` / `declare global` body), so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
 const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
