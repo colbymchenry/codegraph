@@ -43,7 +43,8 @@ import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule 
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
-import type { ReExport } from './types';
+import type { CrossFileNodes, ReExport } from './types';
+import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
@@ -385,8 +386,61 @@ export class ReferenceResolver {
         });
       }
     }
+    for (const fw of this.frameworks) {
+      if (!fw.crossFileNodes) continue;
+      try {
+        updated += this.reconcileCrossFileNodes(fw.crossFileNodes(this.context));
+      } catch (err) {
+        logDebug(`Framework '${fw.name}' crossFileNodes failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     if (updated > 0) this.clearCaches();
     return updated;
+  }
+
+  /**
+   * Bring a framework's cross-file nodes in line with what it wants now:
+   * insert the new ones with their references (pending, for the resolution
+   * that follows), rename the ones whose name changed, and remove the ones it
+   * no longer wants. A removed node's incoming resolution edges go back to
+   * being the references that made them, exactly as when a file is deleted,
+   * so they rebind elsewhere or park as failed. Unchanged nodes are not
+   * touched, so their edges survive. Returns the number of nodes changed.
+   */
+  private reconcileCrossFileNodes(result: CrossFileNodes): number {
+    const wanted = new Map<string, Node>();
+    for (const node of result.nodes) if (result.owns(node)) wanted.set(node.id, node);
+    const existing = new Map<string, Node>();
+    for (const node of this.queries.getNodesByKind(result.kind)) if (result.owns(node)) existing.set(node.id, node);
+    let changed = 0;
+    for (const [id, old] of existing) {
+      if (wanted.has(id)) continue;
+      const refs = this.queries.getCrossFileIncomingEdgesWithTarget(old.filePath)
+        .filter((e) => e.target === id)
+        .map((e) => resurrectRefFromDroppedEdge(e))
+        .filter((r): r is UnresolvedReference => r !== null);
+      if (refs.length > 0) this.queries.insertUnresolvedRefsBatch(refs);
+      this.queries.deleteNode(id);
+      changed++;
+    }
+    const added: Node[] = [];
+    for (const [id, node] of wanted) {
+      const old = existing.get(id);
+      if (!old) added.push(node);
+      else if (old.name !== node.name || old.qualifiedName !== node.qualifiedName) {
+        this.queries.updateNode(node);
+        changed++;
+      }
+    }
+    if (added.length > 0) {
+      this.queries.insertNodes(added);
+      const ids = new Set(added.map((n) => n.id));
+      this.queries.insertUnresolvedRefsBatch(result.references.filter((r) => ids.has(r.fromNodeId)));
+      changed += added.length;
+    }
+    return changed;
   }
 
   /**

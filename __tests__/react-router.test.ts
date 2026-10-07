@@ -574,8 +574,9 @@ describe('react-router: route declaration boundaries (#1348)', () => {
       ]);
     `, extension);
     expect(result).toEqual({
-      paths: ['/', '/data/prefs', '/long', '/quoted', '/sibling'],
-      bindings: ['/->DataSettings', '/data/prefs->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings'],
+      // `{ index: true, Component: DataIndex }` is the page at its parent's address.
+      paths: ['/', '/data', '/data/prefs', '/long', '/quoted', '/sibling'],
+      bindings: ['/->DataSettings', '/data->DataIndex', '/data/prefs->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings'],
     });
   });
 
@@ -690,5 +691,573 @@ export default function FeaturePage() { return <h1>Features</h1>; }
 
   it('v5’s <Redirect to> navigates', () => {
     expect(navsFrom('PrivateRoute')).toEqual(['redirect /']);
+  });
+});
+
+// =============================================================================
+// Route tables another file hands the router
+// =============================================================================
+
+function writeFiles(root: string, files: Record<string, string>): void {
+  for (const [rel, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), content);
+  }
+}
+
+async function indexProject(files: Record<string, string>): Promise<{ root: string; cg: CodeGraph }> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rr-tables-'));
+  writeFiles(root, files);
+  return { root, cg: await CodeGraph.init(root, { index: true }) };
+}
+
+/** `path -> Component` for what each route renders, `path ~> Layout` for each layout around it. */
+function routeBindings(cg: CodeGraph): string[] {
+  return cg.getNodesByKind('route').flatMap((r) => cg.getOutgoingEdges(r.id)
+    .filter((e) => e.kind === 'references')
+    .map((e) => `${r.name} ${(e.metadata as Record<string, unknown> | undefined)?.layout ? '~>' : '->'} ${cg.getNode(e.target)?.name}`))
+    .sort();
+}
+
+/** `Source -> /path` for every navigation into a route. */
+function navigations(cg: CodeGraph): string[] {
+  return cg.getNodesByKind('route').flatMap((r) => cg.getIncomingEdges(r.id)
+    .filter((e) => e.kind === 'navigates')
+    .map((e) => `${cg.getNode(e.source)?.name} -> ${r.name}`))
+    .sort();
+}
+
+const routeNames = (cg: CodeGraph): string[] => cg.getNodesByKind('route').map((r) => r.name).sort();
+
+const component = (name: string): string => `export function ${name}() {\n  return <div>${name}</div>;\n}\n`;
+
+/** jasontaylordev/CleanArchitecture's ClientApp-React and the ASP.NET Core React template it comes from. */
+const ASPNET_TEMPLATE: Record<string, string> = {
+  'src/Web/ClientApp/package.json': JSON.stringify({ name: 'web', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+  'src/Web/ClientApp/src/AppRoutes.js': `import ApiAuthorzationRoutes from './components/api-authorization/ApiAuthorizationRoutes';
+import { Counter } from "./components/Counter";
+import { FetchData } from "./components/FetchData";
+import { Home } from "./components/Home";
+import { ProtectedRoute } from "./components/ProtectedRoute";
+import AdminWrapper from "./components/AdminWrapper";
+import { Users } from "./components/Users";
+
+const AppRoutes = [
+  {
+    index: true,
+    element: <Home />
+  },
+  {
+    path: '/counter',
+    element: <Counter />
+  },
+  {
+    path: '/fetch-data',
+    requireAuth: true,
+    element: <ProtectedRoute><FetchData /></ProtectedRoute>
+  },
+  {
+    path: 'admin/users',
+    element: <AdminWrapper><Users /></AdminWrapper>
+  },
+  ...ApiAuthorzationRoutes
+];
+
+export default AppRoutes;
+`,
+  'src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationRoutes.js': `import { Profile } from './Profile';
+import { Login } from './Login';
+import { ApplicationPaths } from './ApiAuthorizationConstants';
+
+const ApiAuthorizationRoutes = [
+  {
+    path: '/authentication/profile',
+    element: <Profile />
+  },
+  {
+    path: ApplicationPaths.Login,
+    element: loginAction('login')
+  }
+];
+
+function loginAction(name) {
+  return <Login action={name}></Login>;
+}
+
+export default ApiAuthorizationRoutes;
+`,
+  'src/Web/ClientApp/src/components/api-authorization/ApiAuthorizationConstants.js':
+    "const prefix = '/authentication';\nexport const ApplicationPaths = {\n  Login: `${prefix}/login`,\n};\n",
+  'src/Web/ClientApp/src/App.js': `import React, { Component } from 'react';
+import { Route, Routes } from 'react-router-dom';
+import AppRoutes from './AppRoutes';
+import AuthorizeRoute from './components/api-authorization/AuthorizeRoute';
+import { Layout } from './components/Layout';
+
+export default class App extends Component {
+  static displayName = App.name;
+
+  render() {
+    return (
+      <Layout>
+        <Routes>
+          {AppRoutes.map((route, index) => {
+            const { element, requireAuth, ...rest } = route;
+            return <Route key={index} {...rest} element={requireAuth ? <AuthorizeRoute {...rest} element={element} /> : element} />;
+          })}
+        </Routes>
+      </Layout>
+    );
+  }
+}
+`,
+  'src/Web/ClientApp/src/components/NavMenu.js': `import { Link, NavLink, useNavigate } from 'react-router-dom';
+import { menu } from '../menu';
+
+export function NavMenu() {
+  const navigate = useNavigate();
+  const showProfile = () => {
+    navigate('/authentication/profile');
+  };
+  return (
+    <nav>
+      <Link to="/">Home</Link>
+      <Link to="/counter">Counter</Link>
+      <Link to="/fetch-data">Fetch data</Link>
+      <button onClick={showProfile}>Profile</button>
+      {menu.map((item) => <NavLink key={item.path} to={item.path}>{item.element}</NavLink>)}
+    </nav>
+  );
+}
+`,
+  // `{ path, element }` lists that are not route tables: a menu rendered as
+  // links, a list nothing renders, and a table mapped into a path it does not
+  // hold (`layout + path`).
+  'src/Web/ClientApp/src/menu.js': `import { HelpIcon, SettingsIcon } from './icons';
+export const menu = [
+  { path: '/help', element: <HelpIcon /> },
+  { path: '/settings', element: <SettingsIcon /> },
+];
+`,
+  'src/Web/ClientApp/src/breadcrumbs.js': `import { Crumb } from './icons';
+export const crumbs = [{ path: '/history', element: <Crumb /> }];
+`,
+  'src/Web/ClientApp/src/dashboard.js': `import { Route, Routes } from 'react-router-dom';
+import { Stats } from './icons';
+const dashboardRoutes = [{ path: '/stats', layout: '/admin', element: <Stats /> }];
+export function Dashboard() {
+  return <Routes>{dashboardRoutes.map((r) => <Route key={r.path} path={r.layout + r.path} element={r.element} />)}</Routes>;
+}
+`,
+  'src/Web/ClientApp/src/icons.js': component('HelpIcon') + component('SettingsIcon') + component('Crumb') + component('Stats'),
+  'src/Web/ClientApp/src/components/Home.js': component('Home'),
+  'src/Web/ClientApp/src/components/Counter.js': component('Counter'),
+  'src/Web/ClientApp/src/components/FetchData.js': component('FetchData'),
+  'src/Web/ClientApp/src/components/ProtectedRoute.js': 'export function ProtectedRoute({ children }) {\n  return children;\n}\n',
+  'src/Web/ClientApp/src/components/AdminWrapper.js': 'export default function AdminWrapper({ children }) {\n  return children;\n}\n',
+  'src/Web/ClientApp/src/components/Users.js': component('Users'),
+  'src/Web/ClientApp/src/components/Layout.js':
+    "import { NavMenu } from './NavMenu';\nexport function Layout({ children }) {\n  return <div><NavMenu />{children}</div>;\n}\n",
+  'src/Web/ClientApp/src/components/api-authorization/Profile.js': component('Profile'),
+  'src/Web/ClientApp/src/components/api-authorization/Login.js': component('Login'),
+  'src/Web/ClientApp/src/components/api-authorization/AuthorizeRoute.js':
+    'export default function AuthorizeRoute({ element }) {\n  return element;\n}\n',
+};
+
+describe('react-router: a route table another file maps into <Route> (the ASP.NET Core React template)', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject(ASPNET_TEMPLATE));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads the table App.js spreads into <Route {...rest}>, and the table it spreads in turn', () => {
+    expect(routeBindings(cg)).toEqual([
+      // `index: true` at the top of the table is the app's `/`.
+      '/ -> Home',
+      // `<AdminWrapper><Users /></AdminWrapper>` and
+      // `<ProtectedRoute><FetchData /></ProtectedRoute>` render what they wrap.
+      '/admin/users -> Users',
+      '/authentication/profile -> Profile',
+      '/counter -> Counter',
+      '/fetch-data -> FetchData',
+    ]);
+    // An entry that renders a call's result names no component, so it is no route.
+    expect(routeNames(cg)).toEqual(['/', '/admin/users', '/authentication/profile', '/counter', '/fetch-data']);
+  });
+
+  it('keeps each route at the line of its own object in the table', () => {
+    const counter = cg.getNodesByKind('route').find((r) => r.name === '/counter')!;
+    expect(counter.filePath).toBe('src/Web/ClientApp/src/AppRoutes.js');
+    expect(counter.startLine).toBe(15);
+  });
+
+  it('makes no route of a menu, a list nothing hands the router, or a path the table does not hold', () => {
+    for (const p of ['/help', '/settings', '/history', '/stats', '/admin/stats']) expect(routeNames(cg)).not.toContain(p);
+  });
+
+  it('gives the navigation that names those routes somewhere to go', () => {
+    expect(navigations(cg)).toEqual([
+      'NavMenu -> /',
+      'NavMenu -> /counter',
+      'NavMenu -> /fetch-data',
+      'showProfile -> /authentication/profile',
+    ]);
+  });
+
+  it('lands on the Screens tab', async () => {
+    const screens = await buildScreens(cg, root);
+    expect(screens.routed).toBe(true);
+    expect(screens.screens.map((s) => s.path).sort()).toEqual(['/', '/admin/users', '/authentication/profile', '/counter', '/fetch-data']);
+  });
+});
+
+describe('react-router: a table handed to useRoutes from another file, an index route under a layout', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'package.json': JSON.stringify({ name: 'kit', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+      // A table written as a function of the login state, the way many admin kits write it.
+      'src/routes.jsx': `import { Navigate } from 'react-router-dom';
+import DashboardLayout from './layouts/DashboardLayout';
+import MainLayout from './layouts/MainLayout';
+import { Account, Dashboard, Landing, Login } from './pages';
+
+const routes = (isLoggedIn) => [
+  {
+    path: 'app',
+    element: isLoggedIn ? <DashboardLayout /> : <Navigate to="/login" />,
+    children: [
+      { path: 'dashboard', element: <Dashboard /> },
+      { path: 'account', element: <Account /> },
+    ],
+  },
+  {
+    path: '/',
+    element: <MainLayout />,
+    children: [
+      { index: true, element: <Landing /> },
+      { path: 'login', element: <Login /> },
+    ],
+  },
+];
+
+export default routes;
+`,
+      'src/App.jsx': `import { useRoutes } from 'react-router-dom';
+import routes from './routes';
+
+export default function App({ isLoggedIn }) {
+  return useRoutes(routes(isLoggedIn));
+}
+`,
+      'src/layouts/MainLayout.jsx': `import { Link, Outlet } from 'react-router-dom';
+export default function MainLayout() {
+  return <div><Link to="/app/dashboard">Dashboard</Link><Outlet /></div>;
+}
+`,
+      'src/layouts/DashboardLayout.jsx': `import { Outlet } from 'react-router-dom';
+export default function DashboardLayout() {
+  return <Outlet />;
+}
+`,
+      'src/pages.jsx': `import { useNavigate } from 'react-router-dom';
+export function Dashboard() { return <div>Dashboard</div>; }
+export function Account() { return <div>Account</div>; }
+export function Landing() { return <div>Landing</div>; }
+export function Login() {
+  const navigate = useNavigate();
+  const onSubmit = () => navigate('/app/account');
+  return <form onSubmit={onSubmit} />;
+}
+`,
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads the table the function returns, nested paths composed', () => {
+    expect(routeBindings(cg)).toEqual([
+      // The index route is the page at `/`; MainLayout is the layout around it, not a second `/`.
+      '/ -> Landing',
+      '/ ~> MainLayout',
+      // `app`'s element is a choice made at runtime: a path to sit under, no layout.
+      '/app/account -> Account',
+      '/app/dashboard -> Dashboard',
+      '/login -> Login',
+      '/login ~> MainLayout',
+    ]);
+  });
+
+  it("draws a layout's links on every screen inside it", async () => {
+    expect(navigations(cg)).toEqual([
+      'MainLayout -> /app/dashboard',
+      'onSubmit -> /app/account',
+      // The table's own guard: `isLoggedIn ? <DashboardLayout /> : <Navigate to="/login" />`.
+      'routes -> /login',
+    ]);
+    const screens = await buildScreens(cg, root);
+    expect(screens.routed).toBe(true);
+    const at = (p: string) => screens.screens.find((s) => s.path === p)!.id;
+    for (const from of ['/', '/login']) {
+      expect(screens.links.find((l) => l.from === at(from) && l.to === at('/app/dashboard'))).toBeDefined();
+    }
+    expect(screens.links.find((l) => l.from === at('/login') && l.to === at('/app/account'))).toBeDefined();
+  });
+});
+
+describe("react-router: route objects in their own files, handed to createBrowserRouter (codedthemes' admin templates)", () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'package.json': JSON.stringify({ name: 'berry', dependencies: { react: '^18', 'react-router-dom': '^7' } }),
+      'src/routes/index.jsx': `import { createBrowserRouter } from 'react-router-dom';
+
+// routes
+import AuthenticationRoutes from './AuthenticationRoutes';
+import MainRoutes from './MainRoutes';
+
+const router = createBrowserRouter([MainRoutes, AuthenticationRoutes], {
+  basename: import.meta.env.VITE_APP_BASE_NAME
+});
+
+export default router;
+`,
+      'src/routes/MainRoutes.jsx': `import { lazy } from 'react';
+import MainLayout from '../layout/MainLayout';
+import Loadable from '../ui-component/Loadable';
+
+const DashboardDefault = Loadable(lazy(() => import('../views/DashboardDefault')));
+// An import only the app's own build resolves (\`baseUrl\`).
+const SamplePage = Loadable(lazy(() => import('views/sample-page')));
+
+const MainRoutes = {
+  path: '/',
+  element: <MainLayout />,
+  children: [
+    {
+      path: '/',
+      element: <DashboardDefault />
+    },
+    {
+      path: 'dashboard',
+      children: [
+        {
+          path: 'default',
+          element: <DashboardDefault />
+        }
+      ]
+    },
+    {
+      path: '/sample-page',
+      element: <SamplePage />
+    }
+  ]
+};
+
+export default MainRoutes;
+`,
+      'src/routes/AuthenticationRoutes.jsx': `import MinimalLayout from '../layout/MinimalLayout';
+import LoginPage from '../views/LoginPage';
+
+const AuthenticationRoutes = {
+  path: '/',
+  element: <MinimalLayout />,
+  children: [
+    {
+      path: '/pages/login',
+      element: <LoginPage />
+    }
+  ]
+};
+
+export default AuthenticationRoutes;
+`,
+      'src/layout/MainLayout.jsx': 'export default function MainLayout() {\n  return <main />;\n}\n',
+      'src/layout/MinimalLayout.jsx': 'export default function MinimalLayout() {\n  return <main />;\n}\n',
+      'src/views/DashboardDefault.jsx': 'export default function DashboardDefault() {\n  return <div />;\n}\n',
+      'src/views/LoginPage.jsx': 'export default function LoginPage() {\n  return <div />;\n}\n',
+      'src/ui-component/Loadable.jsx': 'export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n',
+      // The repository's other app, with pages of the same names.
+      'next/package.json': JSON.stringify({ name: 'berry-next', dependencies: { next: '^15', react: '^18' } }),
+      'next/src/views/sample-page.jsx': 'export default function SamplePage() {\n  return <div />;\n}\n',
+      'next/src/views/default.jsx': 'export default function DashboardDefault() {\n  return <div />;\n}\n',
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads each route object the array names, its children under its path', () => {
+    expect(routeBindings(cg)).toEqual([
+      // MainRoutes' `/` child claims its layout's address.
+      '/ -> DashboardDefault',
+      '/ ~> MainLayout',
+      // No child of the login layout claims `/`, so it is a page there of its
+      // own — the rule Angular and Vue routes follow.
+      '/ -> MinimalLayout',
+      '/dashboard/default -> DashboardDefault',
+      '/dashboard/default ~> MainLayout',
+      '/pages/login -> LoginPage',
+      '/pages/login ~> MinimalLayout',
+      '/sample-page -> SamplePage',
+      '/sample-page ~> MainLayout',
+    ].sort());
+  });
+
+  it('binds a page the route file loads lazily to the module it loads, and never to a same-named page of another app', () => {
+    const rendered = (p: string): string[] => cg.getNodesByKind('route').filter((r) => r.name === p).flatMap((r) => cg.getOutgoingEdges(r.id)
+      .filter((e) => e.kind === 'references' && !(e.metadata as Record<string, unknown> | undefined)?.layout)
+      .map((e) => { const n = cg.getNode(e.target)!; return `${n.kind} ${n.name} ${n.filePath}`; }));
+    expect(rendered('/dashboard/default')).toEqual(['function DashboardDefault src/views/DashboardDefault.jsx']);
+    // Its module is out of reach, so the page is the declaration itself.
+    expect(rendered('/sample-page')).toEqual(['constant SamplePage src/routes/MainRoutes.jsx']);
+  });
+});
+
+describe('react-router: a table mapped inside <Route path> in the same file', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'ClientApp/package.json': JSON.stringify({ name: 'client', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+      'ClientApp/src/routes.js': `import { Routes, Route } from 'react-router-dom';
+import DashboardLayout from './layouts/dashboard';
+import DashboardApp from './pages/DashboardApp';
+import LandingPage from './pages/LandingPage';
+import TicketDetail from './pages/TicketDetail';
+
+const DashboardRoutes = [
+    {
+        path: 'app',
+        requireAuth: true,
+        element: <DashboardApp/>
+    },
+    {
+        path: 'tickets/:id',
+        requireAuth: true,
+        element: <TicketDetail/>
+    }
+];
+
+export default function Router() {
+    return (
+        <Routes>
+            <Route path="landing" element={<LandingPage/>}/>
+            <Route path="/dashboard" element={<DashboardLayout/>}>
+                {DashboardRoutes.map((route, index) => {
+                    const {element, requireAuth, ...rest} = route;
+                    return <Route key={index} {...rest} element={element}/>;
+                })}
+            </Route>
+        </Routes>
+    );
+}
+`,
+      'ClientApp/src/layouts/dashboard.js': 'export default function DashboardLayout() {\n  return <div />;\n}\n',
+      'ClientApp/src/pages/DashboardApp.js': 'export default function DashboardApp() {\n  return <div />;\n}\n',
+      'ClientApp/src/pages/LandingPage.js': 'export default function LandingPage() {\n  return <div />;\n}\n',
+      'ClientApp/src/pages/TicketDetail.js': 'export default function TicketDetail() {\n  return <div />;\n}\n',
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("composes the table's relative paths onto the <Route path> it is mapped inside", () => {
+    expect(routeBindings(cg)).toEqual([
+      '/dashboard -> DashboardLayout',
+      '/dashboard/app -> DashboardApp',
+      '/dashboard/tickets/:id -> TicketDetail',
+      '/landing -> LandingPage',
+    ]);
+  });
+});
+
+describe('react-router: a route table as the files around it change', () => {
+  let root: string;
+  let cg: CodeGraph;
+  const app = (body: string) => `import { Route, Routes } from 'react-router-dom';
+import AppRoutes from './AppRoutes';
+import { Counter } from './Counter';
+
+export default function App() {
+  return (
+    <Routes>
+      ${body}
+    </Routes>
+  );
+}
+`;
+  const MAPPED = app('{AppRoutes.map(({ element, ...rest }, index) => <Route key={index} {...rest} element={element} />)}');
+  const table = (extra: string) => `import { Counter } from './Counter';
+import { Home } from './Home';
+import { FetchData } from './FetchData';
+
+const AppRoutes = [${extra}
+  { index: true, element: <Home /> },
+  { path: '/counter', element: <Counter /> },
+];
+
+export default AppRoutes;
+`;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { react: '^18', 'react-router-dom': '^6' } }),
+      'src/AppRoutes.js': table(''),
+      'src/App.js': MAPPED,
+      'src/Home.js': component('Home'),
+      'src/Counter.js': component('Counter'),
+      'src/FetchData.js': component('FetchData'),
+      'src/NavMenu.js': `import { Link, useNavigate } from 'react-router-dom';
+export function NavMenu() {
+  const navigate = useNavigate();
+  const goHome = () => navigate('/');
+  return <nav><button onClick={goHome}>Home</button><Link to="/counter">Counter</Link></nav>;
+}
+`,
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('starts with the table read', () => {
+    expect(routeNames(cg)).toEqual(['/', '/counter']);
+    expect(navigations(cg)).toEqual(['NavMenu -> /counter', 'goHome -> /']);
+  });
+
+  it('an edit to the table moves its routes, and what navigated to them still does', async () => {
+    writeFiles(root, { 'src/AppRoutes.js': table("\n  { path: '/fetch-data', element: <FetchData /> },") });
+    await cg.sync();
+    expect(routeBindings(cg)).toEqual(['/ -> Home', '/counter -> Counter', '/fetch-data -> FetchData']);
+    expect(navigations(cg)).toEqual(['NavMenu -> /counter', 'goHome -> /']);
+  });
+
+  it('a file that stops handing the table over takes its routes with it, and putting it back brings them back', async () => {
+    writeFiles(root, { 'src/App.js': app('<Route path="/static" element={<Counter />} />') });
+    await cg.sync();
+    expect(routeNames(cg)).toEqual(['/static']);
+    writeFiles(root, { 'src/App.js': MAPPED });
+    await cg.sync();
+    expect(routeNames(cg)).toEqual(['/', '/counter', '/fetch-data']);
+    expect(navigations(cg)).toContain('NavMenu -> /counter');
+  });
+
+  it('deleting that file is a change too', async () => {
+    fs.rmSync(path.join(root, 'src/App.js'));
+    await cg.sync();
+    expect(routeNames(cg)).toEqual([]);
   });
 });
