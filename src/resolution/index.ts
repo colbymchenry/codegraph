@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, GO_TYPE_KINDS } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -3066,6 +3066,10 @@ export class ReferenceResolver {
    * inside a type never is, and neither is the import statement the reference
    * was written in.
    *
+   * For a Go type position: the target is a type of the package Go reads the
+   * name from, moved there when a strategy found a method, a function or
+   * another package's type (see goTypePositionTarget).
+   *
    * For `extends`/`implements`, it cannot be describing a real supertype when:
    *
    *  1. The target's kind can never be a supertype (an enum member, a method,
@@ -3115,6 +3119,14 @@ export class ReferenceResolver {
       const target = this.nodeById(result.targetNodeId);
       if (target?.kind === 'import' && target.filePath === ref.filePath) return null;
       return target && !isImportableKind(target.kind) ? null : result;
+    }
+
+    // A Go type position — a parameter or result type, a composite literal's
+    // type — names a type of the package Go reads it from (route handlers are
+    // `references` too, but values).
+    if (ref.language === 'go' && (ref.referenceKind === 'instantiates' ||
+        (ref.referenceKind === 'references' && this.nodeById(ref.fromNodeId)?.kind !== 'route'))) {
+      return goTypePositionTarget(result, ref, this.context);
     }
 
     if (!isInheritanceRef(ref)) return result;
