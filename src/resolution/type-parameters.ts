@@ -9,8 +9,9 @@
  * from the declaration heads around the reference: after the declared name
  * (`class Foo<T>`, `fn f<T: Display>`, `func F[T any]`, `def f[F[_]: Monad, A]`,
  * `struct Stack<Element>`), before it where the language puts them
- * (Java's `<T extends X> T max(…)`, Kotlin's `fun <T> f()`), and a C++
- * `template <typename T>` line above it. Applied at resolveOne's seam, so every
+ * (Java's `<T extends X> T max(…)`, Kotlin's `fun <T> f()`), a C++
+ * `template <typename T>` line above it, and a Go method's receiver
+ * (`func (p *Pool[T]) Get() T`). Applied at resolveOne's seam, so every
  * strategy's result obeys it.
  */
 import type { Node } from '../types';
@@ -151,6 +152,12 @@ function declaredTypeParameters(node: Node, context: ResolutionContext): Readonl
       for (let i = 0; i < before.length; i++) {
         if (before[i] === '<' && (i === 0 || /[\s(,]/.test(before[i - 1]!))) collect(before, i, names);
       }
+    }
+    // Go: a method of a generic type declares the type's parameters again in
+    // its receiver — `func (p *Pool[T]) Get() T`, `func (LazyLoader[K, V]) …`.
+    if (node.language === 'go' && node.kind === 'method') {
+      const receiver = /^\s*func\s*\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*[A-Za-z_]\w*\s*\[/.exec(head);
+      if (receiver) collect(head, receiver[0].length - 1, names);
     }
     // C++: `template <typename T, class U>` on the lines just above.
     if (node.language === 'cpp') {

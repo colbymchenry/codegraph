@@ -610,6 +610,15 @@ export interface RouteTable {
 
 const tables = new Map<string, RouteTable>();
 
+/**
+ * True for this framework's own route nodes: the ones whose name IS the path
+ * derived from their file. Express/SvelteKit routes in the same project name
+ * themselves differently and never match.
+ */
+function isScreenRoute(node: Node): boolean {
+  return routePathForFile(node.filePath) === node.name;
+}
+
 export function routeTable(context: ResolutionContext): RouteTable {
   const all = context.getNodesByKind('route');
   const key = context.getProjectRoot();
@@ -618,10 +627,7 @@ export function routeTable(context: ResolutionContext): RouteTable {
   const exact = new Map<string, Node>();
   const dynamic: RouteEntry[] = [];
   for (const node of all) {
-    // Only this framework's own route nodes: the ones whose name IS the path
-    // derived from their file. Express/SvelteKit routes in the same project
-    // name themselves differently and never match.
-    if (routePathForFile(node.filePath) !== node.name) continue;
+    if (!isScreenRoute(node)) continue;
     exact.set(node.name, node);
     if (node.name.includes('[')) dynamic.push({ node, segs: node.name.split('/').slice(1) });
   }
@@ -747,6 +753,14 @@ export const expoRouterResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_METHOD.test(name);
+  },
+
+  navigation: {
+    // A project's own wrapper (`safePush`) is left out: its tail is its own
+    // name, which the failed-tail index cannot find by suffix.
+    tails: ['push', 'replace', 'navigate', 'dismissTo'],
+    // One table for the whole project, and any file's call matches against it.
+    scope: (route) => (isScreenRoute(route) ? [''] : null),
   },
 
   extract(filePath: string, content: string) {
