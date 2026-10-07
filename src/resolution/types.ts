@@ -227,6 +227,13 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The import node of every C / C++ `#include`, narrowed to the path it
+   * spells and where it is written: what ./cpp-includers builds the include
+   * graph from. Optional so minimal contexts compile; it falls back to
+   * reading the import nodes themselves.
+   */
+  getCppIncludeNodes?(): Array<Pick<Node, 'id' | 'name' | 'filePath' | 'language' | 'startLine' | 'startColumn'>>;
 }
 
 /**
