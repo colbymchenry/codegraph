@@ -2160,18 +2160,19 @@ function isGoIdentChar(c: number): boolean {
 
 function readGoScopes(code: string): GoScopeIndex {
   const lineStarts = [0];
+  for (let i = code.indexOf('\n'); i >= 0; i = code.indexOf('\n', i + 1)) lineStarts.push(i + 1);
   const events: number[] = [];
   const open: number[] = [];
   const close = new Map<number, number>();
   const stack: number[] = [];
-  for (let i = 0; i < code.length; i++) {
-    const ch = code.charCodeAt(i);
-    if (ch === 10) { lineStarts.push(i + 1); continue; }
-    if (ch === 123) stack.push(i);
-    else if (ch === 125) {
+  const braces = /[{}]/g;
+  for (let m = braces.exec(code); m; m = braces.exec(code)) {
+    const i = m.index;
+    if (code.charCodeAt(i) === 123) stack.push(i);
+    else {
       const at = stack.pop();
       if (at !== undefined) close.set(at, i);
-    } else continue;
+    }
     events.push(i);
     open.push(stack.length > 0 ? stack[stack.length - 1]! : -1);
   }
@@ -2442,27 +2443,33 @@ function goScopesOf(index: GoScopeIndex, name: string): Array<[number, number, G
  * line and column.
  */
 function blankGoCode(src: string): string {
-  let out = '';
+  const parts: string[] = [];
   let last = 0;
   const blank = (from: number, to: number): void => {
-    out += src.slice(last, from) + src.slice(from, to).replace(/[^\n]/g, ' ');
+    parts.push(src.slice(last, from));
+    const newline = src.indexOf('\n', from);
+    parts.push(newline < 0 || newline >= to ? ' '.repeat(to - from) : src.slice(from, to).replace(/[^\n]/g, ' '));
     last = to;
   };
-  for (let i = 0; i < src.length; i++) {
+  const special = /[/"'`]/g;
+  for (let m = special.exec(src); m; m = special.exec(src)) {
+    const i = m.index;
     const c = src.charCodeAt(i);
-    if (c === 47 && src.charCodeAt(i + 1) === 47) { // `//`
-      const end = src.indexOf('\n', i);
-      blank(i, end < 0 ? src.length : end);
-      i = last - 1;
-    } else if (c === 47 && src.charCodeAt(i + 1) === 42) { // `/*`
-      const end = src.indexOf('*/', i + 2);
-      blank(i, end < 0 ? src.length : end + 2);
-      i = last - 1;
+    if (c === 47) {
+      const d = src.charCodeAt(i + 1);
+      if (d === 47) { // `//`
+        const end = src.indexOf('\n', i);
+        blank(i, end < 0 ? src.length : end);
+      } else if (d === 42) { // `/*`
+        const end = src.indexOf('*/', i + 2);
+        blank(i, end < 0 ? src.length : end + 2);
+      } else continue;
+      special.lastIndex = last;
     } else if (c === 96) { // a raw string
       const end = src.indexOf('`', i + 1);
       blank(i + 1, end < 0 ? src.length : end);
-      i = last;
-    } else if (c === 34 || c === 39) { // "…" or '…'
+      special.lastIndex = last + 1;
+    } else { // "…" or '…'
       let j = i + 1;
       while (j < src.length) {
         const d = src.charCodeAt(j);
@@ -2471,10 +2478,11 @@ function blankGoCode(src: string): string {
         j++;
       }
       blank(i + 1, Math.min(j, src.length));
-      i = last;
+      special.lastIndex = last + 1;
     }
   }
-  return out + src.slice(last);
+  parts.push(src.slice(last));
+  return parts.join('');
 }
 
 const PHP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'trait', 'enum']);
