@@ -1903,9 +1903,10 @@ export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): 
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
   const at = Math.max(0, ref.column);
   // The qualifier right before the name at the reference's column, or the
-  // line's only spelling of the name.
-  const before = line.startsWith(name, at) ? /(?:^|[^\w.])([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
-    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.])([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
+  // line's only spelling of the name. A variadic `...chunks.Meta` is written
+  // through `chunks` too: the ellipsis is no receiver.
+  const before = line.startsWith(name, at) ? /(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
+    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.]|\\.{3})([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
   const imported = before ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before) : undefined;
   memo.set(key, imported ?? null);
   return imported;
@@ -2373,6 +2374,37 @@ function isBareGoCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 }
 
 /**
+ * Whether a Go reference's name is written bare, so that Go reads it from the
+ * reference's own package: a type `Node` (variadic `...Node` too), a composite
+ * literal `&Event{}`, a route's handler `Index`, a call `Walk(v, n)` or a
+ * conversion `(*Block)(pb)`. Not `parser.Node` or `...chunks.Meta`, written
+ * through an import, nor a name reached through a value: `err[i].Error()`, a
+ * `.String()` chained onto the line above, a route's handler `h.Follow`.
+ */
+export function isGoBareName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = ref.referenceName;
+  if (ref.language !== 'go' || !/^[A-Za-z_]\w*$/.test(name)) return false;
+  if (ref.referenceKind === 'calls' && isReceiverLessCall(ref, context)) return true;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (line === undefined) return false;
+  // A call's column is its expression's: only a conversion's parenthesized
+  // type is still bare there.
+  if (ref.referenceKind === 'calls') {
+    return line[ref.column] === '(' && new RegExp(`^\\(\\s*\\*?\\s*${name}\\s*\\)\\s*\\(`).test(line.slice(ref.column));
+  }
+  if (line.startsWith(name, ref.column)) {
+    let end = ref.column;
+    while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
+    return line[end - 1] !== '.' || (end >= 3 && line.slice(end - 3, end) === '...');
+  }
+  // A route's handler is recorded at the start of its line: its spelling
+  // there, outside the path string.
+  const code = line.replace(/"(?:[^"\\]|\\.)*"|`[^`]*`/g, (s) => ' '.repeat(s.length));
+  return new RegExp(`(?<![\\w.])${name}\\b`).test(code);
+}
+
+/**
  * Whether an R call is a plain function call — `range(x)`, `vars(a)` — not a
  * ggproto / R6 method through `obj$m(…)` or `self$m(…)`. A method is only
  * reached through its object: ggplot2's `range(data$x)` (base R's) went to a
@@ -2443,9 +2475,13 @@ const WHITESPACE = /\s/;
 const WORD_CHAR = /\w/;
 /** A character that ends a receiver: `.`, a word character, `$`, `]` or `)`. */
 const RECEIVER_TAIL_CHAR = /[.\w$\])]/;
-/** Keywords after which a name starts an expression, so the call has no receiver. */
+/**
+ * Keywords after which a name starts an expression, so the call has no
+ * receiver — Go's `if Type(b) != Series`, `switch dirType(name)` included.
+ */
 const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
+  'if', 'switch', 'for', 'range',
 ]);
 
 /**
@@ -10478,7 +10514,7 @@ function goDeclaredTypePackage(raw: string | undefined, filePath: string, contex
 }
 
 /** The node kinds a Go `type` declaration produces. */
-const GO_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface', 'type_alias']);
+export const GO_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface', 'type_alias']);
 
 /**
  * `methodName` on the Go type `typeName` that the package in directory
