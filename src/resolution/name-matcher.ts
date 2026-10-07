@@ -11020,9 +11020,10 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  * method of that name: every gRPC handler etcd generates went to the
  * `UnimplementedKVServer` stub beside the `KVServer` interface. The type is
  * the one Go finds: in the call's own package or a package it dot-imports for
- * a bare name, in the imported package for a qualified one. A type found in
- * none — one from outside the project (`http.Flusher`), a predeclared one
- * (`error`) — or a type literal (`interface{ Flush() }`) links nothing.
+ * a bare name, in the imported package for a qualified one, and an alias is
+ * the type it names. A type found in none — one from outside the project
+ * (`http.Flusher`), a predeclared one (`error`) — an alias of such a type, or
+ * a type literal (`interface{ Flush() }`) links nothing.
  * Undefined when the call is not made through an assertion.
  */
 export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
@@ -11038,6 +11039,9 @@ export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionConte
     ? goImportPackageDir(qualifier, ref.filePath, context)
     : [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
   if (!declares(dir)) return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // has that type's methods, none the project declares.
+  if (goPackageTypes(typeName!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
   return resolveMethodOnType(typeName!, ref.referenceName, ref, context, 0.9, 'instance-method', dir);
 }
 

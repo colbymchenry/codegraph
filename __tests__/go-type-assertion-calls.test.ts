@@ -186,6 +186,10 @@ func (s *sink) Fetch(key string) string { return "" }
 func (s *sink) Flush() error { return nil }
 
 func (s *sink) Read(p []byte) (int, error) { return 0, nil }
+
+type Ctx struct{}
+
+func (c *Ctx) Done() <-chan struct{} { return nil }
 `,
   'storage/storage.go': `package storage
 
@@ -199,7 +203,11 @@ func (b *Base) Flush() error { return nil }
 `,
   'store/store.go': `package store
 
-import "example.com/app/storage"
+import (
+	"context"
+
+	"example.com/app/storage"
+)
 
 type Reader interface {
 	Read(p []byte) (int, error)
@@ -226,6 +234,10 @@ type Factory interface {
 type Builder struct{}
 
 func (b *Builder) Add(n int) *Builder { return b }
+
+type Ctx = context.Context
+
+type Keeper = storage.Store
 `,
   'store/use.go': `package store
 
@@ -268,6 +280,14 @@ func (s *sink) Add(n int) *sink { return s }
 
 func Build(v any) {
 	v.(*Builder).Add(1).Add(2)
+}
+
+func Wait(v any) {
+	v.(Ctx).Done()
+}
+
+func Keep(v any) string {
+	return v.(Keeper).Fetch("k")
 }
 `,
   'dot/dot.go': `package dot
@@ -340,6 +360,8 @@ describe.each(['default', 'wasm'])('Go calls through a type assertion resolve on
       '21 storage/storage.go::Store::Fetch',
     ]);
     expect(calls('dot/dot.go', 'Get')).toEqual(['6 storage/storage.go::Store::Fetch']);
+    // An alias is the type it names.
+    expect(calls('store/use.go', 'Keep')).toEqual(['49 storage/storage.go::Store::Fetch']);
     // A string argument holding a parenthesis is not the end of the call.
     expect(calls('store/use.go', 'Quoted')).toEqual([
       '35 storage/storage.go::Store::Fetch',
@@ -350,6 +372,8 @@ describe.each(['default', 'wasm'])('Go calls through a type assertion resolve on
   it('links nothing for a type from outside the project or a type literal', () => {
     // http.Flusher's Flush, on line 20 of Use, has no edge (see above).
     expect(calls('store/use.go', 'Anon')).toEqual([]);
+    // Ctx is an alias of context.Context.
+    expect(calls('store/use.go', 'Wait')).toEqual([]);
     const flush = cg!.getNodesInFile('store/use.go').find((n) => n.qualifiedName === 'sink::Flush')!;
     expect(cg!.getIncomingEdges(flush.id).filter((e) => e.kind === 'calls')).toEqual([]);
   });
@@ -372,7 +396,7 @@ describe.each(['default', 'wasm'])('Go calls through a type assertion resolve on
       ...cg!.getNodesInFile('store/use.go').filter((n) => n.qualifiedName.startsWith('sink::')),
       ...cg!.getNodesInFile('pb/rpc_grpc.pb.go').filter((n) => n.qualifiedName.startsWith('UnimplementedKVServer::')),
     ].filter((n) => n.kind === 'method');
-    expect(decoys.length).toBe(10);
+    expect(decoys.length).toBe(11);
     for (const decoy of decoys) {
       expect(cg!.getIncomingEdges(decoy.id).filter((e) => e.kind === 'calls' && e.provenance !== 'heuristic'), decoy.qualifiedName).toEqual([]);
     }
