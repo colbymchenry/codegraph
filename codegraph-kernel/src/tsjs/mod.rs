@@ -46,10 +46,6 @@ impl Variant {
     fn is_ts(self) -> bool {
         matches!(self, Variant::Typescript | Variant::Tsx)
     }
-    /// VALUE_REF_LANGS includes typescript/tsx/javascript but NOT jsx.
-    fn value_refs(self) -> bool {
-        !matches!(self, Variant::Jsx)
-    }
 }
 
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
@@ -478,9 +474,6 @@ impl<'t> Walker<'t> {
     // --- value references (captureValueRefScope / flushValueRefs) --------------
 
     fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>, value_target: bool) {
-        if !self.variant.value_refs() {
-            return;
-        }
         let target_kind_ok = kind == "constant" || kind == "variable";
         if value_target
             && target_kind_ok
@@ -506,7 +499,7 @@ impl<'t> Walker<'t> {
         let scopes = std::mem::take(&mut self.value_scopes);
         let mut targets = std::mem::take(&mut self.fs_values);
         let counts = std::mem::take(&mut self.fs_value_counts);
-        if !self.variant.value_refs() || std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
+        if std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
             return;
         }
         if targets.is_empty() || scopes.is_empty() || util::is_generated_file(self.file_path) {
