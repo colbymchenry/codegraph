@@ -288,6 +288,8 @@ export class ReferenceResolver {
   // 565s of combined worker time (~581µs each, recursion-multiplied).
   private supertypeGen = 0;
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+  // getSupertypeNodes' memo, by node id, under the same generation tag.
+  private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -295,6 +297,7 @@ export class ReferenceResolver {
     // Lazy invalidation via the gen tag; bound the map so a long run over many
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+    if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -511,6 +514,7 @@ export class ReferenceResolver {
     this.methodMatchCache.clear();
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
+    this.supertypeNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -872,6 +876,18 @@ export class ReferenceResolver {
         }
         this.supertypeMemo.set(memoKey, { gen: this.supertypeGen, supers });
         return supers;
+      },
+
+      getSupertypeNodes: (id: string) => {
+        const hit = this.supertypeNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, RESOLUTION_READ_EDGE_KINDS)) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
       },
 
       getImportMappings: (filePath: string, language) => {

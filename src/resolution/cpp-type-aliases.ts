@@ -124,6 +124,23 @@ export function cppTypeSegments(raw: string): string[] | null {
   return cppTypeName(raw)?.names ?? null;
 }
 
+/**
+ * The top-level arguments of the first template argument list in a written
+ * type: `['Iterator']` for `const std::unique_ptr<Iterator>&`, `['Foo',
+ * 'Deleter<Foo>']` for `std::unique_ptr<Foo, Deleter<Foo>>`. Null when it has
+ * none, or the list is not closed.
+ */
+export function cppTemplateArguments(raw: string): string[] | null {
+  const open = raw.indexOf('<');
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < raw.length; i++) {
+    if (raw[i] === '<') depth++;
+    else if (raw[i] === '>' && --depth === 0) return splitTopLevel(raw.slice(open + 1, i)).map((a) => a.trim());
+  }
+  return null;
+}
+
 /** C and C++ declare the names a C++ file can see (a header may be either). */
 function isCFamily(n: Node): boolean {
   return n.language === 'cpp' || n.language === 'c';
