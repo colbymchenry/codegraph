@@ -53,6 +53,32 @@ type Exact interface{ int64 }
 
 type Dur int
 
+// Aliases (`=`): the types they name are references; a literal makes a struct or interface.
+type Alias = pkga.Widget
+
+type (
+	LocalAlias = Widget
+	PtrAlias   = *Stack[int]
+	FnAlias    = func(w Widget) error
+	MapAlias   = map[string][]pkga.Item
+	Defined    Widget
+)
+
+type AnonAlias = struct {
+	*Base
+	n int
+}
+
+type IfaceAlias = interface {
+	Render() string
+}
+
+type WordAlias = uint
+
+func useAlias(a *Alias) LocalAlias {
+	return LocalAlias{}
+}
+
 func NewRegistry() *Registry {
 	w := Widget{name: "w"}
 	q := pkga.Widget{}

@@ -420,7 +420,7 @@ impl<'t> Walker<'t> {
         } else if kind == "method_declaration" {
             self.extract_method(node);
             skip_children = true;
-        } else if kind == "type_spec" {
+        } else if kind == "type_spec" || kind == "type_alias" {
             skip_children = self.extract_type_alias(node);
         } else if matches!(kind, "var_declaration" | "short_var_declaration" | "const_declaration")
             && !self.inside_class_like()
@@ -554,7 +554,8 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractTypeAlias for Go: type_spec → struct / interface / plain alias.
+    /// extractTypeAlias for Go: type_spec (`type A B`) and type_alias
+    /// (`type A = B`) → struct / interface / plain alias.
     fn extract_type_alias(&mut self, node: Node<'t>) -> bool {
         stack_guard!();
         let name = self.extract_name(node);
@@ -607,14 +608,22 @@ impl<'t> Walker<'t> {
             return true;
         }
 
-        self.create_node(
+        let row = self.create_node(
             "type_alias",
             &name,
             node,
             Extra { docstring, is_exported, ..Extra::default() },
         );
-        // (go type_spec has no `value` field — no type-ref walk; TS/tsx member
-        // extraction is TS-family-only)
+        // (go has no `value` field — no TS-style type-ref walk or member
+        // extraction.) An alias references what its `type` field names; a
+        // defined type (`type_spec`) declares a type of its own.
+        if let Some(row) = row {
+            let references = edge_kind_index("references").unwrap();
+            for ty in self.alias_type_names(node) {
+                let text = self.text(ty).to_string();
+                self.push_ref_at(row, &text, references, ty);
+            }
+        }
         false
     }
 
@@ -885,6 +894,47 @@ impl<'t> Walker<'t> {
             "qualified_type" => ty.child_by_field_name("name"),
             "type_identifier" if !is_go_predeclared_type(self.text(ty)) => Some(ty),
             _ => None,
+        }
+    }
+
+    /// goAliasTypeNames (languages/go.ts): the name nodes of the types an
+    /// alias's `type` field names, in source order, but its own type
+    /// parameters and the predeclared types. Only a `type_alias` is one here:
+    /// a generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
+    /// around an error, never reaches the kernel (its file defers to wasm).
+    fn alias_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
+        let mut names = Vec::new();
+        if node.kind() != "type_alias" {
+            return names;
+        }
+        let Some(ty) = node.child_by_field_name("type") else { return names };
+        let mut params: HashSet<&str> = HashSet::new();
+        if let Some(list) = node.child_by_field_name("type_parameters") {
+            for decl in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
+                for c in (0..decl.named_child_count()).filter_map(|j| decl.named_child(j)) {
+                    if c.kind() == "identifier" {
+                        params.insert(self.text(c));
+                    }
+                }
+            }
+        }
+        self.collect_alias_type_names(ty, &params, &mut names);
+        names
+    }
+
+    fn collect_alias_type_names(&self, node: Node<'t>, params: &HashSet<&str>, out: &mut Vec<Node<'t>>) {
+        stack_guard!();
+        if node.kind() == "type_identifier" {
+            let text = self.text(node);
+            if !params.contains(text) && !is_go_predeclared_type(text) {
+                out.push(node);
+            }
+            return;
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                self.collect_alias_type_names(c, params, out);
+            }
         }
     }
 
