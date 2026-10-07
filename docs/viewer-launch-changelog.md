@@ -143,6 +143,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **React Router apps that keep their routes in a table get a Screens picture.** The ASP.NET Core React template's `AppRoutes` array, a `routes` array handed to `useRoutes` or `createBrowserRouter` from another file, and admin kits' `[MainRoutes, LoginRoutes]` route objects drew no screens, because their routes were never read. They are now, with the links and `navigate(…)` calls between them. A parent route object's component is drawn as the layout around the screens inside it: its own links count from each of those screens, and when an `index: true` child claims its address, that child is the screen there. Re-index React projects after upgrading.
 
+- **A React Router layout written as JSX is drawn around every screen inside it.** In `<Route path="/" element={<Layout />}><Route index element={<Home />} />…</Route>`, the screen at `/` is Home rather than Layout, and the links in Layout's header count from each screen nested in it instead of only from `/`. A guard with no path of its own, like `<Route element={<PrivateRoute />}>`, does the same for its redirect to the login page. Re-index React projects after upgrading.
+
 ## Fixes — Steps — what a call does, and when
 
 - **A Steps picture with nothing past its anchor says why.** Starting Steps from a helper that only computes drew one box and no explanation. The panel now says that nothing it sets in motion is a step the picture draws, explains that calls between plain functions fold into the lines, and links to the symbol's callers and callees.
