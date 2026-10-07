@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-06) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-07) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -38,7 +38,7 @@ guessed.
 |---|---|---|---|---|
 | Expo Router | `frameworks/expo-router.ts` | `expo-router-synthesizer.ts` | `expo-router.test.ts` | — |
 | Next.js | `frameworks/nextjs.ts` | `next-router-synthesizer.ts` | `nextjs.test.ts` | next-saas-starter |
-| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page) |
+| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page). JSX index routes and layouts (trap 14): proshop-v2's `createRoutesFromElements` (`/` is HomeScreen inside App, not App; 30 layout edges, the `path=''` guards included; Screens 30 → 74 transitions, the guards' redirects drawn from the screens they guard), chickadeeinvest's table inside `<Route element={<DashboardLayout/>}>` (its 4 routes get the layout), React Router 6.29's own examples and tests, refine's 281 examples (one `/` per app, 191 layout edges, 21 new navigations), crwn-clothing, the vanlife course app, volun-mern (105 layout edges, six levels deep), spotify/vispana, react_persist_login, chushi (`path={"agents"}`: 2 → 6 routes), hathor-explorer (`path=""` at the root), cboard, react-router-auth-v6: 578 of 581 new layout edges name a component of an enclosing `<Route>` (vanlife's 3 inherit a default-import resolution bug that already misbinds its pages), 27 of 27 new navigations precise, no navigation lost, 16 control repos byte-identical |
 | TanStack Router | `frameworks/tanstack-router.ts` | `tanstack-router-synthesizer.ts` | `tanstack-router.test.ts` | TanStack examples, fastapi-template frontend |
 | Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies |
 | SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
@@ -283,7 +283,30 @@ Each of these cost real debugging time; they are not hypothetical.
    itself mounted under another file's `<Route path="/admin/*">` reads as if
    at the root, and a navigation that failed while its route was gone is not
    retried until a full index.
-14. **`resolve()` sees only references written in the framework's own
+14. **An index route is at its parent's address, so it needs that address
+   written down.** `<Route index element={<Home />} />` inside `<Route
+   path="/" element={<Layout />}>` is the page at `/`, and Layout is the
+   layout of every route nested in it (trap 2: emitting Layout as a second
+   `/` page drew the app's chrome as the home screen and its header's links
+   from `/` alone). A `<Route path>` with no element only groups its children
+   and yields its address the same way. But a `<Routes>` inside a component
+   is mounted wherever another file's `<Route path="shop/*" element={<Shop
+   />}>` puts it: read as `/`, crwn-clothing's `Shop` index made a second
+   home page. So an index route at the top of a `<Routes>` is read only
+   inside the router itself (`createRoutesFromElements(…)`, `<BrowserRouter>`),
+   and one under a path the file does not spell out (`path={paths.agents}`)
+   not at all; `path={"agents"}` is spelled out. Reading what an element
+   renders has three traps of its own: skip elements written in an attribute
+   unless the attribute hands over a page (`component`, `element`, `page`) —
+   `<Suspense fallback={<Loader />}>` bound fifteen routes of one app to the
+   spinner; trim the line break Prettier writes after `element={`, which hid
+   every long element; and read `<Outlet />` as rendering nothing of its own.
+   Version 5's `<Route path="" component={NotFound} />` is a catch-all, not
+   the page at its parent's address. A table written in another file and
+   mapped inside a `<Route element>` gets no layout edge: the layout's name
+   would be looked up in the table's file, and the cross-file pass compares
+   only route names, so a changed layout would never reach the table's routes.
+15. **`resolve()` sees only references written in the framework's own
    languages** (`getResolvingFrameworks`): Express's `logger` middleware rule
    once took etcd's Go `*zap.Logger` result types for a method. A navigation
    written in markup (`.svelte`, `.vue`) needs that language in `languages`.

@@ -31,6 +31,7 @@ import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRea
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
+import { clearCppIncluderMemos } from './cpp-includers';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
@@ -547,6 +548,7 @@ export class ReferenceResolver {
       clearDartLocalScopeMemos(this.context);
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
+      clearCppIncluderMemos(this.context);
     }
   }
 
@@ -977,6 +979,8 @@ export class ReferenceResolver {
       getCppIncludeDirs: () => {
         return loadCppIncludeDirs(this.projectRoot);
       },
+
+      getCppIncludeNodes: () => this.queries.getCppIncludeNodes(),
     };
   }
 
