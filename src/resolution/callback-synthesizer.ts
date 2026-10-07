@@ -803,12 +803,23 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'arkts',
 ]);
 /**
+ * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
+ * declared, never synthesized (go-implements writes those), into a struct, an
+ * interface or a defined type, and out of an interface only into an interface.
+ * `kindOf` answers those three kinds for a Go node id, null for anything else.
+ */
+function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolean {
+  if (e.provenance === 'heuristic') return false;
+  const to = kindOf(e.target);
+  return to !== null && (kindOf(e.source) !== 'interface' || to === 'interface');
+}
+/**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
  * struct satisfies an interface structurally when its method set covers the
  * interface's. Synthesize the missing `implements` edge (struct → interface) by
  * matching method-NAME sets, so impl-navigation works and the interface-dispatch
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
- * method call to the concrete overrides.
+ * method call to the concrete overrides, and to the methods embedding promotes.
  *
  * Both method sets include what embedding brings in, read off the declared
  * `extends`/`implements` edge each embedded type is. An interface has the
@@ -881,9 +892,7 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   // The types one embeds: an interface embeds interfaces, a struct any of the
   // three. Every struct's and interface's are read up front in a few batched
   // queries rather than one query per type; a defined type's, when reached.
-  const isEmbedding = (e: Edge): boolean =>
-    e.provenance !== 'heuristic' &&
-    (typeKind.get(e.source) === 'interface' ? kindOf(e.target) === 'interface' : kindOf(e.target) !== null);
+  const isEmbedding = (e: Edge): boolean => isGoEmbedding(e, kindOf);
   const NO_EMBEDS: string[] = [];
   const embedMemo = new Map<string, string[]>();
   const typeIds = [...typeKind.keys()];
@@ -1121,6 +1130,118 @@ async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYiel
   return edges;
 }
 
+/** The methods a Go struct runs for a name it does not declare, and the line of the embedding they come through. */
+interface GoPromotion {
+  methods: Node[];
+  line: number;
+}
+
+/**
+ * Which embedded type's method a Go struct runs for a name it does not
+ * declare, picked the way Go's selector picks it: breadth-first through the
+ * struct's embeddings, the shallowest depth holding the name wins, and the
+ * name selects nothing when it occurs more than once at that depth, one type
+ * reached along two paths included. A type met at a shallower depth is not
+ * walked again. An embedded interface brings its whole method set at its own
+ * depth, and a method it provides is a dynamic call once more, so that is no
+ * promotion either. Struct fields are not in the graph: a field that hides a
+ * promoted method is not seen.
+ */
+function goPromotions(
+  queries: QueryBuilder,
+  methodsOf: (id: string) => Node[]
+): (structId: string, name: string) => GoPromotion | null {
+  const kinds = new Map<string, NodeKind | null>();
+  const kindOf = (id: string): NodeKind | null => {
+    let kind = kinds.get(id);
+    if (kind === undefined) {
+      const n = queries.getNodeById(id);
+      kind = n?.language === 'go' && (n.kind === 'struct' || n.kind === 'interface' || n.kind === 'type_alias')
+        ? n.kind
+        : null;
+      kinds.set(id, kind);
+    }
+    return kind;
+  };
+  const embedMemo = new Map<string, Edge[]>();
+  const embeds = (id: string): Edge[] => {
+    let out = embedMemo.get(id);
+    if (!out) {
+      const targets = new Set<string>();
+      out = queries.getOutgoingEdges(id, ['extends', 'implements']).filter((e) => {
+        if (!isGoEmbedding(e, kindOf) || targets.has(e.target)) return false;
+        targets.add(e.target);
+        return true;
+      });
+      embedMemo.set(id, out);
+    }
+    return out;
+  };
+  const ifaceMemo = new Map<string, Set<string>>();
+  const ifaceMethods = (id: string): Set<string> => {
+    let names = ifaceMemo.get(id);
+    if (!names) {
+      names = new Set<string>();
+      const reached = new Set<string>([id]);
+      const pending = [id];
+      while (pending.length > 0) {
+        const at = pending.pop()!;
+        for (const m of methodsOf(at)) names.add(m.name);
+        for (const e of embeds(at)) {
+          if (reached.has(e.target)) continue;
+          reached.add(e.target);
+          pending.push(e.target);
+        }
+      }
+      ifaceMemo.set(id, names);
+    }
+    return names;
+  };
+  const provides = (id: string, name: string): boolean =>
+    kindOf(id) === 'interface' ? ifaceMethods(id).has(name) : methodsOf(id).some((m) => m.name === name);
+
+  const memo = new Map<string, GoPromotion | null>();
+  return (structId, name) => {
+    const key = `${structId}>${name}`;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    let found: GoPromotion | null = null;
+    // Each type at the current depth, with how many paths reach it and the
+    // line of the struct's own embedding the first of them starts with.
+    let level = new Map<string, { paths: number; line: number }>([[structId, { paths: 1, line: 0 }]]);
+    const met = new Set<string>([structId]);
+    for (let depth = 0; level.size > 0; depth++) {
+      const next = new Map<string, { paths: number; line: number }>();
+      for (const [id, at] of level) {
+        if (kindOf(id) === 'interface') continue; // its embeddings are its method set
+        for (const e of embeds(id)) {
+          if (met.has(e.target)) continue;
+          const to = next.get(e.target);
+          if (to) to.paths += at.paths;
+          else next.set(e.target, { paths: at.paths, line: depth === 0 ? (e.line ?? 0) : at.line });
+        }
+      }
+      let paths = 0;
+      let provider: string | undefined;
+      for (const [id, at] of next) {
+        met.add(id);
+        if (!provides(id, name)) continue;
+        paths += at.paths;
+        provider = id;
+      }
+      if (provider !== undefined) {
+        if (paths === 1 && kindOf(provider) !== 'interface') {
+          found = { methods: methodsOf(provider).filter((m) => m.name === name), line: next.get(provider)!.line };
+        }
+        break;
+      }
+      level = next;
+    }
+    memo.set(key, found);
+    return found;
+  };
+}
+
 async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
@@ -1158,6 +1279,14 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     protocolMemo.set(base.id, methods);
     return methods;
   };
+  // A Go struct also satisfies an interface with the methods its embedded
+  // types promote into it (goImplementsEdges counts them), and a call through
+  // the interface then runs the embedded type's method. Those links are made
+  // after the loop, from what the struct's cap has left, so every override
+  // keeps its edge, and a provider that implements the interface itself keeps
+  // its own.
+  const goPromotion = goPromotions(queries, methodsOf);
+  const promoted: { cls: Node; methods: Node[]; left: number }[] = [];
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
   // types that conform to protocols. Iterate both.
@@ -1171,10 +1300,15 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     const sups = queries.getOutgoingEdges(cls.id, ['implements', 'extends']);
     if (sups.length === 0) continue;
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
-    if (implMethods.length === 0) continue;
+    // A Go struct that satisfies an interface (a synthesized edge) may do so
+    // with promoted methods alone. Its declared `implements` edges are the
+    // interfaces it embeds, which provide whatever it lacks themselves.
+    const goStruct = cls.language === 'go' && cls.kind === 'struct';
+    if (implMethods.length === 0 && !(goStruct && sups.some((s) => s.provenance === 'heuristic'))) continue;
     for (const sup of sups) {
       const base = queries.getNodeById(sup.target);
       if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
+      const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
       // link every base overload → every same-name impl overload (keying by name
@@ -1185,9 +1319,15 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         if (arr) arr.push(m); else implByName.set(m.name, [m]);
       }
       let added = 0;
+      const unmatched: Node[] = [];
       for (const bm of baseMethodsOf(base)) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-        for (const m of implByName.get(bm.name) ?? []) {
+        const impls = implByName.get(bm.name);
+        if (!impls) {
+          if (promotes) unmatched.push(bm);
+          continue;
+        }
+        for (const m of impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
           const key = `${bm.id}>${m.id}`;
@@ -1204,8 +1344,42 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
           added++;
         }
       }
+      if (unmatched.length > 0 && added < MAX_CALLBACKS_PER_CHANNEL) {
+        promoted.push({ cls, methods: unmatched, left: MAX_CALLBACKS_PER_CHANNEL - added });
+      }
     }
   }
+  }
+  // The wiring site of a promoted method is the struct's embedding it comes
+  // through: `type blockSeriesSet struct{ blockBaseSeriesSet }`.
+  for (const { cls, methods, left } of promoted) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    let budget = left;
+    for (const bm of methods) {
+      if (budget <= 0) break;
+      const promotion = goPromotion(cls.id, bm.name);
+      if (!promotion) continue;
+      for (const m of promotion.methods) {
+        if (budget <= 0) break;
+        const key = `${bm.id}>${m.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: bm.id,
+          target: m.id,
+          kind: 'calls',
+          line: bm.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'interface-impl',
+            via: m.name,
+            promotedInto: cls.name,
+            registeredAt: `${cls.filePath}:${promotion.line || cls.startLine}`,
+          },
+        });
+        budget--;
+      }
+    }
   }
   return edges;
 }
