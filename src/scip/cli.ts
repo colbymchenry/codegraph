@@ -1,5 +1,5 @@
 /**
- * `codegraph scip …` subcommands (fork).
+ * `codegraph scip …` subcommands.
  *
  *   scip index  [path] [--lang <l>] [--force]   run the indexer(s) on PATH, then merge
  *   scip import <file> [path] [--lang <l>]      install an index built elsewhere, then merge

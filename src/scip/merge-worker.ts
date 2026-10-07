@@ -13,7 +13,7 @@ import { MergeScope, runScipPass } from './index';
 const { dbPath, projectRoot, scope } = workerData as { dbPath: string; projectRoot: string; scope?: MergeScope };
 const { db } = createDatabase(dbPath);
 try {
-  // As upstream's connections are configured (db/index.ts configureConnection), less what only a reader needs.
+  // As codegraph's own connections are configured (db/index.ts configureConnection), less what only a reader needs.
   db.pragma('busy_timeout = 5000');
   db.pragma('foreign_keys = ON');
   db.pragma('synchronous = NORMAL');

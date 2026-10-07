@@ -27,7 +27,7 @@ import type { ReferenceSites } from './sites';
 import { callShape, isCallTarget, siteKind } from './syntax';
 
 /**
- * A fork-private occurrence role: a reference this compaction counted as a call
+ * A codegraph-private occurrence role (not in the SCIP spec): a reference this compaction counted as a call
  * (resolvedCalls). Kept in the compact index so a patch can count the calls of
  * the documents it keeps without re-reading their files (addCompacted). Beyond
  * SCIP's own roles (≤ 0x40); the merge reads only ROLE_DEFINITION.

@@ -1,8 +1,8 @@
 /**
- * How an edge's SCIP standing reads in MCP answers (fork).
+ * How an edge's SCIP standing reads in MCP answers.
  *
  * Only edges in files a SCIP index covers carry a verdict; everything else
- * renders exactly as upstream.
+ * renders exactly as it does without SCIP.
  */
 
 import type { Edge } from '../types';

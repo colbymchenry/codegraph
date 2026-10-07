@@ -1,5 +1,5 @@
 /**
- * SCIP (compiler-grade) edges for codegraph — fork-only.
+ * SCIP (compiler-grade) edges for codegraph.
  *
  * Entry points:
  * - {@link runScipPass}: merge every installed index into the graph (after a

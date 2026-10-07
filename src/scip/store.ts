@@ -16,8 +16,8 @@
  * `scip_documents` records which documents are currently merged into the graph,
  * and `scip_merges` which installed index (by `producedAt`) they came from —
  * written in the merge's own transaction, so the stamp can't disagree with the
- * edges. Both are created lazily and sit outside the upstream migration chain, so an
- * upstream rebase never collides with them.
+ * edges. Both are created lazily, outside `src/db/migrations.ts`, so a project
+ * that never runs SCIP never gets them.
  */
 
 import * as fs from 'fs';
@@ -190,7 +190,7 @@ export function installIndex(projectRoot: string, lang: ScipLanguage, write: (fi
   writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
 }
 
-/** Read-only: false when the fork's tables don't exist yet (callers may not hold the write lock). */
+/** Read-only: false when the SCIP tables don't exist yet (callers may not hold the write lock). */
 function hasTable(db: SqliteDatabase, name: string): boolean {
   return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
@@ -307,7 +307,7 @@ export function verifiedEdge(alias?: string): string {
 }
 
 /**
- * The fork's own tables and indexes, outside upstream's migrations. The partial
+ * The SCIP tables and indexes, created here rather than in `src/db/migrations.ts`. The partial
  * index keeps counting unverified edges off a full scan of `edges` (Django: 511 → 2 ms).
  */
 function ensureScipSchema(db: SqliteDatabase): void {

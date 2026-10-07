@@ -42,7 +42,7 @@ export interface IndexerRun {
 }
 
 /**
- * Prefix of a stderr line in which an indexer the fork ships (tsgo-index)
+ * Prefix of a stderr line in which an indexer codegraph ships (tsgo-index)
  * reports a part it skipped; a successful run's such lines become warnings.
  */
 export const RUN_WARNING = 'codegraph-scip warning: ';
@@ -67,7 +67,7 @@ interface Invocation {
   referenceSites?: string;
 }
 
-/** Everything the fork knows about one language — the single place to add or change one. */
+/** Everything the SCIP pass knows about one language — the single place to add or change one. */
 export interface IndexerSpec {
   lang: ScipLanguage;
   /** `ToolInfo.name` in the indexes this language's indexers write (tells `scip import` the language) */

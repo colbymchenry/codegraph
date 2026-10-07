@@ -2,7 +2,7 @@
  * Minimal SCIP index reader.
  *
  * Decodes only the fields the SCIP merge uses, straight from the protobuf wire
- * format, so the fork ships no protobuf runtime or generated code. Field numbers
+ * format, so codegraph ships no protobuf runtime or generated code. Field numbers
  * follow https://github.com/sourcegraph/scip/blob/main/scip.proto — both the
  * deprecated `repeated int32` range and the typed `SingleLineRange` /
  * `MultiLineRange` replacements are accepted (typed wins when both are set).
