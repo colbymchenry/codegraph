@@ -30,7 +30,7 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
-import { importPathKeys } from './db/reference-tail';
+import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -984,12 +984,17 @@ export class CodeGraph {
             // Look them up by the symbol names the changed files now carry
             // and re-resolve just that set. The names include each file's
             // own, which a reference written as a path
-            // (`snippets/price.liquid`) waits under. On a sync where no failed
-            // ref matches, this is one indexed lookup.
+            // (`snippets/price.liquid`) waits under, and the keys a route's
+            // lazily loaded module waits under (`module:Team` for
+            // `lazy-import:./pages/Team`): a route renders the component its
+            // module exports, so an edit can satisfy it as well as an added
+            // file. On a sync where no failed ref matches, this is one
+            // indexed lookup.
             const tRetry = Date.now();
-            const retryable = this.queries.getRetryableFailedReferences(
-              this.queries.getNodeNamesByFiles(result.changedFilePaths)
-            );
+            const retryable = this.queries.getRetryableFailedReferences([...new Set([
+              ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
+              ...result.changedFilePaths.flatMap(moduleReferenceKeys),
+            ])]);
             // A failed import waits for a file, a folder or a namespace, not a
             // symbol: `package:app/b.dart` for a file named `b.dart`, `./ui`
             // for `ui/index.ts`, `using Foo.Bar` for that namespace's node.
@@ -1004,6 +1009,11 @@ export class CodeGraph {
             for (const ref of importRetry) {
               if (!retryRows.has(ref.rowId)) retryable.push(ref);
             }
+            // In row order, as a full index resolves them: when two refs make
+            // the same edge, such as a route's lazily loaded class that its
+            // layout also renders, the one written first names it, as it
+            // does in a fresh index.
+            retryable.sort((a, b) => (a.rowId ?? 0) - (b.rowId ?? 0));
             if (retryable.length > 0) {
               options.onProgress?.({
                 phase: 'resolving',

@@ -10,7 +10,7 @@ import { referenceNameTail } from './reference-tail';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 /**
  * Migration definition
@@ -252,6 +252,34 @@ const migrations: Migration[] = [
         .all() as Array<{ id: number; reference_name: string; name_tail: string }>;
       for (const row of rows) {
         const tail = referenceNameTail(row.reference_name, 'references');
+        if (tail !== row.name_tail) update.run(tail, row.id);
+      }
+    },
+  },
+  {
+    version: 14,
+    description: 'Retry a failed route module reference when sync adds or changes its file: module tails',
+    up: (db) => {
+      // A route's reference to the module it lazily loads, parked before this
+      // version — React Router's `lazy-import:./pages/Team`, Vue Router's and
+      // Angular's `import:./home/home.component#HomeComponent`, each also
+      // behind `layout:` — carries a fragment of its path as its tail
+      // ('/pages/Team', 'component#HomeComponent'), which no file's keys
+      // match. Rewrite it to the module tail it is parked under now.
+      // Idempotent: a rewritten tail rewrites to itself.
+      //
+      // Each prefix is a range of idx_unresolved_name. The `+` keeps the
+      // planner off idx_unresolved_status, which it otherwise picks although
+      // 'failed' is nearly every row: on vscode's index that read 830K rows,
+      // about a second, to select none.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare(`SELECT id, reference_name, reference_kind, name_tail FROM unresolved_refs
+          WHERE (reference_name GLOB 'lazy-import:*' OR reference_name GLOB 'import:*' OR reference_name GLOB 'layout:*')
+            AND +status = 'failed' AND +reference_kind IN ('references', 'calls')`)
+        .all() as Array<{ id: number; reference_name: string; reference_kind: string; name_tail: string }>;
+      for (const row of rows) {
+        const tail = referenceNameTail(row.reference_name, row.reference_kind);
         if (tail !== row.name_tail) update.run(tail, row.id);
       }
     },
