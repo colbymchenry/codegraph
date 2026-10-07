@@ -9184,6 +9184,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_QUALIFIERS.delete(context);
   GO_EMBEDS.delete(context);
+  GO_ALIAS_TARGETS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -10899,7 +10900,18 @@ function resolveGoMethodInPackage(
   const types = goPackageTypes(typeName, pkgDir, context);
   if (types.length === 0) return undefined;
   if (depth >= 4) return null;
+  let unplaced = 0;
   for (const t of types) {
+    // An alias is the type it names, and has that type's methods.
+    const aliased = goAliasTarget(t, context);
+    if (aliased !== undefined) {
+      const via = aliased && resolveMethodOnType(
+        aliased.name, methodName, ref, context, confidence, resolvedBy, aliased.pkgDir, depth + 1,
+      );
+      if (via) return via;
+      if (!aliased) unplaced++;
+      continue;
+    }
     for (const embedded of goEmbeddedTypes(t, context)) {
       const via = resolveMethodOnType(
         embedded.name, methodName, ref, context, confidence, resolvedBy, embedded.pkgDir, depth + 1,
@@ -10907,7 +10919,48 @@ function resolveGoMethodInPackage(
       if (via) return via;
     }
   }
-  return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // or of no named type declares nothing here: the method is looked up by name,
+  // as it was before aliases had nodes.
+  return unplaced === types.length ? undefined : null;
+}
+
+const GO_ALIAS_TARGETS = new WeakMap<ResolutionContext, Map<string, { name: string; pkgDir: string } | null | undefined>>();
+
+/**
+ * The type a Go alias names, with the directory of the package that declares
+ * it — `mvccpb.Event` for `type Event = mvccpb.Event`, `Local` for `type Ptr
+ * = *Local`, `List` for `type Items[T any] = List[T]` — read from the
+ * declaration, as an embedding is. Null for an alias of anything else: a type
+ * from outside the project's packages, a predeclared one, a `func(…)` or
+ * `map[…]…`. Undefined when the node is no alias: a struct, an interface, or a
+ * defined type (`type Dur int`), which declares a type of its own.
+ */
+function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: string; pkgDir: string } | null | undefined {
+  if (typeNode.kind !== 'type_alias') return undefined;
+  let memo = GO_ALIAS_TARGETS.get(context);
+  if (!memo) GO_ALIAS_TARGETS.set(context, (memo = new Map()));
+  if (memo.has(typeNode.id)) return memo.get(typeNode.id);
+  const lines = context.getFileLines?.(typeNode.filePath) ?? context.readFile(typeNode.filePath)?.split(/\r?\n/) ?? [];
+  // From the alias's name, where the node starts, to the end of its type.
+  const decl = lines
+    .slice(Math.max(0, typeNode.startLine - 1), typeNode.endLine ?? typeNode.startLine)
+    .map((l, i) => (i === 0 ? l.slice(typeNode.startColumn ?? 0) : l).replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+    .join(' ');
+  // `Name =` or `Name[T any] =`; a defined type has no `=` there.
+  const head = /^\s*[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*=/.exec(decl);
+  // `T`, `*T`, `pkg.T`, each perhaps with type arguments.
+  const m = head && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(decl.slice(head[0].length));
+  let target: { name: string; pkgDir: string } | null | undefined;
+  if (m) {
+    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+    const name = m[2] ?? m[1]!;
+    target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
+  } else {
+    target = head ? null : undefined;
+  }
+  memo.set(typeNode.id, target);
+  return target;
 }
 
 /** The declarations of Go type `typeName` in the package at directory `pkgDir`. */
