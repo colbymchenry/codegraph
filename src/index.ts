@@ -1652,6 +1652,24 @@ export class CodeGraph {
   }
 
   /**
+   * The names each of the given symbols refers to, by reference kind, where
+   * the resolver could not follow the reference — a decorator or an interface
+   * from outside the index, which leaves no edge. Ids with none are absent.
+   */
+  getUnresolvedReferenceNamesFrom(nodeIds: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, string[]> {
+    return this.queries.getUnresolvedReferenceNamesFrom(nodeIds, kinds);
+  }
+
+  /**
+   * Every symbol that refers to each of the given names, by reference kind,
+   * where the resolver could not follow it: for `implements`, every class that
+   * names a given interface from outside the index.
+   */
+  getUnresolvedReferenceSourcesNamed(names: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, Set<string>> {
+    return this.queries.getUnresolvedReferenceSourcesNamed(names, kinds);
+  }
+
+  /**
    * The symbols with the most distinct dependents, most first — the index's
    * hubs. Distinct dependents, not edges: a helper called forty times from one
    * function has one dependent, and it is dependents a blast radius grows from.
