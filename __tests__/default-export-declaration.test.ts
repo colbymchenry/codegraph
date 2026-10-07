@@ -98,6 +98,21 @@ export default class Store {
   }
 }
 `,
+  // A regex with a backtick inside a template literal's interpolation
+  // (outline's headingToSlug): a string masker loses step there and blanked
+  // the statement below it.
+  'src/slug.ts': `export function escapeHtml(text: string) {
+  return text
+}
+
+function safeSlugify(text: string) {
+  return \`h-\${escapeHtml(text).replace(/[\`]/g, "")}\`
+}
+
+export default function headingToSlug(text: string, index = 0) {
+  return index === 0 ? safeSlugify(text) : \`\${safeSlugify(text)}-\${index}\`
+}
+`,
   // A line break between the statement and the declaration it writes.
   'src/stream.js': `export function emit() {
   return 1
@@ -161,6 +176,7 @@ export default new Service()
 `,
   'src/use.tsx': `import handler from "./api/vans"
 import Store from "./store"
+import headingToSlug from "./slug"
 import stream from "./stream"
 import Title from "./components/Title"
 import Banner from "./components/Banner"
@@ -171,6 +187,7 @@ import service from "./service"
 export function consume() {
   handler({}, { json() {} })
   new Store().read()
+  headingToSlug("Vans")
   stream()
   Title()
   Banner()
@@ -228,9 +245,11 @@ describe('a default import of a module that exports something above its default'
     const targets = consumed();
     expect(targets).toContain('src/api/vans.ts:handler');
     expect(targets).toContain('src/store.ts:Store');
+    expect(targets).toContain('src/slug.ts:headingToSlug');
     expect(targets).toContain('src/stream.js:stream');
     expect(targets).not.toContain('src/api/vans.ts:listVans');
     expect(targets).not.toContain('src/store.ts:createStore');
+    expect(targets).not.toContain('src/slug.ts:escapeHtml');
     expect(targets).not.toContain('src/stream.js:emit');
   });
 

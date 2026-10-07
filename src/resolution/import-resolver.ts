@@ -11,7 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
-import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import {
@@ -129,9 +129,9 @@ const DEFAULT_BINDING_RE = /^([A-Za-z_$][\w$]*)\s*;?[ \t]*(?:\r?\n|$)/;
 
 /**
  * The value of the `export default` statement whose value starts at `at`, in
- * comment- and string-masked code: the name a declaration or a binding gives
- * it, `'anonymous'` for a function, class or arrow function without one, or
- * null for any other expression.
+ * comment-stripped code: the name a declaration or a binding gives it,
+ * `'anonymous'` for a function, class or arrow function without one, or null
+ * for any other expression.
  */
 function readDefaultExport(code: string, at: number): { name: string; nameAt: number; declared: boolean } | 'anonymous' | null {
   const rest = code.slice(at, at + 2048);
@@ -174,16 +174,19 @@ function readDefaultExport(code: string, at: number): { name: string; nameAt: nu
  *   exported too) would be the wrong one.
  * Anything else — an expression (`memo(Card)`, `new Service()`, `{ … }`), a
  * binding the file doesn't declare, no statement at all, a non-JS file — is
- * `'unstated'`. Comments and strings are masked first, so a template that
- * writes `export default function X` is not a statement; of several
- * statements (JSX text is not masked), one naming a node of the file wins.
+ * `'unstated'`. Comments are stripped first. Strings are not masked: a
+ * template whose `${…}` holds another template, or a regex with a backtick,
+ * sets a masker out of step, and it blanked the real statement after it
+ * (outline's 2,900-line styled-components `Styles.ts`). A statement must
+ * name a node of the file instead — one a template only writes as text
+ * names none — and of several statements, one that does wins.
  */
 function statedDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): StatedDefault {
   if (idx.statedDefault !== undefined) return idx.statedDefault;
   let stated: StatedDefault | undefined;
   const source = JS_FAMILY_FILE.test(filePath) ? context.readFile(filePath) : null;
   if (source && /\bexport\s+default\b/.test(source)) {
-    const code = blankStringContents(stripCommentsForRegex(source, 'typescript'));
+    const code = stripCommentsForRegex(source, 'typescript');
     const lineAt = makeLineAt(code, 1);
     EXPORT_DEFAULT_HEAD.lastIndex = 0;
     for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
