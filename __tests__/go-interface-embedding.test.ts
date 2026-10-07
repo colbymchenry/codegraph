@@ -372,8 +372,11 @@ describe('the type hierarchy of an indexed Go module', () => {
       one('Expr', 'parser/ast.go'),
       one('exprWrapper', 'parser/ast.go'),
     ];
+    // Declared edges only: Store also satisfies other.Closer with the Close
+    // that storage.Base promotes, which go-implements synthesizes from names.
     const supertypes = graph
       .getOutgoingEdgesFrom(sources.map((n) => n.id), ['extends', 'implements'])
+      .filter((e) => e.provenance !== 'heuristic')
       .map((e) => `${graph.getNode(e.source)?.name} ${e.kind} ${where(graph.getNode(e.target))}`)
       .sort();
     // An embedded interface of a struct resolves as `implements`; one of an
