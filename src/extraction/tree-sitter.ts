@@ -3874,8 +3874,9 @@ export class TreeSitterExtractor {
           this.extractTsTupleContractNames(value, typeAliasNode);
         }
       } else if (this.language === 'go') {
-        // Go's `type Event = mvccpb.Event` names its type in the `type` field.
-        for (const type of goAliasTypeNames(node, this.source) ?? []) {
+        // Go's `type Event = mvccpb.Event` names its type in the `type` field,
+        // and so does a defined type, `type WatchChan <-chan WatchResponse`.
+        for (const type of goAliasTypeNames(node, this.source)) {
           this.unresolvedReferences.push({
             fromNodeId: typeAliasNode.id,
             referenceName: getNodeText(type, this.source),

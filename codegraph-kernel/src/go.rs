@@ -615,8 +615,8 @@ impl<'t> Walker<'t> {
             Extra { docstring, is_exported, ..Extra::default() },
         );
         // (go has no `value` field — no TS-style type-ref walk or member
-        // extraction.) An alias references what its `type` field names; a
-        // defined type (`type_spec`) declares a type of its own.
+        // extraction.) An alias and a defined type (`type_spec`) alike
+        // reference what their `type` field names.
         if let Some(row) = row {
             let references = edge_kind_index("references").unwrap();
             for ty in self.alias_type_names(node) {
@@ -898,16 +898,15 @@ impl<'t> Walker<'t> {
     }
 
     /// goAliasTypeNames (languages/go.ts): the name nodes of the types an
-    /// alias's `type` field names, in source order, but its own type
-    /// parameters and the predeclared types. Only a `type_alias` is one here:
-    /// a generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
+    /// alias's or a defined type's `type` field names, in source order, but
+    /// its own type parameters, the predeclared types and its own name written
+    /// bare (a recursive type's, `type stateFn func(*Lexer) stateFn`). A
+    /// generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
     /// around an error, never reaches the kernel (its file defers to wasm).
     fn alias_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
         let mut names = Vec::new();
-        if node.kind() != "type_alias" {
-            return names;
-        }
         let Some(ty) = node.child_by_field_name("type") else { return names };
+        let own = node.child_by_field_name("name").map(|n| self.text(n));
         let mut params: HashSet<&str> = HashSet::new();
         if let Some(list) = node.child_by_field_name("type_parameters") {
             for decl in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
@@ -918,22 +917,32 @@ impl<'t> Walker<'t> {
                 }
             }
         }
-        self.collect_alias_type_names(ty, &params, &mut names);
+        self.collect_alias_type_names(ty, &params, own, false, &mut names);
         names
     }
 
-    fn collect_alias_type_names(&self, node: Node<'t>, params: &HashSet<&str>, out: &mut Vec<Node<'t>>) {
+    /// `qualified`: the name of a `pkg.Name`, which is that package's
+    /// whatever this one declares.
+    fn collect_alias_type_names(
+        &self,
+        node: Node<'t>,
+        params: &HashSet<&str>,
+        own: Option<&str>,
+        qualified: bool,
+        out: &mut Vec<Node<'t>>,
+    ) {
         stack_guard!();
         if node.kind() == "type_identifier" {
             let text = self.text(node);
-            if !params.contains(text) && !is_go_predeclared_type(text) {
+            if !is_go_predeclared_type(text) && (qualified || (!params.contains(text) && own != Some(text))) {
                 out.push(node);
             }
             return;
         }
+        let qualified = node.kind() == "qualified_type";
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.collect_alias_type_names(c, params, out);
+                self.collect_alias_type_names(c, params, own, qualified, out);
             }
         }
     }

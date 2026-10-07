@@ -75,6 +75,29 @@ type IfaceAlias = interface {
 
 type WordAlias = uint
 
+// Defined types reference what they are defined from, but their own type
+// parameters, predeclared types and their own name written bare.
+type HandlerFunc func(*Widget, pkga.Item) error
+
+type HandlersChain []HandlerFunc
+
+type WatchChan <-chan *Stack[int]
+
+type (
+	Lookup  map[Dur][]*pkga.Widget
+	Grid    [MAX_ITEMS]Widget
+	Wrapped (Widget)
+	Item    pkga.Item
+	Nested  map[string]struct {
+		w Widget
+		*Base
+	}
+)
+
+type Tree[T any] []*Tree[T]
+
+type stateFn func(*Widget) stateFn
+
 func useAlias(a *Alias) LocalAlias {
 	return LocalAlias{}
 }
