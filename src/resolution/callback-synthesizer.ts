@@ -828,7 +828,9 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * `type_alias` that owns them through `contains` edges. Go gives it none of
  * the methods declared on the type it is written over, so it is matched by
  * the methods it declares. A true alias (`type A = B`) is B, not a type of its
- * own, and is not extracted as one.
+ * own: its `type_alias` owns only methods written with it as the receiver
+ * (`func (c *KumaSDConfig) Name()`), which are B's, and stands in for B with
+ * those. One without any is no implementer.
  *
  * Both method sets include what embedding brings in, read off the declared
  * `extends`/`implements` edge each embedded type is. An interface has the
