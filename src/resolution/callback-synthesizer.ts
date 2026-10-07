@@ -39,7 +39,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
-import { crossesCodeBoundary } from './name-matcher';
+import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1499,6 +1499,12 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     for (const sup of sups) {
       const base = queries.getNodeById(sup.target);
       if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
+      // Go has no inheritance: a Go type's supertype edge to a struct or a
+      // defined type is an embedding (`type Engine struct { RouterGroup }`),
+      // and a call on the embedded type runs its own method, never the
+      // embedder's of the same name. Only a call through an interface
+      // dispatches.
+      if (cls.language === 'go' && base.kind !== 'interface') continue;
       const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
@@ -1768,13 +1774,61 @@ function jsxChild(
 }
 
 /**
+ * Whether the `<Name` at `at` opens a JSX tag. A type argument list follows
+ * its type's name directly — `useState<User>()`, `Array<Item>`, the
+ * `<Document>` of `<PaginatedList<Document>` — and a tag never does, short of
+ * a `return` written up against it. A generic arrow function's type
+ * parameters read like a tag but constrain theirs: `<Entry extends
+ * BaseEntity>({ data }) =>`.
+ */
+function opensTag(src: string, at: number, name: string): boolean {
+  const end = at + 1 + name.length;
+  if (/^\s+extends\s/.test(src.slice(end, end + 40))) return false;
+  return !/[\w$]/.test(src[at - 1] ?? '') || /\breturn$/.test(src.slice(Math.max(0, at - 7), at));
+}
+
+/**
+ * Whether `src` writes `name` other than in a tag (`<Name`, `</Name`): a
+ * parent binds a name only where it writes it bare (`const Content =`,
+ * `(Widget) =>`), so the check for that runs only on these.
+ */
+function writtenBare(src: string, name: string): boolean {
+  for (let at = src.indexOf(name); at !== -1; at = src.indexOf(name, at + name.length)) {
+    if (/[\w$]/.test(src[at - 1] ?? '') || /[\w$]/.test(src[at + name.length] ?? '')) continue;
+    if (src[at - 1] === '<' || (src[at - 1] === '/' && src[at - 2] === '<')) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * What a tag renders when its parent binds the name itself: a component the
+ * parent declares in its own lines (`const Row = ({ row }) => <tr />` in a
+ * table's body), else nothing. Any other local is no node, and a same-named
+ * component elsewhere is only a guess at what it holds.
+ */
+function declaredInside(ctx: ResolutionContext, name: string, parent: Node, child: Node): Node | undefined {
+  const inside = (n: Node) => n.id !== parent.id && n.filePath === parent.filePath &&
+    n.startLine >= parent.startLine && n.startLine <= parent.endLine;
+  if (inside(child)) return child;
+  return ctx.getNodesByName(name).find((n) => JSX_CHILD_KINDS.has(n.kind) && inside(n));
+}
+
+/**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
  * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
- * (read each JSX file once). Precision gate: the child name must resolve to a
- * component/function/class node — TS generics like `Array<Foo>` resolve to a type
- * (or nothing) and are dropped.
+ * (read each JSX file once). Precision gates: the parent must write the name as
+ * a tag, not only in a type argument or parameter list (`useState<User>()`,
+ * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
+ * read its `Document` model class as a child), and the name must resolve to a
+ * component/function/class node. A name the parent binds itself by its first
+ * tag — a parameter, or a `const` like outline's `const Content = variant ===
+ * "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent` — is that
+ * local, and renders only a component declared inside the parent
+ * (`declaredInside`). A destructured name still links by name, as a
+ * destructured function call does.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
@@ -1803,26 +1857,41 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
     // file is split once, not once per function.
     let lines: string[] | null = null;
-    const tagsBySpan = new Map<string, Set<string>>();
+    // Each name a span holds, and the line of its first tag: 0 while only type
+    // argument or parameter lists name it (`opensTag`). `bare` holds the
+    // names it also writes outside a tag (`writtenBare`).
+    const tagsBySpan = new Map<string, { tags: Map<string, number>; bare: Set<string> }>();
     for (const parent of parents) {
       if (!parent.startLine || !parent.endLine) continue;
       const span = `${parent.startLine}:${parent.endLine}`;
       let names = tagsBySpan.get(span);
       if (!names) {
-        names = new Set<string>();
+        names = { tags: new Map<string, number>(), bare: new Set<string>() };
         lines ??= content.split('\n');
         const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
         if (src.includes('</') || src.includes('/>')) {
+          let line = parent.startLine;
+          let counted = 0;
           JSX_TAG_RE.lastIndex = 0;
           let m: RegExpExecArray | null;
-          while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+          while ((m = JSX_TAG_RE.exec(src))) {
+            for (let nl = src.indexOf('\n', counted); nl !== -1 && nl < m.index; nl = src.indexOf('\n', nl + 1)) line++;
+            counted = m.index;
+            if (!names.tags.get(m[1]!)) names.tags.set(m[1]!, opensTag(src, m.index, m[1]!) ? line : 0);
+          }
+          for (const [name, first] of names.tags) if (first && writtenBare(src, name)) names.bare.add(name);
         }
         tagsBySpan.set(span, names);
       }
       let added = 0;
-      for (const name of names) {
+      for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = jsxChild(ctx, name, file, importsOf);
+        if (!line) continue;
+        let child = jsxChild(ctx, name, file, importsOf);
+        // A name the parent binds itself by its first tag is that local.
+        if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
+          child = declaredInside(ctx, name, parent, child);
+        }
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;
