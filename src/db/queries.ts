@@ -1333,14 +1333,18 @@ export class QueryBuilder {
    * order — the ORDER BY is total (`id` is unique), so this yields exactly the
    * nodes a caller filtering iterateNodesByKind by language would keep, in the
    * same sequence. A Go pass on a TypeScript monorepo otherwise materialized
-   * every method in the project to find a couple of Go ones.
+   * every method in the project to find a couple of Go ones. Several kinds
+   * come interleaved in that one order (the sort then holds only the rows
+   * the language filter keeps).
    */
-  *iterateNodesByKindIn(kind: NodeKind, languages: readonly string[]): IterableIterator<Node> {
-    if (languages.length === 0) return;
+  *iterateNodesByKindIn(kind: NodeKind | readonly NodeKind[], languages: readonly string[]): IterableIterator<Node> {
+    const kinds: readonly NodeKind[] = typeof kind === 'string' ? [kind] : kind;
+    if (kinds.length === 0 || languages.length === 0) return;
+    const kindTest = kinds.length === 1 ? 'kind = ?' : `kind IN (${kinds.map(() => '?').join(', ')})`;
     const stmt = this.db.prepare(
-      `SELECT * FROM nodes WHERE kind = ? AND language IN (${languages.map(() => '?').join(', ')}) ORDER BY file_path, start_line, id`
+      `SELECT * FROM nodes WHERE ${kindTest} AND language IN (${languages.map(() => '?').join(', ')}) ORDER BY file_path, start_line, id`
     );
-    for (const row of stmt.iterate(kind, ...languages)) {
+    for (const row of stmt.iterate(...kinds, ...languages)) {
       yield rowToNode(row as NodeRow);
     }
   }
