@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
+import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -2856,9 +2856,22 @@ function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { rec
   if (ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return null;
-  const text = lines.slice(ref.line - 1, ref.line + 7).join('\n').slice(Math.max(0, ref.column));
   const name = ref.referenceName.replace(/\$/g, '\\$');
-  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`).exec(text);
+  const call = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`);
+  // Search the ref's own line first: a minified bundle is one line, and
+  // joining it to the lines after it copied all of it for every call on it
+  // (about 1 MB a call on go-ethereum's graphiql.min.js). Every match starts
+  // with the name, so a match with no `name` before it on the line is where
+  // the joined lines match first too. Otherwise (no match, as for a call that
+  // continues on the next line, or the name earlier) the joined lines decide.
+  const span = lines.slice(ref.line - 1, ref.line + 7);
+  const from = Math.max(0, ref.column);
+  let text = span[0]?.slice(from) ?? '';
+  let at = call.exec(text);
+  if (!at || text.indexOf(ref.referenceName) < at.index) {
+    text = span.join('\n').slice(from);
+    at = call.exec(text);
+  }
   if (!at) return null;
   const before = text.slice(0, at.index).replace(/\s+$/, '');
   if (!/\??\.$/.test(before)) return null;
@@ -8815,11 +8828,39 @@ const CPP_NON_TYPE_TOKENS = new Set([
   'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
 ]);
 
+/**
+ * Does a `>` in a declared C++ type close no `<`? Then the type began on an
+ * earlier line — rocksdb's `std::unique_ptr<BlobContents>>>& blob_reqs` under
+ * `autovector<std::pair<BlobRangeReadRequest*,` — or the text is an
+ * expression (`i < a->b->c`).
+ */
+function cppTypeBeganAbove(typeName: string): boolean {
+  let depth = 0;
+  for (const c of typeName) {
+    if (c === '<') depth++;
+    else if (c === '>' && --depth < 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The last name of a declared C++ type: `const std::vector<std::pair<int,
+ * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
+ * names no type.
+ */
 function normalizeCppTypeName(typeName: string): string | null {
-  const normalized = typeName
-    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
-    .replace(/[&*]+/g, ' ')
-    .replace(/<[^>]*>/g, ' ')
+  // Without its head, what is left of a type begun above names a template
+  // argument's type, not the declared one.
+  if (cppTypeBeganAbove(typeName)) return null;
+  // Template arguments go with the ones nested in them. Cut at their first
+  // `>`, `Table<int, Box<int>>` was `Table >`, which names no type: a call
+  // on it never reached Table's method, and a capitalized name no class has
+  // ruled out any guess as well.
+  const normalized = stripCppTemplateArguments(
+    typeName
+      .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+      .replace(/[&*]+/g, ' '),
+  )
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -9082,6 +9123,10 @@ function inferCppReceiverType(
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
         noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
+      } else if (found && cppTypeBeganAbove(declaratorMatch[1] ?? '')) {
+        // The end of a declaration begun on an earlier line, maybe the
+        // receiver's: one found further up may be another variable.
+        found.shadowed = true;
       }
     } else if (found && cppRebindsReceiver(line, escapedReceiver)) {
       found.shadowed = true;
