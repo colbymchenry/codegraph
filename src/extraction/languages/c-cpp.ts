@@ -378,13 +378,366 @@ function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
  * declarations (`struct FOO var;`, `class FOO obj = …`) untouched, since those
  * end in `;` / `=` / `[`, never `:` / `{`. C++-only (wired into cppExtractor),
  * so C's heavier use of `struct TAG var;` never reaches it.
+ *
+ * The head may carry several macros, and a macro may take arguments: protobuf's
+ * generated `class PROTOBUF_EXPORT PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Any
+ * final : public Message`, `class ABSL_ATTRIBUTE_WARN_UNUSED
+ * PROTOBUF_DECLSPEC_EMPTY_BASES RepeatedField final`, rocksdb's `struct
+ * ALIGN_AS(64U) HandleImpl : public ClockHandle`. The whole run is blanked; the
+ * last name before the guard is the class. The name may be followed by template
+ * arguments, for a specialization (`class PROTOBUF_DECLSPEC_EMPTY_BASES
+ * RepeatedFieldProxyWithSet<ElementType, …> {`). Matched on the code alone, so
+ * a comment or string never takes part.
  */
+const CPP_CLASS_HEAD_MACROS_RE =
+  /\b(?:class|struct)\s+((?:[A-Z][A-Z0-9_]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s+)+)(?!final\b)[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*/g;
 export function blankCppExportMacros(source: string): string {
   if (source.indexOf('class') === -1 && source.indexOf('struct') === -1) return source;
-  return source.replace(
-    /\b(class|struct)(\s+)([A-Z][A-Z0-9_]+)(?=\s+[A-Za-z_]\w*(?:\s+final)?\s*[:{])/g,
-    (_m, kw, ws, macro) => kw + ws + ' '.repeat(macro.length)
-  );
+  if (!/\b(?:class|struct)\s+[A-Z][A-Z0-9_]/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_CLASS_HEAD_MACROS_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    let i = skipCppSpace(code, m.index + m[0].length);
+    if (code[i] === '<') {
+      i = skipCppAngleArgs(code, i);
+      if (i < 0) continue;
+      i = skipCppSpace(code, i);
+    }
+    if (/^final\b/.test(code.slice(i, i + 6))) i = skipCppSpace(code, i + 5);
+    if (code[i] !== '{' && !(code[i] === ':' && code[i + 1] !== ':')) continue;
+    const run = m[1] as string;
+    const start = m.index + m[0].indexOf(run);
+    pushCppRunTokens(spans, run, start);
+  }
+  return blankCppSpans(source, spans);
+}
+
+// Comments and string/char literals (raw strings are masked beforehand by
+// maskCppRawStrings). The char-literal boundary leaves digit separators alone.
+const CPP_COMMENT_OR_LITERAL_RE =
+  /\/\/(?:\\\r?\n|[^\r\n])*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g;
+
+/**
+ * The source with comments and string/char literals turned to spaces, line
+ * endings kept. The macro scans below match on this, so a word in a comment or
+ * a literal (`* NOTE: …` in a doc comment) is never blanked, and every offset
+ * still lines up with the source.
+ */
+function maskCppCommentsAndLiterals(source: string): string {
+  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, ' '));
+}
+
+/**
+ * The code the macro scans below match on, at the source's offsets: comments
+ * are spaces, a string or char literal keeps its place as `\x01`s (it is a
+ * token, not space: in `"… using " GTEST_NAME_` the macro does not start a
+ * line, and a run of macros never reaches across a literal), and
+ * preprocessor directives with their `\` continuation lines are spaces — the
+ * `)` ending `#if !defined(__MINGW32__)` closes no parameter list, so the
+ * `TEST(file_test, open_windows_file) {` under it is not a trailing macro.
+ */
+function maskCppCode(source: string): string {
+  return source
+    .replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, m.startsWith('/') ? ' ' : '\x01'))
+    .replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, ' '));
+}
+
+// One macro, with its arguments, inside a run matched on the masked code.
+const CPP_RUN_TOKEN_RE = /[A-Z][A-Z0-9_]*(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?/g;
+
+/** Add a span for each macro of `run` (found at `start`), leaving what lies between them. */
+function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: number): void {
+  for (const t of run.matchAll(CPP_RUN_TOKEN_RE)) spans.push([start + t.index, start + t.index + t[0].length]);
+}
+
+/** Replace each [start, end) span of `source` with spaces, keeping line endings. */
+function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>): string {
+  if (spans.length === 0) return source;
+  const chars = source.split('');
+  for (const [start, end] of spans) {
+    for (let k = start; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+  }
+  return chars.join('');
+}
+
+function skipCppSpace(code: string, i: number): number {
+  while (i < code.length && /\s/.test(code[i] as string)) i++;
+  return i;
+}
+
+/**
+ * The index just past the template argument list opening at `code[open]`
+ * (`<`), or -1 when it doesn't close before a `;`, `{` or `}` — then it was a
+ * comparison, not template arguments. Angle brackets inside parentheses don't
+ * count (`Foo<sizeof(a) < 4>`).
+ */
+function skipCppAngleArgs(code: string, open: number): number {
+  let angles = 0;
+  let parens = 0;
+  const limit = Math.min(code.length, open + 4000);
+  for (let i = open; i < limit; i++) {
+    const c = code[i];
+    if (c === '(') parens++;
+    else if (c === ')') {
+      if (--parens < 0) return -1;
+    } else if (c === ';' || c === '{' || c === '}') return -1;
+    else if (parens === 0 && c === '<') angles++;
+    else if (parens === 0 && c === '>' && code[i - 1] !== '-') {
+      if (--angles === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Blank attribute macros between a pointer or reference and the name it
+ * declares: protobuf's nullability annotations (`const Descriptor*
+ * PROTOBUF_NONNULL descriptor()`, `Any* PROTOBUF_RESTRICT PROTOBUF_NONNULL
+ * other`, `const FieldDescriptor* PROTOBUF_NULLABLE* PROTOBUF_NONNULL field`).
+ * tree-sitter takes the macro for the declared name and the real name for an
+ * error: a member keeps a broken declarator, an out-of-line definition gets the
+ * macro glued into its qualified name (`PROTOBUF_NONNULL Any::mutable_type_url`),
+ * and a definition whose parameter carries one (`void Any::Swap(Any*
+ * PROTOBUF_NONNULL other) { … }`) parses as a variable and drops out of the
+ * index. Generated `.pb.h`/`.pb.cc` files carry thousands of them.
+ *
+ * Matched on the code alone: the macro is ALL-CAPS with an underscore, right
+ * after `*` or `&`, and followed by the name (or, after `*`, by another `*`).
+ * C++ never puts two names in a row there, and a product (`a * MAX_LEN + 1`)
+ * or a bit test (`flags & FOO_BIT)`) is followed by an operator or a closer
+ * instead; a `*` after `)`, `]` or a number is a product too (`sizeof(int) *
+ * CHAR_BIT * 3`). A trailing macro with nothing after it (`Foo*
+ * PROTOBUF_NONNULL)`) parses as the parameter name and is left alone.
+ * C++-only.
+ */
+const CPP_POINTER_ANNOTATION_RE =
+  /([*&])\s*((?:[A-Z][A-Z0-9]*_[A-Z0-9_]*(?:\s+|(?=\*)))+)(?=\*|::|(?!(?:and|and_eq|bitand|bitor|compl|not|not_eq|or|or_eq|xor|xor_eq)\b)[A-Za-z_~])/g;
+export function blankCppPointerAnnotationMacros(source: string): string {
+  if (!/[*&]\s*[A-Z][A-Z0-9]*_/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_POINTER_ANNOTATION_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const run = m[2] as string;
+    const start = m.index + m[0].length - run.length;
+    // After `&`, only a name: `flags & FOO_BIT\n  && ok` is an expression.
+    if (m[1] === '&' && code[start + run.length] === '*') continue;
+    // A `*` after a closing bracket or a number multiplies: `sizeof(int) * CHAR_BIT * 3`.
+    if (/(?:[)\]]|\b\d[\w.]*)\s*$/.test(code.slice(Math.max(0, m.index - 40), m.index))) continue;
+    pushCppRunTokens(spans, run, start);
+  }
+  return blankCppSpans(source, spans);
+}
+
+// Keywords that take a parenthesized operand: a `)` closing one of these is
+// not a parameter list, so a token after it is not a trailing attribute.
+// `constexpr` / `consteval` stand before the condition of `if constexpr (…)`.
+const CPP_PAREN_KEYWORDS = new Set([
+  'if', 'while', 'for', 'switch', 'catch', 'return', 'sizeof', 'alignof', 'alignas', 'decltype',
+  'typeid', 'noexcept', 'throw', 'static_assert', 'new', 'delete', 'case', 'requires', 'co_await',
+  'co_yield', 'co_return', 'asm', '__asm__', '__attribute__', '__attribute', '__declspec', '_Pragma',
+  'else', 'do', 'constexpr', 'consteval', 'explicit', 'typeof', '__typeof__', '__typeof', '_Alignof',
+  '__alignof__', 'volatile', '__volatile__',
+]);
+
+/**
+ * Blank attribute macros after a function's parameter list: protobuf's
+ * `unknown_fields() const\n ABSL_ATTRIBUTE_LIFETIME_BOUND {` and `~Any()
+ * PROTOBUF_FINAL;`, and the thread-safety annotations of leveldb, rocksdb and
+ * abseil (`void Wait() LOCKS_EXCLUDED(mu_) {`, `void Lock()
+ * EXCLUSIVE_LOCK_FUNCTION();`). tree-sitter reads the macro as the start of a
+ * new declaration, so the method loses its `;` or its body: an inline body
+ * becomes a stray block, and in a long run of members the class can end early.
+ *
+ * Matched on the code alone, so it can't touch an expression:
+ *  - the `)` closes a parameter list: the `(` it matches follows a function
+ *    name (`name(`, `~Name(`, `operator==(`, `operator()(`), not a keyword
+ *    (`if (x) FOO;`), a cast (`= (int) MAX_VALUE;`) or a macro call
+ *    (`FMT_PRAGMA_CLANG(…)` above `TEST(std_test, bitint) {`);
+ *  - between `)` and the macro only `const`, `volatile`, `&`, `&&`,
+ *    `noexcept`, `override` or `final` may stand, and no blank line;
+ *  - the macro (ALL-CAPS, optionally with balanced arguments; several may
+ *    stack) is followed by what may end a declarator: `{`, `;`, `=`, a
+ *    constructor's `:`, `->`, or `override`/`final`/`const`/`noexcept`.
+ * C++-only.
+ */
+const CPP_TRAILING_ATTR_CANDIDATE_RE =
+  /\)((?:\s*(?:const|volatile|noexcept|override|final|&&|&)(?![\w]))*)\s*(?=[A-Z][A-Z0-9_]{2,}\b)/g;
+const CPP_TRAILING_ATTR_RUN_RE =
+  /(?:[A-Z][A-Z0-9_]{2,}\b(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?\s*)+/y;
+const CPP_TRAILING_ATTR_FOLLOW_RE = /(?:\{|;|=(?!=)|:(?!:)|->|(?:override|final|const|noexcept)\b)/y;
+export function blankCppTrailingAttributeMacros(source: string): string {
+  if (!/\)[\s\w&]*?\b[A-Z][A-Z0-9_]{2,}\b/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_TRAILING_ATTR_CANDIDATE_RE.source, 'g');
+  const run = new RegExp(CPP_TRAILING_ATTR_RUN_RE.source, 'y');
+  const follow = new RegExp(CPP_TRAILING_ATTR_FOLLOW_RE.source, 'y');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const macroStart = m.index + m[0].length;
+    if (/\n[ \t]*\r?\n/.test(m[0])) continue;
+    run.lastIndex = macroStart;
+    const r = run.exec(code);
+    if (!r) continue;
+    follow.lastIndex = macroStart + r[0].length;
+    if (!follow.test(code)) continue;
+    if (!closesParameterList(code, m.index)) continue;
+    pushCppRunTokens(spans, r[0], macroStart);
+    re.lastIndex = macroStart + r[0].length;
+  }
+  return blankCppSpans(source, spans);
+}
+
+// Type keywords that may stand right before a declared name (`int count_ …`).
+const CPP_TYPE_KEYWORDS = new Set([
+  'void', 'bool', 'char', 'char8_t', 'char16_t', 'char32_t', 'wchar_t', 'short', 'int', 'long', 'float',
+  'double', 'signed', 'unsigned', 'auto',
+]);
+const CPP_KEYWORDS = new Set([
+  ...CPP_TYPE_KEYWORDS, ...CPP_PAREN_KEYWORDS, 'const', 'volatile', 'static', 'extern', 'inline', 'virtual',
+  'explicit', 'constexpr', 'consteval', 'constinit', 'friend', 'mutable', 'thread_local', 'register',
+  'typedef', 'using', 'template', 'typename', 'class', 'struct', 'union', 'enum', 'namespace', 'operator',
+  'goto', 'break', 'continue', 'default', 'public', 'private', 'protected', 'this', 'true', 'false',
+  'nullptr', 'and', 'or', 'not', 'xor', 'bitand', 'bitor', 'compl', 'and_eq', 'or_eq', 'xor_eq', 'not_eq',
+]);
+
+/**
+ * Blank attribute macros after the name a declaration declares, or after its
+ * array brackets: thread-safety annotations on fields (leveldb's `port::CondVar
+ * cv GUARDED_BY(mu);`, abseil's `ABSL_GUARDED_BY`), annotated parameters
+ * (`const absl::Cord* cord ABSL_ATTRIBUTE_LIFETIME_BOUND)`), and the section
+ * attributes of protobuf's generated globals (`Any_globals_
+ * PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);`, `offsets[]
+ * ABSL_ATTRIBUTE_SECTION_VARIABLE(protodesc_cold) = {`). tree-sitter reads
+ * the macro as a second declarator and errors.
+ *
+ * Matched on the code alone, so it can't touch a variable named in capitals:
+ *  - the macro is ALL-CAPS with an underscore, optionally with balanced
+ *    arguments, and is followed by `;`, `=`, `,` or `)`;
+ *  - before it stands `]`, or a name with a lowercase letter that itself
+ *    follows a type: a type name, a type keyword, `*`, `&`, `>`, or `const`
+ *    after a pointer. `Foo DEFAULT_OPTIONS;` and `const Foo kMAX_SIZE;`
+ *    declare those capitals (nothing names a type before `Foo`), `typedef Foo
+ *    BAR_T;` names a type, and `return x FOO;` or `f(a, b FOO)` have no type
+ *    before the name.
+ * C++-only.
+ */
+const CPP_DECLARATOR_ATTR_CANDIDATE_RE = /([\w\]])(\s+)(?=[A-Z][A-Z0-9]*_)/g;
+const CPP_DECLARATOR_ATTR_RUN_RE =
+  /(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?\s*)+/y;
+export function blankCppDeclaratorAttributeMacros(source: string): string {
+  if (!/[\w\]]\s+[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*[(;=,)]/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_DECLARATOR_ATTR_CANDIDATE_RE.source, 'g');
+  const run = new RegExp(CPP_DECLARATOR_ATTR_RUN_RE.source, 'y');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const macroStart = m.index + m[0].length;
+    run.lastIndex = macroStart;
+    const r = run.exec(code);
+    if (!r || !/^[;,)]|^=(?!=)/.test(code.slice(macroStart + r[0].length, macroStart + r[0].length + 2))) continue;
+    if (m[1] !== ']' && !followsDeclaredName(code, m.index)) continue;
+    pushCppRunTokens(spans, r[0], macroStart);
+    re.lastIndex = macroStart + r[0].length;
+  }
+  return blankCppSpans(source, spans);
+}
+
+/** True when the identifier ending at `code[last]` is a name a declaration declares. */
+function followsDeclaredName(code: string, last: number): boolean {
+  let start = last;
+  while (start > 0 && /\w/.test(code[start - 1] as string)) start--;
+  const name = code.slice(start, last + 1);
+  if (!/^[A-Za-z_]\w*$/.test(name) || !/[a-z]/.test(name) || CPP_KEYWORDS.has(name)) return false;
+  let i = start - 1;
+  while (i >= 0 && /\s/.test(code[i] as string)) i--;
+  const c = code[i];
+  if (c === '*' || c === '&') return true;
+  if (c === '>') return code[i - 1] !== '-';
+  if (!c || !/\w/.test(c)) return false;
+  let j = i;
+  while (j > 0 && /\w/.test(code[j - 1] as string)) j--;
+  const before = code.slice(j, i + 1);
+  if (before === 'const' || before === 'volatile') {
+    let k = j - 1;
+    while (k >= 0 && /\s/.test(code[k] as string)) k--;
+    return code[k] === '*' || code[k] === '&';
+  }
+  if (CPP_TYPE_KEYWORDS.has(before)) return true;
+  return /^[A-Za-z_]\w*$/.test(before) && !CPP_KEYWORDS.has(before);
+}
+
+/** True when the `)` at `code[close]` closes a function declarator's parameter list. */
+function closesParameterList(code: string, close: number): boolean {
+  let depth = 0;
+  let open = -1;
+  for (let i = close; i >= 0 && close - i < 4000; i--) {
+    const c = code[i];
+    if (c === ')') depth++;
+    else if (c === '(') {
+      if (--depth === 0) { open = i; break; }
+    } else if (c === ';' || c === '{' || c === '}') return false;
+  }
+  if (open < 0) return false;
+  const before = code.slice(Math.max(0, open - 200), open);
+  // `operator()(…)`, `operator==(…)`, `operator bool(…)`
+  if (/\boperator\s*(?:\(\s*\)|\[\s*\]|[^\s\w()[\]]{1,3}|\s+[A-Za-z_][\w\s:<>*&]*)\s*$/.test(before)) return true;
+  const name = /([A-Za-z_]\w*)\s*$/.exec(before)?.[1];
+  return !!name && !CPP_PAREN_KEYWORDS.has(name) && !/^[A-Z][A-Z0-9_]*$/.test(name);
+}
+
+/**
+ * Blank attribute macros that open a declaration, at the start of a line or
+ * after a `[[…]]` attribute: protobuf's `PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+ * absl::string_view name() const {` (250 members of descriptor.h alone),
+ * `ABSL_ATTRIBUTE_REINITIALIZES void Clear()`, `[[nodiscard]]
+ * PROTOBUF_NDEBUG_INLINE Ptr<T> Make(…)`, googletest's `GTEST_API_
+ * std::string JoinAsTuple(…)`, {fmt}'s `FMT_EXPORT struct …`. tree-sitter
+ * takes the macro for the type and everything after it for an error, which
+ * swallows the members that follow. `blankCLeadingAttrMacros` only knows a
+ * plain `MACRO Ret name(`; C++ adds qualified and template types, specifiers
+ * and keywords.
+ *
+ * The macro (ALL-CAPS with an underscore; several may stack) must be followed
+ * by what can't follow a type name: a declaration keyword (`static`,
+ * `inline`, `virtual`, `void`, `struct`, `template`, `return`, `[[`, …) or a
+ * whole declaration of its own, a type and then the declared name (`Type
+ * name(`, `ns::Type<T>* name;`). A type is followed by the name alone
+ * (`DWORD_PTR value = 0;`, `HANDLE_T Open(…)`), so it never matches. `const`
+ * after the token could be either (`SIZE_T const n`), so it only counts with a
+ * type and name after it. Matched on the code alone. C++-only.
+ */
+const CPP_TYPE_ARGS = '<(?:[^<>;{}]|<(?:[^<>;{}]|<[^<>;{}]*>)*>)*>';
+const CPP_TYPE_NAME = `(?:::\\s*)?(?!(?:const|volatile|operator|return)\\b)[A-Za-z_]\\w*(?:\\s*${CPP_TYPE_ARGS})?(?:\\s*::\\s*[A-Za-z_]\\w*(?:\\s*${CPP_TYPE_ARGS})?)*`;
+const CPP_DECLARED_NAME = '(?:(?:::\\s*)?~?[A-Za-z_]\\w*(?:\\s*::\\s*~?[A-Za-z_]\\w*)*\\s*[(;=[{]|operator\\b)';
+const CPP_LEADING_ATTR_RE = new RegExp(
+  '(^[ \\t]*|\\]\\][ \\t]*)((?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\\s+)+)(?=' +
+    '(?:static|inline|virtual|explicit|constexpr|consteval|constinit|friend|extern|thread_local|mutable|' +
+    'typedef|using|template|typename|class|struct|union|enum|void|bool|char|char8_t|char16_t|char32_t|' +
+    'wchar_t|short|int|long|float|double|signed|unsigned|auto|decltype|return)\\b|\\[\\[|' +
+    // An out-of-line constructor or destructor: `Any::Impl_::Impl_(`, `Any::~Any(`.
+    '(?:[A-Za-z_]\\w*\\s*::\\s*)*([A-Za-z_]\\w*)\\s*::\\s*~?\\3\\s*\\(|' +
+    `(?:(?:const|volatile)\\s+)*${CPP_TYPE_NAME}(?:\\s*(?:const|volatile)\\b)?(?:\\s*[*&]+\\s*|\\s+)(?:(?:const|volatile)\\s+)?${CPP_DECLARED_NAME})`,
+  'gm'
+);
+export function blankCppLeadingAttributeMacros(source: string): string {
+  if (!/(?:^|\]\])[ \t]*[A-Z][A-Z0-9]*_[A-Z0-9_]*\s/m.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_LEADING_ATTR_RE.source, 'gm');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const start = m.index + (m[1] as string).length;
+    pushCppRunTokens(spans, m[2] as string, start);
+  }
+  return blankCppSpans(source, spans);
 }
 
 /**
@@ -680,9 +1033,11 @@ export function blankCppAnnotationMacroCalls(source: string): string {
  *    continuation) — so an ALL-CAPS operand split onto its own line inside a
  *    multi-line expression (`int x =\n  SOME_CONST\n  | OTHER;`) is left
  *    alone; and
- *  - the NEXT non-blank line starts like a declaration/scope token
+ *  - the NEXT line of code starts like a declaration/scope token
  *    (letter, `_`, `#`, `{`, `}`, or `~`) or the file ends — an operator,
- *    string literal, or `;` continuation rejects the match.
+ *    string literal, or `;` continuation rejects the match. Comments in
+ *    between are skipped: {fmt}'s `FMT_BEGIN_EXPORT` sits above `// A
+ *    generic formatting context …` and then the class it opens.
  * Shared by C and C++ (the idiom is identical in both).
  */
 const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
@@ -709,18 +1064,36 @@ export function blankLoneMacroLines(source: string): string {
     const prevText = prev >= 0 ? content(lines[prev] as string) : '';
     const prevCode = /^(?:\/\/|\/\*|\*)/.test(prevText) ? '' : prevText.replace(/\/\*.*?\*\/|\/\/.*$/g, '').trim();
     if (prevCode !== '' && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
-    let next = i + 1;
-    while (next < lines.length && content(lines[next] as string) === '') next++;
-    if (next < lines.length) {
-      const first = content(lines[next] as string)[0];
-      if (!first || !/[A-Za-z_#{}~]/.test(first)) continue;
-    }
+    const first = firstCodeCharAfter(lines, i + 1);
+    if (first !== undefined && !/[A-Za-z_#{}~]/.test(first)) continue;
     const start = line.indexOf(m[1] as string);
     lines[i] =
       line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
     changed = true;
   }
   return changed ? lines.join('\n') : source;
+}
+
+/** The first character of code at or after line `from`, past blank lines and
+ * comments; undefined at the end of the file. */
+function firstCodeCharAfter(lines: readonly string[], from: number): string | undefined {
+  let inBlock = false;
+  for (let k = from; k < lines.length; k++) {
+    let text = (lines[k] as string).trim();
+    for (;;) {
+      if (inBlock) {
+        const end = text.indexOf('*/');
+        if (end < 0) { text = ''; break; }
+        text = text.slice(end + 2).trim();
+        inBlock = false;
+      }
+      if (text.startsWith('//')) text = '';
+      else if (text.startsWith('/*')) { inBlock = true; text = text.slice(2); continue; }
+      break;
+    }
+    if (text !== '') return text[0];
+  }
+  return undefined;
 }
 
 /**
@@ -931,10 +1304,7 @@ function restoreDirectiveLines(original: string, blanked: string): string {
 function normalizeCppComInterfaces(source: string): string {
   if (!source.includes('interface')) return source;
   // Raw strings have already been masked by preParseCppSource.
-  let code = source.replace(
-    /\/\/(?:\\\r?\n|[^\r\n])*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g,
-    (m) => m.replace(/[^\r\n]/g, ' ')
-  );
+  let code = maskCppCommentsAndLiterals(source);
   const hasAlias = /^[ \t]*#[ \t]*define[ \t]+interface[ \t]+struct\b/m.test(code);
   code = code.replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, '\0'));
   const declaration = /(^|[;{}])\s*\binterface\s+[A-Za-z_]\w*\s*(:[^;{}]+)?\{/gm;
@@ -1065,12 +1435,23 @@ function preParseCppSource(source: string, filePath?: string): string {
   source = flattenMidStatementConditionals(rewriteCppAccessMacros(rawStrings.source));
   // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
   // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
-  // it matches (the _API token is already spaces by then).
+  // it matches (the _API token is already spaces by then). The C++ leading
+  // blank runs after the pointer, trailing and declarator ones, so the
+  // declaration it looks for (`Type* name(`, `Type name;`) is already free of
+  // their macros.
   let blanked = blankLoneMacroLines(
-    blankCLeadingAttrMacros(
-      blankCppAnnotationMacroCalls(
-        blankCppInlineAnnotationMacros(
-          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(normalizeCppComInterfaces(source))))
+    blankCppLeadingAttributeMacros(
+      blankCLeadingAttrMacros(
+        blankCppAnnotationMacroCalls(
+          blankCppDeclaratorAttributeMacros(
+            blankCppTrailingAttributeMacros(
+              blankCppPointerAnnotationMacros(
+                blankCppInlineAnnotationMacros(
+                  blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(normalizeCppComInterfaces(source))))
+                )
+              )
+            )
+          )
         )
       )
     )
