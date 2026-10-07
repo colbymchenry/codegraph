@@ -201,6 +201,21 @@ export const reactResolver: FrameworkResolver = {
   crossFileNodes(context: ResolutionContext) {
     return { kind: 'route', owns: isTableRoute, ...tableRoutes(context) };
   },
+
+  /**
+   * The module a route's answer is read from: a lazily loaded page or layout
+   * (`lazy-import:` references), or the one a same-file lazy value the route
+   * renders loads — the references Pattern 1 asks `declaredComponent` about.
+   */
+  lazyModule(ref: UnresolvedRef, context: ResolutionContext): string | null {
+    const name = ref.referenceName;
+    let spec: string | null | undefined;
+    if (name.startsWith(LAZY_ROUTE_PREFIX)) spec = name.slice(LAZY_ROUTE_PREFIX.length);
+    else if (name.startsWith(LAYOUT_PREFIX + LAZY_ROUTE_PREFIX)) spec = name.slice(LAYOUT_PREFIX.length + LAZY_ROUTE_PREFIX.length);
+    else if ((ref.language === 'tsx' || ref.language === 'jsx') && isPascalCase(name) && !isBuiltInType(name) &&
+      ref.fromNodeId.startsWith(`route:${ref.filePath}:`)) spec = declaredLoader(name, ref.filePath, context);
+    return spec ? lazyModuleFile(spec, ref.filePath, context) : null;
+  },
 };
 
 const LAZY_ROUTE_PREFIX = 'lazy-import:';
@@ -398,9 +413,14 @@ function readObjectPath(text: string, at: number, keys: string[]): string | null
   return null;
 }
 
+/** The file a route's lazily loaded module is, from the file that loads it. */
+function lazyModuleFile(spec: string, fromFile: string, context: ResolutionContext): string | null {
+  return resolveImportPath(spec, fromFile, 'typescript', context);
+}
+
 /** The component a lazy route module renders: its default export, else its `Component` export. */
 function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext): string | null {
-  const file = resolveImportPath(spec, fromFile, 'typescript', context);
+  const file = lazyModuleFile(spec, fromFile, context);
   if (!file) return null;
   const source = context.readFile(file) ?? '';
   const named = /\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*|class\s+)?([A-Za-z_$][\w$]*)/.exec(source)?.[1] ??
@@ -420,13 +440,23 @@ function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionC
  * usual way).
  */
 function declaredComponent(name: string, filePath: string, context: ResolutionContext): string | null | undefined {
+  const spec = declaredLoader(name, filePath, context);
+  if (spec === undefined) return undefined;
+  return spec ? lazyRouteComponent(spec, filePath, context) : null;
+}
+
+/**
+ * The module a value `filePath` declares as `name` loads lazily — the
+ * `'./x'` of `const X = lazy(() => import('./x'))`, wrapped or not — null
+ * for a value that loads none, undefined when the file declares no such value.
+ */
+function declaredLoader(name: string, filePath: string, context: ResolutionContext): string | null | undefined {
   const own = (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
     .find((n) => n.kind === 'constant' || n.kind === 'variable');
   if (!own) return undefined;
   const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
   const text = lines.slice(own.startLine - 1, own.endLine).join('\n');
-  const spec = /=>\s*import\s*\(\s*["']([^"']+)["']\s*\)/.exec(text)?.[1];
-  return spec ? lazyRouteComponent(spec, filePath, context) : null;
+  return /=>\s*import\s*\(\s*["']([^"']+)["']\s*\)/.exec(text)?.[1] ?? null;
 }
 
 /**

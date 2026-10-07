@@ -317,6 +317,16 @@ export interface FrameworkResolver {
    * next run puts it back.
    */
   crossFileNodes?(context: ResolutionContext): CrossFileNodes;
+  /**
+   * The module whose content `resolve()` reads to answer `ref`, a route
+   * node's reference, or null when it reads none. A React route that renders
+   * a same-file `const Docs = lazy(() => import('./pages/Docs'))` binds to
+   * the component that module exports, and to the declaration while the
+   * module is missing or exports none: the answer changes with the module
+   * although no name the reference carries does, so a sync that adds or
+   * changes the module resolves the reference again.
+   */
+  lazyModule?(ref: UnresolvedRef, context: ResolutionContext): string | null;
 }
 
 /**

@@ -1331,6 +1331,18 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+/**
+ * Whether a JSX tag can render `node` (`jsxChild`): a script's component,
+ * function or class named with a tag's capital, or any component, which a
+ * default import names under a name of its own. A tag in a file a sync never
+ * touched may name one the sync adds, so adding one redraws the JSX edges.
+ * (A `.vue` or `.svelte` file redraws them on any change.)
+ */
+export function isJsxChildCandidate(node: Pick<Node, 'kind' | 'name' | 'language'>): boolean {
+  return JSX_CHILD_KINDS.has(node.kind) && JS_FAMILY.includes(node.language) &&
+    (node.kind === 'component' || /^[A-Z]/.test(node.name));
+}
+
 function languageForJsxFile(file: string): Language {
   if (file.endsWith('.tsx')) return 'tsx';
   if (/\.[cm]?ts$/.test(file)) return 'typescript';

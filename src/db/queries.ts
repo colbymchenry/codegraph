@@ -3999,6 +3999,44 @@ export class QueryBuilder {
     return out;
   }
 
+  /**
+   * The resolution edges out of route nodes that a change to `filePaths` can
+   * move: from a route in another file, to a node of one of `filePaths`, or to
+   * a value declared beside the route — what a route rendering
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to while that
+   * module is missing. Returned with the route's file and language, which a
+   * resurrection needs. Synthesized edges carry no reference to resurrect and
+   * are left out.
+   */
+  getRouteEdgesMovedBy(filePaths: readonly string[]): Array<Edge & {
+    edgeId: number;
+    sourceFilePath: string;
+    sourceLanguage: Language;
+  }> {
+    if (filePaths.length === 0) return [];
+    const files = JSON.stringify(filePaths);
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes src
+           JOIN edges e ON e.source = src.id
+           JOIN nodes tgt ON tgt.id = e.target
+          WHERE src.kind = 'route'
+            AND e.kind != 'contains'
+            AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+            AND src.file_path NOT IN (SELECT value FROM json_each(?))
+            AND (tgt.file_path IN (SELECT value FROM json_each(?))
+              OR (tgt.file_path = src.file_path AND tgt.kind IN ('constant', 'variable')))`
+      )
+      .all(files, files) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
     if (edgeIds.length === 0) return 0;
