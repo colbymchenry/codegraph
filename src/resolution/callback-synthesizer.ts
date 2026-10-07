@@ -38,7 +38,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
-import { resolveImportPath } from './import-resolver';
+import { hasAnonymousDefaultExport, resolveImportPath, valueBinding } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -1352,6 +1352,50 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
   return out;
 }
 
+function nodesInFileNamed(ctx: ResolutionContext, file: string, name: string): Node[] {
+  return ctx.getNodesInFileNamed?.(file, name) ?? ctx.getNodesInFile(file).filter((n) => n.name === name);
+}
+
+/**
+ * What a tag the file imports from one of the project's own modules renders,
+ * found the way the import resolver finds any imported name: through barrels,
+ * renames and the module's default export. `null` when the import names
+ * nothing that renders — a type, a value that wraps no function, a default
+ * export with no declaration of its own — and `undefined` when the file
+ * doesn't import the name from the project or the import can't be followed,
+ * which leaves the tag to its name.
+ */
+function importedJsxChild(ctx: ResolutionContext, name: string, file: string, language: Language): Node | null | undefined {
+  if (!ctx.resolveImport || !ctx.getNodeById) return undefined;
+  const mapping = ctx.getImportMappings(file, language).find((m) => m.localName === name);
+  if (!mapping || mapping.isNamespace) return undefined;
+  const module = resolveImportPath(mapping.source, file, language, ctx);
+  if (!module) return undefined;
+  const resolved = ctx.resolveImport({
+    fromNodeId: '', referenceName: name, referenceKind: 'references', line: 0, column: 0, filePath: file, language,
+  });
+  const node = resolved ? ctx.getNodeById(resolved.targetNodeId) : null;
+  if (!node) {
+    const isDefault = mapping.isDefault || mapping.exportedName === 'default';
+    if (!isDefault || !hasAnonymousDefaultExport(module, ctx)) return undefined;
+    // `export default (props) => <Search {...props} params={useParams()} />`
+    // renders what the module declares under the tag's name, if anything —
+    // never a same-named component of another module.
+    return nodesInFileNamed(ctx, module, name).find((n) => JSX_CHILD_KINDS.has(n.kind)) ?? null;
+  }
+  if (JSX_CHILD_KINDS.has(node.kind)) return node;
+  // The value a module declares under its type's name (`export interface Button`
+  // above `export const Button = (…) => …`), or the function a value holds
+  // (`export const Card = observer(function Card() {…})`): the same name, there.
+  const twin = nodesInFileNamed(ctx, node.filePath, node.name)
+    .filter((n) => JSX_CHILD_KINDS.has(n.kind) &&
+      (n.qualifiedName === node.name || (n.startLine >= node.startLine && n.endLine <= node.endLine)))
+    .sort((a, b) => Number(b.qualifiedName === node.name) - Number(a.qualifiedName === node.name))[0];
+  if (twin) return twin;
+  // `const Avatar = AvatarWithHoverCard`: what the value hands on.
+  return valueBinding(node, ctx) ?? null;
+}
+
 /**
  * The component a JSX tag names, among every node that shares the name.
  *
@@ -1366,17 +1410,30 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
  * another sheet.
  *
  * Same file first — a small component declared beside its use is the commonest
- * shape, and the one an import can never disambiguate. Then the file the name
- * is imported from. Then the language, which only decides a tie: a `.tsx` tag
- * naming both a TS component and a same-named Swift class means the TS one.
+ * shape, and the one an import can never disambiguate. Then what the file's
+ * import of the name resolves to, which no other same-named component can be:
+ * bulletproof-react's three apps each import `Button` from their own
+ * `@/components/ui/button` barrel, and the name alone bound a third of their
+ * renders to another app's copy; a default import renders the module's default
+ * export under any name (`import Settings from './settings'` for `export
+ * default function SettingsRoute`). Then, for a name the file neither declares
+ * nor imports from the project, or whose import can't be followed, the name:
+ * the file it is imported from, then the language, which only decides a tie:
+ * a `.tsx` tag naming both a TS component and a same-named Swift class means
+ * the TS one.
  */
 function jsxChild(
   ctx: ResolutionContext,
   name: string,
   file: string,
+  language: Language,
   importsOf: () => Map<string, string>
 ): Node | undefined {
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  const local = candidates.find((n) => n.filePath === file);
+  if (local) return local;
+  const imported = importedJsxChild(ctx, name, file, language);
+  if (imported !== undefined) return imported ?? undefined;
   if (candidates.length === 0) {
     // A name nothing declares is the file's DEFAULT import of a module's one
     // component under another name: segmented-control renders
@@ -1392,8 +1449,6 @@ function jsxChild(
     return components.length === 1 ? components[0] : undefined;
   }
   if (candidates.length === 1) return candidates[0];
-  const local = candidates.find((n) => n.filePath === file);
-  if (local) return local;
   const from = importsOf().get(name);
   if (from) {
     const imported = candidates.find((n) => n.filePath === from);
@@ -1429,21 +1484,36 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     );
     if (parents.length === 0) continue;
     // Read once per file, and only when a name actually turns out ambiguous.
+    const language = parents[0]!.language;
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
-      (imports ??= importedFrom(ctx, file, parents[0]!.language));
+      (imports ??= importedFrom(ctx, file, language));
+    // A tag names the same component wherever the file writes it.
+    const children = new Map<string, Node | undefined>();
+    const childOf = (name: string) => {
+      if (!children.has(name)) children.set(name, jsxChild(ctx, name, file, language, importsOf));
+      return children.get(name);
+    };
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
-      const names = new Set<string>();
+      // Each name, and whether a `<Name` of it opens a tag: a type argument
+      // list follows its type's name directly (`useRef<SharedEditor>`).
+      const names = new Map<string, boolean>();
       JSX_TAG_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+      while ((m = JSX_TAG_RE.exec(src))) {
+        const asTag = !/[\w$]/.test(src[m.index - 1] ?? '') || /\breturn$/.test(src.slice(Math.max(0, m.index - 7), m.index));
+        names.set(m[1]!, (names.get(m[1]!) ?? false) || asTag);
+      }
       let added = 0;
-      for (const name of names) {
+      for (const [name, asTag] of names) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = jsxChild(ctx, name, file, importsOf);
+        const child = childOf(name);
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
+        // What the file imports under another name (`import SharedEditor from
+        // '~/editor'`) renders only where that name is written as a tag.
+        if (!asTag && child.name !== name) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;
         seen.add(key);

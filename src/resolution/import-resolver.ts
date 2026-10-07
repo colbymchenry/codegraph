@@ -13,6 +13,7 @@ import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { dartDirectiveFile } from './dart-libraries';
+import { matchBracket, skipString } from './frameworks/object-literal';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -89,37 +90,312 @@ const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | un
 interface FileExportIndex {
   /** Exported declarations by name. Read through {@link exportedByName}. */
   byName: Map<string, Node>;
+  /** First exported component: an SFC is its own default export; elsewhere a guess. */
   defaultComponent: Node | undefined;
+  /** First exported function or class: the guess for a module that never says. */
   defaultFnClass: Node | undefined;
   /**
-   * The node an `export default NAME` statement names, exported at its
-   * declaration or not — the precise answer where `defaultFnClass` is a
-   * guess. `const Home = () => …; export default Home` and the namespace
-   * object `const UploadApi = { uploadARCapture }; export default UploadApi`
-   * are both invisible to the `isExported` index above: neither declaration
-   * has an `export_statement` ancestor. `undefined` until first read through
-   * {@link defaultExportBindingNode}; `null` when there is none.
+   * What the module's `export default` statement says its default export is
+   * (see {@link defaultStatement}). `undefined` until first read; `null` when
+   * the module has no such statement or is not a JS-family file.
    */
-  defaultBinding?: Node | null;
+  defaultStatement?: DefaultStatement | null;
   /**
    * Names a local export clause (`export { impl as alias }`) binds to a
    * declaration the extractor never flagged isExported, for names not in
    * `byName`. `undefined` until first read through {@link exportedByName}.
    */
   clauseAliases?: Map<string, Node>;
+  /** Names a local export clause forwards from the file's imports: exported name → local name. Filled with `clauseAliases`. */
+  clauseImports?: Map<string, string>;
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
-const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+/** What a wrapper call (`memo(Foo)`, `connect(mapState)(Bar)`) can hand on as the export: a thing that runs. */
+const WRAPPED_BINDING_KINDS = new Set<string>(['function', 'class', 'component']);
 const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
+const EXPORT_DEFAULT_RE = /^[ \t]*export\s+default\s+/gm;
+/** Words that open an expression but never name a binding: `export default await load()`. */
+const NOT_A_BINDING = new Set(['new', 'await', 'typeof', 'void', 'delete', 'yield', 'async', 'this', 'super', 'null', 'undefined', 'true', 'false', 'import']);
 
-/** The identifier `export default NAME` names in a JS-family file, or null. */
-function defaultExportBinding(filePath: string, context: ResolutionContext): string | null {
-  if (!JS_FAMILY_FILE.test(filePath)) return null;
-  const source = context.readFile(filePath);
-  if (!source || !source.includes('export default')) return null;
-  return source.match(DEFAULT_EXPORT_BINDING_RE)?.[1] ?? null;
+/** A name a JS expression hands on; `wrapped` when a call stands around it (`memo(Foo)`). */
+interface NamedBinding {
+  name: string;
+  wrapped: boolean;
 }
+
+/** A default export written as an expression with no name of its own, and where it starts. */
+interface AnonymousDefault {
+  line: number;
+  column: number;
+}
+
+type DefaultStatement = NamedBinding | AnonymousDefault;
+
+function skipSpace(code: string, at: number): number {
+  let i = at;
+  while (i < code.length && /\s/.test(code[i]!)) i++;
+  return i;
+}
+
+/** Past the `<…>` type arguments opening at `at` (`memo<Props>(Foo)`), or -1. */
+function skipTypeArguments(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length && i < at + 400; i++) {
+    const ch = code[i]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const end = skipString(code, i);
+      if (end < 0) return -1;
+      i = end;
+    } else if (ch === '<') depth++;
+    else if (ch === '>' && code[i - 1] !== '=' && --depth === 0) return i + 1;
+  }
+  return -1;
+}
+
+/**
+ * The name the JS expression at `at` hands on: a name (`Page`), a named
+ * function or class (`function Vans() {…}`, `class Baz …`), or what a wrapper
+ * call wraps — the first argument of its last call, read the same way
+ * (`memo(Foo)`, `connect(mapState)(Bar)`, `withRouter(connect(m)(Bar))`,
+ * `observer(function Settings() {…})`, `styled(Button)\`…\``), or the class of an
+ * instance (`new Storage()`, whose members are the class's). Null for one that
+ * names nothing: an arrow function, an object literal, `Primitive.Root`, a
+ * call on a literal (`requireNativeComponent('X')`). `code` is comment-free.
+ */
+function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): NamedBinding | null {
+  const head = code.slice(at, at + 200);
+  const declared = /^(?:async\s+)?function\b\s*\*?\s*([A-Za-z_$][\w$]*)?|^(?:abstract\s+)?class\b(?:\s+(?!extends\b|implements\b)([A-Za-z_$][\w$]*))?/.exec(head);
+  if (declared) {
+    const name = declared[1] ?? declared[2];
+    return name ? { name, wrapped } : null;
+  }
+  const constructed = /^new\s+([A-Za-z_$][\w$]*)\b(?!\s*\.)/.exec(head);
+  if (constructed) return { name: constructed[1]!, wrapped: true };
+  const callee = /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*/.exec(head)?.[0];
+  if (!callee || NOT_A_BINDING.has(callee)) return null;
+  let i = at + callee.length;
+  while (code[i] === ' ' || code[i] === '\t') i++;
+  // A name on its own, up to the end of its statement or argument.
+  if (!callee.includes('.') && /^(?:[;,)\]}]|\r?\n|$|(?:as|satisfies)\b)/.test(code.slice(i, i + 12))) {
+    return { name: callee, wrapped };
+  }
+  i = skipSpace(code, i);
+  if (code[i] === '<') {
+    i = skipTypeArguments(code, i);
+    if (i < 0) return null;
+    i = skipSpace(code, i);
+  }
+  // The call chain: `(…)(…)` and tagged templates; the last argument list is the one that wraps.
+  // One whose end is out of reach (an apostrophe in JSX text reads as a quote) is the last one seen.
+  let args = -1;
+  for (;;) {
+    if (code[i] === '(') {
+      args = i;
+      const close = matchBracket(code, i);
+      if (close < 0) break;
+      i = skipSpace(code, close + 1);
+    } else if (code[i] === '`') {
+      const end = skipString(code, i);
+      if (end < 0) break;
+      i = skipSpace(code, end + 1);
+    } else break;
+  }
+  // `createSlice(…).reducer` hands on a member of what the call returns.
+  if (args < 0 || code[i] === '.' || depth >= 4) return null;
+  return namedBindingAt(code, skipSpace(code, args + 1), true, depth + 1);
+}
+
+/**
+ * What a JS-family module's default export is, read once from the statement
+ * that makes it: the binding it names — `export default Page`, `export
+ * default function Vans()`, `export default class Baz`, `export { Qux as
+ * default }`, or what a wrapper call hands on (`export default memo(Foo)`) —
+ * or, for an expression that names nothing (`export default () => …`), where
+ * that expression starts. Null when the module has no such statement.
+ */
+function defaultStatement(filePath: string, idx: FileExportIndex, context: ResolutionContext): DefaultStatement | null {
+  if (idx.defaultStatement !== undefined) return idx.defaultStatement;
+  let found: DefaultStatement | null = null;
+  const source = JS_FAMILY_FILE.test(filePath) ? context.readFile(filePath) : null;
+  if (source && source.includes('default')) {
+    const at = exportDefaultAt(source);
+    if (at >= 0) {
+      // The statement's own text is all it takes: what a wrapper call wraps
+      // is its first argument, near the call's start.
+      const code = stripCommentsForRegex(source.slice(at, at + DEFAULT_STATEMENT_WINDOW), 'typescript');
+      const before = source.slice(0, at);
+      found = namedBindingAt(code, 0) ?? {
+        line: before.split('\n').length,
+        column: at - before.lastIndexOf('\n') - 1,
+      };
+    } else {
+      const clause = extractLocalExportAliases(source).find((a) => a.exportedName === 'default');
+      if (clause) found = { name: clause.localName, wrapped: false };
+    }
+  }
+  idx.defaultStatement = found;
+  return found;
+}
+
+/** How much of an `export default` statement is read: enough for any wrapper call's head. */
+const DEFAULT_STATEMENT_WINDOW = 4000;
+
+/** Where the expression of the first `export default` statement outside a block comment starts, or -1. */
+function exportDefaultAt(source: string): number {
+  EXPORT_DEFAULT_RE.lastIndex = 0;
+  for (let m = EXPORT_DEFAULT_RE.exec(source); m; m = EXPORT_DEFAULT_RE.exec(source)) {
+    if (!insideBlockComment(source, m.index)) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+/**
+ * Whether `offset` sits inside a block comment of a JS source, read from the
+ * start past strings, template literals and line comments the way
+ * `stripCommentsForRegex` reads them — without copying the file.
+ */
+function insideBlockComment(source: string, offset: number): boolean {
+  for (let i = 0; i < offset; i++) {
+    const ch = source[i];
+    if (ch === '/' && source[i + 1] === '*') {
+      const end = source.indexOf('*/', i + 2);
+      if (end < 0 || end >= offset) return true;
+      i = end + 1;
+    } else if (ch === '/' && source[i + 1] === '/') {
+      const end = source.indexOf('\n', i + 2);
+      if (end < 0) return false;
+      i = end;
+    } else if (ch === '"' || ch === "'" || ch === '`') {
+      // A quote ends at its match; one that isn't a template's, at its line's end.
+      for (i++; i < offset && source[i] !== ch; i++) {
+        if (source[i] === '\\') i++;
+        else if (ch !== '`' && source[i] === '\n') break;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The node a default export statement makes the export. A named binding is
+ * the file's own declaration of it, else what the file imports under that
+ * name (`import Login from './Login'; export default Login` in an `index`);
+ * one a wrapper call hands on must run — `export default createRouter(routes)`
+ * exports a router, not `routes`. An anonymous one is a node only when one
+ * stands at the expression itself: React Native's
+ * `export default codegenNativeComponent('MyView')`.
+ */
+function defaultStatementNode(
+  filePath: string,
+  statement: DefaultStatement,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
+  if (!('name' in statement)) {
+    return context.getNodesInFile(filePath).find((n) =>
+      WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine === statement.line && n.startColumn === statement.column);
+  }
+  return bindingNode(filePath, statement, language, context, visited, depth);
+}
+
+/** What `binding` names in `filePath`: its declaration there, else the export the file imports under that name. */
+function bindingNode(
+  filePath: string,
+  binding: NamedBinding,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
+  const kinds = binding.wrapped ? WRAPPED_BINDING_KINDS : DEFAULT_BINDING_KINDS;
+  // A module-level declaration before one nested in a function body.
+  const topLevel = (n: Node) => (n.qualifiedName === binding.name ? 0 : 1);
+  const own = nodesInFileNamed(filePath, binding.name, context)
+    .filter((n) => kinds.has(n.kind))
+    .sort((a, b) => topLevel(a) - topLevel(b) || a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+  if (own) return own;
+  const imported = context.getImportMappings(filePath, language).find((m) => m.localName === binding.name && !m.isNamespace);
+  const next = imported ? resolveImportPath(imported.source, filePath, language, context) : null;
+  if (!imported || !next) return undefined;
+  const found = findExportedSymbol(
+    next,
+    { isDefault: imported.isDefault, isNamespace: false, exportedName: imported.isDefault ? 'default' : imported.exportedName, memberName: null },
+    language,
+    context,
+    visited,
+    depth + 1
+  );
+  return found && kinds.has(found.kind) ? found : undefined;
+}
+
+/**
+ * Whether a JS-family module's default export is an expression with no name
+ * and no node of its own — `export default () => …`, `export default
+ * memo((props) => …)`, an object literal — so nothing in the graph is it, and
+ * a same-named symbol elsewhere is not it either.
+ */
+export function hasAnonymousDefaultExport(filePath: string, context: ResolutionContext): boolean {
+  const idx = getFileExportIndex(filePath, context);
+  const statement = defaultStatement(filePath, idx, context);
+  return statement !== null && !('name' in statement) &&
+    defaultStatementNode(filePath, statement, 'typescript', context, new Set(), 0) === undefined;
+}
+
+const valueBindingMemos = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/**
+ * The function, class or component a JS value declaration hands on, which is
+ * what renders or runs when the value does: what `const X = …` names when it
+ * is a name or wraps one — `const Avatar = AvatarWithHoverCard`, `const
+ * Suggestions = observer(function Suggestions() {…})`, `const List =
+ * memo(ListInner)` — declared in the value's file or imported into it.
+ * Undefined for any other value: a styled template, `Primitive.Root`, an
+ * object literal.
+ */
+export function valueBinding(value: Node, context: ResolutionContext): Node | undefined {
+  if ((value.kind !== 'constant' && value.kind !== 'variable') || !JS_FAMILY_FILE.test(value.filePath)) return undefined;
+  let memo = valueBindingMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    valueBindingMemos.set(context, memo);
+  }
+  const hit = memo.get(value.id);
+  if (hit !== undefined) return hit ?? undefined;
+  let found: Node | undefined;
+  // The declarator's own text, `Avatar = AvatarWithHoverCard`; its head is enough.
+  const last = Math.min(value.endLine, value.startLine + 60);
+  const lines = (context.getFileLines?.(value.filePath) ?? context.readFile(value.filePath)?.split('\n') ?? [])
+    .slice(value.startLine - 1, last);
+  if (lines.length > 0) {
+    if (last === value.endLine && value.endColumn > 0) lines[lines.length - 1] = lines[lines.length - 1]!.slice(0, value.endColumn);
+    lines[0] = lines[0]!.slice(value.startColumn);
+    const code = stripCommentsForRegex(lines.join('\n').slice(0, DEFAULT_STATEMENT_WINDOW), 'typescript');
+    const init = /^[A-Za-z_$][\w$]*\s*(?::(?:[^=]|=>)*?)?=(?![=>])\s*/.exec(code);
+    const at = init ? init[0].length : -1;
+    const binding = init ? namedBindingAt(code, at) : null;
+    if (binding && binding.name !== value.name) {
+      found = bindingNode(value.filePath, { name: binding.name, wrapped: true }, value.language, context, new Set([value.filePath]), 0);
+    } else if (binding) {
+      // `const Suggestions = observer(function Suggestions() {…})`: the function the value holds.
+      found = nodesInFileNamed(value.filePath, binding.name, context)
+        .find((n) => WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine >= value.startLine && n.endLine <= value.endLine);
+    } else if (init) {
+      // `const MyView = codegenNativeComponent('MyView')`: a node standing at the initializer itself.
+      const before = code.slice(0, at);
+      const newline = before.lastIndexOf('\n');
+      const line = value.startLine + before.split('\n').length - 1;
+      const column = newline < 0 ? value.startColumn + at : at - newline - 1;
+      found = context.getNodesInFile(value.filePath)
+        .find((n) => WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine === line && n.startColumn === column);
+    }
+  }
+  memo.set(value.id, found ?? null);
+  return found;
+}
+
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
 /**
@@ -165,20 +441,6 @@ function nodesInFileNamed(filePath: string, name: string, context: ResolutionCon
   return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
 }
 
-/** The declaration `export default NAME` names in this file (see FileExportIndex.defaultBinding). */
-function defaultExportBindingNode(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
-  if (idx.defaultBinding === undefined) {
-    const bound = defaultExportBinding(filePath, context);
-    idx.defaultBinding =
-      bound === null
-        ? null
-        : (nodesInFileNamed(filePath, bound, context)
-            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
-  }
-  return idx.defaultBinding ?? undefined;
-}
-
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
 function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
   const direct = idx.byName.get(name);
@@ -195,10 +457,31 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
         if (idx.byName.has(exportedName) || idx.clauseAliases.has(exportedName)) continue;
         const decl = nodesInFileNamed(filePath, localName, context)[0];
         if (decl) idx.clauseAliases.set(exportedName, decl);
+        else (idx.clauseImports ??= new Map()).set(exportedName, localName);
       }
     }
   }
   return idx.clauseAliases.get(name);
+}
+
+/**
+ * What this file exports as `name`, through an export clause that forwards a
+ * name it imports rather than declares — the `index` that does `import
+ * AdvancedMarker from './advanced-marker'; export { AdvancedMarker }` — too.
+ */
+function exportedOrForwarded(
+  filePath: string,
+  idx: FileExportIndex,
+  name: string,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
+  const direct = exportedByName(filePath, idx, name, context);
+  if (direct) return direct;
+  const local = idx.clauseImports?.get(name);
+  return local ? bindingNode(filePath, { name: local, wrapped: false }, language, context, visited, depth) : undefined;
 }
 
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
@@ -206,6 +489,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
   exportedSymbolMemos.delete(context);
   fileExportIndexes.delete(context);
+  valueBindingMemos.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
@@ -1019,7 +1303,9 @@ function extractJSImports(content: string): ImportMapping[] {
             localName: aliasMatch[2]!,
             exportedName: aliasMatch[1]!,
             source: source!,
-            isDefault: false,
+            // `{ default as X }` is the default import spelled as a named one;
+            // no module declares an export named `default` to find.
+            isDefault: aliasMatch[1] === 'default',
             isNamespace: false,
           });
         } else if (name) {
@@ -2638,16 +2924,19 @@ function findExportedSymbolWalk(
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
+    // A JS module says what its default export is — the binding its `export
+    // default` names, or an expression with no node of its own — so it is
+    // never guessed: the first exported function or component stood in for
+    // it, and `export function loader` above `export default function Vans`
+    // made every `import Vans from './Vans'` the loader.
+    const statement = defaultStatement(filePath, exportIndex, context);
+    if (statement) return defaultStatementNode(filePath, statement, language, context, visited, depth);
     // Svelte/Vue single-file components ARE the module's default export,
-    // but are extracted as kind 'component' (not function/class). Prefer
-    // the component node; fall back to an exported function/class for the
-    // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
-    // branch, an `export { default as X } from './X.svelte'` barrel never
-    // resolves and the component shows a false 0 callers (#629).
-    // A component file IS its default export; otherwise the statement that
-    // names the binding beats the first-exported-function guess.
-    const direct =
-      exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
+    // but are extracted as kind 'component' (not function/class). Without
+    // this, an `export { default as X } from './X.svelte'` barrel never
+    // resolves and the component shows a false 0 callers (#629). A module
+    // that never says falls back to its first exported function or class.
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
     if (direct) return direct;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
     const commonJs = commonJsDefaultExport(filePath, context);
@@ -2661,10 +2950,10 @@ function findExportedSymbolWalk(
       if (bound) return bound;
     }
   } else if (want.isNamespace && want.memberName) {
-    const direct = exportedByName(filePath, exportIndex, want.memberName, context);
+    const direct = exportedOrForwarded(filePath, exportIndex, want.memberName, language, context, visited, depth);
     if (direct) return direct;
   } else {
-    const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
+    const direct = exportedOrForwarded(filePath, exportIndex, want.exportedName, language, context, visited, depth);
     if (direct) return direct;
   }
 
