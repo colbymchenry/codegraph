@@ -17,8 +17,9 @@
  * Resolution treats the alias as the type it names. A bare `Event{}` or
  * `*Event` in its package links to the alias, a method called on an `*Event`
  * is the aliased type's method, and an alias whose target is written through
- * a package the index doesn't know (`yaml` under `go.yaml.in/yaml/v3`) never
- * links to itself or to a namesake.
+ * a package the index doesn't know (`clientv3` under an unaliased
+ * `go.etcd.io/etcd/client/v3`, known as `v3` or `client`) never links to
+ * itself or to a namesake.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -255,8 +256,6 @@ describe('an indexed Go module resolves through its aliases', () => {
         '',
         'func (e *Event) IsCreate() bool { return false }',
         '',
-        'type Node struct{}',
-        '',
       ].join('\n'),
       'client/v3/watch.go': [
         'package clientv3',
@@ -296,13 +295,13 @@ describe('an indexed Go module resolves through its aliases', () => {
         'func count(xs *Items[int]) int { return xs.Len() }',
         '',
       ].join('\n'),
-      'yamlish/node.go': [
-        'package yamlish',
+      'watcher/watcher.go': [
+        'package watcher',
         '',
-        'import "go.yaml.in/yaml/v3"',
+        'import "go.etcd.io/etcd/client/v3"',
         '',
-        '// The package is yaml, though the index knows its import as v3.',
-        'type Node = yaml.Node',
+        '// The package is clientv3, though the index knows the import as v3 or client.',
+        'type Event = clientv3.Event',
         '',
       ].join('\n'),
     };
@@ -360,8 +359,9 @@ describe('an indexed Go module resolves through its aliases', () => {
   });
 
   it('an alias written through a package the index does not know links to nothing', () => {
-    expect(linksFrom('yamlish/node.go', 'Node')).toEqual([]);
-    const node = cg.getNodesInFile('yamlish/node.go').find((n) => n.name === 'Node')!;
-    expect(cg.getUnresolvedReferencesFrom(node.id).map((r) => `${r.referenceKind} ${r.referenceName}`)).toEqual(['references Node']);
+    // Not to itself, nor to client/v3's, mvccpb's or alpha's `Event`.
+    expect(linksFrom('watcher/watcher.go', 'Event')).toEqual([]);
+    const event = cg.getNodesInFile('watcher/watcher.go').find((n) => n.name === 'Event')!;
+    expect(cg.getUnresolvedReferencesFrom(event.id).map((r) => `${r.referenceKind} ${r.referenceName}`)).toEqual(['references Event']);
   });
 });
