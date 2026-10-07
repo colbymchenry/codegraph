@@ -383,6 +383,30 @@ class Consumer:
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
   });
 
+  it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {
+    // The stoplist holds bare words like Python's `None`; `raft.None` (etcd)
+    // and cgo's `C.NULL` are still values. The name is operand + field, so a
+    // break or comment after the dot keeps it; one inside the operand doesn't.
+    const source = `package demo
+import "example.com/raft"
+type Store struct{}
+func (s *Store) new() any { return nil }
+func wire(s *Store) {
+	Submit(raft.None, C.NULL, None, nil)
+	pool := sync.Pool{New: s.new}
+	Submit(raft.
+		Next, raft./* c */ Prev, raft.// c
+		Last)
+	Submit(s.
+		inner.Fetch)
+	_ = pool
+}
+`;
+    const result = assertParity('values.go', ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['C.NULL', 'raft.Last', 'raft.Next', 'raft.None', 'raft.Prev', 's.new']);
+  });
+
   it.each(REAL_SOURCES)('real source parity: %s', (rel) => {
     const file = path.join(__dirname, '..', rel);
     assertParity(rel, fs.readFileSync(file, 'utf8'), 'typescript');
