@@ -35,10 +35,14 @@
  * inside `<Route path="/dashboard">`, a data router's `children`); the markup
  * scan composes that tree, a constant path (`paths.app.root.path`) included,
  * and a `lazy: () => import('./routes/x')` route renders that module's default
- * export (`frameworks/react.ts`). An `index: true` route is the page at its
- * parent's address, and a route object around others is the layout they
- * render inside (a `references` edge marked `layout: true`). Known limit, deliberate: a splat
- * (`/admin/*`) matches anything, so it is never the answer to a concrete href.
+ * export (`frameworks/react.ts`). An index route (`index: true`, `<Route
+ * index>`) is the page at its parent's address, and a route around others —
+ * an object with `children`, a `<Route element>` with `<Route>`s inside — is
+ * the layout they render inside (a `references` edge marked `layout: true`).
+ * Known limits, deliberate: a splat (`/admin/*`) matches anything, so it is
+ * never the answer to a concrete href; and an index route at the top of a
+ * component's own `<Routes>` is at wherever another route mounts that
+ * component, which its file does not say, so it is no route at all.
  */
 
 import type { Language, Node } from '../../types';
@@ -91,6 +95,15 @@ function isReactRouterRoute(node: Node): boolean {
   return rest === node.name || (!/^[A-Z]+:/.test(rest) && Boolean(node.signature?.startsWith('route-parts:')));
 }
 
+/**
+ * True for a route the table holds. A nested route's path is relative to its
+ * parent; without the tree it is not a destination. A splat matches
+ * everything, so it answers nothing.
+ */
+function isDestination(node: Node): boolean {
+  return isReactRouterRoute(node) && node.name.startsWith('/') && !node.name.endsWith('*');
+}
+
 /** `:id?` — a parameter React Router serves the route with or without. */
 function isOptionalParam(seg: string): boolean {
   return seg.startsWith(':') && seg.endsWith('?');
@@ -110,10 +123,7 @@ export function reactRouterTable(context: ResolutionContext): ReactRouterTable {
     return t;
   };
   for (const node of all) {
-    if (!isReactRouterRoute(node)) continue;
-    // A nested route's path is relative to its parent; without the tree it is
-    // not a destination. A splat matches everything, so it answers nothing.
-    if (!node.name.startsWith('/') || node.name.endsWith('*')) continue;
+    if (!isDestination(node)) continue;
     const root = reactRouterRoot(node.filePath);
     const path = node.name.length > 1 && node.name.endsWith('/') ? node.name.slice(0, -1) : node.name;
     addRouteTo(tableAt(root), path, node);
@@ -173,6 +183,12 @@ export const reactRouterResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_CALL.test(name);
+  },
+
+  navigation: {
+    tails: ['push', 'replace', 'navigate', 'redirect'],
+    // A call matches against the table of the app its file is in.
+    scope: (route) => (isDestination(route) ? [reactRouterRoot(route.filePath)] : null),
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {

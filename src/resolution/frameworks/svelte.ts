@@ -45,6 +45,9 @@ const SVELTEKIT_MODULE_PREFIXES = [
 export const svelteResolver: FrameworkResolver = {
   name: 'svelte',
   languages: ['svelte'],
+  // Runes are written in `.svelte.ts` / `.svelte.js` modules too, and a
+  // SvelteKit `+page.ts` or `hooks.server.ts` imports `$lib/…` and `$app/…`.
+  resolveLanguages: ['svelte', 'typescript', 'javascript'],
 
   detect(context: ResolutionContext): boolean {
     // Check for svelte or @sveltejs/kit in package.json

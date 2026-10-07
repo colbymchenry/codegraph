@@ -15,6 +15,7 @@ import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary 
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedTypeName, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
+import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -1373,8 +1374,9 @@ const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
  * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
  * and the bracket form; and `declare global` contributes names to every file
  * whether or not the module exports anything of its own. Kept as a source test
- * rather than a node scan precisely because `isExported` is set only from an
- * `export_statement` ancestor, so `const x = …; export { x }` and
+ * rather than a node scan precisely because `isExported` is set only where a
+ * declaration is written (an `export_statement` around it, or a `declare
+ * module` / `declare global` body), so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
 const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
@@ -1561,6 +1563,37 @@ function isTestSuitePath(filePath: string): boolean {
       // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
       /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
   return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
+}
+
+const fileStem = (filePath: string): string => {
+  const name = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(0, dot) : name;
+};
+
+/**
+ * Whether a C or C++ file named like a test suite is part of `ref`'s
+ * translation unit after all. A file is in every translation unit that
+ * includes it, whatever its name says: protobuf's conformance framework is
+ * `conformance_test.h` (`ConformanceTestSuite`) and `test_runner.h`, which the
+ * suites and runners include, so binary_json_conformance_suite.cc's
+ * `suite_.ReportFailure(…)` is `ConformanceTestSuite::ReportFailure`. A
+ * definition in a source file counts through the header it implements: the
+ * one named like it that it includes (`conformance_test.cc` →
+ * `conformance_test.h`), when that header is a test suite's too — jemalloc's
+ * test `test/unit/hash.c` includes the library's `hash.h` to test it.
+ */
+function isIncludedCppTestSuite(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if ((candidate.language !== 'c' && candidate.language !== 'cpp') || (ref.language !== 'c' && ref.language !== 'cpp')) return false;
+  if (cppIncluders(candidate.filePath, context).has(ref.filePath)) return true;
+  const stem = fileStem(candidate.filePath);
+  for (const include of context.getNodesInFile(candidate.filePath)) {
+    if (include.kind !== 'import' || fileStem(include.name) !== stem) continue;
+    const header = cppIncludedFile(include, context);
+    if (header && header !== candidate.filePath && fileStem(header) === stem && isTestSuitePath(header) &&
+        cppIncluders(header, context).has(ref.filePath)) return true;
+  }
+  return false;
 }
 
 const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -1938,6 +1971,48 @@ export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionCont
 }
 
 /**
+ * What a Go type position — a parameter or result type, a composite
+ * literal's type — names: a type, which Go reads from one package. A method
+ * or a function is never it; Go reaches those only through a value or a
+ * package. Whichever strategy found a declaration of the name, the type is
+ * the one of that name in the reference's own package for a bare name, or in
+ * the imported project package for `pkg.T`. Without one there, a method or
+ * function of the name is nothing the reference means. etcd's
+ * `func (ti *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex` linked both
+ * `keyIndex` types to the method `treeIndex.keyIndex` beside it,
+ * prometheus's `(ec2Client, error)` result to the method the line declares,
+ * and its `&config_util.URL{…}` (an outside package) to `Target.URL`. A bare
+ * name that found another package's type means its own package's type of
+ * that name when there is one: prometheus's `prompb` builds its own
+ * `Histogram_CountInt`, not the `write/v2` one.
+ */
+export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target || target.language !== 'go') return result;
+  const isType = GO_TYPE_KINDS.has(target.kind);
+  // A composite literal keeps its package in the name (`config_util.URL`);
+  // a parameter type leaves it on the line.
+  const dot = ref.referenceName.lastIndexOf('.');
+  const name = ref.referenceName.slice(dot + 1);
+  // The package's directory; null for a package outside the project,
+  // undefined for a qualifier that is none of the file's imports as indexed.
+  let pkgDir: string | null | undefined;
+  let bare = false;
+  if (dot >= 0) {
+    pkgDir = goImportPackageDir(ref.referenceName.slice(0, dot), ref.filePath, context);
+  } else {
+    const { written, imported } = goRefQualification(ref, context);
+    bare = written === undefined;
+    if (bare) pkgDir = goPackageDir(ref.filePath);
+    else if (imported) pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath) ?? null;
+  }
+  if (isType && (!bare || goPackageDir(target.filePath) === pkgDir)) return result;
+  const types = pkgDir ? goPackageTypes(name, pkgDir, context) : [];
+  if (types.length > 0) return { ...result, targetNodeId: preferCallSiteFile(types, ref.filePath)[0]!.id };
+  return isType ? result : null;
+}
+
+/**
  * Whether a Go reference is written through an imported package from outside
  * the project's modules — `context.Context`, `fmt.Errorf`, a third-party
  * `gin.H`.
@@ -2239,7 +2314,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (isMinifiedScript(candidate.filePath, context)) return false;
   // A test suite is not linked into the program: typeorm's `Record<K, V>` is
   // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
-  if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
+  // A C or C++ file the reference's translation unit includes is, whatever
+  // its name.
+  if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath) && !isIncludedCppTestSuite(candidate, ref, context)) return false;
   // A Svelte component's instance script, or a Vue SFC's `<script setup>`, is
   // private to the component: shadcn-svelte's 838 `<Item.Root>` (a namespace
   // import) went to a `type Item` one example component declares for itself.
@@ -6811,7 +6888,15 @@ function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: Re
     const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
     // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
     // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
-    const parameter = new RegExp(`(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
+    // The leading `(?=\()` (every match opens a list) keeps the lookbehind to
+    // where one opens. Node 22's V8 stops optimizing the regexes a process
+    // compiles once it has generated about a megabyte of regex code, which a
+    // resolver pool worker soon has, and then tried the lookbehind at every
+    // position, each time reading back through the run of blanks before it:
+    // go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
+    // stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
+    // never resolved.
+    const parameter = new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
     binds = declared || parameter.test(text);
     memo.set(key, binds);
   }
