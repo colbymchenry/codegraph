@@ -940,18 +940,16 @@ export class CodeGraph {
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
-        // (regex over *.module.ts only).
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        // (regex over *.module.ts only). A removal counts too: deleting the
+        // file that hands a React Router table to the router leaves the
+        // table's routes behind unless this pass runs to take them away.
+        // (A pure-removal sync still resolves refs below — the deletion path
+        // resurrects the removed file's incoming edges as pending refs, #1240
+        // removal case — and runPostExtract starts by dropping the resolver's
+        // name caches, which a long-lived daemon warmed against the
+        // pre-removal graph.)
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
-        } else if (result.filesRemoved > 0) {
-          // A pure-removal sync still resolves refs below — the deletion path
-          // resurrects the removed file's incoming edges as pending refs
-          // (#1240 removal case) and the orphan sweep consumes them. In a
-          // long-lived process (daemon) the resolver's name caches were
-          // warmed against the pre-removal graph; drop them so resolution
-          // sees the post-removal state. (runPostExtract above clears caches
-          // itself, so the changed-files branch is already covered.)
-          this.resolver.clearCaches();
         }
 
         // Resolve references if files were updated
@@ -1651,6 +1649,24 @@ export class CodeGraph {
    */
   getUnresolvedSupertypeSourcesAmong(nodeIds: Iterable<string>): Set<string> {
     return this.queries.getUnresolvedSupertypeSourcesAmong(nodeIds);
+  }
+
+  /**
+   * The names each of the given symbols refers to, by reference kind, where
+   * the resolver could not follow the reference — a decorator or an interface
+   * from outside the index, which leaves no edge. Ids with none are absent.
+   */
+  getUnresolvedReferenceNamesFrom(nodeIds: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, string[]> {
+    return this.queries.getUnresolvedReferenceNamesFrom(nodeIds, kinds);
+  }
+
+  /**
+   * Every symbol that refers to each of the given names, by reference kind,
+   * where the resolver could not follow it: for `implements`, every class that
+   * names a given interface from outside the index.
+   */
+  getUnresolvedReferenceSourcesNamed(names: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, Set<string>> {
+    return this.queries.getUnresolvedReferenceSourcesNamed(names, kinds);
   }
 
   /**

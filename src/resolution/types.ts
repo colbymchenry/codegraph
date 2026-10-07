@@ -240,6 +240,18 @@ export interface FrameworkExtractionResult {
 }
 
 /**
+ * Nodes a framework can name only from several files at once, with the
+ * references that bind each — and how to recognise the ones an earlier run
+ * produced, so a run can remove those it no longer wants.
+ */
+export interface CrossFileNodes extends FrameworkExtractionResult {
+  /** The kind every one of these nodes has. */
+  kind: Node['kind'];
+  /** True for a node this pass produces, and for no node extraction does. */
+  owns(node: Node): boolean;
+}
+
+/**
  * Framework-specific resolver
  */
 export interface FrameworkResolver {
@@ -292,6 +304,19 @@ export interface FrameworkResolver {
    * second run can recover the original in-file form from `qualifiedName`.
    */
   postExtract?(context: ResolutionContext): Node[];
+  /**
+   * Nodes no single file's `extract()` can decide on — a React Router route
+   * table written in one file is a table of routes only because another
+   * file hands it to the router. Called after `postExtract` on every index
+   * and every sync, it returns the COMPLETE set the framework wants now. The
+   * orchestrator inserts the new ones (their references pending, for the
+   * resolution that follows), removes the ones an earlier run inserted that
+   * are no longer wanted, renames the ones whose name changed, and leaves
+   * the rest alone, so an unchanged node keeps its edges. A node lives in the
+   * file it is written in, so re-extracting that file drops it until the
+   * next run puts it back.
+   */
+  crossFileNodes?(context: ResolutionContext): CrossFileNodes;
 }
 
 /**
