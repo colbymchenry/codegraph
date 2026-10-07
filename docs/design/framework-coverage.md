@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-09-29) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-06) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -38,11 +38,11 @@ guessed.
 |---|---|---|---|---|
 | Expo Router | `frameworks/expo-router.ts` | `expo-router-synthesizer.ts` | `expo-router.test.ts` | — |
 | Next.js | `frameworks/nextjs.ts` | `next-router-synthesizer.ts` | `nextjs.test.ts` | next-saas-starter |
-| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`); bulletproof-react's `paths.x.path` constants and `lazy` routes are not read yet |
+| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page) |
 | TanStack Router | `frameworks/tanstack-router.ts` | `tanstack-router-synthesizer.ts` | `tanstack-router.test.ts` | TanStack examples, fastapi-template frontend |
 | Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies |
 | SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
-| Angular | `frameworks/angular-router.ts` | `angular-template-synthesizer.ts` | `angular-router.test.ts` | angular-realworld (31 edges, 18 renders), Ghostfolio (189 edges, 170 renders), ngx-admin (routes and renders; its menus are config), angular-spotify (Nx libs behind barrels: 14 routes), jira-clone (class-constant paths, mount-only redirects), jhipster (60), ionic-conference (18), Angular-JumpStart (18) |
+| Angular | `frameworks/angular-router.ts` | `angular-template-synthesizer.ts` | `angular-router.test.ts` | angular-realworld (31 edges, 18 renders, 32 bindings), Ghostfolio (189 edges, 170 renders, 215 bindings), ngx-admin (routes and renders; its menus are config; 13 bindings), CleanArchitecture's `src/Web/ClientApp` (signals; 12 bindings), angular-spotify (Nx libs behind barrels: 14 routes), jira-clone (class-constant paths, mount-only redirects), jhipster (60), ionic-conference (18), Angular-JumpStart (18) |
 
 Shared machinery all seven use, in `frameworks/expo-router.ts`: `RouteTable` /
 `RootedRouteTable`, `routesForFile`, `addRouteTo`, `matchRoute`, `appRootFor`,
@@ -59,13 +59,35 @@ field written in a component's class (a tab bar's or a menu's config, bound
 in a loop elsewhere) counts as a link from that component. An event binding
 (`(click)="save()"`) is a `calls` edge from the component to its own method
 carrying `metadata.trigger`, which Steps uses in place of reading a trigger
-at the edge's line (the binding is in the template, not the source there). A route with
+at the edge's line (the binding is in the template, not the source there).
+A property binding, an interpolation, a structural directive or a
+control-flow block that calls one of the component's own members
+(`[name]="icon()"`, `{{ label() }}`, `*matRowDef="let row; columns:
+displayedColumns()"`, `@if (loading())`, `@let total = price();`) is a
+`calls` edge too (`angular-binding`, the binding as `via`), with no trigger:
+it runs when the template renders, so Steps folds it into the screen rather
+than drawing a handler the user fires — a trigger there drew `computed`
+signals as user actions. A member read without a call counts only when it is
+method-kind: a getter is called, a method handed to a child
+(`[displayWith]="displayFn"`, `trackBy: trackById`) is a `references` edge
+with `fnRef`, and a field a call filled (`days = Array.from(…)`) a plain
+`references`. A property read (`[value]="title"`) links nothing, as in
+TypeScript, which records no property reads either; on angular-realworld,
+ngx-admin, Ghostfolio and CleanArchitecture it would have added four times
+the edges and taken nothing off the Dead code list, which never asks about
+properties. A pipe, an object key, a
+microsyntax key (`of`, `trackBy:`, `index`), a template's own names (`let
+item`, `as user`, `#ref`, `@let x`, `let-row`) and a commented-out binding
+link nothing. A route with
 `children` is a layout: its component carries a `references` edge marked
 `layout: true` from each screen nested in it, and `routeLayouts` in
 `route-roots.ts` gives Screens every screen a layout serves. Known limits: a
 route with a custom `matcher` has no static address, a relative navigation
-(`relativeTo`) is left unresolved, and an edit to a template file alone is
-picked up at the next sync of any source file (templates are not watched).
+(`relativeTo`) is left unresolved, an edit to a template file alone is
+picked up at the next sync of any source file (templates are not watched), a
+member a component inherits from a base class is not linked from its
+template, and a template's local hides a same-named member for the rest of
+the template rather than only inside its block.
 
 ---
 
@@ -231,6 +253,36 @@ Each of these cost real debugging time; they are not hypothetical.
    per file-count for exactly this reason — an earlier version cached the empty
    pre-index answer and every framework whose dependency lived one directory
    down stayed undetected.
+12. **An app's manifest can sit three or more levels down.** An ASP.NET
+   solution keeps its single-page app in `src/Web/ClientApp/`, and prometheus
+   keeps its React apps in `web/ui/mantine-ui/` under a workspace root at
+   `web/ui/` that declares only tooling. `declaredDependencies` reads the root
+   and the first two levels, then gives the slots left to the directories
+   above JS/TS code, shallowest first. Read only two levels deep, Angular
+   Router never ran on jasontaylordev/CleanArchitecture, and every
+   template-bound handler there was listed as dead code. A new detector that
+   gates on a dependency should ask `dependsOn`, not read a `package.json`
+   itself, so it sees the same manifests every other detector does.
+13. **A route table can be named only by another file.** The ASP.NET Core
+   React template keeps its routes in `AppRoutes.js`, a file that never names
+   the router, and renders them from `App.js` with `AppRoutes.map(({ element,
+   ...rest }) => <Route {...rest} element={element} />)`; codedthemes' admin
+   kits put one route object per file and list them in
+   `createBrowserRouter([MainRoutes, LoginRoutes])`. Read on its own, such a
+   file cannot be told from a menu's `{ path, element }` list, and per-file
+   extraction cannot see the file that hands it over, nor run again when that
+   file changes. So React keeps those routes in the cross-file pass
+   (`FrameworkResolver.crossFileNodes`, reconciled in `runPostExtract` on every
+   index and sync, removals included): it starts from the files that import
+   React Router, takes only a `useRoutes` / `create*Router` argument or a
+   `.map` whose callback renders a `<Route>` from the item's own fields
+   (`{...route}`, `{...rest}`, `path={route.path}` — never
+   `path={r.layout + r.path}`), follows the import to the table and the tables
+   it names in turn, and owns its routes by id (`…:table:<path>`). Two limits
+   it shares with every router: a table rendered by a component that is
+   itself mounted under another file's `<Route path="/admin/*">` reads as if
+   at the root, and a navigation that failed while its route was gone is not
+   retried until a full index.
 
 ---
 

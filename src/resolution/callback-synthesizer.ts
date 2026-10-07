@@ -828,51 +828,143 @@ const IFACE_OVERRIDE_LANGS = new Set([
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
  * method call to the concrete overrides.
  *
- * Name-only matching (signatures ignored) — over-approximation accepted, in line
- * with the other dispatch synthesizers; capped per interface. Empty interfaces
- * (`any`) are skipped so they don't match every struct.
+ * Both method sets include what embedding brings in, read off the declared
+ * `extends`/`implements` edge each embedded type is. An interface has the
+ * methods of the interfaces it embeds: etcd's `AuthReadTx` is `RLock` and
+ * `RUnlock` plus all of `UnsafeAuthReader`, so an `RWMutex` is not one. A struct
+ * has the methods promoted from the structs, interfaces and defined types it
+ * embeds, at any depth: counting embedded interfaces alone would drop every
+ * struct that satisfies one through promoted methods. Synthesized edges are
+ * never followed (this pass writes them), and an embedding that resolved to
+ * nothing (`io.Closer`) adds nothing.
+ *
+ * Name-only matching (signatures ignored, and a promoted name counted even
+ * where Go finds it ambiguous or hidden by a field) — over-approximation
+ * accepted, in line with the other dispatch synthesizers; capped per
+ * interface. Empty interfaces (`any`) are skipped so they don't match every
+ * struct, and a struct that embeds the interface keeps the edge its embedding
+ * already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
-  const methodNameSet = (id: string): Set<string> =>
-    new Set(
-      queries
-        .getOutgoingEdges(id, ['contains'])
-        .map((e) => queries.getNodeById(e.target))
-        .filter((n): n is Node => !!n && n.kind === 'method')
-        .map((n) => n.name),
-    );
-
-  // Materializes GO structs only (the pass is language-gated by the caller),
-  // never the whole struct kind — that array is O(nodes) on struct-heavy
-  // repos like the Linux kernel (#1212).
+  // Materializes GO structs and interfaces only (the pass is language-gated by
+  // the caller), never the whole struct kind — that array is O(nodes) on
+  // struct-heavy repos like the Linux kernel (#1212).
   const goStructs: Node[] = [];
   for (const s of queries.iterateNodesByKindIn('struct', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
     goStructs.push(s);
   }
-  const structMethods = new Map<string, Set<string>>();
-  for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
-
-  for (const iface of queries.iterateNodesByKindIn('interface', ['go'])) {
+  const goInterfaces: Node[] = [];
+  for (const i of queries.iterateNodesByKindIn('interface', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const want = methodNameSet(iface.id);
+    goInterfaces.push(i);
+  }
+
+  // The kinds of type whose methods embedding passes on. A defined type
+  // (`type HandlersChain []HandlerFunc`) is looked up when an embedding names one.
+  const typeKind = new Map<string, NodeKind | null>();
+  for (const s of goStructs) typeKind.set(s.id, 'struct');
+  for (const i of goInterfaces) typeKind.set(i.id, 'interface');
+  const kindOf = (id: string): NodeKind | null => {
+    let kind = typeKind.get(id);
+    if (kind === undefined) {
+      const n = queries.getNodeById(id);
+      kind = n?.language === 'go' && n.kind === 'type_alias' ? 'type_alias' : null;
+      typeKind.set(id, kind);
+    }
+    return kind;
+  };
+
+  // Memoized: an embedded base is read once, however many types embed it.
+  const ownMemo = new Map<string, Set<string>>();
+  const ownMethods = (id: string): Set<string> => {
+    let names = ownMemo.get(id);
+    if (!names) {
+      names = new Set(
+        queries
+          .getOutgoingEdges(id, ['contains'])
+          .map((e) => queries.getNodeById(e.target))
+          .filter((n): n is Node => !!n && n.kind === 'method')
+          .map((n) => n.name),
+      );
+      ownMemo.set(id, names);
+    }
+    return names;
+  };
+
+  // The types one embeds: an interface embeds interfaces, a struct any of the
+  // three. Every struct's and interface's are read up front in a few batched
+  // queries rather than one query per type; a defined type's, when reached.
+  const isEmbedding = (e: Edge): boolean =>
+    e.provenance !== 'heuristic' &&
+    (typeKind.get(e.source) === 'interface' ? kindOf(e.target) === 'interface' : kindOf(e.target) !== null);
+  const NO_EMBEDS: string[] = [];
+  const embedMemo = new Map<string, string[]>();
+  const typeIds = [...typeKind.keys()];
+  for (let i = 0; i < typeIds.length; i += 2000) {
+    for (const e of queries.getOutgoingEdgesFrom(typeIds.slice(i, i + 2000), ['extends', 'implements'])) {
+      if (!isEmbedding(e)) continue;
+      const targets = embedMemo.get(e.source);
+      if (targets) targets.push(e.target);
+      else embedMemo.set(e.source, [e.target]);
+    }
+    await onYield();
+  }
+  const embeds = (id: string): string[] => {
+    let targets = embedMemo.get(id);
+    if (targets) return targets;
+    const kind = typeKind.get(id);
+    if (kind === 'struct' || kind === 'interface') return NO_EMBEDS;
+    targets = queries.getOutgoingEdges(id, ['extends', 'implements']).filter(isEmbedding).map((e) => e.target);
+    embedMemo.set(id, targets);
+    return targets;
+  };
+
+  // Own methods plus every embedded type's, down to the last level. Go allows
+  // a struct to embed a pointer to itself, or to one embedding it back.
+  const methodSet = (id: string): Set<string> => {
+    if (embeds(id).length === 0) return ownMethods(id);
+    const names = new Set<string>();
+    const reached = new Set<string>([id]);
+    const pending = [id];
+    while (pending.length > 0) {
+      const at = pending.pop()!;
+      for (const m of ownMethods(at)) names.add(m);
+      for (const t of embeds(at)) {
+        if (reached.has(t)) continue;
+        reached.add(t);
+        pending.push(t);
+      }
+    }
+    return names;
+  };
+
+  const covers = (have: Set<string>, want: Set<string>): boolean => {
+    if (have.size < want.size) return false;
+    for (const m of want) {
+      if (!have.has(m)) return false;
+    }
+    return true;
+  };
+
+  const structMethods = new Map<string, Set<string>>();
+  for (const s of goStructs) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    structMethods.set(s.id, methodSet(s.id));
+  }
+
+  for (const iface of goInterfaces) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    const want = methodSet(iface.id);
     if (want.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
-    for (const s of goStructs) {
-      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-      const have = structMethods.get(s.id);
-      if (!have || have.size < want.size) continue;
-      let all = true;
-      for (const m of want) {
-        if (!have.has(m)) { all = false; break; }
-      }
-      if (!all) continue;
+    const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) return;
       seen.add(key);
       edges.push({
         source: s.id,
@@ -883,6 +975,23 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
         metadata: { synthesizedBy: 'go-implements', via: iface.name, registeredAt: `${s.filePath}:${s.startLine}` },
       });
       added++;
+    };
+    // A struct that needs promoted methods waits for those declaring all of
+    // them: under the cap, those are what the interface-dispatch bridge links
+    // a call through the interface to.
+    const throughEmbedding: Node[] = [];
+    for (const s of goStructs) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const have = structMethods.get(s.id);
+      if (!have || !covers(have, want)) continue;
+      if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      const own = ownMethods(s.id);
+      if (own !== have && !covers(own, want)) throughEmbedding.push(s);
+      else link(s);
+    }
+    for (const s of throughEmbedding) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      link(s);
     }
   }
   return edges;
@@ -1461,9 +1570,14 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       const event = m[1]!;
       const expr = m[2]!.trim();
       if (expr.includes('=>') || expr.startsWith('$')) continue; // inline arrow / $emit
-      const name = expr.match(/^([A-Za-z_]\w*)/)?.[1];
+      // `@click="save"` names a method Vue calls with the event. A handler that
+      // is an expression — `save(item)`, `emit('close')`, `open = true` — is
+      // the template's own code: the Vue extractor records its calls, on their
+      // line (#2340), so resolving its leading name here too doubled those
+      // edges and bound `emit(…)` / `open = …` to any function of that name.
+      const name = expr.match(/^([A-Za-z_$][\w$]*)\s*(?:\(|$)/)?.[1];
       if (!name) continue;
-      const direct = resolve(name, HANDLER_KINDS);
+      const direct = name === expr ? resolve(name, HANDLER_KINDS) : undefined;
       if (direct) { addEdge(direct, { synthesizedBy: 'vue-handler', event }); continue; }
       // Composable-destructure handler → resolve to the composable's returned fn.
       const d = destructured.get(name);

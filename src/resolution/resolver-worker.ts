@@ -27,6 +27,7 @@ import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import { RESOLVE_PROFILE, epochMs } from './resolver-pool';
+import { collectBeforeExit } from '../worker-teardown';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -135,6 +136,8 @@ port.on('message', (msg: InMessage) => {
         } catch {
           /* already closed */
         }
+        // No GC marking in flight when the thread ends (worker-teardown.ts).
+        collectBeforeExit();
         process.exit(0);
         break;
       }

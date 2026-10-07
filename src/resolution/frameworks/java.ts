@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -137,7 +138,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -150,7 +151,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 2: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -163,7 +164,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 3: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -176,7 +177,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 4: Entity/Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, ENTITY_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, ENTITY_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -189,7 +190,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 5: Component references
     if (ref.referenceName.endsWith('Component') || ref.referenceName.endsWith('Config')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, COMPONENT_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, COMPONENT_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -553,28 +554,13 @@ function joinPath(prefix: string, sub: string): string {
   return '/' + parts.join('/');
 }
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }
+

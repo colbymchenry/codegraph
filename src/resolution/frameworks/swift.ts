@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 // No extract(): a SwiftUI view is its own struct node, and a UIKit controller
 // its class. A one-line `component`/`class` twin per `struct X: View` (and per
@@ -39,9 +40,12 @@ export const swiftUIResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 1: View references (SwiftUI views are PascalCase ending in View)
     if (ref.referenceName.endsWith('View') && /^[A-Z]/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, VIEW_KINDS, VIEW_DIRS, context);
+      const result = resolveByNameAndKind(ref, VIEW_KINDS, VIEW_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -54,7 +58,7 @@ export const swiftUIResolver: FrameworkResolver = {
 
     // Pattern 2: ViewModel/ObservableObject references
     if (ref.referenceName.endsWith('ViewModel') || ref.referenceName.endsWith('Store') || ref.referenceName.endsWith('Manager')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VIEWMODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, VIEWMODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -67,7 +71,7 @@ export const swiftUIResolver: FrameworkResolver = {
 
     // Pattern 3: Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, MODEL_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, MODEL_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -105,9 +109,12 @@ export const uikitResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 1: ViewController references
     if (ref.referenceName.endsWith('ViewController')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VC_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, VC_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -120,7 +127,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 2: UIView subclass references
     if (ref.referenceName.endsWith('View') && !ref.referenceName.endsWith('ViewController')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, UIVIEW_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, UIVIEW_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -133,7 +140,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 3: Cell references
     if (ref.referenceName.endsWith('Cell')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CELL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CELL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -146,7 +153,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 4: Delegate/DataSource references
     if (ref.referenceName.endsWith('Delegate') || ref.referenceName.endsWith('DataSource')) {
-      const result = resolveByNameAndKind(ref.referenceName, PROTOCOL_KINDS, [], context);
+      const result = resolveByNameAndKind(ref, PROTOCOL_KINDS, [], context);
       if (result) {
         return {
           original: ref,
@@ -193,20 +200,22 @@ export const vaporResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 0: a route's handler — `use: SearchController.show` arrives as
     // `SearchController@show`, `use: self.index` / `use: index` as `@index`.
     // Resolved on the type the route names, never by the method's name alone:
     // every controller has a `show`. No match, or two, is left unresolved.
     const handler = VAPOR_HANDLER.exec(ref.referenceName);
     if (handler) {
-      if (ref.language !== 'swift') return null;
       const target = resolveVaporHandler(handler[1] ?? null, handler[2]!, ref, context);
       return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
     }
 
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, VAPOR_CONTROLLER_KINDS, VAPOR_CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, VAPOR_CONTROLLER_KINDS, VAPOR_CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -219,7 +228,7 @@ export const vaporResolver: FrameworkResolver = {
 
     // Pattern 2: Model references (Fluent)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FLUENT_MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, FLUENT_MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -232,7 +241,7 @@ export const vaporResolver: FrameworkResolver = {
 
     // Pattern 3: Middleware references
     if (ref.referenceName.endsWith('Middleware')) {
-      const result = resolveByNameAndKind(ref.referenceName, VAPOR_CONTROLLER_KINDS, VAPOR_MIDDLEWARE_DIRS, context);
+      const result = resolveByNameAndKind(ref, VAPOR_CONTROLLER_KINDS, VAPOR_MIDDLEWARE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -330,9 +339,106 @@ export const vaporResolver: FrameworkResolver = {
       }
     }
 
+    // `routes.on(.POST, "x", use: handler)` names its method as the first argument.
+    // Arguments may hold one level of parentheses (`body: .collect(maxSize: "1mb")`);
+    // only unlabeled string arguments are path segments.
+    const onRegex = /\b(\w+)\.on\s*\(\s*\.([A-Z]+)\s*,\s*((?:(?:[^,()]|\([^()]*\))+,)*\s*)use:\s*([A-Za-z_][\w.]*)/g;
+    const pathArgs = (argText: string) => argText.split(',').filter((a) => /^\s*"[^"]*"\s*$/.test(a)).join(',');
+    while ((match = onRegex.exec(safe)) !== null) {
+      const [, receiver, method, segsStr, handlerExpr] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', pathArgs(segsStr!)) || '/';
+      const id = `route:${filePath}:${line}:${method}:${routePath}`;
+      nodes.push({
+        id, kind: 'route', name: `${method} ${routePath}`, qualifiedName: `${filePath}::route:${routePath}`,
+        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: 'swift', updatedAt: now,
+      });
+      const handlerName = vaporHandlerRef(handlerExpr!, receiverTypes);
+      if (handlerName) references.push({ fromNodeId: id, referenceName: handlerName, referenceKind: 'references', line, column: 0, filePath, language: 'swift' });
+    }
+
+    // A route whose handler is a trailing closure — `app.get("hello") { req in … }`,
+    // `app.webSocket("chat") { req, ws in … }`, `routes.on(.GET, "x") { … }`. It has
+    // no handler symbol; the closure's calls belong to the function registering it.
+    // An HTTP client's `req.client.get("https://…") { … }` is not a route.
+    const closureRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options|webSocket|on)\s*\(([^()]*)\)\s*\{/g;
+    while ((match = closureRegex.exec(safe)) !== null) {
+      const [, receiver, verb, args] = match;
+      if (/\buse:/.test(args!) || receiver === 'client' || /^\s*"https?:/.test(args!)) continue;
+      // A route registration is a statement: `if let v = req.parameters.get("x") {`
+      // opens the `if` body, not a trailing closure.
+      const lineStart = safe.lastIndexOf('\n', match.index) + 1;
+      if (!/^\s*(?:(?:try|await)\s+)*$/.test(safe.slice(lineStart, match.index))) continue;
+      let method = verb === 'webSocket' ? 'WS' : verb!.toUpperCase();
+      let segs = args!;
+      if (verb === 'on') {
+        const on = /^\s*\.([A-Z]+)\s*,?(.*)$/s.exec(args!);
+        if (!on) continue;
+        method = on[1]!;
+        segs = on[2]!;
+      }
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segs) || '/';
+      const id = `route:${filePath}:${line}:${method}:${routePath}`;
+      nodes.push({
+        id, kind: 'route', name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`, filePath, startLine: line, endLine: line,
+        startColumn: 0, endColumn: match[0].length, language: 'swift', updatedAt: now,
+      });
+      // The closure IS the handler: its calls are the route's, as an Express
+      // inline handler's are, so Steps draws what `GET hello` does.
+      const open = match.index + match[0].length - 1;
+      const close = closingBrace(safe, open);
+      if (close > open) {
+        for (const name of closureCallNames(safe.slice(open + 1, close))) {
+          references.push({ fromNodeId: id, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language: 'swift' });
+        }
+      }
+    }
+
     return { nodes, references };
   },
 };
+
+/** The `}` matching the `{` at `open`; string literals are skipped. -1 when unbalanced. */
+function closingBrace(s: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') {
+      for (i++; i < s.length && s[i] !== '"'; i++) if (s[i] === '\\') i++;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** Words Swift writes before a `(` that are not calls. */
+const SWIFT_NOT_CALLS = new Set(['if', 'guard', 'switch', 'while', 'for', 'return', 'catch', 'case', 'in', 'try', 'await', 'throw', 'some', 'any']);
+
+/**
+ * The calls a route closure's body makes, each once, keeping the receiver
+ * (`Todo.query`, `req.auth.require`) so they resolve as calls on it. A member
+ * of an expression (`a.b().c(`) names nothing this can follow.
+ */
+function closureCallNames(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const callRe = /((?:[A-Za-z_]\w*\s*[?!]?\.\s*)*)([A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(body)) !== null) {
+    const callee = m[2]!;
+    const receiver = m[1]!.replace(/[\s?!]/g, '').replace(/\.$/, '');
+    if (!receiver && (SWIFT_NOT_CALLS.has(callee) || /[.)\]]\s*$/.test(body.slice(0, m.index)))) continue;
+    const name = receiver ? `${receiver}.${callee}` : callee;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
 
 // Directory patterns
 const VIEW_DIRS = ['/Views/', '/View/', '/Screens/', '/Components/', '/UI/'];
@@ -448,29 +554,12 @@ const MODEL_KINDS = new Set(['struct', 'class']);
 const PROTOCOL_KINDS = new Set(['protocol']);
 const VAPOR_CONTROLLER_KINDS = new Set(['class', 'struct']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  if (preferredDirPatterns.length > 0) {
-    const preferred = kindFiltered.filter((n) =>
-      preferredDirPatterns.some((d) => n.filePath.includes(d))
-    );
-    if (preferred.length > 0) return preferred[0]!.id;
-  }
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }

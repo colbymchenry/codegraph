@@ -377,7 +377,7 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Expo Modules | expo-haptics | expo-camera | expo SDK sweep (7 packages) |
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
-Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+Every bridge hop says how it got into the graph. A hop matched by a bridge resolver carries `metadata.resolvedBy: 'framework'` and `metadata.framework` naming the resolver (`swift-objc-bridge`, `react-native-bridge`, `expo-modules-js`, `fabric-view`). A synthesized channel is tagged `provenance:'heuristic'` with `metadata.synthesizedBy` (`rn-event-channel`, `fabric-native-impl`).
 
 ---
 

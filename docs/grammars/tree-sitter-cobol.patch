@@ -303,7 +303,7 @@ index 6d48b47..e700a18 100644
      _NOT_GREATER: $ => /([nN][oO][tT][ \t]+(>|[gG][rR][eE][aA][tT][eE][rR]))/,
  
 diff --git a/src/scanner.c b/src/scanner.c
-index 6c1ae90..b69cf53 100644
+index 6c1ae90..3382988 100644
 --- a/src/scanner.c
 +++ b/src/scanner.c
 @@ -1,4 +1,5 @@
@@ -372,14 +372,18 @@ index 6c1ae90..b69cf53 100644
      if(valid_symbols[WHITE_SPACES]) {
          if(is_white_space(lexer->lookahead)) {
              while(is_white_space(lexer->lookahead)) {
-@@ -106,9 +121,20 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -106,9 +121,23 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
      }
  
      if(valid_symbols[LINE_PREFIX_COMMENT] && lexer->get_column(lexer) <= 5) {
+-        while(lexer->get_column(lexer) <= 5) {
 +        // The sequence area is ignored content — but the free-format
 +        // preprocessor plants the CGWIDE sentinel here on the first line.
++        // Stop at end of input: advance() is a no-op there, so a file that
++        // ends inside the sequence area (e.g. a last line "    .") would
++        // never reach column 6 and the loop would spin forever.
 +        int match = 0;
-         while(lexer->get_column(lexer) <= 5) {
++        while(lexer->get_column(lexer) <= 5 && !lexer->eof(lexer)) {
 +            if(match >= 0 && match < 6 && lexer->lookahead == CG_WIDE_SENTINEL[match]) {
 +                match++;
 +            } else {
@@ -393,7 +397,7 @@ index 6c1ae90..b69cf53 100644
          lexer->result_symbol = LINE_PREFIX_COMMENT;
          lexer->mark_end(lexer);
          return true;
-@@ -132,7 +158,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -132,7 +161,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
      }
  
      if(valid_symbols[LINE_SUFFIX_COMMENT]) {
@@ -402,7 +406,7 @@ index 6c1ae90..b69cf53 100644
              while(lexer->lookahead != '\n' && lexer->lookahead != 0) {
                  lexer->advance(lexer, true);
              }
-@@ -143,7 +169,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -143,7 +172,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
      }
  
      if(valid_symbols[COMMENT_ENTRY]) {
@@ -411,7 +415,7 @@ index 6c1ae90..b69cf53 100644
              lexer->mark_end(lexer);
              lexer->result_symbol = COMMENT_ENTRY;
              return true;
-@@ -152,18 +178,66 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -152,18 +181,66 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
          }
      }
  
@@ -482,7 +486,7 @@ index 6c1ae90..b69cf53 100644
                  lexer->mark_end(lexer);
                  return true;
              }
-@@ -187,7 +261,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -187,7 +264,7 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
              }
  
              lexer->advance(lexer, true);
@@ -491,7 +495,7 @@ index 6c1ae90..b69cf53 100644
                  lexer->advance(lexer, true);
              }
          }
-@@ -197,11 +271,19 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
+@@ -197,11 +274,19 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
  }
  
  unsigned tree_sitter_COBOL_external_scanner_serialize(void *payload, char *buffer) {

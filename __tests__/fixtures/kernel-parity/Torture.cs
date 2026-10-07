@@ -179,3 +179,8 @@ namespace Torture.Beta
 {
     public class Other { }
 }
+
+static class TopLevelGuard
+{
+    public static T AgainstNull<T>(T value) where T : class => value;
+}

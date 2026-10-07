@@ -89,6 +89,19 @@ export const nestjsResolver: FrameworkResolver = {
         .getNodesByName(ref.referenceName)
         .filter((n) => n.kind === 'class');
       if (candidates.length === 0) return null;
+      // A TS module reaches another file's class only by importing it — the
+      // import resolver's — so a guess by name stays in the feature: the
+      // file itself, or the convention file beside it (`users.controller.ts`
+      // → `users.service.ts`). Every Nest sample app declares its own
+      // `CatsService`, and the file-name preference sent specs across apps.
+      const own = candidates.find((n) => n.filePath === ref.filePath);
+      if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'framework' };
+      if (/\.(?:m?[jt]sx?|cjs|cts|mts)$/.test(ref.filePath)) {
+        const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+        const beside = candidates.find((n) => n.filePath.includes(convention) &&
+          n.filePath.startsWith(dir) && !n.filePath.slice(dir.length).includes('/'));
+        return beside ? { original: ref, targetNodeId: beside.id, confidence: 0.85, resolvedBy: 'framework' } : null;
+      }
       const preferred = candidates.find((n) => n.filePath.includes(convention));
       const target = preferred ?? candidates[0]!;
       return {

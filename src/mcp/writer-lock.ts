@@ -165,6 +165,44 @@ export function markWriterReady(projectRoot: string): void {
   }
 }
 
+/** Waits between retries of a writer-record swap refused by Windows (another process has the file open). */
+const SWAP_RETRY_DELAYS_MS = [25, 50, 100, 200];
+
+/**
+ * Replace the writer record of `fromPid` with `next`, and only that record, so
+ * the slot passes between two processes without ever falling free (#2335). A
+ * stopped daemon's sessions serve themselves in-process the moment it goes, and
+ * one that found the slot free or stale would claim it as their own writer.
+ * Compare and rename are separate steps, so callers check the result: whether
+ * the record was replaced. Never throws.
+ */
+export function swapWriterLock(projectRoot: string, fromPid: number, next: WriterLockInfo): boolean {
+  const pidPath = getWriterPidPath(projectRoot);
+  const tmp = `${pidPath}.${process.pid}.swap.tmp`;
+  try {
+    if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
+    fs.writeFileSync(tmp, encode(next), { mode: 0o600 });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(tmp, pidPath);
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        const delay = SWAP_RETRY_DELAYS_MS[attempt];
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || delay === undefined) {
+          return false;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
+      }
+    }
+  } catch {
+    return false;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
+  }
+}
+
 /** Release if we still own the lock (pid match). */
 export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): void {
   const pidPath = getWriterPidPath(projectRoot, lockName);

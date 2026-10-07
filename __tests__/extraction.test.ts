@@ -11,7 +11,7 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, shopifyThemeRoot } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
@@ -1180,7 +1180,7 @@ export const exported = { handler: () => target() };
       return result.unresolvedReferences
         .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
         .map((u) => byId.get(u.fromNodeId))
-        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .map((n) => (n ? `${n.kind}:${n.qualifiedName}` : '?'))
         .sort();
     };
 
@@ -1191,16 +1191,54 @@ export const exported = { handler: () => target() };
     });
 
     it('a non-exported object literal contributes calls (it was skipped outright)', () => {
-      // `exported`'s members are minted as their own function nodes, so its
-      // arrow's call comes from `handler`; the non-exported ones attribute to
-      // the declared constant.
+      // A named literal's function members are its own nodes, exported or not
+      // (#2300), so each arrow's call comes from its `handler`; the literal's
+      // eager value and the array's arrow attribute to the declared constant.
       expect(callersOf('target')).toEqual([
         'constant:list',
         'constant:obj',
-        'constant:obj',
-        'function:handler',
+        'function:exported::handler',
+        'function:obj::handler',
       ]);
     });
+  });
+
+  // A destructuring declaration mints no symbol, so its initializer was never
+  // walked at module scope: `const { a } = useFoo(1)` recorded no call at all,
+  // where the same line inside a function did (#2340).
+  it.each(['ts', 'tsx', 'js', 'jsx'])('records the calls of a module-scope destructuring declaration (%s, #2340)', (ext) => {
+    const code = [
+      'const { a } = useFoo(1)',
+      'let [b, c] = pair()',
+      'var { d: { e } } = nested()',
+      'const { f = fallback() } = withDefault()',
+      'const [g = other(), ...rest] = list()',
+      'export const { h } = exported()',
+      'const { i } = await load(() => inArrow())',
+      'export function probe() { const { j } = inner(); return j }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(`app.${ext}`, code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${byId.get(r.fromNodeId)?.kind}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'file:exported@6',
+      'file:fallback@4',
+      'file:inArrow@7',
+      'file:list@5',
+      'file:load@7',
+      'file:nested@3',
+      'file:other@5',
+      'file:pair@2',
+      'file:useFoo@1',
+      'file:withDefault@4',
+      'function:inner@8', // inside a function: the function's, as before
+    ]);
+    // Still no symbol for a destructured binding.
+    expect(result.nodes.filter((n) => n.kind === 'constant' || n.kind === 'variable')).toEqual([]);
   });
 });
 
@@ -7389,6 +7427,9 @@ describe('Liquid Shopify JSON template section resolution', () => {
     // looked unused. The JSON is now indexed and its `type`s linked.
     fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
     fs.mkdirSync(path.join(tempDir, 'templates/customers'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'layout'), { recursive: true });
+    // Every Shopify theme has layout/theme.liquid beside templates/ and sections/.
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-login.liquid'), `<form>{{ 'customer.login' | t }}</form>\n`);
     fs.writeFileSync(path.join(tempDir, 'templates/product.json'), JSON.stringify({ sections: { main: { type: 'main-product' } }, order: ['main'] }));
@@ -7405,6 +7446,238 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(login, 'main-login section').toBeDefined();
     expect(cg.getFileDependents(product!.filePath).some((p) => p.endsWith('templates/product.json')), 'top-level JSON template links its section').toBe(true);
     expect(cg.getFileDependents(login!.filePath).some((p) => p.endsWith('customers/login.json')), 'nested JSON template links its section').toBe(true);
+  });
+
+  const jsonTemplate = (type: string): string => JSON.stringify({ sections: { main: { type } }, order: ['main'] });
+  const indexedJson = (): string[] =>
+    cg.getNodesByKind('file').map((n) => n.filePath).filter((p) => p.endsWith('.json')).sort();
+
+  it('leaves JSON under templates/ or sections/ out when no Shopify theme holds it', async () => {
+    // jasontaylordev/CleanArchitecture ships a .NET project template under
+    // templates/, and a CMS keeps its content under sections/: JSON in folders
+    // with those names, but nothing beside them makes a Shopify theme, so it is
+    // not Liquid — even when a Liquid file is named like one of its "types".
+    fs.mkdirSync(path.join(tempDir, 'templates/ca-use-case/.template.config'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/dotnetcli.host.json'), JSON.stringify({ symbolInfo: { UseCase: { longName: 'name' } } }));
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/template.json'), JSON.stringify({ identity: 'CleanArchitecture.UseCase', sections: { main: { type: 'hero' } } }));
+    fs.writeFileSync(path.join(tempDir, 'sections/home.json'), jsonTemplate('hero'));
+    fs.writeFileSync(path.join(tempDir, 'sections/hero.liquid'), `<h1>{{ page.title }}</h1>\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual([]);
+    const hero = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/hero.liquid'));
+    expect(hero, 'the Liquid file itself is still indexed').toBeDefined();
+    expect(cg.getFileDependents(hero!.filePath)).toEqual([]);
+  });
+
+  it('finds a Shopify theme in a subdirectory by its config/settings_schema.json', async () => {
+    // A theme under theme/ with no layout/theme.liquid committed: its settings
+    // schema marks it. The same JSON under tools/templates/ is in no theme.
+    for (const dir of ['theme/config', 'theme/sections', 'theme/templates', 'tools/templates']) {
+      fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(tempDir, 'theme/config/settings_schema.json'), JSON.stringify([{ name: 'theme_info' }]));
+    fs.writeFileSync(path.join(tempDir, 'theme/sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'theme/templates/product.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'tools/templates/product.json'), jsonTemplate('main-product'));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual(['theme/templates/product.json']);
+    expect(cg.getFileDependents('theme/sections/main-product.liquid')).toEqual(['theme/templates/product.json']);
+    // Extracting without storing tells them apart the same way.
+    const refsOf = (file: string) => cg.extractFromSource(file, jsonTemplate('main-product')).unresolvedReferences.map((r) => r.referenceName);
+    expect(refsOf('theme/templates/product.json')).toEqual(['sections/main-product.liquid']);
+    expect(refsOf('tools/templates/product.json')).toEqual([]);
+  });
+
+  it('drops JSON templates once their folder is no longer a theme, and takes them back when it is', async () => {
+    // The same path an index built before this check takes: JSON it stored as
+    // Liquid outside any theme leaves on the next sync, without a re-index.
+    for (const dir of ['layout', 'sections', 'templates']) fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/page.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), jsonTemplate('main-product'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+
+    fs.rmSync(path.join(tempDir, 'layout'), { recursive: true, force: true });
+    // A sync of only the reported paths (the watcher's) and a full sync agree.
+    await cg.sync({ paths: ['templates/product.json'] });
+    expect(indexedJson()).toEqual(['templates/page.json']);
+    await cg.sync();
+    expect(indexedJson()).toEqual([]);
+
+    fs.mkdirSync(path.join(tempDir, 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'config/settings_schema.json'), '[]');
+    await cg.sync();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+  });
+
+  it('reads JSON under templates/ or sections/ as Liquid only inside a theme under the project root', () => {
+    fs.mkdirSync(path.join(tempDir, 'shop/layout'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'shop/layout/theme.liquid'), '');
+
+    for (const file of ['shop/templates/product.json', 'shop/templates/customers/login.json', 'shop/sections/header-group.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(true);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('liquid');
+      // Without the project root there is no theme to look for.
+      expect(isSourceFile(file), file).toBe(false);
+      expect(detectLanguage(file), file).toBe('unknown');
+    }
+    // Beside the theme, not in it; and the theme's other JSON was never a template.
+    for (const file of ['templates/product.json', 'other/sections/header-group.json', 'shop/config/settings_data.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(false);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('unknown');
+    }
+    // Outside a theme, JSON gets whatever the project maps `.json` to, as any other JSON does.
+    expect(detectLanguage('templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('yaml');
+    expect(detectLanguage('shop/templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('liquid');
+  });
+
+  const writeFiles = (files: Record<string, string>, root = tempDir): void => {
+    for (const [file, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+  };
+  // A theme at the project root, a theme in a folder marked only by its settings
+  // schema, and one in a folder with no 404 section and no price snippet of its
+  // own — the shape of panoply/syncify's example themes.
+  const severalThemes = {
+    'layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'sections/header.liquid': `{% render 'price' %}\n`,
+    'sections/main.liquid': `<main></main>\n`,
+    'snippets/price.liquid': `{{ product.price | money }}\n`,
+    'straps/dusk/config/settings_schema.json': '[]',
+    'straps/dusk/sections/404.liquid': `<h1>{{ 'templates.404.title' | t }}</h1>\n`,
+    'straps/dusk/templates/404.json': jsonTemplate('404'),
+    'examples/tailwind/layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'examples/tailwind/sections/header.liquid': `{% liquid\n  render 'price'\n  render 'icon'\n%}\n`,
+    'examples/tailwind/sections/main.liquid': `<main class="p-4"></main>\n`,
+    'examples/tailwind/snippets/icon.liquid': `<svg></svg>\n`,
+    'examples/tailwind/templates/index.json': jsonTemplate('main'),
+    'examples/tailwind/templates/404.json': jsonTemplate('404'),
+    // Liquid in no theme: an app's theme extension.
+    'extensions/reviews/blocks/stars.liquid': `{% render 'star' %}\n`,
+    'extensions/reviews/snippets/star.liquid': `<svg></svg>\n`,
+  };
+
+  it("links a theme's sections and snippets only inside that theme", async () => {
+    // Shopify looks a `{% render %}`, a `{% section %}` or a JSON template's
+    // section `type` up in the theme the file belongs to, never in another one.
+    // Matched by path tail, a theme without the 404 section linked to another
+    // theme's, and a theme in a folder even linked the project root's
+    // sections/header.liquid over its own.
+    writeFiles(severalThemes);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('straps/dusk/templates/404.json')).toEqual(['straps/dusk/sections/404.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header.liquid']);
+    expect(linksOf('examples/tailwind/templates/index.json')).toEqual(['examples/tailwind/sections/main.liquid']);
+    // What the theme lacks stays unlinked: no other theme's 404 section or price snippet.
+    expect(linksOf('examples/tailwind/templates/404.json')).toEqual([]);
+    expect(linksOf('examples/tailwind/sections/header.liquid')).toEqual(['examples/tailwind/snippets/icon.liquid']);
+    // Outside any theme, a path still resolves as before.
+    expect(linksOf('extensions/reviews/blocks/stars.liquid')).toEqual(['extensions/reviews/snippets/star.liquid']);
+  });
+
+  it("keeps a theme's references inside it when its own section is deleted", async () => {
+    // Sync resolves again what named a deleted file; another theme's 404
+    // section is no stand-in for the theme's own.
+    writeFiles({ ...severalThemes, 'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n` });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual(['examples/tailwind/sections/404.liquid']);
+
+    fs.rmSync(path.join(tempDir, 'examples/tailwind/sections/404.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual([]);
+  });
+
+  it('links a section or snippet that appears after the files naming it', async () => {
+    // Sync retries a reference it could not resolve once a file it may name
+    // appears. A section or snippet reference was parked under its extension,
+    // `liquid`, which no file is named, so it stayed unlinked until the file
+    // naming it changed or the project was indexed again.
+    const later: Record<string, string> = {
+      'sections/404.liquid': `<h1>404</h1>\n`,
+      'snippets/price.liquid': severalThemes['snippets/price.liquid'],
+      // Only straps/dusk had a 404 section, which is no stand-in for this theme's own.
+      'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n`,
+      'extensions/reviews/snippets/star.liquid': severalThemes['extensions/reviews/snippets/star.liquid'],
+    };
+    const initial = Object.fromEntries(Object.entries(severalThemes).filter(([file]) => !(file in later)));
+    writeFiles({ ...initial, 'templates/404.json': jsonTemplate('404') });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
+      'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
+    const links = (graph = cg) => Object.fromEntries(naming.map((file) => [file, graph.getFileDependencies(file).sort()]));
+    expect(links()).toEqual({
+      'templates/404.json': [],
+      'sections/header.liquid': [],
+      'examples/tailwind/templates/404.json': [],
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': [],
+    });
+
+    writeFiles(later);
+    expect((await cg.sync()).filesAdded).toBe(4);
+    const synced = links();
+    expect(synced).toEqual({
+      'templates/404.json': ['sections/404.liquid'],
+      'sections/header.liquid': ['snippets/price.liquid'],
+      'examples/tailwind/templates/404.json': ['examples/tailwind/sections/404.liquid'],
+      // The root theme's new price snippet is not this theme's.
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    // A fresh index of the same files links the same. (Indexing again over
+    // this index would skip the unchanged files that name the new ones.)
+    const freshDir = createTempDir();
+    writeFiles({ ...severalThemes, 'templates/404.json': jsonTemplate('404'), ...later }, freshDir);
+    const fresh = CodeGraph.initSync(freshDir);
+    try {
+      await fresh.indexAll();
+      expect(links(fresh)).toEqual(synced);
+    } finally {
+      fresh.close();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // A deleted snippet's references wait for it the same way.
+    fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual([]);
+    writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  it('finds the theme a file is in from the theme folder it sits in', () => {
+    const markers = new Set(['layout/theme.liquid', 'examples/tailwind/config/settings_schema.json']);
+    const exists = (relativePath: string): boolean => markers.has(relativePath);
+    expect(shopifyThemeRoot('sections/header.liquid', exists)).toBe('');
+    expect(shopifyThemeRoot('templates/customers/login.json', exists)).toBe('');
+    expect(shopifyThemeRoot('examples/tailwind/snippets/icon.liquid', exists)).toBe('examples/tailwind');
+    // A copy kept elsewhere under the root theme is not part of it, nor is a file beside its folders.
+    expect(shopifyThemeRoot('vendor/legacy/snippets/icon.liquid', exists)).toBeUndefined();
+    expect(shopifyThemeRoot('theme.liquid', exists)).toBeUndefined();
   });
 });
 
@@ -9165,6 +9438,33 @@ const token = getTokenMp();
     expect(call).toBeDefined();
   });
 
+  it.each(['LF', 'CRLF'])('should attribute calls in <script setup> destructuring and in the template to the component (%s, #2340)', (ending) => {
+    const lf = `<template>
+  <NuxtLink :to="useBar(link.location)">{{ useBar(link) }}</NuxtLink>
+  <li v-for="item in items" @click="item.open()">{{ label(item) }}</li>
+</template>
+
+<script setup lang="ts">
+const { a } = useFoo(1)
+const [b] = useFoo(2)
+</script>
+`;
+    const code = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+    const result = extractFromSource('Card.vue', code);
+    const component = result.nodes.find((n) => n.kind === 'component')!;
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${r.fromNodeId === component.id ? 'component' : r.fromNodeId}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'component:label@3',
+      'component:useBar@2',
+      'component:useBar@2',
+      'component:useFoo@7',
+      'component:useFoo@8',
+    ]);
+  });
+
   it('should extract calls from Vue Options API object methods', () => {
     const code = `<template>
   <button @click="save">Save</button>
@@ -9259,8 +9559,10 @@ function greet() {
     expect(componentNode?.name).toBe('Static');
     expect(componentNode?.language).toBe('vue');
 
-    // Only the component node should exist (no script nodes)
-    expect(result.nodes.length).toBe(1);
+    // The file and the component it is — no script nodes. (A file with no
+    // script used to have no file node at all.)
+    expect(result.nodes.map((n) => n.kind).sort()).toEqual(['component', 'file']);
+    expect(result.edges).toContainEqual(expect.objectContaining({ source: 'file:Static.vue', target: componentNode!.id, kind: 'contains' }));
   });
 
   it('should create containment edges from component to script nodes', () => {
@@ -11095,6 +11397,162 @@ import foo.cfm;
       const result = extractFromSource('Outer.cfc', code);
       expect(result.nodes.find((n) => n.name === 'outer')?.kind).toBe('method');
       expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
+    });
+  });
+
+  describe('Calls in tag expressions outside <cfscript>/<cfquery> (#2091)', () => {
+    const callsFrom = (result: ReturnType<typeof extractFromSource>, fromId: string | undefined) =>
+      result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fromId && (r.referenceKind === 'calls' || r.referenceKind === 'instantiates'))
+        .map((r) => `${r.referenceKind === 'instantiates' ? 'new ' : ''}${r.referenceName}@${r.line}`)
+        .sort();
+
+    it('should extract calls in <cfset>, <cfif>, <cfelseif> and <cfreturn>, attributed to the enclosing method', () => {
+      const code = `<cfcomponent>
+\t<cffunction name="a">
+\t\t<cfset x = b(1)>
+\t\t<cfif c(2)>
+\t\t<cfelseif e(3)>
+\t\t</cfif>
+\t\t<cfreturn d()>
+\t</cffunction>
+\t<cffunction name="b"></cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Svc.cfc', code);
+      const a = result.nodes.find((n) => n.kind === 'method' && n.name === 'a');
+      expect(a).toBeDefined();
+      expect(callsFrom(result, a?.id)).toEqual(['b@3', 'c@4', 'd@7', 'e@5']);
+    });
+
+    it('should extract #hash# expressions in output, strings and tag attributes — once each, alongside <cfquery> bodies', () => {
+      const code = `<cfcomponent>
+<cffunction name="render">
+  <cfset var y = svc.load(1)>
+  <cfset local.msg = "Hi #userName()#">
+  <cfoutput>#fmt(y)# and #variables.mailer.send()#</cfoutput>
+  <cfloop array="#getItems()#" index="i"></cfloop>
+  <cfquery name="q" datasource="#dsn()#">SELECT #col()# FROM t</cfquery>
+  <cfset obj = new Widget()>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('View.cfc', code);
+      const render = result.nodes.find((n) => n.kind === 'method' && n.name === 'render');
+      expect(callsFrom(result, render?.id)).toEqual([
+        'col@7',
+        'dsn@7',
+        'fmt@5',
+        'getItems@6',
+        'new Widget@8',
+        'svc.load@3',
+        'userName@4',
+        'variables.mailer.send@5',
+      ]);
+      // `<cfset var y = …>` is a function local — no variable node for it.
+      expect(result.nodes.find((n) => n.name === 'y')).toBeUndefined();
+    });
+
+    it('should attribute component-scope and template-scope calls to the component and the file', () => {
+      const component = `<cfcomponent>\n<cfset setup()>\n<cffunction name="m"></cffunction>\n</cfcomponent>\n`;
+      const cfc = extractFromSource('Pseudo.cfc', component);
+      const cls = cfc.nodes.find((n) => n.kind === 'class');
+      expect(callsFrom(cfc, cls?.id)).toEqual(['setup@2']);
+
+      const template = `<cfset items = loadItems()>\n<cfoutput>#renderList(items)#</cfoutput>\n`;
+      const cfm = extractFromSource('index.cfm', template);
+      const file = cfm.nodes.find((n) => n.kind === 'file');
+      expect(callsFrom(cfm, file?.id)).toEqual(['loadItems@1', 'renderList@2']);
+    });
+
+    it("should keep each call's own line and column (several per line, and across lines)", () => {
+      const code = `<cfcomponent>
+<cffunction name="m"><cfset a()><cfif   b.c()><cfset d(e())></cfif>
+  <cfset total = sum(
+      count(), other.fetch())><cfoutput>#last()#</cfoutput>
+</cffunction>
+</cfcomponent>
+`;
+      const lines = code.split('\n');
+      const result = extractFromSource('Pos.cfc', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((r) => r.referenceName).sort()).toEqual(['a', 'b.c', 'count', 'd', 'e', 'last', 'other.fetch', 'sum']);
+      for (const r of calls) {
+        expect(lines[r.line - 1]!.slice(r.column).startsWith(r.referenceName)).toBe(true);
+      }
+    });
+
+    it('should read a <cfloop condition="…"> attribute as an expression', () => {
+      const code = `<cfcomponent>\n<cffunction name="drain">\n<cfloop condition="hasNext()">\n</cfloop>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Queue.cfc', code);
+      const drain = result.nodes.find((n) => n.kind === 'method' && n.name === 'drain');
+      expect(callsFrom(result, drain?.id)).toEqual(['hasNext@3']);
+    });
+
+    it('should not read HTML <script> bodies or plain text as CFML calls', () => {
+      const code = `<cfcomponent>\n<cffunction name="page">\n<script>notACall();</script>\n<p>also(not)</p>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Page.cfc', code);
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls')).toEqual([]);
+    });
+  });
+
+  describe('<cffunction> inside a generic container tag (#2091)', () => {
+    it('should extract a method nested in <cfprocessingdirective> (the Application.cfc shape)', () => {
+      const code = `<cfcomponent>
+\t<cfprocessingdirective suppresswhitespace="true">
+\t\t<cffunction name="onRequestStart">
+\t\t\t<cfset loadConfig()>
+\t\t</cffunction>
+\t</cfprocessingdirective>
+</cfcomponent>
+`;
+      const result = extractFromSource('Application.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'onRequestStart');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('Application::onRequestStart');
+      expect(result.edges.some((e) => e.kind === 'contains' && e.source === cls?.id && e.target === method?.id)).toBe(true);
+      const call = result.unresolvedReferences.find((r) => r.referenceName === 'loadConfig');
+      expect(call?.fromNodeId).toBe(method?.id);
+    });
+
+    it('should extract a top-level function nested in <cfsilent> in a template', () => {
+      const code = `<cfsilent>\n<cffunction name="helper"><cfreturn 1></cffunction>\n</cfsilent>\n`;
+      const result = extractFromSource('lib.cfm', code);
+      expect(result.nodes.find((n) => n.name === 'helper')?.kind).toBe('function');
+    });
+  });
+
+  describe('<cfinterface> (#2091)', () => {
+    const code = `<cfinterface extends="IBase, IOther">
+\t<cffunction name="search" access="public" returntype="any">
+\t\t<cfargument name="q" type="string">
+\t</cffunction>
+\t<cffunction name="count"></cffunction>
+</cfinterface>
+`;
+
+    it('should extract an interface node named from the file, with its functions as methods', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      expect(iface?.name).toBe('ISearchable');
+      expect(iface?.startLine).toBe(1);
+      expect(iface?.endLine).toBe(6);
+      expect(result.nodes.filter((n) => n.kind === 'class')).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.qualifiedName).sort()).toEqual(['ISearchable::count', 'ISearchable::search']);
+      for (const m of methods) {
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === iface?.id && e.target === m.id)).toBe(true);
+      }
+      expect(methods.find((m) => m.name === 'search')?.returnType).toBe('any');
+    });
+
+    it('should extract each interface it extends', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      const ext = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+      expect(ext.map((r) => r.referenceName)).toEqual(['IBase', 'IOther']);
+      expect(ext.every((r) => r.fromNodeId === iface?.id)).toBe(true);
     });
   });
 });

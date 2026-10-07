@@ -15,7 +15,7 @@
  * crawl).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -266,6 +266,55 @@ describe('Integration: full pipeline', () => {
       const containsOnly = stats.edgesByKind.contains ?? 0;
       expect(stats.edgeCount).toBeGreaterThan(containsOnly);
     } finally {
+      cg.destroy();
+    }
+  }, 30_000);
+
+  it('reports durationMs for the whole run, resolution and linking included (#2334)', async () => {
+    // The CLI summary printed the orchestrator's time — extraction alone —
+    // beside the totals of the whole run, so slow resolution never showed.
+    generateSyntheticProject(tempDir, 10);
+    const cg = await CodeGraph.init(tempDir, {
+      config: { include: ['**/*.ts'], exclude: [] },
+    });
+    const internals = cg as unknown as {
+      orchestrator: Record<'indexAll' | 'sync', (...args: unknown[]) => Promise<{ durationMs: number }>>;
+      resolver: { resolveDeferredThisMemberRefs: () => Promise<number> };
+    };
+    // What the orchestrator measured; and a linking pass that takes a known while.
+    let extraction = -1;
+    const measure = (method: 'indexAll' | 'sync') => {
+      const original = internals.orchestrator[method].bind(internals.orchestrator);
+      vi.spyOn(internals.orchestrator, method).mockImplementation(async (...args: unknown[]) => {
+        const result = await original(...args);
+        extraction = result.durationMs;
+        return result;
+      });
+    };
+    const LINKING_MS = 250;
+    const linking = internals.resolver.resolveDeferredThisMemberRefs.bind(internals.resolver);
+    vi.spyOn(internals.resolver, 'resolveDeferredThisMemberRefs').mockImplementation(async () => {
+      const until = Date.now() + LINKING_MS;
+      while (Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+      return linking();
+    });
+
+    try {
+      measure('indexAll');
+      const indexed = await cg.indexAll();
+      expect(extraction).toBeGreaterThanOrEqual(0);
+      expect(indexed.durationMs).toBeGreaterThanOrEqual(extraction + LINKING_MS);
+
+      // Likewise a sync that re-resolves a changed file.
+      fs.appendFileSync(path.join(tempDir, 'src', 'index.ts'), 'export function again(): number { return entry(); }\n');
+      extraction = -1;
+      measure('sync');
+      const synced = await cg.sync();
+      expect(synced.filesModified).toBe(1);
+      expect(extraction).toBeGreaterThanOrEqual(0);
+      expect(synced.durationMs).toBeGreaterThanOrEqual(extraction + LINKING_MS);
+    } finally {
+      vi.restoreAllMocks();
       cg.destroy();
     }
   }, 30_000);

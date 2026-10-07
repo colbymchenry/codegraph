@@ -69,4 +69,46 @@ describe('C#: a type position names a type', () => {
       cg.close();
     }
   });
+
+  it('never a constant that shares the name', async () => {
+    // `const` and `static readonly` fields are constants: jellyfin's `new
+    // Version(5, 18)` (System.Version) bound to a `const string Version`
+    // claim name, and serilog's `static readonly Meter Meter = new(…)`
+    // instantiated itself.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cs-type-refs-'));
+    roots.push(root);
+    const files: Record<string, string> = {
+      'src/Claims.cs': `namespace App;
+public static class ClaimTypes {
+    public const string Version = "v";
+}
+`,
+      'src/Encoder.cs': `namespace App;
+using System;
+public class ValueFormatter { }
+public class Encoder {
+    private static readonly Version MinVersion = new Version(5, 18);
+    private static readonly Meter Meter = new("app");
+    private static readonly ValueFormatter ValueFormatter = new();
+    public void Check() { var v = new Version(1, 0); }
+}
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const members = cg.getNodesInFile('src/Encoder.cs').filter((n) => n.kind !== 'file');
+      const targets = cg
+        .getOutgoingEdgesFrom(members.map((n) => n.id), ['references', 'instantiates', 'type_of'])
+        .map((e) => `${cg.getNode(e.source)!.name} ${e.kind} ${cg.getNode(e.target)!.kind}:${cg.getNode(e.target)!.qualifiedName}`)
+        .sort();
+      expect(targets.filter((t) => t.includes(' constant:'))).toEqual([]);
+      expect(targets).toContain('ValueFormatter instantiates class:App::ValueFormatter');
+    } finally {
+      cg.close();
+    }
+  });
 });

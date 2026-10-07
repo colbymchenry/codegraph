@@ -38,6 +38,32 @@ function extractGoReturnType(node: SyntaxNode, source: string): string | undefin
   return last;
 }
 
+/**
+ * Go's predeclared types. None is ever a node in the graph, and as the lone
+ * term of an interface (`interface{ int64 }`) a basic type is a type-set
+ * constraint, not an embedded interface.
+ */
+const GO_PREDECLARED_TYPES: ReadonlySet<string> = new Set([
+  'any', 'bool', 'byte', 'comparable', 'complex64', 'complex128', 'error', 'float32', 'float64',
+  'int', 'int8', 'int16', 'int32', 'int64', 'rune', 'string', 'uint', 'uint8', 'uint16', 'uint32',
+  'uint64', 'uintptr',
+]);
+
+/**
+ * The name node of the type a Go embedding names, in a struct or an interface:
+ * `Base`, `*Base` (the `*` is a sibling token), `pkg.Base` and `Base[T]` all
+ * embed `Base`. A qualified type yields its name, not its package: the package
+ * stays in the source text, and resolution reads it back from the reference's
+ * position (#2322). Undefined for any other type (a literal, `~T`, a union's
+ * term) and for a predeclared one.
+ */
+export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: string): SyntaxNode | undefined {
+  if (type?.type === 'generic_type') type = getChildByField(type, 'type');
+  if (type?.type === 'qualified_type') return getChildByField(type, 'name') ?? undefined;
+  if (type?.type !== 'type_identifier') return undefined;
+  return GO_PREDECLARED_TYPES.has(getNodeText(type, source)) ? undefined : type;
+}
+
 export const goExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration'],
   classTypes: [], // Go doesn't have classes

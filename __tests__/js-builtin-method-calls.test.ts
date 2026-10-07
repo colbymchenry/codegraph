@@ -108,8 +108,8 @@ ${typed ? 'export function typed(cart: Cart) { cart.map(); }' : ''}
     for (const name of ['tidy', 'cached', 'unknownCache', 'literalArray', 'literalString']) expect(callees(name), name).toEqual([]);
     expect(callees('constructed')).toContain('Cart::add');
     expect(callees('imported')).toContain('Cart::bind');
-    expect(callees('objectLiteral')).toEqual(['map']);
-    expect(callees('localLiteral')).toEqual(['map']);
+    expect(callees('objectLiteral')).toEqual(['api::map']);
+    expect(callees('localLiteral')).toEqual(['local::map']);
     if (typed) expect(callees('typed')).toEqual(['Cart::map']);
     const self = cg.getNodesByKind('method').find(n => n.qualifiedName === 'Cart::self')!;
     expect(cg.getCallees(self.id).map(c => c.node.qualifiedName)).toEqual(['Cart::add']);

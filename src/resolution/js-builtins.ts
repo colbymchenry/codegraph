@@ -29,6 +29,8 @@ export const JS_BUILTIN_METHODS = new Set([
   'prependListener', 'prependOnceListener', 'listeners', 'rawListeners',
   'listenerCount', 'eventNames', 'setMaxListeners', 'getMaxListeners',
   'next', 'return', 'throw', 'drop', 'take', 'toArray',
+  // fetch's Response / Request / Blob bodies.
+  'text', 'json', 'arrayBuffer', 'blob', 'formData',
 ]);
 
 /**

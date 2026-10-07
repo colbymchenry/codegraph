@@ -1,5 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { hasFlowPragma } from '../grammars';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 /**
@@ -38,7 +39,26 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
   return 'property';
 }
 
+/**
+ * Flow's own syntax, blanked to spaces (offsets survive) so a Flow file reads
+ * as TSX: exact object types `{| a: T |}`, a maybe type's `?` (`x: ?string`,
+ * `Array<?T>`), an inexact object's `...`, `import typeof`, `opaque type`. Only files with the `@flow`
+ * pragma — the ones `detectLanguage` sends here from `.js`.
+ */
+export function blankFlowSyntax(source: string, filePath?: string): string {
+  if (!filePath || !/\.(?:jsx?|mjs|cjs)$/.test(filePath) || !hasFlowPragma(source)) return source;
+  return source
+    .replace(/\{\|/g, '{ ')
+    .replace(/\|\}/g, ' }')
+    .replace(/([:<,]\s*)\?(?=[\w$({[])/g, '$1 ')
+    .replace(/\bimport\s+typeof\b/g, (m) => 'import' + ' '.repeat(m.length - 'import'.length))
+    .replace(/\bopaque(?=\s+type\b)/g, '      ')
+    // An inexact object type's bare `...` (`{a: T, ...}`) — never a value spread.
+    .replace(/\.\.\.(?=\s*[},])/g, '   ');
+}
+
 export const typescriptExtractor: LanguageExtractor = {
+  preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   // `method_signature` is the interface/type-literal form of a method; without it

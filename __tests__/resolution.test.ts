@@ -648,6 +648,28 @@ from ..services import auth_service
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
     });
+
+    it('should extract parenthesized Python from-imports', () => {
+      const content = `
+from store.base import (
+    Base,
+    helper as h,  # a comment, with a comma and a call()
+)
+"""
+from docstring import NotAnImport
+"""
+from store.rows import (Row, Col)
+`;
+
+      const mappings = extractImportMappings('src/main.py', content, 'python');
+
+      expect(mappings.map((m) => [m.localName, m.exportedName, m.source])).toEqual([
+        ['Base', 'Base', 'store.base'],
+        ['h', 'helper', 'store.base'],
+        ['Row', 'Row', 'store.rows'],
+        ['Col', 'Col', 'store.rows'],
+      ]);
+    });
   });
 
   describe('JVM FQN Import Resolution', () => {
@@ -932,6 +954,8 @@ from ..services import auth_service
       const frameworks = detectFrameworks(context);
       const reactResolver = frameworks.find((f) => f.name === 'react');
 
+      // In a JS/TS module another file's hook comes through an import (the
+      // import resolver's), never by name: App.tsx imports nothing here.
       const ref = {
         fromNodeId: 'component:src/App.tsx:App:1',
         referenceName: 'useAuth',
@@ -941,10 +965,11 @@ from ..services import auth_service
         filePath: 'src/App.tsx',
         language: 'typescript' as const,
       };
+      expect(reactResolver!.resolve(ref, context)).toBeNull();
 
-      const result = reactResolver!.resolve(ref, context);
-      expect(result).not.toBeNull();
-      expect(result?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
+      // The file's own hook resolves.
+      const own = reactResolver!.resolve({ ...ref, filePath: 'src/hooks/useAuth.ts', fromNodeId: 'function:src/hooks/useAuth.ts:x:30' }, context);
+      expect(own?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
     });
   });
 
@@ -1339,12 +1364,9 @@ impl<T> Source for BufSource<T> {
       // The two ways this could overreach. `self.missing()` names nothing on
       // the owner, so it must not fall back to some other type's `missing`.
       //
-      // The receiver-less half is pinned as it BEHAVES, not as it should: a
-      // bare `reset()` is a free-function call, and it already resolved to
-      // `Target::reset` before this change — the mirror image of #1861, where
-      // a call with no receiver is given one. That is a separate defect in the
-      // bare-name strategy, measured on this branch's parent; the cell is here
-      // so this change is pinned to not make it worse.
+      // And a bare `reset()` is a free-function call: Rust reaches a method
+      // only through `self.` or `Type::`, so it is the free `reset`, never
+      // `Target::reset` (it used to be — the mirror image of #1861).
       writeRustCrate(tempDir, {
         'lib.rs':
           'pub fn reset() {}\n\n' +
@@ -1355,8 +1377,7 @@ impl<T> Source for BufSource<T> {
       });
       cg = await CodeGraph.init(tempDir, { index: true });
 
-      // Unchanged by this commit — see the note above.
-      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['Target::reset']);
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['reset']);
       // Nothing on the owner is named `missing`, so no edge at all.
       expect(callsFrom('Target::absent')).toEqual([]);
     });

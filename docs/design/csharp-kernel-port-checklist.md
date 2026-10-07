@@ -234,8 +234,8 @@ all PRESERVE):
 | `enum_declaration` | enumTypes:1064 → extractEnum:1914 | body `enum_member_declaration_list` required (bodiless → no node); extractInheritance sees `base_list` → **the underlying type `: byte` emits an `extends` ref named `byte`** (quirk, §inheritance); `enum_member_declaration` children → extractEnumMembers:1958 — `name` field path: ONE `enum_member` node per member, positioned at the member node (attributes included in its span), values/attributes ignored; non-member children (preproc_*, comment) → visitNode (no-op) |
 | `method_declaration` | methodTypes:1027 → extractMethod:1737 | classifyMethodNode absent → always extractMethod. Gate 1747 passes via class-like (a method_declaration outside a type does not occur in non-erroring C# — top-level `void M(){}` parses as local_function_statement, probed); bodyless interface/partial signatures mint nodes with no body walk; **expression-bodied methods have `body: arrow_expression_clause` (a real body FIELD, probed) → walked** |
 | `constructor_declaration` | methodTypes → extractMethod | name field = the class-name identifier → **method node named like the class**; returnType undefined; **`constructor_initializer` (`: base(args)` / `: this(args)`) is a sibling of the body field → NEVER walked → calls inside initializer args are LOST** (probed); expression-bodied ctor body = arrow_expression_clause → walked |
-| `property_declaration` (inside class-like) | propertyTypes:1075 → extractProperty:1986 | property node + scanFnRefSubtree (capture-only) + skipChildren → **accessor bodies (`get { … }`, `get => …`) and the `=> expr` value clause are NEVER walked — calls inside property getters/setters/expression bodies emit NOTHING** (only fn-ref candidates). §property below |
-| `field_declaration` (inside class-like) | fieldTypes:1084 → extractField:2046 | field/constant nodes per declarator + scanFnRefSubtree + skipChildren → **field initializers emit no calls/instantiates/static-member refs** (fn-ref candidates only). §field below |
+| `property_declaration` (inside class-like) | propertyTypes:1075 → extractProperty:1986 | property node, then **propertyBodies — each accessor's `body` (`get { … }`, `set => …`), then the `value:` (an expression body's `=> expr` or an `= initializer`) — walked by visitFunctionBody with the property pushed** (calls, instantiates, static reads and fn-ref candidates attribute to the property; accessor/arrow bodies changed 2026-10-04, `= initializer` 2026-10-05 — previously never walked); a target-typed `= new()` value instantiates the declared type (extractTargetTypedNew); then scanFnRefSubtree (capture-only, attributed to the class) over the rest (attributes, type) skipping the walked bodies, + skipChildren. §property below |
+| `field_declaration` (inside class-like) | fieldTypes:1084 → extractField:2046 | field/constant nodes per declarator, **each declarator walked whole by visitFunctionBody with its field pushed** (its `= initializer`: calls, instantiates, static reads, fn-ref candidates incl. varinit attribute to the field; changed 2026-10-05, previously never walked); a target-typed `= new()` instantiates the declared type; then scanFnRefSubtree (capture-only, attributed to the class) skipping the walked declarators, + skipChildren. §field below |
 | `local_declaration_statement` | variableTypes:1098 (only reachable at top level — global statements; body locals go through visitFunctionBody instead) | not class-like → extractVariable:2538 → **generic fallback (2863-2881) finds no direct `identifier`/`variable_declarator` children (the declarator nests inside `variable_declaration`, probed) → ZERO nodes minted**; isClassScopeConstantAssignment (1508) needs node.type `assignment` → never true. skipChildren=true + scanFnRefSubtree → **a top-level `var builder = WebApplication.CreateBuilder(args);` produces NO node, NO calls ref, NO instantiates** — only fn-ref candidates. PRESERVE |
 | `using_directive` | importTypes:1209 → extractImport:3170 | hook (§config) → import node + ONE generic `imports` ref {fromNodeId: nodeStack top (namespace node if present, else file), referenceName: moduleName, line/col of the directive}; **no per-binding emitter** (the TS/py/rust/php/ruby ladder at 3197-3234 excludes csharp) |
 | `invocation_expression` (top level — global statements) | callTypes:1248 → extractCall:3684 | fires with caller = file/namespace node; children still visited (no skipChildren) so nested invocations recurse |
@@ -305,15 +305,35 @@ for C#) or bare `name`. QUIRKS (probed, PRESERVE):
 - An expression-bodied property (`public int Computed => MaxItems + 1;`) has
   children [modifier, predefined_type, identifier, **arrow_expression_clause
   (`value:` field)**] → typeNode = predefined_type → signature `"int Computed"`;
-  the arrow clause is NEVER walked (calls inside lost).
-- `{ get; } = new();` initializers: the `value:` implicit_object_creation and
-  the accessor_list are both skipped/excluded → no refs, no instantiates.
+  the arrow clause is a property body (walked as the property, below).
+- `{ get; } = new();` initializers: the `value:` is the
+  implicit_object_creation_expression itself (no type child) → walked as a
+  body, and extractTargetTypedNew emits `instantiates` named for the
+  declared `type` (below); the accessor_list is excluded from the type scan.
 
 Then extractDecoratorsFor (no-op) and **extractTypeAnnotations (2037) →
 extractCsharpTypeRefs** — the `type` field IS walked for refs (so `public
 List<Foo> Items` emits references `List` + `Foo` even though the signature
-kept the raw text). Return value feeds no body walk (the classifyMethodNode
-initializer-walk path at 1031-1047 is TS-only).
+kept the raw text). The returned node is pushed while propertyBodies
+(tree-sitter.ts; csharp.rs `property_bodies`) are walked: every
+`accessor_declaration`'s `body` field (block or arrow_expression_clause, in
+accessor order), then the property's `value:` whatever it is (an
+arrow_expression_clause or an `= initializer` expression). Each body is
+preceded by **extractTargetTypedNew(body, `type` field)** (csharp.rs
+`extract_target_typed_new`): when the body IS an
+`implicit_object_creation_expression` it emits ONE `instantiates` ref from
+the property at the `new()`'s position, named by csharpClassTypeName
+(csharp.rs `class_type_name`): `identifier` → its text; `generic_name` → its
+identifier (`List<Foo>` → `List`); `qualified_name` / `alias_qualified_name`
+→ recurse into the `name` field (`Ns.Foo<T>` → `Foo`, `global::Foo` →
+`Foo`, `Outer<int>.Inner` → `Inner`); `nullable_type` → recurse into `type`
+(`Foo?` → `Foo`); anything else (predefined/array/tuple/pointer) → nothing.
+Only a `new()` that IS the value counts — `(new())`, `c ? new() : null` and
+nested `new()`s emit nothing. The fn-ref scan that follows skips the walked
+bodies by node id, so a candidate is captured once — from the property; only
+what is left (attribute arguments, e.g. `[Attr(Make(H))]` → `H` from the
+class) is the class's. Attributes are never walked for calls. (The
+classifyMethodNode initializer-walk path at 1031-1047 is TS-only.)
 
 ### extractField (2046) — field_declaration
 
@@ -335,6 +355,23 @@ initializer-walk path at 1031-1047 is TS-only).
   the variable_declaration's `type` field (5905-5909) → **multi-declarator
   fields (`Foo A, B;`) emit the type refs ONCE PER DECLARATOR**, each from its
   own field node.
+- Then, per created field node (changed 2026-10-05 — initializers used to
+  emit nothing but fn-ref candidates, attributed to the class): push the
+  field, **extractTargetTypedNew(the declarator's LAST named child, the
+  variable_declaration's `type` field)** (§property above — a target-typed
+  `private readonly List<Foo> _items = new();` instantiates `List`), then
+  **visitFunctionBody(the whole declarator)**, pop. The C# declarator has no
+  `value` field — the initializer is its last, unnamed child (probed:
+  [name, expression]; a fixed buffer is [name, bracketed_argument_list]) —
+  so the declarator is walked whole, like VB.NET's: maybeCaptureFnRefs fires
+  on it first (varinit: `Del d = Handler;` → candidate `Handler` FROM THE
+  FIELD), then the name (inert) and the initializer — calls, instantiates,
+  static reads (`Defaults.Name` → `Defaults`) and lambda bodies (no halt:
+  `Func<int,int> f = x => Compute(x)` → the field calls `Compute`) attribute
+  to the field. extractField returns the walked declarator ids and the
+  dispatcher's scanFnRefSubtree skips them, so each candidate is captured
+  once, by the field. (Java's walk of its `value` field reports nothing back
+  — its class-level scan still captures those candidates too, unchanged.)
 - docstring/visibility/isStatic computed once from the outer declaration,
   shared by all declarators. The PHP property_element and bare-fallback
   branches (2078-2154) are unreachable for C#.
@@ -418,16 +455,20 @@ statements at top level) AND visitFunctionBody:5145. QUIRKS, PRESERVE:
 **`implicit_object_creation_expression` (`new()`) and
 `anonymous_object_creation_expression` (`new { X = 1 }`) and
 `array_creation_expression` (`new Widget[10]`) are NOT in INSTANTIATION_KINDS
-→ no instantiates refs** (target-typed `new()` — everywhere in modern C# — is
-invisible); object/collection initializer args and `new[] { Mk() }` contents
-still recurse to their own calls. Top-level `var w = new Widget();` emits
-nothing at all (§local_declaration_statement).
+→ no instantiates refs** (a target-typed `new()` in a body — `Widget c =
+new();`, an argument, a return — is invisible); the one exception is a
+`new()` that IS a field's or property's initializer, which
+extractTargetTypedNew names for the declared type (§property, §field).
+Object/collection initializer args and `new[] { Mk() }` contents still
+recurse to their own calls. Top-level `var w = new Widget();` emits nothing
+at all (§local_declaration_statement).
 
 ### extractStaticMemberRef (4750) — csharp ∈ STATIC_MEMBER_LANGS (345)
 
 Called for EVERY node in visitFunctionBody (5218) — body walker only (never
-visitNode, so class-level field initializers and top-level statements emit no
-static refs). Node gate: MEMBER_ACCESS_TYPES (323) contains
+visitNode, so top-level statements emit no static refs; field and property
+initializers ARE body-walked, so `= Defaults.Name` reads attribute to the
+member). Node gate: MEMBER_ACCESS_TYPES (323) contains
 `member_access_expression`. Skip when the access IS a call's callee (4772-4779:
 parent ∈ callTypes && callee.startIndex === node.startIndex — so
 `Console.WriteLine(…)`'s access is skipped but `DoThing(Constants.MAX)`'s
@@ -614,14 +655,17 @@ layers: `argument`→null (descend named children). special:
   nothing (not idTypes/special).
 - Capture fires from visitNode:990, visitFunctionBody:5137, and
   scanFnRefSubtree (property/field/variable declarations + top-level
-  statements, depth ≤12, capture-only). **scanFnRefSubtree's halt list
-  (tree-sitter.ts:606-612) includes the literal type `lambda_expression` —
-  which IS C#'s lambda node** — so at depth>0 the scan STOPS at a lambda in a
-  field/property initializer (`Action A = () => Register(H);` yields no
-  candidates from inside the lambda), while `anonymous_method_expression`
-  (`delegate() { … }`) is NOT in the list and is scanned through. Method-BODY
-  lambdas are unaffected (visitFunctionBody recursion has no halt — capture
-  fires per node).
+  statements, depth ≤12, capture-only — skipping the subtrees the body
+  walker already went through: property bodies/initializers and field
+  declarators, whose candidates are the member's). **scanFnRefSubtree's halt
+  list (tree-sitter.ts:606-612) includes the literal type `lambda_expression`
+  — which IS C#'s lambda node** — so at depth>0 the scan STOPS at a lambda it
+  reaches (a top-level statement's), while `anonymous_method_expression`
+  (`delegate() { … }`) is NOT in the list and is scanned through. Body-walked
+  lambdas — methods, accessors, and since 2026-10-05 field/property
+  initializers (`Action A = () => Register(H);` → candidate `H` from `A`) —
+  are unaffected (visitFunctionBody recursion has no halt — capture fires per
+  node).
 - Flush gate (flushFnRefCandidates:639): generated-file skip; `this.`-prefixed
   names skip the gate (C# never produces them — its this-forms are bare);
   otherwise name ∈ definedHere ∪ importedNames. **definedHere = same-file
@@ -755,10 +799,15 @@ AspNetCore refs / Program.cs / Startup.cs / controller-source scan.
   `struct Fwd;` (NO node); interface with bodyless method + property +
   default-impl arrow method; enum with `: byte` (extends `byte` quirk),
   attributed member, valued members; const + static-readonly (→ `constant`)
-  + multi-declarator + instance fields (signatures `Type name`);
+  + multi-declarator + instance fields (signatures `Type name`), field
+  initializers (→ the field: `= new() { TargetCb }` instantiates the declared
+  `List` and the list candidate is the field's);
   `protected internal` (→ protected); property shapes: predefined-type,
   bare-identifier type (signature loses type), generic type, expression-bodied
-  (`=>` calls LOST), `{ get; } = new();`, accessor bodies with calls (LOST);
+  (`=>` calls → the property), `{ get; } = new();` (→ the property,
+  instantiates the declared `Widget`), `{ get; } = () => Register(H)` (the
+  lambda's call and candidate → the property),
+  accessor bodies with calls (→ the property);
   event_field_declaration + event_declaration with add/remove bodies (no
   nodes; accessor calls → class); operator + conversion operator + indexer +
   destructor (no nodes; body calls → class); constructor with
@@ -771,7 +820,7 @@ AspNetCore refs / Program.cs / Startup.cs / controller-source scan.
   `Foo.Create(1).Bar()` (re-encode + inner both) + `GetThing().Bar()`,
   `(myDel)(x)` (conv regex → `myDel`), `nameof(Widget)` (calls ref `nameof`);
   `new Widget(…) { … }` (instantiates + initializer calls) + `new Ns.Foo<T>()`
-  (strip both) + `new()` / `new { }` / `new Widget[10]` (all NOTHING);
+  (strip both) + body `new()` / `new { }` / `new Widget[10]` (all NOTHING);
   static value reads (`ReadType.ReadAsDouble` → `ReadType`; `Outer.Inner.DEEP`
   → `Outer`; skip-as-callee; lowercase skip); type refs: params
   (nullable/array/tuple-element/generic/qualified/`dynamic`), returns
@@ -784,7 +833,8 @@ AspNetCore refs / Program.cs / Startup.cs / controller-source scan.
   function + trailing `partial class Program`; fn-refs: `Register(HandleThing)`,
   `Register(this.HandleThing)` (bare name), `Register(C.StaticHandler)`
   (nothing), `Click += OnClick`, initializer_expression list, varinit
-  (`Action g = () => …` no candidate; `Del d = Handler;` candidate),
+  (`Action g = () => …` no candidate; `Del d = Handler;` candidate — from
+  the method for a local, from the field for a field initializer),
   `this.x = x` param-storage skip; value-refs: const target + reader methods +
   a `var MaxItems = …` local shadow (prune) + `static readonly` multi-target;
   preprocessor: `#region`/`#endregion`/`#pragma`/`#nullable`/`#define`

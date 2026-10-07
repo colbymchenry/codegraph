@@ -89,8 +89,17 @@ describe('an unchanged file over the size limit is not reported as drifted (#191
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oversize-drift-'));
     fs.writeFileSync(path.join(dir, 'app.ts'), 'export function alpha() { return 1; }\n');
     // 1.4 MB of ordinary text: over the index limit, under the viewer's 8 MB read cap.
-    const line = 'const x = 1;\n';
-    fs.writeFileSync(path.join(dir, 'big.js'), line.repeat(Math.ceil((1.4 * 1024 * 1024) / line.length)));
+    // Each line differs: Windows Defender's script scan of a freshly written `.js`
+    // made of one statement repeated 110k times takes close to a minute on the
+    // first read, so the viewer's read below blew the test timeout there. Real
+    // code of the same size is scanned in milliseconds.
+    const line = 'const last = 0;\n';
+    const lines: string[] = [];
+    for (let size = 0, i = 0; size < 1.4 * 1024 * 1024; i++) {
+      lines.push(`const x${i} = ${i};\n`);
+      size += lines[i]!.length;
+    }
+    fs.writeFileSync(path.join(dir, 'big.js'), lines.join(''));
     const cg = await CodeGraph.init(dir, { index: true });
     try {
       const record = cg.getFiles().find((f) => f.path === 'big.js')!;

@@ -182,13 +182,21 @@ export interface ResolutionContext {
    */
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
   /**
-   * Go module info from `go.mod` at the project root. Returns `null`
-   * when the project has no `go.mod` (non-Go projects, pre-modules
-   * Go code, or projects whose modules live in subdirectories). Used
-   * by the Go branch of import resolution to distinguish in-module
-   * cross-package imports from third-party packages.
+   * The aliases of the tsconfig / jsconfig nearest `fromFile` below the
+   * project root that declares `paths` — a monorepo app's own `@/*` — or null.
    */
-  getGoModule?(): import('./go-module').GoModule | null;
+  getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
+  /**
+   * The project-relative directory (`/`-separated, `.` for the root) of
+   * the Go package an import path names, when it is a package of one of the
+   * project's own modules — the `go.mod` at the root or any `go.mod` above
+   * an indexed `.go` file (#2322) — else `null` (the standard library,
+   * third-party modules, a project with no `go.mod`). `fromFile`, the
+   * importing file, breaks a tie between two modules declaring one path.
+   * Used by the Go branch of resolution to tell in-project cross-package
+   * imports from outside ones, and to find the package's files.
+   */
+  getGoPackageDir?(importPath: string, fromFile?: string): string | null;
   /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
@@ -229,6 +237,18 @@ export interface FrameworkExtractionResult {
   nodes: Node[];
   /** Framework-specific unresolved references (e.g. route -> handler) */
   references: UnresolvedRef[];
+}
+
+/**
+ * Nodes a framework can name only from several files at once, with the
+ * references that bind each — and how to recognise the ones an earlier run
+ * produced, so a run can remove those it no longer wants.
+ */
+export interface CrossFileNodes extends FrameworkExtractionResult {
+  /** The kind every one of these nodes has. */
+  kind: Node['kind'];
+  /** True for a node this pass produces, and for no node extraction does. */
+  owns(node: Node): boolean;
 }
 
 /**
@@ -284,6 +304,19 @@ export interface FrameworkResolver {
    * second run can recover the original in-file form from `qualifiedName`.
    */
   postExtract?(context: ResolutionContext): Node[];
+  /**
+   * Nodes no single file's `extract()` can decide on — a React Router route
+   * table written in one file is a table of routes only because another
+   * file hands it to the router. Called after `postExtract` on every index
+   * and every sync, it returns the COMPLETE set the framework wants now. The
+   * orchestrator inserts the new ones (their references pending, for the
+   * resolution that follows), removes the ones an earlier run inserted that
+   * are no longer wanted, renames the ones whose name changed, and leaves
+   * the rest alone, so an unchanged node keeps its edges. A node lives in the
+   * file it is written in, so re-extracting that file drops it until the
+   * next run puts it back.
+   */
+  crossFileNodes?(context: ResolutionContext): CrossFileNodes;
 }
 
 /**
@@ -322,6 +355,12 @@ export type ReExport =
   | {
       kind: 'wildcard';
       /** Module specifier of the upstream module. */
+      source: string;
+    }
+  | {
+      /** `export * as ns from './other'`: only `ns` is exported, the module's members through it. */
+      kind: 'namespace';
+      exportedName: string;
       source: string;
     };
 

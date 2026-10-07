@@ -5,8 +5,11 @@
  * `<Route path="/payment" component={PaymentScreen}/>` (v5),
  * `<Route path="/payment" element={<PaymentScreen/>}/>` (v6) and
  * `createBrowserRouter([{ path, element }])` (v6.4+) each become a `route`
- * node named by its path, bound to the component that renders it. That is
- * half of what "how does this app flow" means. This file is the other half.
+ * node named by its path, bound to the component that renders it — and so
+ * does a table another file hands the router (`AppRoutes.map(… <Route
+ * {...rest}>)`, `useRoutes(routes)` with `routes` imported), read once every
+ * file is indexed. That is half of what "how does this app flow" means. This
+ * file is the other half.
  *
  * **Navigation is a string.** `history.push('/placeorder')` (v5, and the
  * `useHistory` hook), `navigate('/placeorder')` (v6's `useNavigate`),
@@ -28,11 +31,14 @@
  * in JavaScript, so the receiver has to name a router — a bare `push` is an
  * array's, and is never claimed.
  *
- * Known limits, both deliberate: a nested route's path is relative to its
- * parent (`<Route path="team">` inside `<Route path="/dashboard">`), and the
- * markup scan does not compose that tree, so only an absolute path is a
- * destination an href can name; and a splat (`/admin/*`) matches anything, so
- * it is never the answer to a concrete href.
+ * A nested route's path is relative to its parent's (`<Route path="team">`
+ * inside `<Route path="/dashboard">`, a data router's `children`); the markup
+ * scan composes that tree, a constant path (`paths.app.root.path`) included,
+ * and a `lazy: () => import('./routes/x')` route renders that module's default
+ * export (`frameworks/react.ts`). An `index: true` route is the page at its
+ * parent's address, and a route object around others is the layout they
+ * render inside (a `references` edge marked `layout: true`). Known limit, deliberate: a splat
+ * (`/admin/*`) matches anything, so it is never the answer to a concrete href.
  */
 
 import type { Language, Node } from '../../types';
@@ -53,6 +59,7 @@ import {
 // two arms). It lives in `nextjs.ts` because that is where it was first
 // needed; duplicating it here would be a second derivation of the same rule.
 import { destinationsForHref } from './nextjs';
+import { configHrefExpression, isTableRoute } from './react';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'tsx', 'jsx'];
 
@@ -70,13 +77,18 @@ export const reactRouterRoot = appRootFor;
  *
  * Its id is a verbatim reconstruction of the node's own fields, which no
  * other framework's route id is: a server route carries its METHOD
- * (`route:file:12:POST:/login`), a file-based page carries no line.
+ * (`route:file:12:POST:/login`), a file-based page carries no line. A path
+ * built from a constant keeps the id it was extracted with, and a route read
+ * from a table another file hands the router says so (`…:12:table:/login`).
  */
 function isReactRouterRoute(node: Node): boolean {
-  return (
-    (node.language === 'tsx' || node.language === 'jsx') &&
-    node.id === `route:${node.filePath}:${node.startLine}:${node.name}`
-  );
+  const prefix = `route:${node.filePath}:${node.startLine}:`;
+  if ((node.language !== 'tsx' && node.language !== 'jsx') || !node.id.startsWith(prefix)) return false;
+  if (isTableRoute(node)) return true;
+  // Its name, or — for a path built from a constant, renamed after extraction
+  // — the path as the file wrote it; never a server route's `METHOD:`.
+  const rest = node.id.slice(prefix.length);
+  return rest === node.name || (!/^[A-Z]+:/.test(rest) && Boolean(node.signature?.startsWith('route-parts:')));
 }
 
 /** `:id?` — a parameter React Router serves the route with or without. */
@@ -176,6 +188,11 @@ export const reactRouterResolver: FrameworkResolver = {
     const arg = firstArgumentText(lines, ref.line, ref.column, verb);
     if (arg === null) return null;
     let href = parseHrefExpression(arg);
+    // `navigate(paths.auth.login.getHref())`: a route-config object's href.
+    if (!href) {
+      const configured = configHrefExpression(arg, ref.filePath, context);
+      if (configured) href = parseHrefExpression(configured);
+    }
     if (!href) {
       const enclosing = context.getNodeById?.(ref.fromNodeId);
       const start = enclosing && enclosing.filePath === ref.filePath ? enclosing.startLine : Math.max(1, ref.line - 40);

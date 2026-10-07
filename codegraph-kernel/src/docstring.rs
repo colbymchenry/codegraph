@@ -131,6 +131,18 @@ pub fn clean_comment_markers(comment: &str) -> String {
 /// Returns None when there is no preceding comment (a PRESENT-but-empty
 /// docstring after cleaning still returns Some(""), matching the TS helper).
 pub fn preceding_docstring(node: Node, src: &str) -> Option<String> {
+    preceding_docstring_stepping_over(node, src, &[])
+}
+
+/// getPrecedingDocstring's `stepOver` — sibling kinds that may stand between
+/// the declaration and its comments without ending the run (Dart's
+/// `annotation`: `/// Builds it.` `@override` `Widget build(…)`). They are not
+/// part of the docstring; the comments on either side of one still join.
+pub fn preceding_docstring_stepping_over(
+    node: Node,
+    src: &str,
+    step_over: &[&str],
+) -> Option<String> {
     let mut anchor = node;
     while let Some(parent) = anchor.parent() {
         if is_wrapper(parent.kind()) {
@@ -145,6 +157,8 @@ pub fn preceding_docstring(node: Node, src: &str) -> Option<String> {
     while let Some(s) = sibling {
         if is_comment(s.kind()) {
             comments.push(&src[s.byte_range()]);
+            sibling = s.prev_named_sibling();
+        } else if step_over.contains(&s.kind()) {
             sibling = s.prev_named_sibling();
         } else {
             break;
@@ -192,6 +206,29 @@ mod tests {
         assert_eq!(
             clean_comment_markers("// a\r\n// b"),
             "a\r\nb"
+        );
+    }
+
+    /// A `step_over` kind is passed without ending the run, and the comments
+    /// on either side of it join; any other node still ends it. With no
+    /// step-over kinds the walk stops at the first non-comment, as before.
+    #[test]
+    fn steps_over_only_the_listed_kinds() {
+        let grammar = crate::langs::grammar_for("dart").expect("dart grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let src = "void g() {}\n/// a\n@x\n// b\nvoid f() {}\n";
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let f = (0..root.named_child_count())
+            .filter_map(|i| root.named_child(i))
+            .filter(|n| n.kind() == "function_signature")
+            .nth(1)
+            .expect("f's signature");
+        assert_eq!(preceding_docstring(f, src).as_deref(), Some("b"));
+        assert_eq!(
+            preceding_docstring_stepping_over(f, src, &["annotation"]).as_deref(),
+            Some("a\nb")
         );
     }
 }

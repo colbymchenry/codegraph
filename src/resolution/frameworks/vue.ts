@@ -8,6 +8,10 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
+import { pageComponentRef, resolvePageComponent } from './page-component';
+
+/** The languages a Vue app's scripts are written in. */
+const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
 
 /**
  * Vue 3 compiler macros — compiler-provided, not user code
@@ -102,6 +106,11 @@ export const vueResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Vue's macros, auto-imports and components are a script's, never a
+    // backend's: mealie's Python `QueryFilterBuilder(...)` is not the
+    // `QueryFilterBuilder.vue` component.
+    if (!VUE_SCRIPT_LANGUAGES.has(ref.language)) return null;
+
     // Pattern 1: Vue compiler macros (defineProps, defineEmits, etc.)
     if (VUE_COMPILER_MACROS.has(ref.referenceName)) {
       return {
@@ -112,8 +121,10 @@ export const vueResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 2: Nuxt auto-imported composables
-    if (NUXT_AUTO_IMPORTS.has(ref.referenceName)) {
+    // Pattern 2: Nuxt auto-imported composables — unless the file declares
+    // its own function of that name, which shadows the auto-import: elk's
+    // lists page calls its own `clearError(true)`, not Nuxt's (#2340).
+    if (NUXT_AUTO_IMPORTS.has(ref.referenceName) && !declaresOwnFunction(ref, context)) {
       return {
         original: ref,
         targetNodeId: ref.fromNodeId,
@@ -204,12 +215,14 @@ export const nuxtResolver: FrameworkResolver = {
     return context.getAllFiles().some((f) => /(?:^|\/)nuxt\.config\.(?:[cm]?[jt]s)$/.test(f));
   },
 
-  resolve(): ResolvedRef | null {
-    return null;
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A page route names the component its file is.
+    return resolvePageComponent(ref, context);
   },
 
   extract(filePath: string, _content: string) {
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
 
     // Forward slashes, and a leading `/` so an app at the repository root
@@ -221,7 +234,7 @@ export const nuxtResolver: FrameworkResolver = {
     if (pagesIndex !== -1 && normalized.endsWith('.vue')) {
       const routePath = filePathToNuxtRoute(normalized, pagesIndex + '/pages/'.length);
       if (routePath !== null) {
-        nodes.push({
+        const route: Node = {
           id: `route:${filePath}:${routePath}:1`,
           kind: 'route',
           name: routePath,
@@ -233,7 +246,9 @@ export const nuxtResolver: FrameworkResolver = {
           endColumn: 0,
           language: 'vue',
           updatedAt: now,
-        });
+        };
+        nodes.push(route);
+        references.push(pageComponentRef(route, '.vue', 'vue'));
       }
     }
 
@@ -284,9 +299,16 @@ export const nuxtResolver: FrameworkResolver = {
       });
     }
 
-    return { nodes, references: [] };
+    return { nodes, references };
   },
 };
+
+/** Does the reference's own file declare a function (or a const holding one) by that name? */
+function declaresOwnFunction(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return context
+    .getNodesInFile(ref.filePath)
+    .some((n) => n.name === ref.referenceName && (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable'));
+}
 
 /**
  * Check if string is PascalCase

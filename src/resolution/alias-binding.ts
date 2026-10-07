@@ -131,5 +131,20 @@ export function extractLocalExportAliases(content: string): Array<{ exportedName
       }
     }
   }
+  // CommonJS: `exports.setCharset = function setCharset(…)`, `module.exports.x = impl`.
+  const memberRe = /^[ \t]*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=\s*(?:(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|([A-Za-z_$][\w$]*)\s*;?[ \t]*$)/gm;
+  let member: RegExpExecArray | null;
+  while ((member = memberRe.exec(content)) !== null) {
+    out.push({ exportedName: member[1]!, localName: member[2] ?? member[3]! });
+  }
+  // `module.exports = { parse, format: formatDate }`.
+  const objectRe = /^[ \t]*module\.exports\s*=\s*\{([^{}]*)\}/gm;
+  let object: RegExpExecArray | null;
+  while ((object = objectRe.exec(content)) !== null) {
+    for (const raw of object[1]!.split(',')) {
+      const entry = /^\s*([A-Za-z_$][\w$]*)\s*(?::\s*([A-Za-z_$][\w$]*)\s*)?$/.exec(raw);
+      if (entry) out.push({ exportedName: entry[1]!, localName: entry[2] ?? entry[1]! });
+    }
+  }
   return out;
 }

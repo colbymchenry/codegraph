@@ -330,7 +330,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -862,6 +862,8 @@ impl<'t> Walker<'t> {
             self.extract_import(node);
         } else if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
         }
         // companion_object, anonymous_initializer, secondary_constructor,
         // getter/setter siblings, file_annotation, object_literal, if/when at
@@ -890,6 +892,8 @@ impl<'t> Walker<'t> {
 
         if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
         }
         // (INSTANTIATION_KINDS has no kotlin members; extractBareCall absent.)
 
@@ -1085,7 +1089,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_entry_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -1093,18 +1098,36 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
         // name field → null (zero fields) → the identifier-children scan: one
         // enum_member per direct simple_identifier, positioned AT the
-        // identifier. Entry value_arguments and entry class_bodies (override
-        // methods!) are never visited — invisible (quirk).
+        // identifier. Entry value_arguments are never visited.
+        let mut first: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if matches!(child.kind(), "simple_identifier" | "identifier" | "property_identifier") {
                 let name = self.text(child).to_string();
-                self.create_node("enum_member", &name, child, Extra::default());
+                let row = self.create_node("enum_member", &name, child, Extra::default());
+                if first.is_none() {
+                    first = row.map(|r| (r, name));
+                }
             }
         }
+        first
+    }
+
+    /// `NewBuffer { override fun pipe() … }`: an entry's own class_body
+    /// declares members of its own, scoped under the entry.
+    fn visit_enum_entry_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractTypeAlias — plain node; the alias-value ref walk reads the
@@ -1149,6 +1172,28 @@ impl<'t> Walker<'t> {
     /// extractCall — the kotlin paths: navigation member branch (+ the #750
     /// re-encode) and the raw-text else (paren-then-lambda / glued-invoke
     /// garbage preserved).
+    /// extractKotlinInfixCall — `Users.id eq id1` / `a to b`: a call of the
+    /// middle simple_identifier, `lhs.fn` when the left operand is a plain
+    /// name, else the bare name; literal left operands emit nothing.
+    fn extract_infix_call(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() || node.named_child_count() != 3 {
+            return;
+        }
+        let (Some(lhs), Some(func)) = (node.named_child(0), node.named_child(1)) else { return };
+        if func.kind() != "simple_identifier" || is_literal_receiver(lhs.kind()) {
+            return;
+        }
+        let caller = self.top_row();
+        let name = self.text(func);
+        let receiver = if lhs.kind() == "simple_identifier" { self.text(lhs) } else { "" };
+        let callee = if !receiver.is_empty() && receiver != "this" && receiver != "super" {
+            format!("{receiver}.{name}")
+        } else {
+            name.to_string()
+        };
+        self.push_ref_at(caller, &callee, edge_kind_index("calls").unwrap(), node);
+    }
+
     fn extract_call(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {
             return;

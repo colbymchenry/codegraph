@@ -4,6 +4,55 @@ import { generateNodeId, NodeIdAllocator } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { getParser } from './grammars';
 
+/** Tags whose own children include an expression: `<cfset …>`, `<cfif …>`, `<cfelseif …>`, `<cfreturn …>`, and `#…#`. */
+const TAG_EXPRESSION_PARENTS: ReadonlySet<string> = new Set([
+  'cf_set_tag',
+  'cf_if_tag',
+  'cf_elseif_tag',
+  'cf_return_tag',
+  'hash_expression',
+]);
+
+/**
+ * The expression node types (shared with the cfscript grammar) that can
+ * contain a call. A positive list, so a tag's markup — body content, its
+ * `var` keyword, an ERROR — is never mistaken for an expression; a bare
+ * identifier or literal can't call anything and is skipped.
+ */
+const TAG_EXPRESSION_TYPES: ReadonlySet<string> = new Set([
+  'call_expression',
+  'member_expression',
+  'subscript_expression',
+  'new_expression',
+  'assignment_expression',
+  'augmented_assignment_expression',
+  'binary_expression',
+  'unary_expression',
+  'update_expression',
+  'ternary_expression',
+  'elvis_expression',
+  'parenthesized_expression',
+  'sequence_expression',
+  'string',
+  'array',
+  'object',
+  'ordered_struct',
+  'function_expression',
+  'arrow_function',
+]);
+
+/** An expression in tag markup and the scope (function, component or file node) that owns its calls. */
+interface TagExpression {
+  startIndex: number;
+  endIndex: number;
+  /** Where it starts in the file — the same line in the source extractTagExpressions synthesizes. */
+  row: number;
+  column: number;
+  /** Its start column in the synthesized source. */
+  textColumn: number;
+  scopeId: string;
+}
+
 /**
  * CfmlExtractor - Extracts code relationships from CFML source (.cfc/.cfm).
  *
@@ -15,7 +64,9 @@ import { getParser } from './grammars';
  * raw AST, so this extractor replicates it: a file whose first real token
  * isn't `<` is delegated wholesale to the cfscript grammar (the dominant
  * modern style); otherwise the file is walked tag-by-tag with the cfml
- * grammar, delegating any `<cfscript>` tag bodies the same way.
+ * grammar, delegating any `<cfscript>` tag bodies the same way — and the
+ * expressions written in tags themselves (`<cfset>`, `<cfif>`, `#hash#`, …)
+ * through the same cfscript extraction (see extractTagExpressions).
  */
 export class CfmlExtractor {
   private filePath: string;
@@ -26,6 +77,7 @@ export class CfmlExtractor {
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
+  private tagExpressions: TagExpression[] = [];
 
   /** `language` is the file's detected language — `'cfml'` for `.cfc`/`.cfm`, `'cfscript'` for `.cfs`. Both dialect-switch internally; this only controls the language tag stamped onto emitted nodes/refs. */
   constructor(filePath: string, source: string, language: Language = 'cfml') {
@@ -95,10 +147,12 @@ export class CfmlExtractor {
   private extractTagBased(): void {
     const parser = getParser('cfml');
     if (!parser) {
+      // Same code as TreeSitterExtractor's missing parser, so a grammar that
+      // failed to load is never stored as this file's index data (#2335).
       this.errors.push({
         message: 'cfml grammar not loaded',
         severity: 'error',
-        code: 'unsupported_language',
+        code: 'parser_error',
       });
       return;
     }
@@ -113,8 +167,14 @@ export class CfmlExtractor {
       return;
     }
 
-    const fileNode = this.createFileNode();
-    this.walkProgram(tree.rootNode, fileNode.id);
+    try {
+      const fileNode = this.createFileNode();
+      this.walkProgram(tree.rootNode, fileNode.id);
+    } finally {
+      // Trees hold wasm heap memory V8's GC never sees — free it per file.
+      tree.delete();
+    }
+    this.extractTagExpressions();
   }
 
   /** Build the file's own `kind:'file'` node, spanning the whole source. Tag-based files need this explicitly — unlike `extractBareScript` (which delegates the whole file to `TreeSitterExtractor` and inherits its file node), `extractTagBased` walks the tree itself and has no other source of one. */
@@ -151,17 +211,11 @@ export class CfmlExtractor {
       if (child.type === 'cf_component_open_tag') {
         child = this.extractComponent(child, fileNodeId).nextSibling;
         continue;
-      } else if (child.type === 'cf_function_tag') {
-        // A cffunction outside any cfcomponent wrapper (rare, but legal in a
-        // .cfm template) — extract as a top-level function, contained by the file.
-        this.extractFunctionTag(child, undefined, fileNodeId);
-      } else if (child.type === 'cf_script_tag') {
-        this.delegateScriptTag(child, fileNodeId);
-      } else if (child.type === 'cf_query_tag') {
-        this.delegateQueryTag(child, fileNodeId);
-      } else {
-        this.delegateNestedTags(child, fileNodeId);
       }
+      // Template scope: a cffunction outside any cfcomponent wrapper (rare,
+      // but legal in a .cfm template) is a top-level function contained by
+      // the file, and template code's calls are the file's.
+      this.visitTag(child, root.type, fileNodeId, undefined, true);
       child = child.nextSibling;
     }
   }
@@ -208,20 +262,7 @@ export class CfmlExtractor {
         language: this.language,
       });
     }
-    const implementsAttr = this.tagAttr(openTag, 'implements');
-    if (implementsAttr) {
-      for (const iface of implementsAttr.split(',').map((s) => s.trim()).filter(Boolean)) {
-        this.unresolvedReferences.push({
-          fromNodeId: classNode.id,
-          referenceName: iface,
-          referenceKind: 'implements',
-          filePath: this.filePath,
-          line: openTag.startPosition.row + 1,
-          column: openTag.startPosition.column,
-          language: this.language,
-        });
-      }
-    }
+    this.pushInheritanceRefs(classNode.id, this.tagAttr(openTag, 'implements'), 'implements', openTag);
 
     // Walk siblings between the open tag and its close tag.
     let sibling = openTag.nextSibling;
@@ -231,20 +272,62 @@ export class CfmlExtractor {
         lastNode = sibling;
         break;
       }
-      if (sibling.type === 'cf_function_tag') {
-        this.extractFunctionTag(sibling, classNode.id, classNode.id, classNode.name);
-      } else if (sibling.type === 'cf_script_tag') {
-        this.delegateScriptTag(sibling, classNode.id, classNode.name);
-      } else if (sibling.type === 'cf_query_tag') {
-        this.delegateQueryTag(sibling, classNode.id);
-      } else {
-        this.delegateNestedTags(sibling, classNode.id, classNode.name);
-      }
+      // Component scope: cffunctions are its methods, pseudo-constructor
+      // code's calls (a component-level `<cfset init()>`) are the component's.
+      this.visitTag(sibling, openTag.parent?.type ?? '', classNode.id, classNode.name, true);
       lastNode = sibling;
       sibling = sibling.nextSibling;
     }
     classNode.endLine = lastNode.endPosition.row + 1;
     return lastNode;
+  }
+
+  /**
+   * `<cfinterface extends="IBase,IOther">...</cfinterface>` (#2091). Unlike
+   * `<cfcomponent>` (see the implicit-end-tag note on `extractComponent`) the
+   * grammar has no dedicated rule for it: it is a generic `cf_tag` whose body
+   * — the `<cffunction>` signatures — is ordinary nested children. Named like
+   * a component (the file name, unless a `name` attribute says otherwise), so
+   * `<cfcomponent implements="ISearchable">` resolves to it. An interface may
+   * extend several interfaces, comma-separated.
+   */
+  private extractInterfaceTag(tag: SyntaxNode, containerId: string): void {
+    const startTag = this.cfStartTag(tag) ?? tag;
+    const name = this.tagAttr(startTag, 'name') ?? this.componentNameFromPath();
+    const id = this.nodeIds.generate(this.filePath, 'interface', name, tag.startPosition.row + 1, tag.startPosition.column);
+    this.nodes.push({
+      id,
+      kind: 'interface',
+      name,
+      qualifiedName: `${this.filePath}::${name}`,
+      filePath: this.filePath,
+      language: this.language,
+      startLine: tag.startPosition.row + 1,
+      endLine: tag.endPosition.row + 1,
+      startColumn: tag.startPosition.column,
+      endColumn: tag.endPosition.column,
+      isExported: true,
+      updatedAt: Date.now(),
+    });
+    this.edges.push({ source: containerId, target: id, kind: 'contains' });
+    this.pushInheritanceRefs(id, this.tagAttr(startTag, 'extends'), 'extends', startTag);
+    this.delegateNestedTags(tag, id, name, true);
+  }
+
+  /** One unresolved `extends`/`implements` ref per name in a comma-separated tag attribute. */
+  private pushInheritanceRefs(fromNodeId: string, list: string | undefined, kind: 'extends' | 'implements', tag: SyntaxNode): void {
+    if (!list) return;
+    for (const name of list.split(',').map((s) => s.trim()).filter(Boolean)) {
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: kind,
+        filePath: this.filePath,
+        line: tag.startPosition.row + 1,
+        column: tag.startPosition.column,
+        language: this.language,
+      });
+    }
   }
 
   /**
@@ -290,36 +373,190 @@ export class CfmlExtractor {
       this.edges.push({ source: containerId, target: fnNode.id, kind: 'contains' });
     }
 
-    // Delegate any <cfscript>/<cfquery> bodies nested inside this function, at
-    // any depth (e.g. inside <cfif>/<cfloop>/<cftry> control-flow tags).
+    // Walk the body, at any depth (e.g. inside <cfif>/<cfloop>/<cftry>
+    // control-flow tags): its <cfscript>/<cfquery> bodies and tag
+    // expressions are this function's.
     this.delegateNestedTags(tag, fnNode.id);
   }
 
   /**
-   * Recursively delegates any `cf_script_tag`/`cf_query_tag` found within
-   * `node`'s subtree — e.g. a `<cfscript>`/`<cfquery>` nested inside
-   * `<cfif>`/`<cfloop>`/`<cftry>` control-flow tags, which (unlike
-   * `<cfcomponent>`'s body — see the implicit-end-tag note on `extractComponent`)
-   * ARE normal children, just possibly several levels deep, so a direct-children
-   * check misses them. Does not descend into a nested `cf_function_tag` — that
-   * has its own scope and is walked separately. `parentClassName` rides along
-   * so a `<cfscript>` at component scope classifies its functions as methods
-   * scoped under the component.
+   * Visit one node of tag markup. `containerId` is the scope the node sits in
+   * — the function whose body it is, else the component, else the file — and
+   * owns whatever calls it makes. `declScope` is true outside function bodies
+   * (component/interface/template scope), where a `<cffunction>` declares a
+   * function of that scope; `parentClassName` is set at component/interface
+   * scope, where those functions are methods.
+   *
+   * - `<cfscript>`/`<cfquery>` bodies go to their own grammars (see
+   *   delegateScriptTag / delegateQueryTag).
+   * - A `<cffunction>` is extracted when reached at declaration scope, at any
+   *   depth: `<cfprocessingdirective>` around Application.cfc's handlers
+   *   (#2091) or `<cfsilent>` around a template's helpers doesn't make them
+   *   any less the scope's functions. Never through an ERROR node — at file
+   *   scope that is typically a `<cfcomponent>` the parser lost (behind an
+   *   unclosed `<cfsetting>`), whose methods must not be misfiled as
+   *   top-level functions. Inside a function body a `<cffunction>` would be
+   *   its own scope; CFML rejects that, so it is skipped.
+   * - An expression in tag position — the value of `<cfset>`, the condition
+   *   of `<cfif>`/`<cfelseif>`, the operand of `<cfreturn>`, a `#hash#`
+   *   anywhere in markup, attributes and strings included — is recorded for
+   *   extractTagExpressions. The grammar parses these structurally (the same
+   *   expression rules as cfscript), so `parentType` (the node's parent) is
+   *   enough to tell the expression from the tag around it.
    */
-  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined, parentClassName?: string): void {
+  private visitTag(node: SyntaxNode, parentType: string, containerId: string, parentClassName: string | undefined, declScope: boolean): void {
+    switch (node.type) {
+      case 'cf_script_tag':
+        this.delegateScriptTag(node, containerId, parentClassName);
+        return;
+      case 'cf_query_tag':
+        // The SQL body is opaque to this grammar; the walk below only reaches
+        // the tag's attributes (`datasource="#dsn()#"`), never the body twice.
+        this.delegateQueryTag(node, containerId);
+        break;
+      case 'cf_function_tag':
+        if (declScope) this.extractFunctionTag(node, parentClassName ? containerId : undefined, containerId, parentClassName);
+        return;
+      case 'cf_tag': {
+        const name = this.cfTagName(node);
+        if (name === 'interface' && declScope && !parentClassName) {
+          this.extractInterfaceTag(node, containerId);
+          return;
+        }
+        // `<cfloop condition="hasNext()">` — the one common tag attribute whose
+        // plain-text value is a CFML expression rather than a literal.
+        if (name === 'loop') {
+          const condition = this.tagAttrValueNode(this.cfStartTag(node) ?? node, 'condition');
+          if (condition) this.addTagExpression(condition, containerId);
+        }
+        break;
+      }
+      default:
+        if (TAG_EXPRESSION_PARENTS.has(parentType) && TAG_EXPRESSION_TYPES.has(node.type)) {
+          this.addTagExpression(node, containerId);
+          return;
+        }
+    }
+    this.delegateNestedTags(node, containerId, parentClassName, declScope && node.type !== 'ERROR');
+  }
+
+  /**
+   * Visit `node`'s children (see visitTag) — e.g. a `<cfscript>`/`<cfquery>`
+   * nested inside `<cfif>`/`<cfloop>`/`<cftry>` control-flow tags, which
+   * (unlike `<cfcomponent>`'s body — see the implicit-end-tag note on
+   * `extractComponent`) ARE normal children, just possibly several levels
+   * deep, so a direct-children check misses them. `parentClassName` rides
+   * along so a `<cfscript>` at component scope classifies its functions as
+   * methods scoped under the component.
+   */
+  private delegateNestedTags(node: SyntaxNode, containerId: string, parentClassName?: string, declScope = false): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (!child) continue;
-      if (child.type === 'cf_script_tag') {
-        this.delegateScriptTag(child, containerId, parentClassName);
-      } else if (child.type === 'cf_query_tag') {
-        this.delegateQueryTag(child, containerId);
-      } else if (child.type === 'cf_function_tag') {
-        continue;
+      if (child) this.visitTag(child, node.type, containerId, parentClassName, declScope);
+    }
+  }
+
+  /** Record an expression in tag markup, owned by `scopeId`, for extractTagExpressions. */
+  private addTagExpression(node: SyntaxNode, scopeId: string): void {
+    if (node.endIndex <= node.startIndex) return;
+    this.tagExpressions.push({
+      startIndex: node.startIndex,
+      endIndex: node.endIndex,
+      row: node.startPosition.row,
+      column: node.startPosition.column,
+      textColumn: 0,
+      scopeId,
+    });
+  }
+
+  /**
+   * Extract calls from the expressions visitTag recorded, through the same
+   * cfscript extraction a `<cfscript>` body gets — one parse per file, not
+   * one per expression: the expressions are copied out in order, each on its
+   * own line (the line breaks between them are kept, so every line number is
+   * the file's) and ended with a `;`, and the result is read with the
+   * cfscript grammar. Each reference is handed back to the scope whose
+   * expression contains it, its column shifted back to the file's. Only
+   * references are kept: an expression declares nothing (`<cfset var x = …>`
+   * is a function local, and its `var` isn't copied), so a closure written in
+   * one is part of its scope's code.
+   */
+  private extractTagExpressions(): void {
+    const exprs = this.tagExpressions;
+    if (exprs.length === 0) return;
+    exprs.sort((a, b) => a.startIndex - b.startIndex);
+
+    const parts: string[] = [];
+    let pos = 0;
+    let column = 0; // column in the synthesized source
+    for (const expr of exprs) {
+      if (pos > 0) {
+        parts.push(';');
+        column++;
+      }
+      let breaks = 0;
+      for (let at = this.source.indexOf('\n', pos); at !== -1 && at < expr.startIndex; at = this.source.indexOf('\n', at + 1)) breaks++;
+      if (breaks > 0) {
+        parts.push('\n'.repeat(breaks));
+        column = 0;
+      }
+      expr.textColumn = column;
+      const text = this.source.slice(expr.startIndex, expr.endIndex);
+      parts.push(text);
+      const lastBreak = text.lastIndexOf('\n');
+      column = lastBreak === -1 ? column + text.length : text.length - lastBreak - 1;
+      pos = expr.endIndex;
+    }
+
+    const result = new TreeSitterExtractor(this.filePath, parts.join(''), 'cfscript').extract();
+    for (const ref of result.unresolvedReferences) {
+      const expr = this.tagExpressionAt(ref.line - 1, ref.column);
+      // Only an expression's first line moved; its later lines are verbatim.
+      if (ref.line - 1 === expr.row) ref.column += expr.column - expr.textColumn;
+      ref.fromNodeId = expr.scopeId;
+      ref.filePath = this.filePath;
+      ref.language = this.language;
+      this.unresolvedReferences.push(ref);
+    }
+    // A broken expression is routine in hand-written markup and the file's
+    // symbols came from the tag walk, so only a genuine failure is reported —
+    // not the extractor's "no symbols" warning, which an expressions-only
+    // source always earns.
+    for (const error of result.errors) {
+      if (error.severity === 'error') this.errors.push(error);
+    }
+  }
+
+  /** The recorded expression containing a synthesized-source position: the last one starting at or before it. */
+  private tagExpressionAt(row: number, column: number): TagExpression {
+    const exprs = this.tagExpressions;
+    let lo = 0;
+    let hi = exprs.length - 1;
+    let found = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const e = exprs[mid]!;
+      if (e.row < row || (e.row === row && e.textColumn <= column)) {
+        found = mid;
+        lo = mid + 1;
       } else {
-        this.delegateNestedTags(child, containerId, parentClassName);
+        hi = mid - 1;
       }
     }
+    return exprs[found]!;
+  }
+
+  /** A generic `cf_tag`'s start tag — where its name and attributes live. */
+  private cfStartTag(tag: SyntaxNode): SyntaxNode | undefined {
+    return tag.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'cf_start_tag' || c.type === 'cf_start_tag_with_selfclose'
+    );
+  }
+
+  /** A generic `cf_tag`'s name, lowercased, without the `cf` prefix (`<cfLoop>` → `loop`). */
+  private cfTagName(tag: SyntaxNode): string | undefined {
+    const nameNode = this.cfStartTag(tag)?.namedChildren.find((c: SyntaxNode) => c.type === 'cf_tag_name');
+    return nameNode ? this.source.substring(nameNode.startIndex, nameNode.endIndex).toLowerCase() : undefined;
   }
 
   /**
@@ -445,6 +682,18 @@ export class CfmlExtractor {
 
   /** Read a `cf_attribute`'s value by name from a tag node's direct `cf_attribute`/`cf_tag_attributes` children. */
   private tagAttr(tag: SyntaxNode, attrName: string): string | undefined {
+    const valueNode = this.tagAttrValueNode(tag, attrName);
+    if (valueNode === undefined) return undefined;
+    if (!valueNode) return '';
+    return this.source.substring(valueNode.startIndex, valueNode.endIndex);
+  }
+
+  /**
+   * The `attribute_value` node of a tag attribute — `undefined` when the tag
+   * has no such attribute, `null` when its value isn't plain text (empty, or
+   * a `#hash#` expression).
+   */
+  private tagAttrValueNode(tag: SyntaxNode, attrName: string): SyntaxNode | null | undefined {
     const attrs: SyntaxNode[] = [];
     for (let i = 0; i < tag.namedChildCount; i++) {
       const child = tag.namedChild(i);
@@ -467,9 +716,7 @@ export class CfmlExtractor {
       const valueWrapper = attr.namedChildren.find(
         (c: SyntaxNode) => c.type === 'quoted_cf_attribute_value' || c.type === 'cf_attribute_value'
       );
-      const valueNode = valueWrapper?.namedChildren.find((c: SyntaxNode) => c.type === 'attribute_value');
-      if (!valueNode) return '';
-      return this.source.substring(valueNode.startIndex, valueNode.endIndex);
+      return valueWrapper?.namedChildren.find((c: SyntaxNode) => c.type === 'attribute_value') ?? null;
     }
     return undefined;
   }

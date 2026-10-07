@@ -143,6 +143,109 @@ describe('daemon-registry', () => {
     }
   }, 15000);
 
+  /**
+   * A daemon fixture whose SIGTERM (intercepted; nothing is delivered) runs
+   * `onTerm` — the shape of its graceful shutdown — instead of exiting.
+   * `exitAfter(ms)` ends the process for real, as the end of that shutdown.
+   */
+  async function stoppingDaemon(
+    root: string,
+    onTerm: (daemon: { server: net.Server; pidPath: string; exitAfter: (ms: number) => void }) => void,
+  ): Promise<{ root: string; pid: number; pidPath: string; signalled: (signal: string) => boolean; dispose: () => Promise<void> }> {
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    const socketPath = getDaemonSocketPath(root);
+    const pidPath = getDaemonPidPath(root);
+    const pid = startDetachedProcess();
+    const server = net.createServer((socket) => {
+      socket.end(`${JSON.stringify({ protocol: 1, codegraph: 'test', pid, socketPath })}\n`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    fs.writeFileSync(pidPath, encodeLockInfo({ pid, version: 'test', socketPath, startedAt: Date.now() }));
+    const originalKill = process.kill.bind(process);
+    let exitTimer: NodeJS.Timeout | undefined;
+    const exitAfter = (ms: number): void => { exitTimer = setTimeout(() => originalKill(pid, 'SIGKILL'), ms); };
+    const kill = vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (target === pid && signal === 'SIGTERM') {
+        onTerm({ server, pidPath, exitAfter });
+        return true;
+      }
+      return originalKill(target, signal);
+    });
+    return {
+      root,
+      pid,
+      pidPath,
+      signalled: (signal) => kill.mock.calls.some(([target, sent]) => target === pid && sent === signal),
+      dispose: async () => {
+        clearTimeout(exitTimer);
+        kill.mockRestore();
+        if (isProcessAlive(pid)) process.kill(pid, 'SIGKILL');
+        if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it('waits for a daemon that has closed its socket but is still shutting down', async () => {
+    // A daemon's shutdown closes its socket first, then waits up to 15 s for
+    // query workers still starting up before it exits. Past the first 3 s the
+    // identity probe fails; that is a daemon still stopping, not a stranger.
+    const daemon = await stoppingDaemon(fs.mkdtempSync(path.join(tmpHome, 'stop-slow-')), ({ server, exitAfter }) => {
+      server.close();
+      exitAfter(4000);
+    });
+    try {
+      const result = await stopDaemonAt(daemon.root);
+      expect(result.outcome).toBe('term');
+      expect(isProcessAlive(daemon.pid)).toBe(false);
+      expect(daemon.signalled('SIGKILL')).toBe(false);
+      expect(fs.existsSync(daemon.pidPath)).toBe(false);
+    } finally {
+      await daemon.dispose();
+    }
+  }, 15000);
+
+  it('waits for a daemon that has released its lock but not yet exited', async () => {
+    // The end of the same shutdown: the lock goes just before the process does.
+    // A stop that looks then must wait for the exit, not report it running.
+    const daemon = await stoppingDaemon(fs.mkdtempSync(path.join(tmpHome, 'stop-unlocked-')), ({ server, pidPath, exitAfter }) => {
+      server.close();
+      fs.unlinkSync(pidPath);
+      exitAfter(4000);
+    });
+    try {
+      const result = await stopDaemonAt(daemon.root);
+      expect(result.outcome).toBe('term');
+      expect(isProcessAlive(daemon.pid)).toBe(false);
+      expect(daemon.signalled('SIGKILL')).toBe(false);
+    } finally {
+      await daemon.dispose();
+    }
+  }, 15000);
+
+  it('still reports a daemon whose shutdown never finishes, without force-killing it', async () => {
+    // The wait is bounded: past it, a daemon that closed its socket and never
+    // exited is reported, and with no socket to re-prove its identity it is
+    // left alone rather than SIGKILLed.
+    const daemon = await stoppingDaemon(fs.mkdtempSync(path.join(tmpHome, 'stop-wedged-')), ({ server }) => {
+      server.close();
+    });
+    try {
+      const started = Date.now();
+      const result = await stopDaemonAt(daemon.root, { shutdownGraceMs: 300 });
+      expect(result.outcome).toBe('still-running');
+      expect(Date.now() - started).toBeLessThan(8000);
+      expect(isProcessAlive(daemon.pid)).toBe(true);
+      expect(daemon.signalled('SIGKILL')).toBe(false);
+      expect(fs.existsSync(daemon.pidPath)).toBe(true);
+    } finally {
+      await daemon.dispose();
+    }
+  }, 15000);
+
   it('preserves a newer lock installed during a successful stop identity probe', async () => {
     const root = fs.mkdtempSync(path.join(tmpHome, 'stop-race-'));
     fs.mkdirSync(path.join(root, '.codegraph'));

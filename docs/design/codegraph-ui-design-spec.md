@@ -378,8 +378,10 @@ modules are not dimmed — a module with one `.pb.go` in it is still one somebod
 
 **What the list refuses to claim** is the whole design. Behind it, `src/graph/dead-code.ts` starts from "no incoming edge
 other than `contains`" and subtracts every candidate there is any reason to believe something reaches: exported symbols and
-header declarations, test and generated files, abstract and interface members, anything carrying a `decorates` edge, overrides
-of an ancestor's member, names the language calls by itself, vendored directories, files nothing in the index reaches (those are
+header declarations, test and generated files, abstract and interface members, anything carrying a decorator (a `decorates`
+edge, or a decorator from outside the index the resolver could not follow), overrides of an ancestor's member, a TypeScript
+hook its framework calls by name on a decorated class that skips the `implements` clause (which names are hooks is read off the
+classes that do write the interface out), names the language calls by itself, vendored directories, files nothing in the index reaches (those are
 islands — the Map's job, not this list's), names the resolver failed to resolve somewhere, names shared with a symbol that IS
 referenced, and — the only rule that reads a file — names written more than once in a file that can reach them.
 

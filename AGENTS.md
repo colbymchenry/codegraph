@@ -181,6 +181,8 @@ Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond
 
 Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.
 
+Every engine test file runs in a throwaway home dir (`__tests__/setup-home-sandbox.ts`, a `setupFiles` entry): `HOME`/`USERPROFILE` (+ Windows vars), `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` point into it, and `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/… are cleared; spawned children inherit it. It's a backstop — still inject writes to global state (e.g. `UpgradeDeps.wirePromptHook`, #2275).
+
 ### Windows-gated tests
 
 Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
@@ -212,6 +214,7 @@ For any Windows-specific PR, bug, or implementation, validate it on the real Win
 - Guest toolchain (winget): Node LTS, Git, and the **VC++ ARM64 redistributable** (required by `@rollup/rollup-win32-arm64-msvc`, which vitest pulls in).
 - Fetch a contributor PR head straight from their fork to dodge `pull/<n>/head` lag: `git fetch <fork-url> <branch>` then `git checkout -f FETCH_HEAD`.
 - Windows baseline: as of #2053 the full suite passes on the Windows 11 (ARM64) VM. The only expected exception is `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink`, which needs symlink privileges (Developer Mode) — confirm any other failure against `origin/main` before blaming your PR. The former `mcp-initialize.test.ts` / `mcp-roots.test.ts` `EPERM` teardown failures came from tests spawning `serve --mcp` without the runtime flags (its `--liftoff-only` re-exec grandchild kept the cwd / SQLite file open); spawn it with `WASM_RUNTIME_FLAGS` and await the child's exit before removing the temp dir. Windows checkouts may be CRLF — split source lines on `/\r?\n/` in tests.
+- Windows worker crashes: a worker thread that ends (`terminate()`, its own `process.exit()`, or the process exiting) while V8's concurrent marker is marking its heap kills the process with exit 3221225477 (0xC0000005) and leaves no error or dump. It's worst while the worker is still loading its modules. Owners must not terminate a worker before its first message (`workerStarted` / `terminateOnceStarted`, or the pool's own handshake), and a worker that exits itself calls `collectBeforeExit()` first — both in `src/worker-teardown.ts`. `--no-concurrent-marking` also stops it, but measured about a third slower indexing on the Windows VM, so it is not used.
 
 ## Releases
 

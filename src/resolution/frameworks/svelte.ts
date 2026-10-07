@@ -80,8 +80,10 @@ export const svelteResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 2: Store auto-subscriptions ($storeName)
-    if (ref.referenceName.startsWith('$') && !ref.referenceName.startsWith('$$')) {
+    // Pattern 2: Store auto-subscriptions ($storeName) — a `.svelte`
+    // component's syntax only. In any other script `$n` is a name of its own
+    // (jQuery's `$el`, a compiler's `$n`), never the store `n`.
+    if (ref.language === 'svelte' && ref.referenceName.startsWith('$') && !ref.referenceName.startsWith('$$')) {
       const storeName = ref.referenceName.substring(1);
       const storeNode = context.getNodesByName(storeName).find(
         (n) => n.kind === 'variable' || n.kind === 'constant'

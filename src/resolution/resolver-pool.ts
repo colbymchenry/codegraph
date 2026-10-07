@@ -16,6 +16,7 @@ import * as os from 'os';
 import type { Edge, UnresolvedReference } from '../types';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
+import { terminateOnceStarted, workerStarted } from '../worker-teardown';
 
 /** One synthesis pass's output: its edge list + worker-measured wall clock. */
 export interface SynthPassResult {
@@ -56,8 +57,13 @@ export const RESOLVE_PROFILE = !!process.env.CODEGRAPH_RESOLVE_PROFILE;
 interface PoolWorker {
   worker: Worker;
   ready: Promise<void>;
+  /** Settles on the worker's first message or its end — see worker-teardown.ts. */
+  started: Promise<void>;
   busy: number;
 }
+
+/** How long destroy() waits for a worker to exit on 'close' before terminating it. */
+const CLOSE_TIMEOUT_MS = 5000;
 
 const MIN_PARALLEL_BATCH = 1000;
 /**
@@ -85,6 +91,23 @@ export function minRefsForPool(): number {
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
   return 150_000;
+}
+
+/**
+ * Fewest refs still to settle for the batch loop to boot the pool mid-run
+ * from its observed per-ref rate. Booting takes seconds (each worker opens the
+ * database and warms a resolver), only batches of MIN_PARALLEL_BATCH refs fan
+ * out, and synthesis waits for a booting pool. A rate measured on a busy
+ * machine inflates every projection, so with no floor a ten-file project booted
+ * the pool in half its runs under heavy load and paid seconds for nothing.
+ * Repos the adaptive bar is for (Rust-class per-ref cost) have tens of
+ * thousands of refs and still engage.
+ */
+export const ADAPTIVE_ENGAGE_MIN_REFS = 20_000;
+
+/** Whether the resolve loop should boot the pool mid-run (see ADAPTIVE_ENGAGE_MIN_REFS). */
+export function shouldEngageAdaptively(projectedMs: number, remainingRefs: number, barMs: number): boolean {
+  return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
 }
 
 export class ResolverPool {
@@ -178,13 +201,14 @@ export class ResolverPool {
   private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerScript);
+      const started = workerStarted(worker);
       let readyResolve!: () => void;
       let readyReject!: (e: Error) => void;
       const ready = new Promise<void>((resolve, reject) => {
         readyResolve = resolve;
         readyReject = reject;
       });
-      const pw: PoolWorker = { worker, ready, busy: 0 };
+      const pw: PoolWorker = { worker, ready, started, busy: 0 };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number; t0?: number; t1?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
           readyResolve();
@@ -365,14 +389,20 @@ export class ResolverPool {
     );
   }
 
-  async destroy(): Promise<void> {
+  /**
+   * Ask every worker to close; each collects garbage and exits by itself (see
+   * worker-teardown.ts). One that hasn't by `closeTimeoutMs` is terminated —
+   * but never while it is still starting up: a pool torn down soon after it
+   * booted, on a busy machine, can have a worker still loading its modules.
+   */
+  async destroy(closeTimeoutMs = CLOSE_TIMEOUT_MS): Promise<void> {
     await Promise.all(
       this.workers.map(
         (pw) =>
           new Promise<void>((resolve) => {
             const t = setTimeout(() => {
-              void pw.worker.terminate().then(() => resolve());
-            }, 5000);
+              void terminateOnceStarted(pw.worker, pw.started).then(() => resolve());
+            }, closeTimeoutMs);
             pw.worker.once('exit', () => {
               clearTimeout(t);
               resolve();
