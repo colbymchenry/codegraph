@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -681,10 +681,19 @@ export class ReferenceResolver {
   private createContext(): ResolutionContext {
     return {
       resolveImport: (ref) => resolveViaImport(ref, this.context),
-      isOutOfRepoImport: (source, fromFile, language) =>
-        isExternalImport(source, language, this.context) &&
-        resolveImportPath(source, fromFile, language, this.context) === null &&
-        this.isDeclaredOutsidePackage(source, fromFile),
+      // A path alias makes an import the project's only when it maps the
+      // import to a file the index holds. Matching its prefix is not enough:
+      // cord-field's `"*": ["./typings/*"]` matches every package, and
+      // counting the match bound 169 imports of `@mui/material`'s Typography
+      // to its own. Nor is a path that exists on disk: home-assistant's
+      // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
+      // `node_modules`, topcoder's `config` package on its `config/` folder.
+      isOutOfRepoImport: (source, fromFile, language) => {
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        const resolved = resolveImportPath(source, fromFile, language, this.context);
+        if (resolved !== null && this.isIndexedFile(resolved)) return false;
+        return this.isDeclaredOutsidePackage(source, fromFile);
+      },
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -1271,6 +1280,11 @@ export class ReferenceResolver {
     // A Dart annotation (`@riverpod`, `@Riverpod(…)`) is a constant or a
     // constructor call, as written — never a method or function by its name.
     if (isDartAnnotation(ref)) return matchDartAnnotation(ref, this.context);
+    // A Go call through a type assertion (`srv.(KVServer).Range(ctx, in)`),
+    // which arrives by its bare name, is to a method of the asserted type, or
+    // to nothing the project declares.
+    const asserted = matchGoAssertedCall(ref, this.context);
+    if (asserted !== undefined) return asserted;
 
     // A section or snippet a Shopify theme's file names is that theme's own,
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
@@ -3332,6 +3346,12 @@ export class ReferenceResolver {
     if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
     const target = this.nodeById(result.targetNodeId);
     return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+  }
+
+  /** Is `filePath` (project-relative) one of the files the index holds? */
+  private isIndexedFile(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/');
+    return this.knownFiles ? this.knownFiles.has(normalized) : this.queries.getFileByPath(normalized) !== null;
   }
 
   /** The repository's own package name, from its root package.json; null without one. */
