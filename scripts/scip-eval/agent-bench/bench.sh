@@ -2,7 +2,7 @@
 #
 # Agent benchmark: the same question asked of a headless Claude Code agent in
 # arms that differ only in what codegraph serves it, scored against the
-# compiler's answer. Results and method: FORK.md, "Agent benchmark".
+# compiler's answer. Results and method: docs/scip.md, "Agent benchmark".
 #
 #   scripts/scip-eval/agent-bench/bench.sh setup <task>          fresh repo copies; B and C build their own graphs
 #   scripts/scip-eval/agent-bench/bench.sh run <task> [arm...]   BENCH_REPEAT runs per arm (default 1; arms A B C), one after another
@@ -12,7 +12,7 @@
 # Arms:
 #   A  no codegraph: no MCP server, and the CLI is off PATH and blocked by a hook (agent-eval/no-cli-shim.sh)
 #   B  upstream codegraph @colbymchenry/codegraph@1.6.1 (installed under $BENCH_RUNS/upstream, not globally)
-#   C  the installed fork (`codegraph` on PATH: build the bundle and install it first; FORK.md)
+#   C  the installed fork (`codegraph` on PATH: build the bundle and install it first)
 #   D  this checkout's build (npx tsc -p .) on a copy of C's repo and graph — for trying a change before installing it
 #   H  C plus the UserPromptSubmit hook a real install has (`codegraph prompt-hook`), on a copy of C's repo and graph
 # Each run: BENCH_MODEL (default sonnet), effort high, $2 cap, project settings only (no user hooks or plugins), no skills,

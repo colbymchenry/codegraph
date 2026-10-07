@@ -1,45 +1,19 @@
-# codegraph-scip
+# SCIP: compiler-verified call edges
 
-A private fork of [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph). It merges
-compiler-grade call edges from [SCIP](https://github.com/sourcegraph/scip) indexers into codegraph's
-graph. codegraph's heuristic resolver still handles everything an indexer can't see.
+codegraph merges call edges from [SCIP](https://github.com/sourcegraph/scip) indexers into its graph.
+Where a compiler resolves a call, its answer verifies, removes or adds codegraph's edge; everything an
+indexer can't see stays with codegraph's own resolver. On Django, a proof of concept took "who calls X"
+recall from 47–60% to 99%, at 99–100% precision.
 
-Origin: the POC in `dotclaude` → `research/2026-09-30-scip-codegraph-poc/` (branch `worktree-scip-codegraph-poc`),
-including `FORK-PLAN.md`. On Django, the POC took "who calls X" recall from 47–60% to 99%, at 99–100% precision.
+## Files touched in codegraph
 
-## Branches
-
-| ref | what |
-|---|---|
-| `main`, tags `vX.Y.Z` | mirror of upstream (`git fetch upstream && git push origin 'refs/remotes/upstream/*:refs/heads/*' --tags`) |
-| `scip` | the fork: rebased onto each upstream release tag |
-| tags `vX.Y.Z-scip.N` | fork releases — none yet: releases are deferred (roadmap 7.4); install from a local bundle (below) |
-
-Upstream's `Release` and `Deploy site` workflows are disabled on this repo. Only `scip CI` runs here.
-
-**Rebase onto a new upstream release:** `git fetch upstream --tags && git rebase vX.Y.Z scip`.
-Then run the SCIP suite, the upstream suite and the eval gate (below).
-Upstream files the fork touches (keep these hunks small):
+Kept small; everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixtures/scip-*/`
+and `scripts/scip-eval/`.
 
 - `src/index.ts`: the `runScipPass` hook in `indexAll`, the `onSynced` hook in `sync`, the reindex scheduler in `watch`/`unwatch`, and `scipReadDb`/`scipWrite`
 - `src/bin/codegraph.ts`: `registerScipCommands`, the update-check default, and the `upgrade` refusal
 - `src/mcp/tools.ts`: `scipFlowNote`, `scipTrailNote`, and `callSitesSection` at the top of explore's answer
 - `install.sh`: `CODEGRAPH_ARCHIVE`, to install a locally built bundle
-
-Everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixtures/scip-ts/` and `scripts/scip-eval/`.
-
-## Installing it as `codegraph`
-
-Build a self-contained bundle with upstream's recipe ([`BUNDLING.md`](BUNDLING.md)): vendored Node 24 plus the native extraction kernel. It runs whatever Node the machine has, including 25+, which the plain build refuses. Then install it with upstream's `install.sh`, which links it and removes older versions:
-
-```sh
-scripts/build-kernel.sh                      # native kernel (cargo); without it the bundle falls back to the slower wasm path
-scripts/build-bundle.sh linux-x64            # -> release/codegraph-linux-x64.tar.gz
-CODEGRAPH_ARCHIVE=release/codegraph-linux-x64.tar.gz \
-CODEGRAPH_VERSION="v$(node -p "require('./package.json').version")-scip.$(git rev-parse --short HEAD)" sh install.sh
-```
-
-MCP clients that launch `codegraph` pick it up on restart. To go back to the npm install: `ln -sfn ../lib/node_modules/@colbymchenry/codegraph/npm-shim.js ~/.local/bin/codegraph`, or run `npm i -g @colbymchenry/codegraph`, which re-links it (so does any `npm update -g`).
 
 ## Using it
 
@@ -119,7 +93,7 @@ So the speed-up for Python is patching, not a faster full run. A new index repla
 
 ## How edges are decided
 
-Call sites are keyed by (caller node, line, callee name, kind), as in the POC. The caller comes from **codegraph's own node spans**, not SCIP's ranges. That is the narrowest enclosing function or method, unless a class defined inside it is narrower. Failing that it is the narrowest enclosing container node (the kinds are listed in `CONTAINER_KINDS` in `src/scip/sites.ts`), and failing that the file. This is the same caller codegraph's extractors record, so decorators belong to the class, calls in a local class body to that class, and top-level code to the file. An earlier version used SCIP's definition ranges, which include decorators. It disagreed with the heuristic's caller on thousands of Django sites and produced parallel edges.
+Call sites are keyed by (caller node, line, callee name, kind). The caller comes from **codegraph's own node spans**, not SCIP's ranges. That is the narrowest enclosing function or method, unless a class defined inside it is narrower. Failing that it is the narrowest enclosing container node (the kinds are listed in `CONTAINER_KINDS` in `src/scip/sites.ts`), and failing that the file. This is the same caller codegraph's extractors record, so decorators belong to the class, calls in a local class body to that class, and top-level code to the file. An earlier version used SCIP's definition ranges, which include decorators. It disagreed with the heuristic's caller on thousands of Django sites and produced parallel edges.
 
 | case | action |
 |---|---|
@@ -131,7 +105,7 @@ Call sites are keyed by (caller node, line, callee name, kind), as in the POC. T
 
 The **hash gate** decides whether a document is used. It is used only when three hashes are equal: the file's content hash when the indexer started, `files.content_hash`, and the file on disk. `scip import` has no indexer start to snapshot, so the index file's mtime stands in for it: a source modified after the index was written is left to the heuristic until a reindex. Copy an index with its mtime intact (`cp -p`), or the copy time becomes the build time. Synthesized dynamic-dispatch edges (`provenance='heuristic'`) are never touched.
 
-Differences from the POC:
+Design notes:
 
 - A target that the index *defines* but that has no codegraph node (or sits in a stale document) is **unknown**, not external. It never deletes a heuristic edge.
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
@@ -140,7 +114,7 @@ Differences from the POC:
 - `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
 - An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements. Overloads share a qualified name. When one symbol is defined at nodes with **different** qualified names, it is left unjudged: no edge is verified, moved or added through it. rust-analyzer does this, naming every nested `fn imp` in a module `module/imp()`, and first-wins sent all four of ripgrep's `pathutil.rs` `imp()` calls to the first one.
 - With tsgo, an object-literal method *definition* that implements an interface (`{ listen(e) { … } }`) is not a call. scip-typescript records it as a reference to the interface method, so the merge used to add a `calls` edge for it.
-- Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
+- Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. No runtime dependency is added. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
 
 ### Types and calls through interfaces
 
@@ -192,13 +166,13 @@ Most remaining "wrong" on Playwright are shorthand properties (`{ queryAll }`): 
 | cobra | 49 / 2,688 (1.8%) | 5 | 37 | 2 | 5 | 0 | 0 |
 | ripgrep | 2,460 / 12,860 (19.1%) | 46 | 120 | 14 | **1,321 (54%)** | **959 (39%)** | 0 |
 
-- **Target without node:** SCIP resolved the call to a project definition that maps to no node. In vscode it was almost all **overloaded functions**: tsgo (like scip-typescript) defines one at its first signature, codegraph's node is the implementation further down (`localize` alone: 25,762 edges). Fixed (roadmap 4.2): a definition no node contains maps to the file's only node of that name and kind starting below it. Tracing the rest found a lookup bug: every method named like an `Object.prototype` member (`toString`, `valueOf`, …) never mapped, in any language.
+- **Target without node:** SCIP resolved the call to a project definition that maps to no node. In vscode it was almost all **overloaded functions**: tsgo (like scip-typescript) defines one at its first signature, codegraph's node is the implementation further down (`localize` alone: 25,762 edges). Fixed: a definition no node contains maps to the file's only node of that name and kind starting below it. Tracing the rest found a lookup bug: every method named like an `Object.prototype` member (`toString`, `valueOf`, …) never mapped, in any language.
 
   After both, vscode: **64,103 unverified (7.1%, from 12.9%)**; target without node 51,798 → 1,955; the merge removed 3,260 wrong heuristic edges (mostly `toString` calls aimed at a same-named class in another copy of the file) and added 15,373 missing ones. Eval gates unchanged on all corpora.
-- **No document** (roadmap 4.3): tsgo now indexes TS/JS files outside every tsconfig as one inferred program (also a repo with no tsconfig at all), and Go modules / Cargo workspaces below the repo root get a run each. Unverified call edges: Playwright 30.2% → 14.3%, codegraph 68.4% → 5.3% (`__tests__` and `codegraph-kernel/`), vscode 7.1% → 6.3% (no document 14,839 → 293; Rust `cli/` indexed); Django's JS indexed. Eval gates unchanged. Nothing judges the inferred program independently (scip-typescript indexes the same tsconfig projects); spot checks of removed edges in codegraph's tests read right (`spawn` → `child_process`, `controller.enqueue` → a stream controller).
+- **No document**: tsgo now indexes TS/JS files outside every tsconfig as one inferred program (also a repo with no tsconfig at all), and Go modules / Cargo workspaces below the repo root get a run each. Unverified call edges: Playwright 30.2% → 14.3%, codegraph 68.4% → 5.3% (`__tests__` and `codegraph-kernel/`), vscode 7.1% → 6.3% (no document 14,839 → 293; Rust `cli/` indexed); Django's JS indexed. Eval gates unchanged. Nothing judges the inferred program independently (scip-typescript indexes the same tsconfig projects); spot checks of removed edges in codegraph's tests read right (`spawn` → `child_process`, `controller.enqueue` → a stream controller).
 - **No reference:** SCIP resolved nothing at the call: an untyped receiver (most of Django: `self.apps.check_models_ready()`), an `any`, an unresolved import. Some of these heuristic edges are wrong guesses (`self.label.title()` → `defaultfilters.title`) that the merge can't judge.
 - **No document:** no index covers the caller's file. TS files no `tsconfig.json` includes (vscode `extensions/copilot`: 8,009; codegraph `__tests__`), a language root below the repo root that detection misses (vscode's Rust `cli/`: 3,201; codegraph's `codegraph-kernel/`: 3,709), and vendored JS (Playwright `tests/assets`: 17,343).
-- **Not a call to SCIP / later line (Rust):** rust-analyzer names enum variants as types (`Result#Ok#`), so `Ok(…)` / `Some(…)` were keyed as instantiations while codegraph records a call to the variant; and in a multi-line chain codegraph keys a call at the chain's first line, SCIP at the method name's. Fixed (roadmap 4.4): the Rust adapter declares `variantCalls`, and variant definitions map to `enum_member` nodes. The chain line was later found in every language and both dot styles (Go's `mk().⏎Bar()` merged to a silent heuristic edge plus a SCIP duplicate): every call is now keyed at the line its expression starts (`src/scip/site.ts` callLine), which also judges sites the old rule never matched — on ripgrep, Django and Playwright, 6 + 1 + 8 more heuristic edges verified and 6 + 6 + 1 removed, each a call into std / builtins / a dependency the heuristic had linked to a project method by name. ripgrep: unverified 19.1% → **1.1%** (2,460 → 118). The eval now judges the graph at the line codegraph keys a call on, so codegraph-only Rust recall reads a few points higher (37 → 40%, 20 → 24%); codegraph+SCIP is unchanged.
+- **Not a call to SCIP / later line (Rust):** rust-analyzer names enum variants as types (`Result#Ok#`), so `Ok(…)` / `Some(…)` were keyed as instantiations while codegraph records a call to the variant; and in a multi-line chain codegraph keys a call at the chain's first line, SCIP at the method name's. Fixed: the Rust adapter declares `variantCalls`, and variant definitions map to `enum_member` nodes. The chain line was later found in every language and both dot styles (Go's `mk().⏎Bar()` merged to a silent heuristic edge plus a SCIP duplicate): every call is now keyed at the line its expression starts (`src/scip/site.ts` callLine), which also judges sites the old rule never matched — on ripgrep, Django and Playwright, 6 + 1 + 8 more heuristic edges verified and 6 + 6 + 1 removed, each a call into std / builtins / a dependency the heuristic had linked to a project method by name. ripgrep: unverified 19.1% → **1.1%** (2,460 → 118). The eval now judges the graph at the line codegraph keys a call on, so codegraph-only Rust recall reads a few points higher (37 → 40%, 20 → 24%); codegraph+SCIP is unchanged.
 - **Target outside graph:** a definition in a file codegraph has no nodes for. Only Playwright's `types.d.ts` (over the 1 MB limit): 709 edges.
 
 ## Eval gate
@@ -218,7 +192,7 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 | TS | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
 | TS (tsgo) | same, judged by scip-typescript's index | 1 | 100% / 44% | 92% / 100% | **100% / 100%** | 1.4 s + 0.3 s |
 | TS (tsgo) | same | 2 | 100% / 56% | 91% / 100% | **100% / 100%** | |
-| Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.6 s |
+| Python | Django @ 026b005 (2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.6 s |
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 | Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
 | Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
@@ -261,11 +235,11 @@ Seeds 1 and 2, judged by scip-typescript's index:
 
 tsgo's 13 seed-2 "misses" are all object-literal method definitions that scip-typescript counts as calls (see above), so the gap is scip-typescript's error. On the graph, tsgo verified 557k heuristic edges where scip-typescript verified 540k, and left 112k unverified instead of 130k.
 
-### Fork vs regular codegraph, from scratch
+### Regular codegraph vs with SCIP, from scratch
 
-Regular: `npx @colbymchenry/codegraph@1.6.1 init`. Fork: `codegraph init` (the same tree-sitter indexer), then `codegraph scip index` with tsgo. Accuracy is judged by scip-typescript's index, over 50 random functions/methods per seed.
+Regular: `npx @colbymchenry/codegraph@1.6.1 init`. With SCIP: `codegraph init` (the same tree-sitter indexer), then `codegraph scip index` with tsgo. Accuracy is judged by scip-typescript's index, over 50 random functions/methods per seed.
 
-| | vscode, regular | vscode, fork | Playwright¹, regular | Playwright¹, fork |
+| | vscode, regular | vscode, + SCIP | Playwright¹, regular | Playwright¹, + SCIP |
 |---|---|---|---|---|
 | time | 2m06s | 2m20s + 1m31s = 3m51s | 18 s | 16 s + 8.7 s = 25 s |
 | `.codegraph` size | 1,769 MB | 1,975 MB | 193 MB | 213 MB |
@@ -292,20 +266,15 @@ Raw per-seed output (`compare.ts --json`): [`scripts/scip-eval/results/`](script
 | cobra | 2,637 | 160 | 1 | 48 |
 | ripgrep | 4,447 | 1,080 | 5,957 | 2,442 |
 
-After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC.
+After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1.
 
-The Django codegraph-only baseline (75–78% recall) is higher than the POC's 47–60%, for three reasons:
-- The targets differ. `compare.ts` samples with a seeded mulberry32, the POC with Python's `random`, so seed 1 does not pick the same 50 callables.
-- The heuristic here is upstream v1.6.1, where the POC used v1.6.0.
-- The POC's hand-picked targets were deliberately chosen from its conflict samples.
-
-The merged result reproduces the POC: 100%/100% here, 99%/100% there. On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
+On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
 
 Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph attributes their calls to a variable node whose span is one line, so 18 sites get a parallel file-level SCIP edge. Rust tests defined through macros (`rgtest!(name, |…| {…})`) have no function node, so their calls are attributed to the file. This matches codegraph's convention for top-level code; the heuristic has no edges there at all.
 
-## Agent benchmark (roadmap 6.1)
+## Agent benchmark
 
-Does any of this change what an agent does? `scripts/scip-eval/agent-bench/bench.sh` asks a headless Claude Code agent (Sonnet 5.5, effort high) the same question in arms that differ only in what codegraph serves it, each on its own copy of the repo with its own freshly built graph, and `score.js` scores the answer against the compiler's. Arms: **A** no codegraph (CLI blocked too), **B** upstream codegraph 1.6.1, **C** this fork, **D** this fork with the call-sites answer below. Measured 2026-10-01, one run per cell.
+Does any of this change what an agent does? `scripts/scip-eval/agent-bench/bench.sh` asks a headless Claude Code agent (Sonnet 5.5, effort high) the same question in arms that differ only in what codegraph serves it, each on its own copy of the repo with its own freshly built graph, and `score.js` scores the answer against the compiler's. Arms: **A** no codegraph (CLI blocked too), **B** upstream codegraph 1.6.1, **C** codegraph with SCIP, **D** codegraph with SCIP and the call-sites answer below. Measured 2026-10-01, one run per cell.
 
 | task (truth) | grep noise | A | B | C | D |
 |---|---|---|---|---|---|
@@ -315,11 +284,7 @@ Does any of this change what an agent does? `scripts/scip-eval/agent-bench/bench
 | T4 ripgrep, `LineTerminator::as_bytes` two levels (4 + 14 functions) | 198 | 18/18 · 125k · $0.13 · 34 s | 18/18 · 173k · $0.17 · 33 s | 18/18 · 128k · $0.14 · 23 s | 18/18 · 119k · $0.13 · 21 s |
 
 - **Grep alone was enough.** Sonnet 5.5 filtered hundreds of hits by reading types and imports and got every task right in under a minute. Where upstream's graph was empty (T1: 0 callers) or wrong (T4: 37 of 39), its agent fell back to grep, once by writing its own TypeScript compiler-API script, and paid for the extra output.
-- **The fork's verified callers never reached the agent.** Agents called `codegraph_explore` at most once, then redid the task with grep: explore answered with related source and other symbols' blast radius, not the call sites (T3: 16k chars, none of the 67). In T1 and T2 the fork's agent did not call it at all.
+- **The verified callers never reached the agent.** Agents called `codegraph_explore` at most once, then redid the task with grep: explore answered with related source and other symbols' blast radius, not the call sites (T3: 16k chars, none of the 67). In T1 and T2 the SCIP arm's agent did not call it at all.
 - **Arm D** (`src/scip/callsites.ts`): explore now opens with every call site of a symbol the query names (`Type.method`, `Type::method`), each with its line and caller, and says the list is compiler-verified and complete for what the compiler resolves. Where the agent used it, it took fewer steps and tokens (T3 192k against 234–247k) but still re-checked with grep, and on T2 it did not call codegraph at all. Trust and adoption, not the index, are what limit the gain.
 - A Django (Python) task was dropped: untyped receivers (`form.save()`) leave no compiler truth to score against, and some are other classes' `save`.
-- Since then (roadmap 8.1–8.3, not yet run): the call-sites answer ends with the other calls of the name (what a grep adds that the list doesn't explain: T3 D's second call was `grep -rn "\.start()" … | wc -l`), grouped by file. The bench takes `BENCH_REPEAT` runs per cell and `BENCH_MODEL` (e.g. Haiku), has an arm **H** (C plus a real install's `codegraph prompt-hook`, which injects explore's answer, call sites included, before the agent's first tool call), and `score.js` averages runs and reports whether each called codegraph and how many tool calls came after its first answer.
-
-## Status
-
-What is done and what is next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).
+- Since then (not yet run): the call-sites answer ends with the other calls of the name (what a grep adds that the list doesn't explain: T3 D's second call was `grep -rn "\.start()" … | wc -l`), grouped by file. The bench takes `BENCH_REPEAT` runs per cell and `BENCH_MODEL` (e.g. Haiku), has an arm **H** (C plus a real install's `codegraph prompt-hook`, which injects explore's answer, call sites included, before the agent's first tool call), and `score.js` averages runs and reports whether each called codegraph and how many tool calls came after its first answer.

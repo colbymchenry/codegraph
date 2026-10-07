@@ -1,7 +1,7 @@
 /**
  * "Who calls X?" answered as a list the agent can stop on.
  *
- * Measured (FORK.md, agent runs): an agent asked for a method's call sites called
+ * Measured (docs/scip.md, agent benchmark): an agent asked for a method's call sites called
  * `codegraph_explore` once, got related source and other symbols' blast radius —
  * not the call sites — and re-derived them with grep, even when every site was in
  * the graph, compiler-verified. This section lists them: every call site of the

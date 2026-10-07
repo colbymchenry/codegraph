@@ -2900,7 +2900,7 @@ program
   .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
     // Fork: refuse up front. Upstream's body below is left unreachable rather
     // than deleted so this hunk stays three lines on every rebase.
-    error('This is the codegraph-scip fork: `upgrade` would replace it with upstream. Install a newer fork tarball instead (see FORK.md).');
+    error('This is the codegraph-scip fork: `upgrade` would replace it with upstream. Install a newer fork tarball instead (see docs/scip.md).');
     process.exit(1);
     const up = await import('../upgrade');
     const method = up.detectInstallMethod({

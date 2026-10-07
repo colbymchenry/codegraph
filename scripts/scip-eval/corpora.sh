@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Reproduce FORK.md's eval tables: clone each corpus at its pinned commit, index
+# Reproduce docs/scip.md's eval tables: clone each corpus at its pinned commit, index
 # it with this checkout (codegraph init, then scip index), and judge "who calls
 # X?" over 50 random targets per seed with compare.ts.
 #
@@ -14,7 +14,7 @@
 #   SEEDS          default "1 2"
 #
 # Needs: a built checkout (npx tsc -p .) and a Node that runs it (22/24), the
-# language's indexer (FORK.md "Using it"), and npx for the TypeScript judge.
+# language's indexer (docs/scip.md "Using it"), and npx for the TypeScript judge.
 # TS corpora are judged by scip-typescript's index (an independent compiler,
 # run through the fork's own adapter); the others by their own indexer's.
 # TS corpora also get references.ts: the precision of every `references` edge,

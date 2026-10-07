@@ -11,7 +11,7 @@
  *   unknown — SCIP has no resolution there (dynamic code)
  * Recall is against SCIP-resolved call lines; precision excludes unknowns.
  *
- * Gate (FORK.md): codegraph+SCIP precision >= 95%, recall >= codegraph-only.
+ * Gate (docs/scip.md): codegraph+SCIP precision >= 95%, recall >= codegraph-only.
  */
 
 import { SqliteDatabase, createDatabase } from '../../src/db/sqlite-adapter';
