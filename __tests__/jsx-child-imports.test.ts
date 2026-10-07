@@ -152,6 +152,34 @@ export function App() { return <div><VansPage /><PriceCard /></div>; }
     expect(rendersFrom(db, 'App')).toEqual(['pages/card.tsx:Card', 'pages/vans.tsx:Vans']);
   });
 
+  it('reads the module’s own `export default` past ones a template writes as text', async () => {
+    // react.dev's SandpackWithHTMLOutput.tsx: sandbox files' sources sit in
+    // templates above the real statement, and one names a function the file
+    // also declares, which only the statement that declares it may bind.
+    write(
+      'components/sandpack.tsx',
+      `import { memo } from 'react';
+export function formatHTML(markup: string) { return markup.trim(); }
+const files = {
+  '/App.js': \`
+export default function ShowRenderedHTML({children}) {
+  return children;
+}
+\`,
+  '/formatHTML.js': \`
+export default function formatHTML(markup) {
+  return markup;
+}
+\`,
+};
+export default memo(function SandpackWithHTMLOutput() { return <pre>{Object.keys(files).join()}</pre>; });
+`
+    );
+    write('mdx.tsx', `import Sandpack from './components/sandpack';\nexport function MDX() { return <Sandpack />; }\n`);
+    const db = await index();
+    expect(rendersFrom(db, 'MDX')).toEqual(['components/sandpack.tsx:SandpackWithHTMLOutput']);
+  });
+
   it('renders nothing for a default export with no declaration of its own, not a same-named symbol elsewhere', async () => {
     write('app/header.tsx', `export function Header() { return <nav>app header</nav>; }\n`);
     write('emails/components/header.tsx', `export default () => <header>email header</header>;\n`);

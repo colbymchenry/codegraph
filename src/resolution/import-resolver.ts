@@ -95,11 +95,11 @@ interface FileExportIndex {
   /** First exported function or class: the guess for a module that never says. */
   defaultFnClass: Node | undefined;
   /**
-   * What the module's `export default` statement says its default export is
-   * (see {@link defaultStatement}). `undefined` until first read; `null` when
+   * What the module's `export default` statements say its default export is
+   * (see {@link defaultStatements}). `undefined` until first read; empty when
    * the module has no such statement or is not a JS-family file.
    */
-  defaultStatement?: DefaultStatement | null;
+  defaultStatements?: DefaultStatement[];
   /**
    * Names a local export clause (`export { impl as alias }`) binds to a
    * declaration the extractor never flagged isExported, for names not in
@@ -122,6 +122,10 @@ const NOT_A_BINDING = new Set(['new', 'await', 'typeof', 'void', 'delete', 'yiel
 interface NamedBinding {
   name: string;
   wrapped: boolean;
+  /** For a function or class the expression declares itself: where its name is written in the code read. */
+  nameAt?: number;
+  /** For such a declaration in an `export default` statement: the lines its node starts on, the statement's to its name's. */
+  declaredLines?: { from: number; to: number };
 }
 
 /** A default export written as an expression with no name of its own, and where it starts. */
@@ -168,7 +172,7 @@ function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): N
   const declared = /^(?:async\s+)?function\b\s*\*?\s*([A-Za-z_$][\w$]*)?|^(?:abstract\s+)?class\b(?:\s+(?!extends\b|implements\b)([A-Za-z_$][\w$]*))?/.exec(head);
   if (declared) {
     const name = declared[1] ?? declared[2];
-    return name ? { name, wrapped } : null;
+    return name ? { name, wrapped, nameAt: at + declared[0].length - name.length } : null;
   }
   const constructed = /^new\s+([A-Za-z_$][\w$]*)\b(?!\s*\.)/.exec(head);
   if (constructed) return { name: constructed[1]!, wrapped: true };
@@ -207,84 +211,106 @@ function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): N
 }
 
 /**
- * What a JS-family module's default export is, read once from the statement
- * that makes it: the binding it names — `export default Page`, `export
+ * What a JS-family module's default export is, read once from the statements
+ * that make it: the binding one names — `export default Page`, `export
  * default function Vans()`, `export default class Baz`, `export { Qux as
  * default }`, or what a wrapper call hands on (`export default memo(Foo)`) —
  * or, for an expression that names nothing (`export default () => …`), where
- * that expression starts. Null when the module has no such statement.
+ * that expression starts. Every line-initial `export default` outside a block
+ * comment is read, in order: a template's text can hold one too — react.dev's
+ * `SandpackWithHTMLOutput.tsx` writes two sandbox files' `export default
+ * function` lines above its own `export default memo(function …)` — and the
+ * first that names a node is the module's (see the default branch of
+ * {@link findExportedSymbolWalk}). Empty when the module has none.
  */
-function defaultStatement(filePath: string, idx: FileExportIndex, context: ResolutionContext): DefaultStatement | null {
-  if (idx.defaultStatement !== undefined) return idx.defaultStatement;
-  let found: DefaultStatement | null = null;
+function defaultStatements(filePath: string, idx: FileExportIndex, context: ResolutionContext): DefaultStatement[] {
+  if (idx.defaultStatements !== undefined) return idx.defaultStatements;
+  const found: DefaultStatement[] = [];
   const source = JS_FAMILY_FILE.test(filePath) ? context.readFile(filePath) : null;
   if (source && source.includes('default')) {
-    const at = exportDefaultAt(source);
-    if (at >= 0) {
+    let lineAt = 0;
+    let line = 1;
+    for (const at of exportDefaultStarts(source)) {
+      for (let i = source.indexOf('\n', lineAt); i >= 0 && i < at; i = source.indexOf('\n', i + 1)) line++;
+      lineAt = at;
       // The statement's own text is all it takes: what a wrapper call wraps
       // is its first argument, near the call's start.
       const code = stripCommentsForRegex(source.slice(at, at + DEFAULT_STATEMENT_WINDOW), 'typescript');
-      const before = source.slice(0, at);
-      found = namedBindingAt(code, 0) ?? {
-        line: before.split('\n').length,
-        column: at - before.lastIndexOf('\n') - 1,
-      };
-    } else {
+      const binding = namedBindingAt(code, 0);
+      if (binding?.nameAt !== undefined) {
+        // A declaration's node starts on the statement's line, or on its
+        // name's when the statement breaks before it.
+        let to = line;
+        for (let i = code.indexOf('\n'); i >= 0 && i < binding.nameAt; i = code.indexOf('\n', i + 1)) to++;
+        binding.declaredLines = { from: line, to };
+      }
+      found.push(binding ?? { line, column: at - source.lastIndexOf('\n', at - 1) - 1 });
+    }
+    if (found.length === 0) {
       const clause = extractLocalExportAliases(source).find((a) => a.exportedName === 'default');
-      if (clause) found = { name: clause.localName, wrapped: false };
+      if (clause) found.push({ name: clause.localName, wrapped: false });
     }
   }
-  idx.defaultStatement = found;
+  idx.defaultStatements = found;
   return found;
 }
 
 /** How much of an `export default` statement is read: enough for any wrapper call's head. */
 const DEFAULT_STATEMENT_WINDOW = 4000;
 
-/** Where the expression of the first `export default` statement outside a block comment starts, or -1. */
-function exportDefaultAt(source: string): number {
+/** Where the expression of each `export default` statement outside a block comment starts, in order. */
+function exportDefaultStarts(source: string): number[] {
+  const starts: number[] = [];
+  const inBlockComment = blockCommentReader(source);
   EXPORT_DEFAULT_RE.lastIndex = 0;
   for (let m = EXPORT_DEFAULT_RE.exec(source); m; m = EXPORT_DEFAULT_RE.exec(source)) {
-    if (!insideBlockComment(source, m.index)) return m.index + m[0].length;
+    if (!inBlockComment(m.index)) starts.push(m.index + m[0].length);
   }
-  return -1;
+  return starts;
 }
 
 /**
- * Whether `offset` sits inside a block comment of a JS source, read from the
- * start past strings, template literals and line comments the way
- * `stripCommentsForRegex` reads them — without copying the file.
+ * Whether each of a rising run of offsets in a JS source sits inside a block
+ * comment, read in one pass past strings, template literals and line comments
+ * the way `stripCommentsForRegex` reads them — without copying the file.
  */
-function insideBlockComment(source: string, offset: number): boolean {
-  for (let i = 0; i < offset; i++) {
-    const ch = source[i];
-    if (ch === '/' && source[i + 1] === '*') {
-      const end = source.indexOf('*/', i + 2);
-      if (end < 0 || end >= offset) return true;
-      i = end + 1;
-    } else if (ch === '/' && source[i + 1] === '/') {
-      const end = source.indexOf('\n', i + 2);
-      if (end < 0) return false;
-      i = end;
-    } else if (ch === '"' || ch === "'" || ch === '`') {
-      // A quote ends at its match; one that isn't a template's, at its line's end.
-      for (i++; i < offset && source[i] !== ch; i++) {
-        if (source[i] === '\\') i++;
-        else if (ch !== '`' && source[i] === '\n') break;
-      }
+function blockCommentReader(source: string): (offset: number) => boolean {
+  let i = 0;
+  return (offset) => {
+    while (i < offset) {
+      const ch = source[i];
+      if (ch === '/' && source[i + 1] === '*') {
+        const end = source.indexOf('*/', i + 2);
+        if (end < 0 || end >= offset) return true;
+        i = end + 2;
+      } else if (ch === '/' && source[i + 1] === '/') {
+        const end = source.indexOf('\n', i + 2);
+        i = end < 0 ? source.length : end;
+      } else if (ch === '"' || ch === "'" || ch === '`') {
+        // A quote ends at its match; one that isn't a template's, at its line's end.
+        let j = i + 1;
+        for (; j < source.length && source[j] !== ch; j++) {
+          if (source[j] === '\\') j++;
+          else if (ch !== '`' && source[j] === '\n') break;
+        }
+        if (j >= offset) return false;
+        i = j + 1;
+      } else i++;
     }
-  }
-  return false;
+    return false;
+  };
 }
 
 /**
- * The node a default export statement makes the export. A named binding is
- * the file's own declaration of it, else what the file imports under that
- * name (`import Login from './Login'; export default Login` in an `index`);
- * one a wrapper call hands on must run — `export default createRouter(routes)`
- * exports a router, not `routes`. An anonymous one is a node only when one
- * stands at the expression itself: React Native's
- * `export default codegenNativeComponent('MyView')`.
+ * The node a default export statement makes the export. A function or class
+ * the statement declares is the node that starts there — never a namesake
+ * elsewhere in the file, which a template's text would otherwise reach. A
+ * named binding is the file's own declaration of it, else what the file
+ * imports under that name (`import Login from './Login'; export default
+ * Login` in an `index`); one a wrapper call hands on must run — `export
+ * default createRouter(routes)` exports a router, not `routes`. An anonymous
+ * one is a node only when one stands at the expression itself: React
+ * Native's `export default codegenNativeComponent('MyView')`.
  */
 function defaultStatementNode(
   filePath: string,
@@ -297,6 +323,11 @@ function defaultStatementNode(
   if (!('name' in statement)) {
     return context.getNodesInFile(filePath).find((n) =>
       WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine === statement.line && n.startColumn === statement.column);
+  }
+  const lines = statement.declaredLines;
+  if (lines) {
+    return nodesInFileNamed(filePath, statement.name, context)
+      .find((n) => WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine >= lines.from && n.startLine <= lines.to);
   }
   return bindingNode(filePath, statement, language, context, visited, depth);
 }
@@ -338,10 +369,9 @@ function bindingNode(
  * a same-named symbol elsewhere is not it either.
  */
 export function hasAnonymousDefaultExport(filePath: string, context: ResolutionContext): boolean {
-  const idx = getFileExportIndex(filePath, context);
-  const statement = defaultStatement(filePath, idx, context);
-  return statement !== null && !('name' in statement) &&
-    defaultStatementNode(filePath, statement, 'typescript', context, new Set(), 0) === undefined;
+  const statements = defaultStatements(filePath, getFileExportIndex(filePath, context), context);
+  return statements.length > 0 && statements.every((s) =>
+    !('name' in s) && defaultStatementNode(filePath, s, 'typescript', context, new Set(), 0) === undefined);
 }
 
 const valueBindingMemos = new WeakMap<ResolutionContext, Map<string, Node | null>>();
@@ -376,13 +406,13 @@ export function valueBinding(value: Node, context: ResolutionContext): Node | un
     const init = /^[A-Za-z_$][\w$]*\s*(?::(?:[^=]|=>)*?)?=(?![=>])\s*/.exec(code);
     const at = init ? init[0].length : -1;
     const binding = init ? namedBindingAt(code, at) : null;
-    if (binding && binding.name !== value.name) {
-      found = bindingNode(value.filePath, { name: binding.name, wrapped: true }, value.language, context, new Set([value.filePath]), 0);
-    } else if (binding) {
+    if (binding?.nameAt !== undefined) {
       // `const Suggestions = observer(function Suggestions() {…})`: the function the value holds.
       found = nodesInFileNamed(value.filePath, binding.name, context)
         .find((n) => WRAPPED_BINDING_KINDS.has(n.kind) && n.startLine >= value.startLine && n.endLine <= value.endLine);
-    } else if (init) {
+    } else if (binding && binding.name !== value.name) {
+      found = bindingNode(value.filePath, { name: binding.name, wrapped: true }, value.language, context, new Set([value.filePath]), 0);
+    } else if (!binding && init) {
       // `const MyView = codegenNativeComponent('MyView')`: a node standing at the initializer itself.
       const before = code.slice(0, at);
       const newline = before.lastIndexOf('\n');
@@ -2963,9 +2993,17 @@ function findExportedSymbolWalk(
     // default` names, or an expression with no node of its own — so it is
     // never guessed: the first exported function or component stood in for
     // it, and `export function loader` above `export default function Vans`
-    // made every `import Vans from './Vans'` the loader.
-    const statement = defaultStatement(filePath, exportIndex, context);
-    if (statement) return defaultStatementNode(filePath, statement, language, context, visited, depth);
+    // made every `import Vans from './Vans'` the loader. Of several
+    // statements, the first that names a node is the module's own; one a
+    // template only writes as text names none.
+    const statements = defaultStatements(filePath, exportIndex, context);
+    if (statements.length > 0) {
+      for (const statement of statements) {
+        const node = defaultStatementNode(filePath, statement, language, context, visited, depth);
+        if (node) return node;
+      }
+      return undefined;
+    }
     // Svelte/Vue single-file components ARE the module's default export,
     // but are extracted as kind 'component' (not function/class). Without
     // this, an `export { default as X } from './X.svelte'` barrel never
