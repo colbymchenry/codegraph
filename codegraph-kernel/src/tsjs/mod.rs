@@ -1030,7 +1030,8 @@ impl<'t> Walker<'t> {
         None
     }
 
-    /// isExported: walk the parent chain for an export_statement.
+    /// isExported: walk the parent chain for an export_statement, then ask
+    /// whether a `declare module '…'` / `declare global` body exports it.
     fn is_exported(&self, node: Node) -> bool {
         let mut cur = node.parent();
         while let Some(p) = cur {
@@ -1039,7 +1040,7 @@ impl<'t> Walker<'t> {
             }
             cur = p.parent();
         }
-        false
+        is_ambient_export(node)
     }
 
     fn has_keyword_child(&self, node: Node, kw: &str) -> bool {
@@ -1134,6 +1135,48 @@ fn resolve_field_body(node: Node) -> Option<Node> {
 /// resolveBody ?? getChildByField(node, 'body') — the body-walk resolution.
 fn body_of(node: Node) -> Option<Node> {
     resolve_field_body(node).or_else(|| node.child_by_field_name("body"))
+}
+
+/// isAmbientExport (languages/typescript.ts): declared in a `declare module
+/// 'x' { … }` or `declare global { … }` body, which TypeScript exports without
+/// an `export` keyword unless the body holds an export declaration of its own.
+fn is_ambient_export(node: Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "statement_block" && has_export_declaration(p) {
+            return false;
+        }
+        if p.kind() == "ambient_declaration" {
+            // `declare global` is the keyword and a bare block, with no field names.
+            for i in 0..p.child_count() {
+                if p.child(i).is_some_and(|c| c.kind() == "global") {
+                    return true;
+                }
+            }
+            if let Some(declared) = p.named_child(0) {
+                if declared.kind() == "module"
+                    && declared.child_by_field_name("name").is_some_and(|n| n.kind() == "string")
+                {
+                    return true;
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// hasExportDeclaration: a statement that exports by name or by assignment
+/// (`export {…}`, `export =`, `export default x`), not by declaring.
+fn has_export_declaration(block: Node) -> bool {
+    for i in 0..block.named_child_count() {
+        if let Some(statement) = block.named_child(i) {
+            if statement.kind() == "export_statement" && statement.child_by_field_name("declaration").is_none() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn opt_str(arena: &mut Arena, s: Option<&str>) -> StrRef {
