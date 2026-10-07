@@ -65,20 +65,23 @@ export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: 
 }
 
 /**
- * The name nodes of the types a Go alias declaration names, in source order:
- * `Event` in `type Event = mvccpb.Event`, `List` and `Event` in `type Page =
- * List[Event]`, each where it is written, so resolution reads a package
- * qualifier back. The alias's own type parameters (`T` in `type Items[T any]
- * = List[T]`) and Go's predeclared types are not types it names. A generic
- * alias has no rule in tree-sitter-go 0.23: it parses as a `type_spec` whose
- * `=` is an error, and reads as an alias here too. Undefined for a defined
- * type (`type WatchChan <-chan Event`), which declares a type of its own.
+ * The name nodes of the types a Go `type_alias` node names on its right-hand
+ * side, in source order: an alias's (`Event` in `type Event = mvccpb.Event`,
+ * `List` and `Event` in `type Page = List[Event]`) and a defined type's
+ * (`WatchResponse` in `type WatchChan <-chan WatchResponse`, `Context` in
+ * `type HandlerFunc func(*Context)`), each where it is written, so resolution
+ * reads a package qualifier back. Not types it names: the declaration's own
+ * type parameters (`T` in `type Items[T any] = List[T]`), Go's predeclared
+ * types, and its own name written bare, which in a recursive type (`type
+ * stateFn func(*Lexer) stateFn`) is the declaration itself. A generic alias
+ * has no rule in tree-sitter-go 0.23: it parses as a `type_spec` whose `=` is
+ * an error, and reads as any other declaration here.
  */
-export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[] | undefined {
-  const isAlias = node.type === 'type_alias' ||
-    (node.type === 'type_spec' && node.children.some((c: SyntaxNode) => c.type === 'ERROR' && getNodeText(c, source).trim() === '='));
-  const type = isAlias ? getChildByField(node, 'type') : null;
-  if (!type) return undefined;
+export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[] {
+  const type = getChildByField(node, 'type');
+  if (!type) return [];
+  const nameNode = getChildByField(node, 'name');
+  const own = nameNode ? getNodeText(nameNode, source) : undefined;
   const params = new Set<string>();
   for (const decl of getChildByField(node, 'type_parameters')?.namedChildren ?? []) {
     for (const c of decl.namedChildren) {
@@ -86,15 +89,17 @@ export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[]
     }
   }
   const names: SyntaxNode[] = [];
-  const walk = (n: SyntaxNode): void => {
+  // `qualified`: the name of a `pkg.Name`, which is that package's whatever
+  // this one declares.
+  const walk = (n: SyntaxNode, qualified: boolean): void => {
     if (n.type === 'type_identifier') {
       const text = getNodeText(n, source);
-      if (!params.has(text) && !GO_PREDECLARED_TYPES.has(text)) names.push(n);
+      if (!GO_PREDECLARED_TYPES.has(text) && (qualified || (!params.has(text) && text !== own))) names.push(n);
       return;
     }
-    for (const c of n.namedChildren) walk(c);
+    for (const c of n.namedChildren) walk(c, n.type === 'qualified_type');
   };
-  walk(type);
+  walk(type, false);
   return names;
 }
 

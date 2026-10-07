@@ -45,6 +45,7 @@ import {
   cppScopesWithin,
   cppTemplateParameters,
   cppTypeSegments,
+  stripCppTemplateArguments,
   type CppNamedClass,
 } from './cpp-type-aliases';
 import { cppMacroNamespaceFrames, cppNamespaceAliases } from './name-matcher';
@@ -163,19 +164,7 @@ function writtenBase(ref: UnresolvedRef, context: ResolutionContext): string {
   }
   const written = text.slice(0, end).trim();
   const squash = (s: string): string => s.replace(/\s+/g, '');
-  return squash(stripTemplateArguments(written)) === squash(ref.referenceName) ? written : ref.referenceName.trim();
-}
-
-/** `Base<T, Cmp<int>>::Inner` → `Base::Inner`. */
-function stripTemplateArguments(text: string): string {
-  let out = '';
-  let depth = 0;
-  for (const c of text) {
-    if (c === '<') depth++;
-    else if (c === '>') depth = Math.max(0, depth - 1);
-    else if (depth === 0) out += c;
-  }
-  return out;
+  return squash(stripCppTemplateArguments(written)) === squash(ref.referenceName) ? written : ref.referenceName.trim();
 }
 
 /**

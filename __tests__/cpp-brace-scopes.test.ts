@@ -19,6 +19,10 @@
  * Lookups that start from a declaration's scope (base classes, alias
  * receivers, constructors) then had only a unique-name guess left.
  *
+ * The C++ preParse now blanks both of those macros, so the fixtures below
+ * keep the shapes with macros it doesn't know: a one-word attribute macro
+ * (`NODISCARD`) and a lowercase one in a class head (`cacheline_aligned(64U)`).
+ *
  * For a file whose tree has errors, the walker now takes each declaration's
  * namespaces and enclosing classes from the source's braces, which the
  * parser rarely misreads; a class the tree glued into a declaration's type is
@@ -54,7 +58,7 @@ namespace protobuf {
 
 class Names {
  public:
-  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view name() const {
+  NODISCARD absl::string_view name() const {
     return absl::string_view(payload_);
   }
 
@@ -77,7 +81,7 @@ namespace clock_cache {
 
 class FixedTable : public BaseTable {
  public:
-  struct ALIGN_AS(64U) HandleImpl : public ClockHandle {
+  struct cacheline_aligned(64U) HandleImpl : public ClockHandle {
     RelaxedAtomic<uint32_t> displacements{};
     bool standalone = false;
   };
@@ -224,7 +228,7 @@ describe('C++ scopes from the source braces of a file whose tree has errors', ()
   });
 
   it('a file that parses cleanly keeps the tree scopes', () => {
-    const clean = PROTOBUF_SHAPE.replace('PROTOBUF_FUTURE_ADD_EARLY_NODISCARD ', '');
+    const clean = PROTOBUF_SHAPE.replace('NODISCARD ', '');
     const tree = getParser('cpp')!.parse(cppExtractor.preParse!(clean, 'descriptor.h'))!;
     expect(tree.rootNode.hasError).toBe(false);
     tree.delete();
