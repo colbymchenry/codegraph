@@ -411,11 +411,17 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * (tsconfig/jsconfig `paths`). Without that check, custom prefixes
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
+ *
+ * `aliasPrefixes: false` skips that check, for a caller that has already
+ * asked `resolveImportPath` whether an alias maps the specifier to a file.
+ * Matching a prefix proves nothing by itself: a catch-all `"*"` pattern
+ * (`"*": ["./typings/*"]`) has an empty prefix and matches every package.
  */
 export function isExternalImport(
   importPath: string,
   language: Language,
-  context?: ResolutionContext
+  context?: ResolutionContext,
+  options: { aliasPrefixes?: boolean } = {}
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
@@ -438,7 +444,7 @@ export function isExternalImport(
       return true;
     }
     // Project-defined alias prefix? Treat as local.
-    const aliases = context?.getProjectAliases?.();
+    const aliases = options.aliasPrefixes === false ? null : context?.getProjectAliases?.();
     if (aliases) {
       for (const pat of aliases.patterns) {
         if (importPath.startsWith(pat.prefix)) return false;
