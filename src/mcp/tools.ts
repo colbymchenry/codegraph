@@ -59,6 +59,8 @@ import {
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
+import { scipFlowNote, scipTrailNote } from '../scip/notes';
+import { callSitesSection } from '../scip/callsites';
 import { measurePendingChanges } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
@@ -3634,7 +3636,7 @@ export class ToolHandler {
           if (step.edge) {
             const sy = this.synthEdgeNote(step.edge);
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${scipFlowNote(step.edge)}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -5147,9 +5149,17 @@ export class ToolHandler {
     const copybookSection = this.buildCopybookSection(namedCopybooks);
     if (copybookSection) lines.push(copybookSection);
 
+    // Naming once: call-sites and the Flow section share resolveNamedSymbolFlow
+    // (via buildFlowFromNamedSymbols). Call-sites used to re-lex the query.
+    await warmBranchGuardGrammars();
+    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
+    const callTargetIds = new Set([...exactNodeIds, ...flow.namedNodeIds]);
+    const callSites = callSitesSection(cg.scipReadDb(), cg.getProjectRoot(), query, callTargetIds); // fork: src/scip/callsites.ts
+    if (callSites) lines.push(callSites);
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
 
@@ -5189,14 +5199,9 @@ export class ToolHandler {
     }
 
     // Step 4: Read contiguous file sections
-    // Compute the flow spine once — used both to prepend the Flow section (below)
-    // and to gate adaptive source sizing: files on the spine get full source,
-    // off-spine peers skeletonize.
-    // The Flow section labels each hop with its branch conditions; that read
-    // is synchronous, so the grammars it needs are loaded here, once.
-    await warmBranchGuardGrammars();
-    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
-
+    // Flow was computed above (shared with call-sites). Used to prepend the Flow
+    // section and to gate adaptive source sizing: files on the spine get full
+    // source, off-spine peers skeletonize.
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
     /**
@@ -8032,7 +8037,7 @@ export class ToolHandler {
   private formatTrail(cg: CodeGraph, node: Node): string {
     const TRAIL_CAP = 12;
     const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})${scipTrailNote(e.edge)}`;
       const synth = this.synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };

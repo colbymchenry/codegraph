@@ -1,0 +1,68 @@
+{
+  "repo": "vscode",
+  "verified": 844937,
+  "unverified": 56517,
+  "causes": {
+    "no reference": 48021,
+    "not a call to SCIP": 5727,
+    "target without node": 1995,
+    "later line": 480,
+    "no document": 293,
+    "target outside graph": 1
+  },
+  "targets": {
+    "no document": {
+      "extensions/copilot (.cpp)": 100,
+      "extensions/copilot (.py)": 81,
+      "cli/src (.rs)": 72,
+      "extensions/copilot (.java)": 9,
+      "extensions/copilot (.cs)": 7,
+      "extensions/copilot (.rs)": 6,
+      ".github/skills (.py)": 5,
+      "extensions/copilot (.go)": 4
+    },
+    "target without node": {
+      "src/vs/base/common/lifecycle.ts (dispose().)": 297,
+      "src/vscode-dts/vscode.d.ts (executeCommand().)": 260,
+      "src/vscode-dts/vscode.d.ts (getConfiguration().)": 215,
+      "src/vscode-dts/vscode.d.ts (registerCommand().)": 43,
+      "src/vs/workbench/api/common/extHostTypeConverters.ts (to().)": 36,
+      "src/vs/workbench/api/common/extHostTypeConverters.ts (from().)": 32,
+      "src/vs/platform/backup/test/electron-main/backupMainService.test.ts (service.toBackupPath().)": 31,
+      "src/vs/workbench/services/configuration/test/browser/configurationService.test.ts (processExperimentalSettings().)": 29
+    },
+    "target outside graph": {
+      "build/lib/tsb/index.ts (create().)": 1
+    }
+  },
+  "examples": {
+    "no reference": [
+      ".agents/skills/launch/playwrightScripts/focus-chat-input.ts:39 focusIfNeeded → focus (src/vs/base/browser/ui/findinput/findInput.ts)",
+      ".agents/skills/launch/scripts/monaco-paste.ts:14 scriptDirectory → dirname (extensions/copilot/src/extension/completions-core/vscode-node/lib/src/util/uri.ts)",
+      ".agents/skills/launch/scripts/monaco-paste.ts:15 focusChatScript → join (extensions/copilot/src/util/vs/base/common/path.ts)"
+    ],
+    "not a call to SCIP": [
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:304 walkChildren → visit (src/vs/base/common/json.ts)",
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:308 walkChildren → visit (src/vs/base/common/json.ts)",
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:312 walkChildren → visit (src/vs/base/common/json.ts)"
+    ],
+    "no document": [
+      ".github/skills/agent-host-logs/scripts/extract.py:130 validate_entries → validate_windows_path (.github/skills/agent-host-logs/scripts/extract.py)",
+      ".github/skills/agent-host-logs/scripts/extract.py:153 extract_archive → preflight_archive (.github/skills/agent-host-logs/scripts/extract.py)",
+      ".github/skills/agent-host-logs/scripts/extract.py:157 extract_archive → validate_entries (.github/skills/agent-host-logs/scripts/extract.py)"
+    ],
+    "target without node": [
+      ".vscode/extensions/vscode-selfhost-import-aid/src/extension.ts:26 activate → _refresh (src/vs/base/browser/ui/tree/dataTree.ts)",
+      ".vscode/extensions/vscode-selfhost-test-provider/src/failingDeepStrictEqualAssertFixer.ts:34 FailingDeepStrictEqualAssertFixer::constructor → registerCommand (src/vs/editor/browser/triggerInlineEditCommandsRegistry.ts)",
+      ".vscode/extensions/vscode-selfhost-test-provider/src/failingDeepStrictEqualAssertFixer.ts:52 FailingDeepStrictEqualAssertFixer::constructor → applyEdit (extensions/copilot/src/platform/ignore/node/test/mockWorkspaceService.ts)"
+    ],
+    "later line": [
+      "cli/build.rs:189 apply_win32_version_resources → get (cli/src/download_cache.rs)",
+      "cli/build.rs:193 apply_win32_version_resources → get (cli/src/download_cache.rs)",
+      "cli/src/auth.rs:119 get_github_user → send (cli/src/commands/agent.rs)"
+    ],
+    "target outside graph": [
+      "extensions/vscode-colorize-tests/test/colorize-fixtures/test.js:12 compilation → create (src/vs/workbench/contrib/webview/browser/pre/service-worker.js)"
+    ]
+  }
+}

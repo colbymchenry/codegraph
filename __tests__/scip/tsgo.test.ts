@@ -1,0 +1,420 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync, spawn } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import CodeGraph from '../../src/index';
+import { importScipFile, runScipPass } from '../../src/scip';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
+import { indexProjects } from '../../src/scip/indexers/tsgo-index';
+import { findTsgo } from '../../src/scip/indexers/typescript';
+import { scipFlowNote } from '../../src/scip/notes';
+import { MAX_PATCHES, MAX_PATCH_AGE_MS, ScipMeta, scipDir } from '../../src/scip/store';
+import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
+import type { Edge } from '../../src/types';
+
+const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
+/** TypeScript ≥ 7.1 to index with: `CODEGRAPH_TSGO_DIR`, else wherever the adapter would find one. */
+const TSGO = process.env.CODEGRAPH_TSGO_DIR ?? (() => {
+  const found = findTsgo(path.join(__dirname, '..', '..'));
+  return found && 'dir' in found ? found.dir : undefined;
+})();
+
+describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
+  let dir: string;
+  let cg: CodeGraph;
+  const edge = (src: string, tgt: string) => cg.scipReadDb().prepare(`
+    SELECT e.kind, e.line, e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+    WHERE s.qualified_name = ? AND t.qualified_name = ?`).get(src, tgt) as { kind: string; line: number; provenance: string | null } | undefined;
+  const index = async (configs = ['tsconfig.json']) => {
+    const out = path.join(dir, 'tsgo.scip');
+    const result = await indexProjects(TSGO!, out, dir, configs.map(c => path.join(dir, c)));
+    importScipFile(dir, out); // language from the tool name
+    const report = await cg.scipWrite(db => runScipPass(db, dir));
+    return { ...result, report: report! };
+  };
+
+  beforeEach(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-'));
+    fs.cpSync(path.join(FIXTURE, 'project'), dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'union.ts'),
+      'class A { run() {} }\nclass B { run() {} }\nexport function both(x: A | B) {\n  x.run();\n}\n');
+    cg = await CodeGraph.init(dir);
+    await cg.indexAll();
+  }, 30_000);
+
+  afterEach(() => {
+    cg.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('names symbols by where they are declared: stable across edits, distinct when the names alone collide', async () => {
+    const src = 'function run(f: () => void) { f(); }\nrun(() => { function input() { return 1; } input(); });\nrun(() => { function input() { return 2; } input(); });\n';
+    const defs = async () => {
+      const out = path.join(dir, 'names.scip');
+      await indexProjects(TSGO!, out, dir, [path.join(dir, 'tsconfig.json')]);
+      const doc = decodeScipIndex(fs.readFileSync(out)).documents.find(d => d.relativePath === 'src/dup.ts')!;
+      return doc.occurrences.filter(o => o.roles & ROLE_DEFINITION).map(o => o.symbol).sort();
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'dup.ts'), src);
+    const before = await defs();
+    expect(before.filter(s => s.endsWith('input().'))).toHaveLength(2); // two declarations, two symbols
+    expect(before).toContain('tsgo . . . `src/dup.ts`/run().');
+    fs.writeFileSync(path.join(dir, 'src', 'dup.ts'), `// shifted\n\n${src}`); // every node index moves
+    expect((await defs()).filter(s => !s.endsWith('input().'))).toEqual(before.filter(s => !s.endsWith('input().')));
+  }, 30_000);
+
+  it('implements/extends edges come from the compiler', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'shapes.ts'),
+      'export interface Shape { area(): number }\nexport class Square implements Shape { area() { return 1; } }\nexport class Rect extends Square {}\n' +
+      // vscode's service idiom: a value declared before the interface it merges with
+      'export const Svc = {} as unknown;\nexport interface Svc { go(): void }\nexport class SvcImpl implements Svc { go() {} }\n');
+    await cg.indexAll();
+    await index();
+    expect(edge('Square', 'Shape')).toMatchObject({ kind: 'implements', provenance: 'scip' });
+    expect(edge('Rect', 'Square')).toMatchObject({ kind: 'extends', provenance: 'scip' });
+    expect(edge('SvcImpl', 'Svc')).toMatchObject({ kind: 'implements', provenance: 'scip' });
+  }, 30_000);
+
+  it('a call through an interface with no node verifies the edge to an implementation, and only that', async () => {
+    // The interface lives in a file over codegraph's size limit, so the compiler's target has no node.
+    fs.writeFileSync(path.join(dir, 'src', 'api.ts'), `export interface Api { launch(): void }\n// ${'x'.repeat(MAX_SOURCE_FILE_SIZE_BYTES)}\n`);
+    fs.writeFileSync(path.join(dir, 'src', 'impl.ts'),
+      "import { Api } from './api';\nexport class Impl implements Api { launch() {} }\nexport class Other { launch() {} }\n");
+    fs.writeFileSync(path.join(dir, 'src', 'use.ts'), "import { Api } from './api';\nexport function useApi(a: Api) {\n  a.launch();\n}\n");
+    await cg.indexAll();
+    const id = (qn: string) => (cg.scipReadDb().prepare('SELECT id FROM nodes WHERE qualified_name = ?').get(qn) as { id: string }).id;
+    const db = cg.scipReadDb();
+    db.prepare(`DELETE FROM edges WHERE source = ? AND kind = 'calls'`).run(id('useApi'));
+    for (const target of ['Impl::launch', 'Other::launch']) {
+      db.prepare(`INSERT INTO edges (source, target, kind, line, col) VALUES (?, ?, 'calls', 3, 2)`).run(id('useApi'), id(target));
+    }
+    const { report } = await index();
+    expect(report.outcome.dispatchVerified).toBe(1);
+    expect(edge('useApi', 'Impl::launch')?.provenance).toBe('scip'); // Impl implements Api.launch
+    const via = cg.scipReadDb().prepare(`SELECT e.metadata FROM edges e JOIN nodes t ON t.id = e.target WHERE t.qualified_name = 'Impl::launch' AND e.kind = 'calls'`).get() as { metadata: string };
+    expect(scipFlowNote({ provenance: 'scip', metadata: JSON.parse(via.metadata) } as unknown as Edge)).toMatch(/through the interface/);
+    expect(edge('useApi', 'Other::launch')).toMatchObject({ provenance: null }); // same name, unrelated: unverified, kept
+    await cg.scipWrite(db => runScipPass(db, dir)); // a re-merge keeps it
+    expect(edge('useApi', 'Impl::launch')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('resolves the fixture like scip-typescript', async () => {
+    await index();
+    expect(edge('sum', 'helper')?.provenance).toBe('scip');
+    expect(edge('make', 'Invoice')).toMatchObject({ kind: 'instantiates', provenance: 'scip' });
+    expect(edge('Service::run', 'Service::step')?.provenance).toBe('scip');
+    expect(edge('sum', 'Invoice::totalPrice')).toMatchObject({ provenance: 'scip', line: 6 }); // missed by the heuristic
+    expect(edge('usesOverloads', 'Registry::lookup')?.provenance).toBe('scip'); // the first signature
+  }, 30_000);
+
+  it('a call on a union-typed receiver reaches every member', async () => {
+    await index();
+    expect(edge('both', 'A::run')?.provenance).toBe('scip');
+    expect(edge('both', 'B::run')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a call through a constant of callable type is judged against the constant node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'consts.ts'), [
+      'type Fn = (n: number) => number;',
+      'function makeDoubler(): Fn { return n => n * 2; }',
+      'export const twice: Fn = makeDoubler();',
+      'export function useConst() {',
+      '  return twice(2);',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(cg.scipReadDb().prepare(`SELECT kind FROM nodes WHERE name = 'twice'`).get()).toEqual({ kind: 'constant' });
+    expect(edge('useConst', 'twice')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('indexes files outside every tsconfig in one inferred program', async () => {
+    fs.mkdirSync(path.join(dir, 'scripts'));
+    fs.writeFileSync(path.join(dir, 'scripts', 'tool.ts'), "import { helper } from '../src/models';\nexport function tool() {\n  return helper(1);\n}\n");
+    fs.writeFileSync(path.join(dir, 'scripts', 'plain.js'), "import { Invoice } from '../src/models';\nexport function viaJs(i) {\n  return new Invoice(i).totalPrice();\n}\n");
+    await cg.indexAll();
+    const { report } = await index();
+    expect(report.staleDocuments).toEqual([]);
+    expect(edge('tool', 'helper')?.provenance).toBe('scip');
+    expect(edge('viaJs', 'Invoice::totalPrice')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a method named like an Object.prototype member (toString) maps to its node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'named.ts'), [
+      'export class Money {',
+      '  toString(): string {',
+      '    return "1";',
+      '  }',
+      '}',
+      'export function show(m: Money) {',
+      '  return m.toString();',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(edge('show', 'Money::toString')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('an overloaded function, defined at its first signature, maps to its implementation\'s node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'overloads.ts'), [
+      'export function format(n: number): string;',
+      'export function format(s: string): string;',
+      'export function format(x: number | string): string {',
+      '  return String(x);',
+      '}',
+      'export function useFormat() {',
+      '  return format(1) + format(\'a\');',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(cg.scipReadDb().prepare(`SELECT start_line FROM nodes WHERE name = 'format'`).all()).toEqual([{ start_line: 3 }]); // the implementation only
+    expect(edge('useFormat', 'format')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a file over codegraph\'s size limit is skipped, not reported stale', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'big.ts'), `export function big() { return 1; }\n// ${'x'.repeat(MAX_SOURCE_FILE_SIZE_BYTES)}\n`);
+    await cg.indexAll();
+    const { report } = await index();
+    expect(report.staleDocuments).toEqual([]);
+    expect(report.freshDocuments).toBe(3);
+  }, 30_000);
+
+  it('a file is indexed by the deepest project containing it, whose paths resolve its imports', async () => {
+    // The root config claims everything (no `include`); only sub/'s config maps `@models`.
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{"compilerOptions":{"strict":true,"target":"es2020","module":"commonjs"}}');
+    fs.mkdirSync(path.join(dir, 'sub'));
+    fs.writeFileSync(path.join(dir, 'sub', 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true,"target":"es2020","module":"commonjs","paths":{"@models":["../src/models.ts"]}}}');
+    fs.writeFileSync(path.join(dir, 'sub', 'use.ts'), "import { helper } from '@models';\nexport function viaAlias() {\n  helper();\n}\n");
+    await cg.indexAll();
+    await index(['tsconfig.json', 'sub/tsconfig.json']); // root first, as heaviest-first would order it
+    expect(edge('viaAlias', 'helper')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a project it cannot open is a warning; the others are indexed', async () => {
+    const { warnings, documents } = await index(['tsconfig.json', 'missing/tsconfig.json']);
+    expect(warnings).toEqual([expect.stringMatching(/^missing\/tsconfig\.json: can't open the project/)]);
+    expect(documents).toBe(3);
+  }, 30_000);
+});
+
+describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
+  let dir: string;
+  const cli = (...args: string[]) => execFileSync(process.execPath, [path.join(__dirname, '..', '..', 'dist', 'bin', 'codegraph.js'), ...args],
+    { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1', CODEGRAPH_NO_UPDATE_CHECK: '1' } });
+  const edge = async (src: string, tgt: string) => {
+    const cg = await CodeGraph.open(dir);
+    try {
+      return cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+        WHERE e.kind = 'calls' AND s.qualified_name = ? AND t.qualified_name = ?`).get(src, tgt) as { provenance: string | null } | undefined;
+    } finally {
+      cg.close();
+    }
+  };
+
+  /** As if the last full run had taken a minute — a repo big enough for a patch to pay (produce.ts incrementalPlan). */
+  const slowFullRun = () => {
+    const meta = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    fs.writeFileSync(meta, JSON.stringify({ ...JSON.parse(fs.readFileSync(meta, 'utf8')), fullRunMs: 60_000 }));
+  };
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-inc-'));
+    fs.cpSync(path.join(FIXTURE, 'project'), dir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'node_modules'));
+    fs.symlinkSync(TSGO!, path.join(dir, 'node_modules', 'typescript')); // what the adapter looks for first
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('judges codegraph\'s references, in a full run and a patch: a lib type read as a project enum member is removed, a type annotation verified', async () => {
+    const refs = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return cg.scipReadDb().prepare(`SELECT DISTINCT s.name || '->' || t.qualified_name || ':' || e.line || ':' || IFNULL(e.provenance, '-') AS e
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+          WHERE e.kind = 'references' AND s.file_path = 'src/saver.ts' ORDER BY 1`).all().map(r => (r as { e: string }).e);
+      } finally {
+        cg.close();
+      }
+    };
+    const saver = 'import { Shape2 } from "./kinds";\nexport function save(b: Blob): Blob { return b; }\nexport function use(s: Shape2): Shape2 { return s; }\n';
+    fs.writeFileSync(path.join(dir, 'src', 'kinds.ts'), 'export enum Kind { Blob, Other }\nexport interface Shape2 { x: number }\n');
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'), saver);
+    cli('init', '-y', dir);
+    expect(await refs()).toContain('save->Kind::Blob:2:-'); // the heuristic's guess by name
+    // produce.ts hands tsgo-index the reference sites (--refs) and compaction keeps its references there.
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    expect(await refs()).toEqual(['use->Shape2:3:scip']); // `Blob` is lib.dom's
+    expect(await edge('use', 'use')).toBeUndefined(); // the declaration's own name on a reference line is no call
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'), `// moved\n${saver}`);
+    cli('sync', dir);
+    slowFullRun();
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/patched|re-indexing/);
+    expect(await refs()).toEqual(['use->Shape2:4:scip']);
+  }, 120_000);
+
+  it('init --scip runs the indexer while references resolve, and ends where init + scip index does', async () => {
+    const graph = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return cg.scipReadDb().prepare(`SELECT s.qualified_name || '>' || t.qualified_name || ':' || e.kind || ':' || IFNULL(e.line, '') || ':' || IFNULL(e.provenance, '-') AS e
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target ORDER BY 1`).all().map(r => (r as { e: string }).e);
+      } finally {
+        cg.close();
+      }
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'kinds.ts'), 'export enum Kind { Blob, Other }\nexport interface Shape2 { x: number }\n');
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'),
+      'import { Shape2 } from "./kinds";\nexport function save(b: Blob): Blob { return b; }\nexport function use(s: Shape2): Shape2 { return s; }\nconst f = () => use({ x: 1 });\nexport const run = [f].map(g => g);\n');
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir);
+    const sequential = await graph();
+    expect(sequential.filter(e => e.endsWith(':scip')).length).toBeGreaterThan(0);
+    fs.rmSync(path.join(dir, '.codegraph'), { recursive: true });
+    expect(cli('init', '-y', '--scip', dir)).toMatch(/typescript: \d+ documents/);
+    expect(await graph()).toEqual(sequential);
+  }, 120_000);
+
+  it('re-indexes only the edited file (and its importers), splicing it into the installed index', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n'); // called by nothing yet
+    cli('init', '-y', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript')).not.toMatch(/patched/);
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+    slowFullRun();
+
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'),
+      "\nimport { spare } from './spare';\nexport function extra(): number {\n  return helper(3) + spare();\n}\n");
+    cli('sync', dir);
+    const out = cli('scip', 'index', dir, '--lang', 'typescript', '--changed');
+    expect(out).toMatch(/patched: 1 file\(s\) re-indexed/); // main.ts; nothing imports it
+    expect((await edge('extra', 'helper'))?.provenance).toBe('scip'); // the new call, compiler-verified
+    expect((await edge('extra', 'spare'))?.provenance).toBe('scip'); // into a file not re-indexed, whose document defined `spare` already
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
+    expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
+    expect(fs.readdirSync(scipDir(dir)).filter(f => f.includes('.raw'))).toEqual([]); // an up-to-date run leaves no helper files
+  }, 60_000);
+
+  it('rebuilds in full when a patch would not save much: its estimate is half the last full run or more', () => {
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript'); // the fixture's full run takes well under a second
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport const x = 1;\n');
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).not.toMatch(/patched/);
+    slowFullRun();
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport const y = 1;\n');
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/patched: 1 file\(s\) re-indexed/);
+  }, 60_000);
+
+  it('a patch measures its estimate, and a full run is forced after MAX_PATCHES patches or MAX_PATCH_AGE_MS', () => {
+    const metaFile = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    const meta = () => JSON.parse(fs.readFileSync(metaFile, 'utf8')) as ScipMeta;
+    const setMeta = (m: Partial<ScipMeta>) => fs.writeFileSync(metaFile, JSON.stringify({ ...meta(), ...m }));
+    let n = 0;
+    const edit = () => {
+      fs.appendFileSync(path.join(dir, 'src', 'main.ts'), `\nexport const e${n++} = 1;\n`);
+      cli('sync', dir);
+      return cli('scip', 'index', dir, '--lang', 'typescript', '--changed');
+    };
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    const { fullAt } = meta();
+    expect(fullAt).toBe(meta().producedAt);
+    slowFullRun();
+    expect(edit()).toMatch(/patched/);
+    expect(meta()).toMatchObject({ fullAt, patches: 1, fullRunMs: 60_000 });
+    expect(meta().patchRatio).toBeGreaterThan(0);
+
+    setMeta({ patches: MAX_PATCHES });
+    expect(edit()).not.toMatch(/patched/);
+    const ratio = meta().patchRatio;
+    expect(meta().patches).toBeUndefined(); // the full run starts the count again, and keeps what patches measured
+    expect(meta().patchRatio).toBe(ratio);
+
+    slowFullRun();
+    setMeta({ fullAt: Date.now() - MAX_PATCH_AGE_MS - 1 });
+    expect(edit()).not.toMatch(/patched/);
+
+    slowFullRun();
+    setMeta({ fullRunMs: 4_000, patchRatio: 2 }); // learned: patches cost twice what the adapter declares
+    expect(edit()).not.toMatch(/patched/); // 2 × (1 s + 0.015 s) ≥ half of 4 s
+  }, 120_000);
+
+  it('a repo with no tsconfig is indexed by tsgo, as one inferred program', async () => {
+    fs.rmSync(path.join(dir, 'tsconfig.json'));
+    cli('init', '-y', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript')).toMatch(/tsgo-index/);
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+  }, 60_000);
+
+  it('merges only what a patch can change, and ends where a full rebuild does', async () => {
+    const graph = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return (cg.scipReadDb().prepare(`SELECT s.qualified_name AS s, t.qualified_name AS t, e.kind, e.line, IFNULL(e.provenance, '') AS p, IFNULL(e.metadata, '') AS m
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target`).all() as Record<string, unknown>[])
+          .map(r => Object.values(r).join(' ')).sort();
+      } finally {
+        cg.close();
+      }
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n');
+    fs.writeFileSync(path.join(dir, 'src', 'gone.ts'), "import { helper } from './models';\nexport function gone(): number {\n  return helper(1);\n}\n");
+    // Calls into models.ts without importing it — through what another module returns — so it is
+    // never in a patch's plan; its edge into models.ts is flagged stale by sync all the same.
+    fs.writeFileSync(path.join(dir, 'src', 'factory.ts'), "import { Registry } from './models';\nexport function make(): Registry {\n  return new Registry();\n}\n");
+    fs.writeFileSync(path.join(dir, 'src', 'indirect.ts'), "import { make } from './factory';\nexport function indirect(): number {\n  return make().lookup(1);\n}\n");
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    slowFullRun();
+
+    const models = path.join(dir, 'src', 'models.ts');
+    fs.writeFileSync(models, fs.readFileSync(models, 'utf8')
+      .replace('soloMethod(): number', 'renamed(): number') // main.ts's call loses its target
+      .replace('export class Registry {', 'export class Registry {\n  extra(): number {\n    return 1;\n  }\n')); // Registry's methods move down
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), "\nimport { spare } from './spare';\nexport function extra(): number {\n  return spare();\n}\n");
+    fs.rmSync(path.join(dir, 'src', 'gone.ts'));
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/re-judged/);
+    const patched = await graph();
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    expect(patched).toEqual(await graph());
+  }, 60_000);
+
+  it('a watched edit is re-indexed on its own: watcher → sync → patch → merge', async () => {
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    slowFullRun();
+    const metaFile = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    const before = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as { producedAt: number };
+
+    // What the MCP server does: open the project and watch it (from dist, which holds tsgo-index.js).
+    const dist = path.join(__dirname, '..', '..', 'dist', 'index.js');
+    const watcher = spawn(process.execPath, ['-e',
+      `require(${JSON.stringify(dist)}).default.open(${JSON.stringify(dir)}).then(cg => { cg.watch({ debounceMs: 50 }); console.log('ready'); setInterval(() => {}, 1000); })`],
+    { env: { ...process.env, CODEGRAPH_SCIP_REINDEX_IDLE_MS: '200', CODEGRAPH_NO_UPDATE_CHECK: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    watcher.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    const until = async (what: string, ok: () => boolean | Promise<boolean>) => {
+      for (const end = Date.now() + 40_000; Date.now() < end; await new Promise(r => setTimeout(r, 200))) if (await ok()) return;
+      throw new Error(`timed out waiting for ${what}; watcher stderr:\n${stderr}`);
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        watcher.stdout.on('data', (d: Buffer) => { if (d.toString().includes('ready')) resolve(); });
+        watcher.on('exit', code => reject(new Error(`watcher exited ${code}: ${stderr}`)));
+      });
+      fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport function extra(): number {\n  return helper(3);\n}\n');
+
+      await until('the reindex', () => JSON.parse(fs.readFileSync(metaFile, 'utf8')).producedAt !== before.producedAt);
+      expect(JSON.parse(fs.readFileSync(metaFile, 'utf8')).fullRunMs).toBe(60_000); // a patch keeps the last full run's time
+      await until('the merge', async () => (await edge('extra', 'helper'))?.provenance === 'scip');
+      expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+    } finally {
+      watcher.kill();
+    }
+  }, 90_000);
+});

@@ -1,0 +1,169 @@
+/**
+ * An index reduced to what the merge reads, written once when it is built.
+ *
+ * Indexers record every mention of every symbol — locals, parameters, type
+ * annotations, imports, namespaces. The merge needs two things: definitions
+ * of callables and types (to map symbols onto codegraph nodes, and to tell a
+ * project symbol from an external one), and references that read as a call,
+ * `new`, or struct literal — and, of the rest, those at a site where codegraph
+ * has a `references` edge (`refs`, sites.ts referenceSites), which the merge
+ * judges too. Everything else is dropped. The result is still a
+ * standard SCIP index, a fraction of the size, and it decodes in a fraction of
+ * the time on every later merge. Implementation relationships between those
+ * symbols (class → base, method → the method it implements) are kept too. The merge re-checks the call shape against
+ * the (hash-gated, identical) source, so compaction can't change an outcome.
+ *
+ * Indexer outputs are added one at a time and only the current document is
+ * held — a split run's parts never need to be concatenated in memory.
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { pathToFileURL } from 'url';
+import { INDEXERS } from './indexers';
+import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
+import type { ScipLanguage } from './store';
+import type { ReferenceSites } from './sites';
+import { callShape, isCallTarget, siteKind } from './syntax';
+
+/**
+ * A codegraph-private occurrence role (not in the SCIP spec): a reference this compaction counted as a call
+ * (resolvedCalls). Kept in the compact index so a patch can count the calls of
+ * the documents it keeps without re-reading their files (addCompacted). Beyond
+ * SCIP's own roles (≤ 0x40); the merge reads only ROLE_DEFINITION.
+ */
+const ROLE_COUNTED_CALL = 1 << 24;
+
+export class Compactor {
+  meta: IndexMeta | null = null;
+  /** repo-relative paths of the documents kept, in order */
+  readonly paths: string[] = [];
+  private seen = new Set<string>();
+  private defined = new Set<string>();
+  private callRefs = new Map<string, number>();
+  private parsed = new Map<string, ParsedSymbol | null>();
+  private symbols = new Map<string, Buffer>();
+  private chunks: Buffer[] = [];
+
+  constructor(private readonly projectRoot: string, private readonly lang: ScipLanguage, private readonly refs: ReferenceSites = new Map()) {}
+
+  /** Adds one indexer output. A file already added (overlapping projects) keeps its first document. */
+  add(index: Buffer): void {
+    const meta = scanIndex(index, doc => this.keep(doc), this.projectRoot);
+    this.meta ??= meta;
+  }
+
+  /**
+   * Adds documents of an index this class wrote with ROLE_COUNTED_CALL marks (ScipMeta.callMarks):
+   * already compact, so kept as they are — no file read, no shape check — counting the marked calls.
+   */
+  addCompacted(meta: IndexMeta, docs: Iterable<ScipDocument>): void {
+    this.meta ??= meta;
+    for (const doc of docs) {
+      if (this.seen.has(doc.relativePath)) continue;
+      this.seen.add(doc.relativePath);
+      for (const o of doc.occurrences) {
+        if (o.roles & ROLE_DEFINITION) this.defined.add(o.symbol);
+        else if (o.roles & ROLE_COUNTED_CALL) this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+      }
+      this.chunks.push(encodeDocument(doc, s => this.bytes(s)));
+      this.paths.push(doc.relativePath);
+    }
+  }
+
+  /** Adds documents already decoded (and rebased onto the project): a patch's splice. */
+  addDocuments(meta: IndexMeta, docs: Iterable<ScipDocument>): void {
+    this.meta ??= meta;
+    for (const doc of docs) this.keep(doc);
+  }
+
+  private keep(doc: ScipDocument): void {
+    const { literalShape: literal, implHeader } = INDEXERS[this.lang];
+    if (this.seen.has(doc.relativePath)) return;
+    this.seen.add(doc.relativePath);
+    const lines = readLines(path.join(this.projectRoot, doc.relativePath));
+    const kept: ScipOccurrence[] = [];
+    const fileRefs = this.refs.get(doc.relativePath);
+    for (const o of doc.occurrences) {
+      const parsed = this.parse(o.symbol); // null for locals
+      if (parsed && !(o.roles & ROLE_DEFINITION) && fileRefs?.get(o.range.startLine + 1)?.has(parsed.last.name)) {
+        // judged as a reference whatever its shape; counted (and marked) if it is also a call
+        if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
+          kept.push(this.counted(o));
+        } else {
+          kept.push(o);
+        }
+        continue;
+      }
+      const kind = parsed?.last.kind;
+      if (!isCallTarget(kind)) continue;
+      if (o.roles & ROLE_DEFINITION) {
+        kept.push(o);
+        this.defined.add(o.symbol);
+        continue;
+      }
+      if (!lines) continue; // unreadable now: the merge would treat the file as stale anyway
+      if (kind === 'type' && implHeader?.(lines[o.range.startLine] ?? '')) { // `impl Trait for Type`: see sites.ts
+        kept.push(o);
+        continue;
+      }
+      if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
+      kept.push(this.counted(o));
+    }
+    // Class → base/interface and method → the method it implements: what `implements`/`extends`
+    // edges and calls made through an interface are judged by (see sites.ts scipDefinitions, scipSites).
+    const implementations = (doc.implementations ?? []).filter(i =>
+      isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
+    this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));
+    this.paths.push(doc.relativePath);
+  }
+
+  /**
+   * Calls and instantiations the compiler resolved to a symbol the project itself
+   * defines — the regression guard's measure of how much the index resolved.
+   * Imports and type references don't count: a broken build can keep those while
+   * call resolution collapses.
+   */
+  resolvedCalls(): number {
+    let n = 0;
+    for (const [symbol, count] of this.callRefs) if (this.defined.has(symbol)) n += count;
+    return n;
+  }
+
+  /** Writes the compact index to `file` (the caller makes it atomic where it matters). */
+  write(file: string): void {
+    const fd = fs.openSync(file, 'w');
+    try {
+      if (this.meta) fs.writeSync(fd, encodeMetadata({ ...this.meta, projectRoot: pathToFileURL(this.projectRoot).href })); // paths are rebased onto it
+      for (const c of this.chunks) fs.writeSync(fd, c);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /** `o` counted as a call: tallied for resolvedCalls, and marked for a later addCompacted. */
+  private counted(o: ScipOccurrence): ScipOccurrence {
+    this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+    return { ...o, roles: o.roles | ROLE_COUNTED_CALL };
+  }
+
+  private parse(symbol: string): ParsedSymbol | null {
+    let p = this.parsed.get(symbol);
+    if (p === undefined) this.parsed.set(symbol, (p = parseSymbol(symbol)));
+    return p;
+  }
+
+  private bytes(symbol: string): Buffer {
+    let b = this.symbols.get(symbol);
+    if (!b) this.symbols.set(symbol, (b = Buffer.from(symbol)));
+    return b;
+  }
+}
+
+function readLines(file: string): string[] | null {
+  try {
+    return fs.readFileSync(file, 'utf8').split(/\r?\n/);
+  } catch {
+    return null;
+  }
+}

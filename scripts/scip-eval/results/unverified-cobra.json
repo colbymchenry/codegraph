@@ -1,0 +1,32 @@
+{
+  "repo": "cobra",
+  "verified": 2639,
+  "unverified": 49,
+  "causes": {
+    "no reference": 37,
+    "not a call to SCIP": 5,
+    "target without node": 5,
+    "no document": 2
+  },
+  "examples": {
+    "no reference": [
+      "args_test.go:48 validOnlyWithInvalidArgs → Error (completions.go)",
+      "args_test.go:59 noArgsWithArgs → Error (completions.go)",
+      "args_test.go:70 minimumNArgsWithLessArgs → Error (completions.go)"
+    ],
+    "not a call to SCIP": [
+      "command.go:1335 Command::Commands → commandSorterByName (command.go)",
+      "doc/man_docs.go:232 genMan → byName (doc/util.go)",
+      "doc/md_docs.go:99 GenMarkdownCustom → byName (doc/util.go)"
+    ],
+    "target without node": [
+      "command_test.go:2513 TestFParseErrWhitelistSameCommand → FParseErrWhitelist (command.go)",
+      "command_test.go:2529 TestFParseErrWhitelistParentCommand → FParseErrWhitelist (command.go)",
+      "command_test.go:2558 TestFParseErrWhitelistChildCommand → FParseErrWhitelist (command.go)"
+    ],
+    "no document": [
+      "command_win.go:32 preExecHook → Print (command.go)",
+      "command_win.go:36 preExecHook → Println (command.go)"
+    ]
+  }
+}

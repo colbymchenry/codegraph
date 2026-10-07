@@ -116,9 +116,21 @@ function nuxtComponentName(filePath: string): string | null {
   return out.join('');
 }
 
+/**
+ * The last file's lines: passes slice one file's nodes in a row, and splitting
+ * the whole file per node was an O(nodes × file-size) term (jsxEdges was
+ * 2.3 s of Playwright's 2.7 s synthesis; same fix as c-fnptr's sliceLinesPre).
+ */
+let lastContent: string | null = null;
+let lastLines: string[] = [];
+
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
-  return content.split('\n').slice(startLine - 1, endLine).join('\n');
+  if (content !== lastContent) {
+    lastContent = content;
+    lastLines = content.split('\n');
+  }
+  return lastLines.slice(startLine - 1, endLine).join('\n');
 }
 
 function registrarField(src: string): string | null {
@@ -436,6 +448,9 @@ async function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext, 
   const seen = new Set<string>();
   for (const cls of queries.iterateNodesByKind('class')) {
     if ((++scanned255 & 63) === 0) await onYield();
+    // A class's methods live in its file: only a Dart class can have the Dart `build` below.
+    // Checked before loading children — the gate opens on one .dart file in a repo of any size.
+    if (!cls.filePath.endsWith('.dart')) continue;
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -751,6 +766,9 @@ async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Pro
       .filter((n): n is Node => !!n && n.kind === 'method');
   for (const cls of queries.iterateNodesByKind('class')) {
     if ((++scanned255 & 63) === 0) await onYield();
+    // A class's methods share its file's language: only a C++ class has the C++ methods below.
+    // Checked before loading them — the gate opens on one C++ file in a repo of any size.
+    if (cls.language !== 'cpp') continue;
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {

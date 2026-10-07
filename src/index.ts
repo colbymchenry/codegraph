@@ -66,6 +66,9 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { mergeRebuiltGraph, onSynced } from './scip';
+import { ScipReindexScheduler } from './scip/reindex';
+import type { SqliteDatabase } from './db/sqlite-adapter';
 
 // Re-export types for consumers
 export * from './types';
@@ -138,6 +141,11 @@ export interface IndexOptions {
   verbose?: boolean;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
+  /**
+   * Fork: called once every file is extracted and stored, before references are
+   * resolved — `init --scip` starts the SCIP indexers here (src/scip/first-index.ts).
+   */
+  onExtracted?: () => void;
 }
 
 /**
@@ -166,6 +174,9 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+
+  // Fork: background SCIP reindex, created on the first watched change
+  private scipReindex: ScipReindexScheduler | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -564,6 +575,7 @@ export class CodeGraph {
       try {
         const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
+        let scipMergeDue = false; // fork: set once resolution ran, merged after maintenance (below)
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
@@ -583,6 +595,11 @@ export class CodeGraph {
         // — they delete per-file rows mid-phase through the file_path indexes.
         if (freshDb) this.db.beginBulkParseLoad();
         let result: IndexResult;
+        // Set once parsing succeeds: whether resolution's ref and edge windows
+        // will drop (and later rebuild) indexes the parse window would rebuild.
+        // The resolver makes the same call from the same pending count — nothing
+        // between here and resolution (re-init, postExtract) touches refs.
+        let resolutionRebuilds = false;
         try {
           result = await this.orchestrator.indexAll(
             options.onProgress,
@@ -594,10 +611,15 @@ export class CodeGraph {
             // edge snapshots) and delete, which belongs on one thread.
             freshDb ? { dbPath: this.db.getPath(), fastInit } : null
           );
+          if (freshDb && result.success && result.filesIndexed > 0) {
+            const tCount = Date.now();
+            resolutionRebuilds = this.queries.getUnresolvedReferencesCount() >= minRefsForPool();
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-ref-count: ${Date.now() - tCount}ms (resolution rebuilds: ${resolutionRebuilds})`);
+          }
         } finally {
           if (freshDb) {
             const tIdx = Date.now();
-            await this.db.endBulkParseLoad();
+            await this.db.endBulkParseLoad({ resolutionRebuilds });
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
           }
           const tFts = Date.now();
@@ -626,6 +648,7 @@ export class CodeGraph {
           // before resolution so updated names show up in subsequent reads.
           this.resolver.runPostExtract();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolver-reinit: ${Date.now() - tReinit}ms`);
+          options.onExtracted?.();
         }
 
         // Resolve references to create call/import/extends edges
@@ -702,7 +725,12 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          scipMergeDue = true;
         }
+
+        // Indexes the parse window left to resolution's windows: rebuilt here if
+        // resolution never ran them (one query when it did).
+        if (resolutionRebuilds) await this.db.ensureSecondaryIndexes();
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread (worker connection): on a multi-GB index this is minutes
@@ -716,6 +744,13 @@ export class CodeGraph {
           if (walValve) { walValve.stop(); await walValve.drain(); }
           await this.db.runMaintenance();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
+        }
+
+        // SCIP (fork): after the maintenance above, never before — its ANALYZE gives
+        // the planner statistics, and a fresh graph has none: without them the
+        // merge's per-file queries planned badly (Playwright: >2 min instead of 6 s).
+        if (scipMergeDue) {
+          await this.scipHook(() => mergeRebuiltGraph(this.db.getDb(), this.db.getPath(), this.projectRoot));
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
@@ -1139,6 +1174,11 @@ export class CodeGraph {
           this.queries.setMetadata('synthesis_pending', '0');
         }
 
+        if (result.changedFilePaths) {
+          const changed = result.changedFilePaths;
+          await this.scipHook(() => onSynced(this.db.getDb(), this.db.getPath(), this.projectRoot, changed));
+        }
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
@@ -1237,6 +1277,7 @@ export class CodeGraph {
       async (paths?: string[]) => {
         const result = await this.sync({ paths });
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
+        if (filesChanged > 0) (this.scipReindex ??= new ScipReindexScheduler(this)).notifyChange();
         return { filesChanged, durationMs: result.durationMs };
       },
       options,
@@ -1255,6 +1296,47 @@ export class CodeGraph {
     if (this.watcher) {
       this.watcher.stop();
       this.watcher = null;
+    }
+    this.scipReindex?.stop();
+    this.scipReindex = null;
+  }
+
+  // ===========================================================================
+  // SCIP (fork) — see src/scip/
+  // ===========================================================================
+
+  /** Raw connection for SCIP reads. */
+  scipReadDb(): SqliteDatabase {
+    return this.db.getDb();
+  }
+
+  /** The database file, for a SCIP merge on its own connection. */
+  scipDbPath(): string {
+    return this.db.getPath();
+  }
+
+  /** Runs `fn` under the same in-process mutex and cross-process lock as indexing, until what it returns settles. */
+  async scipWrite<T>(fn: (db: SqliteDatabase) => T | Promise<T>): Promise<T> {
+    return this.indexMutex.withLock(async () => {
+      this.fileLock.acquire();
+      try {
+        return await fn(this.db.getDb());
+      } finally {
+        this.fileLock.release();
+      }
+    });
+  }
+
+  /**
+   * A failed SCIP merge must never fail the index or sync that triggered it.
+   * Awaited, so the merge (off-thread when built — see scip/index.ts mergePass)
+   * finishes inside the caller's write lock while the event loop stays free.
+   */
+  private async scipHook(fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      process.stderr.write(`[CodeGraph SCIP] merge skipped: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 

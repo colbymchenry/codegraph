@@ -293,17 +293,30 @@ export class DatabaseConnection {
    * so paths that never enter the resolution phase's own bulk-edge window
    * (small runs) are left with a complete schema; the batched resolver's
    * beginBulkEdgeLoad simply re-drops them (DROP IF EXISTS — idempotent).
+   *
+   * `resolutionRebuilds`: the batched resolver's ref and edge windows follow
+   * and drop the ref indexes in BULK_REF_INDEX_NAMES and every edge index
+   * straight away, rebuilding them at their own end — so building them here is
+   * thrown away (5.9 s on vscode). Nothing in between reads them: resolver
+   * re-init and the frameworks' postExtract read nodes and files, and the
+   * pending count uses the status index, which is still built here. The caller
+   * runs ensureSecondaryIndexes() after resolution for any path that skipped
+   * the windows after all.
    */
-  async endBulkParseLoad(): Promise<void> {
+  async endBulkParseLoad(options: { resolutionRebuilds?: boolean } = {}): Promise<void> {
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
+    const refIndexes: readonly string[] = DatabaseConnection.BULK_REF_INDEX_NAMES;
     for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      if (options.resolutionRebuilds && refIndexes.includes(idx)) continue;
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: parse index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
-    await this.endBulkEdgeLoad();
+    if (!options.resolutionRebuilds) await this.endBulkEdgeLoad();
   }
 
   /**
@@ -345,7 +358,9 @@ export class DatabaseConnection {
     for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: ref index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -401,9 +416,19 @@ export class DatabaseConnection {
       if (options.deferSynthesisSite && idx === DatabaseConnection.SYNTHESIS_SITE_INDEX) continue;
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
+  }
+
+  /** One bulk-window index rebuild, with the WAL size it ran against (CODEGRAPH_SYNTH_TIMINGS). */
+  private logIndexTiming(idx: string, startedAt: number): void {
+    if (!process.env.CODEGRAPH_SYNTH_TIMINGS) return;
+    let walMb = -1;
+    try { walMb = Math.round(fs.statSync(`${this.dbPath}-wal`).size / 1e6); } catch { /* no WAL file */ }
+    console.error(`[index-timing] ${idx}: ${Date.now() - startedAt}ms (wal ${walMb} MB)`);
   }
 
   /**
@@ -436,24 +461,42 @@ export class DatabaseConnection {
 
   /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
   private healBulkSecondaryIndexes(): void {
+    for (const ddl of this.missingSecondaryIndexes()) this.db.exec(ddl);
+  }
+
+  /**
+   * The same repair as the open-time heal, for a live index run: builds only
+   * what is missing (one query when nothing is), yielding between builds for
+   * the #850 watchdog. After resolution, for a run whose parse window skipped
+   * indexes the resolver's windows were expected to rebuild.
+   */
+  async ensureSecondaryIndexes(): Promise<void> {
+    for (const ddl of this.missingSecondaryIndexes()) {
+      this.db.exec(ddl);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /** CREATE statements for the bulk-window secondary indexes that do not exist. */
+  private missingSecondaryIndexes(): string[] {
     const names = [...new Set<string>([
       ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
       ...DatabaseConnection.BULK_REF_INDEX_NAMES,
       ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
     ])];
     const placeholders = names.map(() => '?').join(',');
-    const row = this.db
-      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
-      .get(...names) as { c: number } | undefined;
-    if ((row?.c ?? 0) >= names.length) return;
+    const present = new Set((this.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
+      .all(...names) as Array<{ name: string }>).map((r) => r.name));
+    if (present.size >= names.length) return [];
 
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
-    for (const idx of names) {
+    return names.filter((idx) => !present.has(idx)).map((idx) => {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
-      this.db.exec(m[0]);
-    }
+      return m[0];
+    });
   }
 
   /**

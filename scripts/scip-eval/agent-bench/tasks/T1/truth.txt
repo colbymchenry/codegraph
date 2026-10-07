@@ -1,0 +1,13 @@
+packages/playwright-core/src/server/chromium/crPage.ts:573
+packages/playwright-core/src/server/dispatchers/frameDispatcher.ts:54
+packages/playwright-core/src/server/launchApp.ts:82
+packages/playwright-core/src/server/page.ts:578
+packages/playwright-core/src/server/recorder.ts:307
+packages/playwright-core/src/server/recorder.ts:514
+packages/playwright-core/src/server/recorder.ts:524
+packages/playwright-core/src/server/recorder.ts:557
+packages/playwright-core/src/server/recorder/recorderSignalProcessor.ts:74
+packages/playwright-core/src/server/recorder/recorderSignalProcessor.ts:136
+packages/playwright-core/src/server/recorder/recorderSignalProcessor.ts:152
+packages/playwright-core/src/server/recorder/recorderUtils.ts:145
+packages/playwright-core/src/server/webkit/wkPage.ts:345

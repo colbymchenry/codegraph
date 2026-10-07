@@ -1,0 +1,3 @@
+I am about to change `LineTerminator::as_bytes()` in the `grep-matcher` crate (crates/matcher/src/lib.rs) and need its two-level blast radius. Find (1) every function or method that calls `LineTerminator::as_bytes` directly, and (2) every function or method that calls one of those level-1 functions. Only calls that resolve to these exact items count — not other `as_bytes()` methods (str, String, Vec, etc.) and not other functions that merely share a name. Do not modify any files.
+
+End your answer with two sections, headed `LEVEL 1` and `LEVEL 2`. In each, list one function per line as `path name` — the repo-relative path of the file that defines it, a space, and its name (for a method, `Type::method`). Nothing else in those sections.

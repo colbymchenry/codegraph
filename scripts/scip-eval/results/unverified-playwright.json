@@ -1,0 +1,77 @@
+{
+  "repo": "playwright",
+  "verified": 98116,
+  "unverified": 16321,
+  "causes": {
+    "no reference": 11816,
+    "not a call to SCIP": 2942,
+    "target outside graph": 738,
+    "later line": 441,
+    "no document": 359,
+    "target without node": 25
+  },
+  "targets": {
+    "no document": {
+      "browser_patches/webkit (.cpp)": 186,
+      "packages/playwright-core (.java)": 57,
+      "browser_patches/webkit (.m)": 56,
+      "browser_patches/webkit (.h)": 26,
+      "browser_patches/firefox (.cpp)": 24,
+      "browser_patches/winldd (.cpp)": 5,
+      "utils/doclint (.java)": 3,
+      "utils/doclint (.py)": 2
+    },
+    "target without node": {
+      "packages/playwright/types/test.d.ts (defineConfig().)": 11,
+      "packages/playwright-core/src/server/browser.ts (Browser#contexts().)": 4,
+      "packages/playwright/types/test.d.ts (mergeTests().)": 3,
+      "packages/playwright-core/src/server/browserContext.ts (BrowserContext#addCookies().)": 2,
+      "packages/playwright/types/test.d.ts (mergeExpects().)": 2,
+      "packages/playwright-core/src/server/browserContext.ts (BrowserContext#setGeolocation().)": 1,
+      "packages/playwright-core/src/server/browser.ts (Browser#version().)": 1,
+      "packages/playwright-core/src/server/browser.ts (Browser#userAgent().)": 1
+    },
+    "target outside graph": {
+      "packages/playwright-core/types/types.d.ts (APIRequestContext#dispose().)": 74,
+      "packages/playwright-core/types/types.d.ts (APIResponse#status().)": 65,
+      "packages/playwright-core/types/types.d.ts (FrameLocator#locator().)": 64,
+      "packages/playwright-core/types/types.d.ts (Browser#close().)": 41,
+      "packages/playwright-core/types/types.d.ts (APIResponse#text().)": 39,
+      "packages/playwright-core/types/types.d.ts (JSHandle#jsonValue().)": 26,
+      "packages/playwright-core/types/types.d.ts (APIResponse#url().)": 26,
+      "packages/playwright-core/types/types.d.ts (WebSocketRoute#send().)": 24
+    }
+  },
+  "examples": {
+    "no reference": [
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:38 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → unregister (browser_patches/firefox/juggler/SimpleChannel.js)",
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:61 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → QueryInterface (browser_patches/firefox/juggler/components/Juggler.js)",
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:83 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → QueryInterface (browser_patches/firefox/juggler/components/Juggler.js)"
+    ],
+    "no document": [
+      "browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp:91 mozilla::nsRemoteDebuggingPipe::GetSingleton → nsRemoteDebuggingPipe (browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp)",
+      "browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp:154 mozilla::nsRemoteDebuggingPipe::ReaderLoop → ReadBytes (browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp)",
+      "browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp:196 mozilla::nsRemoteDebuggingPipe::ReceiveMessage → ReceiveMessage (browser_patches/firefox/juggler/pipe/nsRemoteDebuggingPipe.cpp)"
+    ],
+    "target without node": [
+      "examples/github-api/playwright.config.ts:8 examples/github-api/playwright.config.ts → defineConfig (packages/playwright/src/common/configLoader.ts)",
+      "examples/mock-battery/playwright.config.js:6 examples/mock-battery/playwright.config.js → defineConfig (packages/playwright/test.mjs)",
+      "examples/mock-filesystem/playwright.config.js:6 examples/mock-filesystem/playwright.config.js → defineConfig (packages/playwright/test.mjs)"
+    ],
+    "target outside graph": [
+      "examples/github-api/tests/test-api.spec.ts:33 examples/github-api/tests/test-api.spec.ts → ok (packages/playwright-core/src/client/network.ts)",
+      "examples/github-api/tests/test-api.spec.ts:39 examples/github-api/tests/test-api.spec.ts → ok (packages/playwright-core/src/client/network.ts)",
+      "examples/mock-battery/tests/update-battery-status.spec.js:56 examples/mock-battery/tests/update-battery-status.spec.js → evaluate (browser_patches/firefox/juggler/content/Runtime.js)"
+    ],
+    "not a call to SCIP": [
+      "examples/svgomg/tests/example.spec.ts:21 examples/svgomg/tests/example.spec.ts → describe (packages/playwright-core/src/client/locator.ts)",
+      "examples/todomvc/tests/fixtures.ts:10 test → use (packages/playwright/src/common/ipc.ts)",
+      "packages/dashboard/src/annotations.tsx:131 ColorPicker → onChange (packages/web/src/components/codeMirrorWrapper.tsx)"
+    ],
+    "later line": [
+      "examples/todomvc/tests/adding-todos/should-add-multiple-todos.spec.ts:5 examples/todomvc/tests/adding-todos/should-add-multiple-todos.spec.ts → test (examples/todomvc/tests/fixtures.ts)",
+      "examples/todomvc/tests/adding-todos/should-add-single-todo.spec.ts:5 examples/todomvc/tests/adding-todos/should-add-single-todo.spec.ts → test (examples/todomvc/tests/fixtures.ts)",
+      "examples/todomvc/tests/adding-todos/should-not-add-empty-todo.spec.ts:6 examples/todomvc/tests/adding-todos/should-not-add-empty-todo.spec.ts → test (examples/todomvc/tests/fixtures.ts)"
+    ]
+  }
+}

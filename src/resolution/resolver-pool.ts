@@ -30,7 +30,29 @@ export interface ChunkResult {
   deferredChain: UnresolvedRef[];
   deferredThisMember: UnresolvedRef[];
   byMethod: Record<string, number>;
+  /** Epoch-ms stamps for CODEGRAPH_RESOLVE_PROFILE's per-batch wait attribution. */
+  timing?: BatchTiming;
 }
+
+/**
+ * When a fan-out ran, on one clock (`performance.timeOrigin + now()` is epoch
+ * ms in every thread): first chunk started and last chunk finished in a
+ * worker, last result handled on the main thread (late when the main thread
+ * was busy), and the workers' summed busy time. Only under
+ * CODEGRAPH_RESOLVE_PROFILE — the workers stamp nothing otherwise.
+ */
+export interface BatchTiming {
+  start: number;
+  end: number;
+  received: number;
+  busyMs: number;
+}
+
+/** Epoch ms with sub-ms precision, comparable across worker threads. */
+export const epochMs = (): number => performance.timeOrigin + performance.now();
+
+/** CODEGRAPH_RESOLVE_PROFILE: stamp chunks so the batch loop can attribute its waits. */
+export const RESOLVE_PROFILE = !!process.env.CODEGRAPH_RESOLVE_PROFILE;
 
 interface PoolWorker {
   worker: Worker;
@@ -44,7 +66,14 @@ interface PoolWorker {
 const CLOSE_TIMEOUT_MS = 5000;
 
 const MIN_PARALLEL_BATCH = 1000;
-const CHUNK_SIZE = 500;
+/**
+ * Chunks per worker per batch. All chunks are posted up front (no per-chunk
+ * round-trip through the main thread, which is busy persisting the previous
+ * batch), so balance comes from count: with ~1.7 chunks per worker one costly
+ * chunk set the batch's span and the others waited (31% of worker time on
+ * vscode); several per worker average the cost out.
+ */
+const CHUNKS_PER_WORKER = 4;
 
 /**
  * Minimum TOTAL pending refs before the pool is created at all. Pool boot
@@ -180,7 +209,7 @@ export class ResolverPool {
         readyReject = reject;
       });
       const pw: PoolWorker = { worker, ready, started, busy: 0 };
-      worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
+      worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number; t0?: number; t1?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
           readyResolve();
         } else if (msg.type === 'result' && msg.id !== undefined) {
@@ -193,6 +222,8 @@ export class ResolverPool {
             deferredChain: msg.deferredChain!,
             deferredThisMember: msg.deferredThisMember!,
             byMethod: msg.byMethod!,
+            timing: msg.t0 === undefined || msg.t1 === undefined ? undefined
+              : { start: msg.t0, end: msg.t1, received: epochMs(), busyMs: msg.t1 - msg.t0 },
           });
         } else if (msg.type === 'synth-result' && msg.id !== undefined) {
           pw.busy--;
@@ -267,8 +298,9 @@ export class ResolverPool {
   async resolveBatch(refs: UnresolvedReference[]): Promise<ChunkResult> {
     if (this.failed) throw this.failed;
     const chunkPromises: Promise<ChunkResult>[] = [];
-    for (let i = 0; i < refs.length; i += CHUNK_SIZE) {
-      const chunk = refs.slice(i, i + CHUNK_SIZE);
+    const chunkSize = Math.ceil(refs.length / (this.workers.length * CHUNKS_PER_WORKER));
+    for (let i = 0; i < refs.length; i += chunkSize) {
+      const chunk = refs.slice(i, i + chunkSize);
       const id = this.nextId++;
       // Least-busy dispatch keeps workers evenly loaded regardless of chunk
       // cost variance; result order is fixed by the promise array, not by
@@ -278,19 +310,28 @@ export class ResolverPool {
       chunkPromises.push(
         new Promise<ChunkResult>((resolve, reject) => {
           this.waiters.set(id, { resolve, reject });
-          pw.worker.postMessage({ type: 'resolve', id, refs: chunk });
+          pw.worker.postMessage({ type: 'resolve', id, refs: chunk, sentAt: RESOLVE_PROFILE ? epochMs() : undefined });
         })
       );
     }
     const chunks = await Promise.all(chunkPromises);
     const out: ChunkResult = { resolved: [], unresolved: [], deferredChain: [], deferredThisMember: [], byMethod: {} };
+    let timing: BatchTiming | undefined;
     for (const c of chunks) {
+      if (c.timing) {
+        timing ??= { start: Infinity, end: 0, received: 0, busyMs: 0 };
+        timing.start = Math.min(timing.start, c.timing.start);
+        timing.end = Math.max(timing.end, c.timing.end);
+        timing.received = Math.max(timing.received, c.timing.received);
+        timing.busyMs += c.timing.busyMs;
+      }
       out.resolved.push(...c.resolved);
       out.unresolved.push(...c.unresolved);
       out.deferredChain.push(...c.deferredChain);
       out.deferredThisMember.push(...c.deferredThisMember);
       for (const [k, v] of Object.entries(c.byMethod)) out.byMethod[k] = (out.byMethod[k] || 0) + v;
     }
+    if (timing) out.timing = timing;
     return out;
   }
 

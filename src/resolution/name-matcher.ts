@@ -7356,6 +7356,25 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
+ * A receiver name's method-owner types, in getNodesByName's order — once per
+ * name, not per call: a module receiver like `assert` is an `import` node in
+ * every file that imports it (2,653 on vscode), and the filter walked that list
+ * for each of its 88k calls.
+ */
+const RECEIVER_OWNERS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+function receiverOwners(name: string, context: ResolutionContext): Node[] {
+  let memo = RECEIVER_OWNERS.get(context);
+  if (!memo) { memo = new Map(); RECEIVER_OWNERS.set(context, memo); }
+  let owners = memo.get(name);
+  if (!owners) {
+    owners = context.getNodesByName(name).filter(isMethodOwnerKind);
+    memo.set(name, owners);
+  }
+  return owners;
+}
+
+/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -9012,6 +9031,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TARGET_LANGUAGE.delete(context);
+  RECEIVER_OWNERS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -10292,10 +10312,7 @@ export function matchMethodCall(
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
-    let classCandidates = preferCallSiteFile(
-      context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind),
-      ref.filePath,
-    );
+    let classCandidates = preferCallSiteFile(receiverOwners(objectOrClass!, context), ref.filePath);
     // A C# class the call's namespaces can see before one they can't:
     // serilog's `Some.InformationEvent()` in Serilog.Tests is its own
     // Support namespace's `Some`, not the performance tests'.
@@ -10391,7 +10408,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
       const fuzzyClassCandidates = preferCallSiteFile(
-        context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind),
+        receiverOwners(capitalizedReceiver, context),
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {

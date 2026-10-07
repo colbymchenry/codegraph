@@ -26,6 +26,7 @@ import { QueryBuilder } from '../db/queries';
 import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
+import { RESOLVE_PROFILE, epochMs } from './resolver-pool';
 import { collectBeforeExit } from '../worker-teardown';
 import type { UnresolvedReference } from '../types';
 
@@ -41,7 +42,7 @@ let resolver: ReferenceResolver | null = null;
 type InMessage =
   | { type: 'open'; dbPath: string; projectRoot: string }
   | { type: 'recycle'; id: number }
-  | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
+  | { type: 'resolve'; id: number; refs: UnresolvedReference[]; sentAt?: number }
   | { type: 'synth'; id: number; pass: string }
   | { type: 'close' };
 
@@ -86,10 +87,18 @@ port.on('message', (msg: InMessage) => {
       }
       case 'resolve': {
         if (!resolver) throw new Error('resolver-worker: resolve before open');
-        const tRes = Date.now();
+        const t0 = epochMs();
         const out = resolver.resolveListForAdmission(msg.refs);
-        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
-        port.postMessage({ type: 'result', id: msg.id, ...out });
+        const t1 = epochMs();
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Math.round(t1 - t0)}ms`);
+        port.postMessage(RESOLVE_PROFILE ? { type: 'result', id: msg.id, ...out, t0, t1 } : { type: 'result', id: msg.id, ...out });
+        // CODEGRAPH_RESOLVE_PROFILE: this chunk's timeline on the shared clock
+        // (sent by main, resolve start/end, result serialized) — the gaps
+        // between a worker's chunks are deserialization or waiting.
+        if (RESOLVE_PROFILE) {
+          const r = (x: number): string => x.toFixed(2);
+          console.error(`[chunk] ${threadId} ${msg.id} ${r(msg.sentAt ?? 0)} ${r(t0)} ${r(t1)} ${r(epochMs())} ${msg.refs.length}`);
+        }
         break;
       }
       case 'synth': {
