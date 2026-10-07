@@ -53,6 +53,7 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
+import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
 import {
   findAllSymbols,
@@ -3305,12 +3306,6 @@ export class ToolHandler {
   }
 
   /**
-   * Describe a synthesized (dynamic-dispatch) edge for human output: how the
-   * callback was wired up — the bridge static parsing can't see. Returns null
-   * for ordinary static edges. Used by trace + the node trail so a synthesized
-   * hop reads as "registered via onUpdate at App.tsx:3148", not a bare arrow.
-   */
-  /**
    * The branch conditions a flow hop's call site runs under, read from the
    * caller's source now (`graph/branch-guards.ts`); '' when unconditional,
    * unreadable, or the grammar for that language is not loaded.
@@ -3333,117 +3328,17 @@ export class ToolHandler {
     }
   }
 
-  private synthEdgeNote(edge: Edge | null): { label: string; compact: string; registeredAt?: string } | null {
-    if (!edge || edge.provenance !== 'heuristic') return null;
-    const m = edge.metadata as Record<string, unknown> | undefined;
-    const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
-    const at = registeredAt ? ` @${registeredAt}` : '';
-    if (m?.synthesizedBy === 'callback') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
-      const field = m.field ? ` on .${String(m.field)}` : '';
-      return {
-        label: `callback — registered via ${via}${field} (dynamic dispatch)`,
-        compact: `dynamic: callback via ${via}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'http-client') {
-      const req = `${String(m.method ?? 'GET')} ${String(m.href ?? '')}`.trim();
-      return {
-        label: `HTTP request \`${req}\` — the client's call onto its own route (cross-tier)`,
-        compact: `dynamic: HTTP ${req}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'queue-job') {
-      const job = m.event ? `\`${String(m.event)}\`` : 'a job';
-      const queue = m.queue ? ` on queue \`${String(m.queue)}\`` : '';
-      return {
-        label: `queue job ${job}${queue} — producer → consumer (cross-tier)`,
-        compact: `dynamic: queue job ${job}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-bus') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      const what = m.channel === 'socket' ? 'socket message' : 'bus event';
-      const dir = m.tier === 'client→server' ? ', client → server' : m.tier === 'server→client' ? ', server → client' : '';
-      return {
-        label: `${what} ${ev} — emit → handler${dir} (dynamic dispatch)`,
-        compact: `dynamic: ${what} ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-emitter') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      return {
-        label: `event ${ev} — emit → handler (dynamic dispatch)`,
-        compact: `dynamic: event ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'react-render') {
-      return {
-        label: `React re-render — \`setState\` re-runs render() (dynamic dispatch)`,
-        compact: `dynamic: React re-render via setState${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'jsx-render') {
-      const child = m.via ? `<${String(m.via)}>` : 'a child component';
-      return {
-        label: `renders ${child} (JSX child — dynamic dispatch)`,
-        compact: `dynamic: renders ${child}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'vue-handler') {
-      const ev = m.event ? `@${String(m.event)}` : 'a template event';
-      return {
-        label: `Vue template handler — bound to ${ev} (dynamic dispatch)`,
-        compact: `dynamic: Vue ${ev} handler`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'interface-impl') {
-      return {
-        label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
-        compact: `dynamic: interface → impl${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'closure-collection') {
-      const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
-      return {
-        label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
-        compact: `dynamic: runs ${field} handlers${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
-      return {
-        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
-        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'goframe-route') {
-      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
-      return {
-        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
-        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
-    // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
-    // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
-    if (typeof m?.synthesizedBy === 'string') {
-      const kind = m.synthesizedBy.replace(/-/g, ' ');
-      return { label: `${kind} (dynamic dispatch)`, compact: `dynamic: ${kind}${at}`, registeredAt };
-    }
-    return null;
+  /**
+   * The tag a synthesized (dynamic-dispatch) hop carries in explore's Flow and
+   * dynamic-dispatch links and in the codegraph_node trail, so it reads as
+   * "dynamic: callback via `onUpdate` @App.tsx:3148", not a bare arrow. Null
+   * for an ordinary static edge. The wording is `graph/synthesized-hop.ts`'s,
+   * shared with ContextBuilder's call paths.
+   */
+  private synthEdgeNote(edge: Edge | null): string | null {
+    const hop = describeSynthesizedHop(edge);
+    if (!hop) return null;
+    return `dynamic: ${hop.summary}${hop.registeredAt ? ` @${hop.registeredAt}` : ''}`;
   }
 
   /**
@@ -3498,8 +3393,7 @@ export class ToolHandler {
             const key = `${src.name}>${tgt.name}`;
             if (synthSeen.has(key)) continue;
             synthSeen.add(key);
-            const note = this.synthEdgeNote(edge);
-            synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
+            synthLines.push(`- ${src.name} → ${tgt.name}   [${this.synthEdgeNote(edge) ?? edge.kind}]`);
           }
         }
         return synthLines;
@@ -3632,9 +3526,8 @@ export class ToolHandler {
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) {
-            const sy = this.synthEdgeNote(step.edge);
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? step.edge.kind}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -8034,7 +7927,7 @@ export class ToolHandler {
     const fmt = (e: { node: Node; edge: Edge }) => {
       const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
       const synth = this.synthEdgeNote(e.edge);
-      return synth ? `${base} [${synth.compact}]` : base;
+      return synth ? `${base} [${synth}]` : base;
     };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
       const seen = new Set<string>([node.id]);
