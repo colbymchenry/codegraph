@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoBareName, GO_TYPE_KINDS } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, GO_TYPE_KINDS } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -29,6 +29,8 @@ import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { clearCppTypeAliasMemos } from './cpp-type-aliases';
+import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -475,6 +477,7 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
+      clearCppTypeAliasMemos(this.context);
     }
   }
 
@@ -1152,6 +1155,11 @@ export class ReferenceResolver {
     // A Dart annotation (`@riverpod`, `@Riverpod(…)`) is a constant or a
     // constructor call, as written — never a method or function by its name.
     if (isDartAnnotation(ref)) return matchDartAnnotation(ref, this.context);
+
+    // A section or snippet a Shopify theme's file names is that theme's own,
+    // or nothing: Shopify never looks in another theme (see ./shopify-themes).
+    const themeFile = matchShopifyThemeFile(ref, this.context);
+    if (themeFile !== undefined) return themeFile;
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
@@ -3056,6 +3064,11 @@ export class ReferenceResolver {
       result = { ...result, targetNodeId: type.id };
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    // A Go type embedded through a package (`yaml.Node`) is that package's.
+    // When the package is none of the file's imports as indexed, a type found
+    // by its bare name is some other package's namesake: prometheus's
+    // `RuleGroupNode` embeds yaml's `Node`, not discovery/kubernetes's.
+    if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
     return result;
   }
 

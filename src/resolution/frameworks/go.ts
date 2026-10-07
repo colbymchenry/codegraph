@@ -31,11 +31,15 @@ export const goResolver: FrameworkResolver = {
     // reads a name from one package only: one written bare from the
     // reference's own, `pkg.Node` from that import's (the import resolver's
     // job), `x[i].Error()` from whatever type `x[i]` has. So they guess only
-    // for a bare name, and only in its own package. Past that, promql/parser's
-    // `Node` parameters went to discovery/kubernetes's struct `Node` beside the
-    // package's own `Node` interface, `apiv1.Node` to the struct in the same
-    // file, and every `.String()` called through an expression to the struct
+    // for a bare name, only in its own package, and never for an embedded
+    // type, which name matching and the import resolver work out. Past that,
+    // promql/parser's `Node` parameters and embeddings went to
+    // discovery/kubernetes's struct `Node` beside the package's own `Node`
+    // interface, `apiv1.Node` to the struct in the same file, etcd's `Client`
+    // embedding its own `Lease` interface to the server's `Lease` struct, and
+    // every `.String()` called through an expression to the struct
     // `promql.String`, as an instantiation.
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
     if (!isGoBareName(ref, context)) return null;
 
     // Pattern 1: Handler references

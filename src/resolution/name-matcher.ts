@@ -14,6 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
+import { cppAliasedTypeName, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -1883,7 +1884,36 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
-const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, ImportMapping | null>>();
+interface GoQualification {
+  /** The package name written before the reference's name, as spelled. */
+  written?: string;
+  /** The file's import that name is. */
+  imported?: ImportMapping;
+}
+
+const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, GoQualification>>();
+
+function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQualification {
+  if (ref.referenceKind === 'imports') return {};
+  const name = ref.referenceName.split('.').pop()!;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return {};
+  let memo = GO_QUALIFIERS.get(context);
+  if (!memo) GO_QUALIFIERS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const at = Math.max(0, ref.column);
+  // The qualifier right before the name at the reference's column, or the
+  // line's only spelling of the name. A variadic `...chunks.Meta` is written
+  // through `chunks` too: the ellipsis is no receiver.
+  const written = line.startsWith(name, at) ? /(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
+    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.]|\\.{3})([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
+  const imported = written ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === written) : undefined;
+  const found = { written, imported };
+  memo.set(key, found);
+  return found;
+}
 
 /**
  * The import a Go reference is written through — `context` in
@@ -1892,24 +1922,18 @@ const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, ImportMapping |
  * through anything that isn't one of the file's imports.
  */
 export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): ImportMapping | undefined {
-  if (ref.referenceKind === 'imports') return undefined;
-  const name = ref.referenceName.split('.').pop()!;
-  if (!/^[A-Za-z_]\w*$/.test(name)) return undefined;
-  let memo = GO_QUALIFIERS.get(context);
-  if (!memo) GO_QUALIFIERS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit ?? undefined;
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  const at = Math.max(0, ref.column);
-  // The qualifier right before the name at the reference's column, or the
-  // line's only spelling of the name. A variadic `...chunks.Meta` is written
-  // through `chunks` too: the ellipsis is no receiver.
-  const before = line.startsWith(name, at) ? /(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
-    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.]|\\.{3})([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
-  const imported = before ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before) : undefined;
-  memo.set(key, imported ?? null);
-  return imported;
+  return goRefQualification(ref, context).imported;
+}
+
+/**
+ * Whether a Go reference is written through a package that is none of its
+ * file's imports as the index knows them: `yaml` in `yaml.Node` under an
+ * unaliased `import "go.yaml.in/yaml/v3"`, which is recorded under its last
+ * path element, `v3`. Which package that is cannot be told from here.
+ */
+export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const { written, imported } = goRefQualification(ref, context);
+  return written !== undefined && imported === undefined;
 }
 
 /**
@@ -8263,11 +8287,102 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   );
 }
 
+/** What C++ receiver inference made of a receiver's declared type. */
+interface CppReceiverDeclaration {
+  /**
+   * The declared type is an alias: `followed` to the type it names, or
+   * `unreadable` when that type is a template parameter's (`using Type =
+   * GenericType;`, `typename Traits::Field`) or a `decltype(…)` — no
+   * particular class.
+   */
+  aliased?: 'followed' | 'unreadable';
+  /** The type as written in the declaration, without following an alias (`Table`). */
+  written?: string;
+  /** The type is reached through a pointer (`Table* t`, `using Field = const FieldDescriptor*;`). */
+  pointer?: boolean;
+  /** The type is one of the project's class templates, whose specializations may add members. */
+  classTemplate?: boolean;
+}
+
+/**
+ * A declared C++ type as receiver inference reads it: its own last segment,
+ * or, when it is an alias the caller's own declaration uses, the type the
+ * alias names (cpp-type-aliases.ts) — null when that type can't be known. An
+ * alias is never a class, so its own name is never looked up as one: that is
+ * how protobuf's `Field f; f->number()` (`using Field = const
+ * FieldDescriptor*;`) reached the generated `Field` message's `number`.
+ */
+function cppDeclaredType(
+  raw: string,
+  normalized: string,
+  inCallerScope: boolean,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  found?: CppReceiverDeclaration,
+): string | null {
+  // A declaration read from elsewhere (an earlier function, another class)
+  // may not be this receiver's, so it is taken as it was before aliases
+  // were followed.
+  if (!inCallerScope) return normalized;
+  const aliased = resolveCppAliasedType(raw, ref, context);
+  if (aliased === undefined) return normalized;
+  if (found) {
+    found.aliased = aliased ? 'followed' : 'unreadable';
+    found.written = normalized;
+    found.pointer = aliased ? aliased.pointer : isCppPointerType(raw);
+    found.classTemplate = aliased?.classTemplate ?? false;
+  }
+  return aliased ? cppAliasedTypeName(aliased) : null;
+}
+
+/**
+ * Is line `line` of `file` — where `text` declares a C++ receiver at column
+ * `at` — the calling function's own code, or a member declaration of the
+ * caller's class? Receiver inference reads back to the top of the file and
+ * through the header, so a declaration it finds elsewhere (an earlier
+ * function, another class in the header, a comment) may be another variable
+ * of the same name.
+ */
+function isCppCallersDeclaration(file: string, line: number, text: string, at: number, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (/^\s*(?:\/\/|\/\*|\*)/.test(text)) return false;
+  const comment = text.indexOf('//');
+  if (comment >= 0 && comment < at) return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || (caller.kind !== 'method' && caller.kind !== 'function')) return false;
+  if (file === ref.filePath && line >= caller.startLine && line <= ref.line) return true;
+  const cut = caller.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  return context.getNodesByQualifiedName(caller.qualifiedName.slice(0, cut)).some((owner) =>
+    (owner.kind === 'class' || owner.kind === 'struct' || owner.kind === 'union') && owner.filePath === file &&
+    line >= owner.startLine && line <= (owner.endLine ?? owner.startLine));
+}
+
+/** Is the C++ member call at `ref` written `receiver.method(…)`, not through `->`? */
+function isCppDotCall(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const at = lines?.[ref.line - 1]?.slice(ref.column);
+  if (!lines || !at?.startsWith(receiver)) return false;
+  let rest = at.slice(receiver.length);
+  // `symbols_by_parent_` ending its line, `.insert(…)` starting the next.
+  for (let next = ref.line; !rest.trim() && next < Math.min(lines.length, ref.line + 3); next++) rest = lines[next]!;
+  return /^\s*\./.test(rest);
+}
+
+/**
+ * A type name that reads as a type (capitalized) yet names no class, struct
+ * or interface the project declares: one from outside the project.
+ */
+function isUndeclaredTypeName(typeName: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return /^[A-Z]/.test(typeName) &&
+    !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language));
+}
+
 function inferCppReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
   depth = 0,
+  found?: CppReceiverDeclaration,
 ): string | null {
   // Per-file lines cache when available — this runs per `receiver->method()`
   // ref and re-splitting the file each time is the same quadratic as the
@@ -8296,7 +8411,8 @@ function inferCppReceiverType(
         if (initType) return initType;
         // No usable initializer on this line — keep scanning earlier ones.
       } else if (normalized) {
-        return normalized;
+        const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, line, declaratorMatch.index ?? 0, ref, context);
+        return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
       }
     }
   }
@@ -8314,12 +8430,16 @@ function inferCppReceiverType(
       : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
     if (!headerLines) continue;
 
-    for (const line of headerLines) {
+    for (let i = 0; i < headerLines.length; i++) {
+      const line = headerLines[i]!;
       if (!receiverPattern.test(line)) continue;
       const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
-      if (normalized && normalized !== 'auto') return normalized;
+      if (normalized && normalized !== 'auto') {
+        const inCallerScope = isCppCallersDeclaration(headerPath, i + 1, line, declaratorMatch.index ?? 0, ref, context);
+        return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
+      }
     }
   }
 
@@ -9970,9 +10090,10 @@ export function matchMethodCall(
       if (typed !== undefined) return typed;
     }
     const decl: { raw?: string } = {};
+    const cppDecl: CppReceiverDeclaration = {};
     let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
-        ? inferCppReceiverType(objectOrClass!, ref, context)
+        ? inferCppReceiverType(objectOrClass!, ref, context, 0, cppDecl)
         : inferLocalReceiverType(objectOrClass!, ref, context, decl));
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
@@ -10049,11 +10170,23 @@ export function matchMethodCall(
       // list wrapper's `add`, commons-lang's `s.length()` to a writer's.
       // (Only a type name — `java.util.List`, not a call chain like Python's
       // `Device.objects.create(…)` the initializer pattern also captures.)
-      const typeName = inferredType.split('.').pop()!;
-      if (/^[A-Z]/.test(typeName) &&
-          !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language))) {
-        return null;
-      }
+      if (isUndeclaredTypeName(inferredType.split('.').pop()!, ref, context)) return null;
+    }
+    if (cppDecl.aliased) {
+      // A C++ receiver the calling function or its class declares through an
+      // alias has the type the alias names. When that type and its
+      // supertypes lack the method (`files_.clear()` through `using Files =
+      // std::vector<int>;`), or the alias names a template parameter's type,
+      // a method picked by the receiver's name below would be some other
+      // type's.
+      if (!cppDecl.classTemplate && (cppDecl.pointer || isCppDotCall(objectOrClass!, ref, context))) return null;
+      // Not so for `it->m()` on an iterator or smart pointer, whose `->`
+      // reaches an element type the alias doesn't name, nor for one of the
+      // project's class templates, whose specializations may declare members
+      // the template itself doesn't (rocksdb's `omt_node_templated<T, true>`
+      // adds `get_marked`): that call goes on as it did before aliases were
+      // followed.
+      if (isUndeclaredTypeName(cppDecl.written!, ref, context)) return null;
     }
   }
 
