@@ -1030,7 +1030,7 @@ impl<'t> Walker<'t> {
             }
             // #1820: preserve the receiver of a method value. The name is
             // rebuilt from operand and field, as normalizeSpecial does, so a
-            // line break or comment after the dot keeps the candidate.
+            // comment or line break beside the dot keeps the candidate.
             // NAME_STOPLIST applies to the whole name and holds no dotted
             // word, so it never drops one: `raft.None` is a candidate even
             // though a bare `None` is not.
