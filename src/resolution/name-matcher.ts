@@ -6846,7 +6846,15 @@ function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: Re
     const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
     // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
     // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
-    const parameter = new RegExp(`(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
+    // The leading `(?=\()` (every match opens a list) keeps the lookbehind to
+    // where one opens. Node 22's V8 stops optimizing the regexes a process
+    // compiles once it has generated about a megabyte of regex code, which a
+    // resolver pool worker soon has, and then tried the lookbehind at every
+    // position, each time reading back through the run of blanks before it:
+    // go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
+    // stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
+    // never resolved.
+    const parameter = new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
     binds = declared || parameter.test(text);
     memo.set(key, binds);
   }
