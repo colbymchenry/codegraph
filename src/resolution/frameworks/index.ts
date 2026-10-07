@@ -143,6 +143,27 @@ export function getApplicableFrameworks(
 }
 
 /**
+ * Filter a list of detected frameworks down to ones whose `resolve()` reads a
+ * reference written in `language`: its `resolveLanguages`, else its
+ * `languages`. Frameworks that declare neither are treated as universal.
+ *
+ * A framework's conventions are its languages': Express's `logger` middleware
+ * rule took a Go method's `*zap.Logger` result type for the method itself.
+ * Bridges list the language their references are written in — the React
+ * Native bridge JS, the Swift ↔ Objective-C bridge both, Drupal the
+ * `routing.yml` it reads controllers from.
+ */
+export function getResolvingFrameworks(
+  detected: FrameworkResolver[],
+  language: Language
+): FrameworkResolver[] {
+  return detected.filter((fw) => {
+    const languages = fw.resolveLanguages ?? fw.languages;
+    return !languages || languages.includes(language);
+  });
+}
+
+/**
  * Register a custom framework resolver
  */
 export function registerFrameworkResolver(resolver: FrameworkResolver): void {

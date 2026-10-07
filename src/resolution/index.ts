@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, GO_TYPE_KINDS } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -36,7 +36,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks } from './frameworks';
+import { detectFrameworks, getResolvingFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -236,6 +236,8 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  /** `frameworks` narrowed to those that resolve each reference language (see getResolvingFrameworks). */
+  private frameworksByLanguage = new Map<Language, FrameworkResolver[]>();
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
   // collected in-memory and left pending in the DB until the post-pass
   // finishes, so a restart can recover the queue (#1577). Drained by
@@ -360,7 +362,18 @@ export class ReferenceResolver {
    */
   initialize(): void {
     this.frameworks = detectFrameworks(this.context);
+    this.frameworksByLanguage.clear();
     this.clearCaches();
+  }
+
+  /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
+  private frameworksFor(language: Language): FrameworkResolver[] {
+    let frameworks = this.frameworksByLanguage.get(language);
+    if (!frameworks) {
+      frameworks = getResolvingFrameworks(this.frameworks, language);
+      this.frameworksByLanguage.set(language, frameworks);
+    }
+    return frameworks;
   }
 
   /**
@@ -1292,6 +1305,10 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
+      // Every detected framework's claim, not only those that resolve this
+      // language: the check above reads no leading `::`, and protobuf's C++
+      // `::_pbi::…` calls get past it only on the Swift ↔ Objective-C
+      // bridge's claim of any name with a `:` in it.
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
@@ -1367,12 +1384,16 @@ export class ReferenceResolver {
 
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution. Cross-language bridges
-    // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
-    // JS → native `calls`); other code references obey the shared family gate.
+    // Strategy 1: Try framework-specific resolution, by the frameworks that
+    // read this reference's language: Express's `logger` middleware rule took
+    // a Go method's `*zap.Logger` result for the method itself (etcd).
+    // Cross-language bridges are deliberately preserved (Drupal `routing.yml`
+    // → PHP controller, RN JS → native `calls`); each lists the language its
+    // references are written in. Other code references obey the shared
+    // family gate.
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
-    for (const framework of this.frameworks) {
+    for (const framework of this.frameworksFor(ref.language)) {
       const resolved = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       // Name the resolver on the edge (`metadata.framework`): a Swift→ObjC or
       // React Native bridge hop says how it got into the graph, as a
@@ -2562,6 +2583,91 @@ export class ReferenceResolver {
     return this.frameworks.map((f) => f.name);
   }
 
+  /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
+  hasNavigationRouters(): boolean {
+    return this.frameworks.some((f) => f.navigation !== undefined);
+  }
+
+  /**
+   * Put back in the pending set the navigation calls `routes` — route nodes a
+   * sync added, removed or renamed ({@link changedRoutes}) — may now resolve
+   * differently, for the sync's resolution sweep: the calls parked as failed,
+   * and the calls whose `navigates` edges a router's resolver made. Calls in
+   * `changedFilePaths` are left alone; the sync resolved them against the new
+   * routes already. Returns the number of references put back.
+   *
+   * A navigation call names its route by path (`navigate('/login')`) and its
+   * reference by the router's method (`navigate`, `history.push`), so a route
+   * table that changed in another file is invisible to the rest of sync. A
+   * call parked as failed while its route was missing is keyed on `push`,
+   * which no synced file defines, and a resolved call keeps the route it bound
+   * to while a better one was missing (a catch-all, a parameter route, one arm
+   * of a conditional) or a route renamed under it. A full index resolves every
+   * call against the final table. Each router says which calls a route of its
+   * own can answer (`FrameworkResolver.navigation`): the method tails, and the
+   * apps whose files match against that route's table. A name more of those
+   * calls share than `perNameCeiling` is skipped, as the symbol retry skips a
+   * common tail.
+   */
+  reopenNavigationsFor(routes: readonly Node[], changedFilePaths: readonly string[] = [], perNameCeiling: number = 500): number {
+    if (routes.length === 0) return 0;
+    const plans: Array<{ router: FrameworkResolver; scopes: string[] }> = [];
+    const tails = new Set<string>();
+    for (const router of this.frameworks) {
+      if (!router.navigation) continue;
+      const scopes = new Set<string>();
+      for (const route of routes) {
+        for (const scope of router.navigation.scope(route, this.context) ?? []) scopes.add(scope);
+      }
+      if (scopes.size === 0) continue;
+      plans.push({ router, scopes: [...scopes] });
+      for (const tail of router.navigation.tails) tails.add(tail);
+    }
+    if (plans.length === 0) return 0;
+    const claimed = (name: string, filePath: string): boolean =>
+      plans.some(({ router, scopes }) => scopes.some((scope) => filePath.startsWith(scope)) && router.claimsReference?.(name) === true);
+
+    const fresh = new Set(changedFilePaths);
+    const failed = new Map<string, number[]>();
+    for (const ref of this.queries.getFailedCallsByTail([...tails])) {
+      if (fresh.has(ref.filePath) || !claimed(ref.referenceName, ref.filePath)) continue;
+      const rowIds = failed.get(ref.referenceName);
+      if (rowIds) rowIds.push(ref.rowId);
+      else failed.set(ref.referenceName, [ref.rowId]);
+    }
+    const resolved = new Map<string, Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>>();
+    for (const edge of this.queries.getResolvedNavigations()) {
+      const name = edge.metadata?.refName;
+      if (typeof name !== 'string' || fresh.has(edge.sourceFilePath) || !claimed(name, edge.sourceFilePath)) continue;
+      const edges = resolved.get(name);
+      if (edges) edges.push(edge);
+      else resolved.set(name, [edge]);
+    }
+
+    const rowIds: number[] = [];
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    // A conditional's arms are edges of one call: it goes back as one reference.
+    const sites = new Set<string>();
+    for (const name of new Set([...failed.keys(), ...resolved.keys()])) {
+      const rows = failed.get(name) ?? [];
+      const edges = resolved.get(name) ?? [];
+      if (rows.length + edges.length > perNameCeiling) continue;
+      for (const rowId of rows) rowIds.push(rowId);
+      for (const edge of edges) {
+        const ref = resurrectRefFromDroppedEdge(edge);
+        if (!ref) continue;
+        edgeIds.push(edge.edgeId);
+        const site = `${ref.fromNodeId}\0${ref.referenceName}\0${ref.line}\0${ref.column}`;
+        if (sites.has(site)) continue;
+        sites.add(site);
+        refs.push(ref);
+      }
+    }
+    if (edgeIds.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return this.queries.reopenFailedReferences(rowIds) + refs.length;
+  }
+
   /**
    * True when `receiver` is a local name bound by an import that resolves to a
    * file IN THIS PROJECT — the only case where letting a python
@@ -3079,6 +3185,10 @@ export class ReferenceResolver {
    * inside a type never is, and neither is the import statement the reference
    * was written in.
    *
+   * For a Go type position: the target is a type of the package Go reads the
+   * name from, moved there when a strategy found a method, a function or
+   * another package's type (see goTypePositionTarget).
+   *
    * For `extends`/`implements`, it cannot be describing a real supertype when:
    *
    *  1. The target's kind can never be a supertype (an enum member, a method,
@@ -3128,6 +3238,20 @@ export class ReferenceResolver {
       const target = this.nodeById(result.targetNodeId);
       if (target?.kind === 'import' && target.filePath === ref.filePath) return null;
       return target && !isImportableKind(target.kind) ? null : result;
+    }
+
+    // A Go alias names its type as an embedding does (below): written through
+    // a package that is none of the file's imports as indexed, the type found
+    // by its bare name is another package's namesake, or the alias itself.
+    if (ref.language === 'go' && ref.referenceKind === 'references' &&
+        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+
+    // A Go type position — a parameter or result type, a composite literal's
+    // type — names a type of the package Go reads it from (route handlers are
+    // `references` too, but values).
+    if (ref.language === 'go' && (ref.referenceKind === 'instantiates' ||
+        (ref.referenceKind === 'references' && this.nodeById(ref.fromNodeId)?.kind !== 'route'))) {
+      return goTypePositionTarget(result, ref, this.context);
     }
 
     if (!isInheritanceRef(ref)) return result;
@@ -3286,6 +3410,20 @@ export class ReferenceResolver {
 function goDirOf(p: string): string {
   const dir = path.posix.dirname(p.replace(/\\/g, '/'));
   return dir === '.' || dir === '/' ? '' : dir;
+}
+
+/**
+ * The routes a sync added, removed or renamed: `before` is every route node
+ * before the sync changed a file, `after` every one after its post-extract
+ * pass, and a route whose file and path are on one side only changed. A route
+ * renamed in place — the same node under a new path — is in the result twice,
+ * as its old self and its new one.
+ */
+export function changedRoutes(before: readonly Node[], after: readonly Node[]): Node[] {
+  const key = (route: Node): string => `${route.filePath}\0${route.name}`;
+  const beforeKeys = new Set(before.map(key));
+  const afterKeys = new Set(after.map(key));
+  return [...before.filter((route) => !afterKeys.has(key(route))), ...after.filter((route) => !beforeKeys.has(key(route)))];
 }
 
 /**
