@@ -1316,6 +1316,12 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     for (const sup of sups) {
       const base = queries.getNodeById(sup.target);
       if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
+      // Go has no inheritance: a Go type's supertype edge to a struct or a
+      // defined type is an embedding (`type Engine struct { RouterGroup }`),
+      // and a call on the embedded type runs its own method, never the
+      // embedder's of the same name. Only a call through an interface
+      // dispatches.
+      if (cls.language === 'go' && base.kind !== 'interface') continue;
       const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
