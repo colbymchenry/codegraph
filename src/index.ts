@@ -30,7 +30,7 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
-import { importPathKeys } from './db/reference-tail';
+import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -48,6 +48,7 @@ import {
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
+  changedRoutes,
   createResolver,
   ResolutionResult,
 } from './resolution';
@@ -922,8 +923,15 @@ export class CodeGraph {
         let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
+        // The route nodes as they were before this sync replaced or removed a
+        // file — read at the first change, so a sync that changes nothing
+        // reads nothing, and only where a router binds navigation calls to
+        // routes. Compared with the routes after runPostExtract below.
+        const watchRoutes = this.resolver.hasNavigationRouters();
+        let routesBefore = null as Node[] | null;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
               (content !== undefined && hasSynthesisPattern(filePath, content)))) {
@@ -965,6 +973,29 @@ export class CodeGraph {
           this.resolver.runPostExtract();
         }
 
+        // A route that appeared, went away or was renamed changes what a
+        // navigation call in an UNCHANGED file resolves to: `history.push(
+        // '/login')` binds again once `/login` is back. While the route was
+        // missing the call was parked as failed, or bound to a catch-all, and
+        // nothing below revisits it: the retry keys on the names this sync's
+        // files define, which a call named for the router's method (`push`)
+        // never matches. Put those calls back in the pending set for the sweep
+        // below, and let the synthesizers redraw the links markup makes to
+        // routes. The route table is final here: renames and table routes are
+        // runPostExtract's.
+        if (routesBefore) {
+          const tNav = Date.now();
+          const routes = changedRoutes(routesBefore, this.queries.getNodesByKind('route'));
+          const reopened = this.resolver.reopenNavigationsFor(routes, result.changedFilePaths ?? []);
+          if (routes.length > 0 && !refreshSynthesis) {
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-navigation-retry: ${Date.now() - tNav}ms (${routes.length} routes changed, ${reopened} refs re-opened)`);
+          }
+        }
+
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
         if (filesChanged) {
@@ -997,12 +1028,17 @@ export class CodeGraph {
             // Look them up by the symbol names the changed files now carry
             // and re-resolve just that set. The names include each file's
             // own, which a reference written as a path
-            // (`snippets/price.liquid`) waits under. On a sync where no failed
-            // ref matches, this is one indexed lookup.
+            // (`snippets/price.liquid`) waits under, and the keys a route's
+            // lazily loaded module waits under (`module:Team` for
+            // `lazy-import:./pages/Team`): a route renders the component its
+            // module exports, so an edit can satisfy it as well as an added
+            // file. On a sync where no failed ref matches, this is one
+            // indexed lookup.
             const tRetry = Date.now();
-            const retryable = this.queries.getRetryableFailedReferences(
-              this.queries.getNodeNamesByFiles(result.changedFilePaths)
-            );
+            const retryable = this.queries.getRetryableFailedReferences([...new Set([
+              ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
+              ...result.changedFilePaths.flatMap(moduleReferenceKeys),
+            ])]);
             // A failed import waits for a file, a folder or a namespace, not a
             // symbol: `package:app/b.dart` for a file named `b.dart`, `./ui`
             // for `ui/index.ts`, `using Foo.Bar` for that namespace's node.
@@ -1017,6 +1053,11 @@ export class CodeGraph {
             for (const ref of importRetry) {
               if (!retryRows.has(ref.rowId)) retryable.push(ref);
             }
+            // In row order, as a full index resolves them: when two refs make
+            // the same edge, such as a route's lazily loaded class that its
+            // layout also renders, the one written first names it, as it
+            // does in a fresh index.
+            retryable.sort((a, b) => (a.rowId ?? 0) - (b.rowId ?? 0));
             if (retryable.length > 0) {
               options.onProgress?.({
                 phase: 'resolving',
