@@ -162,17 +162,19 @@ function skipTypeArguments(code: string, at: number): number {
  * function or class (`function Vans() {…}`, `class Baz …`), or what a wrapper
  * call wraps — the first argument of its last call, read the same way
  * (`memo(Foo)`, `connect(mapState)(Bar)`, `withRouter(connect(m)(Bar))`,
- * `observer(function Settings() {…})`, `styled(Button)\`…\``), or the class of an
- * instance (`new Storage()`, whose members are the class's). Null for one that
- * names nothing: an arrow function, an object literal, `Primitive.Root`, a
- * call on a literal (`requireNativeComponent('X')`). `code` is comment-free.
+ * `observer(function Settings() {…})`, `styled(Button)\`…\``) when it is a
+ * component's name or ends a curried chain (see {@link handsOn}) — or the
+ * class of an instance (`new Storage()`, whose members are the class's). Null
+ * for one that names nothing: an arrow function, an object literal,
+ * `Primitive.Root`, a call on a literal (`requireNativeComponent('X')`), a
+ * factory's argument (`createStore(reducer)`). `code` is comment-free.
  */
-function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): NamedBinding | null {
+function namedBindingAt(code: string, at: number, wrapped = false, depth = 0, curried = false): NamedBinding | null {
   const head = code.slice(at, at + 200);
   const declared = /^(?:async\s+)?function\b\s*\*?\s*([A-Za-z_$][\w$]*)?|^(?:abstract\s+)?class\b(?:\s+(?!extends\b|implements\b)([A-Za-z_$][\w$]*))?/.exec(head);
   if (declared) {
     const name = declared[1] ?? declared[2];
-    return name ? { name, wrapped, nameAt: at + declared[0].length - name.length } : null;
+    return name && handsOn(name, wrapped, curried) ? { name, wrapped, nameAt: at + declared[0].length - name.length } : null;
   }
   const constructed = /^new\s+([A-Za-z_$][\w$]*)\b(?!\s*\.)/.exec(head);
   if (constructed) return { name: constructed[1]!, wrapped: true };
@@ -182,7 +184,7 @@ function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): N
   while (code[i] === ' ' || code[i] === '\t') i++;
   // A name on its own, up to the end of its statement or argument.
   if (!callee.includes('.') && /^(?:[;,)\]}]|\r?\n|$|(?:as|satisfies)\b)/.test(code.slice(i, i + 12))) {
-    return { name: callee, wrapped };
+    return handsOn(callee, wrapped, curried) ? { name: callee, wrapped } : null;
   }
   i = skipSpace(code, i);
   if (code[i] === '<') {
@@ -193,9 +195,11 @@ function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): N
   // The call chain: `(…)(…)` and tagged templates; the last argument list is the one that wraps.
   // One whose end is out of reach (an apostrophe in JSX text reads as a quote) is the last one seen.
   let args = -1;
+  let calls = 0;
   for (;;) {
     if (code[i] === '(') {
       args = i;
+      calls++;
       const close = matchBracket(code, i);
       if (close < 0) break;
       i = skipSpace(code, close + 1);
@@ -207,7 +211,18 @@ function namedBindingAt(code: string, at: number, wrapped = false, depth = 0): N
   }
   // `createSlice(…).reducer` hands on a member of what the call returns.
   if (args < 0 || code[i] === '.' || depth >= 4) return null;
-  return namedBindingAt(code, skipSpace(code, args + 1), true, depth + 1);
+  return namedBindingAt(code, skipSpace(code, args + 1), true, depth + 1, calls > 1);
+}
+
+/**
+ * Whether a wrapper call hands on the name it is given: a component's name
+ * (`memo(Card)`, `observer(function Settings() {…})`), or whatever ends a
+ * curried chain (`connect(mapState)(view)`, `traceFunction({…})(provision)`).
+ * `createStore(reducer)` hands on a store, not `reducer`. A name the
+ * expression holds on its own is always handed on.
+ */
+function handsOn(name: string, wrapped: boolean, curried: boolean): boolean {
+  return !wrapped || curried || /^[A-Z]/.test(name);
 }
 
 /**

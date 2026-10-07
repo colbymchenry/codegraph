@@ -358,6 +358,38 @@ export function start() { return makeApp(); }
     expect(callees).toEqual(['createApp']);
   });
 
+  it('does not reach the argument of a factory a module exports by default', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'factory.ts'),
+      `export function createStore(r: (s: unknown) => unknown) { return { dispatch(a: unknown) { return r(a); } }; }\n`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'store.ts'),
+      `import { createStore } from './factory';
+function reducer(state: unknown) { return state; }
+export default createStore(reducer);
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'main.ts'),
+      `import store from './store';
+export function start() { return store.dispatch({ type: 'go' }); }
+`
+    );
+    cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const callees = (cg as any).db.db
+      .prepare(
+        `SELECT t.name AS n FROM edges e
+           JOIN nodes s ON s.id = e.source
+           JOIN nodes t ON t.id = e.target
+          WHERE s.name = 'start' AND e.kind = 'calls'`
+      )
+      .all()
+      .map((r: any) => r.n);
+    expect(callees).not.toContain('reducer');
+  });
+
   it('reaches the function a wrapper call hands on, and the methods of an exported instance', async () => {
     fs.writeFileSync(
       path.join(dir, 'tracing.ts'),
