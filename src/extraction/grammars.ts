@@ -263,6 +263,31 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
  */
 const SHOPIFY_THEME_MARKERS = ['layout/theme.liquid', 'config/settings_schema.json'];
 
+/** The folders a Shopify theme is made of. */
+const SHOPIFY_THEME_FOLDERS = /^(assets|blocks|config|layout|locales|sections|snippets|templates)$/i;
+
+/**
+ * The root of the Shopify theme `filePath` is in: the directory holding the
+ * theme folder (one `folders` matches) the file sits in, when that directory
+ * also holds one of `SHOPIFY_THEME_MARKERS`. Project-relative and
+ * `/`-separated, '' for the project root; undefined when the file is in no
+ * theme. `exists` says whether a project-relative path exists. The folder
+ * nearest the file is tried first.
+ */
+export function shopifyThemeRoot(
+  filePath: string,
+  exists: (relativePath: string) => boolean,
+  folders: RegExp = SHOPIFY_THEME_FOLDERS,
+): string | undefined {
+  const segments = filePath.split('/');
+  for (let i = segments.length - 2; i >= 0; i--) {
+    if (!folders.test(segments[i]!)) continue;
+    const themeDir = segments.slice(0, i).join('/');
+    if (SHOPIFY_THEME_MARKERS.some((marker) => exists(themeDir ? `${themeDir}/${marker}` : marker))) return themeDir;
+  }
+  return undefined;
+}
+
 /**
  * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
  * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
@@ -279,13 +304,8 @@ export function isShopifyLiquidJson(filePath: string, rootDir?: string): boolean
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
   if (rootDir === undefined || !/(^|\/)(templates|sections)\/.+\.json$/i.test(filePath)) return false;
-  const segments = filePath.split('/');
-  for (let i = 0; i < segments.length - 1; i++) {
-    if (!/^(templates|sections)$/i.test(segments[i]!)) continue;
-    const themeDir = path.join(rootDir, ...segments.slice(0, i));
-    if (SHOPIFY_THEME_MARKERS.some((marker) => fs.existsSync(path.join(themeDir, marker)))) return true;
-  }
-  return false;
+  const exists = (relativePath: string): boolean => fs.existsSync(path.join(rootDir, relativePath));
+  return shopifyThemeRoot(filePath, exists, /^(templates|sections)$/i) !== undefined;
 }
 
 /**
