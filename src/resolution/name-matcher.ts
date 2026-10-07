@@ -10735,8 +10735,9 @@ export function matchMethodCall(
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
     // A Go parameter named like an import is declared through a package as
     // often as not (`logger logger.Interface`), which the patterns above
-    // don't read; the scope reader kept its type.
-    if (!inferredType && ref.language === 'go' && dotMatch) {
+    // don't read; the scope reader kept its type. Not a field's: in
+    // `metadata.Type.String()` that is the type of `metadata`.
+    if (!inferredType && ref.language === 'go' && dotMatch && !objectOrClass!.includes('.')) {
       const declared = goRefQualification(ref, context).declaredType;
       if (declared) {
         inferredType = normalizeInferredTypeName(declared);

@@ -193,6 +193,7 @@ type Store interface {
 
 type Interface interface {
 	Error(v ...interface{})
+	String() string
 }
 
 func Error(v ...interface{}) {}
@@ -225,6 +226,10 @@ func cachedHasSynced(store cache.Store) func() bool {
 	cache := &atomic.Bool{}
 	cache.Store(false)
 	return cache.Load
+}
+
+func describe(logger logger.Interface) string {
+	return logger.Kind.String()
 }
 `,
   // harbor's controller/robot.Robot embeds model.Robot, whose method a
@@ -359,6 +364,8 @@ describe('a Go parameter or local named like an import', () => {
     // type brings in counts.
     expect(reachedAt('jobs/job.go', 'logger.Error(err)')).toEqual(['Interface::Error']);
     expect(reachedAt('scan/job_test.go', 'robot.ToJSON()')).toEqual(['Robot::ToJSON']);
+    // The type is the variable's, not a field's read through it.
+    expect(reachedAt('jobs/job.go', 'logger.Kind.String()')).not.toContain('Interface::String');
   });
 
   it('is read from the file as a sync leaves it', async () => {
