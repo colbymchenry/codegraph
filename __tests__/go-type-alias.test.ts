@@ -16,10 +16,11 @@
  *
  * Resolution treats the alias as the type it names. A bare `Event{}` or
  * `*Event` in its package links to the alias, a method called on an `*Event`
- * is the aliased type's method, and an alias whose target is written through
- * a package the index doesn't know (`clientv3` under an unaliased
- * `go.etcd.io/etcd/client/v3`, known as `v3` or `client`) never links to
- * itself or to a namesake.
+ * is the aliased type's method, methods written with the alias as the
+ * receiver make it implement what they satisfy, and an alias whose target is
+ * written through a package the index doesn't know (`clientv3` under an
+ * unaliased `go.etcd.io/etcd/client/v3`, known as `v3` or `client`) never
+ * links to itself or to a namesake.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -295,6 +296,21 @@ describe('an indexed Go module resolves through its aliases', () => {
         'func count(xs *Items[int]) int { return xs.Len() }',
         '',
       ].join('\n'),
+      // prometheus's discovery/xds: methods written on the alias are SDConfig's.
+      'discovery/kuma.go': [
+        'package discovery',
+        '',
+        'type Config interface {',
+        '\tName() string',
+        '}',
+        '',
+        'type SDConfig struct{}',
+        '',
+        'type KumaSDConfig = SDConfig',
+        '',
+        'func (*KumaSDConfig) Name() string { return "kuma" }',
+        '',
+      ].join('\n'),
       'watcher/watcher.go': [
         'package watcher',
         '',
@@ -356,6 +372,17 @@ describe('an indexed Go module resolves through its aliases', () => {
       'calls client/v3/list.go:List::Len',
       'references client/v3/list.go:Items',
     ]);
+  });
+
+  it('an alias owning methods written on it implements what they satisfy', () => {
+    expect(linksFrom('discovery/kuma.go', 'KumaSDConfig')).toEqual([
+      'implements discovery/kuma.go:Config',
+      'references discovery/kuma.go:SDConfig',
+    ]);
+    // A call through Config.Name reaches the method written on the alias.
+    const config = cg.getNodesInFile('discovery/kuma.go').find((n) => n.name === 'Config')!;
+    const name = cg.getOutgoingEdgesFrom([config.id], ['contains']).map((e) => cg.getNode(e.target)!).find((n) => n.name === 'Name')!;
+    expect(cg.getOutgoingEdgesFrom([name.id], ['calls']).map((e) => cg.getNode(e.target)?.qualifiedName)).toEqual(['KumaSDConfig::Name']);
   });
 
   it('an alias written through a package the index does not know links to nothing', () => {
