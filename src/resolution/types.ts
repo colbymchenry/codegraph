@@ -29,6 +29,9 @@ export interface UnresolvedRef {
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
+  /** The tail a ref that failed to resolve is parked under, when it is not
+   * the one its name gives (see `importBindingTail`). */
+  nameTail?: string;
 }
 
 /**
