@@ -314,6 +314,33 @@ export function second() { return probe(); }
     ]));
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'],
+  ] as const)('typed styled tags are components, parsed as comparisons or not: %s', (ext, language) => {
+    // `styled.div<Props>\`…\`` parses as `(styled.div < Props) > \`…\``; the
+    // type argument's own operators sit between (`<A | B>`, `<Partial<A>>`).
+    const result = assertParity(`styles.${ext}`, `
+import styled, { css } from 'styled-components';
+import { s } from './theme';
+type Props = { align: 'start' | 'end' };
+const Plain = styled.div\`color: red;\`;
+export const Wrapper = styled.div<Props>\`color: \${(p) => s(p.align)};\`;
+const CloseAction = styled.div<{ animation: Animation | null }>\`top: 0;\`;
+const Content = styled(Plain)<Props>\`padding: 4px;\`;
+const NudeButton = styled(Plain).attrs((props: Props) => ({ type: "button" }))<Props>\`\`;
+const Either = styled.div<Props | Other>\`color: red;\`;
+const Nested = styled.div<Partial<Props>>\`color: red;\`;
+const Mixin = css<Props>\`color: red;\`;
+const Compared = styled.length < LIMIT > 2;
+const lowerCase = styled.div<Props>\`color: red;\`;
+`, language);
+    const kind = (name: string) => result.nodes.filter((n) => n.name === name).map((n) => n.kind);
+    for (const name of ['Plain', 'Wrapper', 'CloseAction', 'Content', 'NudeButton', 'Either', 'Nested']) {
+      expect(kind(name), name).toEqual(['component']);
+    }
+    for (const name of ['Mixin', 'Compared', 'lowerCase']) expect(kind(name), name).toEqual(['constant']);
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
@@ -381,6 +408,30 @@ class Consumer:
     const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
     expect(names.sort()).toEqual(['Store.Fetch', 'c.Fetch', 'c.store.Fetch']);
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
+  });
+
+  it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {
+    // The stoplist holds bare words like Python's `None`; `raft.None` (etcd)
+    // and cgo's `C.NULL` are still values. The name is operand + field, so a
+    // break or comment after the dot keeps it; one inside the operand doesn't.
+    const source = `package demo
+import "example.com/raft"
+type Store struct{}
+func (s *Store) new() any { return nil }
+func wire(s *Store) {
+	Submit(raft.None, C.NULL, None, nil)
+	pool := sync.Pool{New: s.new}
+	Submit(raft.
+		Next, raft./* c */ Prev, raft.// c
+		Last)
+	Submit(s.
+		inner.Fetch)
+	_ = pool
+}
+`;
+    const result = assertParity('values.go', ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['C.NULL', 'raft.Last', 'raft.Next', 'raft.None', 'raft.Prev', 's.new']);
   });
 
   it.each(REAL_SOURCES)('real source parity: %s', (rel) => {

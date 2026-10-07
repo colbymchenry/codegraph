@@ -15,6 +15,39 @@ import CodeGraph, { LockUnavailableError } from '../src/index';
 import { QueryBuilder } from '../src/db/queries';
 import { __emitWatchEventForTests } from '../src/sync/watcher';
 
+/**
+ * Index `cg`'s project again from an empty database, as `codegraph index`
+ * does, and return the new handle: the graph a synced index has to match.
+ * indexAll over the synced index is no stand-in — it skips every file whose
+ * content is unchanged, so the edges the sync wrote survive it untouched.
+ */
+async function reindexFromScratch(cg: CodeGraph): Promise<CodeGraph> {
+  const root = cg.getProjectRoot();
+  // recreate unlinks the database file; a held handle makes that EBUSY on Windows.
+  cg.close();
+  const rebuilt = await CodeGraph.recreate(root);
+  await rebuilt.indexAll();
+  return rebuilt;
+}
+
+/**
+ * For a test that indexes twice in its body: on a busy host the default 5s
+ * timeout measures the machine rather than the tree (#1773).
+ */
+const REINDEX_TIMEOUT = 60_000;
+
+/** Every node and edge by natural key, so two indexes of the same files compare directly. */
+function graphOf(cg: CodeGraph): { nodes: string[]; edges: string[] } {
+  const keys = new Map(
+    cg.getFiles()
+      .flatMap((file) => cg.getNodesInFile(file.path))
+      .map((n) => [n.id, `${n.kind} ${n.filePath}:${n.qualifiedName}:${n.startLine}`] as const)
+  );
+  const edges = cg.getOutgoingEdgesFrom([...keys.keys()])
+    .map((e) => `${e.kind} ${keys.get(e.source)} -> ${keys.get(e.target) ?? e.target}`);
+  return { nodes: [...keys.values()].sort(), edges: edges.sort() };
+}
+
 describe('Sync Module', () => {
   describe('Sync Functionality', () => {
     let testDir: string;
@@ -569,14 +602,11 @@ describe('Sync Module', () => {
     it('the synced graph matches a full re-index (the issue\'s exact complaint)', async () => {
       write('b.ts', `export function greet(): number {\n  return 42;\n}\n`);
       await cg.sync();
-      const synced = cg.getStats();
+      const synced = graphOf(cg);
 
-      await cg.indexAll();
-      const reindexed = cg.getStats();
-
-      expect(synced.edgeCount).toBe(reindexed.edgeCount);
-      expect(synced.nodeCount).toBe(reindexed.nodeCount);
-    });
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
 
     it('a second sync is a no-op and does not duplicate edges', async () => {
       write('b.ts', `export function greet(): number {\n  return 42;\n}\n`);
@@ -663,10 +693,10 @@ describe('Sync Module', () => {
       expect(def?.filePath).toBe('d.ts');
       expect(greetCallers()).toContain('run');
       // Parity with a full re-index — the issue's contract.
-      const synced = cg.getStats();
-      await cg.indexAll();
-      expect(cg.getStats().edgeCount).toBe(synced.edgeCount);
-    });
+      const synced = graphOf(cg);
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
 
     it('drops the edge on removal and restores it when the symbol returns', async () => {
       write('b.ts', `export function other(): number {\n  return 1;\n}\n`);

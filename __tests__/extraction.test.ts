@@ -11,7 +11,7 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, shopifyThemeRoot } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
@@ -7951,6 +7951,9 @@ describe('Liquid Shopify JSON template section resolution', () => {
     // looked unused. The JSON is now indexed and its `type`s linked.
     fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
     fs.mkdirSync(path.join(tempDir, 'templates/customers'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'layout'), { recursive: true });
+    // Every Shopify theme has layout/theme.liquid beside templates/ and sections/.
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-login.liquid'), `<form>{{ 'customer.login' | t }}</form>\n`);
     fs.writeFileSync(path.join(tempDir, 'templates/product.json'), JSON.stringify({ sections: { main: { type: 'main-product' } }, order: ['main'] }));
@@ -7967,6 +7970,238 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(login, 'main-login section').toBeDefined();
     expect(cg.getFileDependents(product!.filePath).some((p) => p.endsWith('templates/product.json')), 'top-level JSON template links its section').toBe(true);
     expect(cg.getFileDependents(login!.filePath).some((p) => p.endsWith('customers/login.json')), 'nested JSON template links its section').toBe(true);
+  });
+
+  const jsonTemplate = (type: string): string => JSON.stringify({ sections: { main: { type } }, order: ['main'] });
+  const indexedJson = (): string[] =>
+    cg.getNodesByKind('file').map((n) => n.filePath).filter((p) => p.endsWith('.json')).sort();
+
+  it('leaves JSON under templates/ or sections/ out when no Shopify theme holds it', async () => {
+    // jasontaylordev/CleanArchitecture ships a .NET project template under
+    // templates/, and a CMS keeps its content under sections/: JSON in folders
+    // with those names, but nothing beside them makes a Shopify theme, so it is
+    // not Liquid — even when a Liquid file is named like one of its "types".
+    fs.mkdirSync(path.join(tempDir, 'templates/ca-use-case/.template.config'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/dotnetcli.host.json'), JSON.stringify({ symbolInfo: { UseCase: { longName: 'name' } } }));
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/template.json'), JSON.stringify({ identity: 'CleanArchitecture.UseCase', sections: { main: { type: 'hero' } } }));
+    fs.writeFileSync(path.join(tempDir, 'sections/home.json'), jsonTemplate('hero'));
+    fs.writeFileSync(path.join(tempDir, 'sections/hero.liquid'), `<h1>{{ page.title }}</h1>\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual([]);
+    const hero = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/hero.liquid'));
+    expect(hero, 'the Liquid file itself is still indexed').toBeDefined();
+    expect(cg.getFileDependents(hero!.filePath)).toEqual([]);
+  });
+
+  it('finds a Shopify theme in a subdirectory by its config/settings_schema.json', async () => {
+    // A theme under theme/ with no layout/theme.liquid committed: its settings
+    // schema marks it. The same JSON under tools/templates/ is in no theme.
+    for (const dir of ['theme/config', 'theme/sections', 'theme/templates', 'tools/templates']) {
+      fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(tempDir, 'theme/config/settings_schema.json'), JSON.stringify([{ name: 'theme_info' }]));
+    fs.writeFileSync(path.join(tempDir, 'theme/sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'theme/templates/product.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'tools/templates/product.json'), jsonTemplate('main-product'));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual(['theme/templates/product.json']);
+    expect(cg.getFileDependents('theme/sections/main-product.liquid')).toEqual(['theme/templates/product.json']);
+    // Extracting without storing tells them apart the same way.
+    const refsOf = (file: string) => cg.extractFromSource(file, jsonTemplate('main-product')).unresolvedReferences.map((r) => r.referenceName);
+    expect(refsOf('theme/templates/product.json')).toEqual(['sections/main-product.liquid']);
+    expect(refsOf('tools/templates/product.json')).toEqual([]);
+  });
+
+  it('drops JSON templates once their folder is no longer a theme, and takes them back when it is', async () => {
+    // The same path an index built before this check takes: JSON it stored as
+    // Liquid outside any theme leaves on the next sync, without a re-index.
+    for (const dir of ['layout', 'sections', 'templates']) fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/page.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), jsonTemplate('main-product'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+
+    fs.rmSync(path.join(tempDir, 'layout'), { recursive: true, force: true });
+    // A sync of only the reported paths (the watcher's) and a full sync agree.
+    await cg.sync({ paths: ['templates/product.json'] });
+    expect(indexedJson()).toEqual(['templates/page.json']);
+    await cg.sync();
+    expect(indexedJson()).toEqual([]);
+
+    fs.mkdirSync(path.join(tempDir, 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'config/settings_schema.json'), '[]');
+    await cg.sync();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+  });
+
+  it('reads JSON under templates/ or sections/ as Liquid only inside a theme under the project root', () => {
+    fs.mkdirSync(path.join(tempDir, 'shop/layout'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'shop/layout/theme.liquid'), '');
+
+    for (const file of ['shop/templates/product.json', 'shop/templates/customers/login.json', 'shop/sections/header-group.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(true);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('liquid');
+      // Without the project root there is no theme to look for.
+      expect(isSourceFile(file), file).toBe(false);
+      expect(detectLanguage(file), file).toBe('unknown');
+    }
+    // Beside the theme, not in it; and the theme's other JSON was never a template.
+    for (const file of ['templates/product.json', 'other/sections/header-group.json', 'shop/config/settings_data.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(false);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('unknown');
+    }
+    // Outside a theme, JSON gets whatever the project maps `.json` to, as any other JSON does.
+    expect(detectLanguage('templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('yaml');
+    expect(detectLanguage('shop/templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('liquid');
+  });
+
+  const writeFiles = (files: Record<string, string>, root = tempDir): void => {
+    for (const [file, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+  };
+  // A theme at the project root, a theme in a folder marked only by its settings
+  // schema, and one in a folder with no 404 section and no price snippet of its
+  // own — the shape of panoply/syncify's example themes.
+  const severalThemes = {
+    'layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'sections/header.liquid': `{% render 'price' %}\n`,
+    'sections/main.liquid': `<main></main>\n`,
+    'snippets/price.liquid': `{{ product.price | money }}\n`,
+    'straps/dusk/config/settings_schema.json': '[]',
+    'straps/dusk/sections/404.liquid': `<h1>{{ 'templates.404.title' | t }}</h1>\n`,
+    'straps/dusk/templates/404.json': jsonTemplate('404'),
+    'examples/tailwind/layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'examples/tailwind/sections/header.liquid': `{% liquid\n  render 'price'\n  render 'icon'\n%}\n`,
+    'examples/tailwind/sections/main.liquid': `<main class="p-4"></main>\n`,
+    'examples/tailwind/snippets/icon.liquid': `<svg></svg>\n`,
+    'examples/tailwind/templates/index.json': jsonTemplate('main'),
+    'examples/tailwind/templates/404.json': jsonTemplate('404'),
+    // Liquid in no theme: an app's theme extension.
+    'extensions/reviews/blocks/stars.liquid': `{% render 'star' %}\n`,
+    'extensions/reviews/snippets/star.liquid': `<svg></svg>\n`,
+  };
+
+  it("links a theme's sections and snippets only inside that theme", async () => {
+    // Shopify looks a `{% render %}`, a `{% section %}` or a JSON template's
+    // section `type` up in the theme the file belongs to, never in another one.
+    // Matched by path tail, a theme without the 404 section linked to another
+    // theme's, and a theme in a folder even linked the project root's
+    // sections/header.liquid over its own.
+    writeFiles(severalThemes);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('straps/dusk/templates/404.json')).toEqual(['straps/dusk/sections/404.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header.liquid']);
+    expect(linksOf('examples/tailwind/templates/index.json')).toEqual(['examples/tailwind/sections/main.liquid']);
+    // What the theme lacks stays unlinked: no other theme's 404 section or price snippet.
+    expect(linksOf('examples/tailwind/templates/404.json')).toEqual([]);
+    expect(linksOf('examples/tailwind/sections/header.liquid')).toEqual(['examples/tailwind/snippets/icon.liquid']);
+    // Outside any theme, a path still resolves as before.
+    expect(linksOf('extensions/reviews/blocks/stars.liquid')).toEqual(['extensions/reviews/snippets/star.liquid']);
+  });
+
+  it("keeps a theme's references inside it when its own section is deleted", async () => {
+    // Sync resolves again what named a deleted file; another theme's 404
+    // section is no stand-in for the theme's own.
+    writeFiles({ ...severalThemes, 'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n` });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual(['examples/tailwind/sections/404.liquid']);
+
+    fs.rmSync(path.join(tempDir, 'examples/tailwind/sections/404.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual([]);
+  });
+
+  it('links a section or snippet that appears after the files naming it', async () => {
+    // Sync retries a reference it could not resolve once a file it may name
+    // appears. A section or snippet reference was parked under its extension,
+    // `liquid`, which no file is named, so it stayed unlinked until the file
+    // naming it changed or the project was indexed again.
+    const later: Record<string, string> = {
+      'sections/404.liquid': `<h1>404</h1>\n`,
+      'snippets/price.liquid': severalThemes['snippets/price.liquid'],
+      // Only straps/dusk had a 404 section, which is no stand-in for this theme's own.
+      'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n`,
+      'extensions/reviews/snippets/star.liquid': severalThemes['extensions/reviews/snippets/star.liquid'],
+    };
+    const initial = Object.fromEntries(Object.entries(severalThemes).filter(([file]) => !(file in later)));
+    writeFiles({ ...initial, 'templates/404.json': jsonTemplate('404') });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
+      'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
+    const links = (graph = cg) => Object.fromEntries(naming.map((file) => [file, graph.getFileDependencies(file).sort()]));
+    expect(links()).toEqual({
+      'templates/404.json': [],
+      'sections/header.liquid': [],
+      'examples/tailwind/templates/404.json': [],
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': [],
+    });
+
+    writeFiles(later);
+    expect((await cg.sync()).filesAdded).toBe(4);
+    const synced = links();
+    expect(synced).toEqual({
+      'templates/404.json': ['sections/404.liquid'],
+      'sections/header.liquid': ['snippets/price.liquid'],
+      'examples/tailwind/templates/404.json': ['examples/tailwind/sections/404.liquid'],
+      // The root theme's new price snippet is not this theme's.
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    // A fresh index of the same files links the same. (Indexing again over
+    // this index would skip the unchanged files that name the new ones.)
+    const freshDir = createTempDir();
+    writeFiles({ ...severalThemes, 'templates/404.json': jsonTemplate('404'), ...later }, freshDir);
+    const fresh = CodeGraph.initSync(freshDir);
+    try {
+      await fresh.indexAll();
+      expect(links(fresh)).toEqual(synced);
+    } finally {
+      fresh.close();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // A deleted snippet's references wait for it the same way.
+    fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual([]);
+    writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  it('finds the theme a file is in from the theme folder it sits in', () => {
+    const markers = new Set(['layout/theme.liquid', 'examples/tailwind/config/settings_schema.json']);
+    const exists = (relativePath: string): boolean => markers.has(relativePath);
+    expect(shopifyThemeRoot('sections/header.liquid', exists)).toBe('');
+    expect(shopifyThemeRoot('templates/customers/login.json', exists)).toBe('');
+    expect(shopifyThemeRoot('examples/tailwind/snippets/icon.liquid', exists)).toBe('examples/tailwind');
+    // A copy kept elsewhere under the root theme is not part of it, nor is a file beside its folders.
+    expect(shopifyThemeRoot('vendor/legacy/snippets/icon.liquid', exists)).toBeUndefined();
+    expect(shopifyThemeRoot('theme.liquid', exists)).toBeUndefined();
   });
 });
 

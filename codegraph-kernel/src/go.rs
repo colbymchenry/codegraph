@@ -4,8 +4,8 @@
 //! Go's shape quirks, mirrored exactly: methods are top-level with a receiver
 //! (qualifiedName override `Recv::name` + a contains edge to the FIRST
 //! earlier-in-file struct of that name), structs/interfaces arrive as
-//! `type_spec` and classify via the inner type node (struct embedding →
-//! extends; interface method_elems become method nodes), composite literals
+//! `type_spec` and classify via the inner type node (struct and interface
+//! embedding → extends; interface method_elems become method nodes), composite literals
 //! (`pkga.Widget{}`) keep their package qualifier as `instantiates` refs,
 //! top-level var/const specs walk their initializers ATTRIBUTED to the
 //! declared symbol (#693), 2-hop field chains (`t.conn.Exec`) keep the chain
@@ -16,7 +16,7 @@ use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
     RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FUNCTION_REF_CODE, NONE, NONE_STR,
 };
-use crate::docstring::preceding_docstring;
+use crate::docstring::preceding_docstring_skipping_trailing;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
@@ -380,6 +380,31 @@ impl<'t> Walker<'t> {
         receiver_re().captures(text).map(|c| c[1].to_string())
     }
 
+    /// goExtractor.getDeclarationWrapper: a type declared on its own, `type
+    /// Foo struct{…}`, is a `type_declaration` holding one spec, and its doc
+    /// comment comes before the declaration, outside the spec. A member of a
+    /// `type ( … )` group has its comment beside it, and the comment above the
+    /// group is the group's. A group of one is that type's declaration, as go
+    /// doc reads it, unless its member has a comment of its own.
+    fn declaration_wrapper(&self, node: Node<'t>) -> Option<Node<'t>> {
+        let parent = node.parent()?;
+        if parent.kind() != "type_declaration" || parent.named_child(0)? != node {
+            return None;
+        }
+        let specs = (0..parent.named_child_count())
+            .filter_map(|i| parent.named_child(i))
+            .filter(|c| matches!(c.kind(), "type_spec" | "type_alias"))
+            .count();
+        (specs == 1).then_some(parent)
+    }
+
+    /// docstringFor (tree-sitter.ts) — the preceding comment run, looked up
+    /// from the declaration wrapper when there is one, without the comments
+    /// that trail the code above it (docstringSkipsTrailingComments).
+    fn docstring_of(&self, node: Node<'t>) -> Option<String> {
+        preceding_docstring_skipping_trailing(self.declaration_wrapper(node).unwrap_or(node), self.src)
+    }
+
     // --- visitNode ------------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
@@ -395,7 +420,7 @@ impl<'t> Walker<'t> {
         } else if kind == "method_declaration" {
             self.extract_method(node);
             skip_children = true;
-        } else if kind == "type_spec" {
+        } else if kind == "type_spec" || kind == "type_alias" {
             skip_children = self.extract_type_alias(node);
         } else if matches!(kind, "var_declaration" | "short_var_declaration" | "const_declaration")
             && !self.inside_class_like()
@@ -465,7 +490,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: self.docstring_of(node),
             signature: self.signature_of(node),
             is_exported: Some(self.is_exported(node)),
             return_type: self.return_type_of(node),
@@ -487,7 +512,7 @@ impl<'t> Walker<'t> {
         let receiver_type = self.receiver_type_of(node);
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: self.docstring_of(node),
             signature: self.signature_of(node),
             return_type: self.return_type_of(node),
             qualified_name: receiver_type.as_ref().map(|r| format!("{r}::{name}")),
@@ -529,14 +554,15 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractTypeAlias for Go: type_spec → struct / interface / plain alias.
+    /// extractTypeAlias for Go: type_spec (`type A B`) and type_alias
+    /// (`type A = B`) → struct / interface / plain alias.
     fn extract_type_alias(&mut self, node: Node<'t>) -> bool {
         stack_guard!();
         let name = self.extract_name(node);
         if name == "<anonymous>" {
             return false;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let is_exported = Some(self.is_exported(node));
         let type_child = node.child_by_field_name("type");
         let resolved = type_child.map(|t| t.kind());
@@ -582,14 +608,22 @@ impl<'t> Walker<'t> {
             return true;
         }
 
-        self.create_node(
+        let row = self.create_node(
             "type_alias",
             &name,
             node,
             Extra { docstring, is_exported, ..Extra::default() },
         );
-        // (go type_spec has no `value` field — no type-ref walk; TS/tsx member
-        // extraction is TS-family-only)
+        // (go has no `value` field — no TS-style type-ref walk or member
+        // extraction.) An alias and a defined type (`type_spec`) alike
+        // reference what their `type` field names.
+        if let Some(row) = row {
+            let references = edge_kind_index("references").unwrap();
+            for ty in self.alias_type_names(node) {
+                let text = self.text(ty).to_string();
+                self.push_ref_at(row, &text, references, ty);
+            }
+        }
         false
     }
 
@@ -614,7 +648,7 @@ impl<'t> Walker<'t> {
 
     /// extractVariable's Go branch: var/const specs + short_var_declaration.
     fn extract_variable(&mut self, node: Node<'t>) {
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let is_const_decl = node.kind() == "const_declaration";
 
         for i in 0..node.named_child_count() {
@@ -846,20 +880,92 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// extractInheritance — the Go branches: interface embedding
-    /// (constraint_elem) and struct embedding (field_declaration without a
-    /// field_identifier), plus the field_declaration_list recursion.
+    /// goEmbeddedTypeName (languages/go.ts): the name node of the type an
+    /// embedding names — `T`, `*T` (the `*` is a sibling token), `pkg.T` and
+    /// `T[X]` all embed `T`. A qualified type yields its name; resolution reads
+    /// the package back from the source at that position. None for any other
+    /// type and for a predeclared one.
+    fn embedded_type_name(&self, ty: Option<Node<'t>>) -> Option<Node<'t>> {
+        let mut ty = ty?;
+        if ty.kind() == "generic_type" {
+            ty = ty.child_by_field_name("type")?;
+        }
+        match ty.kind() {
+            "qualified_type" => ty.child_by_field_name("name"),
+            "type_identifier" if !is_go_predeclared_type(self.text(ty)) => Some(ty),
+            _ => None,
+        }
+    }
+
+    /// goAliasTypeNames (languages/go.ts): the name nodes of the types an
+    /// alias's or a defined type's `type` field names, in source order, but
+    /// its own type parameters, the predeclared types and its own name written
+    /// bare (a recursive type's, `type stateFn func(*Lexer) stateFn`). A
+    /// generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
+    /// around an error, never reaches the kernel (its file defers to wasm).
+    fn alias_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
+        let mut names = Vec::new();
+        let Some(ty) = node.child_by_field_name("type") else { return names };
+        let own = node.child_by_field_name("name").map(|n| self.text(n));
+        let mut params: HashSet<&str> = HashSet::new();
+        if let Some(list) = node.child_by_field_name("type_parameters") {
+            for decl in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
+                for c in (0..decl.named_child_count()).filter_map(|j| decl.named_child(j)) {
+                    if c.kind() == "identifier" {
+                        params.insert(self.text(c));
+                    }
+                }
+            }
+        }
+        self.collect_alias_type_names(ty, &params, own, false, &mut names);
+        names
+    }
+
+    /// `qualified`: the name of a `pkg.Name`, which is that package's
+    /// whatever this one declares.
+    fn collect_alias_type_names(
+        &self,
+        node: Node<'t>,
+        params: &HashSet<&str>,
+        own: Option<&str>,
+        qualified: bool,
+        out: &mut Vec<Node<'t>>,
+    ) {
+        stack_guard!();
+        if node.kind() == "type_identifier" {
+            let text = self.text(node);
+            if !is_go_predeclared_type(text) && (qualified || (!params.contains(text) && own != Some(text))) {
+                out.push(node);
+            }
+            return;
+        }
+        let qualified = node.kind() == "qualified_type";
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                self.collect_alias_type_names(c, params, own, qualified, out);
+            }
+        }
+    }
+
+    /// extractInheritance — the Go branches: interface embedding (a type_elem
+    /// holding one named type; a union, `~T` or basic type is a constraint)
+    /// and struct embedding (field_declaration without a field_identifier),
+    /// plus the field_declaration_list recursion.
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             match child.kind() {
-                "constraint_elem" => {
-                    let type_id = (0..child.named_child_count())
+                "type_elem" => {
+                    let mut terms = (0..child.named_child_count())
                         .filter_map(|j| child.named_child(j))
-                        .find(|c| c.kind() == "type_identifier");
-                    if let Some(type_id) = type_id {
+                        .filter(|c| c.kind() != "comment");
+                    let only = match (terms.next(), terms.next()) {
+                        (Some(term), None) => Some(term),
+                        _ => None,
+                    };
+                    if let Some(type_id) = self.embedded_type_name(only) {
                         let name = self.text(type_id).to_string();
                         self.push_ref_at(class_row, &name, extends_kind, type_id);
                     }
@@ -869,10 +975,7 @@ impl<'t> Walker<'t> {
                         .filter_map(|j| child.named_child(j))
                         .any(|c| c.kind() == "field_identifier");
                     if !has_field_identifier {
-                        let type_id = (0..child.named_child_count())
-                            .filter_map(|j| child.named_child(j))
-                            .find(|c| c.kind() == "type_identifier");
-                        if let Some(type_id) = type_id {
+                        if let Some(type_id) = self.embedded_type_name(child.child_by_field_name("type")) {
                             let name = self.text(type_id).to_string();
                             self.push_ref_at(class_row, &name, extends_kind, type_id);
                         }
@@ -1009,18 +1112,20 @@ impl<'t> Walker<'t> {
                     row: p.row,
                 });
             }
-            // #1820: preserve the receiver of a method value.
+            // #1820: preserve the receiver of a method value. The name is
+            // rebuilt from operand and field, as normalizeSpecial does, so a
+            // comment or line break beside the dot keeps the candidate.
+            // NAME_STOPLIST applies to the whole name and holds no dotted
+            // word, so it never drops one: `raft.None` is a candidate even
+            // though a bare `None` is not.
             "selector_expression" => {
-                let field = v
-                    .child_by_field_name("field")
-                    .or_else(|| v.named_child(v.named_child_count().saturating_sub(1)));
-                let Some(field) = field else { return };
-                let name = self.text(field);
-                if name.is_empty() || is_stoplisted(name) {
+                let (Some(operand), Some(field)) =
+                    (v.child_by_field_name("operand"), v.child_by_field_name("field"))
+                else {
                     return;
-                }
-                let value = self.text(v);
-                if !value.split('.').all(|part| {
+                };
+                let name = format!("{}.{}", self.text(operand), self.text(field));
+                if !name.split('.').all(|part| {
                     !part.is_empty() && part.chars().enumerate().all(|(i, c)| {
                         c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
                     })
@@ -1028,7 +1133,7 @@ impl<'t> Walker<'t> {
                 let p = field.start_position();
                 self.fn_ref_cands.push(Cand {
                     from,
-                    name: value.to_string(),
+                    name,
                     line: p.row as u32 + 1,
                     column_byte: field.start_byte(),
                     row: p.row,
@@ -1250,6 +1355,17 @@ fn is_builtin_type(name: &str) -> bool {
             | "float32" | "float64" | "complex64" | "complex128" | "rune" | "error"
             | "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean" | "Char"
             | "Unit" | "String" | "Any" | "AnyRef" | "AnyVal" | "Nothing" | "Null"
+    )
+}
+
+/// GO_PREDECLARED_TYPES (languages/go.ts): never a node in the graph, and as
+/// the lone term of an interface a basic type is a constraint, not an embedding.
+fn is_go_predeclared_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any" | "bool" | "byte" | "comparable" | "complex64" | "complex128" | "error" | "float32"
+            | "float64" | "int" | "int8" | "int16" | "int32" | "int64" | "rune" | "string" | "uint"
+            | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr"
     )
 }
 

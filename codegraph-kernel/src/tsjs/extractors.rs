@@ -103,6 +103,9 @@ impl<'t> Walker<'t> {
     /// inner is the inline render function, or None for `styled.x`/`memo(Ref)`.
     /// Outer None = not a component wrapper.
     fn react_component_hoc(&self, value: Node<'t>) -> Option<Option<Node<'t>>> {
+        if self.is_typed_styled_template(value) {
+            return Some(None);
+        }
         if value.kind() != "call_expression" {
             return None;
         }
@@ -126,6 +129,35 @@ impl<'t> Walker<'t> {
             }
         }
         Some(inner)
+    }
+
+    /// A typed styled tag, `styled.div<Props>` before a template literal, which
+    /// parses as comparisons: `(styled.div < Props) > template`. The leftmost
+    /// operand is the `styled` tag against a `<`; the rightmost is the
+    /// template_string against a `>` (`>>` when the type argument ends in its
+    /// own `<…>`). Mirrors TreeSitterExtractor.isTypedStyledTemplate.
+    fn is_typed_styled_template(&self, value: Node<'t>) -> bool {
+        if value.kind() != "binary_expression" {
+            return false;
+        }
+        let (mut tag_parent, mut tag) = (value, value.child_by_field_name("left"));
+        while let Some(t) = tag.filter(|t| t.kind() == "binary_expression") {
+            (tag_parent, tag) = (t, t.child_by_field_name("left"));
+        }
+        let (mut template_parent, mut template) = (value, value.child_by_field_name("right"));
+        while let Some(t) = template.filter(|t| t.kind() == "binary_expression") {
+            (template_parent, template) = (t, t.child_by_field_name("right"));
+        }
+        let (Some(tag), Some(template)) = (tag, template) else {
+            return false;
+        };
+        let operator = |n: Node<'t>| n.child_by_field_name("operator").map(|o| o.kind()).unwrap_or("");
+        let closing = operator(template_parent);
+        template.kind() == "template_string"
+            && operator(tag_parent) == "<"
+            && !closing.is_empty()
+            && closing.bytes().all(|b| b == b'>')
+            && util::styled_callee().is_match(self.text(tag))
     }
 
     fn extract_react_component_node(

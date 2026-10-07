@@ -29,6 +29,9 @@ export interface UnresolvedRef {
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
+  /** The tail a ref that failed to resolve is parked under, when it is not
+   * the one its name gives (see `importBindingTail`). */
+  nameTail?: string;
 }
 
 /**
@@ -227,6 +230,13 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The import node of every C / C++ `#include`, narrowed to the path it
+   * spells and where it is written: what ./cpp-includers builds the include
+   * graph from. Optional so minimal contexts compile; it falls back to
+   * reading the import nodes themselves.
+   */
+  getCppIncludeNodes?(): Array<Pick<Node, 'id' | 'name' | 'filePath' | 'language' | 'startLine' | 'startColumn'>>;
 }
 
 /**
@@ -240,13 +250,58 @@ export interface FrameworkExtractionResult {
 }
 
 /**
+ * Nodes a framework can name only from several files at once, with the
+ * references that bind each — and how to recognise the ones an earlier run
+ * produced, so a run can remove those it no longer wants.
+ */
+export interface CrossFileNodes extends FrameworkExtractionResult {
+  /** The kind every one of these nodes has. */
+  kind: Node['kind'];
+  /** True for a node this pass produces, and for no node extraction does. */
+  owns(node: Node): boolean;
+}
+
+/**
+ * The navigation calls a router binds to its routes — `navigate('/login')`,
+ * `router.push('/x')` — described so a sync can find the ones a changed route
+ * may answer (see `FrameworkResolver.navigation`).
+ */
+export interface NavigationCalls {
+  /**
+   * The name tails of the calls `claimsReference` accepts as navigation —
+   * `push` for `history.push` — which find them through the failed-tail
+   * index; `claimsReference` then decides on the whole name.
+   */
+  tails: readonly string[];
+  /**
+   * The files whose navigation calls can name `route`: the path prefixes of
+   * the apps whose table it is in (`''` for every file), or null when it is
+   * not one of this router's routes.
+   */
+  scope(route: Node, context: ResolutionContext): readonly string[] | null;
+}
+
+/**
  * Framework-specific resolver
  */
 export interface FrameworkResolver {
   /** Framework name */
   name: string;
-  /** Languages this framework applies to. If omitted, applies to all languages. */
+  /**
+   * Languages this framework applies to: `extract()` runs only on files in
+   * them, and `resolve()` sees only references written in them (unless
+   * `resolveLanguages` says otherwise). If omitted, applies to all languages.
+   */
   languages?: Language[];
+  /**
+   * The languages whose references `resolve()` sees, when they are not
+   * `languages`. For a resolver that reads references in languages it
+   * extracts nothing from: SvelteKit's `$lib/…` imports and Svelte 5 runes
+   * are written in `.ts` / `.js` modules too, but only a `.svelte` file holds
+   * a route. Widening `languages` instead would run `extract()` on those
+   * files.
+   */
+  resolveLanguages?: readonly Language[];
   /**
    * Packages an app declares when it is built on this framework. When set,
    * `extract()` runs only on files of an app whose package.json — the file's
@@ -267,6 +322,7 @@ export interface FrameworkResolver {
    * an attribute/descriptor, not a declared symbol (e.g. Django's
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
+   * Asked only about references written in the languages `resolve()` sees.
    */
   claimsReference?(name: string): boolean;
   /**
@@ -292,6 +348,29 @@ export interface FrameworkResolver {
    * second run can recover the original in-file form from `qualifiedName`.
    */
   postExtract?(context: ResolutionContext): Node[];
+  /**
+   * Nodes no single file's `extract()` can decide on — a React Router route
+   * table written in one file is a table of routes only because another
+   * file hands it to the router. Called after `postExtract` on every index
+   * and every sync, it returns the COMPLETE set the framework wants now. The
+   * orchestrator inserts the new ones (their references pending, for the
+   * resolution that follows), removes the ones an earlier run inserted that
+   * are no longer wanted, renames the ones whose name changed, and leaves
+   * the rest alone, so an unchanged node keeps its edges. A node lives in the
+   * file it is written in, so re-extracting that file drops it until the
+   * next run puts it back.
+   */
+  crossFileNodes?(context: ResolutionContext): CrossFileNodes;
+  /**
+   * Set by a router whose `resolve()` binds a navigation call to one of its
+   * route nodes. A call whose route did not exist yet was parked as failed, or
+   * bound to whatever answered it then (a catch-all, a parameter route), and
+   * the retry that matches a failed ref's name tail against the names a sync
+   * adds (#1240) never finds it: its name is the router's method, never the
+   * route's path. So a sync that adds, removes or renames a route puts the
+   * calls this describes back for its resolution sweep.
+   */
+  navigation?: NavigationCalls;
 }
 
 /**

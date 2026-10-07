@@ -21,8 +21,10 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
+import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { rustImplTypeName } from './languages/rust';
+import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -277,36 +279,6 @@ function csharpClassTypeName(node: SyntaxNode | null, source: string): string | 
     default:
       return null;
   }
-}
-
-/**
- * Resolve the declared identifier inside a C declarator. A `declaration`'s
- * `declarator` field nests the name through `init_declarator` (with value),
- * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
- * wrappers (each via their own `declarator` field) down to an `identifier`.
- * A `function_declarator` means the declaration is a function prototype (or a
- * function-pointer var) — return null so it isn't extracted as a variable.
- */
-function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
-  let cur: SyntaxNode | null = node;
-  let guard = 0;
-  while (cur && guard++ < 12) {
-    switch (cur.type) {
-      case 'identifier':
-        return cur;
-      case 'function_declarator':
-        return null;
-      case 'init_declarator':
-      case 'pointer_declarator':
-      case 'array_declarator':
-      case 'parenthesized_declarator':
-        cur = getChildByField(cur, 'declarator');
-        break;
-      default:
-        return null;
-    }
-  }
-  return null;
 }
 
 /** First `simple_identifier` in `node`'s subtree (breadth-ish, first-found).
@@ -582,7 +554,8 @@ export class TreeSitterExtractor {
     const preceding = getPrecedingDocstring(
       anchor,
       this.source,
-      this.extractor?.docstringStepOverTypes
+      this.extractor?.docstringStepOverTypes,
+      this.extractor?.docstringSkipsTrailingComments
     );
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
@@ -615,6 +588,20 @@ export class TreeSitterExtractor {
   // files, and a node per block would flood search with same-named symbols
   // (the #1093 crowd-out failure mode). Always empty outside C/C++.
   private namespacePrefix: string[] = [];
+  // A C++ file whose tree has errors is walked in the scopes its braces
+  // open (see visitInCppBraceScope): the scan of them, null for every other
+  // file, and the class-like nodes extracted so far by the braces of their
+  // bodies.
+  private cppBraceScopes: CppBraceScopes | null = null;
+  private cppClassScopes = new NestedIntervals<string>();
+  private cppClassScopeIds = new Set<string>();
+  // C/C++: whether a class, struct, union or enum defined in the type of a
+  // declaration outside any body is walked (see visitNode). Not in a C++ file
+  // whose tree has errors and whose braces don't balance: error recovery can
+  // close a namespace or a class at the wrong `}`, or run a class past its
+  // own, and with no brace scopes to correct it the walked class would land
+  // in the wrong scope.
+  private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
   // {flash_fwd_kernel}, so a later `kernel<<<grid, block>>>(params)` (or plain
@@ -711,6 +698,12 @@ export class TreeSitterExtractor {
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      if (this.language === 'cpp' && this.tree.rootNode.hasError) {
+        this.cppBraceScopes = scanCppBraceScopes(this.source);
+      }
+      this.walkDeclaredTypes =
+        this.language === 'c' ||
+        (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
       const fileNode: Node = {
@@ -1169,6 +1162,65 @@ export class TreeSitterExtractor {
    * Visit a node and extract information
    */
   private visitNode(node: SyntaxNode): void {
+    if (this.cppBraceScopes) this.visitInCppBraceScope(node, this.cppBraceScopes);
+    else this.dispatchNode(node);
+  }
+
+  /**
+   * Walk a node of a C++ file whose tree has errors in the namespaces and
+   * classes its source braces put it in. That is where the tree put it unless
+   * error recovery closed a scope at the wrong `}` or ran one past its own —
+   * the rest of a class then parses as declarations of the namespace around
+   * it (rocksdb's `struct Opts`), and the rest of each namespace one level out
+   * (protobuf's `FieldDescriptor` at the top level). See cpp-brace-scopes.ts.
+   *
+   * The namespaces apply everywhere. The enclosing classes are set only at
+   * declaration level, where the stack above the file node holds nothing but
+   * class scopes; inside a function (a local class's members) the walk's own
+   * stack stands.
+   */
+  private visitInCppBraceScope(node: SyntaxNode, scopes: CppBraceScopes): void {
+    const at = node.startIndex;
+    const namespaces = this.namespacePrefix;
+    this.namespacePrefix = scopes.namespacesAt(at);
+    const stack = this.nodeStack;
+    let base = stack.length;
+    while (base > 1 && this.cppClassScopeIds.has(stack[base - 1]!)) base--;
+    let walked: string[] | null = null;
+    if (base === 1) {
+      const classes = this.cppClassScopes.at(at);
+      if (classes.length !== stack.length - base || classes.some((id, i) => stack[base + i] !== id)) {
+        walked = stack.splice(base);
+        stack.push(...classes);
+      }
+    }
+    this.dispatchNode(node);
+    if (walked) stack.splice(base, stack.length - base, ...walked);
+    this.namespacePrefix = namespaces;
+  }
+
+  /**
+   * The textual extent of a C++ class-like body while the file is walked in
+   * brace scopes: where the node ends (the `}` that closes its body) to pass
+   * to createNode, or null to keep the tree's.
+   */
+  private cppBodyEnd(body: SyntaxNode | null | undefined): Partial<Node> | null {
+    const close = body ? this.cppBraceScopes?.closeOf(body.startIndex) : undefined;
+    if (close === undefined) return null;
+    const end = this.cppBraceScopes!.positionOf(close + 1);
+    return { endLine: end.line, endColumn: end.column };
+  }
+
+  /** Open a class-like node's body as a scope for visitInCppBraceScope. */
+  private openCppClassScope(node: Node, body: SyntaxNode | null | undefined): void {
+    if (!body) return;
+    const close = this.cppBraceScopes?.closeOf(body.startIndex);
+    if (close !== undefined && this.cppClassScopes.add(body.startIndex, close, node.id)) {
+      this.cppClassScopeIds.add(node.id);
+    }
+  }
+
+  private dispatchNode(node: SyntaxNode): void {
     if (!this.extractor) return;
 
     const nodeType = node.type;
@@ -1372,8 +1424,9 @@ export class TreeSitterExtractor {
       skipChildren = true; // extractEnum visits body children
     }
     // Check for type alias declarations (e.g. `type X = ...` in TypeScript)
-    // For Go, type_spec wraps struct/interface definitions — resolveTypeAliasKind
-    // detects these and extractTypeAlias creates the correct node kind.
+    // For Go, type_spec (and type_alias, `type A = B`) wraps struct/interface
+    // definitions — resolveTypeAliasKind detects these and extractTypeAlias
+    // creates the correct node kind.
     else if (this.extractor.typeAliasTypes.includes(nodeType)) {
       skipChildren = this.extractTypeAlias(node);
     }
@@ -1418,6 +1471,17 @@ export class TreeSitterExtractor {
       this.extractor.variableTypes.includes(nodeType) &&
       (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
     ) {
+      // C/C++: a class, struct, union or enum defined in the declaration's
+      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
+      // definition like one written on its own, and the variables keep their
+      // nodes beside it. So is a class the tree reads as a declaration's type
+      // in a file walked in brace scopes (`class X {…}` glued to the tokens
+      // after it by error recovery). In a class or function body the children
+      // walk reaches it; here, this branch skips that walk. Mirrored in the
+      // kernel (ccpp/mod.rs visit_node).
+      const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
+      const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
+      if (definedType) this.visitNode(definedType);
       this.extractVariable(node);
       // extractVariable doesn't walk every initializer shape (object literals
       // are deliberately skipped; Python/Ruby don't walk at all), so scan the
@@ -1425,8 +1489,9 @@ export class TreeSitterExtractor {
       // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
       // at nested function definitions (their bodies are walked — and
       // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk.
-      this.scanFnRefSubtree(node, 0);
+      // initializers extractVariable DOES walk. A type walked above captured
+      // its own.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : undefined);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
@@ -1962,7 +2027,8 @@ export class TreeSitterExtractor {
   /**
    * Detect a React component declared via an HOC wrapper whose result is itself a
    * component: `forwardRef(...)`, `memo(...)`, `React.forwardRef/memo(...)`, and
-   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``. These
+   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``, typed
+   * (`styled.tag<Props>\`…\``) or not. These
    * initializers are a call / tagged-template (not a bare arrow), so the const is
    * otherwise classified `constant` — and a constant is skipped by both the
    * JSX-render edge synthesizer and component resolution, so `<Button/>` usages
@@ -1974,6 +2040,7 @@ export class TreeSitterExtractor {
    * `undefined` when this initializer is not a recognized component wrapper.
    */
   private reactComponentHoc(valueNode: SyntaxNode): { inner: SyntaxNode | null } | undefined {
+    if (this.isTypedStyledTemplate(valueNode)) return { inner: null };
     if (valueNode.type !== 'call_expression') return undefined;
     const callee = getChildByField(valueNode, 'function');
     if (!callee) return undefined;
@@ -1999,6 +2066,42 @@ export class TreeSitterExtractor {
       }
     }
     return { inner };
+  }
+
+  /**
+   * A styled tag with type arguments: `styled.div<Props>\`…\``,
+   * `styled(Base)<Props>\`…\``. tree-sitter's tagged-template call takes no type
+   * arguments, so when the type argument also reads as an expression the
+   * initializer parses as comparisons around it: `(styled.div < Props) > \`…\``.
+   * (A type argument that can't be an expression, like `<{ open: boolean }>`,
+   * error-recovers into a call on the tag instead, which the callee test in
+   * reactComponentHoc takes.) The tag is the leftmost operand, against a `<`;
+   * the template is the rightmost, against a `>` (`>>` when the type argument
+   * ends in its own `<…>`). Operators in between belong to the type argument:
+   * `<A & B>` parses as `(styled.div < A) & (B > \`…\`)`. Mirrored in the
+   * kernel (tsjs/extractors.rs is_typed_styled_template).
+   */
+  private isTypedStyledTemplate(valueNode: SyntaxNode): boolean {
+    if (valueNode.type !== 'binary_expression') return false;
+    let tagParent = valueNode;
+    let tag = getChildByField(valueNode, 'left');
+    while (tag?.type === 'binary_expression') {
+      tagParent = tag;
+      tag = getChildByField(tag, 'left');
+    }
+    let templateParent = valueNode;
+    let template = getChildByField(valueNode, 'right');
+    while (template?.type === 'binary_expression') {
+      templateParent = template;
+      template = getChildByField(template, 'right');
+    }
+    return (
+      !!tag &&
+      template?.type === 'template_string' &&
+      getChildByField(tagParent, 'operator')?.type === '<' &&
+      /^>+$/.test(getChildByField(templateParent, 'operator')?.type ?? '') &&
+      /^styled\b/.test(getNodeText(tag, this.source))
+    );
   }
 
   /**
@@ -2048,8 +2151,10 @@ export class TreeSitterExtractor {
       docstring,
       visibility,
       isExported,
+      ...this.cppBodyEnd(resolvedBody),
     });
     if (!classNode) return;
+    this.openCppClassScope(classNode, resolvedBody);
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
@@ -2262,8 +2367,10 @@ export class TreeSitterExtractor {
       docstring,
       visibility,
       isExported,
+      ...this.cppBodyEnd(body),
     });
     if (!aggregateNode) return;
+    this.openCppClassScope(aggregateNode, body);
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, aggregateNode.id);
@@ -3801,6 +3908,18 @@ export class TreeSitterExtractor {
           // entry's string-literal name as a searchable member (issue #634).
           this.extractTsTupleContractNames(value, typeAliasNode);
         }
+      } else if (this.language === 'go') {
+        // Go's `type Event = mvccpb.Event` names its type in the `type` field,
+        // and so does a defined type, `type WatchChan <-chan WatchResponse`.
+        for (const type of goAliasTypeNames(node, this.source)) {
+          this.unresolvedReferences.push({
+            fromNodeId: typeAliasNode.id,
+            referenceName: getNodeText(type, this.source),
+            referenceKind: 'references',
+            line: type.startPosition.row + 1,
+            column: type.startPosition.column,
+          });
+        }
       }
     }
     return false;
@@ -3811,7 +3930,7 @@ export class TreeSitterExtractor {
    * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
-   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   * are `type_elem`s, not methods, and are left to inheritance extraction.
    */
   private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
     this.nodeStack.push(ifaceId);
@@ -7000,15 +7119,18 @@ export class TreeSitterExtractor {
         }
       }
 
-      // Go interface embedding: `type Querier interface { LabelQuerier; ... }`
-      // constraint_elem wraps the embedded interface type identifier
-      if (child.type === 'constraint_elem') {
-        const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      // Go interface embedding: `type IRouter interface { IRoutes; Group(…) }`.
+      // tree-sitter-go parses every element of an interface that is not a
+      // method as a `type_elem`; one holding a single named type embeds that
+      // interface. A union (`float32 | float64`), an underlying type (`~int`)
+      // or a lone basic type (`int64`) is a type-set constraint instead.
+      if (this.language === 'go' && child.type === 'type_elem') {
+        const terms = child.namedChildren.filter((c: SyntaxNode) => c.type !== 'comment');
+        const typeId = terms.length === 1 ? goEmbeddedTypeName(terms[0], this.source) : undefined;
         if (typeId) {
-          const name = getNodeText(typeId, this.source);
           this.unresolvedReferences.push({
             fromNodeId: classId,
-            referenceName: name,
+            referenceName: getNodeText(typeId, this.source),
             referenceKind: 'extends',
             line: typeId.startPosition.row + 1,
             column: typeId.startPosition.column,
@@ -7017,21 +7139,23 @@ export class TreeSitterExtractor {
       }
 
       // Go struct embedding: field_declaration without field_identifier
-      // e.g. `type DB struct { *Head; Queryable }` — no field name means embedded type
-      if (child.type === 'field_declaration') {
+      // e.g. `type DB struct { *Head; Queryable; sync.Mutex }` — no field name
+      // means an embedded type, read the way an interface's is.
+      // Go only: C, C++ and Objective-C members are field_declarations too, but
+      // nest their name inside the declarator (`Cache* cache_;`, `jv elems[];`,
+      // `Status Get(int);`), so this test read every such member's type as a
+      // supertype. Their supertypes come from base_class_clause / superclass.
+      if (this.language === 'go' && child.type === 'field_declaration') {
         const hasFieldIdentifier = child.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier');
-        if (!hasFieldIdentifier) {
-          const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-          if (typeId) {
-            const name = getNodeText(typeId, this.source);
-            this.unresolvedReferences.push({
-              fromNodeId: classId,
-              referenceName: name,
-              referenceKind: 'extends',
-              line: typeId.startPosition.row + 1,
-              column: typeId.startPosition.column,
-            });
-          }
+        const typeId = hasFieldIdentifier ? undefined : goEmbeddedTypeName(getChildByField(child, 'type'), this.source);
+        if (typeId) {
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(typeId, this.source),
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
         }
       }
 

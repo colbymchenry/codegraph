@@ -39,7 +39,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
-import { crossesCodeBoundary } from './name-matcher';
+import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -803,58 +803,341 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'arkts',
 ]);
 /**
+ * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
+ * declared, never synthesized (go-implements writes those), into a struct, an
+ * interface or a defined type, and out of an interface only into an interface.
+ * `kindOf` answers those three kinds for a Go node id, null for anything else.
+ */
+function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolean {
+  if (e.provenance === 'heuristic') return false;
+  const to = kindOf(e.target);
+  return to !== null && (kindOf(e.source) !== 'interface' || to === 'interface');
+}
+/**
+ * The top-level items of the Go bracketed list opening at `text[open]` — the
+ * parameters of `(ctx context.Context, a, b int)` are `ctx context.Context`, `a`
+ * and `b int` — and the offset where the list closes. Nested brackets, string
+ * literals and comments are skipped whole. Null when the list never closes.
+ */
+function goListItems(text: string, open: number): { items: string[]; end: number } | null {
+  const items: string[] = [];
+  let depth = 0;
+  let item = '';
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+      const end = text[i + 1] === '/' ? text.indexOf('\n', i) : text.indexOf('*/', i + 2) + 1;
+      if (end <= 0) return null;
+      i = end;
+      item += ' ';
+      continue;
+    }
+    if (c === '"' || c === '`' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) j += c !== '`' && text[j] === '\\' ? 2 : 1;
+      if (j >= text.length) return null;
+      item += text.slice(i, j + 1);
+      i = j;
+      continue;
+    }
+    if (c === '(' || c === '[' || c === '{') {
+      if (depth++ === 0) continue;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) {
+        if (item.trim()) items.push(item.trim());
+        return { items, end: i };
+      }
+    } else if (c === ',' && depth === 1) {
+      if (item.trim()) items.push(item.trim());
+      item = '';
+      continue;
+    }
+    item += c;
+  }
+  return null;
+}
+
+/**
+ * A Go signature as extraction stores it for a function or method — the
+ * parameter list's text, then the result's — split into its parameters and
+ * results: `(ctx context.Context, a, b int) (int, error)` has the parameters
+ * `ctx context.Context`, `a` and `b int`. Null when the text has another shape.
+ */
+function goSignatureParts(signature: string | undefined): { params: string[]; results: string[] } | null {
+  const sig = signature?.trim();
+  if (!sig || sig[0] !== '(') return null;
+  const params = goListItems(sig, 0);
+  if (!params) return null;
+  const rest = sig.slice(params.end + 1).trim();
+  if (rest[0] !== '(') return { params: params.items, results: rest ? [rest] : [] };
+  const results = goListItems(rest, 0);
+  if (!results || rest.slice(results.end + 1).trim()) return null;
+  return { params: params.items, results: results.items };
+}
+
+/**
+ * How many parameters and results a Go signature has, as `params/results`:
+ * `(ctx context.Context, keys ...string) (int, error)` is `2/2`, and a grouped
+ * `a, b int` is two parameters. Null when the signature doesn't read.
+ */
+export function goSignatureArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  return parts ? `${parts.params.length}/${parts.results.length}` : null;
+}
+
+/**
+ * The arity a gRPC server implements an RPC with, read off the signature the
+ * generated client has for it. A unary call (`Range(ctx, in *RangeRequest,
+ * opts ...grpc.CallOption) (*RangeResponse, error)`) is served without the
+ * call options (`Range(ctx, *RangeRequest) (*RangeResponse, error)`); a
+ * streaming one (`Watch(ctx, opts ...grpc.CallOption) (Watch_WatchClient,
+ * error)`) gets its stream in their place and returns an error
+ * (`Watch(Watch_WatchServer) error`). Null when it isn't a client's.
+ */
+function goGrpcServerArity(signature: string | undefined): string | null {
+  const parts = goSignatureParts(signature);
+  const opts = parts?.params[parts.params.length - 1];
+  if (!parts || !opts || !/^(?:[A-Za-z_]\w*\s+)?\.\.\.\s*(?:grpc\.)?CallOption$/.test(opts)) return null;
+  const unary = parts.results.length === 2 && parts.results[0]!.startsWith('*');
+  return `${parts.params.length - 1}/${unary ? 2 : 1}`;
+}
+
+/**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
- * struct satisfies an interface structurally when its method set covers the
- * interface's. Synthesize the missing `implements` edge (struct → interface) by
- * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * type satisfies an interface structurally when its method set covers the
+ * interface's. Synthesize the missing `implements` edge (type → interface) by
+ * matching method sets, so impl-navigation works and the interface-dispatch
  * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
- * method call to the concrete overrides.
+ * method call to the concrete overrides, and to the methods embedding promotes.
  *
- * Name-only matching (signatures ignored) — over-approximation accepted, in line
- * with the other dispatch synthesizers; capped per interface. Empty interfaces
- * (`any`) are skipped so they don't match every struct.
+ * The implementers are structs and defined types. A defined type declares
+ * methods as a struct does — gin's `type formSource map[string][]string` has
+ * `TrySet`, prometheus's `type staticDiscoverer []*targetgroup.Group` has `Run`,
+ * an adapter `type HandlerFunc func(…)` has `ServeHTTP` — and is extracted as a
+ * `type_alias` that owns them through `contains` edges. Go gives it none of
+ * the methods declared on the type it is written over, so it is matched by
+ * the methods it declares. A true alias (`type A = B`) is B, not a type of its
+ * own: its `type_alias` owns only methods written with it as the receiver
+ * (`func (c *KumaSDConfig) Name()`), which are B's, and stands in for B with
+ * those. One without any is no implementer.
+ *
+ * Both method sets include what embedding brings in, read off the declared
+ * `extends`/`implements` edge each embedded type is. An interface has the
+ * methods of the interfaces it embeds: etcd's `AuthReadTx` is `RLock` and
+ * `RUnlock` plus all of `UnsafeAuthReader`, so an `RWMutex` is not one. A struct
+ * has the methods promoted from the structs, interfaces and defined types it
+ * embeds, at any depth: counting embedded interfaces alone would drop every
+ * struct that satisfies one through promoted methods. Synthesized edges are
+ * never followed (this pass writes them), and an embedding that resolved to
+ * nothing (`io.Closer`) adds nothing.
+ *
+ * Each wanted method also needs a declaration with its parameter and result
+ * counts, read off the stored signatures: Go wants the signatures identical,
+ * and the counts are what the text settles for certain — a cache's `Get(ctx,
+ * key, opts ...OpOption)` is no `Get(id types.ID) Peer`. A signature that
+ * doesn't read rules nothing out. A gRPC client interface also takes the
+ * structs serving its service (see `wantedArities`), the bridge a client's
+ * call crosses to reach its handler.
+ *
+ * Types are not compared, and a promoted name counts even where Go finds it
+ * ambiguous or hidden by a field — over-approximation accepted, in line with
+ * the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every type, and a struct that
+ * embeds the interface keeps the edge its embedding already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
-  const methodNameSet = (id: string): Set<string> =>
-    new Set(
-      queries
-        .getOutgoingEdges(id, ['contains'])
-        .map((e) => queries.getNodeById(e.target))
-        .filter((n): n is Node => !!n && n.kind === 'method')
-        .map((n) => n.name),
-    );
-
-  // Materializes GO structs only (the pass is language-gated by the caller),
-  // never the whole struct kind — that array is O(nodes) on struct-heavy
-  // repos like the Linux kernel (#1212).
-  const goStructs: Node[] = [];
-  for (const s of queries.iterateNodesByKindIn('struct', ['go'])) {
+  // Materializes GO types only (the pass is language-gated by the caller),
+  // never the whole struct kind — that array is O(nodes) on struct-heavy repos
+  // like the Linux kernel (#1212). Structs and defined types arrive
+  // interleaved in one canonical order, so the cap below takes implementers
+  // as the files declare them, whatever their kind.
+  const goImplementers: Node[] = [];
+  for (const n of queries.iterateNodesByKindIn(['struct', 'type_alias'], ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    goStructs.push(s);
+    goImplementers.push(n);
   }
-  const structMethods = new Map<string, Set<string>>();
-  for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
-
-  for (const iface of queries.iterateNodesByKindIn('interface', ['go'])) {
+  const goInterfaces: Node[] = [];
+  for (const i of queries.iterateNodesByKindIn('interface', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const want = methodNameSet(iface.id);
+    goInterfaces.push(i);
+  }
+
+  // The kinds of type whose methods embedding passes on: a struct can embed a
+  // defined type (`type HandlersChain []HandlerFunc`) as well.
+  const typeKind = new Map<string, NodeKind>();
+  for (const n of goImplementers) typeKind.set(n.id, n.kind);
+  for (const i of goInterfaces) typeKind.set(i.id, 'interface');
+  const kindOf = (id: string): NodeKind | null => typeKind.get(id) ?? null;
+
+  // Memoized: an embedded base is read once, however many types embed it. Each
+  // method's stored signature rides along for the arity check below.
+  const ownMemo = new Map<string, Set<string>>();
+  const ownSignatures = new Map<string, Map<string, (string | undefined)[]>>();
+  const ownMethods = (id: string): Set<string> => {
+    let names = ownMemo.get(id);
+    if (!names) {
+      names = new Set();
+      const signatures = new Map<string, (string | undefined)[]>();
+      for (const e of queries.getOutgoingEdges(id, ['contains'])) {
+        const n = queries.getNodeById(e.target);
+        if (!n || n.kind !== 'method') continue;
+        names.add(n.name);
+        const list = signatures.get(n.name);
+        if (list) list.push(n.signature);
+        else signatures.set(n.name, [n.signature]);
+      }
+      ownMemo.set(id, names);
+      ownSignatures.set(id, signatures);
+    }
+    return names;
+  };
+
+  // The types one embeds: an interface embeds interfaces, a struct any of the
+  // three. Every type's are read up front in a few batched queries rather than
+  // one query per type.
+  const isEmbedding = (e: Edge): boolean => isGoEmbedding(e, kindOf);
+  const NO_EMBEDS: string[] = [];
+  const embedMemo = new Map<string, string[]>();
+  const typeIds = [...typeKind.keys()];
+  for (let i = 0; i < typeIds.length; i += 2000) {
+    for (const e of queries.getOutgoingEdgesFrom(typeIds.slice(i, i + 2000), ['extends', 'implements'])) {
+      if (!isEmbedding(e)) continue;
+      const targets = embedMemo.get(e.source);
+      if (targets) targets.push(e.target);
+      else embedMemo.set(e.source, [e.target]);
+    }
+    await onYield();
+  }
+  const embeds = (id: string): string[] => embedMemo.get(id) ?? NO_EMBEDS;
+
+  // The type and every type it embeds, down to the last level. Go allows a
+  // struct to embed a pointer to itself, or to one embedding it back.
+  const embedClosure = (id: string): string[] => {
+    if (embeds(id).length === 0) return [id];
+    const reached = new Set<string>([id]);
+    const pending = [id];
+    while (pending.length > 0) {
+      const at = pending.pop()!;
+      for (const t of embeds(at)) {
+        if (reached.has(t)) continue;
+        reached.add(t);
+        pending.push(t);
+      }
+    }
+    return [...reached];
+  };
+
+  // Own methods plus every embedded type's.
+  const methodSet = (id: string): Set<string> => {
+    const types = embedClosure(id);
+    if (types.length === 1) return ownMethods(id);
+    const names = new Set<string>();
+    for (const t of types) for (const m of ownMethods(t)) names.add(m);
+    return names;
+  };
+
+  const covers = (have: Set<string>, want: Set<string>): boolean => {
+    if (have.size < want.size) return false;
+    for (const m of want) {
+      if (!have.has(m)) return false;
+    }
+    return true;
+  };
+
+  // Each method name in a type's method set → the arities (`params/results`)
+  // its declarations there have, or null when one of their signatures doesn't
+  // read (then the name rules nothing out). Built only for the pairs whose
+  // names already match.
+  const arityMemo = new Map<string, Map<string, Set<string> | null>>();
+  const methodArities = (id: string): Map<string, Set<string> | null> => {
+    let arities = arityMemo.get(id);
+    if (arities) return arities;
+    arities = new Map();
+    for (const t of embedClosure(id)) {
+      ownMethods(t);
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let known = arities.get(name);
+        if (known === null) continue;
+        if (!known) arities.set(name, (known = new Set()));
+        for (const signature of signatures) {
+          const arity = goSignatureArity(signature);
+          if (arity === null) {
+            arities.set(name, null);
+            break;
+          }
+          known.add(arity);
+        }
+      }
+    }
+    arityMemo.set(id, arities);
+    return arities;
+  };
+  // The arities an implementer may declare each of an interface's methods
+  // with: the interface's own. A gRPC client interface (every method takes
+  // `opts ...grpc.CallOption` last) also takes its service's server side, so
+  // the structs serving it (etcd's `kvServer` for `KVClient`) stay linked and
+  // a client's call keeps reaching the handler that serves it.
+  const wantedArities = (iface: Node): Map<string, Set<string> | null> => {
+    const own = methodArities(iface.id);
+    const wanted = new Map<string, Set<string> | null>();
+    for (const t of embedClosure(iface.id)) {
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let arities = wanted.get(name);
+        if (!arities) wanted.set(name, (arities = new Set(own.get(name))));
+        for (const signature of signatures) {
+          const served = goGrpcServerArity(signature);
+          if (served === null) return own;
+          arities.add(served);
+        }
+      }
+    }
+    return wanted;
+  };
+
+  // Go accepts an implementation only when each method's signature is the
+  // interface's. The stored text settles how many parameters and results
+  // there are: a type with no declaration of a wanted name at a wanted arity
+  // can't satisfy it.
+  const aritiesFit = (typeId: string, wanted: Map<string, Set<string> | null>): boolean => {
+    const have = methodArities(typeId);
+    for (const [name, arities] of wanted) {
+      const got = have.get(name);
+      if (!arities || !got) continue;
+      let fits = false;
+      for (const arity of arities) {
+        if (got.has(arity)) {
+          fits = true;
+          break;
+        }
+      }
+      if (!fits) return false;
+    }
+    return true;
+  };
+
+  // A type without a method satisfies no interface this pass looks at.
+  const candidates: Node[] = [];
+  const candidateMethods = new Map<string, Set<string>>();
+  for (const s of goImplementers) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    const have = methodSet(s.id);
+    if (have.size === 0) continue;
+    candidates.push(s);
+    candidateMethods.set(s.id, have);
+  }
+
+  for (const iface of goInterfaces) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    const want = methodSet(iface.id);
     if (want.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
-    for (const s of goStructs) {
-      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-      const have = structMethods.get(s.id);
-      if (!have || have.size < want.size) continue;
-      let all = true;
-      for (const m of want) {
-        if (!have.has(m)) { all = false; break; }
-      }
-      if (!all) continue;
+    const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) return;
       seen.add(key);
       edges.push({
         source: s.id,
@@ -865,6 +1148,26 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
         metadata: { synthesizedBy: 'go-implements', via: iface.name, registeredAt: `${s.filePath}:${s.startLine}` },
       });
       added++;
+    };
+    // A struct that needs promoted methods waits for the types declaring all
+    // of them, every defined type among them: under the cap, those are what
+    // the interface-dispatch bridge links a call through the interface to.
+    const throughEmbedding: Node[] = [];
+    let wanted: Map<string, Set<string> | null> | undefined;
+    for (const s of candidates) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const have = candidateMethods.get(s.id)!;
+      if (!covers(have, want)) continue;
+      if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      if (!wanted) wanted = wantedArities(iface);
+      if (!aritiesFit(s.id, wanted)) continue;
+      const own = ownMethods(s.id);
+      if (own !== have && !covers(own, want)) throughEmbedding.push(s);
+      else link(s);
+    }
+    for (const s of throughEmbedding) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      link(s);
     }
   }
   return edges;
@@ -1012,6 +1315,118 @@ async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYiel
   return edges;
 }
 
+/** The methods a Go struct runs for a name it does not declare, and the line of the embedding they come through. */
+interface GoPromotion {
+  methods: Node[];
+  line: number;
+}
+
+/**
+ * Which embedded type's method a Go struct runs for a name it does not
+ * declare, picked the way Go's selector picks it: breadth-first through the
+ * struct's embeddings, the shallowest depth holding the name wins, and the
+ * name selects nothing when it occurs more than once at that depth, one type
+ * reached along two paths included. A type met at a shallower depth is not
+ * walked again. An embedded interface brings its whole method set at its own
+ * depth, and a method it provides is a dynamic call once more, so that is no
+ * promotion either. Struct fields are not in the graph: a field that hides a
+ * promoted method is not seen.
+ */
+function goPromotions(
+  queries: QueryBuilder,
+  methodsOf: (id: string) => Node[]
+): (structId: string, name: string) => GoPromotion | null {
+  const kinds = new Map<string, NodeKind | null>();
+  const kindOf = (id: string): NodeKind | null => {
+    let kind = kinds.get(id);
+    if (kind === undefined) {
+      const n = queries.getNodeById(id);
+      kind = n?.language === 'go' && (n.kind === 'struct' || n.kind === 'interface' || n.kind === 'type_alias')
+        ? n.kind
+        : null;
+      kinds.set(id, kind);
+    }
+    return kind;
+  };
+  const embedMemo = new Map<string, Edge[]>();
+  const embeds = (id: string): Edge[] => {
+    let out = embedMemo.get(id);
+    if (!out) {
+      const targets = new Set<string>();
+      out = queries.getOutgoingEdges(id, ['extends', 'implements']).filter((e) => {
+        if (!isGoEmbedding(e, kindOf) || targets.has(e.target)) return false;
+        targets.add(e.target);
+        return true;
+      });
+      embedMemo.set(id, out);
+    }
+    return out;
+  };
+  const ifaceMemo = new Map<string, Set<string>>();
+  const ifaceMethods = (id: string): Set<string> => {
+    let names = ifaceMemo.get(id);
+    if (!names) {
+      names = new Set<string>();
+      const reached = new Set<string>([id]);
+      const pending = [id];
+      while (pending.length > 0) {
+        const at = pending.pop()!;
+        for (const m of methodsOf(at)) names.add(m.name);
+        for (const e of embeds(at)) {
+          if (reached.has(e.target)) continue;
+          reached.add(e.target);
+          pending.push(e.target);
+        }
+      }
+      ifaceMemo.set(id, names);
+    }
+    return names;
+  };
+  const provides = (id: string, name: string): boolean =>
+    kindOf(id) === 'interface' ? ifaceMethods(id).has(name) : methodsOf(id).some((m) => m.name === name);
+
+  const memo = new Map<string, GoPromotion | null>();
+  return (structId, name) => {
+    const key = `${structId}>${name}`;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    let found: GoPromotion | null = null;
+    // Each type at the current depth, with how many paths reach it and the
+    // line of the struct's own embedding the first of them starts with.
+    let level = new Map<string, { paths: number; line: number }>([[structId, { paths: 1, line: 0 }]]);
+    const met = new Set<string>([structId]);
+    for (let depth = 0; level.size > 0; depth++) {
+      const next = new Map<string, { paths: number; line: number }>();
+      for (const [id, at] of level) {
+        if (kindOf(id) === 'interface') continue; // its embeddings are its method set
+        for (const e of embeds(id)) {
+          if (met.has(e.target)) continue;
+          const to = next.get(e.target);
+          if (to) to.paths += at.paths;
+          else next.set(e.target, { paths: at.paths, line: depth === 0 ? (e.line ?? 0) : at.line });
+        }
+      }
+      let paths = 0;
+      let provider: string | undefined;
+      for (const [id, at] of next) {
+        met.add(id);
+        if (!provides(id, name)) continue;
+        paths += at.paths;
+        provider = id;
+      }
+      if (provider !== undefined) {
+        if (paths === 1 && kindOf(provider) !== 'interface') {
+          found = { methods: methodsOf(provider).filter((m) => m.name === name), line: next.get(provider)!.line };
+        }
+        break;
+      }
+      level = next;
+    }
+    memo.set(key, found);
+    return found;
+  };
+}
+
 async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
@@ -1049,12 +1464,26 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     protocolMemo.set(base.id, methods);
     return methods;
   };
+  // A Go struct also satisfies an interface with the methods its embedded
+  // types promote into it (goImplementsEdges counts them), and a call through
+  // the interface then runs the embedded type's method. Those links are made
+  // after the loop, from what the struct's cap has left, so every override
+  // keeps its edge, and a provider that implements the interface itself keeps
+  // its own.
+  const goPromotion = goPromotions(queries, methodsOf);
+  const promoted: { cls: Node; methods: Node[]; left: number }[] = [];
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
-  // types that conform to protocols. Iterate both.
+  // types that conform to protocols. Iterate both. A Go defined type
+  // (`type HandlerFunc func(…)`) holds its methods as a struct does, as a
+  // `type_alias`; that kind is walked for Go alone.
   const concreteKinds = ['class', 'struct', 'union'] as const;
-  for (const kind of concreteKinds) {
-  for (const cls of queries.iterateNodesByKind(kind)) {
+  const concrete = [
+    ...concreteKinds.map((kind) => () => queries.iterateNodesByKind(kind)),
+    () => queries.iterateNodesByKindIn('type_alias', ['go']),
+  ];
+  for (const nodesOfKind of concrete) {
+  for (const cls of nodesOfKind()) {
     if ((++scanned255 & 63) === 0) await onYield();
     // A class can only emit here if it HAS a supertype edge — check that
     // (one edge query) before materializing its methods: most classes in a
@@ -1062,10 +1491,21 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     const sups = queries.getOutgoingEdges(cls.id, ['implements', 'extends']);
     if (sups.length === 0) continue;
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
-    if (implMethods.length === 0) continue;
+    // A Go struct that satisfies an interface (a synthesized edge) may do so
+    // with promoted methods alone. Its declared `implements` edges are the
+    // interfaces it embeds, which provide whatever it lacks themselves.
+    const goStruct = cls.language === 'go' && cls.kind === 'struct';
+    if (implMethods.length === 0 && !(goStruct && sups.some((s) => s.provenance === 'heuristic'))) continue;
     for (const sup of sups) {
       const base = queries.getNodeById(sup.target);
       if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
+      // Go has no inheritance: a Go type's supertype edge to a struct or a
+      // defined type is an embedding (`type Engine struct { RouterGroup }`),
+      // and a call on the embedded type runs its own method, never the
+      // embedder's of the same name. Only a call through an interface
+      // dispatches.
+      if (cls.language === 'go' && base.kind !== 'interface') continue;
+      const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
       // link every base overload → every same-name impl overload (keying by name
@@ -1076,9 +1516,15 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         if (arr) arr.push(m); else implByName.set(m.name, [m]);
       }
       let added = 0;
+      const unmatched: Node[] = [];
       for (const bm of baseMethodsOf(base)) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-        for (const m of implByName.get(bm.name) ?? []) {
+        const impls = implByName.get(bm.name);
+        if (!impls) {
+          if (promotes) unmatched.push(bm);
+          continue;
+        }
+        for (const m of impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
           const key = `${bm.id}>${m.id}`;
@@ -1095,8 +1541,42 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
           added++;
         }
       }
+      if (unmatched.length > 0 && added < MAX_CALLBACKS_PER_CHANNEL) {
+        promoted.push({ cls, methods: unmatched, left: MAX_CALLBACKS_PER_CHANNEL - added });
+      }
     }
   }
+  }
+  // The wiring site of a promoted method is the struct's embedding it comes
+  // through: `type blockSeriesSet struct{ blockBaseSeriesSet }`.
+  for (const { cls, methods, left } of promoted) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    let budget = left;
+    for (const bm of methods) {
+      if (budget <= 0) break;
+      const promotion = goPromotion(cls.id, bm.name);
+      if (!promotion) continue;
+      for (const m of promotion.methods) {
+        if (budget <= 0) break;
+        const key = `${bm.id}>${m.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: bm.id,
+          target: m.id,
+          kind: 'calls',
+          line: bm.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'interface-impl',
+            via: m.name,
+            promotedInto: cls.name,
+            registeredAt: `${cls.filePath}:${promotion.line || cls.startLine}`,
+          },
+        });
+        budget--;
+      }
+    }
   }
   return edges;
 }
@@ -1294,13 +1774,61 @@ function jsxChild(
 }
 
 /**
+ * Whether the `<Name` at `at` opens a JSX tag. A type argument list follows
+ * its type's name directly — `useState<User>()`, `Array<Item>`, the
+ * `<Document>` of `<PaginatedList<Document>` — and a tag never does, short of
+ * a `return` written up against it. A generic arrow function's type
+ * parameters read like a tag but constrain theirs: `<Entry extends
+ * BaseEntity>({ data }) =>`.
+ */
+function opensTag(src: string, at: number, name: string): boolean {
+  const end = at + 1 + name.length;
+  if (/^\s+extends\s/.test(src.slice(end, end + 40))) return false;
+  return !/[\w$]/.test(src[at - 1] ?? '') || /\breturn$/.test(src.slice(Math.max(0, at - 7), at));
+}
+
+/**
+ * Whether `src` writes `name` other than in a tag (`<Name`, `</Name`): a
+ * parent binds a name only where it writes it bare (`const Content =`,
+ * `(Widget) =>`), so the check for that runs only on these.
+ */
+function writtenBare(src: string, name: string): boolean {
+  for (let at = src.indexOf(name); at !== -1; at = src.indexOf(name, at + name.length)) {
+    if (/[\w$]/.test(src[at - 1] ?? '') || /[\w$]/.test(src[at + name.length] ?? '')) continue;
+    if (src[at - 1] === '<' || (src[at - 1] === '/' && src[at - 2] === '<')) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * What a tag renders when its parent binds the name itself: a component the
+ * parent declares in its own lines (`const Row = ({ row }) => <tr />` in a
+ * table's body), else nothing. Any other local is no node, and a same-named
+ * component elsewhere is only a guess at what it holds.
+ */
+function declaredInside(ctx: ResolutionContext, name: string, parent: Node, child: Node): Node | undefined {
+  const inside = (n: Node) => n.id !== parent.id && n.filePath === parent.filePath &&
+    n.startLine >= parent.startLine && n.startLine <= parent.endLine;
+  if (inside(child)) return child;
+  return ctx.getNodesByName(name).find((n) => JSX_CHILD_KINDS.has(n.kind) && inside(n));
+}
+
+/**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
  * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
- * (read each JSX file once). Precision gate: the child name must resolve to a
- * component/function/class node — TS generics like `Array<Foo>` resolve to a type
- * (or nothing) and are dropped.
+ * (read each JSX file once). Precision gates: the parent must write the name as
+ * a tag, not only in a type argument or parameter list (`useState<User>()`,
+ * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
+ * read its `Document` model class as a child), and the name must resolve to a
+ * component/function/class node. A name the parent binds itself by its first
+ * tag — a parameter, or a `const` like outline's `const Content = variant ===
+ * "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent` — is that
+ * local, and renders only a component declared inside the parent
+ * (`declaredInside`). A destructured name still links by name, as a
+ * destructured function call does.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
@@ -1323,17 +1851,47 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    // A function renders the tags its own lines hold, so functions that span
+    // the same lines share them: every function of a minified bundle spans
+    // its one line, and reading that line again per function took 9 to 25 s
+    // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
+    // file is split once, not once per function.
+    let lines: string[] | null = null;
+    // Each name a span holds, and the line of its first tag: 0 while only type
+    // argument or parameter lists name it (`opensTag`). `bare` holds the
+    // names it also writes outside a tag (`writtenBare`).
+    const tagsBySpan = new Map<string, { tags: Map<string, number>; bare: Set<string> }>();
     for (const parent of parents) {
-      const src = sliceLines(content, parent.startLine, parent.endLine);
-      if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
-      const names = new Set<string>();
-      JSX_TAG_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+      if (!parent.startLine || !parent.endLine) continue;
+      const span = `${parent.startLine}:${parent.endLine}`;
+      let names = tagsBySpan.get(span);
+      if (!names) {
+        names = { tags: new Map<string, number>(), bare: new Set<string>() };
+        lines ??= content.split('\n');
+        const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
+        if (src.includes('</') || src.includes('/>')) {
+          let line = parent.startLine;
+          let counted = 0;
+          JSX_TAG_RE.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = JSX_TAG_RE.exec(src))) {
+            for (let nl = src.indexOf('\n', counted); nl !== -1 && nl < m.index; nl = src.indexOf('\n', nl + 1)) line++;
+            counted = m.index;
+            if (!names.tags.get(m[1]!)) names.tags.set(m[1]!, opensTag(src, m.index, m[1]!) ? line : 0);
+          }
+          for (const [name, first] of names.tags) if (first && writtenBare(src, name)) names.bare.add(name);
+        }
+        tagsBySpan.set(span, names);
+      }
       let added = 0;
-      for (const name of names) {
+      for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = jsxChild(ctx, name, file, importsOf);
+        if (!line) continue;
+        let child = jsxChild(ctx, name, file, importsOf);
+        // A name the parent binds itself by its first tag is that local.
+        if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
+          child = declaredInside(ctx, name, parent, child);
+        }
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;
