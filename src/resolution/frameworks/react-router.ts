@@ -35,10 +35,14 @@
  * inside `<Route path="/dashboard">`, a data router's `children`); the markup
  * scan composes that tree, a constant path (`paths.app.root.path`) included,
  * and a `lazy: () => import('./routes/x')` route renders that module's default
- * export (`frameworks/react.ts`). An `index: true` route is the page at its
- * parent's address, and a route object around others is the layout they
- * render inside (a `references` edge marked `layout: true`). Known limit, deliberate: a splat
- * (`/admin/*`) matches anything, so it is never the answer to a concrete href.
+ * export (`frameworks/react.ts`). An index route (`index: true`, `<Route
+ * index>`) is the page at its parent's address, and a route around others —
+ * an object with `children`, a `<Route element>` with `<Route>`s inside — is
+ * the layout they render inside (a `references` edge marked `layout: true`).
+ * Known limits, deliberate: a splat (`/admin/*`) matches anything, so it is
+ * never the answer to a concrete href; and an index route at the top of a
+ * component's own `<Routes>` is at wherever another route mounts that
+ * component, which its file does not say, so it is no route at all.
  */
 
 import type { Language, Node } from '../../types';
