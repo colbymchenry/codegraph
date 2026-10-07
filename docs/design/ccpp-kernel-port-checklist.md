@@ -178,7 +178,7 @@ type_identifier + ≥2 params + NO other lone-identifier param; gtest
 recoverMangledCppName (line 406 — only already-mangled names, `Ret (name)`
 idiom left alone, last token before `(`, primitive/keyword guard);
 stripCppTemplateArgs (line 157 — depth-counted removal of every balanced
-`<…>`); cDeclaratorIdentifier (tree-sitter.ts:234 — declarator chain walk,
+`<…>`); cDeclaratorIdentifier (languages/c-cpp.ts — declarator chain walk,
 function_declarator → null, 12-hop guard).
 
 ## tree-sitter.ts branches (anchors as of `705e501`)
@@ -187,6 +187,7 @@ function_declarator → null, 12-hop guard).
 |---|---|---|
 | 962 | cpp namespace prefix stack (#1291) | named `namespace_definition` pushes its name (C++17 `a::b` as written) onto the QN prefix while walking children; anonymous falls through bare |
 | 2795 | C file-scope variables | only when NO function ancestor; iterate declarators; accept ONLY init_declarator / pointer_declarator / array_declarator — a BARE identifier declarator is a macro-prototype misparse, skip (loses uninit scalars by design); name via cDeclaratorIdentifier; signature `= <first 100 chars>`; kind constant/variable via isConst |
+| — | class-like types defined in declarations | a `declaration` outside any body whose `type` is a class/struct/union/enum specifier WITH a body: visit the type before extracting the variables, in C always and in C++ only when the tree has no errors (`walkDeclaredTypes` ↔ `walk_declared_types`); the declaration's fn-ref scan skips the walked type. An unnamed specifier whose parent declaration has it as `type` takes the first declarator's cDeclaratorIdentifier name — in function bodies too (the c/cpp `resolveName` ↔ `extract_name_raw`) — and the declaration's preceding comment is its docstring (`getDeclarationWrapper` ↔ `class_like_docstring`) |
 | 4313 | explicit operator calls (#1247) | callee = `function` field + ERROR-wrapped `operator_name` sibling; compact symbolic spacing (`operator *`→`operator*`, word forms keep space); receiver `->`→`.`; DROP unless receiver is `this` (bare name) or simple identifier/member chain (silent miss over wrong edge) |
 | ~4340 | field_expression method calls | `recv.method`/`ptr->method` → `recv.method`; SKIP_RECEIVERS {self,this,cls,super} → bare name; LITERAL receiver → emit nothing (#1230) |
 | 4398 | call-result receivers (#645/#608) | receiver is call_expression → `<innerCallee>().<method>` re-encode (c AND cpp in the gate list) |

@@ -21,7 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
 import { goEmbeddedTypeName } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
@@ -262,36 +262,6 @@ function csharpClassTypeName(node: SyntaxNode | null, source: string): string | 
     default:
       return null;
   }
-}
-
-/**
- * Resolve the declared identifier inside a C declarator. A `declaration`'s
- * `declarator` field nests the name through `init_declarator` (with value),
- * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
- * wrappers (each via their own `declarator` field) down to an `identifier`.
- * A `function_declarator` means the declaration is a function prototype (or a
- * function-pointer var) — return null so it isn't extracted as a variable.
- */
-function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
-  let cur: SyntaxNode | null = node;
-  let guard = 0;
-  while (cur && guard++ < 12) {
-    switch (cur.type) {
-      case 'identifier':
-        return cur;
-      case 'function_declarator':
-        return null;
-      case 'init_declarator':
-      case 'pointer_declarator':
-      case 'array_declarator':
-      case 'parenthesized_declarator':
-        cur = getChildByField(cur, 'declarator');
-        break;
-      default:
-        return null;
-    }
-  }
-  return null;
 }
 
 /** First `simple_identifier` in `node`'s subtree (breadth-ish, first-found).
@@ -600,6 +570,12 @@ export class TreeSitterExtractor {
   // files, and a node per block would flood search with same-named symbols
   // (the #1093 crowd-out failure mode). Always empty outside C/C++.
   private namespacePrefix: string[] = [];
+  // C/C++: whether a class, struct, union or enum defined in the type of a
+  // declaration outside any body is walked (see visitNode). Not in a C++ file
+  // whose tree has errors: error recovery there can close a namespace or a
+  // class at the wrong `}`, or run a class past its own, so the walked class
+  // would land in the wrong scope.
+  private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
   // {flash_fwd_kernel}, so a later `kernel<<<grid, block>>>(params)` (or plain
@@ -696,6 +672,8 @@ export class TreeSitterExtractor {
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      this.walkDeclaredTypes =
+        this.language === 'c' || (this.language === 'cpp' && !this.tree.rootNode.hasError);
 
       // Create file node representing the source file
       const fileNode: Node = {
@@ -1403,6 +1381,15 @@ export class TreeSitterExtractor {
       this.extractor.variableTypes.includes(nodeType) &&
       (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
     ) {
+      // C/C++: a class, struct, union or enum defined in the declaration's
+      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
+      // definition like one written on its own, and the variables keep their
+      // nodes beside it. In a class or function body the children walk
+      // reaches it; here, this branch skips that walk. Mirrored in the kernel
+      // (ccpp/mod.rs visit_node).
+      const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
+      const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
+      if (definedType) this.visitNode(definedType);
       this.extractVariable(node);
       // extractVariable doesn't walk every initializer shape (object literals
       // are deliberately skipped; Python/Ruby don't walk at all), so scan the
@@ -1410,8 +1397,9 @@ export class TreeSitterExtractor {
       // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
       // at nested function definitions (their bodies are walked — and
       // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk.
-      this.scanFnRefSubtree(node, 0);
+      // initializers extractVariable DOES walk. A type walked above captured
+      // its own.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : undefined);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
