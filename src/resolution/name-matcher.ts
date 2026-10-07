@@ -8282,11 +8282,108 @@ function normalizeCppTypeName(typeName: string): string | null {
 // `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
 // (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
 // terminator rules out uses like `return receiver->m()` where the preceding
-// token is a keyword, not a type.
+// token is a keyword, not a type. A range-based for's `Type receiver :` is read
+// by cppRangeForDeclaration instead.
 function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   return new RegExp(
     `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
   );
+}
+
+// A range-based for's declaration, `for (const Foo& name :`, up to the single
+// colon (not `::`) that ends it. What may precede the type — `const`, a
+// global-scope `::` — is never an initializer, a call or a member access.
+const CPP_RANGE_FOR_DECLARATION = /\bfor\s*\(([^;=(){}?."']*?)\b([A-Za-z_]\w*)\s*:(?!:)/g;
+// The type a declaration ends with, read as the declarator regex reads it.
+const CPP_DECLARED_TYPE_TAIL = /([A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*[*&]+)?)\s*$/;
+
+/**
+ * The type `line`'s range-based for declares `receiverName` with —
+ * `for (ConformanceTestSuite *suite : suites)` — and where the type and the
+ * header's `(` are. The declarator regex never reads one: a loop's name is
+ * followed by its `:`. (Neither is a bit-field, `unsigned car : 1;`, which no
+ * method is called on.)
+ */
+function cppRangeForDeclaration(line: string, receiverName: string): { type: string; at: number; paren: number } | null {
+  if (!line.includes('for') || /^\s*(?:\/\/|\/\*|\*)/.test(line)) return null;
+  for (const m of line.matchAll(CPP_RANGE_FOR_DECLARATION)) {
+    if (m[2] !== receiverName) continue;
+    const paren = m.index! + m[0].indexOf('(');
+    const tail = m[1]!.match(CPP_DECLARED_TYPE_TAIL);
+    return tail ? { type: tail[1]!, at: paren + 1 + tail.index!, paren } : null;
+  }
+  return null;
+}
+
+/** Where the C or C++ string or character literal opening at `text[start]` closes (the line's end if it doesn't). */
+function cppLiteralEnd(text: string, start: number): number {
+  for (let i = start + 1; i < text.length; i++) {
+    if (text[i] === '\\') i++;
+    else if (text[i] === text[start]) return i;
+  }
+  return text.length;
+}
+
+/**
+ * Is column `useColumn` of line `useLine` inside the body of the `for` whose
+ * header opens at `lines[line][paren]`? A range-based for's variable is in
+ * scope there and nowhere else: after the loop, or in a later function, the
+ * same name is some other variable. The body runs to the `}` closing a braced
+ * body, or to the end of its one statement — taken to be the first `;` or
+ * closing `}` at its own depth, so an `else` after it is not counted.
+ * Comments and literals are skipped, and a `for` inside one (commented-out
+ * code, a code generator's template) has no body.
+ */
+function cppForBodyEncloses(lines: readonly string[], line: number, paren: number, useLine: number, useColumn: number): boolean {
+  let phase: 'before' | 'header' | 'gap' | 'block' | 'statement' = 'before';
+  let depth = 0;
+  let comment = false;
+  for (let l = line; l <= useLine && l < lines.length; l++) {
+    const text = lines[l]!;
+    const end = l === useLine ? Math.min(useColumn, text.length) : text.length;
+    for (let c = 0; c < end; c++) {
+      const ch = text[c]!;
+      if (comment) {
+        if (ch === '*' && text[c + 1] === '/') {
+          comment = false;
+          c++;
+        }
+        continue;
+      }
+      if (ch === '/' && text[c + 1] === '/') break;
+      if (ch === '/' && text[c + 1] === '*') {
+        comment = true;
+        c++;
+        continue;
+      }
+      // (A `'` after a digit separates digits: `1'000'000`.)
+      if (ch === '"' || (ch === '\'' && !/\d/.test(text[c - 1] ?? ''))) {
+        c = cppLiteralEnd(text, c);
+        continue;
+      }
+      if (phase === 'before') {
+        if (l === line && c === paren) {
+          phase = 'header';
+          depth = 1;
+        }
+        continue;
+      }
+      if (phase === 'header') {
+        if (ch === '(') depth++;
+        else if (ch === ')' && --depth === 0) phase = 'gap';
+        continue;
+      }
+      if (phase === 'gap') {
+        if (/\s/.test(ch)) continue;
+        phase = ch === '{' ? 'block' : 'statement';
+      }
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']') depth--;
+      else if (ch === '}' && --depth <= 0) return false;
+      else if (ch === ';' && depth <= 0 && phase === 'statement') return false;
+    }
+  }
+  return phase !== 'before' && phase !== 'header';
 }
 
 /** What C++ receiver inference made of a receiver's declared type. */
@@ -8415,6 +8512,18 @@ function inferCppReceiverType(
       } else if (normalized) {
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, line, declaratorMatch.index ?? 0, ref, context);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
+      }
+    } else {
+      // `for (ConformanceTestSuite *suite : suites)`, when the call is in the
+      // loop's body. A loop over `auto` elements has no initializer to read,
+      // so the scan goes on as for an `auto` local whose initializer is unreadable.
+      const loopVar = cppRangeForDeclaration(line, receiverName);
+      if (loopVar && cppForBodyEncloses(lines, i, loopVar.paren, callLineIndex, ref.column)) {
+        const normalized = normalizeCppTypeName(loopVar.type);
+        if (normalized && normalized !== 'auto') {
+          const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, line, loopVar.at, ref, context);
+          return cppDeclaredType(loopVar.type, normalized, inCallerScope, ref, context, found);
+        }
       }
     }
   }
