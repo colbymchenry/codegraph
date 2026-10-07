@@ -12661,7 +12661,7 @@ const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
 const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
 
 /** The project's namespace aliases: `namespace py = pybind11;`. */
-function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
+export function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
   const hit = CPP_NS_ALIASES.get(context);
   if (hit) return hit;
   const aliases = new Map<string, string>();
@@ -12724,7 +12724,7 @@ function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, 
 }
 
 /** The line ranges of a C / C++ file each namespace macro opens, with the namespace path it opens. */
-function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
+export function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
   let memo = CPP_NS_FRAMES.get(context);
   if (!memo) {
     memo = new Map();
