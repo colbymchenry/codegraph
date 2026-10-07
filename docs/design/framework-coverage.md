@@ -231,6 +231,16 @@ Each of these cost real debugging time; they are not hypothetical.
    per file-count for exactly this reason — an earlier version cached the empty
    pre-index answer and every framework whose dependency lived one directory
    down stayed undetected.
+12. **An app's manifest can sit three or more levels down.** An ASP.NET
+   solution keeps its single-page app in `src/Web/ClientApp/`, and prometheus
+   keeps its React apps in `web/ui/mantine-ui/` under a workspace root at
+   `web/ui/` that declares only tooling. `declaredDependencies` reads the root
+   and the first two levels, then gives the slots left to the directories
+   above JS/TS code, shallowest first. Read only two levels deep, Angular
+   Router never ran on jasontaylordev/CleanArchitecture, and every
+   template-bound handler there was listed as dead code. A new detector that
+   gates on a dependency should ask `dependsOn`, not read a `package.json`
+   itself, so it sees the same manifests every other detector does.
 
 ---
 
