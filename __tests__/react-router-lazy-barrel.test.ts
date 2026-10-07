@@ -7,7 +7,7 @@
  * own, found none, and the route linked nothing. (The fixture's folder is
  * `builds/`: a `build/` folder is skipped as build output.)
  */
-import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { describe, it, expect, afterAll, afterEach, beforeAll } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -187,4 +187,87 @@ describe('a lazy route module that is a barrel', () => {
     expect(renders('/loop')).toEqual([]);
     expect(renders('/no-default')).toEqual([]);
   });
+});
+
+describe('sync, for a lazy route module that is a barrel', () => {
+  type Files = Record<string, string>;
+  const ROUTER: Files = {
+    'package.json': JSON.stringify({ name: 'ui', private: true, dependencies: { react: '^18', 'react-router': '^7' } }),
+    'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+    'src/router.tsx': `import { createBrowserRouter } from 'react-router';
+
+export const router = createBrowserRouter([
+  { path: '/reports', lazy: () => import('@/reports/report_list') },
+  { path: '/reports/:id', lazy: () => import('@/reports/report_page') },
+]);
+`,
+    'src/reports/report_list/index.ts': `export { ReportList as Component } from './report_list';
+`,
+    'src/reports/report_page/index.ts': `export * from './report_page';
+`,
+  };
+  const PAGES: Files = {
+    'src/reports/report_list/report_list.tsx': `export function ReportList() {
+  return null;
+}
+`,
+    'src/reports/report_page/report_page.tsx': `export function Component() {
+  return null;
+}
+`,
+  };
+  const LINKED = {
+    '/reports': ['ReportList@src/reports/report_list/report_list.tsx'],
+    '/reports/:id': ['Component@src/reports/report_page/report_page.tsx'],
+  };
+
+  let dirs: string[] = [];
+  let graphs: CodeGraph[] = [];
+  afterEach(() => {
+    for (const graph of graphs) graph.close();
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    graphs = [];
+    dirs = [];
+  });
+
+  const write = (dir: string, files: Files): void => {
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    }
+  };
+  /** A project of `files`, indexed from scratch in a folder of its own. */
+  const indexed = async (files: Files): Promise<{ dir: string; graph: CodeGraph }> => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rr-lazy-barrel-sync-'));
+    dirs.push(dir);
+    write(dir, files);
+    const graph = await CodeGraph.init(dir, { index: true });
+    graphs.push(graph);
+    return { dir, graph };
+  };
+  /** Each route's `references` edges, as `name@file`. */
+  const routeLinks = (graph: CodeGraph): Record<string, string[]> => Object.fromEntries(
+    graph.getNodesByKind('route').map((route) => [route.name, graph.getOutgoingEdges(route.id)
+      .filter((e) => e.kind === 'references')
+      .map((e) => graph.getNode(e.target)!)
+      .map((n) => `${n.name}@${n.filePath}`)
+      .sort()])
+  );
+
+  it('links a page that appears behind its barrel later', async () => {
+    const { dir, graph } = await indexed(ROUTER);
+    expect(routeLinks(graph)).toEqual({ '/reports': [], '/reports/:id': [] });
+    write(dir, PAGES);
+    expect((await graph.sync()).filesAdded).toBe(2);
+    expect(routeLinks(graph)).toEqual(LINKED);
+    expect(routeLinks((await indexed({ ...ROUTER, ...PAGES })).graph)).toEqual(LINKED);
+  }, 60_000);
+
+  it('links a page once an edit gives it the Component its barrel forwards', async () => {
+    const { dir, graph } = await indexed({ ...ROUTER, ...PAGES, 'src/reports/report_page/report_page.tsx': 'export const placeholder = 1;\n' });
+    expect(routeLinks(graph)['/reports/:id']).toEqual([]);
+    write(dir, { 'src/reports/report_page/report_page.tsx': PAGES['src/reports/report_page/report_page.tsx']! });
+    expect((await graph.sync()).filesModified).toBe(1);
+    expect(routeLinks(graph)).toEqual(LINKED);
+  }, 60_000);
 });
