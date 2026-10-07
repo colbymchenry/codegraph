@@ -202,18 +202,19 @@ export const reactResolver: FrameworkResolver = {
   },
 
   /**
-   * The module a route's answer is read from: a lazily loaded page or layout
+   * The modules a route's answer is read from: a lazily loaded page or layout
    * (`lazy-import:` references), or the one a same-file lazy value the route
-   * renders loads — the references Pattern 1 asks `declaredComponent` about.
+   * renders loads — the references Pattern 1 asks `declaredComponent` about —
+   * with the modules a barrel there forwards the lookup to.
    */
-  lazyModule(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  lazyModules(ref: UnresolvedRef, context: ResolutionContext): readonly string[] {
     const name = ref.referenceName;
     let spec: string | null | undefined;
     if (name.startsWith(LAZY_ROUTE_PREFIX)) spec = name.slice(LAZY_ROUTE_PREFIX.length);
     else if (name.startsWith(LAYOUT_PREFIX + LAZY_ROUTE_PREFIX)) spec = name.slice(LAYOUT_PREFIX.length + LAZY_ROUTE_PREFIX.length);
     else if ((ref.language === 'tsx' || ref.language === 'jsx') && isPascalCase(name) && !isBuiltInType(name) &&
       ref.fromNodeId.startsWith(`route:${ref.filePath}:`)) spec = declaredLoader(name, ref.filePath, context);
-    return spec ? lazyModuleFile(spec, ref.filePath, context) : null;
+    return spec ? lazyRouteFiles(spec, ref.filePath, context) : [];
   },
 };
 
@@ -418,10 +419,18 @@ function lazyModuleFile(spec: string, fromFile: string, context: ResolutionConte
 }
 
 /** The component a lazy route module renders: its default export, else its `Component` export. */
-function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext): string | null {
+function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext, reads?: Set<string>): string | null {
   const file = lazyModuleFile(spec, fromFile, context);
   if (!file) return null;
-  return exportedComponent(file, 'default', context) ?? exportedComponent(file, 'Component', context);
+  return exportedComponent(file, 'default', context, new Set(), reads) ??
+    exportedComponent(file, 'Component', context, new Set(), reads);
+}
+
+/** The files `lazyRouteComponent` reads: the module, and the ones a barrel forwards it to. */
+function lazyRouteFiles(spec: string, fromFile: string, context: ResolutionContext): string[] {
+  const reads = new Set<string>();
+  lazyRouteComponent(spec, fromFile, context, reads);
+  return [...reads];
 }
 
 /** What a module can export as a component: a declaration, or a value holding one. */
@@ -438,10 +447,17 @@ const MAX_REEXPORT_HOPS = 4;
  * './page'`, or `export * from './page'`, which forwards every name but the
  * default. As in JavaScript, a name the file exports itself hides one an
  * `export *` would forward, and a name two `export *` modules both forward is
- * exported by neither.
+ * exported by neither. `reads` collects every file the lookup reads.
  */
-function exportedComponent(file: string, name: string, context: ResolutionContext, visited: ReadonlySet<string> = new Set()): string | null {
+function exportedComponent(
+  file: string,
+  name: string,
+  context: ResolutionContext,
+  visited: ReadonlySet<string> = new Set(),
+  reads?: Set<string>
+): string | null {
   if (visited.has(file) || visited.size > MAX_REEXPORT_HOPS) return null;
+  reads?.add(file);
   const local = ownExport(stripCommentsForRegex(context.readFile(file) ?? '', 'typescript'), name);
   if (local) return context.getNodesInFile(file).find((n) => n.name === local && EXPORTED_COMPONENT_KINDS.has(n.kind))?.id ?? null;
   const language = scriptLanguage(file);
@@ -449,7 +465,7 @@ function exportedComponent(file: string, name: string, context: ResolutionContex
   const through = new Set(visited).add(file);
   const forwarded = (source: string, exported: string): string | null => {
     const target = resolveImportPath(source, file, language, context);
-    return target ? exportedComponent(target, exported, context, through) : null;
+    return target ? exportedComponent(target, exported, context, through, reads) : null;
   };
   for (const re of reExports) {
     if (re.kind === 'named' && re.exportedName === name) return forwarded(re.source, re.originalName);

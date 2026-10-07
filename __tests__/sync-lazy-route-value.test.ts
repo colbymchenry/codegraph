@@ -209,6 +209,28 @@ describe('sync redraws a route that renders a same-file lazy value when its modu
     expect(graphOf(cg!)).toEqual(await freshGraph({ ...files, ...pages }));
   }, 60_000);
 
+  it('when the page behind a barrel is added, then switches its default export', async () => {
+    const files = await indexThenSync(
+      {
+        'package.json': pkg,
+        'src/App.tsx': APP,
+        'src/pages/Team.tsx': page('Team'),
+        // `./pages/Docs` is a barrel; the page it forwards comes later.
+        'src/pages/Docs/index.ts': "export { default } from './DocsPage';\n",
+      },
+      { 'src/pages/Docs/DocsPage.tsx': page('DocsPage') }
+    );
+    expect(routeLinks(cg!)['/docs']).toEqual(['src/pages/Docs/DocsPage.tsx::DocsPage']);
+    expect(graphOf(cg!)).toEqual(await freshGraph(files));
+
+    // The barrel is unchanged; only the page behind it moves its default export.
+    const edit = { 'src/pages/Docs/DocsPage.tsx': `${page('DocsPage', 'export')}${page('Documentation')}` };
+    write(root!, edit);
+    await cg!.sync();
+    expect(routeLinks(cg!)['/docs']).toEqual(['src/pages/Docs/DocsPage.tsx::Documentation']);
+    expect(graphOf(cg!)).toEqual(await freshGraph({ ...files, ...edit }));
+  }, 60_000);
+
   it('in a route table another file hands the router (codedthemes’ admin templates)', async () => {
     const files = await indexThenSync(
       {

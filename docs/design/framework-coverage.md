@@ -335,12 +335,12 @@ Each of these cost real debugging time; they are not hypothetical.
    names a sync defines (CG-33) reaches it only when the module's component
    is named like the declaration: on minimal-ui-kit/material-kit-react,
    `/user` stayed on its `UserPage` declaration after `src/pages/user.tsx`
-   (`Page`) came back. A router whose `resolve()` reads a module's content to
-   answer a route says which module (`FrameworkResolver.lazyModule`), and a
-   sync that adds or edits that module puts the route's reference back for
-   its resolution sweep. The same holds for the JSX a component renders: a
-   sync that adds a component redraws the `jsx-render` edges, since a tag in
-   a file it never touched may name it.
+   (`Page`) came back. A router whose `resolve()` reads modules' content to
+   answer a route says which ones (`FrameworkResolver.lazyModules`), barrels it
+   follows included, and a sync that adds or edits one of them puts the
+   route's reference back for its resolution sweep. The same holds for the
+   JSX a component renders: a sync that adds a component redraws the
+   `jsx-render` edges, since a tag in a file it never touched may name it.
 
 ---
 
