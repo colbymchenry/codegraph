@@ -1432,13 +1432,28 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    // A function renders the tags its own lines hold, so functions that span
+    // the same lines share them: every function of a minified bundle spans
+    // its one line, and reading that line again per function took 9 to 25 s
+    // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
+    // file is split once, not once per function.
+    let lines: string[] | null = null;
+    const tagsBySpan = new Map<string, Set<string>>();
     for (const parent of parents) {
-      const src = sliceLines(content, parent.startLine, parent.endLine);
-      if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
-      const names = new Set<string>();
-      JSX_TAG_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+      if (!parent.startLine || !parent.endLine) continue;
+      const span = `${parent.startLine}:${parent.endLine}`;
+      let names = tagsBySpan.get(span);
+      if (!names) {
+        names = new Set<string>();
+        lines ??= content.split('\n');
+        const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
+        if (src.includes('</') || src.includes('/>')) {
+          JSX_TAG_RE.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+        }
+        tagsBySpan.set(span, names);
+      }
       let added = 0;
       for (const name of names) {
         if (added >= MAX_JSX_CHILDREN) break;
