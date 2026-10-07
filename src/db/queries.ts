@@ -3829,6 +3829,9 @@ export class QueryBuilder {
    * (`get`, `map`, …) that one new definition won't resolve — the same
    * rationale as resolution's AMBIGUOUS_NAME_CEILING (#999) — and retrying an
    * arbitrary subset would be both wasted work and incoherent coverage.
+   *
+   * A name can also be one of a changed file's `moduleReferenceKeys`, which a
+   * route's reference to the module it lazily loads is parked under.
    */
   getRetryableFailedReferences(names: string[], perNameCeiling: number = 500): UnresolvedReference[] {
     if (names.length === 0) return [];
