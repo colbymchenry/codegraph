@@ -17,7 +17,12 @@
  * candidate is dropped from the list the moment there is any reason to believe
  * something outside the graph reaches it:
  *
- * - it is **exported** (something outside this repository may import it);
+ * - it is **exported** (something outside this repository may import it). That
+ *   includes whatever a TypeScript `declare module 'x'` or `declare global`
+ *   block declares, which TypeScript exports without the keyword: `interface
+ *   Window` or chart.js's `PluginOptionsByType` merges into a type declared
+ *   outside the index, and the runtime or the library reads it through that
+ *   type, so nothing in the repository names it;
  * - it lives in a **test** or a **generated** file (not code anyone deletes by
  *   hand);
  * - it is **abstract** or declared on an interface (a declaration is dispatched
@@ -353,7 +358,11 @@ export interface DeadCodeExclusions {
   tests: number;
   /** In a tool-generated file. */
   generated: number;
-  /** Exported, or declared in a header — reachable from outside this index. */
+  /**
+   * Exported, or declared in a header — reachable from outside this index. A
+   * TypeScript `declare module` / `declare global` declaration is exported
+   * implicitly: it merges into a library's or the global scope's type.
+   */
   exported: number;
   /**
    * In a language this index records no export marker for, so nothing here can
