@@ -1,8 +1,9 @@
 /**
  * The keys sync's failed-ref retry (#1240) matches on: the tail a failed ref
  * is parked under, and the names a newly added file can be imported as.
- * Shared by the query layer, which writes and reads them, and the migration
- * that rewrote the tails parked before path imports had one of their own.
+ * Shared by the query layer, which writes and reads them, and the migrations
+ * that rewrote the tails parked before path imports and path references had
+ * ones of their own.
  */
 
 /**
@@ -17,6 +18,13 @@
  * `inc/db.php` → 'db' — the stem {@link importPathKeys} takes from a file
  * that could satisfy it. The dotted tail was the extension ('dart', 'php') or
  * a path fragment ('/foo'), which no file ever matched.
+ *
+ * Any other reference written as a path to a file names it by the file's own
+ * name: Liquid's `{% render 'price' %}` is `snippets/price.liquid`, parked as
+ * 'price.liquid' — the name path matching looks the file up by, and the name
+ * of the node a file that appears later is given. Its dotted tail was the
+ * extension, 'liquid'. A call's slashes are in its arguments, a comment or a
+ * division, so only a `references` ref is read as a path.
  */
 export function referenceNameTail(referenceName: string, referenceKind?: string): string {
   if (referenceKind === 'imports') {
@@ -26,12 +34,19 @@ export function referenceNameTail(referenceName: string, referenceKind?: string)
     // `..` and `.` name a folder only through the importing file's location.
     if (!/^\.*$/.test(stem)) return stem;
   }
+  if (referenceKind === 'references') {
+    const fileName = referenceName.slice(referenceName.lastIndexOf('/') + 1);
+    if (fileName !== referenceName && FILE_NAME.test(fileName)) return fileName;
+  }
   // Erlang refs carry a written arity (`f/1`, `mod::fn/2` — #1610); the tail a
   // new symbol's plain name could match is the arity-less function name.
   const base = referenceName.replace(/\/\d{1,3}$/, '') || referenceName;
   const idx = Math.max(base.lastIndexOf('.'), base.lastIndexOf(':'));
   return idx >= 0 ? base.slice(idx + 1) : base;
 }
+
+/** A file name with an extension: 'price.liquid', 'icon.logo.liquid', 'about.tsx' — not 'x.component#Name'. */
+const FILE_NAME = /^[\w$@+~.-]+\.[A-Za-z][A-Za-z0-9]*$/;
 
 /** A file or folder name up to its first dot: 'b.dart' → 'b', 'types.d.ts' → 'types', '.eslintrc.js' → '.eslintrc'. */
 function fileNameStem(name: string): string {
