@@ -3110,6 +3110,12 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
+    // A Go alias names its type as an embedding does (below): written through
+    // a package that is none of the file's imports as indexed, the type found
+    // by its bare name is another package's namesake, or the alias itself.
+    if (ref.language === 'go' && ref.referenceKind === 'references' &&
+        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+
     if (!isInheritanceRef(ref)) return result;
     const target = this.nodeById(result.targetNodeId);
     if (target && !isSupertypeTarget(target)) {
