@@ -22,8 +22,6 @@ export const reactResolver: FrameworkResolver = {
   // Includes 'tsx'/'jsx' so route extraction runs on JSX files (where
   // `<Route element={<X/>}>` routes live) — without them the .tsx/.jsx grammars
   // were filtered out of the extract pass and those routes were never indexed.
-  // (resolve() is unaffected — it runs for every detected framework regardless
-  // of language; only the extract pass filters on `languages`.)
   languages: ['javascript', 'typescript', 'tsx', 'jsx'],
 
   detect(context: ResolutionContext): boolean {
