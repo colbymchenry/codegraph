@@ -4092,8 +4092,9 @@ export class QueryBuilder {
    * a value declared beside the route — what a route rendering
    * `const Docs = lazy(() => import('./pages/Docs'))` binds to while that
    * module is missing. Returned with the route's file and language, which a
-   * resurrection needs. Synthesized edges carry no reference to resurrect and
-   * are left out.
+   * resurrection needs, in the order they were written, so references put
+   * back resolve in that order again. Synthesized edges carry no reference to
+   * resurrect and are left out.
    */
   getRouteEdgesMovedBy(filePaths: readonly string[]): Array<Edge & {
     edgeId: number;
@@ -4113,7 +4114,8 @@ export class QueryBuilder {
             AND (e.provenance IS NULL OR e.provenance != 'heuristic')
             AND src.file_path NOT IN (SELECT value FROM json_each(?))
             AND (tgt.file_path IN (SELECT value FROM json_each(?))
-              OR (tgt.file_path = src.file_path AND tgt.kind IN ('constant', 'variable')))`
+              OR (tgt.file_path = src.file_path AND tgt.kind IN ('constant', 'variable')))
+          ORDER BY e.id`
       )
       .all(files, files) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
     return rows.map((row) => ({
