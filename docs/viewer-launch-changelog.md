@@ -209,6 +209,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **A file's outside imports are listed in more languages.** The file screen lists the imports that name nothing in your project, like a third-party package or a system header. In C and C++, Objective-C, JavaScript and TypeScript, Python, C#, Lua, R, Solidity, Svelte and Vue, an import that named no file had been linked to its own import statement, so it was listed nowhere. Re-index after upgrading.
 
+- **What an Angular template uses is no longer dead code.** A signal, `computed` value, getter or method that a component's template calls from a property binding, an interpolation, a structural directive or a control-flow block — `[name]="icon()"`, `{{ label() }}`, `*matRowDef="let row; columns: displayedColumns()"`, `@if (loading())` — or hands to a child, like `[displayWith]="displayFn"`, now counts as reached, so it leaves the Dead code tab. Steps draws it as part of what the screen renders, not as something the user does. Re-index Angular projects after upgrading.
+
 ## Entries whose graph and `codegraph_explore` half already shipped
 
 The release notes carry a reworded version of each of these. Keep only the viewer half at launch.
