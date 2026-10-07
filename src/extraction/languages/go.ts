@@ -55,13 +55,15 @@ const GO_PREDECLARED_TYPES: ReadonlySet<string> = new Set([
  * embed `Base`. A qualified type yields its name, not its package: the package
  * stays in the source text, and resolution reads it back from the reference's
  * position (#2322). Undefined for any other type (a literal, `~T`, a union's
- * term) and for a predeclared one.
+ * term) and for a predeclared one but `error`: an interface with a method,
+ * which an embedding brings in like any type's from outside the index.
  */
 export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: string): SyntaxNode | undefined {
   if (type?.type === 'generic_type') type = getChildByField(type, 'type');
   if (type?.type === 'qualified_type') return getChildByField(type, 'name') ?? undefined;
   if (type?.type !== 'type_identifier') return undefined;
-  return GO_PREDECLARED_TYPES.has(getNodeText(type, source)) ? undefined : type;
+  const name = getNodeText(type, source);
+  return name === 'error' || !GO_PREDECLARED_TYPES.has(name) ? type : undefined;
 }
 
 /**

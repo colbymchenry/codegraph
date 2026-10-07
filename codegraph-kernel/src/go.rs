@@ -859,7 +859,7 @@ impl<'t> Walker<'t> {
     /// embedding names — `T`, `*T` (the `*` is a sibling token), `pkg.T` and
     /// `T[X]` all embed `T`. A qualified type yields its name; resolution reads
     /// the package back from the source at that position. None for any other
-    /// type and for a predeclared one.
+    /// type and for a predeclared one but `error`, an interface with a method.
     fn embedded_type_name(&self, ty: Option<Node<'t>>) -> Option<Node<'t>> {
         let mut ty = ty?;
         if ty.kind() == "generic_type" {
@@ -867,7 +867,10 @@ impl<'t> Walker<'t> {
         }
         match ty.kind() {
             "qualified_type" => ty.child_by_field_name("name"),
-            "type_identifier" if !is_go_predeclared_type(self.text(ty)) => Some(ty),
+            "type_identifier" => {
+                let name = self.text(ty);
+                (name == "error" || !is_go_predeclared_type(name)).then_some(ty)
+            }
             _ => None,
         }
     }

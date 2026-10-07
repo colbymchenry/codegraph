@@ -2987,6 +2987,42 @@ export class QueryBuilder {
   }
 
   /**
+   * {@link getUnresolvedReferencesFrom} for many nodes at once, limited to
+   * `kinds`: a Go type's embeddings of types outside the index, say. Chunked
+   * probe over `idx_unresolved_from_node`.
+   */
+  getUnresolvedReferencesFromNodes(nodeIds: Iterable<string>, kinds: readonly string[]): UnresolvedReference[] {
+    const unique = [...new Set(nodeIds)];
+    const found: UnresolvedReference[] = [];
+    if (unique.length === 0 || kinds.length === 0) return found;
+    const kindPlaceholders = kinds.map(() => '?').join(',');
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM unresolved_refs
+            WHERE from_node_id IN (${placeholders})
+              AND reference_kind IN (${kindPlaceholders})`
+        )
+        .all(...chunk, ...kinds) as UnresolvedRefRow[];
+      for (const row of rows) {
+        found.push({
+          fromNodeId: row.from_node_id,
+          referenceName: row.reference_name,
+          referenceKind: row.reference_kind as EdgeKind,
+          line: row.line,
+          column: row.col,
+          filePath: row.file_path,
+          language: row.language as Language,
+          rowId: row.id,
+        });
+      }
+    }
+    return found;
+  }
+
+  /**
    * Find all edges where both source and target are in the given node set.
    * Useful for recovering inter-node connectivity after BFS.
    */

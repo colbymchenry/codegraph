@@ -39,7 +39,8 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
-import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
+import { crossesCodeBoundary, goRefQualification, jsCodeBindsName } from './name-matcher';
+import { goStdlibMethods } from './go-stdlib-methods';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -802,6 +803,15 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
   'arkts',
 ]);
+/** A Go type's method names, by where they are known from. */
+interface GoMethodNames {
+  /** Declared in the project: the type's own, and those of the project types it embeds. */
+  readonly declared: Set<string>;
+  /** Those of the standard-library types it embeds, and `error`'s (see ./go-stdlib-methods). */
+  readonly stdlib: ReadonlySet<string>;
+  /** Embedded types from outside the index whose methods nothing names, by package and name. */
+  readonly opaque: ReadonlySet<string>;
+}
 /**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
  * declared, never synthesized (go-implements writes those), into a struct, an
@@ -839,8 +849,18 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * has the methods promoted from the structs, interfaces and defined types it
  * embeds, at any depth: counting embedded interfaces alone would drop every
  * struct that satisfies one through promoted methods. Synthesized edges are
- * never followed (this pass writes them), and an embedding that resolved to
- * nothing (`io.Closer`) adds nothing.
+ * never followed (this pass writes them).
+ *
+ * A type embedded from outside the index leaves only the resolver's failed
+ * `extends` row. The methods of a standard-library type, and of `error`, are
+ * known (./go-stdlib-methods): prometheus's `TBRun` is all of `testing.TB`
+ * plus `Run`, not any struct with a `Run`. Such a name answers only a method
+ * the standard library asks for too: etcd's gRPC `LockClient.Lock` is not the
+ * `Lock` an embedded `sync.Mutex` promotes. Any other outside type's methods
+ * are unknown, so a struct embedding the same type has them, and otherwise
+ * only the one struct with every method the interface does name is taken to
+ * implement it — kapacitor's `Diagnostic` (a third-party `Logger` plus `Log`)
+ * has no more claim on every struct with a `Log` than on none of them.
  *
  * Name-only matching (signatures ignored, and a promoted name counted even
  * where Go finds it ambiguous or hidden by a field) — over-approximation
@@ -849,7 +869,7 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * type, and a struct that embeds the interface keeps the edge its embedding
  * already is.
  */
-async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -912,48 +932,98 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   }
   const embeds = (id: string): string[] => embedMemo.get(id) ?? NO_EMBEDS;
 
+  // The types each one embeds from outside the index, as the resolver's failed
+  // `extends` rows: the methods of a standard-library type or of `error`, or
+  // else the embedded type itself, named by the package it is written through
+  // so that the same embedding elsewhere is recognized.
+  const outside = new Map<string, { stdlib: ReadonlySet<string>[]; opaque: string[] }>();
+  for (const ref of queries.getUnresolvedReferencesFromNodes(typeIds, ['extends'])) {
+    if (ref.language !== 'go' || !ref.filePath) continue;
+    const name = ref.referenceName;
+    const { written, imported } = goRefQualification({ ...ref, filePath: ref.filePath, language: 'go' }, ctx);
+    const known = imported ? goStdlibMethods(imported.source, name) : written ? undefined : goStdlibMethods(null, name);
+    let found = outside.get(ref.fromNodeId);
+    if (!found) outside.set(ref.fromNodeId, (found = { stdlib: [], opaque: [] }));
+    if (known) found.stdlib.push(known);
+    else if (imported) found.opaque.push(`${imported.source}.${name}`);
+    else if (written) found.opaque.push(`${written}.${name}`);
+    else found.opaque.push(`${ref.filePath.replace(/\\/g, '/').replace(/\/?[^/]*$/, '')}#${name}`);
+  }
+  await onYield();
+
   // Own methods plus every embedded type's, down to the last level. Go allows
   // a struct to embed a pointer to itself, or to one embedding it back.
-  const methodSet = (id: string): Set<string> => {
-    if (embeds(id).length === 0) return ownMethods(id);
-    const names = new Set<string>();
+  const NONE_KNOWN: ReadonlySet<string> = new Set();
+  const methodNames = (id: string): GoMethodNames => {
+    if (embeds(id).length === 0 && !outside.has(id)) return { declared: ownMethods(id), stdlib: NONE_KNOWN, opaque: NONE_KNOWN };
+    const declared = new Set<string>();
+    const stdlib = new Set<string>();
+    const opaque = new Set<string>();
     const reached = new Set<string>([id]);
     const pending = [id];
     while (pending.length > 0) {
       const at = pending.pop()!;
-      for (const m of ownMethods(at)) names.add(m);
+      for (const m of ownMethods(at)) declared.add(m);
+      const out = outside.get(at);
+      if (out) {
+        for (const names of out.stdlib) for (const m of names) stdlib.add(m);
+        for (const type of out.opaque) opaque.add(type);
+      }
       for (const t of embeds(at)) {
         if (reached.has(t)) continue;
         reached.add(t);
         pending.push(t);
       }
     }
-    return names;
+    return { declared, stdlib, opaque };
   };
 
-  const covers = (have: Set<string>, want: Set<string>): boolean => {
-    if (have.size < want.size) return false;
-    for (const m of want) {
-      if (!have.has(m)) return false;
+  // Every method `want` names, wherever it is known from: a name the standard
+  // library asks for is answered by any method of that name, and one only the
+  // project asks for by a method the project declares.
+  const coversNamed = (have: GoMethodNames, want: GoMethodNames): boolean => {
+    for (const m of want.declared) {
+      if (!have.declared.has(m) && !want.stdlib.has(m)) return false;
+    }
+    for (const m of want.stdlib) {
+      if (!have.declared.has(m) && !have.stdlib.has(m)) return false;
+    }
+    return true;
+  };
+  const coversOpaque = (have: GoMethodNames, want: GoMethodNames): boolean => {
+    for (const type of want.opaque) {
+      if (!have.opaque.has(type)) return false;
+    }
+    return true;
+  };
+  const declaresAll = (own: Set<string>, want: GoMethodNames): boolean => {
+    if (want.opaque.size > 0) return false;
+    for (const m of want.declared) {
+      if (!own.has(m)) return false;
+    }
+    for (const m of want.stdlib) {
+      if (!own.has(m)) return false;
     }
     return true;
   };
 
-  // A type without a method satisfies no interface this pass looks at.
+  // A type without a method, or an embedded type nothing describes, satisfies
+  // no interface this pass looks at.
   const candidates: Node[] = [];
-  const candidateMethods = new Map<string, Set<string>>();
+  const candidateMethods = new Map<string, GoMethodNames>();
   for (const s of goImplementers) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const have = methodSet(s.id);
-    if (have.size === 0) continue;
+    const have = methodNames(s.id);
+    if (have.declared.size + have.stdlib.size + have.opaque.size === 0) continue;
     candidates.push(s);
     candidateMethods.set(s.id, have);
   }
 
   for (const iface of goInterfaces) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const want = methodSet(iface.id);
-    if (want.size === 0) continue; // empty interface (`any`) — would match everything
+    const want = methodNames(iface.id);
+    const named = want.stdlib.size === 0 ? want.declared.size : new Set([...want.declared, ...want.stdlib]).size;
+    if (named === 0 && want.opaque.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
     const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
@@ -972,16 +1042,25 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     // A struct that needs promoted methods waits for the types declaring all
     // of them, every defined type among them: under the cap, those are what
     // the interface-dispatch bridge links a call through the interface to.
+    // One that lacks only the embedded types nothing names the methods of
+    // counts when no other type has the rest.
     const throughEmbedding: Node[] = [];
+    let covering = 0;
+    let sole: Node | undefined;
     for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       const have = candidateMethods.get(s.id)!;
-      if (!covers(have, want)) continue;
+      if (have.declared.size + have.stdlib.size < named || !coversNamed(have, want)) continue;
+      covering++;
       if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
-      const own = ownMethods(s.id);
-      if (own !== have && !covers(own, want)) throughEmbedding.push(s);
-      else link(s);
+      if (!coversOpaque(have, want)) {
+        if (covering === 1) sole = s;
+        continue;
+      }
+      if (declaresAll(ownMethods(s.id), want)) link(s);
+      else throughEmbedding.push(s);
     }
+    if (sole && covering === 1 && named > 0) throughEmbedding.push(sole);
     for (const s of throughEmbedding) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       link(s);
@@ -4389,7 +4468,7 @@ export async function synthesizeCallbackEdges(
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
-  const goImpl = has('go') ? await goImplementsEdges(queries, yieldToLoop) : NONE;
+  const goImpl = has('go') ? await goImplementsEdges(queries, ctx, yieldToLoop) : NONE;
   for (let i = 0; i < goImpl.length; i += 2000) {
     queries.insertEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();

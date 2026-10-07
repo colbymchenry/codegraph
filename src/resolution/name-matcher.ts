@@ -1918,7 +1918,7 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
-interface GoQualification {
+export interface GoQualification {
   /** The package name written before the reference's name, as spelled. */
   written?: string;
   /** The file's import that name is. */
@@ -1927,7 +1927,12 @@ interface GoQualification {
 
 const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, GoQualification>>();
 
-function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQualification {
+/**
+ * The package a Go reference is written through, read from its line (the
+ * index keeps only the name): `io` in `io.Closer`, and the file's import of
+ * it. Empty for a name written bare.
+ */
+export function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQualification {
   if (ref.referenceKind === 'imports') return {};
   const name = ref.referenceName.split('.').pop()!;
   if (!/^[A-Za-z_]\w*$/.test(name)) return {};
