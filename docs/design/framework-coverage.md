@@ -306,6 +306,15 @@ Each of these cost real debugging time; they are not hypothetical.
    mapped inside a `<Route element>` gets no layout edge: the layout's name
    would be looked up in the table's file, and the cross-file pass compares
    only route names, so a changed layout would never reach the table's routes.
+15. **`resolve()` sees only references written in the framework's own
+   languages** (`getResolvingFrameworks`): Express's `logger` middleware rule
+   once took etcd's Go `*zap.Logger` result types for a method. A navigation
+   written in markup (`.svelte`, `.vue`) needs that language in `languages`.
+   A resolver that reads a language it extracts nothing from lists it in
+   `resolveLanguages` instead — Svelte's `$lib/…` imports in `.ts` route
+   modules, ASP.NET's Razor `@model` — because widening `languages` also runs
+   `extract()` on those files. `claimsReference()` is still asked of every
+   detected framework.
 
 ---
 
