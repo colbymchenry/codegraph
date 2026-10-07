@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-06) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-07) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -38,7 +38,7 @@ guessed.
 |---|---|---|---|---|
 | Expo Router | `frameworks/expo-router.ts` | `expo-router-synthesizer.ts` | `expo-router.test.ts` | — |
 | Next.js | `frameworks/nextjs.ts` | `next-router-synthesizer.ts` | `nextjs.test.ts` | next-saas-starter |
-| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page) |
+| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page). A page or layout the route file declares as a value binds to what that value renders (trap 14): outline/outline's lazily loaded screens reach the component behind an `index` that forwards it and an `export default observer(X)` (4 routes move from the declaration to `SharedScene` and `Login`) |
 | TanStack Router | `frameworks/tanstack-router.ts` | `tanstack-router-synthesizer.ts` | `tanstack-router.test.ts` | TanStack examples, fastapi-template frontend |
 | Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies |
 | SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
@@ -283,6 +283,22 @@ Each of these cost real debugging time; they are not hypothetical.
    itself mounted under another file's `<Route path="/admin/*">` reads as if
    at the root, and a navigation that failed while its route was gone is not
    retried until a full index.
+14. **A name the file declares itself is that declaration.** A screen's
+   component is often a value, not a function: `const RegisterPage =
+   Loadable(lazy(() => import('pages/auth/Register')))`, `dynamic(async () =>
+   (await import('../wrapper')).default)`, `observer(function Settings() {…})`,
+   `const DialogPortal = DialogPrimitive.Portal`, or a `styled.div<Props>`
+   the extractor leaves a `constant`. A lookup that keeps only component,
+   function and class nodes skips the value and takes a lone same-named
+   component anywhere: codedthemes' mantis bound its vite app's routes to the
+   Next.js app's `RegisterPage`, and excalidraw's Next.js example rendered
+   the docs site's `Excalidraw`. `declaredComponent` in `frameworks/react.ts`
+   is the one rule for every React component name — a route's `element` and
+   layout, a component reference, a `jsx-render` child: the component of the
+   module the value's own loader imports (the export it picks, through an
+   `index` that forwards it and an `export default observer(X)`), else the
+   function the value wraps, else the declaration. A `<Name` written right
+   after an identifier is a type argument (`useForm<Schema>()`), not a tag.
 
 ---
 
