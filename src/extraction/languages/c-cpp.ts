@@ -411,7 +411,7 @@ export function blankCppExportMacros(source: string): string {
     const start = m.index + m[0].indexOf(run);
     pushCppRunTokens(spans, run, start);
   }
-  return blankCppSpans(source, spans);
+  return blankCppSpans(source, spans, code);
 }
 
 // Comments and string/char literals (raw strings are masked beforehand by
@@ -439,10 +439,19 @@ function maskCppCommentsAndLiterals(source: string): string {
  * `TEST(file_test, open_windows_file) {` under it is not a trailing macro.
  */
 function maskCppCode(source: string): string {
-  return source
+  if (cppMaskMemo !== null && cppMaskMemo.source === source) return cppMaskMemo.code;
+  const code = source
     .replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, m.startsWith('/') ? ' ' : '\x01'))
     .replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, ' '));
+  cppMaskMemo = { source, code };
+  return code;
 }
+
+// The last source maskCppCode masked. The passes run one after another on
+// the same text: one that blanks nothing hands the next the same string, and
+// one that blanks hands it a mask blanked the same way (blankCppSpans), so a
+// file is masked once rather than once per pass.
+let cppMaskMemo: { source: string; code: string } | null = null;
 
 // One macro, with its arguments, inside a run matched on the masked code.
 const CPP_RUN_TOKEN_RE = /[A-Z][A-Z0-9_]*(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?/g;
@@ -452,16 +461,26 @@ function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: nu
   for (const t of run.matchAll(CPP_RUN_TOKEN_RE)) spans.push([start + t.index, start + t.index + t[0].length]);
 }
 
-/** Replace each [start, end) span of `source` with spaces, keeping line endings. */
-function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>): string {
+/**
+ * Replace each [start, end) span of `source` with spaces, keeping line
+ * endings. Given the mask the spans were found on, blank it the same way and
+ * keep it for the next pass: a span holds whole macros (with their arguments),
+ * so the result is what masking the new source would give.
+ */
+function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>, code?: string): string {
   if (spans.length === 0) return source;
-  const chars = source.split('');
-  for (const [start, end] of spans) {
-    for (let k = start; k < end; k++) {
-      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+  const blank = (text: string): string => {
+    const chars = text.split('');
+    for (const [start, end] of spans) {
+      for (let k = start; k < end; k++) {
+        if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+      }
     }
-  }
-  return chars.join('');
+    return chars.join('');
+  };
+  const out = blank(source);
+  if (code !== undefined) cppMaskMemo = { source: out, code: blank(code) };
+  return out;
 }
 
 function skipCppSpace(code: string, i: number): number {
@@ -531,7 +550,7 @@ export function blankCppPointerAnnotationMacros(source: string): string {
     if (/(?:[)\]]|\b\d[\w.]*)\s*$/.test(code.slice(Math.max(0, m.index - 40), m.index))) continue;
     pushCppRunTokens(spans, run, start);
   }
-  return blankCppSpans(source, spans);
+  return blankCppSpans(source, spans, code);
 }
 
 // Keywords that take a parenthesized operand: a `)` closing one of these is
@@ -591,7 +610,7 @@ export function blankCppTrailingAttributeMacros(source: string): string {
     pushCppRunTokens(spans, r[0], macroStart);
     re.lastIndex = macroStart + r[0].length;
   }
-  return blankCppSpans(source, spans);
+  return blankCppSpans(source, spans, code);
 }
 
 // Type keywords that may stand right before a declared name (`int count_ …`).
@@ -628,7 +647,7 @@ const CPP_KEYWORDS = new Set([
  *    before the name.
  * C++-only.
  */
-const CPP_DECLARATOR_ATTR_CANDIDATE_RE = /([\w\]])(\s+)(?=[A-Z][A-Z0-9]*_)/g;
+const CPP_DECLARATOR_ATTR_CANDIDATE_RE = /(?<![\w$])[A-Z][A-Z0-9]*_[A-Z0-9_]*\b/g;
 const CPP_DECLARATOR_ATTR_RUN_RE =
   /(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?\s*)+/y;
 export function blankCppDeclaratorAttributeMacros(source: string): string {
@@ -639,15 +658,19 @@ export function blankCppDeclaratorAttributeMacros(source: string): string {
   const run = new RegExp(CPP_DECLARATOR_ATTR_RUN_RE.source, 'y');
   let m: RegExpExecArray | null;
   while ((m = re.exec(code)) !== null) {
-    const macroStart = m.index + m[0].length;
+    const macroStart = m.index;
+    // Whitespace before the macro, and before that a name or `]`.
+    let last = macroStart - 1;
+    while (last >= 0 && /\s/.test(code[last] as string)) last--;
+    if (last === macroStart - 1 || last < 0 || !/[\w\]]/.test(code[last] as string)) continue;
     run.lastIndex = macroStart;
     const r = run.exec(code);
     if (!r || !/^[;,)]|^=(?!=)/.test(code.slice(macroStart + r[0].length, macroStart + r[0].length + 2))) continue;
-    if (m[1] !== ']' && !followsDeclaredName(code, m.index)) continue;
+    if (code[last] !== ']' && !followsDeclaredName(code, last)) continue;
     pushCppRunTokens(spans, r[0], macroStart);
     re.lastIndex = macroStart + r[0].length;
   }
-  return blankCppSpans(source, spans);
+  return blankCppSpans(source, spans, code);
 }
 
 /** True when the identifier ending at `code[last]` is a name a declaration declares. */
@@ -737,7 +760,7 @@ export function blankCppLeadingAttributeMacros(source: string): string {
     const start = m.index + (m[1] as string).length;
     pushCppRunTokens(spans, m[2] as string, start);
   }
-  return blankCppSpans(source, spans);
+  return blankCppSpans(source, spans, code);
 }
 
 /**
