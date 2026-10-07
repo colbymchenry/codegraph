@@ -233,6 +233,39 @@ describe('a C++ receiver declared with nested template arguments', () => {
       cg.close();
     }
   });
+
+  it('a declaration begun on the line above still hides a member of the same name', async () => {
+    // The parameter's type is not on the line that names it, but the
+    // parameter is still what the call is on: the class's `std::string
+    // blob_reqs` member it hides says nothing about the call.
+    const cg = await indexed({
+      'util/autovector.h': ROCKSDB['util/autovector.h'],
+      'db/blob/blob_file_reader.cc': [
+        '#include <string>',
+        '#include "util/autovector.h"',
+        'namespace rocksdb {',
+        'struct BlobContents {};',
+        'class BlobFileReader {',
+        ' public:',
+        '  size_t MultiGetBlob(autovector<std::pair<int*,',
+        '                                           std::unique_ptr<BlobContents>>>& blob_reqs) const;',
+        ' private:',
+        '  std::string blob_reqs;',
+        '};',
+        'size_t BlobFileReader::MultiGetBlob(autovector<std::pair<int*,',
+        '                                           std::unique_ptr<BlobContents>>>& blob_reqs) const {',
+        '  return blob_reqs.size();',
+        '}',
+        '}  // namespace rocksdb',
+        '',
+      ].join('\n'),
+    });
+    try {
+      expect(calls(cg, 'rocksdb::BlobFileReader::MultiGetBlob')).toEqual(['rocksdb::autovector::size (util/autovector.h)']);
+    } finally {
+      cg.close();
+    }
+  });
 });
 
 describe('stripCppTemplateArguments', () => {
