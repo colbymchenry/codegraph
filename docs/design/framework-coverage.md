@@ -283,6 +283,15 @@ Each of these cost real debugging time; they are not hypothetical.
    itself mounted under another file's `<Route path="/admin/*">` reads as if
    at the root, and a navigation that failed while its route was gone is not
    retried until a full index.
+14. **`resolve()` sees only references written in the framework's own
+   languages** (`getResolvingFrameworks`): Express's `logger` middleware rule
+   once took etcd's Go `*zap.Logger` result types for a method. A navigation
+   written in markup (`.svelte`, `.vue`) needs that language in `languages`.
+   A resolver that reads a language it extracts nothing from lists it in
+   `resolveLanguages` instead — Svelte's `$lib/…` imports in `.ts` route
+   modules, ASP.NET's Razor `@model` — because widening `languages` also runs
+   `extract()` on those files. `claimsReference()` is still asked of every
+   detected framework.
 
 ---
 

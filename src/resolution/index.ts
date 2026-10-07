@@ -35,7 +35,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks } from './frameworks';
+import { detectFrameworks, getResolvingFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -235,6 +235,8 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  /** `frameworks` narrowed to those that resolve each reference language (see getResolvingFrameworks). */
+  private frameworksByLanguage = new Map<Language, FrameworkResolver[]>();
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
   // collected in-memory and left pending in the DB until the post-pass
   // finishes, so a restart can recover the queue (#1577). Drained by
@@ -359,7 +361,18 @@ export class ReferenceResolver {
    */
   initialize(): void {
     this.frameworks = detectFrameworks(this.context);
+    this.frameworksByLanguage.clear();
     this.clearCaches();
+  }
+
+  /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
+  private frameworksFor(language: Language): FrameworkResolver[] {
+    let frameworks = this.frameworksByLanguage.get(language);
+    if (!frameworks) {
+      frameworks = getResolvingFrameworks(this.frameworks, language);
+      this.frameworksByLanguage.set(language, frameworks);
+    }
+    return frameworks;
   }
 
   /**
@@ -1279,6 +1292,10 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
+      // Every detected framework's claim, not only those that resolve this
+      // language: the check above reads no leading `::`, and protobuf's C++
+      // `::_pbi::…` calls get past it only on the Swift ↔ Objective-C
+      // bridge's claim of any name with a `:` in it.
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
@@ -1354,12 +1371,16 @@ export class ReferenceResolver {
 
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution. Cross-language bridges
-    // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
-    // JS → native `calls`); other code references obey the shared family gate.
+    // Strategy 1: Try framework-specific resolution, by the frameworks that
+    // read this reference's language: Express's `logger` middleware rule took
+    // a Go method's `*zap.Logger` result for the method itself (etcd).
+    // Cross-language bridges are deliberately preserved (Drupal `routing.yml`
+    // → PHP controller, RN JS → native `calls`); each lists the language its
+    // references are written in. Other code references obey the shared
+    // family gate.
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
-    for (const framework of this.frameworks) {
+    for (const framework of this.frameworksFor(ref.language)) {
       const resolved = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       // Name the resolver on the edge (`metadata.framework`): a Swift→ObjC or
       // React Native bridge hop says how it got into the graph, as a
