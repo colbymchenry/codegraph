@@ -26,6 +26,15 @@ export const goResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // An embedded type is the one its package declares under that name: the
+    // same package's for `Node`, the import's for `pkg.Node`, which name
+    // matching and the import resolver work out. The patterns below pick among
+    // every same-named node by folder convention, and Pattern 4 sees structs
+    // only: `Node` embedded beside promql/parser's `type Node interface` went
+    // to discovery/kubernetes's struct `Node`, etcd's `Client` embedding its
+    // own `Lease` interface to the server's `Lease` struct.
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
+
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('Handler') || ref.referenceName.startsWith('Handle')) {
       const result = resolveByNameAndKind(ref, 'function', HANDLER_DIRS, context);

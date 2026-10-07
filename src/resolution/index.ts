@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -29,6 +29,7 @@ import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
@@ -476,6 +477,7 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
+      clearCppTypeAliasMemos(this.context);
     }
   }
 
@@ -3056,6 +3058,11 @@ export class ReferenceResolver {
       result = { ...result, targetNodeId: type.id };
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    // A Go type embedded through a package (`yaml.Node`) is that package's.
+    // When the package is none of the file's imports as indexed, a type found
+    // by its bare name is some other package's namesake: prometheus's
+    // `RuleGroupNode` embeds yaml's `Node`, not discovery/kubernetes's.
+    if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
     return result;
   }
 

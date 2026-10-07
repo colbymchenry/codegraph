@@ -4,8 +4,8 @@
 //! Go's shape quirks, mirrored exactly: methods are top-level with a receiver
 //! (qualifiedName override `Recv::name` + a contains edge to the FIRST
 //! earlier-in-file struct of that name), structs/interfaces arrive as
-//! `type_spec` and classify via the inner type node (struct embedding →
-//! extends; interface method_elems become method nodes), composite literals
+//! `type_spec` and classify via the inner type node (struct and interface
+//! embedding → extends; interface method_elems become method nodes), composite literals
 //! (`pkga.Widget{}`) keep their package qualifier as `instantiates` refs,
 //! top-level var/const specs walk their initializers ATTRIBUTED to the
 //! declared symbol (#693), 2-hop field chains (`t.conn.Exec`) keep the chain
@@ -846,20 +846,42 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// extractInheritance — the Go branches: interface embedding
-    /// (constraint_elem) and struct embedding (field_declaration without a
-    /// field_identifier), plus the field_declaration_list recursion.
+    /// goEmbeddedTypeName (languages/go.ts): the name node of the type an
+    /// embedding names — `T`, `*T` (the `*` is a sibling token), `pkg.T` and
+    /// `T[X]` all embed `T`. A qualified type yields its name; resolution reads
+    /// the package back from the source at that position. None for any other
+    /// type and for a predeclared one.
+    fn embedded_type_name(&self, ty: Option<Node<'t>>) -> Option<Node<'t>> {
+        let mut ty = ty?;
+        if ty.kind() == "generic_type" {
+            ty = ty.child_by_field_name("type")?;
+        }
+        match ty.kind() {
+            "qualified_type" => ty.child_by_field_name("name"),
+            "type_identifier" if !is_go_predeclared_type(self.text(ty)) => Some(ty),
+            _ => None,
+        }
+    }
+
+    /// extractInheritance — the Go branches: interface embedding (a type_elem
+    /// holding one named type; a union, `~T` or basic type is a constraint)
+    /// and struct embedding (field_declaration without a field_identifier),
+    /// plus the field_declaration_list recursion.
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             match child.kind() {
-                "constraint_elem" => {
-                    let type_id = (0..child.named_child_count())
+                "type_elem" => {
+                    let mut terms = (0..child.named_child_count())
                         .filter_map(|j| child.named_child(j))
-                        .find(|c| c.kind() == "type_identifier");
-                    if let Some(type_id) = type_id {
+                        .filter(|c| c.kind() != "comment");
+                    let only = match (terms.next(), terms.next()) {
+                        (Some(term), None) => Some(term),
+                        _ => None,
+                    };
+                    if let Some(type_id) = self.embedded_type_name(only) {
                         let name = self.text(type_id).to_string();
                         self.push_ref_at(class_row, &name, extends_kind, type_id);
                     }
@@ -869,10 +891,7 @@ impl<'t> Walker<'t> {
                         .filter_map(|j| child.named_child(j))
                         .any(|c| c.kind() == "field_identifier");
                     if !has_field_identifier {
-                        let type_id = (0..child.named_child_count())
-                            .filter_map(|j| child.named_child(j))
-                            .find(|c| c.kind() == "type_identifier");
-                        if let Some(type_id) = type_id {
+                        if let Some(type_id) = self.embedded_type_name(child.child_by_field_name("type")) {
                             let name = self.text(type_id).to_string();
                             self.push_ref_at(class_row, &name, extends_kind, type_id);
                         }
@@ -1252,6 +1271,17 @@ fn is_builtin_type(name: &str) -> bool {
             | "float32" | "float64" | "complex64" | "complex128" | "rune" | "error"
             | "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean" | "Char"
             | "Unit" | "String" | "Any" | "AnyRef" | "AnyVal" | "Nothing" | "Null"
+    )
+}
+
+/// GO_PREDECLARED_TYPES (languages/go.ts): never a node in the graph, and as
+/// the lone term of an interface a basic type is a constraint, not an embedding.
+fn is_go_predeclared_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any" | "bool" | "byte" | "comparable" | "complex64" | "complex128" | "error" | "float32"
+            | "float64" | "int" | "int8" | "int16" | "int32" | "int64" | "rune" | "string" | "uint"
+            | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr"
     )
 }
 

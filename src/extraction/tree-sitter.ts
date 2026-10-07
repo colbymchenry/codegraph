@@ -23,6 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { goEmbeddedTypeName } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -3795,7 +3796,7 @@ export class TreeSitterExtractor {
    * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
-   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   * are `type_elem`s, not methods, and are left to inheritance extraction.
    */
   private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
     this.nodeStack.push(ifaceId);
@@ -6984,15 +6985,18 @@ export class TreeSitterExtractor {
         }
       }
 
-      // Go interface embedding: `type Querier interface { LabelQuerier; ... }`
-      // constraint_elem wraps the embedded interface type identifier
-      if (child.type === 'constraint_elem') {
-        const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      // Go interface embedding: `type IRouter interface { IRoutes; Group(…) }`.
+      // tree-sitter-go parses every element of an interface that is not a
+      // method as a `type_elem`; one holding a single named type embeds that
+      // interface. A union (`float32 | float64`), an underlying type (`~int`)
+      // or a lone basic type (`int64`) is a type-set constraint instead.
+      if (this.language === 'go' && child.type === 'type_elem') {
+        const terms = child.namedChildren.filter((c: SyntaxNode) => c.type !== 'comment');
+        const typeId = terms.length === 1 ? goEmbeddedTypeName(terms[0], this.source) : undefined;
         if (typeId) {
-          const name = getNodeText(typeId, this.source);
           this.unresolvedReferences.push({
             fromNodeId: classId,
-            referenceName: name,
+            referenceName: getNodeText(typeId, this.source),
             referenceKind: 'extends',
             line: typeId.startPosition.row + 1,
             column: typeId.startPosition.column,
@@ -7001,25 +7005,23 @@ export class TreeSitterExtractor {
       }
 
       // Go struct embedding: field_declaration without field_identifier
-      // e.g. `type DB struct { *Head; Queryable }` — no field name means embedded type.
+      // e.g. `type DB struct { *Head; Queryable; sync.Mutex }` — no field name
+      // means an embedded type, read the way an interface's is.
       // Go only: C, C++ and Objective-C members are field_declarations too, but
       // nest their name inside the declarator (`Cache* cache_;`, `jv elems[];`,
       // `Status Get(int);`), so this test read every such member's type as a
       // supertype. Their supertypes come from base_class_clause / superclass.
       if (this.language === 'go' && child.type === 'field_declaration') {
         const hasFieldIdentifier = child.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier');
-        if (!hasFieldIdentifier) {
-          const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-          if (typeId) {
-            const name = getNodeText(typeId, this.source);
-            this.unresolvedReferences.push({
-              fromNodeId: classId,
-              referenceName: name,
-              referenceKind: 'extends',
-              line: typeId.startPosition.row + 1,
-              column: typeId.startPosition.column,
-            });
-          }
+        const typeId = hasFieldIdentifier ? undefined : goEmbeddedTypeName(getChildByField(child, 'type'), this.source);
+        if (typeId) {
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(typeId, this.source),
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
         }
       }
 
