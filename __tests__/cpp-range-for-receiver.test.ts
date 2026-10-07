@@ -283,6 +283,33 @@ describe('a C++ range-based for declares its loop variable', () => {
     }
   });
 
+  it('a brace in a comment or a string literal does not end the loop', async () => {
+    const cg = await indexed({
+      ...GARAGE,
+      'garage/braces.cc': [
+        '#include "garage/vehicle.h"',
+        'namespace garage {',
+        'void Braces(const std::vector<Engine*>& engines) {',
+        '  for (Engine* e : engines) {',
+        '    // A comment\'s } is not the loop\'s.',
+        '    const char* close = "}";',
+        '    /* nor is } this one',
+        '       } or this */',
+        '    char brace = \'}\';',
+        '    e->Start();',
+        '  }',
+        '}',
+        '}  // namespace garage',
+        '',
+      ].join('\n'),
+    });
+    try {
+      expect(calls(cg, 'garage::Braces')).toEqual(['garage::Engine::Start @0.9']);
+    } finally {
+      cg.close();
+    }
+  });
+
   it('a nested loop\'s call is inside the outer loop\'s body', async () => {
     const cg = await indexed({
       ...GARAGE,
