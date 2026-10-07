@@ -984,8 +984,10 @@ export class CodeGraph {
             // now resolve, and nothing else ever revisits them (their rows
             // were parked as status='failed' by an earlier completed pass).
             // Look them up by the symbol names the changed files now carry
-            // and re-resolve just that set. On a sync where no failed ref
-            // matches, this is one indexed lookup.
+            // and re-resolve just that set. The names include each file's
+            // own, which a reference written as a path
+            // (`snippets/price.liquid`) waits under. On a sync where no failed
+            // ref matches, this is one indexed lookup.
             const tRetry = Date.now();
             const retryable = this.queries.getRetryableFailedReferences(
               this.queries.getNodeNamesByFiles(result.changedFilePaths)

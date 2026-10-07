@@ -7608,6 +7608,57 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual([]);
   });
 
+  it('links a section or snippet that appears after the files naming it', async () => {
+    // Sync retries a reference it could not resolve once a file it may name
+    // appears. A section or snippet reference was parked under its extension,
+    // `liquid`, which no file is named, so it stayed unlinked until the file
+    // naming it changed or the project was indexed again.
+    const later: Record<string, string> = {
+      'sections/404.liquid': `<h1>404</h1>\n`,
+      'snippets/price.liquid': severalThemes['snippets/price.liquid'],
+      // Only straps/dusk had a 404 section, which is no stand-in for this theme's own.
+      'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n`,
+      'extensions/reviews/snippets/star.liquid': severalThemes['extensions/reviews/snippets/star.liquid'],
+    };
+    const initial = Object.fromEntries(Object.entries(severalThemes).filter(([file]) => !(file in later)));
+    writeFiles({ ...initial, 'templates/404.json': jsonTemplate('404') });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
+      'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
+    const links = () => Object.fromEntries(naming.map((file) => [file, cg.getFileDependencies(file).sort()]));
+    expect(links()).toEqual({
+      'templates/404.json': [],
+      'sections/header.liquid': [],
+      'examples/tailwind/templates/404.json': [],
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': [],
+    });
+
+    writeFiles(later);
+    expect((await cg.sync()).filesAdded).toBe(4);
+    const synced = links();
+    expect(synced).toEqual({
+      'templates/404.json': ['sections/404.liquid'],
+      'sections/header.liquid': ['snippets/price.liquid'],
+      'examples/tailwind/templates/404.json': ['examples/tailwind/sections/404.liquid'],
+      // The root theme's new price snippet is not this theme's.
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    await cg.indexAll();
+    expect(links()).toEqual(synced);
+
+    // A deleted snippet's references wait for it the same way.
+    fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual([]);
+    writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
   it('finds the theme a file is in from the theme folder it sits in', () => {
     const markers = new Set(['layout/theme.liquid', 'examples/tailwind/config/settings_schema.json']);
     const exists = (relativePath: string): boolean => markers.has(relativePath);
