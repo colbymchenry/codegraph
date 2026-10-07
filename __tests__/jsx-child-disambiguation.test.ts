@@ -137,7 +137,8 @@ export function Header() { return <h1><Badge /></h1>; }
  * kind used to skip it and take a lone same-named function anywhere: on
  * codedthemes' mantis (a vite app and a Next.js app in one repository) the
  * vite app's `RegisterPage` went to the Next.js app's page, and excalidraw's
- * Next.js example rendered the docs site's `Excalidraw`.
+ * Next.js example rendered the docs site's `Excalidraw`. Component resolution
+ * keeps the same rule for every other reference to such a name (the last case).
  */
 describe('JSX child: a value the file declares itself', () => {
   let dir: string;
