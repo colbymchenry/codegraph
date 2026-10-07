@@ -57,6 +57,43 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\.\.\.(?=\s*[},])/g, '   ');
 }
 
+/**
+ * Whether `node` is declared in a `declare module 'x' { … }` or `declare
+ * global { … }` body, which exports it without an `export` keyword.
+ *
+ * This is TypeScript's own rule: the binder makes an ambient module body an
+ * export context unless the body holds an export declaration (`export {…}`,
+ * `export * from`, `export =`, `export default x`), and a namespace nested in
+ * one is ambient too. What such a body declares belongs to that module or to
+ * the global scope, not to this file (`interface Window`, chart.js's
+ * `PluginOptionsByType`): other files reach it through them, and so does the
+ * library whose type it extends. `declare namespace X` is not one: in a module
+ * file, X belongs to that file. Mirrored in the kernel (tsjs/mod.rs
+ * `is_ambient_export`).
+ */
+export function isAmbientExport(node: SyntaxNode): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'statement_block' && hasExportDeclaration(current)) return false;
+    if (current.type !== 'ambient_declaration') continue;
+    // `declare global` is the keyword and a bare block, with no field names.
+    for (let i = 0; i < current.childCount; i++) {
+      if (current.child(i)?.type === 'global') return true;
+    }
+    const declared = current.namedChild(0);
+    if (declared?.type === 'module' && getChildByField(declared, 'name')?.type === 'string') return true;
+  }
+  return false;
+}
+
+/** A statement in `block` that exports by name or by assignment, not by declaring. */
+function hasExportDeclaration(block: SyntaxNode): boolean {
+  for (let i = 0; i < block.namedChildCount; i++) {
+    const statement = block.namedChild(i);
+    if (statement?.type === 'export_statement' && !getChildByField(statement, 'declaration')) return true;
+  }
+  return false;
+}
+
 export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
@@ -143,7 +180,7 @@ export const typescriptExtractor: LanguageExtractor = {
       if (current.type === 'export_statement') return true;
       current = current.parent;
     }
-    return false;
+    return isAmbientExport(node);
   },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {
