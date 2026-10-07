@@ -111,6 +111,8 @@ interface FileExportIndex {
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
 const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+/** Any `export default …` statement: the module is an ES module with a default export. */
+const ESM_DEFAULT_EXPORT_RE = /^[ \t]*export\s+default\b/m;
 const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
 /** The identifier `export default NAME` names in a JS-family file, or null. */
@@ -177,6 +179,28 @@ function defaultExportBindingNode(filePath: string, idx: FileExportIndex, contex
             .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
   }
   return idx.defaultBinding ?? undefined;
+}
+
+/**
+ * The declaration a module default-exports: the component a single-file
+ * component file is, else what an `export default NAME` statement names, else
+ * the first exported function or class (`export default class Foo`).
+ */
+function esmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
+  return idx.defaultComponent ?? defaultExportBindingNode(filePath, idx, context) ?? idx.defaultFnClass;
+}
+
+/**
+ * Whether the module has an ESM default export at all: it is a single-file
+ * component, or a JS-family file with an `export default` statement. A
+ * CommonJS module has none, though its `exports.x = function` declarations are
+ * exported and would feed the first-exported-function guess.
+ */
+function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): boolean {
+  if (idx.defaultComponent) return true;
+  if (!JS_FAMILY_FILE.test(filePath)) return false;
+  const source = context.readFile(filePath);
+  return !!source && source.includes('default') && ESM_DEFAULT_EXPORT_RE.test(source);
 }
 
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
@@ -2683,8 +2707,7 @@ function findExportedSymbolWalk(
     // resolves and the component shows a false 0 callers (#629).
     // A component file IS its default export; otherwise the statement that
     // names the binding beats the first-exported-function guess.
-    const direct =
-      exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
+    const direct = esmDefaultExport(filePath, exportIndex, context);
     if (direct) return direct;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
     const commonJs = commonJsDefaultExport(filePath, context);
@@ -2703,6 +2726,22 @@ function findExportedSymbolWalk(
   } else {
     const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
     if (direct) return direct;
+    // `require('./x').default` and `const { default: X } = require('./x')` read
+    // the `default` property of module.exports. A CommonJS module sets it by
+    // name (`exports.default = fn`, the dual `module.exports.default = X`),
+    // found just above. A module written as an ES module sets it to its
+    // default export, `export default class Foo`, which is no named export —
+    // the answer when the module has no such property. Only in the module
+    // asked for: `export * from` never forwards a default.
+    if (
+      depth === 0 &&
+      want.exportedName === 'default' &&
+      ESM_IMPORT_LANGUAGES.has(language) &&
+      hasEsmDefaultExport(filePath, exportIndex, context)
+    ) {
+      const esmDefault = esmDefaultExport(filePath, exportIndex, context);
+      if (esmDefault) return esmDefault;
+    }
   }
 
   // 2. Re-export hit: the file forwards the symbol to another module.
