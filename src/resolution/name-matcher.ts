@@ -1925,9 +1925,10 @@ interface GoQualification {
   /**
    * For a call through a parameter or local that takes an import's name, the
    * type it is declared as, when its declaration writes one (`*tokenJWT`,
-   * `clock.PassiveClock`), and the import that type is written through:
+   * `clock.PassiveClock`), and the import that type is written through —
    * `clock` in a parameter `clock clock.PassiveClock`, `atomic` in
-   * `cache := &atomic.Bool{}`.
+   * `cache := &atomic.Bool{}` — or its value comes from: `reflect` in
+   * `value := reflect.New(t)`.
    */
   declaredType?: string;
   typePackage?: ImportMapping;
@@ -1977,7 +1978,10 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   const local = imported && dot >= 0 && ref.referenceKind === 'calls' ? goLocalDecl(written!, ref, context) : undefined;
   if (local) {
     declaredType = local.type;
-    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(declaredType ?? '')?.[1];
+    // A value a package outside the project hands out is of a type it
+    // declares: kubernetes' `clock := clocktesting.NewFakePassiveClock(…)`
+    // has no project method `Now`.
+    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(declaredType ?? '')?.[1] ?? local.from;
     typePackage = qualifier ? imports.find((m) => m.localName === qualifier) : undefined;
     written = undefined;
     imported = undefined;
@@ -2112,6 +2116,8 @@ interface GoDecl {
   body?: number;
   /** The declared type as written, when the declaration writes one. */
   type?: string;
+  /** The package a `:=` takes its value from: `clocktesting` in `clock := clocktesting.NewFakeClock(…)`. */
+  from?: string;
 }
 
 const GO_SCOPE_INDEXES = new WeakMap<ResolutionContext, Map<string, GoScopeIndex | null>>();
@@ -2195,9 +2201,12 @@ function readGoScopes(code: string): GoScopeIndex {
     const first = names[names.length - 1]![1];
     const lead = code.slice(code.lastIndexOf('\n', first - 1) + 1, first);
     const kind = /^\s*(?:\}\s*else\s+)?(?:if|for|switch)\b/.test(lead) ? 'header' : /^\s*case\b/.test(lead) ? 'case' : 'local';
-    // `x := &pkg.T{…}` writes the type it declares.
-    const type = names.length === 1 ? /^[ \t]*&?[ \t]*([A-Za-z_]\w*\.[A-Za-z_]\w*)[ \t]*\{/.exec(code.slice(i + 2, i + 160))?.[1] : undefined;
-    for (const [name, at] of names) add(name, { at, kind, type });
+    // `x := &pkg.T{…}` writes the type it declares; `x := pkg.New(…)` the
+    // package its value comes from.
+    const rhs = code.slice(i + 2, i + 160);
+    const type = names.length === 1 ? /^[ \t]*&?[ \t]*([A-Za-z_]\w*\.[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] : undefined;
+    const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
+    for (const [name, at] of names) add(name, { at, kind, type, from });
   }
   // `var x T`, `var a, b = …`, `const (…)`: names before a type, an `=` or
   // the line's end — in a group, on lines outside the brackets of a value

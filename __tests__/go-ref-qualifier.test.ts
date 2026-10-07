@@ -208,10 +208,12 @@ func (l *Logger) Error(v ...interface{}) {}
 
 import (
 	"sync/atomic"
+	"time"
 
 	"example.com/app/cache"
 	"example.com/app/jobs/logger"
 	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 func logError(logger logger.Interface, err error) {
@@ -230,6 +232,12 @@ func cachedHasSynced(store cache.Store) func() bool {
 
 func describe(logger logger.Interface) string {
 	return logger.Kind.String()
+}
+
+func elapsed() time.Time {
+	clock := clocktesting.NewFakePassiveClock(time.Unix(1, 0))
+	now := clock.Now()
+	return now
 }
 `,
   // harbor's controller/robot.Robot embeds model.Robot, whose method a
@@ -356,9 +364,11 @@ describe('a Go parameter or local named like an import', () => {
   });
 
   it('has the methods of the type it is declared as', () => {
-    // An outside package's type holds none of the project's methods…
+    // An outside package's type holds none of the project's methods, nor
+    // does a value one of its functions hands out…
     expect(reachedAt('jobs/job.go', 'clock.Now()')).not.toContain('Clock::Now');
     expect(reachedAt('jobs/job.go', 'cache.Store(false)')).toEqual([]);
+    expect(reachedAt('jobs/job.go', 'now := clock.Now()')).toEqual([]);
     // …and a project package's type its own: not the function the import
     // names, nor another package's `Logger::Error`. A method an embedded
     // type brings in counts.
