@@ -3131,10 +3131,10 @@ export class ReferenceResolver {
       result = { ...result, targetNodeId: type.id };
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
-    // A Go type embedded through a package (`yaml.Node`) is that package's.
-    // When the package is none of the file's imports as indexed, a type found
-    // by its bare name is some other package's namesake: prometheus's
-    // `RuleGroupNode` embeds yaml's `Node`, not discovery/kubernetes's.
+    // A Go type embedded through a package (`clientv3.KV`) is that package's.
+    // When the package is none of the file's imports as indexed (clientv3
+    // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its
+    // bare name is some other package's namesake.
     if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
     return result;
   }
