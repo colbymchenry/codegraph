@@ -31,7 +31,7 @@ function parseLang(raw: string | undefined): ScipLanguage | undefined {
 }
 
 export function registerScipCommands(program: Command, h: CliHelpers): void {
-  const scip = program.command('scip').description('Compiler-grade call edges from SCIP indexers (fork)');
+  const scip = program.command('scip').description('Compiler-grade call edges from SCIP indexers');
 
   const withGraph = async (pathArg: string | undefined, fn: (cg: import('../index').CodeGraph) => Promise<void>) => {
     const projectPath = h.resolveProjectPath(pathArg);

@@ -76,10 +76,6 @@ import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 import { registerScipCommands } from '../scip/cli';
 
-// Fork: never nag about (or check for) upstream releases — this build is
-// replaced by installing a newer codegraph-scip tarball, not by `upgrade`.
-process.env.CODEGRAPH_NO_UPDATE_CHECK ??= '1';
-
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
 const COLORS_ENABLED = ansiColorsEnabled();
@@ -800,7 +796,7 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .option('--scip', 'Fork: also build the SCIP indexes, the indexers running while references resolve (see `codegraph scip index`)')
+  .option('--scip', 'Also build the SCIP indexes, the indexers running while references resolve (see `codegraph scip index`)')
   .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; scip?: boolean }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
@@ -2894,14 +2890,10 @@ program
  */
 program
   .command('upgrade [version]')
-  .description('Disabled in the codegraph-scip fork (would replace it with upstream)')
+  .description('Update CodeGraph to the latest release (or a specific version)')
   .option('--check', 'Check whether an update is available without installing')
   .option('-f, --force', 'Reinstall even if already on the target version')
   .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
-    // Fork: refuse up front. Upstream's body below is left unreachable rather
-    // than deleted so this hunk stays three lines on every rebase.
-    error('This is the codegraph-scip fork: `upgrade` would replace it with upstream. Install a newer fork tarball instead (see docs/scip.md).');
-    process.exit(1);
     const up = await import('../upgrade');
     const method = up.detectInstallMethod({
       filename: __filename,
@@ -2947,7 +2939,7 @@ program
     console.log(packageJson.version);
   });
 
-// Fork: `codegraph scip …` (src/scip/cli.ts)
+// `codegraph scip …` (src/scip/cli.ts)
 registerScipCommands(program, { resolveProjectPath, isInitialized, loadCodeGraph, success, info, warn, error });
 
 // Parse and run

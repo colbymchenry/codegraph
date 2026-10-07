@@ -11,7 +11,7 @@ Kept small; everything else is new, under `src/scip/`, `__tests__/scip/`, `__tes
 and `scripts/scip-eval/`.
 
 - `src/index.ts`: the `runScipPass` hook in `indexAll`, the `onSynced` hook in `sync`, the reindex scheduler in `watch`/`unwatch`, and `scipReadDb`/`scipWrite`
-- `src/bin/codegraph.ts`: `registerScipCommands`, the update-check default, and the `upgrade` refusal
+- `src/bin/codegraph.ts`: `registerScipCommands` and `init --scip`
 - `src/mcp/tools.ts`: `scipFlowNote`, `scipTrailNote`, and `callSitesSection` at the top of explore's answer
 - `install.sh`: `CODEGRAPH_ARCHIVE`, to install a locally built bundle
 
