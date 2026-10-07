@@ -1884,7 +1884,35 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
-const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, ImportMapping | null>>();
+interface GoQualification {
+  /** The package name written before the reference's name, as spelled. */
+  written?: string;
+  /** The file's import that name is. */
+  imported?: ImportMapping;
+}
+
+const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, GoQualification>>();
+
+function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQualification {
+  if (ref.referenceKind === 'imports') return {};
+  const name = ref.referenceName.split('.').pop()!;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return {};
+  let memo = GO_QUALIFIERS.get(context);
+  if (!memo) GO_QUALIFIERS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const at = Math.max(0, ref.column);
+  // The qualifier right before the name at the reference's column, or the
+  // line's only spelling of the name.
+  const written = line.startsWith(name, at) ? /(?:^|[^\w.])([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
+    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.])([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
+  const imported = written ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === written) : undefined;
+  const found = { written, imported };
+  memo.set(key, found);
+  return found;
+}
 
 /**
  * The import a Go reference is written through — `context` in
@@ -1893,23 +1921,18 @@ const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, ImportMapping |
  * through anything that isn't one of the file's imports.
  */
 export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): ImportMapping | undefined {
-  if (ref.referenceKind === 'imports') return undefined;
-  const name = ref.referenceName.split('.').pop()!;
-  if (!/^[A-Za-z_]\w*$/.test(name)) return undefined;
-  let memo = GO_QUALIFIERS.get(context);
-  if (!memo) GO_QUALIFIERS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit ?? undefined;
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  const at = Math.max(0, ref.column);
-  // The qualifier right before the name at the reference's column, or the
-  // line's only spelling of the name.
-  const before = line.startsWith(name, at) ? /(?:^|[^\w.])([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
-    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.])([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
-  const imported = before ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before) : undefined;
-  memo.set(key, imported ?? null);
-  return imported;
+  return goRefQualification(ref, context).imported;
+}
+
+/**
+ * Whether a Go reference is written through a package that is none of its
+ * file's imports as the index knows them: `yaml` in `yaml.Node` under an
+ * unaliased `import "go.yaml.in/yaml/v3"`, which is recorded under its last
+ * path element, `v3`. Which package that is cannot be told from here.
+ */
+export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const { written, imported } = goRefQualification(ref, context);
+  return written !== undefined && imported === undefined;
 }
 
 /**
