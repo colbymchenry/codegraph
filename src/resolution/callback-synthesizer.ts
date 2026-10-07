@@ -40,6 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
+import { declaredComponent } from './frameworks/react';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1369,13 +1370,27 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
  * shape, and the one an import can never disambiguate. Then the file the name
  * is imported from. Then the language, which only decides a tie: a `.tsx` tag
  * naming both a TS component and a same-named Swift class means the TS one.
+ *
+ * A value the file declares under the name is the tag's, whatever else shares
+ * it: `const Chart = lazy(() => import('./Chart'))` renders the component that
+ * module exports, `observer(function Settings() {…})` the function it wraps,
+ * and anything else the declaration itself (see `declaredComponent`).
+ * Kind alone left it out — a value is no component node — so a lone function
+ * of that name anywhere won: mantis's vite app rendered the `RegisterPage` of
+ * the repository's Next.js app. `asTag` says some `<Name` is a tag, not a type
+ * argument (`useForm<Schema>()` under `const Schema = z.object(…)` renders
+ * nothing).
  */
 function jsxChild(
   ctx: ResolutionContext,
   name: string,
   file: string,
-  importsOf: () => Map<string, string>
+  importsOf: () => Map<string, string>,
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>,
+  asTag: boolean
 ): Node | undefined {
+  const own = ownValueOf(name);
+  if (own) return asTag ? own.component ?? own.declaration : undefined;
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
   if (candidates.length === 0) {
     // A name nothing declares is the file's DEFAULT import of a module's one
@@ -1408,8 +1423,9 @@ function jsxChild(
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
  * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
  * (read each JSX file once). Precision gate: the child name must resolve to a
- * component/function/class node — TS generics like `Array<Foo>` resolve to a type
- * (or nothing) and are dropped.
+ * component/function/class node, or to a value the file declares itself and
+ * writes as a tag — TS generics like `Array<Foo>` resolve to a type (or
+ * nothing) and are dropped.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
@@ -1432,17 +1448,28 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    // Once per file and name: the value the file declares under it, if any.
+    const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
+    const ownValueOf = (name: string) => {
+      if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
+      return ownValues.get(name);
+    };
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
-      const names = new Set<string>();
+      // Each name, and whether a `<Name` of it opens a tag: a type argument
+      // list follows its type's name directly (`useForm<Schema>`, `Array<Item>`).
+      const names = new Map<string, boolean>();
       JSX_TAG_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = JSX_TAG_RE.exec(src))) names.add(m[1]!);
+      while ((m = JSX_TAG_RE.exec(src))) {
+        const asTag = !/[\w$]/.test(src[m.index - 1] ?? '') || /\breturn$/.test(src.slice(Math.max(0, m.index - 7), m.index));
+        names.set(m[1]!, (names.get(m[1]!) ?? false) || asTag);
+      }
       let added = 0;
-      for (const name of names) {
+      for (const [name, asTag] of names) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = jsxChild(ctx, name, file, importsOf);
+        const child = jsxChild(ctx, name, file, importsOf, ownValueOf, asTag);
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;

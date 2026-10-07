@@ -1124,6 +1124,57 @@ export default AuthenticationRoutes;
   });
 });
 
+describe('react-router: a layout the route file loads lazily', () => {
+  let root: string;
+  let cg: CodeGraph;
+  beforeAll(async () => {
+    ({ root, cg } = await indexProject({
+      'package.json': JSON.stringify({ name: 'mantis', private: true }),
+      'vite/package.json': JSON.stringify({ name: 'vite-app', dependencies: { react: '^18', 'react-router-dom': '^7' } }),
+      'vite/src/routes/index.jsx': `import { createBrowserRouter } from 'react-router-dom';
+import MainRoutes from './MainRoutes';
+
+const router = createBrowserRouter([MainRoutes]);
+
+export default router;
+`,
+      'vite/src/routes/MainRoutes.jsx': `import { lazy } from 'react';
+import Loadable from '../components/Loadable';
+
+const MainLayout = Loadable(lazy(() => import('../layout/MainLayout')));
+const Dashboard = Loadable(lazy(() => import('../views/Dashboard')));
+
+const MainRoutes = {
+  path: '/',
+  element: <MainLayout />,
+  children: [
+    {
+      path: 'dashboard',
+      element: <Dashboard />
+    }
+  ]
+};
+
+export default MainRoutes;
+`,
+      'vite/src/layout/MainLayout/index.jsx': 'export default function Layout() {\n  return <main />;\n}\n',
+      'vite/src/views/Dashboard.jsx': 'export default function Dashboard() {\n  return <div />;\n}\n',
+      'vite/src/components/Loadable.jsx': 'export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n',
+      // The repository's other app, with a layout of the same name.
+      'next/package.json': JSON.stringify({ name: 'next-app', dependencies: { next: '^15', react: '^18' } }),
+      'next/src/layout/MainLayout.jsx': 'export default function MainLayout({ children }) {\n  return <main>{children}</main>;\n}\n',
+    }));
+  });
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('binds the layout to the module the route file loads, never to a same-named layout of another app', () => {
+    expect(routeBindings(cg)).toEqual(['/ -> Layout', '/dashboard -> Dashboard', '/dashboard ~> Layout']);
+  });
+});
+
 describe('react-router: a table mapped inside <Route path> in the same file', () => {
   let root: string;
   let cg: CodeGraph;
