@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
+import { cppAliasedTypeName, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -8261,11 +8261,30 @@ const CPP_NON_TYPE_TOKENS = new Set([
   'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
 ]);
 
+/**
+ * The last name of a declared C++ type: `const std::vector<std::pair<int,
+ * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
+ * names no type.
+ */
 function normalizeCppTypeName(typeName: string): string | null {
-  const normalized = typeName
-    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
-    .replace(/[&*]+/g, ' ')
-    .replace(/<[^>]*>/g, ' ')
+  // A `>` that closes no `<` ends a type begun on an earlier line — rocksdb's
+  // `std::unique_ptr<BlobContents>>>& blob_reqs` under `autovector<std::pair<
+  // BlobRangeReadRequest*,` — and without its head, what is left names a
+  // template argument's type, not the declared one.
+  let depth = 0;
+  for (const c of typeName) {
+    if (c === '<') depth++;
+    else if (c === '>' && --depth < 0) return null;
+  }
+  // Template arguments go with the ones nested in them. Cut at their first
+  // `>`, `Table<int, Box<int>>` was `Table >`, which names no type: a call
+  // on it never reached Table's method, and a capitalized name no class has
+  // ruled out any guess as well.
+  const normalized = stripCppTemplateArguments(
+    typeName
+      .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+      .replace(/[&*]+/g, ' '),
+  )
     .replace(/\s+/g, ' ')
     .trim();
 
