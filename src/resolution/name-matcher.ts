@@ -1971,6 +1971,48 @@ export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionCont
 }
 
 /**
+ * What a Go type position — a parameter or result type, a composite
+ * literal's type — names: a type, which Go reads from one package. A method
+ * or a function is never it; Go reaches those only through a value or a
+ * package. Whichever strategy found a declaration of the name, the type is
+ * the one of that name in the reference's own package for a bare name, or in
+ * the imported project package for `pkg.T`. Without one there, a method or
+ * function of the name is nothing the reference means. etcd's
+ * `func (ti *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex` linked both
+ * `keyIndex` types to the method `treeIndex.keyIndex` beside it,
+ * prometheus's `(ec2Client, error)` result to the method the line declares,
+ * and its `&config_util.URL{…}` (an outside package) to `Target.URL`. A bare
+ * name that found another package's type means its own package's type of
+ * that name when there is one: prometheus's `prompb` builds its own
+ * `Histogram_CountInt`, not the `write/v2` one.
+ */
+export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target || target.language !== 'go') return result;
+  const isType = GO_TYPE_KINDS.has(target.kind);
+  // A composite literal keeps its package in the name (`config_util.URL`);
+  // a parameter type leaves it on the line.
+  const dot = ref.referenceName.lastIndexOf('.');
+  const name = ref.referenceName.slice(dot + 1);
+  // The package's directory; null for a package outside the project,
+  // undefined for a qualifier that is none of the file's imports as indexed.
+  let pkgDir: string | null | undefined;
+  let bare = false;
+  if (dot >= 0) {
+    pkgDir = goImportPackageDir(ref.referenceName.slice(0, dot), ref.filePath, context);
+  } else {
+    const { written, imported } = goRefQualification(ref, context);
+    bare = written === undefined;
+    if (bare) pkgDir = goPackageDir(ref.filePath);
+    else if (imported) pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath) ?? null;
+  }
+  if (isType && (!bare || goPackageDir(target.filePath) === pkgDir)) return result;
+  const types = pkgDir ? goPackageTypes(name, pkgDir, context) : [];
+  if (types.length > 0) return { ...result, targetNodeId: preferCallSiteFile(types, ref.filePath)[0]!.id };
+  return isType ? result : null;
+}
+
+/**
  * Whether a Go reference is written through an imported package from outside
  * the project's modules — `context.Context`, `fmt.Errorf`, a third-party
  * `gin.H`.
