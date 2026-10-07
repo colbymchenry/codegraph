@@ -10,7 +10,7 @@
  * `manifest.kt` / a `RealCall.kt` production file must NOT be flagged.
  */
 import { describe, it, expect } from 'vitest';
-import { isTestFile } from '../src/search/query-utils';
+import { isTestFile, isTestPath } from '../src/search/query-utils';
 
 describe('isTestFile', () => {
   it('flags test-support modules and doubles by directory name', () => {
@@ -54,6 +54,30 @@ describe('isTestFile', () => {
     expect(isTestFile('com/example/FooTestCase.java')).toBe(true);
     expect(isTestFile('project/__tests__/foo.ts')).toBe(true);
     expect(isTestFile('project/tests/foo.rb')).toBe(true);
+  });
+
+  it("flags Google's unittest-named files as tests", () => {
+    // protobuf's 62 and Chromium's: `wire_format_unittest.cc` is a suite, not
+    // the code it tests, even with no `test/` directory above it.
+    for (const suite of [
+      'src/google/protobuf/wire_format_unittest.cc',
+      'src/google/protobuf/wire_format_unittest.h',
+      'src/compiler/register-allocator-unittest.cpp',
+      'lib/parser.unittest.js',
+      'tools/run_all_unittests.cc',
+      'build/android/pylib/device_unittest.py',
+    ]) {
+      expect(isTestPath(suite), suite).toBe(true);
+      expect(isTestFile(suite), suite).toBe(true);
+    }
+  });
+
+  it('does NOT flag a file merely named unittest', () => {
+    // promtool's `unittest.go` is the code that runs rule tests, and
+    // CPython's `unittest` package is the framework itself.
+    expect(isTestPath('cmd/promtool/unittest.go')).toBe(false);
+    expect(isTestPath('Lib/unittest/case.py')).toBe(false);
+    expect(isTestFile('cmd/promtool/unittest.go')).toBe(false);
   });
 
   it('does NOT flag production files that merely contain "test" lowercase', () => {
