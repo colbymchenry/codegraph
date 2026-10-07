@@ -48,6 +48,7 @@ import {
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
+  changedRoutes,
   createResolver,
   ResolutionResult,
 } from './resolution';
@@ -922,8 +923,15 @@ export class CodeGraph {
         let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
+        // The route nodes as they were before this sync replaced or removed a
+        // file — read at the first change, so a sync that changes nothing
+        // reads nothing, and only where a router binds navigation calls to
+        // routes. Compared with the routes after runPostExtract below.
+        const watchRoutes = this.resolver.hasNavigationRouters();
+        let routesBefore = null as Node[] | null;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
               (content !== undefined && hasSynthesisPattern(filePath, content)))) {
@@ -950,6 +958,29 @@ export class CodeGraph {
         // pre-removal graph.)
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
+        }
+
+        // A route that appeared, went away or was renamed changes what a
+        // navigation call in an UNCHANGED file resolves to: `history.push(
+        // '/login')` binds again once `/login` is back. While the route was
+        // missing the call was parked as failed, or bound to a catch-all, and
+        // nothing below revisits it: the retry keys on the names this sync's
+        // files define, which a call named for the router's method (`push`)
+        // never matches. Put those calls back in the pending set for the sweep
+        // below, and let the synthesizers redraw the links markup makes to
+        // routes. The route table is final here: renames and table routes are
+        // runPostExtract's.
+        if (routesBefore) {
+          const tNav = Date.now();
+          const routes = changedRoutes(routesBefore, this.queries.getNodesByKind('route'));
+          const reopened = this.resolver.reopenNavigationsFor(routes, result.changedFilePaths ?? []);
+          if (routes.length > 0 && !refreshSynthesis) {
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-navigation-retry: ${Date.now() - tNav}ms (${routes.length} routes changed, ${reopened} refs re-opened)`);
+          }
         }
 
         // Resolve references if files were updated
