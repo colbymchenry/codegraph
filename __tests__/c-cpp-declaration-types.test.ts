@@ -15,8 +15,10 @@
  * (which keep their nodes), and the comment above the declaration documents
  * it. An unnamed one takes the name of the first variable its declaration
  * declares, as `typedef struct { … } Name;` takes the typedef name: no code
- * can name the type of `SPT`, only `SPT`. Runs against the native kernel
- * (when built) and the wasm extractor, which must agree.
+ * can name the type of `SPT`, only `SPT`. In a C++ file whose tree has errors
+ * the type is walked in the scopes the file's braces open (#2426), and not at
+ * all when the braces don't balance. Runs against the native kernel (when
+ * built) and the wasm extractor, which must agree.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
