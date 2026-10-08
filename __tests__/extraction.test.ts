@@ -298,6 +298,16 @@ class ENGINE_API UNetConnectionRepControl : public UObject
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
   });
+  it('should detect Nim files', () => {
+    expect(detectLanguage('src/main.nim')).toBe('nim');
+    expect(detectLanguage('scripts/build.nims')).toBe('nim');
+    expect(detectLanguage('mypkg.nimble')).toBe('nim');
+    // Nim's config files are not source: only the FINAL extension counts, so a
+    // `.nim.cfg` resolves on `.cfg` and stays out of the index.
+    expect(detectLanguage('config.nim.cfg')).toBe('unknown');
+    expect(isSourceFile('src/main.nim')).toBe(true);
+    expect(isSourceFile('config.nim.cfg')).toBe(false);
+  });
 });
 
 describe('Language Support', () => {
@@ -324,6 +334,7 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('nim');
   });
 });
 
@@ -463,6 +474,166 @@ in
     expect(node('package')?.isExported).toBe(true);
     expect(node('privateNested')?.isExported).toBe(false);
     expect(node('licenses')?.isExported).toBe(true);
+  });
+});
+
+describe('Nim Extraction', () => {
+  it('should extract every callable form as a function, without the export asterisk', () => {
+    const code = `
+proc compute*(n: int): int =
+  result = n * 2
+
+func square(x: int): int = x * x
+
+iterator walk(xs: seq[int]): int =
+  for x in xs:
+    yield x
+
+template withLock*(body: untyped) =
+  body
+
+macro debug(x: untyped): untyped =
+  x
+
+converter toInt*(x: string): int =
+  0
+`;
+    const result = extractFromSource('callables.nim', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function');
+
+    expect(fns.map((n) => n.name).sort()).toEqual(['compute', 'debug', 'square', 'toInt', 'walk', 'withLock']);
+    // `foo*` is Nim's only export marker — and the asterisk is not part of the name.
+    expect(fns.find((n) => n.name === 'compute')?.isExported).toBe(true);
+    expect(fns.find((n) => n.name === 'square')?.isExported).toBe(false);
+    expect(fns.find((n) => n.name === 'compute')?.signature).toBe('(n: int): int');
+  });
+
+  it('should map each Nim type definition to the kind it means', () => {
+    const code = `
+type
+  Plain = object
+    y: string
+  Circle = ref object of Shape
+    radius: float
+  Color = enum
+    red, green, blue
+  Handler = proc (p: int): int
+  Alias = string
+`;
+    const result = extractFromSource('types.nim', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    // `object` is a value type; `ref object` is the reference/inheritance type.
+    expect(kindOf('Plain')).toBe('struct');
+    expect(kindOf('Circle')).toBe('class');
+    expect(kindOf('Color')).toBe('enum');
+    expect(kindOf('Handler')).toBe('type_alias');
+    expect(kindOf('Alias')).toBe('type_alias');
+  });
+
+  it('should extract enum members qualified by their enum', () => {
+    const code = `
+type
+  Color = enum
+    red, green, blue
+`;
+    const result = extractFromSource('enum.nim', code);
+    const members = result.nodes.filter((n) => n.kind === 'enum_member');
+
+    expect(members.map((n) => n.name)).toEqual(['red', 'green', 'blue']);
+    expect(members[0]?.qualifiedName).toBe('Color::red');
+  });
+
+  it('should extract object fields, including several names on one declaration', () => {
+    const code = `
+type
+  Point* = object
+    x*, y*: int
+    label: string
+`;
+    const result = extractFromSource('fields.nim', code);
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+
+    expect(fields.map((n) => n.name).sort()).toEqual(['label', 'x', 'y']);
+    expect(fields.find((n) => n.name === 'label')?.isExported).toBe(false);
+    expect(fields.find((n) => n.name === 'x')?.isExported).toBe(true);
+    expect(fields.find((n) => n.name === 'label')?.signature).toBe(': string');
+  });
+
+  it('should attach a method to the type of its first parameter', () => {
+    const code = `
+method describe*(s: Shape): string {.base.} =
+  result = s.name
+`;
+    const result = extractFromSource('methods.nim', code);
+    const method = result.nodes.find((n) => n.kind === 'method');
+
+    expect(method?.name).toBe('describe');
+    expect(method?.qualifiedName).toBe('Shape::describe');
+    // A method is never also a top-level function — the receiver decides.
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'describe')).toBeUndefined();
+  });
+
+  it('should emit an extends reference for a ref object base', () => {
+    const code = `
+type
+  Shape = ref object of RootObj
+  Circle = ref object of Shape
+`;
+    const result = extractFromSource('inherit.nim', code);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+
+    expect(extendsRefs.map((r) => r.referenceName)).toEqual(['RootObj', 'Shape']);
+    expect(extendsRefs[1]?.fromNodeId).toBe(result.nodes.find((n) => n.name === 'Circle')?.id);
+  });
+
+  it('should expand a bracket import list into one import per module', () => {
+    const code = `
+import std/[tables, sets]
+import os
+from std/math import PI
+include common
+`;
+    const result = extractFromSource('imports.nim', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+
+    // `std/[tables, sets]` names TWO modules — one node each, not one node
+    // called `std/[tables, sets]`.
+    expect(imports).toEqual(['std/tables', 'std/sets', 'os', 'std/math', 'common']);
+    expect(importRefs).toEqual(['std/tables', 'std/sets', 'os', 'std/math', 'common']);
+  });
+
+  it('should extract let, var and const with the kind each section means', () => {
+    const code = `
+let counter = 0
+var total: int
+const Limit* = 10
+`;
+    const result = extractFromSource('vars.nim', code);
+
+    expect(result.nodes.find((n) => n.name === 'counter')?.kind).toBe('variable');
+    expect(result.nodes.find((n) => n.name === 'total')?.kind).toBe('variable');
+    expect(result.nodes.find((n) => n.name === 'Limit')?.kind).toBe('constant');
+    expect(result.nodes.find((n) => n.name === 'Limit')?.isExported).toBe(true);
+  });
+
+  it('should attribute a call inside a proc to that proc', () => {
+    const code = `
+proc helper(): int = 1
+
+proc caller*(): int =
+  result = helper()
+`;
+    const result = extractFromSource('calls.nim', code);
+    const caller = result.nodes.find((n) => n.name === 'caller');
+    const callRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+    );
+
+    expect(callRef?.fromNodeId).toBe(caller?.id);
   });
 });
 
