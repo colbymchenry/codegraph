@@ -866,3 +866,29 @@ export const config = appConfig;
     expect(names(report)).toContain('NotMergedAnywhere');
   });
 });
+
+describe('CODEGRAPH_DEADCODE_KEEP_UNKNOWN_EXPORTS', () => {
+  let root: string;
+  let graph: CodeGraph;
+  beforeEach(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-unknown-'));
+    write(root, 'lib.py', 'def used():\n    return 1\n\ndef orphan_helper():\n    return 2\n');
+    write(root, 'main.py', 'from lib import used\n\nused()\n');
+    graph = CodeGraph.initSync(root);
+    await graph.indexAll();
+  }, 60_000);
+  afterEach(() => {
+    delete process.env.CODEGRAPH_DEADCODE_KEEP_UNKNOWN_EXPORTS;
+    graph?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  it('drops by default; keeps flagged rows under the flag', () => {
+    const off = buildDeadCodeReport(graph);
+    expect(names(off)).not.toContain('orphan_helper');
+    expect(off.excluded.exportsUnknown).toBeGreaterThan(0);
+    process.env.CODEGRAPH_DEADCODE_KEEP_UNKNOWN_EXPORTS = '1';
+    const on = buildDeadCodeReport(graph);
+    expect(on.entries.find((e) => e.node.name === 'orphan_helper')?.exportsUnknown).toBe(true);
+    expect(on.excluded.exportsUnknown).toBe(0);
+  });
+});
