@@ -176,7 +176,7 @@ the first two inherit the C rules and the third has none.)
 
 **No rules** — boxes draw, arrows carry no condition, and no arguments or
 trigger labels are read: PHP, Ruby, Rust, Scala, Dart, Erlang, Lua, Luau, R,
-Solidity, COBOL, CFML, VB.NET, Nix, Terraform, Pascal/Delphi, Liquid, Razor,
+Solidity, COBOL, CFML, VB.NET, Nix, Nim, Terraform, Pascal/Delphi, Liquid, Razor,
 Twig, ArkTS, and the `.svelte` / `.vue` / `.astro` template languages.
 
 A language with no rules yields **nothing**, never a wrong label — that is the
