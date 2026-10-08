@@ -3585,6 +3585,46 @@ export class TreeSitterExtractor {
           }
         }
       }
+    } else if (this.language === 'nim') {
+      // Nim: `variable_declaration` > symbol_declaration_list >
+      // symbol_declaration (the `name` field) — the declared names are never
+      // direct children, so the generic fallback finds none. `let`/`var`/`const`
+      // sections share this shape; the section parent supplies the kind (the
+      // extractor's isConst).
+      const symList = node.namedChildren.find((c) => c.type === 'symbol_declaration_list');
+      const valueNode = getChildByField(node, 'value');
+      const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+      const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+
+      for (const sym of symList?.namedChildren ?? []) {
+        if (sym.type !== 'symbol_declaration') continue;
+        const nameNode = getChildByField(sym, 'name');
+        if (!nameNode) continue;
+
+        // `counter*` — an exported name is wrapped in `exported_symbol`, whose
+        // own text carries the trailing `*`. The wrapper is also Nim's only
+        // export signal (there is no visibility keyword).
+        const exported = nameNode.type === 'exported_symbol';
+        const name = getNodeText(exported ? nameNode.namedChild(0) ?? nameNode : nameNode, this.source)
+          .replace(/\*+$/, '')
+          .trim();
+        if (!name) continue;
+
+        const varNode = this.createNode(kind, name, sym, {
+          docstring,
+          signature: initSignature,
+          isExported: exported,
+        });
+
+        // Walk the initializer scoped to the variable, as the Go branch does:
+        // a top-level `let handlers = @[onA, onB]` otherwise leaks its calls to
+        // the file node, which reads as "no caller".
+        if (valueNode) {
+          if (varNode) this.nodeStack.push(varNode.id);
+          this.visitFunctionBody(valueNode, varNode?.id ?? '');
+          if (varNode) this.nodeStack.pop();
+        }
+      }
     } else if (this.language === 'lua' || this.language === 'luau') {
       // Lua/Luau: variable_declaration → assignment_statement → variable_list
       //      (name: identifier...) = expression_list. `local x, y = 1, 2`
