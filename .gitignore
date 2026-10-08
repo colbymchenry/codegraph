@@ -29,6 +29,12 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Local decision inputs, overrides, and accounting
+/decisions.jsonl
+/overrides.json
+/decision-ledger.jsonl
+/decision-usage.sqlite*
+
 # Logs
 *.log
 npm-debug.log*
