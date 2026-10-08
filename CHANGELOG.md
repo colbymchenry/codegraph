@@ -12,7 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **CodeGraph now indexes DAML** (`.daml`), the smart-contract language of Canton and the Daml SDK. Templates show up with their fields and their `signatory`, `observer`, `ensure` and `key` clauses, choices with their controllers and whether they consume the contract, and interfaces with their methods and choices. Exercising a choice (`exercise`, `exerciseCmd`, `createAndExerciseCmd`, or a helper of your own named like them) links to that choice, creating a contract links to its template, and `interface instance` links a template to the interface it implements, so `callers` and impact follow a contract from the scripts that test it to the choices they run.
+- In Haskell and DAML, a call written through a module, like `Map.fromList` or `Account.credit`, now links to that module's function through the file's imports, including a module re-exported by another and an alias shared by several imports, and a call without a module links only to a function the file can actually see: one of its own module's or one it imports. Before, a call like `pure`, `show` or `time` could link to any project function of that name.
+
 ### Fixes
+
+- Indexing a Scala project with an overloaded operator method, such as `++`, no longer stops resolving references part way, which left most of a large project like Canton unlinked.
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
