@@ -34,6 +34,7 @@ import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks
 import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { extractHaskellImportSurface, parseHaskellReferenceName } from '../resolution/import-resolver';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
@@ -145,6 +146,8 @@ export interface SyncResult {
    */
   durationMs: number;
   changedFilePaths?: string[];
+  /** Internal recovery signal used to invalidate resolver caches after a crash. */
+  haskellImportInvalidationRecovered?: boolean;
   /** The part of `changedFilePaths` that was not indexed before this sync. */
   addedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
@@ -164,6 +167,10 @@ export interface SyncResult {
    */
   definitionDelta?: string[];
 }
+
+/** Durable marker that a Haskell import-topology invalidation is in flight.
+ *  Shared by the orchestrator and `CodeGraph` (its indexFiles cache gating). */
+export const HASKELL_IMPORT_INVALIDATION_PENDING = 'haskell_import_invalidation_pending';
 
 /**
  * Calculate SHA256 hash of file contents
@@ -192,6 +199,44 @@ function isMpegTsBytes(filePath: string, bytes: Buffer): boolean {
   if (!hasMpegTsExtension(filePath) || !isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return false;
   logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath });
   return true;
+}
+
+/**
+ * Hash only the Haskell surface that can change cross-file import resolution.
+ * Bodies, source positions, signatures, and docs are intentionally excluded so
+ * comment-only edits do not force a project-wide Haskell replay.
+ */
+export function computeHaskellTopologyHash(
+  content: string,
+  result: ExtractionResult,
+): string {
+  const symbols = result.nodes
+    .filter((node) => node.language === 'haskell' && (node.kind === 'namespace' || node.isExported))
+    .map((node) => ({
+      kind: node.kind,
+      name: node.name,
+      qualifiedName: node.qualifiedName,
+      exportParents: (node.decorators ?? [])
+        .filter((decorator) => decorator.startsWith('haskell-export-parent:')),
+    }));
+  // Both import surfaces share one comment strip (the generic dispatchers
+  // would strip three times for the same file).
+  const { imports, reExports } = extractHaskellImportSurface(content);
+  const descriptor = {
+    version: 'haskell-topology-v1',
+    symbols,
+    imports,
+    reExports,
+  };
+  const serialized = JSON.stringify(descriptor, (_key, value: unknown) => {
+    if (value instanceof Set) return [...value].sort();
+    if (value instanceof Map) {
+      return [...value.entries()]
+        .sort(([left], [right]) => String(left).localeCompare(String(right)));
+    }
+    return value;
+  });
+  return hashContent(serialized);
 }
 
 /**
@@ -226,6 +271,8 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.ipynb_checkpoints', '.eggs',
   // Rust / JVM (Maven, Gradle, Scala)
   'target', '.gradle',
+  // Haskell (Cabal / Stack build trees and dependency caches)
+  'dist-newstyle', '.stack-work',
   // .NET
   'obj',
   // Vendored deps (Go, PHP/Composer, Ruby/Bundler)
@@ -2113,6 +2160,30 @@ export class ExtractionOrchestrator {
     };
 
 
+    // Cheap pre-index probe (indexed DISTINCT scan, same pattern as the
+    // synthesizer language gates, #1212): the before/after bookkeeping below
+    // exists only for the Haskell import replay, so a project without
+    // Haskell pays neither the full-file Map nor the module-name index.
+    // Deliberately based on pre-index state — deleting the last .hs must
+    // still arm the guard for this run so removal-side topology changes are
+    // compared against what the DB remembers.
+    const recoveringHaskellInvalidation =
+      this.queries.getMetadata(HASKELL_IMPORT_INVALIDATION_PENDING) === '1';
+    const hadExistingHaskell = this.queries.getDistinctFileLanguages().has('haskell');
+    const guardHaskellReindex = hadExistingHaskell || recoveringHaskellInvalidation;
+    const trackedBeforeIndexAll = guardHaskellReindex
+      ? new Map(this.queries.getAllFiles().map((file) => [file.path, file] as const))
+      : new Map<string, FileRecord>();
+    const oldHaskellModulesByFile = guardHaskellReindex
+      ? this.queries.getHaskellModuleNamesByFile()
+      : new Map<string, string[]>();
+    if (hadExistingHaskell && !recoveringHaskellInvalidation) {
+      // Arm recovery before healZeroNodeRows or any per-file store can replace
+      // Haskell nodes/edges. A throw leaves this durable marker behind so the
+      // next indexAll/sync replays the global import invalidation.
+      this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '1');
+    }
+
     // A re-index over an existing DB skips unchanged-hash files at the store,
     // which would preserve wiped zero-node rows (#1541) — drop them first so
     // this run stores their files fresh. No-op on a fresh DB.
@@ -2291,7 +2362,7 @@ export class ExtractionOrchestrator {
             filePath,
             language,
             buffers: result.kernelBuffers,
-            file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
+            file: this.buildFileRecord(filePath, content, language, stats, result, nodeCount),
             ...(result.unresolvedReferences.length > 0 ? { extraRefs: result.unresolvedReferences } : {}),
           });
         } else {
@@ -2690,8 +2761,42 @@ export class ExtractionOrchestrator {
       }
     }
 
-    // Shut down the parse worker pool.
+    // Shut down the parse worker pool before final main-thread graph work.
     if (pool) await pool.destroy();
+
+    if (guardHaskellReindex) {
+      const trackedAfter = new Map(
+        this.queries.getAllFiles().map((file) => [file.path, file] as const),
+      );
+      const changedModules = new Set<string>();
+      let topologyChanged = recoveringHaskellInvalidation;
+      for (const filePath of files) {
+        const before = trackedBeforeIndexAll.get(filePath);
+        const after = trackedAfter.get(filePath);
+        if (before?.language !== 'haskell' && after?.language !== 'haskell') continue;
+        if (before?.haskellTopologyHash === after?.haskellTopologyHash) continue;
+        topologyChanged = true;
+        for (const name of oldHaskellModulesByFile.get(filePath) ?? []) changedModules.add(name);
+        for (const node of this.queries.getNodesByFile(filePath)) {
+          if (node.kind === 'namespace' && node.language === 'haskell') changedModules.add(node.name);
+        }
+      }
+      const indexingFailed = errors.some((error) => error.severity === 'error');
+      if (topologyChanged && !indexingFailed) {
+        const haskellFiles = [...trackedAfter.values()]
+          .filter((file) => file.language === 'haskell')
+          .map((file) => file.path);
+        this.invalidateHaskellImportEdges(
+          haskellFiles,
+          changedModules,
+          recoveringHaskellInvalidation,
+        );
+      } else if (!topologyChanged && !indexingFailed) {
+        // A complete re-index whose Haskell topology stayed stable can safely
+        // disarm the pre-mutation guard. On any returned error it remains set.
+        this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '0');
+      }
+    }
 
     return {
       success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
@@ -2718,12 +2823,51 @@ export class ExtractionOrchestrator {
     let filesErrored = 0;
     let totalNodes = 0;
     let totalEdges = 0;
+    const overrides = loadExtensionOverrides(this.rootDir);
+    const changedModules = new Set<string>();
+    const hadPendingHaskellInvalidation =
+      this.queries.getMetadata(HASKELL_IMPORT_INVALIDATION_PENDING) === '1';
+    let haskellRecoveryArmed = hadPendingHaskellInvalidation;
+    let haskellIndexingFailed = false;
+    let topologyChanged = false;
 
     for (const filePath of filePaths) {
+      const trackedBefore = this.queries.getFileByPath(filePath);
+      const isHaskell = trackedBefore?.language === 'haskell'
+        || detectLanguage(filePath, undefined, overrides) === 'haskell';
+      const oldModuleNames = isHaskell && trackedBefore
+        ? this.queries.getNodesByFile(filePath)
+          .filter((node) => node.kind === 'namespace' && node.language === 'haskell')
+          .map((node) => node.name)
+        : [];
+      if (isHaskell) {
+        // Persist the recovery intent before indexFile can replace nodes/edges.
+        // A thrown store or invalidation must leave this set so a later sync can
+        // replay the project-wide import invalidation even when hashes now match.
+        if (!haskellRecoveryArmed) {
+          this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '1');
+          haskellRecoveryArmed = true;
+        }
+      }
+
       const result = await this.indexFile(filePath);
+
+      if (isHaskell) {
+        const after = this.queries.getFileByPath(filePath);
+        if (after?.haskellTopologyHash !== trackedBefore?.haskellTopologyHash) {
+          topologyChanged = true;
+          for (const name of oldModuleNames) changedModules.add(name);
+          for (const node of this.queries.getNodesByFile(filePath)) {
+            if (node.kind === 'namespace' && node.language === 'haskell') changedModules.add(node.name);
+          }
+        }
+      }
 
       if (result.errors.length > 0) {
         errors.push(...result.errors);
+        if (isHaskell && result.errors.some((error) => error.severity === 'error')) {
+          haskellIndexingFailed = true;
+        }
       }
 
       if (hasGrammarLoadFailure(result.errors)) {
@@ -2742,6 +2886,25 @@ export class ExtractionOrchestrator {
           filesSkipped++;
         }
       }
+    }
+
+    if (
+      topologyChanged
+      && !hadPendingHaskellInvalidation
+      && !haskellIndexingFailed
+    ) {
+      const haskellFiles = this.queries.getAllFiles()
+        .filter((file) => file.language === 'haskell')
+        .map((file) => file.path);
+      this.invalidateHaskellImportEdges(haskellFiles, changedModules);
+    } else if (
+      !hadPendingHaskellInvalidation
+      && haskellRecoveryArmed
+      && !haskellIndexingFailed
+    ) {
+      // All Haskell stores completed and their import/export surface stayed
+      // stable. A crash before this write merely causes a conservative replay.
+      this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '0');
     }
 
     return {
@@ -2955,6 +3118,11 @@ export class ExtractionOrchestrator {
     // removed) by an edit is reflected on the next sync (#1500). Computed after
     // the unchanged-file early return so untouched files pay nothing.
     const generated = detectGeneratedFile(filePath, content);
+    const haskellTopologyHash = language === 'haskell'
+      ? computeHaskellTopologyHash(content, result)
+      : undefined;
+    const haskellTopologyChanged = language === 'haskell'
+      && existingFile?.haskellTopologyHash !== haskellTopologyHash;
 
     // Snapshot incoming cross-file edges BEFORE deleting this file's nodes.
     // `deleteFile` cascades to delete every edge whose source OR target is a
@@ -3011,7 +3179,7 @@ export class ExtractionOrchestrator {
       validEdges.length <= STORE_CHUNK &&
       validRefs.length <= STORE_CHUNK;
     if (fitsOneChunk) {
-      this.queries.runInTransaction(() => {
+      this.queries.transaction(() => {
         if (existingFile) {
           this.queries.deleteFile(filePath);
         }
@@ -3027,13 +3195,19 @@ export class ExtractionOrchestrator {
             modifiedAt: stats.mtimeMs,
             indexedAt: Date.now(),
             nodeCount: result.nodes.length,
+            haskellTopologyHash,
             errors: result.errors.length > 0 ? result.errors : undefined,
             generated,
           },
         });
-        // On a fresh bulk index crossFileIncomingEdges is [].
         if (crossFileIncomingEdges.length > 0) {
-          this.reattachCrossFileEdges(crossFileIncomingEdges, priorNodes, validNodes);
+          this.reattachCrossFileEdges(
+            crossFileIncomingEdges,
+            priorNodes,
+            validNodes,
+            language,
+            haskellTopologyChanged,
+          );
         }
       });
       return;
@@ -3078,7 +3252,13 @@ export class ExtractionOrchestrator {
     // target's plain name would strip receiver/qualifier context and risk a
     // rebind a full re-index would never make.
     if (crossFileIncomingEdges.length > 0) {
-      this.reattachCrossFileEdges(crossFileIncomingEdges, priorNodes, validNodes);
+      this.reattachCrossFileEdges(
+        crossFileIncomingEdges,
+        priorNodes,
+        validNodes,
+        language,
+        haskellTopologyChanged,
+      );
     }
 
     // Insert unresolved references in batch with denormalized filePath/language
@@ -3096,6 +3276,7 @@ export class ExtractionOrchestrator {
       modifiedAt: stats.mtimeMs,
       indexedAt: Date.now(),
       nodeCount: result.nodes.length,
+      haskellTopologyHash,
       errors: result.errors.length > 0 ? result.errors : undefined,
       generated,
     };
@@ -3113,8 +3294,8 @@ export class ExtractionOrchestrator {
     content: string,
     language: Language,
     stats: fs.Stats,
-    nodeCount: number,
-    resultErrors: ExtractionResult['errors']
+    result: ExtractionResult,
+    nodeCountOverride?: number,
   ): FileRecord {
     return {
       path: filePath,
@@ -3123,8 +3304,11 @@ export class ExtractionOrchestrator {
       size: stats.size,
       modifiedAt: stats.mtimeMs,
       indexedAt: Date.now(),
-      nodeCount,
-      errors: resultErrors.length > 0 ? resultErrors : undefined,
+      nodeCount: nodeCountOverride ?? result.nodes.length,
+      haskellTopologyHash: language === 'haskell'
+        ? computeHaskellTopologyHash(content, result)
+        : undefined,
+      errors: result.errors.length > 0 ? result.errors : undefined,
       // Decided here, once, while the content is already in memory — never at
       // query time (#1500). The header scan short-circuits on a single
       // substring test for ~every hand-written file.
@@ -3143,33 +3327,55 @@ export class ExtractionOrchestrator {
       result,
       filePath,
       language,
-      this.buildFileRecord(filePath, content, language, stats, result.nodes.length, result.errors)
+      this.buildFileRecord(filePath, content, language, stats, result)
     );
   }
 
   /**
    * Re-attach cross-file incoming edges snapshotted before a re-index delete
-   * (#899): move each edge's target to the re-indexed node that replaces it
-   * ({@link pairReindexedNodes}). Targets that vanished, or that can't be
-   * told apart from a same-named sibling (#2276), are resurrected as their
-   * original unresolved ref (#1240's removal-side counterpart) when the edge
-   * carries its refName stamp, so resolution picks the target afresh.
+   * (#899). Non-Haskell targets follow the old/new node pairing
+   * ({@link pairReindexedNodes}). Haskell imports are revalidated only when the module
+   * topology changed; body/comment edits retain the fast path.
    */
   private reattachCrossFileEdges(
-    crossFileIncomingEdges: Array<Edge & { sourceFilePath: string; sourceLanguage: Language }>,
+    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; targetQualifiedName: string; sourceFilePath: string; sourceLanguage: Language }>,
     priorNodes: readonly NodeIdentity[],
-    validNodes: readonly NodeIdentity[]
+    validNodes: readonly NodeIdentity[],
+    targetLanguage: Language,
+    targetHaskellTopologyChanged: boolean,
   ): void {
+    const qualified = new Map<string, string | null>();
+    const unqualified = new Map<string, string | null>();
     const replacementOf = pairReindexedNodes(priorNodes, validNodes);
+    const addUnique = (index: Map<string, string | null>, key: string, id: string): void => {
+      const current = index.get(key);
+      if (current === undefined) index.set(key, id);
+      else if (current !== id) index.set(key, null);
+    };
+    for (const n of validNodes) {
+      addUnique(qualified, `${n.kind}\0${n.qualifiedName}`, n.id);
+      addUnique(unqualified, `${n.kind}\0${n.name}`, n.id);
+    }
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
-      const newTargetId = replacementOf.get(e.target);
+      const ref = resurrectRefFromDroppedEdge(e);
+      const mustRevalidateHaskellImport = targetHaskellTopologyChanged
+        && targetLanguage === 'haskell'
+        && e.sourceLanguage === 'haskell'
+        && e.metadata?.resolvedBy === 'import';
+      if (ref && mustRevalidateHaskellImport) {
+        resurrected.push(ref);
+        continue;
+      }
+      const newTargetId = targetLanguage === 'haskell'
+        ? qualified.get(`${e.targetKind}\0${e.targetQualifiedName}`)
+          ?? unqualified.get(`${e.targetKind}\0${e.targetName}`)
+        : replacementOf.get(e.target);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
-      } else {
-        const ref = resurrectRefFromDroppedEdge(e);
-        if (ref) resurrected.push(ref);
+      } else if (ref) {
+        resurrected.push(ref);
       }
     }
     if (reinserted.length > 0) {
@@ -3178,6 +3384,84 @@ export class ExtractionOrchestrator {
     if (resurrected.length > 0) {
       this.queries.insertUnresolvedRefsBatch(resurrected);
     }
+  }
+
+  /**
+   * Haskell import resolution depends on global module headers and arbitrary
+   * re-export chains. The persisted edge points directly at the final symbol,
+   * so neither a changed/deleted intermediate facade nor a newly-added better
+   * duplicate module is visible from that target edge. Until the edge stores
+   * its complete module provenance, correctness requires invalidating every
+   * Haskell edge produced by import resolution whenever the Haskell module
+   * topology changes. Module-level local references are included when their
+   * uniqueness depends on that same import namespace.
+   *
+   * Preserve extraction/synthesis edges from each affected source node, and
+   * resurrect only faithfully stamped import edges as their original refs. The
+   * normal sync orphan sweep resolves those pending refs against the final
+   * post-sync module/re-export graph.
+   */
+  private invalidateHaskellImportEdges(
+    sourceFilePaths: Iterable<string>,
+    changedModuleNames: ReadonlySet<string>,
+    retryAllHaskellFiles = false,
+  ): number {
+    return this.queries.transaction(() => {
+      const sourceFiles = new Set(sourceFilePaths);
+      const resurrected: UnresolvedReference[] = [];
+      // Recovery after an interrupted topology sync no longer has the old/new
+      // module-name delta. Retrying known-name failures from every Haskell file
+      // is rare, bounded, and restores the same result as a full fresh index.
+      const touchedSourceFiles = new Set(retryAllHaskellFiles ? sourceFiles : []);
+      const edgeIds: number[] = [];
+      for (const edge of this.queries.getHaskellImportResolutionEdges()) {
+        if (!sourceFiles.has(edge.sourceFilePath)) continue;
+        const ref = resurrectRefFromDroppedEdge(edge);
+        if (!ref) continue;
+        touchedSourceFiles.add(edge.sourceFilePath);
+        resurrected.push(ref);
+        edgeIds.push(edge.edgeId);
+      }
+      // Delete only the rows being replayed. Nested lexical, extraction, and
+      // synthesis edges retain their row ids and metadata.
+      this.queries.deleteEdgesByIds(edgeIds);
+
+      // A facade that was absent during the previous sync has no surviving edge
+      // to invalidate when it reappears. Its failed module-import ref still tells
+      // us which source files depend on the changed module; include those files
+      // in the retry set, then reset only refs whose leaf now exists somewhere in
+      // the project (avoids retrying every Prelude/external name).
+      const existingRefs = this.queries.getUnresolvedReferencesByLanguage('haskell');
+      for (const ref of existingRefs) {
+        if (ref.filePath && ref.referenceKind === 'imports' && changedModuleNames.has(ref.referenceName)) {
+          touchedSourceFiles.add(ref.filePath);
+        }
+      }
+      const knownNames = new Set(this.queries.getNodeNamesByLanguage('haskell'));
+      const retryable = existingRefs.filter((ref) => {
+        if (!ref.filePath || !touchedSourceFiles.has(ref.filePath)) return false;
+        const parsed = parseHaskellReferenceName(ref.referenceName);
+        const normalized = parsed.normalized;
+        const leaf = parsed.member;
+        return knownNames.has(normalized)
+          || knownNames.has(leaf)
+          || knownNames.has(`(${leaf})`);
+      });
+      const retryRowIds = retryable.flatMap((ref) => ref.rowId === undefined ? [] : [ref.rowId]);
+      if (retryRowIds.length > 0) this.queries.deleteReferencesByRowIds(retryRowIds);
+
+      const BATCH = 2000;
+      for (let i = 0; i < retryable.length; i += BATCH) {
+        this.queries.insertUnresolvedRefsBatch(retryable.slice(i, i + BATCH));
+      }
+      for (let i = 0; i < resurrected.length; i += BATCH) {
+        this.queries.insertUnresolvedRefsBatch(resurrected.slice(i, i + BATCH));
+      }
+      // Clearing the durable marker in the same transaction as edge→ref
+      // conversion makes an interruption either fully committed or replayable.
+      this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '0');
+      return edgeIds.length;
+    });
   }
 
   /**
@@ -3268,12 +3552,35 @@ export class ExtractionOrchestrator {
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
+    const extensionOverrides = loadExtensionOverrides(this.rootDir);
     let filesChecked = 0;
     let filesAdded = 0;
     let filesModified = 0;
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    const recoveringHaskellInvalidation =
+      this.queries.getMetadata(HASKELL_IMPORT_INVALIDATION_PENDING) === '1';
+    let haskellTopologyChanged = recoveringHaskellInvalidation;
+    let haskellRecoveryArmed = recoveringHaskellInvalidation;
+    const modifiedHaskellTopologies = new Map<string, {
+      oldTopologyHash?: string;
+      expectedContentHash: string;
+    }>();
+    const changedHaskellModuleNames = new Set<string>();
+    const armHaskellInvalidationRecovery = (): void => {
+      // Commit the recovery intent before any file/edge mutation. If a later
+      // write or the invalidation transaction is interrupted, the next sync
+      // replays a broad Haskell invalidation even when file hashes now match.
+      if (!haskellRecoveryArmed) {
+        this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '1');
+        haskellRecoveryArmed = true;
+      }
+    };
+    const markHaskellTopologyChanged = (): void => {
+      armHaskellInvalidationRecovery();
+      haskellTopologyChanged = true;
+    };
     const addedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
@@ -3317,10 +3624,9 @@ export class ExtractionOrchestrator {
       // sync would treat it. (`include`-forced paths pass: ScopeIgnore
       // applies the include precedence itself.)
       const scope = this.scopedSyncMatcher();
-      const overrides = loadExtensionOverrides(this.rootDir);
       currentFiles = unique.filter(
         (p) =>
-          isSourceFile(p, overrides, this.rootDir) &&
+          isSourceFile(p, extensionOverrides, this.rootDir) &&
           !scope.ignores(p) &&
           fs.existsSync(path.join(this.rootDir, p))
       );
@@ -3350,8 +3656,10 @@ export class ExtractionOrchestrator {
     }
     const currentSet = new Set(currentFiles);
     const trackedMap = new Map<string, FileRecord>();
+    const haskellSourcePaths = new Set<string>();
     for (const f of trackedFiles) {
       trackedMap.set(f.path, f);
+      if (f.language === 'haskell') haskellSourcePaths.add(f.path);
     }
 
     // Removals: tracked in the DB but no longer a present source file. Check the
@@ -3361,6 +3669,14 @@ export class ExtractionOrchestrator {
     // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
     let reconcileChecks = 0;
     const removeTracked = (tracked: FileRecord): void => {
+      if (tracked.language === 'haskell') {
+        markHaskellTopologyChanged();
+        for (const node of this.queries.getNodesByFile(tracked.path)) {
+          if (node.kind === 'namespace' && node.language === 'haskell') {
+            changedHaskellModuleNames.add(node.name);
+          }
+        }
+      }
       // Before the cascade deletes them, resurrect incoming cross-file
       // resolution edges as their original refs (#1240 removal case): the
       // callers live in files this sync will NOT revisit, so this is their
@@ -3403,6 +3719,9 @@ export class ExtractionOrchestrator {
       }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
+      const isHaskell = tracked?.language === 'haskell'
+        || detectLanguage(filePath, undefined, extensionOverrides) === 'haskell';
+      if (isHaskell) haskellSourcePaths.add(filePath);
       // A row an older engine stored while the file's grammar could not load
       // (#2335) holds no parse of these bytes: re-index it even though its
       // size, mtime and hash all match. Rows with a real parse error are
@@ -3451,7 +3770,23 @@ export class ExtractionOrchestrator {
         changedFilePaths.push(filePath);
         addedFilePaths.push(filePath);
         filesAdded++;
+        if (isHaskell) markHaskellTopologyChanged();
       } else if (tracked.contentHash !== contentHash || neverParsed) {
+        if (isHaskell) {
+          // Arm recovery before indexFile mutates nodes/file records, but defer
+          // the expensive global replay decision until the freshly committed
+          // topology fingerprint can be compared with this old one.
+          armHaskellInvalidationRecovery();
+          modifiedHaskellTopologies.set(filePath, {
+            oldTopologyHash: tracked.haskellTopologyHash,
+            expectedContentHash: contentHash,
+          });
+          for (const node of this.queries.getNodesByFile(filePath)) {
+            if (node.kind === 'namespace' && node.language === 'haskell') {
+              changedHaskellModuleNames.add(node.name);
+            }
+          }
+        }
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
@@ -3469,8 +3804,7 @@ export class ExtractionOrchestrator {
 
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
-      const overrides = loadExtensionOverrides(this.rootDir);
-      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides, this.rootDir));
+      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, extensionOverrides, this.rootDir));
     }
 
     // Index changed files
@@ -3490,6 +3824,48 @@ export class ExtractionOrchestrator {
 
       const pause = backpressure?.();
       if (pause) await pause;
+    }
+
+    if (!recoveringHaskellInvalidation) {
+      for (const [filePath, previous] of modifiedHaskellTopologies) {
+        const current = this.queries.getFileByPath(filePath);
+        const topologyUnchanged = previous.oldTopologyHash !== undefined
+          && current?.contentHash === previous.expectedContentHash
+          && current.haskellTopologyHash === previous.oldTopologyHash;
+        if (!topologyUnchanged) {
+          haskellTopologyChanged = true;
+          for (const node of this.queries.getNodesByFile(filePath)) {
+            if (node.kind === 'namespace' && node.language === 'haskell') {
+              changedHaskellModuleNames.add(node.name);
+            }
+          }
+        }
+      }
+    }
+
+    if (haskellTopologyChanged) {
+      if (scopedPaths && scopedPaths.length > 0) {
+        for (const file of this.queries.getAllFiles()) {
+          if (file.language === 'haskell') haskellSourcePaths.add(file.path);
+        }
+      }
+      for (const filePath of filesToIndex) {
+        for (const node of this.queries.getNodesByFile(filePath)) {
+          if (node.kind === 'namespace' && node.language === 'haskell') {
+            changedHaskellModuleNames.add(node.name);
+          }
+        }
+      }
+      this.invalidateHaskellImportEdges(
+        haskellSourcePaths,
+        changedHaskellModuleNames,
+        recoveringHaskellInvalidation,
+      );
+    } else if (haskellRecoveryArmed) {
+      // Every modified Haskell file committed the same cross-file topology.
+      // Clearing the pre-mutation marker is now safe; a crash before this line
+      // merely causes one conservative broad recovery on the next sync.
+      this.queries.setMetadata(HASKELL_IMPORT_INVALIDATION_PENDING, '0');
     }
 
     // Names whose definition set this sync changed: a `file\0name` pair present
@@ -3519,6 +3895,7 @@ export class ExtractionOrchestrator {
       nodesUpdated,
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
+      haskellImportInvalidationRecovered: recoveringHaskellInvalidation || undefined,
       ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,

@@ -10,7 +10,7 @@ import { referenceNameTail } from './reference-tail';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 15;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 /**
  * Migration definition
@@ -297,6 +297,34 @@ const migrations: Migration[] = [
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_name ON unresolved_refs(status, reference_name) WHERE status = 'failed' AND name_tail GLOB 'module:*';
       `);
+    },
+  },
+  {
+    version: 16,
+    description:
+      'Reconcile Haskell fingerprints and upstream synthesis and import-retry migrations',
+    up: (db) => {
+      // Haskell v14 used the version for fingerprint reconciliation, skipping
+      // upstream's route-module tail rewrite. Replay that idempotent rewrite
+      // so indexes from either history can retry their parked route references.
+      migrations.find((migration) => migration.version === 14)!.up(db);
+      // Haskell indexes at v12 used that version for topology fingerprints,
+      // so they have not run upstream's v12 import-tail migration. Replay it
+      // only when its indexes are missing; its DDL and tail rewrite are idempotent.
+      const failedImportIndexes = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_unresolved_failed_import_tail', 'idx_unresolved_failed_import_name')"
+      ).all();
+      if (failedImportIndexes.length < 2) migrations.find((migration) => migration.version === 12)!.up(db);
+      // The Haskell branch also used v10, for topology fingerprints. Its
+      // existing indexes have not run upstream's v10 synthesis migration.
+      const synthesisInputs = db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'synthesis_inputs'"
+      ).get();
+      if (!synthesisInputs) migrations.find((migration) => migration.version === 10)!.up(db);
+      const cols = db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>;
+      if (!cols.some((column) => column.name === 'haskell_topology_hash')) {
+        db.exec('ALTER TABLE files ADD COLUMN haskell_topology_hash TEXT');
+      }
     },
   },
 ];

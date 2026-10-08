@@ -136,6 +136,7 @@ describe('generated flag — schema migration to v9', () => {
       INSERT INTO schema_versions VALUES (8, 0, 'legacy');
       DROP INDEX idx_files_generated;
       ALTER TABLE files DROP COLUMN generated;
+      ALTER TABLE files DROP COLUMN haskell_topology_hash;
       DROP TABLE synthesis_inputs;
       DROP INDEX idx_edges_synthesis_site;
       DROP INDEX idx_nodes_kind;

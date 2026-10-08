@@ -3,7 +3,9 @@ import { QueryBuilder } from './queries';
 import { createYielder } from '../resolution/cooperative-yield';
 
 // Ownership is independent of provenance: Go method containment is structural.
-export const SYNTHESIZED_EDGE = "CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL";
+// Haskell combinators belong to reference resolution/import invalidation, so
+// callback synthesis must preserve them as base edges when replacing its output.
+export const SYNTHESIZED_EDGE = "CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END NOT IN ('haskell-combinator')";
 
 /** A private edge overlay: passes see base edges plus their new Go prerequisites. */
 export class SynthesisStage {

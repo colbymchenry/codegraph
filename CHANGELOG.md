@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
+### Security
+
+- Indexing now bounds re-export searches so deeply interconnected modules cannot cause exponential work and block the process. (#1337)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
@@ -107,6 +115,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_explore`'s Flow now goes through the implementation your query names when an interface method has several that lead to the same place. Before, it took whichever one came first in the index: asking about prometheus's `Engine.execEvalStmt Queryable.Querier fanout.Querier NewMergeQuerier` traced the call through the TSDB's `DB.Querier` and left the `fanout.Querier` you named off the Flow. Any two routes of the same length are now settled this way, in favor of the one that passes through more of the symbols you named.
 - In C and C++, a struct, class, union or enum defined in a variable declaration, like `struct Foo { … } foo;`, is now indexed with its methods and enum values, next to the variable. Before, at most the variable was, so the type was missing from search and `codegraph_explore`, a class deriving from it had no base, and calls to its methods linked to nothing: in redis, the Sentinel's `sentinelState` and `redis-cli`'s `config` struct were missing. A struct, union or enum with no name of its own now takes the name of the variable it declares, so redis's `static struct { … } SPT;` is found as `SPT`, and one declared inside a function is named after its variable instead of `<anonymous>`. The comment above the declaration becomes the type's description. Re-index C and C++ projects after upgrading.
 - In TypeScript React code, a styled-components or emotion component declared with a type argument, like `const Wrapper = styled.div<WrapperProps>` followed by its CSS, or `styled(Base)<Props>`, is now indexed as a component, as one written without a type argument already was. Before, it was indexed as a plain constant, so `codegraph callers` and impact found none of the code that renders it, and its tags could link to another file's component of the same name instead: in outline/outline, `NudeButton` and `HStack` had no callers, and `<Text>` tags linked to a different `Text` than the one each file imports. Re-index TypeScript React projects after upgrading.
+
+#### Haskell indexing
+
+- Large Haskell projects index and refresh exported definitions faster while preserving import visibility and ambiguity checks. (#1337)
+
+- Haskell local functions keep their callers when they shadow a parameter with the same name. (#1337)
+
+- Custom Haskell functions named like standard combinators no longer create calls to arguments they do not execute. (#1337)
+
+- Haskell pattern synonyms now retain calls through local helpers while excluding quoted code that is not executed.
+
+- Haskell calls now respect nested and inline local scopes, keeping helpers from capturing unrelated calls elsewhere in a function.
+
+- Haskell names shared by a module declaration and an import remain unresolved when ambiguous, including after an imported module changes its exports.
+
+- Haskell record fields shared by several constructors resolve as one selector per type, and applied deriving clauses no longer create false class relationships.
+
+- Haskell record construction now links each field to the type named by its constructor, including through qualified imports.
+
+- Incremental Haskell updates refresh affected module imports with fewer database reads while preserving unrelated graph relationships.
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 ## [1.6.2] - 2026-10-03
 
