@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Production code that imports a package no longer links by name to that package's Jest manual mock under `__mocks__/` when the import itself could not be followed. Before, `formatLabel(name)` after `import { formatLabel } from 'acme-shared'` pointed at `__mocks__/acme-shared.ts`, and the real function showed no caller. A file that imports the mock by path still reaches it, and so do tests. (#2455)
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn for the report. (#2600)
