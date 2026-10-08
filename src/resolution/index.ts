@@ -51,6 +51,8 @@ import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
 import { parse as parseJsonc } from 'jsonc-parser';
+import { atSite, refKey, refPayload, toCand, isRecording } from '../decision/record';
+import { appliedFor, isVetoed, overridesActive } from '../decision/overrides';
 
 const NODE_BUILTINS = new Set(builtinModules);
 
@@ -1187,9 +1189,14 @@ export class ReferenceResolver {
     // A name a declaration around the reference declares as a type parameter
     // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters),
     // and a Dart call to a parameter or local calls that (./dart-local-scope).
+    // Decision overrides (src/decision): an A2/A3 "none" ends the reference whatever a
+    // later strategy found; one every strategy declined may still take an
+    // A6 pick, which meets the same gates.
+    const inner = this.resolveOneInner(ref);
+    const decided = overridesActive() && isVetoed(refKey(ref)) ? null : inner ?? this.decideUnresolved(ref);
     const candidate = gateDartLocal(
       gateTypeParameter(
-        gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+        gateSwiftTypeTarget(this.gateTargetKind(decided, ref), ref, this.context),
         ref,
         this.context,
       ),
@@ -1220,6 +1227,37 @@ export class ReferenceResolver {
       targetNodeId: forwarded.id,
       confidence: Math.min(resolved.confidence, 0.85),
     }, ref);
+  }
+
+  /**
+   * Decision point A6: a reference every strategy declined. Records its
+   * same-named project definitions and obeys a precomputed override; the pick
+   * then passes resolveOne's gates like any strategy's answer. With no record
+   * path and no overrides file this returns null immediately.
+   */
+  private decideUnresolved(ref: UnresolvedRef): ResolvedRef | null {
+    if (!isRecording('A6') && !overridesActive()) return null;
+    // Just queued for a later pass (it needs supertype edges): not declined yet.
+    if (this.deferredChainRefs.at(-1) === ref || this.deferredThisMemberRefs.at(-1) === ref) return null;
+    const cut = Math.max(ref.referenceName.lastIndexOf('.'), ref.referenceName.lastIndexOf(':'));
+    const bare = cut >= 0 ? ref.referenceName.slice(cut + 1) : ref.referenceName;
+    if (!bare) return null;
+    const pool = this.context.getNodesByName(bare).filter((n) => n.id !== ref.fromNodeId && n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file');
+    if (pool.length === 0) return null;
+    const v = atSite('A6', refKey(ref), null, () => ({ ref: refPayload(ref), candidates: pool.slice(0, 32).map(toCand), total: pool.length }));
+    if (!v?.pick || !pool.some((n) => n.id === v.pick)) return null;
+    return { original: ref, targetNodeId: v.pick, confidence: v.p, resolvedBy: 'exact-match', metadata: { decision: 'A6', decisionP: v.p } };
+  }
+
+  /**
+   * A B1 pick a framework's name heuristic applied (src/decision) carries its verdict, as
+   * the A-group picks do: confidence p, `metadata.decision`, `metadata.decisionP`.
+   */
+  private markAppliedB1(resolved: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!resolved || !overridesActive()) return resolved;
+    const v = appliedFor(refKey(ref));
+    if (!v || v.pick !== resolved.targetNodeId) return resolved;
+    return { ...resolved, confidence: v.p, metadata: { ...resolved.metadata, decision: 'B1', decisionP: v.p } };
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
@@ -1400,7 +1438,7 @@ export class ReferenceResolver {
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
     for (const framework of this.frameworksFor(ref.language)) {
-      const resolved = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
+      const resolved = this.markAppliedB1(this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref), ref);
       // Name the resolver on the edge (`metadata.framework`): a Swift→ObjC or
       // React Native bridge hop says how it got into the graph, as a
       // synthesized edge's `synthesizedBy` does.
@@ -1872,7 +1910,8 @@ export class ReferenceResolver {
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
       const match = this.gateLanguage(chainMatch, ref);
-      if (match) resolved.push(match);
+      // An A2/A3 "none" stays final in this pass too (src/decision).
+      if (match && !(overridesActive() && isVetoed(refKey(ref)))) resolved.push(match);
       await maybeYield();
     }
     return this.persistDeferredReferences(deferred, resolved);

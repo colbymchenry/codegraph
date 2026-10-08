@@ -19,6 +19,9 @@ import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
+import { atSite, capWithPick, refKey, refPayload, toCand } from '../decision/record';
+import { vetoReference } from '../decision/overrides';
+import type { Verdict } from '../decision/types';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -7565,6 +7568,33 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
 }
 
 /**
+ * Decision point A1 (src/decision): record the instance; obey a precomputed
+ * override. `best` is the definition to link (null: none of them — the caller
+ * moves on to the next strategy), `a1` the override that chose it, if any. A
+ * pick that is no current candidate is no override.
+ */
+function decideA1(ref: UnresolvedRef, candidates: Node[], heuristic: Node | null): { best: Node | null; a1: Verdict | undefined } {
+  const pick = heuristic?.id ?? null;
+  const v = atSite('A1', refKey(ref), pick, () => ({
+    ref: refPayload(ref),
+    candidates: capWithPick(candidates, pick, 32).map(toCand),
+    total: candidates.length,
+  }));
+  const chosen = v?.pick ? candidates.find((c) => c.id === v.pick) : undefined;
+  if (!v || (v.pick !== null && !chosen)) return { best: heuristic, a1: undefined };
+  return { best: chosen ?? null, a1: v };
+}
+
+/**
+ * An A2/A3 "none" verdict: drop this strategy's answer and end the
+ * reference — resolveOne keeps every later strategy, and A6, off it.
+ */
+function vetoed(ref: UnresolvedRef): null {
+  vetoReference(refKey(ref));
+  return null;
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -7769,7 +7799,7 @@ export function matchByExactName(
   }
 
   // Multiple matches - try to narrow down
-  const bestMatch = findBestMatch(ref, candidates, context);
+  const { best: bestMatch, a1 } = decideA1(ref, candidates, findBestMatch(ref, candidates, context));
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
@@ -7777,8 +7807,9 @@ export function matchByExactName(
     return {
       original: ref,
       targetNodeId: bestMatch.id,
-      confidence,
+      confidence: a1?.pick ? a1.p : confidence,
       resolvedBy: 'exact-match',
+      ...(a1?.pick ? { metadata: { decision: 'A1', decisionP: a1.p } } : {}),
     };
   }
 
@@ -8811,11 +8842,28 @@ export function resolveMethodOnType(
   // an import FQN pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
   const ordered = preferCallSiteFile(matches, ref.filePath);
+  // Several declarations, none in the call site's file: ordered[0] is a guess.
+  const guessed = matches.length > 1 && ordered[0]!.filePath !== ref.filePath;
+  // Decision point A3: which same-named Type::method declaration. `ref` may be a copy
+  // with another filePath (typed-receiver paths), so the snippet file comes from the caller node.
+  const a3 = matches.length > 1
+    ? atSite('A3', `${refKey(ref)}:${typeName}.${methodName}`, ordered[0]!.id, () => ({
+        ref: { ...refPayload(ref), filePath: context.getNodeById?.(ref.fromNodeId)?.filePath ?? ref.filePath },
+        typeName,
+        methodName,
+        candidates: capWithPick(matches, ordered[0]!.id, 32).map(toCand),
+        total: matches.length,
+      }))
+    : undefined;
+  if (a3?.pick === null) return vetoed(ref);
+  // A pick that is no current candidate is no override: the heuristic stands.
+  const chosen = a3?.pick ? matches.find((m) => m.id === a3.pick) : undefined;
   return {
     original: ref,
-    targetNodeId: ordered[0]!.id,
-    confidence,
+    targetNodeId: (chosen ?? ordered[0]!).id,
+    confidence: chosen && a3 ? a3.p : guessed ? Math.min(confidence, 0.6) : confidence,
     resolvedBy,
+    ...(chosen && a3 ? { metadata: { decision: 'A3', decisionP: a3.p } } : {}),
   };
 }
 
@@ -11252,11 +11300,22 @@ export function matchMethodCall(
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
+      const lone = targetMethods[0]!;
+      // Decision point A2 (lone candidate): is the untyped receiver this class, or a library object?
+      const v = atSite('A2', refKey(ref), lone.id, () => ({
+        call: { receiver: objectOrClass!, method: methodName!, filePath: ref.filePath, line: ref.line },
+        candidates: [toCand(lone)],
+        total: 1,
+      }));
+      // Only "none" or the lone candidate is a verdict; any other pick is no override.
+      const a2 = v && (v.pick === null || v.pick === lone.id) ? v : undefined;
+      if (a2?.pick === null) return vetoed(ref);
       return {
         original: ref,
-        targetNodeId: targetMethods[0]!.id,
-        confidence: 0.7,
+        targetNodeId: lone.id,
+        confidence: a2 ? a2.p : 0.7,
         resolvedBy: 'instance-method',
+        ...(a2 ? { metadata: { decision: 'A2', decisionP: a2.p } } : {}),
       };
     }
 
@@ -11307,6 +11366,21 @@ export function matchMethodCall(
       // `ColorHSL`, and the first indexed took about 90 of the app's calls.
       if (ref.language === 'vbnet' && tied.length > 1 && bestScore >= 2) bestMatch = breakVbTie(tied, ref, context) ?? undefined;
 
+      // Decision point A2 (several owners): which class's method the untyped receiver calls.
+      const a2Pick = bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId ? bestMatch.id : null;
+      const a2m = atSite('A2', refKey(ref), a2Pick, () => ({
+        call: { receiver: objectOrClass!, method: methodName!, filePath: ref.filePath, line: ref.line },
+        candidates: capWithPick(targetMethods, a2Pick, 32).map(toCand),
+        total: targetMethods.length,
+      }));
+      if (a2m?.pick === null) return vetoed(ref);
+      // A pick that is no current candidate is no override: the heuristic below stands.
+      const chosen = a2m?.pick ? targetMethods.find((m) => m.id === a2m.pick) : undefined;
+      if (a2m && chosen) {
+        return chosen.id !== ref.fromNodeId
+          ? { original: ref, targetNodeId: chosen.id, confidence: a2m.p, resolvedBy: 'instance-method', metadata: { decision: 'A2', decisionP: a2m.p } }
+          : null;
+      }
       // A wrapper handing its call on — BookStack's `FileStorage::delete` doing
       // `$storage->delete($path)`, `CommentRepo::delete` doing
       // `$comment->delete()` — names the caller's own class only by a shared
@@ -13443,14 +13517,15 @@ function matchReferenceInner(
         if (candidates.length === 1) {
           return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
         }
-        const best = findBestMatch(ref, candidates, context);
+        const { best, a1 } = decideA1(ref, candidates, findBestMatch(ref, candidates, context));
         if (best) {
           const proximity = computePathProximity(ref.filePath, best.filePath);
           return {
             original: ref,
             targetNodeId: best.id,
-            confidence: proximity >= 30 ? 0.7 : 0.4,
+            confidence: a1?.pick ? a1.p : proximity >= 30 ? 0.7 : 0.4,
             resolvedBy: 'exact-match',
+            ...(a1?.pick ? { metadata: { decision: 'A1', decisionP: a1.p } } : {}),
           };
         }
       }

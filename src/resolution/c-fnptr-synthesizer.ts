@@ -90,6 +90,7 @@ import { LRUCache } from './lru-cache';
 import { stripCommentsForRegex } from './strip-comments';
 import { getKernel } from '../extraction/kernel/loader';
 import type { CfnptrFactsOut, CfnptrFileIn } from '../extraction/kernel/loader';
+import { decideB1, deciding } from '../decision/record';
 
 const C_CPP_EXT = /\.(c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc)$/i;
 const FN_KINDS = new Set(['function', 'method']);
@@ -878,6 +879,13 @@ export async function cFnPointerDispatchEdges(
   // (O(nodes) memory, part of the #1212 kernel OOM).
 
   // ---- function-name → node resolution (prefer a function in the same file) ----
+  // Decision point B1 (src/decision): p of each function a B1 override registered, for
+  // its edges' marker. By function id, so a field←field propagation keeps it too.
+  const b1Picked = deciding('B1') ? new Map<string, number>() : undefined;
+  const b1Mark = (id: string) => {
+    const p = b1Picked?.get(id);
+    return p === undefined ? undefined : { decision: 'B1', decisionP: p };
+  };
   const resolveFn = (name: string, preferFile?: string): Node | null => {
     const cands = ctx.getNodesByName(name).filter((n) => FN_KINDS.has(n.kind));
     if (cands.length === 0) return null;
@@ -886,7 +894,11 @@ export async function cFnPointerDispatchEdges(
       const same = cands.find((n) => n.filePath === preferFile);
       if (same) return same;
     }
-    return cands[0]!;
+    if (!b1Picked) return cands[0]!;
+    const b1 = decideB1(`cfnptr:${preferFile ?? ''}:0:${name}`, { kind: 'cfnptr', name, filePath: preferFile ?? cands[0]!.filePath, line: 0 }, cands, cands[0]);
+    if (!b1) return cands[0]!;
+    if (b1.pick) b1Picked.set(b1.pick.id, b1.p);
+    return b1.pick;
   };
 
   // ---- Stage C: registrations — Map<"struct.field", Set<funcNodeId>> ----
@@ -1395,6 +1407,7 @@ export async function cFnPointerDispatchEdges(
             synthesizedBy: 'fn-pointer-dispatch',
             via: `${struct}.${field}`,
             registeredAt: `${fn.filePath}:${line}`,
+            ...b1Mark(tid),
           },
         });
         if (++added >= FANOUT_CAP) break;
@@ -1432,6 +1445,7 @@ export async function cFnPointerDispatchEdges(
               synthesizedBy: 'fn-pointer-dispatch',
               via: `${m[1]}[]`,
               registeredAt: `${fn.filePath}:${line}`,
+              ...b1Mark(tid),
             },
           });
           if (++added >= FANOUT_CAP) break;

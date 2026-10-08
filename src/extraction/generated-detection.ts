@@ -43,6 +43,8 @@
  * demoting its own file.
  */
 
+import { atSite, deciding } from '../decision/record';
+
 const GENERATED_PATTERNS: ReadonlyArray<RegExp> = [
   // Go — protobuf / gRPC / pulsar
   /\.pb\.go$/,
@@ -244,12 +246,22 @@ export function hasGeneratedHeader(content: string): boolean {
   return false;
 }
 
+function detectGeneratedFileHeuristic(filePath: string, content: string): boolean {
+  return isGeneratedFile(filePath) || hasGeneratedHeader(content) || isMinifiedContent(filePath, content);
+}
+
 /**
  * The union signal: path convention OR content banner. This is what the
  * indexer persists to `files.generated`.
  */
 export function detectGeneratedFile(filePath: string, content: string): boolean {
-  return isGeneratedFile(filePath) || hasGeneratedHeader(content) || isMinifiedContent(filePath, content);
+  const heuristic = detectGeneratedFileHeuristic(filePath, content);
+  // Decision point G1 — only files whose head mentions "generat…": the rest are clear-cut.
+  if (deciding('G1') && GENERATED_STEM.test(content.slice(0, HEADER_SCAN_CHARS))) {
+    const g1 = atSite('G1', filePath, String(heuristic), () => ({ filePath }));
+    if (g1 && (g1.pick === 'true' || g1.pick === 'false')) return g1.pick === 'true';
+  }
+  return heuristic;
 }
 
 /** Scripts a bundler or minifier writes as a few enormous lines. */

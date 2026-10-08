@@ -51,6 +51,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
 import { HOLE, readStringAt } from './frameworks/expo-router';
 import { enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
+import { atSite, b2Asker, deciding, toCand } from '../decision/record';
 
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
@@ -392,6 +393,16 @@ interface HttpSite {
   /** The path began with a hole — a base URL — and matches a route by its tail. */
   suffix: boolean;
   display: string;
+  /** p of a B3 verdict that judged the receiver a client (src/decision). */
+  clientP?: number;
+}
+
+/** A route a B3 tie verdict chose carries its p (src/decision). */
+type MatchedRoute = HttpRoute & { decisionP?: number };
+
+/** The edge marker of an applied B3 verdict (src/decision). */
+function b3Mark(p: number | undefined): { decision: string; decisionP: number } | undefined {
+  return p === undefined ? undefined : { decision: 'B3', decisionP: p };
 }
 
 function httpRoutes(ctx: ResolutionContext): HttpRoute[] {
@@ -435,10 +446,10 @@ function scorePath(client: readonly string[], route: readonly string[]): number 
   return i === client.length ? score : null;
 }
 
-function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | null {
+function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): MatchedRoute | null {
   let best: HttpRoute | null = null;
   let bestScore = -1;
-  let tied = false;
+  let tied: HttpRoute[] | null = null;
   for (const r of routes) {
     if (r.method !== 'ALL' && r.method !== 'ANY' && r.method !== site.method) continue;
     let score: number | null;
@@ -454,10 +465,21 @@ function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | nu
     if (score > bestScore) {
       best = r;
       bestScore = score;
-      tied = false;
-    } else if (score === bestScore) tied = true;
+      tied = null;
+    } else if (score === bestScore) (tied ??= []).push(r);
   }
-  return tied ? null : best;
+  if (!tied || !best) return best;
+  // Decision point B3 (tie): several routes match equally well — today that is "no edge".
+  if (!deciding('B3')) return null;
+  const all = [best, ...tied];
+  const b3 = atSite('B3', `tie:${site.file}:${site.line}:${site.column}`, null, () => ({
+    kind: 'tie',
+    site: { method: site.method, display: site.display, filePath: site.file, line: site.line },
+    routes: all.slice(0, 32).map((r) => toCand(r.node)),
+  }));
+  if (!b3?.pick) return null;
+  const chosen = all.find((r) => r.node.id === b3.pick);
+  return chosen ? { ...chosen, decisionP: b3.p } : null;
 }
 
 /**
@@ -512,7 +534,7 @@ function clientFor(
   facts: FileFacts,
   receiver: string,
   cache: Map<string, FileFacts | null>
-): { baseURL: string | null } | null {
+): { baseURL: string | null; decisionP?: number } | null {
   const chain = receiver.replace(/\s+/g, '').replace(/^this\./, '').split('.');
   const head = chain[0]!;
   const last = chain[chain.length - 1]!;
@@ -523,14 +545,22 @@ function clientFor(
     const bound = imported.isDefault ? imported.facts.defaultClient : imported.facts.clients.get(imported.exportedName) ?? null;
     if (bound) return bound;
   }
-  if (SERVER_NAMES.test(last) || SERVER_NAMES.test(head)) return null;
-  if (CLIENT_NAMES.test(last)) return { baseURL: null };
-  return null;
+  const named = !(SERVER_NAMES.test(last) || SERVER_NAMES.test(head)) && CLIENT_NAMES.test(last);
+  if (!deciding('B3')) return named ? { baseURL: null } : null;
+  // Decision point B3: a receiver with no client binding is judged by name lists alone.
+  const b3 = atSite('B3', `client:${facts.file}:${receiver}`, named ? 'true' : 'false', () => ({
+    kind: 'client',
+    call: { receiver, verb: '', filePath: facts.file, line: 0 },
+  }));
+  // Only a 'true' / 'false' verdict overrides; anything else keeps the name lists' answer.
+  if (b3?.pick === 'true') return { baseURL: null, decisionP: b3.p };
+  if (b3?.pick === 'false') return null;
+  return named ? { baseURL: null } : null;
 }
 
 function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpSite[], cache: Map<string, FileFacts | null>): void {
   const { safe, lineOf } = facts;
-  const add = (index: number, open: number, verb: string | null, baseURL: string | null): void => {
+  const add = (index: number, open: number, verb: string | null, baseURL: string | null, clientP?: number): void => {
     const line = lineOf(index);
     const callee = safe.slice(index, open).replace(/\s+/g, '').replace(/<.*>$/, '');
     if (facts.routeLines.has(line)) return; // a registration the resolver already read
@@ -553,7 +583,7 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     if (literal === null) return;
     const path = clientPath(literal, baseURL);
     if (!path) return;
-    sites.push({ fn, file: facts.file, line, column: facts.columnOf(index), callee, method, segs: path.segs, suffix: path.suffix, display: path.display });
+    sites.push({ fn, file: facts.file, line, column: facts.columnOf(index), callee, method, segs: path.segs, suffix: path.suffix, display: path.display, clientP });
   };
 
   BARE_CLIENT_CALL.lastIndex = 0;
@@ -569,7 +599,7 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     const client = clientFor(ctx, facts, m[1]!, cache);
     if (!client) continue;
     const verb = m[2]!.replace(/^\$/, '').toUpperCase();
-    add(m.index, m.index + m[0].length - 1, verb === 'REQUEST' ? null : verb, client.baseURL);
+    add(m.index, m.index + m[0].length - 1, verb === 'REQUEST' ? null : verb, client.baseURL, client.decisionP);
   }
 }
 
@@ -724,6 +754,30 @@ function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: Queue
 }
 
 function pairQueue(producers: readonly QueueProducer[], consumers: readonly QueueConsumer[], edges: Edge[], seen: Set<string>): void {
+  const askB2 = deciding('B2');
+  const link = (p: QueueProducer, c: QueueConsumer, decision?: Record<string, unknown>): void => {
+    if (c.node.id === p.fn.id) return;
+    const key = `${p.fn.id}>${c.node.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    edges.push({
+      source: p.fn.id,
+      target: c.node.id,
+      kind: 'calls',
+      line: p.line,
+      column: p.column,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'queue-job',
+        channel: 'queue',
+        callee: p.callee,
+        event: p.job,
+        ...(p.queue ?? c.queue ? { queue: p.queue ?? c.queue } : {}),
+        registeredAt: `${c.file}:${c.line}`,
+        ...decision,
+      },
+    });
+  };
   for (const p of producers) {
     let candidates = consumers.filter((c) => (p.queue === null || c.queue === null || c.queue === p.queue) && (c.job === null || c.job === p.job));
     // The most specific pairing wins: the job by name on the named queue,
@@ -736,29 +790,18 @@ function pairQueue(producers: readonly QueueProducer[], consumers: readonly Queu
       else if (p.queue === null) continue; // an unnamed queue and no consumer naming the job: a guess
       else candidates = candidates.filter((c) => c.queue === p.queue);
     }
-    if (candidates.length === 0 || candidates.length > EVENT_FANOUT_CAP) continue;
-    for (const c of candidates) {
-      if (c.node.id === p.fn.id) continue;
-      const key = `${p.fn.id}>${c.node.id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push({
-        source: p.fn.id,
-        target: c.node.id,
-        kind: 'calls',
-        line: p.line,
-        column: p.column,
-        provenance: 'heuristic',
-        metadata: {
-          synthesizedBy: 'queue-job',
-          channel: 'queue',
-          callee: p.callee,
-          event: p.job,
-          ...(p.queue ?? c.queue ? { queue: p.queue ?? c.queue } : {}),
-          registeredAt: `${c.file}:${c.line}`,
-        },
-      });
+    if (candidates.length === 0 || candidates.length > EVENT_FANOUT_CAP) {
+      // Decision point B2 (src/decision): over the cap, link only the pairs a model judged to share one queue.
+      if (askB2) {
+        const ask = b2Asker('queue', p.job);
+        for (const c of candidates) {
+          const mark = ask(p.fn.id, c.node.id, () => ({ dispatcher: { filePath: p.file, line: p.line }, handler: { filePath: c.file, line: c.line } }));
+          if (mark) link(p, c, mark);
+        }
+      }
+      continue;
     }
+    for (const c of candidates) link(p, c);
   }
 }
 
@@ -855,8 +898,34 @@ function pairEvents(dispatches: readonly Dispatch[], handlers: readonly Handler[
   // Fan-out is judged per event name on each side, as the emitter pass does.
   const dispatchesByEvent = new Map<string, Dispatch[]>();
   for (const d of dispatches) dispatchesByEvent.set(`${d.shape}:${d.event}`, [...(dispatchesByEvent.get(`${d.shape}:${d.event}`) ?? []), d]);
+  const askB2 = deciding('B2');
+  const link = (d: Dispatch, h: Handler, tier: string | null, decision?: Record<string, unknown>): void => {
+    if (h.node.id === d.fn.id) return;
+    const key = `${d.fn.id}>${h.node.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    edges.push({
+      source: d.fn.id,
+      target: h.node.id,
+      kind: 'calls',
+      line: d.line,
+      column: d.column,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'event-bus',
+        channel: d.shape === 'bus' ? 'event' : 'socket',
+        callee: d.callee,
+        event: d.event,
+        ...(tier ? { tier } : {}),
+        registeredAt: `${h.file}:${h.line}`,
+        ...decision,
+      },
+    });
+  };
   for (const [, group] of dispatchesByEvent) {
-    if (group.length > EVENT_FANOUT_CAP) continue;
+    const overGroup = group.length > EVENT_FANOUT_CAP;
+    if (overGroup && !askB2) continue;
+    let ask: ReturnType<typeof b2Asker> | undefined; // decision point B2: one budget per event
     for (const d of group) {
       let matched: Handler[];
       let tier: string | null = null;
@@ -868,29 +937,18 @@ function pairEvents(dispatches: readonly Dispatch[], handlers: readonly Handler[
         matched = handlers.filter((h) => h.kind === 'socket' && h.side === 'client' && h.pattern === d.event);
         tier = TIER_SERVER_TO_CLIENT;
       }
-      if (matched.length === 0 || matched.length > EVENT_FANOUT_CAP) continue;
-      for (const h of matched) {
-        if (h.node.id === d.fn.id) continue;
-        const key = `${d.fn.id}>${h.node.id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        edges.push({
-          source: d.fn.id,
-          target: h.node.id,
-          kind: 'calls',
-          line: d.line,
-          column: d.column,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'event-bus',
-            channel: d.shape === 'bus' ? 'event' : 'socket',
-            callee: d.callee,
-            event: d.event,
-            ...(tier ? { tier } : {}),
-            registeredAt: `${h.file}:${h.line}`,
-          },
-        });
+      if (overGroup || matched.length === 0 || matched.length > EVENT_FANOUT_CAP) {
+        // Decision point B2 (src/decision): over a fan-out cap, link only the pairs a model judged to share one bus or socket.
+        if (askB2) {
+          ask ??= b2Asker(d.shape, d.event);
+          for (const h of matched) {
+            const mark = ask(d.fn.id, h.node.id, () => ({ dispatcher: { filePath: d.file, line: d.line }, handler: { filePath: h.file, line: h.line } }));
+            if (mark) link(d, h, tier, mark);
+          }
+        }
+        continue;
       }
+      for (const h of matched) link(d, h, tier);
     }
   }
 }
@@ -1211,6 +1269,7 @@ export async function testRequestEdges(ctx: ResolutionContext, onYield: MaybeYie
         method: site.method,
         href: site.display,
         registeredAt: `${route.node.filePath}:${route.node.startLine}`,
+        ...b3Mark(route.decisionP),
       },
     });
   }
@@ -1278,6 +1337,7 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
         method: site.method,
         href: site.display,
         registeredAt: `${route.node.filePath}:${route.node.startLine}`,
+        ...b3Mark(route.decisionP ?? site.clientP), // the tie's verdict names the route; else the client verdict made the site
       },
     });
   }

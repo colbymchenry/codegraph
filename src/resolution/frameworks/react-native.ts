@@ -62,6 +62,8 @@ import {
   FrameworkResolver,
   ResolutionContext,
 } from '../types';
+import { decideB1, deciding, refKey } from '../../decision/record';
+import { vetoReference } from '../../decision/overrides';
 
 /**
  * One native RN method known to the resolver. Indexed by JS-visible name.
@@ -400,7 +402,9 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
       const className = findObjcClassName(source);
       const exports = parseObjcRNExports(source, className);
       for (const exp of exports) {
-        if (RN_EMITTER_BUILTINS.has(exp.jsName)) continue;
+        if (RN_EMITTER_BUILTINS.has(exp.jsName)) {
+          continue;
+        }
         // Resolve to the native node by selector first-keyword. Multiple
         // ObjC methods may share a first keyword across modules; filter by
         // file path to attribute the export to this module's
@@ -420,7 +424,9 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
       // is never the answer.
       if (/RCT_EXTERN_(?:REMAP_)?MODULE\b/.test(source)) {
         for (const ext of parseObjcRNExterns(source)) {
-          if (RN_EMITTER_BUILTINS.has(ext.jsName)) continue;
+          if (RN_EMITTER_BUILTINS.has(ext.jsName)) {
+            continue;
+          }
           const candidates = (swiftMethodsByName.get(ext.nativeSelectorFirstKw) ?? [])
             .filter((c) => c.qualifiedName.split('::').includes(ext.className))
             .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
@@ -448,7 +454,9 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
       if (!source) continue;
       const exports = parseJvmRNExports(source);
       for (const exp of exports) {
-        if (RN_EMITTER_BUILTINS.has(exp.jsName)) continue;
+        if (RN_EMITTER_BUILTINS.has(exp.jsName)) {
+          continue;
+        }
         const candidates = jvmMethodsByName.get(exp.jsName) ?? [];
         const node = candidates.find((c) => c.filePath === file) ?? candidates[0];
         if (!node) continue;
@@ -470,7 +478,9 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
       // path (Codegen wires it via name convention), so we match across
       // all native methods of the right name.
       for (const methodName of spec.methods) {
-        if (RN_EMITTER_BUILTINS.has(methodName)) continue;
+        if (RN_EMITTER_BUILTINS.has(methodName)) {
+          continue;
+        }
         // ObjC first-keyword match, then JVM bare-name match. Don't
         // require module-name match for ObjC because the native side may
         // have stripped a prefix.
@@ -626,14 +636,20 @@ export const reactNativeBridgeResolver: FrameworkResolver = {
       }
     }
 
-    const target = pick(entries);
+    let target = pick(entries);
+    const b1 = entries.length > 1 && deciding('B1')
+      ? decideB1(`rn-bridge:${refKey(ref)}`, { kind: 'rn-bridge', name: ref.referenceName, filePath: ref.filePath, line: ref.line }, entries.map((e) => e.node), target?.node)
+      : undefined;
+    // "None" ends the reference: no later strategy may link it.
+    if (b1?.pick === null) { vetoReference(refKey(ref)); return null; }
+    if (b1) target = entries.find((e) => e.node === b1.pick);
     if (!target) return null;
     return {
       original: ref,
       targetNodeId: target.node.id,
-      confidence: 0.6,
+      confidence: b1 ? b1.p : 0.6,
       resolvedBy: 'framework',
-      metadata: { bridge: 'react-native', module: target.moduleName },
+      metadata: { bridge: 'react-native', module: target.moduleName, ...(b1 ? { decision: 'B1', decisionP: b1.p } : {}) },
     };
   },
 };

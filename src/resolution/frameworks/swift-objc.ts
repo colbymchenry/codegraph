@@ -38,6 +38,8 @@ import {
   swiftBaseNamesForObjcSelector,
   isObjcExposed,
 } from '../swift-objc-bridge';
+import { decideB1, deciding, refKey } from '../../decision/record';
+import { vetoReference } from '../../decision/overrides';
 
 /**
  * Memoized "Swift base name → ObjC method nodes" map.
@@ -190,13 +192,20 @@ function resolveSwiftCallToObjc(
   // and should already be resolved by the name-matcher). Since this resolver
   // runs AFTER exact-match, any matching Swift node would already have won;
   // so a candidate reaching us is a legitimate cross-language hit.
-  const target = candidates[0];
+  let target = candidates[0];
+  const b1 = candidates.length > 1 && deciding('B1')
+    ? decideB1(`swift-objc:${refKey(ref)}`, { kind: 'swift-objc', name: rawName, filePath: ref.filePath, line: ref.line }, candidates, target)
+    : undefined;
+  // "None" ends the reference: no later strategy may link it.
+  if (b1?.pick === null) { vetoReference(refKey(ref)); return null; }
+  if (b1) target = b1.pick ?? undefined;
   if (!target) return null;
   return {
     original: ref,
     targetNodeId: target.id,
-    confidence: 0.6,
+    confidence: b1 ? b1.p : 0.6,
     resolvedBy: 'framework',
+    ...(b1 ? { metadata: { decision: 'B1', decisionP: b1.p } } : {}),
   };
 }
 

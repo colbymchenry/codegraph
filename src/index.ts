@@ -53,6 +53,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern } from './resolution/callback-synthesizer';
+import { overridesActive, resetOverrides } from './decision/overrides';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -522,6 +523,8 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      // Decision overrides (src/decision): a run starts with no vetoes from the last one and re-reads the overrides file.
+      if (overridesActive()) resetOverrides();
       // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
       // default 1000-page interval re-writes hot pages into the main DB file
       // over and over — ~95% of all disk I/O during a bulk index, and a
@@ -842,6 +845,8 @@ export class CodeGraph {
           `Sync could not acquire the file lock; retry when the index is available. ${err instanceof Error ? err.message : String(err)}`
         );
       }
+      // Decision overrides (src/decision): a run starts with no vetoes from the last one and re-reads the overrides file.
+      if (overridesActive()) resetOverrides();
       // A full rebuild in another process (`codegraph index` → recreate)
       // unlinks the database and creates a new file at the same path. A
       // long-lived instance — the MCP daemon's watcher — would otherwise keep

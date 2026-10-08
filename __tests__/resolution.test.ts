@@ -2108,6 +2108,8 @@ func main() {
         'Logger', 'log', callRef('c/other.cpp'), ctxFor([logA, logB]), 0.9, 'instance-method',
       );
       expect(result?.targetNodeId).toBe('m:a');
+      // Several declarations and none in the call site's file: ordered[0] is a guess, so it must not carry 0.9.
+      expect(result?.confidence).toBe(0.6);
     });
 
     it('resolves C++ calls end-to-end to same-named classes in different files (#1079)', async () => {

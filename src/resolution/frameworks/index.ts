@@ -6,6 +6,7 @@
 
 import { FrameworkResolver, ResolutionContext } from '../types';
 import type { Language } from '../../types';
+import { atSite } from '../../decision/record';
 import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
@@ -122,7 +123,10 @@ export function getFrameworkResolver(name: string): FrameworkResolver | undefine
 export function detectFrameworks(context: ResolutionContext): FrameworkResolver[] {
   return FRAMEWORK_RESOLVERS.filter((resolver) => {
     try {
-      return resolver.detect(context);
+      const detected = resolver.detect(context);
+      // Decision point B5: does this project really use the framework?
+      const b5 = atSite('B5', resolver.name, String(detected), () => ({ framework: resolver.name, detected }));
+      return b5 && (b5.pick === 'true' || b5.pick === 'false') ? b5.pick === 'true' : detected;
     } catch {
       return false;
     }
