@@ -34,7 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isTestFile, isTestIntentQuery, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
   extractQueryPaths,
@@ -58,6 +58,9 @@ import {
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
+import { hashKey, toCand } from '../decision/record';
+import { decideLive, isLive } from '../decision/live';
+import type { DecisionRecord } from '../decision/types';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
@@ -4253,11 +4256,26 @@ export class ToolHandler {
     // that prevents context bloat, so more nodes just means better coverage
     // across entry points (especially for large files like Svelte components).
     // Matching runs on the path-stripped query; `query` stays for display.
+    const testIntentHeuristic = isTestIntentQuery(matchQuery);
+    const testIntentVerdict = isLive('C2') ? await decideLive({ point: 'C2', key: `${hashKey(matchQuery)}:test`,
+      payload: { kind: 'test', query: matchQuery }, heuristic: { pick: String(testIntentHeuristic) },
+    }, { root: projectRoot, query: true }) : null;
+    const queryMentionsTests = testIntentVerdict ? testIntentVerdict.pick === 'true' : testIntentHeuristic;
     const subgraph = await cg.findRelevantContext(matchQuery, {
       searchLimit: 8,
       traversalDepth: 3,
       maxNodes: 200,
       minScore: 0.2,
+      testIntent: testIntentVerdict ? queryMentionsTests : undefined,
+      rerank: isLive('C3') ? async (q, pool, limit) => {
+        const v = await decideLive({ point: 'C3', key: `${hashKey(q)}:entries`,
+          payload: { query: q, hits: pool.map(r => toCand(r.node)), k: limit },
+          heuristic: { pick: pool.slice(0, limit).map(r => r.node.id).join(',') },
+        }, { root: projectRoot, query: true });
+        if (!v?.ranking) return null;
+        const byId = new Map(pool.map(r => [r.node.id, r]));
+        return v.ranking.map(r => byId.get(r.id)!).filter(Boolean);
+      } : undefined,
     });
 
     // Pinned files' symbols enter the gather unconditionally — the agent named
@@ -4320,6 +4338,16 @@ export class ToolHandler {
         explanation += '\nThis project has nothing indexed.';
       } else {
         const miss = cg.getExploreMissDiagnostics(matchQuery);
+        if (isLive('C5') && miss.candidates.length >= 2) {
+          const v = await decideLive({ point: 'C5', key: `${hashKey(query)}:empty`,
+            payload: { query, files: [], symbols: [], empty: true, retry: miss.candidates.slice(0, 12) },
+            heuristic: { pick: 'insufficient' },
+          }, { root: projectRoot, query: true });
+          if (v?.ranking) {
+            const order = new Map(v.ranking.map((r, i) => [r.id, i]));
+            miss.candidates.sort((a, b) => (order.get(a) ?? 99) - (order.get(b) ?? 99));
+          }
+        }
         const list = (words: string[]) => words.map(w => `\`${w}\``).join(', ');
         // Separate caps preserve the retry instruction and complete candidate
         // names even with long queries or generated identifiers.
@@ -4521,15 +4549,9 @@ export class ToolHandler {
         // must not exempt a `Body` interface it never meant to name. Kept
         // separate from `namedSeedIds`, which is callable-only by construction —
         // a type never becomes a named seed, so it cannot be the guard here.
-        if (isPreciseToken(t)) {
-          for (const n of raw) {
-            if (DECLARATION_KINDS.has(n.kind) && n.name.toLowerCase() === t.toLowerCase()) {
-              namedTypeFiles.add(n.filePath);
-            }
-          }
-        }
+        let namedToken = isPreciseToken(t);
         let cands = raw
-          .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
+          .filter((n) => SEEDABLE.has(n.kind) && (testIntentVerdict?.pick === 'true' || !isTestPath(n.filePath)))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
         // Field-name seeding fallback (#1196): a camelCase token that names NO
         // definition of its own is usually an object-literal key / API field
@@ -4548,7 +4570,7 @@ export class ToolHandler {
               kinds: ['function', 'method', 'component', 'variable', 'constant'],
               limit: 60,
             })
-            .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
+            .filter((n) => SEEDABLE.has(n.kind) && (testIntentVerdict?.pick === 'true' || !isTestPath(n.filePath)))
             .filter((n) => {
               const idx = n.name.toLowerCase().indexOf(lcToken);
               if (idx < 0) return false;
@@ -4564,7 +4586,18 @@ export class ToolHandler {
         // single-pick fallback — an uncorroborated bare `run` must not tier its
         // most-substantive namesake any more than a 1-def `check` may.
         if (!isPreciseToken(t)) {
-          cands = cands.filter((n) => coNamedInFile(t, n.filePath));
+          const heuristic = cands.filter(n => coNamedInFile(t, n.filePath));
+          if (isLive('C2')) {
+            const rec: DecisionRecord = { point: 'C2', key: `${hashKey(query)}:tok:${t}`, payload: { kind: 'token', query, token: t }, heuristic: { pick: String(heuristic.length > 0) } };
+            const v = await decideLive(rec, { root: projectRoot, query: true });
+            if (v) namedToken = v.pick === 'true';
+            cands = v ? v.pick === 'true' ? cands : [] : heuristic;
+          } else cands = heuristic;
+        }
+        if (namedToken) {
+          for (const n of raw) {
+            if (DECLARATION_KINDS.has(n.kind) && n.name.toLowerCase() === t.toLowerCase()) namedTypeFiles.add(n.filePath);
+          }
         }
         // A specific name (<=3 defs) injects all its defs. An overloaded name
         // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
@@ -4588,7 +4621,7 @@ export class ToolHandler {
         } else {
           const ctx = cands.filter(inNamedContext);
           picks = ctx.length > 0 ? ctx.slice(0, 4) : cands.slice(0, 1);
-          tierPicks = picks; // corroborated overloads (or the single fallback) all earn it
+          tierPicks = picks;
         }
         for (const n of picks) {
           if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n);
@@ -4836,7 +4869,7 @@ export class ToolHandler {
         isGeneratedCandidate(filePath) ? GENERATED_RANK_PENALTY : 1,
         isDampedDeclaration(filePath) ? AMBIENT_DECLARATION_RANK_PENALTY : 1,
       )
-      * (isLowValue(filePath) ? LOW_VALUE_RANK_PENALTY : 1);
+      * (isLowValue(filePath) && !(testIntentVerdict?.pick === 'true' && isTestFile(filePath)) ? LOW_VALUE_RANK_PENALTY : 1);
 
     for (const [filePath, group] of fileGroups) {
       group.score = (group.score + Math.min(PERIPHERAL_SCORE_CAP, group.peripheral))
@@ -4859,7 +4892,6 @@ export class ToolHandler {
     // keep-minimum then pulled two test files back in as the "spread".
     let candidateFiles = [...fileGroups.entries()];
     {
-      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(matchQuery);
       if (!queryMentionsTests) {
         // A pinned file is exempt: naming a test file by path IS asking for it.
         const nonLow = candidateFiles.filter(([p]) => !isLowValue(p) || pinnedSet.has(p));
@@ -5387,13 +5419,29 @@ export class ToolHandler {
     // lost-pointer note above squeezed out.
     // Reserved at its worst case: the gather's symbol and file counts bound the
     // shown ones from above.
+    // findRelevantContext's verdict (context/index.ts). Silent when a file was pinned or a named symbol tiered.
+    let lowConfidence = subgraph.confidence === 'low' && pinnedFiles.length === 0 && tierSeedIds.size === 0;
+    if (isLive('C5')) {
+      const shown = sortedFiles.slice(0, Math.min(10, maxFiles)); // explore serves at most maxFiles
+      const rec: DecisionRecord = {
+        point: 'C5',
+        key: `${hashKey(query)}:answer`,
+        payload: { query, files: shown.map(([fp]) => fp), symbols: shown.flatMap(([, e]) => e.nodes.slice(0, 2).map((n) => n.name)).slice(0, 20), empty: false },
+        heuristic: { pick: lowConfidence ? 'insufficient' : 'sufficient' },
+      };
+      const v = await decideLive(rec, { root: projectRoot, query: true });
+      if (v) lowConfidence = v.pick === 'insufficient';
+    }
+    const lowConfidenceNote = lowConfidence
+      ? ' Matched on common words only — if these files look off-target, re-run codegraph_explore with the exact symbol names you are after.'
+      : '';
     const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
     const summaryReserve = `Found ${plural(subgraph.nodes.size, 'symbol')} across ${plural(fileGroups.size, 'file')}.`.length
       + (pinnedFiles.length > 0 ? ` ${plural(pinnedFiles.length, 'file')} pinned from the query.`.length : 0)
       + (unresolvedPathSpans.length > 0
         ? ` No indexed file uniquely matches ${unresolvedPathSpans.map((sp) => `\`${sp}\``).join(', ')}.`.length
         : 0)
-      + setAsideNote.length;
+      + setAsideNote.length + lowConfidenceNote.length;
     const epilogueFloor = Math.max(
       EXPLORE_FALLBACK_NOTES.lost.complete.length, EXPLORE_FALLBACK_NOTES.lost.trimmed.length,
     ) + 2 + cliffPointerFloor + summaryReserve;
@@ -7594,7 +7642,7 @@ export class ToolHandler {
     if (unresolvedPathSpans.length > 0) {
       summaryLine += ` No indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')}.`;
     }
-    summaryLine += setAsideNote;
+    summaryLine += setAsideNote + lowConfidenceNote;
     finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
 
     // Emit the allocation diagnostic from the FINAL text, so per-file bytes and

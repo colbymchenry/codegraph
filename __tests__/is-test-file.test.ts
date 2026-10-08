@@ -10,7 +10,7 @@
  * `manifest.kt` / a `RealCall.kt` production file must NOT be flagged.
  */
 import { describe, it, expect } from 'vitest';
-import { isTestFile, isTestPath } from '../src/search/query-utils';
+import { isTestFile, isTestPath, isTestIntentQuery, scorePathRelevance } from '../src/search/query-utils';
 
 describe('isTestFile', () => {
   it('flags test-support modules and doubles by directory name', () => {
@@ -93,5 +93,19 @@ describe('isTestFile', () => {
     expect(isTestFile('src/flask/app.py')).toBe(false);
     expect(isTestFile('src/vs/workbench/api/common/extensionHostMain.ts')).toBe(false);
     expect(isTestFile('okhttp/src/commonJvmAndroid/kotlin/okhttp3/OkHttpClient.kt')).toBe(false);
+  });
+});
+
+describe('isTestIntentQuery', () => {
+  it('matches whole test words', () => {
+    for (const q of ['explore the tests', 'foo.test.ts', 'spec runner', 'the specs', 'testing flow', 'verify login'])
+      expect(isTestIntentQuery(q)).toBe(true);
+  });
+  it('ignores words that merely contain them', () => {
+    for (const q of ['latest version', 'fastest path', 'specific handler', 'inspect state', 'contest'])
+      expect(isTestIntentQuery(q)).toBe(false);
+  });
+  it('"latest" no longer waives the test-path penalty', () => {
+    expect(scorePathRelevance('src/foo.test.ts', 'latest foo')).toBe(scorePathRelevance('src/foo.test.ts', 'foo'));
   });
 });

@@ -16,6 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
+import { ToolHandler } from '../src/mcp/tools';
 import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
 
 describe('isDistinctiveIdentifier', () => {
@@ -185,5 +186,12 @@ export function downloadDataset(name: string): string { return name; }
 
     const md = await cg.buildContext('CaptureIntroScreen', { format: 'markdown' });
     expect(md as string).not.toContain(LOW_CONFIDENCE_MARKER);
+  });
+
+  it('explore surfaces low confidence as a one-line summary note', async () => {
+    const run = async (query: string) =>
+      (await new ToolHandler(cg).execute('codegraph_explore', { query })).content[0]!.text;
+    expect(await run('flat object thing')).toMatch(/Found \d+ symbols? across \d+ files?\.[^\n]*Matched on common words only/);
+    expect(await run('CaptureIntroScreen')).not.toContain('Matched on common words only');
   });
 });

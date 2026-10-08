@@ -716,4 +716,10 @@ export interface FindRelevantContextOptions {
    * SEGMENTS the query's words name are seeded here instead.
    */
   seedNames?: string[];
+
+  /** Optional entry-point reranking before the search limit is applied. Null keeps the heuristic order. */
+  rerank?: (query: string, pool: SearchResult[], limit: number) => Promise<SearchResult[] | null>;
+
+  /** Override test intent for an explicitly enabled query decision. Undefined keeps the word heuristic. */
+  testIntent?: boolean;
 }

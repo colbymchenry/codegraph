@@ -54,6 +54,9 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { decisionConfig } from '../decision/config';
+import { decideLive, decisionStatus, isLive } from '../decision/live';
+import { hashKey } from '../decision/record';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1083,6 +1086,13 @@ function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErro
   return lines;
 }
 
+program
+  .command('decision-status')
+  .description('Check decision-model routing and Cloudflare free allowance without making an inference request')
+  .action(async () => {
+    console.log(JSON.stringify(await decisionStatus(), null, 2));
+  });
+
 /**
  * codegraph status [path]
  */
@@ -1537,7 +1547,21 @@ program
       // Keywords fire on their own; a token or prose word is only a CANDIDATE
       // verified against the graph below, so a tech brand ("JavaScript") that
       // merely looks like code doesn't inject spurious context.
-      const keyworded = hasStructuralKeyword(prompt);
+      let keyworded = hasStructuralKeyword(prompt);
+      // Hosted D1 requires explicit permission to send the user's prompt remotely.
+      if (isLive('D1')) {
+        let local = false;
+        try {
+          const url = new URL(decisionConfig().url);
+          local = /^https?:$/.test(url.protocol) && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+        } catch { /* invalid endpoint keeps the heuristic */ }
+        if (local || process.env.CODEGRAPH_DECISION_ALLOW_REMOTE_PROMPTS === '1') {
+          const v = await decideLive({ point: 'D1', key: hashKey(prompt), payload: { prompt }, heuristic: { pick: String(keyworded) } }, { root: String(input.cwd || process.cwd()), query: true });
+          // Overriding a verified code-symbol match requires a stronger negative than the keyword gate.
+          if (v?.pick === 'false' && v.p >= .95) { gate('noop-model'); return; }
+          if (v) keyworded = v.pick === 'true';
+        }
+      }
       const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
       const proseWords = keyworded ? [] : extractProseCandidates(prompt);
       if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
