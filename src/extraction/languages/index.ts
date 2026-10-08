@@ -37,6 +37,7 @@ import { terraformExtractor } from './terraform';
 import { arktsExtractor } from './arkts';
 import { nixExtractor } from './nix';
 import { haskellExtractor } from './haskell';
+import { damlExtractor } from './daml';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -71,4 +72,5 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   arkts: arktsExtractor,
   nix: nixExtractor,
   haskell: haskellExtractor,
+  daml: damlExtractor,
 };

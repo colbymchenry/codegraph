@@ -119,6 +119,7 @@ export const LANGUAGES = [
   'erlang',
   'terraform',
   'haskell',
+  'daml',
   'unknown',
 ] as const;
 

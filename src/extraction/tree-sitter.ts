@@ -4903,7 +4903,8 @@ export class TreeSitterExtractor {
     //   - `apply` with a `variable` or `qualified` function — the generic
     //     fallback (`getNodeText(func)`) already handles these, so the Haskell
     //     branch only intercepts `infix` and constructor `apply`.
-    if (this.language === 'haskell') {
+    // DAML's grammar extends Haskell's, so it shares these call shapes.
+    if (this.language === 'haskell' || this.language === 'daml') {
       const line = node.startPosition.row + 1;
       const column = node.startPosition.column;
 
