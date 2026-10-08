@@ -5978,6 +5978,14 @@ export class TreeSitterExtractor {
       node.namedChild(0);
     if (!recv) return;
     const t = recv.type;
+    // PHP writes any namespaced receiver as a `qualified_name` — `Foo\Bar::class`,
+    // `\App\Models\User::TABLE`, `Alias\Bar::class`. Push it verbatim:
+    // resolvePhpQualifiedClassRef reads it the way PHP does (#2256).
+    if (this.language === 'php' && t === 'qualified_name') {
+      const text = getNodeText(recv, this.source);
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text.split('\\').pop() ?? '')) this.pushStaticMemberRef(text, ownerId, recv);
+      return;
+    }
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
       t === 'name' || t === 'scoped_type_identifier'

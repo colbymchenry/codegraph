@@ -1158,6 +1158,16 @@ impl<'t> Walker<'t> {
             .or_else(|| node.child_by_field_name("scope"))
             .or_else(|| node.named_child(0));
         let Some(recv) = recv else { return };
+        // A namespaced receiver is a `qualified_name` — `Foo\Bar::class`,
+        // `\App\Models\User::TABLE`, `Alias\Bar::class`. Push it verbatim:
+        // resolvePhpQualifiedClassRef reads it the way PHP does (#2256).
+        if recv.kind() == "qualified_name" {
+            let text = self.text(recv);
+            if capitalized_re().is_match(text.rsplit('\\').next().unwrap_or("")) {
+                self.push_ref_at(owner, &text.to_string(), edge_kind_index("references").unwrap(), recv);
+            }
+            return;
+        }
         if matches!(
             recv.kind(),
             "identifier" | "type_identifier" | "simple_identifier" | "name" | "scoped_type_identifier"
