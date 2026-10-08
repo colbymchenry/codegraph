@@ -13947,7 +13947,7 @@ factorial n = n * factorial (n - 1)
       expect(refs.length).toBeGreaterThan(0);
     });
 
-    it('should extract qualified calls', () => {
+    it('should extract qualified calls in the resolver form, expanding the import alias', () => {
       const code = `module M where
 
 import qualified Data.Text as T
@@ -13956,8 +13956,9 @@ main :: IO ()
 main = T.putStrLn "hello"
 `;
       const result = extractFromSource('src/M.hs', code);
+      // Node qualified names are `Module::name`; `T.putStrLn` could never match one.
       const refs = result.unresolvedReferences.filter(
-        (r) => r.referenceName === 'T.putStrLn' && r.referenceKind === 'calls',
+        (r) => r.referenceName === 'Data.Text::putStrLn' && r.referenceKind === 'calls',
       );
       expect(refs.length).toBeGreaterThan(0);
     });

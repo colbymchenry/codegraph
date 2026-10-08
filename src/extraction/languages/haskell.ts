@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
+import type { NodeKind } from '../../types';
 
 // Node names follow the tree-sitter-haskell grammar 0.23.1 (vendored, ABI 14).
 //
@@ -17,12 +18,12 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 // nodes — covering bare `fn x` and qualified `Mod.fn x` calls).
 
 /** Collapse runs of whitespace for one-line signatures. */
-function collapseWs(text: string): string {
+export function collapseWs(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
 /** Read the text of a `module` node as a dotted module name (`Data.List`). */
-function moduleDottedName(node: SyntaxNode, source: string): string {
+export function moduleDottedName(node: SyntaxNode, source: string): string {
   const parts: string[] = [];
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -33,27 +34,44 @@ function moduleDottedName(node: SyntaxNode, source: string): string {
   return parts.join('.');
 }
 
-/** Extract a Haddock comment (`-- | ...` / `{- | ... -}`) preceding a node.
- *  Haddocks sit as siblings of the `declarations` container (not as siblings
- *  of the declaration itself), so climb out of `declarations` to find them. */
-function precedingHaddock(node: SyntaxNode, source: string): string | undefined {
-  // Climb out of `declarations` so we see top-level siblings (haddocks sit
-  // alongside `declarations`, not inside it).
-  let anchor: SyntaxNode = node;
-  while (anchor.parent && anchor.parent.type === 'declarations') anchor = anchor.parent;
-  let sibling = anchor.previousNamedSibling;
+/** Haddock prose without its comment markers (`-- |`, `{- | -}`, continuation `--`). */
+function haddockText(node: SyntaxNode, source: string): string | undefined {
+  const text = getNodeText(node, source)
+    .replace(/^\{-\s*[|^]?\s*/, '')
+    .replace(/-}$/, '')
+    .split('\n')
+    .map((line) => line.replace(/^\s*--\s?[|^]?\s?/, '').trimEnd())
+    .join('\n')
+    .trim();
+  return text || undefined;
+}
+
+/** The haddock found walking back from `start` over plain comments; null when another node comes first. */
+function haddockBackFrom(start: SyntaxNode | null, source: string): string | undefined | null {
+  let sibling = start;
   while (sibling?.type === 'haddock' || sibling?.type === 'comment') {
-    if (sibling.type === 'haddock') {
-      const text = getNodeText(sibling, source)
-        .replace(/^--\s*\|?\s*/, '')
-        .replace(/^\{-\s*\|?\s*/, '')
-        .replace(/-}$/, '')
-        .trim();
-      return text || undefined;
-    }
+    if (sibling.type === 'haddock') return haddockText(sibling, source);
     sibling = sibling.previousNamedSibling;
   }
-  return undefined;
+  return sibling ? null : undefined;
+}
+
+/**
+ * Extract a Haddock comment (`-- | ...` / `{- | ... -}`) preceding a node.
+ * Haddocks are siblings of the declaration they document, except before a
+ * container's first declaration: the parser attaches that one to the end of
+ * the previous container (`imports`, or before `declarations` itself).
+ */
+export function precedingHaddock(node: SyntaxNode, source: string): string | undefined {
+  const own = haddockBackFrom(node.previousNamedSibling, source);
+  if (own !== undefined) return own ?? undefined;
+  const container = node.parent;
+  if (container?.type !== 'declarations') return undefined;
+  const before = container.previousNamedSibling;
+  if (before?.type === 'imports' || before?.type === 'header') {
+    return haddockBackFrom(before.lastNamedChild, source) ?? undefined;
+  }
+  return haddockBackFrom(before, source) ?? undefined;
 }
 
 /** The preceding `signature` sibling (comments/haddocks may sit between), if it names this function. */
@@ -67,6 +85,144 @@ function precedingSignature(node: SyntaxNode, name: string, source: string): Syn
   return null;
 }
 
+// --- Exports ---
+//
+// A module with an export list (`module M (f, T(..)) where`) exports exactly
+// the listed names; a module without one exports every top-level declaration.
+// Only top-level declarations can be exported.
+
+interface ModuleExports {
+  /** null = no export list, so every top-level declaration is exported. */
+  names: Set<string> | null;
+  /** Types exported with all their constructors/fields: `T(..)`. */
+  allChildren: Set<string>;
+}
+
+// Per-file memos are keyed by the parse tree: a new object per parse, whereas
+// a path, a source text or a node id can repeat across extractions.
+let exportsMemoTree: unknown = null;
+let exportsMemo: ModuleExports = { names: null, allChildren: new Set() };
+
+function rootOf(node: SyntaxNode): SyntaxNode {
+  let root = node;
+  while (root.parent) root = root.parent;
+  return root;
+}
+
+function moduleExports(node: SyntaxNode, source: string): ModuleExports {
+  const root = rootOf(node);
+  if (exportsMemoTree === node.tree) return exportsMemo;
+  const result: ModuleExports = { names: null, allChildren: new Set() };
+  const header = root.namedChildren.find((c) => c?.type === 'header');
+  const exports = header ? getChildByField(header, 'exports') : null;
+  if (exports) {
+    result.names = new Set();
+    for (const exp of exports.namedChildren) {
+      if (exp?.type !== 'export') continue;
+      const named = getChildByField(exp, 'variable') ?? getChildByField(exp, 'type') ?? getChildByField(exp, 'operator');
+      if (!named) continue;
+      const name = getNodeText(named, source).replace(/^\((.*)\)$/, '$1');
+      result.names.add(name);
+      const children = getChildByField(exp, 'children');
+      if (!children) continue;
+      for (const child of children.namedChildren) {
+        if (!child) continue;
+        if (child.type === 'all_names') result.allChildren.add(name);
+        else result.names.add(getNodeText(child, source));
+      }
+    }
+  }
+  exportsMemoTree = node.tree;
+  exportsMemo = result;
+  return result;
+}
+
+// --- Qualified references ---
+//
+// The resolver matches a qualified reference against node qualified names,
+// which are `Module::name` (the header's namespace node is the scope). A
+// Haskell reference is written `Mod.name`, usually through an import
+// alias (`import Data.Map qualified as M` … `M.fromList`), so it is rewritten
+// to `Data.Map::fromList` from the file's own imports.
+
+let aliasMemoTree: unknown = null;
+let aliasMemo = new Map<string, string[]>();
+
+/** Module names each qualifier in this file can stand for: aliases, and full names. */
+function moduleAliases(node: SyntaxNode, source: string): Map<string, string[]> {
+  const root = rootOf(node);
+  if (aliasMemoTree === node.tree) return aliasMemo;
+  const aliases = new Map<string, string[]>();
+  const add = (qualifier: string, module: string): void => {
+    const modules = aliases.get(qualifier) ?? [];
+    if (!modules.includes(module)) modules.push(module);
+    aliases.set(qualifier, modules);
+  };
+  const imports = root.namedChildren.find((c) => c?.type === 'imports');
+  for (const imp of imports?.namedChildren ?? []) {
+    if (imp?.type !== 'import') continue;
+    const mod = getChildByField(imp, 'module');
+    if (!mod) continue;
+    const module = moduleDottedName(mod, source);
+    const alias = getChildByField(imp, 'alias');
+    add(alias ? moduleDottedName(alias, source) : module, module);
+  }
+  aliasMemoTree = node.tree;
+  aliasMemo = aliases;
+  return aliases;
+}
+
+/** The module a file declares (`module Token.Asset where`), or null without a header. */
+export function fileModuleName(node: SyntaxNode, source: string): string | null {
+  const header = rootOf(node).namedChildren.find((c) => c?.type === 'header');
+  const mod = header ? getChildByField(header, 'module') : null;
+  return mod ? moduleDottedName(mod, source) : null;
+}
+
+export interface QualifiedRef {
+  /** `Module::name` — the first candidate when the qualifier is ambiguous. */
+  referenceName: string;
+  /** Every `Module::name` an alias shared by several imports can stand for. */
+  candidates?: string[];
+}
+
+/**
+ * `U.feeFor` → `Lib.Util::feeFor` for a `qualified` node, expanding an import
+ * alias; null when the node isn't qualified. An alias several imports share
+ * yields one candidate per module for the resolver to choose from.
+ */
+export function qualifiedRef(node: SyntaxNode, source: string): QualifiedRef | null {
+  if (node.type !== 'qualified') return null;
+  const mod = getChildByField(node, 'module');
+  const id = getChildByField(node, 'id');
+  if (!mod || !id) return null;
+  const written = moduleDottedName(mod, source);
+  const member = getNodeText(id, source);
+  const modules = moduleAliases(node, source).get(written) ?? [written];
+  const names = modules.map((m) => `${m}::${member}`);
+  return names.length === 1 ? { referenceName: names[0]! } : { referenceName: names[0]!, candidates: names };
+}
+
+/** A declaration directly in the module body (not in a where/let/class/instance). */
+export function isTopLevelDecl(node: SyntaxNode): boolean {
+  const parent = node.parent;
+  return parent?.type === 'declarations' && parent.parent?.parent === null;
+}
+
+/** Whether a top-level declaration named `name` is exported by its module. */
+export function isExportedName(node: SyntaxNode, name: string, source: string): boolean {
+  if (!isTopLevelDecl(node)) return false;
+  const exports = moduleExports(node, source);
+  return exports.names === null || exports.names.has(name);
+}
+
+/** Whether a constructor or field of exported type `typeName` is exported. */
+function isExportedChild(typeNode: SyntaxNode, typeName: string, childName: string, source: string): boolean {
+  if (!isTopLevelDecl(typeNode)) return false;
+  const exports = moduleExports(typeNode, source);
+  return exports.names === null || exports.allChildren.has(typeName) || exports.names.has(childName);
+}
+
 // --- Per-file memos. Extraction is file-sequential within a worker, so a
 // single-entry memo keyed by filePath is safe (and resets naturally). ---
 
@@ -74,14 +230,16 @@ function precedingSignature(node: SyntaxNode, name: string, source: string): Syn
  * enclosing scope* merge into one. The scope key is the top of the node stack
  * (the instance/class/top-level container) so two `instance` blocks each
  * defining `show` don't collapse into one node. */
-let lastFnFile = '';
+// Keyed by the parse tree: re-extracting the same path (a sync, a re-index)
+// must not continue the previous extraction's last function.
+let lastFnTree: unknown = null;
 let lastFnName = '';
 let lastFnScope = '';
 let lastFnId = '';
 
-function resetFnMemo(filePath: string): void {
-  if (lastFnFile !== filePath) {
-    lastFnFile = filePath;
+function resetFnMemo(node: SyntaxNode): void {
+  if (lastFnTree !== node.tree) {
+    lastFnTree = node.tree;
     lastFnName = '';
     lastFnScope = '';
     lastFnId = '';
@@ -101,14 +259,17 @@ function visitMatch(matchNode: SyntaxNode, fnId: string, ctx: ExtractorContext):
   ctx.popScope();
 }
 
-/** Handle a `function` or `bind` node (both are function definitions). */
-function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
+/**
+ * Handle a `function` or `bind` node (both are function definitions). `kind`
+ * lets a dialect record implementation bodies as methods.
+ */
+export function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext, kind: NodeKind = 'function'): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
   const name = getNodeText(nameNode, ctx.source);
   if (!name) return true;
 
-  resetFnMemo(ctx.filePath);
+  resetFnMemo(node);
 
   // Continuation clause: same-name consecutive function *in the same enclosing
   // scope* — extend the existing node and attribute this clause's calls to it.
@@ -140,9 +301,10 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
   const sig = precedingSignature(node, name, ctx.source);
   const doc = precedingHaddock(sig ?? node, ctx.source);
-  const fn = ctx.createNode('function', name, node, {
+  const fn = ctx.createNode(kind, name, node, {
     docstring: doc,
     signature: sig ? collapseWs(getNodeText(sig, ctx.source)).slice(0, 300) : undefined,
+    isExported: isExportedName(node, name, ctx.source),
   });
   if (!fn) return true;
   lastFnName = name;
@@ -164,14 +326,55 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+/**
+ * `bind` nodes that are not definitions:
+ *
+ * - a `do` statement or guard `pat <- e` (no `match`), whose expression runs in
+ *   the enclosing function;
+ * - a value binding in a `do` block's `let` (`let fee = computeFee amount`),
+ *   which is part of the enclosing function's body rather than a callable of
+ *   its own. Without this, calls in it hang off a nested node that nothing
+ *   calls, and drop out of the function's call tree.
+ *
+ * Their calls are attributed to the current scope. `where` bindings stay
+ * definitions: point-free local functions are common there.
+ */
+function handleStatementBind(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const match = getChildByField(node, 'match');
+  if (!match) {
+    const expression = getChildByField(node, 'expression');
+    if (expression) ctx.visitNode(expression);
+    return true;
+  }
+  const localBinds = node.parent;
+  const isDoLetValue =
+    localBinds?.type === 'local_binds' &&
+    localBinds.parent?.type === 'let' &&
+    localBinds.parent.parent?.type === 'do' &&
+    !!getChildByField(node, 'name');
+  if (!isDoLetValue) return false;
+  for (const child of match.namedChildren) {
+    if (child) ctx.visitNode(child);
+  }
+  const binds = getChildByField(node, 'binds');
+  if (binds) {
+    for (const child of binds.namedChildren) {
+      if (child) ctx.visitNode(child);
+    }
+  }
+  return true;
+}
+
 /** Handle a `data_type` node — struct + constructors (enum_members) + record fields. */
-function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
+export function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
+  const typeName = getNodeText(nameNode, ctx.source);
   const doc = precedingHaddock(node, ctx.source);
-  const struct = ctx.createNode('struct', getNodeText(nameNode, ctx.source), node, {
+  const struct = ctx.createNode('struct', typeName, node, {
     docstring: doc,
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 300),
+    isExported: isExportedName(node, typeName, ctx.source),
   });
   if (!struct) return true;
 
@@ -188,7 +391,9 @@ function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
       const ctorNameNode = getChildByField(shape, 'name') || getChildByField(shape, 'constructor');
       const ctorName = ctorNameNode ? getNodeText(ctorNameNode, ctx.source) : null;
       if (ctorName) {
-        ctx.createNode('enum_member', ctorName, dc);
+        ctx.createNode('enum_member', ctorName, dc, {
+          isExported: isExportedChild(node, typeName, ctorName, ctx.source),
+        });
       }
       // Record fields
       if (shape.type === 'record') {
@@ -198,7 +403,11 @@ function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
             const field = fields.namedChild(j);
             if (!field || field.type !== 'field') continue;
             const fNameNode = getChildByField(field, 'name');
-            if (fNameNode) ctx.createNode('field', getNodeText(fNameNode, ctx.source), field);
+            if (!fNameNode) continue;
+            const fieldName = getNodeText(fNameNode, ctx.source);
+            ctx.createNode('field', fieldName, field, {
+              isExported: isExportedChild(node, typeName, fieldName, ctx.source),
+            });
           }
         }
       }
@@ -209,12 +418,14 @@ function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 /** Handle a `newtype` node — struct + single constructor + field. */
-function handleNewtype(node: SyntaxNode, ctx: ExtractorContext): boolean {
+export function handleNewtype(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
-  const struct = ctx.createNode('struct', getNodeText(nameNode, ctx.source), node, {
+  const typeName = getNodeText(nameNode, ctx.source);
+  const struct = ctx.createNode('struct', typeName, node, {
     docstring: precedingHaddock(node, ctx.source),
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 300),
+    isExported: isExportedName(node, typeName, ctx.source),
   });
   if (!struct) return true;
 
@@ -234,39 +445,67 @@ function handleNewtype(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 /** Handle a `type_synomym` node (note: grammar typo is intentional) — type_alias. */
-function handleTypeSynonym(node: SyntaxNode, ctx: ExtractorContext): boolean {
+export function handleTypeSynonym(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
-  ctx.createNode('type_alias', getNodeText(nameNode, ctx.source), node, {
+  const name = getNodeText(nameNode, ctx.source);
+  ctx.createNode('type_alias', name, node, {
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 200),
+    isExported: isExportedName(node, name, ctx.source),
   });
   return true; // the type body is type-position — don't descend
 }
 
 /** Handle a `class` node — trait + default method implementations. */
-function handleClass(node: SyntaxNode, ctx: ExtractorContext): boolean {
+export function handleClass(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
-  const trait = ctx.createNode('trait', getNodeText(nameNode, ctx.source), node, {
+  const name = getNodeText(nameNode, ctx.source);
+  const trait = ctx.createNode('trait', name, node, {
     docstring: precedingHaddock(node, ctx.source),
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 300),
+    isExported: isExportedName(node, name, ctx.source),
   });
   if (!trait) return true;
 
   ctx.pushScope(trait.id);
   const decls = getChildByField(node, 'declarations');
   if (decls) {
+    const module = fileModuleName(node, ctx.source);
     for (let i = 0; i < decls.namedChildCount; i++) {
       const child = decls.namedChild(i);
-      if (child) ctx.visitNode(child);
+      if (!child) continue;
+      if (child.type === 'signature') handleClassMethodSignature(child, module, name, ctx);
+      else ctx.visitNode(child);
     }
   }
   ctx.popScope();
   return true;
 }
 
+/**
+ * A class method's signature declares a module-level function (`M.method`
+ * calls it through any instance), so it is a method node qualified
+ * `Module::method` — the form a qualified call resolves against.
+ */
+function handleClassMethodSignature(sig: SyntaxNode, module: string | null, className: string, ctx: ExtractorContext): void {
+  const nameNodes = sig.childrenForFieldName('name').filter((n): n is SyntaxNode => !!n);
+  const names = getChildByField(sig, 'names');
+  if (names) nameNodes.push(...names.childrenForFieldName('name').filter((n): n is SyntaxNode => !!n));
+  for (const nameNode of nameNodes) {
+    const methodName = getNodeText(nameNode, ctx.source).replace(/^\((.*)\)$/, '$1');
+    ctx.createNode('method', methodName, sig, {
+      ...(module ? { qualifiedName: `${module}::${methodName}` } : {}),
+      signature: collapseWs(getNodeText(sig, ctx.source)).slice(0, 300),
+      docstring: precedingHaddock(sig, ctx.source),
+      isAbstract: true,
+      isExported: isExportedName(sig.parent?.parent ?? sig, className, ctx.source),
+    });
+  }
+}
+
 /** Handle an `instance` node — class node + implements reference + methods. */
-function handleInstance(node: SyntaxNode, ctx: ExtractorContext): boolean {
+export function handleInstance(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
   const className = getNodeText(nameNode, ctx.source);
@@ -348,8 +587,9 @@ export const haskellExtractor: LanguageExtractor = {
 
   visitNode: (node, ctx) => {
     switch (node.type) {
-      case 'function':
       case 'bind':
+        return handleStatementBind(node, ctx) || handleFunctionLike(node, ctx);
+      case 'function':
         return handleFunctionLike(node, ctx);
       case 'signature':
         return true; // metadata for the following function — skip as a node

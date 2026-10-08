@@ -26,6 +26,7 @@ import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './lang
 import { rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
+import { qualifiedRef } from './languages/haskell';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -4925,6 +4926,24 @@ export class TreeSitterExtractor {
 
       if (node.type === 'apply') {
         const func = getChildByField(node, 'function');
+        // A curried call `f a b` nests as apply(apply(f, a), b). The innermost
+        // application names the callee; outer ones would only add refs named
+        // after partial applications (`f a`).
+        if (func?.type === 'apply') return;
+        // `M.f x` / `M.Ctor x` — the resolver's qualified form, with the import
+        // alias expanded.
+        const qualified = func?.type === 'qualified' ? qualifiedRef(func, this.source) : null;
+        if (qualified) {
+          const isConstructor = getChildByField(func!, 'id')?.type === 'constructor';
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            ...qualified,
+            referenceKind: isConstructor ? 'instantiates' : 'calls',
+            line,
+            column,
+          });
+          return;
+        }
         if (func?.type === 'constructor') {
           // Data constructor application — `Circle 5.0`, `Just x`.
           const ctorName = getNodeText(func, this.source);
