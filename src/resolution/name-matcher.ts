@@ -173,6 +173,8 @@ const CODE_FAMILY: Record<string, string> = {
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
+  // DAML compiles to its own ledger runtime: it can't call Haskell, and vice versa.
+  haskell: 'haskell', daml: 'daml',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
