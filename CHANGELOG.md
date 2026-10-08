@@ -335,6 +335,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **CodeGraph now indexes Haskell** (`.hs`, `.lhs`) — functions (including multi-clause definitions with type signatures and Haddock docs), type classes and their instances, algebraic data types and their constructors, record fields, type synonyms, newtypes, and module imports. The call graph follows both local and qualified calls (`Mod.fn`), data-constructor use, and user-defined infix operators, and `where`-clause helpers are tracked as their own symbols.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **Next.js pages and their navigation are in the graph.** App Router pages (`app/(group)/blog/[slug]/page.tsx` → `/blog/:slug`) and Pages Router pages are routes bound to the component they export, and `<Link href>`, an internal `<a href>`, `router.push` / `router.replace` (`next/navigation` and `next/router`), `redirect()` / `permanentRedirect()` and the middleware's `NextResponse.redirect(…)` are `navigates` edges between them. `app/api/**/route.ts` exports (`GET`, `POST`, …) are endpoints bound to their functions, and `pages/api/*` handlers are `ANY /api/…`. Re-index after upgrading.
