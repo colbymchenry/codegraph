@@ -21,6 +21,7 @@
 
 import type { Node } from '../types';
 import type { ResolutionContext } from './types';
+import { resolveObjectLiteralBinding } from './name-matcher';
 
 /** Kinds that can be a pure alias for another symbol. */
 const ALIAS_BINDING_KINDS = new Set<string>(['constant', 'variable', 'property']);
@@ -79,6 +80,15 @@ export function resolveAliasBinding(
 ): Node | null {
   if (!ALIAS_BINDING_KINDS.has(aliasNode.kind)) return null;
 
+  if (memberName && ['typescript', 'tsx', 'javascript', 'jsx', 'arkts'].includes(aliasNode.language)) {
+    const resolved = resolveObjectLiteralBinding(aliasNode, memberName, {
+      fromNodeId: aliasNode.id, referenceName: memberName, referenceKind: 'calls',
+      filePath: aliasNode.filePath, language: aliasNode.language,
+      line: aliasNode.startLine, column: aliasNode.startColumn,
+    }, context);
+    return resolved ? context.getNodeById?.(resolved.targetNodeId) ?? null : null;
+  }
+
   const targetName = aliasTargetName(aliasNode.signature, memberName);
   if (!targetName || targetName === aliasNode.name) return null;
 
@@ -119,6 +129,21 @@ export function extractLocalExportAliases(content: string): Array<{ exportedName
       if (/^[A-Za-z_$][\w$]*$/.test(specifier)) {
         out.push({ localName: specifier, exportedName: specifier });
       }
+    }
+  }
+  // CommonJS: `exports.setCharset = function setCharset(…)`, `module.exports.x = impl`.
+  const memberRe = /^[ \t]*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=\s*(?:(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|([A-Za-z_$][\w$]*)\s*;?[ \t]*$)/gm;
+  let member: RegExpExecArray | null;
+  while ((member = memberRe.exec(content)) !== null) {
+    out.push({ exportedName: member[1]!, localName: member[2] ?? member[3]! });
+  }
+  // `module.exports = { parse, format: formatDate }`.
+  const objectRe = /^[ \t]*module\.exports\s*=\s*\{([^{}]*)\}/gm;
+  let object: RegExpExecArray | null;
+  while ((object = objectRe.exec(content)) !== null) {
+    for (const raw of object[1]!.split(',')) {
+      const entry = /^\s*([A-Za-z_$][\w$]*)\s*(?::\s*([A-Za-z_$][\w$]*)\s*)?$/.exec(raw);
+      if (entry) out.push({ exportedName: entry[1]!, localName: entry[2] ?? entry[1]! });
     }
   }
   return out;

@@ -17,7 +17,12 @@
  * candidate is dropped from the list the moment there is any reason to believe
  * something outside the graph reaches it:
  *
- * - it is **exported** (something outside this repository may import it);
+ * - it is **exported** (something outside this repository may import it). That
+ *   includes whatever a TypeScript `declare module 'x'` or `declare global`
+ *   block declares, which TypeScript exports without the keyword: `interface
+ *   Window` or chart.js's `PluginOptionsByType` merges into a type declared
+ *   outside the index, and the runtime or the library reads it through that
+ *   type, so nothing in the repository names it;
  * - it lives in a **test** or a **generated** file (not code anyone deletes by
  *   hand);
  * - it is **abstract** or declared on an interface (a declaration is dispatched
@@ -25,11 +30,18 @@
  * - it is **decorated** (`@app.route`, `@Component`, `@EventHandler`) — a
  *   decorator is a registration, and the framework that reads it is not in the
  *   graph. Seen as the symbol's own outgoing `decorates` edge, which is where
- *   the engine records it; `node.decorators` is only populated by a couple of
- *   languages and is checked as well rather than instead;
+ *   the engine records it, or, for a decorator imported from outside the index
+ *   (`@HostListener`, `@Cron`), as the resolver's unresolved `decorates` row —
+ *   the same record the ancestor rule below reads for a supertype it could not
+ *   follow. `node.decorators` is only populated by a couple of languages and is
+ *   checked as well rather than instead;
  * - it **overrides** a member an ancestor declares (calls land on the ancestor;
  *   see {@link overrideCandidates} for why an ancestor we cannot read counts
  *   the same way);
+ * - it is a **hook its framework calls by name**: `ngOnInit` on a component
+ *   that never writes `implements OnInit`. Which names are hooks is not kept in
+ *   a table here — the index already says it, in what the classes that DO
+ *   write the interface out declare (see {@link byNameHookCandidates});
  * - it has a name the language calls by itself (`constructor`, `__enter__`,
  *   `main`);
  * - it sits in a **vendored** directory (`vendor/`, `third_party/`,
@@ -90,7 +102,7 @@
 import fs from 'fs';
 import path from 'path';
 import type CodeGraph from '../index';
-import type { Node, NodeKind } from '../types';
+import type { EdgeKind, Node, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
 
 // =============================================================================
@@ -185,6 +197,18 @@ const OVERRIDABLE_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>([
 ]);
 
 /**
+ * Languages whose `implements` clause is erased before the program runs, so a
+ * framework that calls an interface's member can only be finding it by name —
+ * the premise of {@link byNameHookCandidates}. Java, C#, Kotlin and the rest
+ * check the interface itself: Spring never calls `afterPropertiesSet` on a
+ * bean that merely has a method of that name.
+ */
+const BY_NAME_DISPATCH_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'tsx']);
+
+/** Member kinds a framework calls as a hook. */
+const HOOK_KINDS: readonly NodeKind[] = ['method', 'function'];
+
+/**
  * Names a language or a runtime calls without anything in the source naming
  * them.
  *
@@ -193,7 +217,8 @@ const OVERRIDABLE_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>([
  * stale, and it would hide real dead code behind a name coincidence. The
  * entries below are the ones where the *language itself* does the calling, so
  * no source file could name them even in principle. Framework hooks are caught
- * by the decorator and override rules instead, which are structural.
+ * by the decorator, override and by-name hook rules instead, which are
+ * structural.
  */
 const IMPLICIT_ENTRY_NAMES: ReadonlySet<string> = new Set([
   'constructor',
@@ -333,7 +358,11 @@ export interface DeadCodeExclusions {
   tests: number;
   /** In a tool-generated file. */
   generated: number;
-  /** Exported, or declared in a header — reachable from outside this index. */
+  /**
+   * Exported, or declared in a header — reachable from outside this index. A
+   * TypeScript `declare module` / `declare global` declaration is exported
+   * implicitly: it merges into a library's or the global scope's type.
+   */
   exported: number;
   /**
    * In a language this index records no export marker for, so nothing here can
@@ -346,6 +375,12 @@ export interface DeadCodeExclusions {
   decorated: number;
   /** Overrides a member an ancestor declares, or an ancestor we cannot read. */
   overriding: number;
+  /**
+   * A hook its framework calls by name, on a class that skips the interface:
+   * the class carries a decorator, and the name is one an interface outside
+   * the index carries, going by the classes that write it out.
+   */
+  hooks: number;
   /** Named something the language calls by itself. */
   implicit: number;
   /** In a vendored directory — carried code, reached by something outside the index. */
@@ -437,6 +472,7 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
     declarations: 0,
     decorated: 0,
     overriding: 0,
+    hooks: 0,
     implicit: 0,
     vendored: 0,
     testScope: 0,
@@ -508,14 +544,7 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
   // A `decorates` edge runs FROM the decorated symbol to the decorator, so
   // this is an outgoing-edge question, not something the candidate query could
   // have answered.
-  const decorated = new Set(
-    cg
-      .getOutgoingEdgesFrom(
-        surviving.map((row) => row.node.id),
-        ['decorates']
-      )
-      .map((edge) => edge.source)
-  );
+  const decorated = carriesDecorator(cg, surviving.map((row) => row.node));
   const containers = containersOf(cg, surviving.map((row) => row.node));
   const overriding = overrideCandidates(cg, surviving.map((row) => row.node), containers);
   // One batched count for every file still in play. A file nothing reaches is
@@ -532,10 +561,19 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
   const names = surviving.map((row) => row.node.name);
   const unresolved = cg.getUnresolvedNamesAmong(names);
   const ambiguousNames = cg.getAmbiguousReferencedNames(names);
+  // Asked only about the members no earlier rule in the loop below drops.
+  const hooks = byNameHookCandidates(
+    cg,
+    surviving
+      .map((row) => row.node)
+      .filter((node) => !decorated.has(node.id) && !overriding.has(node.id)),
+    containers,
+    candidates.map((row) => row.node)
+  );
 
   const kept: Array<{ node: Node; generated: boolean }> = [];
   for (const row of surviving) {
-    if (decorated.has(row.node.id) || (row.node.decorators?.length ?? 0) > 0) {
+    if (decorated.has(row.node.id)) {
       excluded.decorated += 1;
       continue;
     }
@@ -546,6 +584,10 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
     }
     if (overriding.has(row.node.id)) {
       excluded.overriding += 1;
+      continue;
+    }
+    if (hooks.has(row.node.id)) {
+      excluded.hooks += 1;
       continue;
     }
     if (unresolved.has(row.node.name)) {
@@ -797,6 +839,13 @@ function containersOf(cg: CodeGraph, nodes: readonly Node[]): Map<string, Node> 
  * only choice that keeps the list's promise; the alternative puts every
  * implementation of every signature-only interface at the top of a screen that
  * says "nothing reaches this".
+ *
+ * An ancestor **outside the index** is opaque in the same way, and more so: a
+ * class that extends `React.Component` or `stream.Transform`, or implements a
+ * framework interface, has lifecycle methods the framework calls, and the
+ * ancestor leaves no edge to walk at all — only the resolver's failed
+ * `extends` / `implements` row. A container with such a row, or a project
+ * ancestor of one that has it, counts as having an opaque ancestor (#1973).
  */
 function overrideCandidates(
   cg: CodeGraph,
@@ -807,40 +856,15 @@ function overrideCandidates(
   const containerIds = [...new Set([...containers.values()].map((node) => node.id))];
   if (containerIds.length === 0) return dropped;
 
-  // Level-by-level upward walk over EVERY container at once: one query per
-  // level rather than one per container. `reach` maps an ancestor back to the
-  // containers it is an ancestor of.
-  const reach = new Map<string, Set<string>>();
-  const seen = new Set<string>(containerIds);
-  let frontier = containerIds.map((id) => ({ id, roots: new Set<string>([id]) }));
+  // `reach` maps an ancestor back to the containers it is an ancestor of.
+  const reach = ancestorsOf(cg, containerIds, ['extends', 'implements']);
 
-  for (let depth = 0; depth < MAX_OVERRIDE_ANCESTOR_DEPTH && frontier.length > 0; depth++) {
-    const rootsOf = new Map(frontier.map((item) => [item.id, item.roots]));
-    const edges = cg.getOutgoingEdgesFrom(
-      frontier.map((item) => item.id),
-      ['extends', 'implements']
-    );
-    const next = new Map<string, Set<string>>();
-    for (const edge of edges) {
-      if (edge.target === edge.source) continue;
-      const roots = rootsOf.get(edge.source);
-      if (!roots) continue;
-      const merged = next.get(edge.target) ?? new Set<string>();
-      for (const root of roots) merged.add(root);
-      next.set(edge.target, merged);
-      const known = reach.get(edge.target) ?? new Set<string>();
-      for (const root of roots) known.add(root);
-      reach.set(edge.target, known);
-    }
-    frontier = [];
-    for (const [id, roots] of next) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      frontier.push({ id, roots });
-    }
+  const opaqueContainers = new Set<string>();
+  const externalBased = cg.getUnresolvedSupertypeSourcesAmong([...containerIds, ...reach.keys()]);
+  for (const id of containerIds) if (externalBased.has(id)) opaqueContainers.add(id);
+  for (const [ancestorId, roots] of reach) {
+    if (externalBased.has(ancestorId)) for (const root of roots) opaqueContainers.add(root);
   }
-
-  if (reach.size === 0) return dropped;
 
   // What each ancestor declares, and whether it declares anything at all.
   const ancestorIds = [...reach.keys()];
@@ -855,7 +879,6 @@ function overrideCandidates(
 
   /** Member names an ancestor declares, and whether it declares none we can read. */
   const namesByContainer = new Map<string, Set<string>>();
-  const opaqueContainers = new Set<string>();
   for (const [ancestorId, roots] of reach) {
     const names: string[] = [];
     for (const memberId of memberIdsByAncestor.get(ancestorId) ?? []) {
@@ -882,5 +905,210 @@ function overrideCandidates(
     }
     if (namesByContainer.get(container.id)?.has(node.name)) dropped.add(node.id);
   }
+  return dropped;
+}
+
+/**
+ * Every ancestor of `ids` along `kinds` edges, mapped back to the ids it is an
+ * ancestor of. A level-by-level upward walk over EVERY id at once — one query
+ * per level rather than one per id — up to {@link MAX_OVERRIDE_ANCESTOR_DEPTH}.
+ */
+function ancestorsOf(
+  cg: CodeGraph,
+  ids: readonly string[],
+  kinds: EdgeKind[]
+): Map<string, Set<string>> {
+  const reach = new Map<string, Set<string>>();
+  const seen = new Map(ids.map((id) => [id, new Set([id])]));
+  let frontier = ids.map((id) => ({ id, roots: new Set<string>([id]) }));
+
+  for (let depth = 0; depth < MAX_OVERRIDE_ANCESTOR_DEPTH && frontier.length > 0; depth++) {
+    const rootsOf = new Map(frontier.map((item) => [item.id, item.roots]));
+    const edges = cg.getOutgoingEdgesFrom(
+      frontier.map((item) => item.id),
+      kinds
+    );
+    const next = new Map<string, Set<string>>();
+    for (const edge of edges) {
+      if (edge.target === edge.source) continue;
+      const roots = rootsOf.get(edge.source);
+      if (!roots) continue;
+      const merged = next.get(edge.target) ?? new Set<string>();
+      const visited = seen.get(edge.target) ?? new Set<string>();
+      const known = reach.get(edge.target) ?? new Set<string>();
+      // An ancestor may already be a root. Only skip pairs we have propagated,
+      // so later descendants still reach all of its ancestors.
+      for (const root of roots) {
+        if (visited.has(root)) continue;
+        visited.add(root);
+        merged.add(root);
+        known.add(root);
+      }
+      seen.set(edge.target, visited);
+      if (merged.size > 0) next.set(edge.target, merged);
+      if (known.size > 0) reach.set(edge.target, known);
+    }
+    frontier = [];
+    for (const [id, roots] of next) {
+      frontier.push({ id, roots });
+    }
+  }
+  return reach;
+}
+
+/**
+ * Which of `nodes` carry a decorator: their own outgoing `decorates` edge, an
+ * unresolved `decorates` row (the only trace a decorator imported from outside
+ * the index, like `@HostListener` or `@Cron`, leaves), or the `decorators`
+ * list a couple of languages record on the node itself.
+ */
+function carriesDecorator(cg: CodeGraph, nodes: readonly Node[]): Set<string> {
+  const ids = nodes.map((node) => node.id);
+  const found = new Set(cg.getOutgoingEdgesFrom(ids, ['decorates']).map((edge) => edge.source));
+  for (const id of cg.getUnresolvedReferenceNamesFrom(ids, ['decorates']).keys()) found.add(id);
+  for (const node of nodes) if ((node.decorators?.length ?? 0) > 0) found.add(node.id);
+  return found;
+}
+
+/**
+ * Which members are hooks their framework calls by name — the ids to drop.
+ *
+ * Angular calls `ngOnInit` on every component it creates, and NestJS calls
+ * `onModuleInit` on every provider, whether or not the class writes
+ * `implements OnInit`: TypeScript erases the clause, so the framework can only
+ * be finding the method by its name. A class that writes the clause is already
+ * off the list, because its ancestor is outside the index
+ * ({@link overrideCandidates}). One that skips it is tied to the framework by
+ * nothing but the name.
+ *
+ * Which names are hooks is not a table kept here; a table would go stale and
+ * hide real dead code behind a name coincidence. The index says it already:
+ * what `OnInit` carries is what the classes that DO write `implements OnInit`
+ * have. A method is dropped when all of this holds:
+ *
+ * - **its class carries a decorator**, so a framework creates it
+ *   (`@Component`, `@Injectable`). Nothing creates an undecorated class, so
+ *   nothing calls its hooks. And the class's decorator says nothing about its
+ *   other methods: an unused helper on a component stays on the list;
+ * - **an interface outside the index carries the name**. Every TypeScript class
+ *   that writes the interface into an `implements` clause has a method of that
+ *   name, declared or inherited from an ancestor that declares it, which is
+ *   what TypeScript itself checks; a class that inherits from outside the index
+ *   may have it from there, so it is no evidence either way. At least two of
+ *   them, and more than half, declare it themselves: one class's methods are
+ *   that class, not a contract, and a name that only a few declare while the
+ *   rest are unreadable is not evidence of one either;
+ * - **more than half of those classes carry a decorator** as well: the
+ *   interface is one that framework-created classes fill, not a library type
+ *   whose method happens to share the name.
+ *
+ * TypeScript only — see {@link BY_NAME_DISPATCH_LANGUAGES}.
+ */
+function byNameHookCandidates(
+  cg: CodeGraph,
+  nodes: readonly Node[],
+  containers: ReadonlyMap<string, Node>,
+  unreferenced: readonly Node[]
+): Set<string> {
+  const dropped = new Set<string>();
+  const isHookShaped = (node: Node): boolean =>
+    HOOK_KINDS.includes(node.kind) && BY_NAME_DISPATCH_LANGUAGES.has(node.language);
+  const methods = nodes.filter(
+    (node) => isHookShaped(node) && containers.get(node.id)?.kind === 'class'
+  );
+  if (methods.length === 0) return dropped;
+
+  const classes = new Map<string, Node>();
+  for (const node of methods) {
+    const container = containers.get(node.id);
+    if (container) classes.set(container.id, container);
+  }
+  const registered = carriesDecorator(cg, [...classes.values()]);
+  const eligible = methods.filter((node) => registered.has(containers.get(node.id)?.id ?? ''));
+  if (eligible.length === 0) return dropped;
+
+  // Every class declaring a method of each name. A hook is called by its
+  // framework and never by the code in the index, so each class's own
+  // declaration of it is unreferenced too: it is in `unreferenced` already, and
+  // the index need not be searched by name. (A name with a declaration that
+  // something does call is the ambiguous-name rule's, which drops every
+  // candidate of that name.)
+  const names = new Set(eligible.map((node) => node.name));
+  const declarations = unreferenced.filter((node) => names.has(node.name) && isHookShaped(node));
+  const declaredIn = containersOf(
+    cg,
+    declarations.filter((node) => !containers.has(node.id))
+  );
+  const declaring = new Map<string, Set<string>>();
+  for (const node of declarations) {
+    const container = containers.get(node.id) ?? declaredIn.get(node.id);
+    if (container?.kind !== 'class') continue;
+    const ids = declaring.get(node.name);
+    if (ids) ids.add(container.id);
+    else declaring.set(node.name, new Set([container.id]));
+  }
+
+  // The interfaces outside the index each of those classes writes out.
+  const declarers = new Set([...declaring.values()].flatMap((ids) => [...ids]));
+  const interfacesOf = cg.getUnresolvedReferenceNamesFrom(declarers, ['implements']);
+  const interfaces = new Set([...interfacesOf.values()].flat());
+  if (interfaces.size === 0) return dropped;
+
+  // Every TypeScript class writing each of those interfaces out, kept where
+  // more than half of them are framework-created.
+  const writers = cg.getUnresolvedReferenceSourcesNamed(interfaces, ['implements']);
+  const writerIds = [...new Set([...writers.values()].flatMap((ids) => [...ids]))];
+  const typescript = [...cg.getNodesByIds(writerIds).values()].filter((node) =>
+    BY_NAME_DISPATCH_LANGUAGES.has(node.language)
+  );
+  const typescriptIds = new Set(typescript.map((node) => node.id));
+  const registeredWriters = carriesDecorator(cg, typescript);
+  const implementers = new Map<string, string[]>();
+  for (const [name, ids] of writers) {
+    const own = [...ids].filter((id) => typescriptIds.has(id));
+    const registeredCount = own.filter((id) => registeredWriters.has(id)).length;
+    if (registeredCount > own.length / 2) implementers.set(name, own);
+  }
+  if (implementers.size === 0) return dropped;
+
+  // What each implementer inherits from, and which inherit from outside the
+  // index somewhere up the chain.
+  const implementerIds = [...new Set([...implementers.values()].flat())];
+  const ancestors = ancestorsOf(cg, implementerIds, ['extends']);
+  const inherits = new Map<string, string[]>();
+  for (const [ancestor, roots] of ancestors) {
+    for (const root of roots) {
+      const bucket = inherits.get(root);
+      if (bucket) bucket.push(ancestor);
+      else inherits.set(root, [ancestor]);
+    }
+  }
+  const outside = cg.getUnresolvedReferenceNamesFrom([...implementerIds, ...ancestors.keys()], ['extends']);
+  const opaque = new Set(implementerIds.filter((id) => outside.has(id)));
+  for (const [ancestor, roots] of ancestors) {
+    if (outside.has(ancestor)) for (const root of roots) opaque.add(root);
+  }
+
+  const hookNames = new Set<string>();
+  for (const name of names) {
+    const declared = declaring.get(name);
+    if (!declared) continue;
+    const has = (id: string): boolean =>
+      declared.has(id) ||
+      opaque.has(id) ||
+      (inherits.get(id) ?? []).some((ancestor) => declared.has(ancestor));
+    const contracts = new Set([...declared].flatMap((id) => interfacesOf.get(id) ?? []));
+    for (const contract of contracts) {
+      const own = implementers.get(contract);
+      if (!own) continue;
+      const declaredCount = own.filter((id) => declared.has(id)).length;
+      if (declaredCount >= 2 && declaredCount > own.length / 2 && own.every(has)) {
+        hookNames.add(name);
+        break;
+      }
+    }
+  }
+
+  for (const node of eligible) if (hookNames.has(node.name)) dropped.add(node.id);
   return dropped;
 }

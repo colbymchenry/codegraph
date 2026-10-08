@@ -151,7 +151,7 @@ describe('extractQueryPaths — resolution and stripping', () => {
   it('passes through untouched when nothing resolves', () => {
     const q = 'plain prose question about scrolling';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 });
 
@@ -191,13 +191,13 @@ describe('extractQueryPaths — extension-less kebab basenames', () => {
   it('leaves kebab prose that names no indexed file untouched — and unreported', () => {
     const q = 'how does cross-call dedup make explore non-blocking';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 
   it('leaves a stem shared by too many files alone — one hot name must not pin half the repo', () => {
     const q = 'refactor the user-profile rendering';
     const out = extractQueryPaths(q, INDEX);
-    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [] });
+    expect(out).toEqual({ strippedQuery: q, pinnedFiles: [], unresolvedPathSpans: [], lineAnchors: [], setAsideMatches: [] });
   });
 
   it('pins all files sharing a stem when within the ambiguity budget', () => {
@@ -234,5 +234,271 @@ describe('extractQueryPaths — extension-less kebab basenames', () => {
     expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
     // The kebab token was not consumed once the budget was spent — it stays for FTS.
     expect(out.strippedQuery).toBe('background-image-table then');
+  });
+});
+
+/**
+ * Dotless slashed spans (#1830). `scripts/deploy` names a real file that the
+ * index does not hold (no recognized extension), but the shape test demands a
+ * dot-extension on the last segment — so the span was neither pinned NOR
+ * reported, and its fragments (`scripts`, `deploy`) went on to feed FTS. The
+ * agent got a pile of unrelated source with no hint that the file it named was
+ * never consulted. Shape alone cannot decide this (`and/or` is the same shape),
+ * so the caller injects an `existsOnDisk` predicate and the file's existence
+ * decides. These tests also pin that the predicate is genuinely CONSULTED —
+ * a predicate that is never called would make the whole arm vacuous.
+ */
+describe('extractQueryPaths — dotless slashed spans, decided on disk', () => {
+  /** Records every span the predicate is asked about. */
+  const probe = (onDisk: readonly string[]) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      existsOnDisk: (rel: string) => { asked.push(rel); return onDisk.includes(rel); },
+    };
+  };
+
+  it('reports a dotless path that exists on disk but is not indexed', () => {
+    const p = probe(['scripts/deploy']);
+    const out = extractQueryPaths(
+      'why does scripts/deploy fail on release', INDEX, { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual(['scripts/deploy']);
+    expect(out.strippedQuery).toBe('why does fail on release');
+    // Vacuity guard: the verdict came from the predicate, not from some other arm.
+    expect(p.asked).toContain('scripts/deploy');
+  });
+
+  it('leaves the same span alone when no predicate is injected', () => {
+    const q = 'why does scripts/deploy fail on release';
+    const out = extractQueryPaths(q, INDEX);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+  });
+
+  it('leaves `and/or` prose alone even though a predicate is injected', () => {
+    const p = probe(['scripts/deploy']);
+    const q = 'does gen_server:call/2 block and/or timeout';
+    const out = extractQueryPaths(q, INDEX, { existsOnDisk: p.existsOnDisk });
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+    // Consulted and refused — not skipped by shape.
+    expect(p.asked).toContain('and/or');
+  });
+
+  it('leaves a slashed word pair that is not a file on disk alone', () => {
+    const p = probe(['scripts/deploy']);
+    const q = 'trace the input/output buffering path';
+    const out = extractQueryPaths(q, INDEX, { existsOnDisk: p.existsOnDisk });
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+    expect(p.asked).toContain('input/output');
+  });
+
+  it('still reports a dotted span that matches nothing and is not on disk', () => {
+    const p = probe([]);
+    const out = extractQueryPaths(
+      'crash in src/routes/gone/missing-page.svelte on load', INDEX,
+      { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.unresolvedPathSpans).toEqual(['src/routes/gone/missing-page.svelte']);
+    expect(out.strippedQuery).toBe('crash in on load');
+  });
+
+  it('pins an indexed dotless path by resolution, never asking about it', () => {
+    const p = probe(['scripts/pre-commit']);
+    const out = extractQueryPaths(
+      'what does scripts/pre-commit run', INDEX, { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.pinnedFiles).toEqual(['scripts/pre-commit']);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(p.asked).not.toContain('scripts/pre-commit');
+  });
+});
+
+describe('extractQueryPaths — line anchors', () => {
+  // The django follow-ups that went unanswered: an agent handed a signature for
+  // a 226-line method asks for the body by line, and explore used to pin the
+  // file but drop the lines — answering "the file's most relevant clusters"
+  // instead of the span it named.
+  const CHAT = 'src/lib/chat-manager.ts';
+
+  it('keeps a :line / :start-end / #L suffix as an anchor on the pinned file', () => {
+    expect(extractQueryPaths(`body of ${CHAT}:776`, INDEX).lineAnchors)
+      .toEqual([{ file: CHAT, start: 776, end: 776 }]);
+    expect(extractQueryPaths(`see ${CHAT}:12-40`, INDEX).lineAnchors)
+      .toEqual([{ file: CHAT, start: 12, end: 40 }]);
+    expect(extractQueryPaths('regression at src/lib/task-runner-manager.ts#L88-L120', INDEX).lineAnchors)
+      .toEqual([{ file: 'src/lib/task-runner-manager.ts', start: 88, end: 120 }]);
+  });
+
+  it('binds a prose line range to the path it sits next to and removes it from the query', () => {
+    const out = extractQueryPaths(`${CHAT} lines 900-1003 flushQueue tail`, INDEX);
+    expect(out.lineAnchors).toEqual([{ file: CHAT, start: 900, end: 1003 }]);
+    // `lines` would feed FTS a word every file holds; the numbers match nothing.
+    expect(out.strippedQuery).toBe('flushQueue tail');
+  });
+
+  it('accepts the other spellings agents write', () => {
+    const anchor = (q: string) => extractQueryPaths(q, INDEX).lineAnchors;
+    expect(anchor(`lines 900 to 1003 of ${CHAT}`)).toEqual([{ file: CHAT, start: 900, end: 1003 }]);
+    expect(anchor(`L900-L1003 in ${CHAT}`)).toEqual([{ file: CHAT, start: 900, end: 1003 }]);
+    expect(anchor(`${CHAT} line 42`)).toEqual([{ file: CHAT, start: 42, end: 42 }]);
+    expect(anchor(`${CHAT} 900-1003`)).toEqual([{ file: CHAT, start: 900, end: 1003 }]);
+    expect(anchor(`${CHAT} (lines 1003-900)`)).toEqual([{ file: CHAT, start: 900, end: 1003 }]);
+  });
+
+  it('binds each range to its NEAREST path when the query names two files', () => {
+    const out = extractQueryPaths(
+      `${CHAT} lines 10-20 and src/lib/task-runner-manager.ts lines 30-40`, INDEX,
+    );
+    expect(out.lineAnchors).toEqual([
+      { file: CHAT, start: 10, end: 20 },
+      { file: 'src/lib/task-runner-manager.ts', start: 30, end: 40 },
+    ]);
+  });
+
+  it('leaves line numbers alone when there is no path, or the path is ambiguous', () => {
+    const noPath = extractQueryPaths('flushQueue lines 900-1003', INDEX);
+    expect(noPath.lineAnchors).toEqual([]);
+    // A bare number with no line context is not a line number either.
+    expect(extractQueryPaths(`${CHAT} retries 3 times`, INDEX).lineAnchors).toEqual([]);
+    // `generic-modal` pins two files; a line number means nothing across both.
+    const twoFiles = extractQueryPaths('generic-modal.tsx:40', INDEX);
+    expect(twoFiles.pinnedFiles).toHaveLength(2);
+    expect(twoFiles.lineAnchors).toEqual([]);
+  });
+});
+
+/**
+ * A span that matches several files, narrowed by the symbols the query names.
+ *
+ * vscode has two `editorOptions.ts`; `editorOptions.ts clampedInt
+ * cursorStyleToString` pinned both, and the pins split the reservation, so the
+ * file holding the named functions got half the room it got WITHOUT the path.
+ * The caller injects `symbolFiles` (the index lookup; this module stays
+ * DB-free) and the matches defining a named symbol are the ones pinned.
+ */
+describe('extractQueryPaths — same-named files, narrowed by named symbols', () => {
+  const REGISTRY = 'src/editor/config/editorOptions.ts';
+  const HELPER = 'src/workbench/editor/editorOptions.ts';
+  const SHARED = [...INDEX, REGISTRY, HELPER];
+  /** Records every symbol the lookup is asked about. */
+  const lookup = (defs: Record<string, string[]>) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      symbolFiles: (symbol: string) => { asked.push(symbol); return defs[symbol] ?? []; },
+    };
+  };
+
+  it('pins only the match defining a named symbol and reports the one set aside', () => {
+    const l = lookup({ clampedInt: [REGISTRY], cursorStyleToString: [REGISTRY] });
+    const out = extractQueryPaths(
+      'editorOptions.ts clampedInt cursorStyleToString', SHARED, { symbolFiles: l.symbolFiles },
+    );
+    expect(out.pinnedFiles).toEqual([REGISTRY]);
+    expect(out.setAsideMatches).toEqual([{ span: 'editorOptions.ts', files: [HELPER] }]);
+    expect(out.strippedQuery).toBe('clampedInt cursorStyleToString');
+    // The span itself is a file name, not a symbol to look up.
+    expect(l.asked).toEqual(['clampedInt', 'cursorStyleToString']);
+  });
+
+  it('narrows a shared kebab stem the same way', () => {
+    const l = lookup({ GenericModalFooter: ['src/y/generic-modal.tsx'] });
+    const out = extractQueryPaths('generic-modal GenericModalFooter', SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual(['src/y/generic-modal.tsx']);
+    expect(out.setAsideMatches).toEqual([{ span: 'generic-modal', files: ['src/x/generic-modal.tsx'] }]);
+  });
+
+  it('pins every match when none defines a named symbol, or every one does', () => {
+    const none = lookup({ clampedInt: ['src/lib/chat-manager.ts'] });
+    const noneOut = extractQueryPaths('editorOptions.ts clampedInt', SHARED, { symbolFiles: none.symbolFiles });
+    expect(noneOut.pinnedFiles).toEqual([REGISTRY, HELPER]);
+    expect(noneOut.setAsideMatches).toEqual([]);
+    // Consulted and found nothing — not skipped.
+    expect(none.asked).toEqual(['clampedInt']);
+
+    const both = lookup({ EditorOptions: [HELPER, REGISTRY] });
+    const bothOut = extractQueryPaths('editorOptions.ts EditorOptions', SHARED, { symbolFiles: both.symbolFiles });
+    expect(bothOut.pinnedFiles).toEqual([REGISTRY, HELPER]);
+    expect(bothOut.setAsideMatches).toEqual([]);
+  });
+
+  it('does not let a bare English word pick a file', () => {
+    // `options` and `close` are words as much as names: a file defining one
+    // says nothing about which same-named file the agent meant.
+    const l = lookup({ options: [HELPER], close: ['src/x/generic-modal.tsx'] });
+    expect(extractQueryPaths('editorOptions.ts options', SHARED, { symbolFiles: l.symbolFiles }).pinnedFiles)
+      .toEqual([REGISTRY, HELPER]);
+    expect(extractQueryPaths('generic-modal close behavior', SHARED, { symbolFiles: l.symbolFiles }).pinnedFiles)
+      .toEqual(['src/x/generic-modal.tsx', 'src/y/generic-modal.tsx']);
+    expect(l.asked).toEqual([]);
+  });
+
+  it('looks a qualified token up as written, and reads `name()` as the name', () => {
+    const l = lookup({ 'EditorIntOption.clampedInt': [REGISTRY], cursorStyleFromString: [REGISTRY] });
+    const out = extractQueryPaths(
+      'editorOptions.ts EditorIntOption.clampedInt `cursorStyleFromString()`', SHARED,
+      { symbolFiles: l.symbolFiles },
+    );
+    expect(out.pinnedFiles).toEqual([REGISTRY]);
+    expect(l.asked).toEqual(['EditorIntOption.clampedInt', 'cursorStyleFromString']);
+  });
+
+  it('resolves a basename shared past the ambiguity budget when one match defines the named symbol', () => {
+    const l = lookup({ UserProfileCard: ['src/c/user-profile.tsx'] });
+    const out = extractQueryPaths('user-profile UserProfileCard', SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual(['src/c/user-profile.tsx']);
+    expect(out.setAsideMatches).toEqual([{
+      span: 'user-profile',
+      files: ['src/a/user-profile.tsx', 'src/b/user-profile.tsx', 'src/d/user-profile.tsx'],
+    }]);
+
+    const dotted = extractQueryPaths('+page.svelte ChatScroller', SHARED, {
+      symbolFiles: lookup({ ChatScroller: ['src/routes/(protected)/chat-window/+page.svelte'] }).symbolFiles,
+    });
+    expect(dotted.pinnedFiles).toEqual(['src/routes/(protected)/chat-window/+page.svelte']);
+    expect(dotted.unresolvedPathSpans).toEqual([]);
+  });
+
+  it('keeps an over-budget span ambiguous when the symbols do not narrow it into budget', () => {
+    const l = lookup({ PageHeader: [
+      'src/routes/m/projects/[id]/runs/[runId]/+page.svelte',
+      'src/routes/m/projects/[id]/chat/[scope]/+page.svelte',
+      'src/routes/m/projects/[id]/+page.svelte',
+      'src/routes/(protected)/chat-window/+page.svelte',
+    ] });
+    const out = extractQueryPaths('why do all +page.svelte PageHeader files flash', SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual(['+page.svelte']);
+    expect(out.setAsideMatches).toEqual([]);
+
+    const kebab = extractQueryPaths('refactor the user-profile rendering', SHARED, { symbolFiles: l.symbolFiles });
+    expect(kebab.pinnedFiles).toEqual([]);
+    expect(kebab.strippedQuery).toBe('refactor the user-profile rendering');
+  });
+
+  it('binds a line anchor once the span narrows to one file', () => {
+    const l = lookup({ clampedInt: [REGISTRY] });
+    const out = extractQueryPaths('editorOptions.ts:1291 clampedInt', SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual([REGISTRY]);
+    expect(out.lineAnchors).toEqual([{ file: REGISTRY, start: 1291, end: 1291 }]);
+  });
+
+  it('does not report a file the query also named by its full path', () => {
+    const l = lookup({ clampedInt: [REGISTRY] });
+    const out = extractQueryPaths(`editorOptions.ts clampedInt ${HELPER}`, SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual([REGISTRY, HELPER]);
+    expect(out.setAsideMatches).toEqual([]);
+  });
+
+  it('never looks anything up for a span that matches one file', () => {
+    const l = lookup({ ChatManager: ['src/lib/chat-manager.ts'] });
+    const out = extractQueryPaths('chat-manager.ts ChatManager', SHARED, { symbolFiles: l.symbolFiles });
+    expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
+    expect(l.asked).toEqual([]);
   });
 });

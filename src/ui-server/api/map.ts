@@ -106,7 +106,11 @@ export function rootFilesId(root: string): string {
 export interface WireMapModule {
   /** Directory path, or the `(root files)` bucket, or a façade file's own path. */
   id: string;
-  /** Last path segment — what the node label shows when the id is long. */
+  /**
+   * What the box says: the id, with a folder chain the repository never forks
+   * in written `first/…/last` — Maven's `src/main/java/…/petclinic/owner`
+   * rather than all seven segments. Equal to `id` everywhere else.
+   */
   label: string;
   files: number;
   symbols: number;
@@ -223,17 +227,81 @@ function stemOf(basename: string): string {
 }
 
 /**
+ * Directories a module boundary never falls on: exactly one subdirectory and
+ * no file of their own. A Maven project keeps every line of Java under
+ * `src/main/java/org/springframework/samples/petclinic/`, and the first four
+ * of those folders split nothing — cutting at any of them draws the whole
+ * program as one box, and no depth the reader can pick gets past them. Such a
+ * folder joins the level below it, so depth counts folders that fork.
+ *
+ * Read from every indexed file, tests included, so a module's id does not
+ * change when the reader toggles tests. The repository root is never one.
+ */
+export function passThroughDirs(paths: Iterable<string>): Set<string> {
+  const children = new Map<string, Set<string>>();
+  const holdsFiles = new Set<string>();
+  for (const raw of paths) {
+    const parts = toPosixPath(raw).split('/').filter(Boolean);
+    let dir = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      let kids = children.get(dir);
+      if (!kids) children.set(dir, (kids = new Set()));
+      kids.add(parts[i]!);
+      dir = dir ? `${dir}/${parts[i]}` : parts[i]!;
+    }
+    holdsFiles.add(dir);
+  }
+  const out = new Set<string>();
+  for (const [dir, kids] of children) {
+    if (dir !== '' && kids.size === 1 && !holdsFiles.has(dir)) out.add(dir);
+  }
+  return out;
+}
+
+/**
+ * Where each level of a file's directory path ends, as indexes into `dirs`: a
+ * level is one folder plus every pass-through folder that follows it.
+ */
+function levelEnds(root: string, dirs: readonly string[], passThrough: ReadonlySet<string> | undefined): number[] {
+  const ends: number[] = [];
+  for (let i = 0; i < dirs.length; ) {
+    i++;
+    while (passThrough && i < dirs.length && passThrough.has(joinPath(root, dirs.slice(0, i)))) i++;
+    ends.push(i);
+  }
+  return ends;
+}
+
+function joinPath(root: string, segments: readonly string[]): string {
+  return [root, ...segments].filter(Boolean).join('/');
+}
+
+/** The first `levels` levels of `dirs`, a chain of three or more folders written `first/…/last`. */
+function levelLabel(root: string, dirs: readonly string[], ends: readonly number[]): string {
+  const out: string[] = root ? [root] : [];
+  let from = 0;
+  for (const end of ends) {
+    const chain = dirs.slice(from, end);
+    out.push(chain.length >= 3 ? `${chain[0]}/…/${chain[chain.length - 1]}` : chain.join('/'));
+    from = end;
+  }
+  return out.join('/');
+}
+
+/**
  * Which module a file belongs to, or `null` when it is outside the root.
  *
- * `depth` segments under the root name the module. A file with fewer segments
- * than that is loose in the root: a façade keeps its own box, everything else
- * joins the `(root files)` bucket.
+ * `depth` levels under the root name the module — a level being a folder and
+ * the {@link passThroughDirs} that follow it (without them, one level per
+ * folder). A file with fewer levels than that is loose in the root: a façade
+ * keeps its own box, everything else joins the `(root files)` bucket.
  */
 export function moduleIdFor(
   filePath: string,
   root: string,
-  depth: number
-): { id: string; facade: boolean } | null {
+  depth: number,
+  passThrough?: ReadonlySet<string>
+): { id: string; facade: boolean; label: string } | null {
   const path = toPosixPath(filePath);
   let rel = path;
   if (root) {
@@ -242,16 +310,24 @@ export function moduleIdFor(
   }
   const parts = rel.split('/').filter(Boolean);
   if (parts.length === 0) return null;
-  if (parts.length <= depth) {
+  const dirs = parts.slice(0, -1);
+  const ends = levelEnds(root, dirs, passThrough);
+  if (ends.length < depth) {
     // A loose file. The directories it DOES have still qualify it, so
     // `src/a/b.ts` at depth 2 lands in `src/a/(root files)`, not the top one.
-    const dir = [root, ...parts.slice(0, -1)].filter(Boolean).join('/');
-    if (FACADE_STEMS.has(stemOf(parts[parts.length - 1] ?? ''))) {
-      return { id: [root, ...parts].filter(Boolean).join('/'), facade: true };
+    const dir = joinPath(root, dirs);
+    const dirLabel = levelLabel(root, dirs, ends);
+    const file = parts[parts.length - 1] ?? '';
+    if (FACADE_STEMS.has(stemOf(file))) {
+      return { id: joinPath(root, parts), facade: true, label: dirLabel ? `${dirLabel}/${file}` : file };
     }
-    return { id: rootFilesId(dir), facade: false };
+    return { id: rootFilesId(dir), facade: false, label: rootFilesId(dirLabel) };
   }
-  return { id: [root, ...parts.slice(0, depth)].filter(Boolean).join('/'), facade: false };
+  return {
+    id: joinPath(root, dirs.slice(0, ends[depth - 1])),
+    facade: false,
+    label: levelLabel(root, dirs, ends.slice(0, depth)),
+  };
 }
 
 /**
@@ -272,11 +348,13 @@ export function pickDefaultRoot(
   let total = 0;
   for (const file of files) {
     if (file.test) continue;
+    // A file loose in the repository root is program too: git's hundreds of
+    // top-level `.c` files made `builtin/` look like the majority of the code.
+    total += file.symbols;
     const slash = file.path.indexOf('/');
     if (slash <= 0) continue;
     const dir = file.path.slice(0, slash);
     byDir.set(dir, (byDir.get(dir) ?? 0) + file.symbols);
-    total += file.symbols;
   }
   if (total === 0) return '';
   let best = '';
@@ -318,13 +396,14 @@ const MAX_MODULES = 60;
 function tallyModules(
   files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
   root: string,
-  depth: number
+  depth: number,
+  passThrough?: ReadonlySet<string>
 ): { count: number; share: number; largestFiles: number } {
   const byModule = new Map<string, { symbols: number; files: number }>();
   let total = 0;
   for (const file of files) {
     if (file.test) continue;
-    const assigned = moduleIdFor(file.path, root, depth);
+    const assigned = moduleIdFor(file.path, root, depth, passThrough);
     if (assigned === null) continue;
     let entry = byModule.get(assigned.id);
     if (!entry) byModule.set(assigned.id, (entry = { symbols: 0, files: 0 }));
@@ -364,7 +443,8 @@ function tallyModules(
  */
 export function pickDefaultDepth(
   files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
-  root: string
+  root: string,
+  passThrough?: ReadonlySet<string>
 ): number {
   // Past the deepest directory, a bigger number only renames boxes to
   // `src/a/(root files)`. There is nothing below the leaves.
@@ -374,13 +454,14 @@ export function pickDefaultDepth(
     const path = toPosixPath(file.path);
     if (root && !path.startsWith(`${root}/`)) continue;
     const rel = root ? path.slice(root.length + 1) : path;
-    deepest = Math.max(deepest, rel.split('/').filter(Boolean).length - 1);
+    const dirs = rel.split('/').filter(Boolean).slice(0, -1);
+    deepest = Math.max(deepest, levelEnds(root, dirs, passThrough).length);
   }
 
   let fallback = DEFAULT_DEPTH;
   let fallbackCount = 0;
   for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_DEPTH, deepest); depth += 1) {
-    const tally = tallyModules(files, root, depth);
+    const tally = tallyModules(files, root, depth, passThrough);
     if (tally.count === 0) break;
     // Deeper only gets more crowded from here.
     if (tally.count > MAX_MODULES) break;
@@ -394,6 +475,26 @@ export function pickDefaultDepth(
     }
   }
   return fallback;
+}
+
+/**
+ * The root and depth the map opens on when the reader named neither.
+ *
+ * A source directory whose files all sit in one folder — Express's `lib/`, an
+ * R package's `R/`, an Erlang app's `src/`, fmt's `include/fmt/` — draws as one
+ * box at any depth, and a map whose subject is one box has said nothing. The
+ * repository around it (that folder beside a CLI, a `src/`, the examples) is
+ * then the picture worth opening on, when it draws more than one box.
+ */
+export function pickDefaultView(
+  files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
+  passThrough?: ReadonlySet<string>
+): { root: string; depth: number } {
+  const root = pickDefaultRoot(files);
+  const depth = pickDefaultDepth(files, root, passThrough);
+  if (root === '' || tallyModules(files, root, depth, passThrough).count > 1) return { root, depth };
+  const wholeDepth = pickDefaultDepth(files, '', passThrough);
+  return tallyModules(files, '', wholeDepth, passThrough).count > 1 ? { root: '', depth: wholeDepth } : { root, depth };
 }
 
 // =============================================================================
@@ -493,11 +594,13 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     };
   });
 
-  const root = requestedRoot ?? pickDefaultRoot(fileRecords);
+  const passThrough = passThroughDirs(fileRecords.map((f) => f.path));
   // Root first, then depth against THAT root: how finely to cut depends on
   // what is being cut. Choosing `src` and then asking for one level under it
   // is the same question as choosing the whole project and asking for two.
-  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root);
+  const view = requestedRoot === null ? pickDefaultView(fileRecords, passThrough) : null;
+  const root = view?.root ?? requestedRoot ?? '';
+  const depth = requestedDepth ?? view?.depth ?? pickDefaultDepth(fileRecords, root, passThrough);
   const stats = cg.getStats();
   const key = [
     projectRoot,
@@ -531,12 +634,18 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   >();
   const moduleOfFile = new Map<string, string>();
 
-  const assigned = new Map<string, { id: string; facade: boolean }>();
+  const assigned = new Map<string, { id: string; facade: boolean; label: string }>();
+  const labelOf = new Map<string, string>();
   for (const file of fileRecords) {
-    const at = moduleIdFor(file.path, root, depth);
-    if (at !== null) assigned.set(file.path, at);
+    const at = moduleIdFor(file.path, root, depth, passThrough);
+    if (at === null) continue;
+    assigned.set(file.path, at);
+    labelOf.set(at.id, at.label);
   }
   const renamed = collapseLoneRootFiles(new Set([...assigned.values()].map((a) => a.id)));
+  for (const [from, to] of renamed) {
+    labelOf.set(to, (labelOf.get(from) ?? to).replace(/\/\(root files\)$/, ''));
+  }
 
   for (const file of fileRecords) {
     const at = assigned.get(file.path);
@@ -625,7 +734,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
         const shown = entry.paths.slice().sort().slice(0, MAX_FILES_PER_MODULE);
         return {
           id: entry.id,
-          label: entry.id.slice(entry.id.lastIndexOf('/') + 1) || entry.id,
+          label: labelOf.get(entry.id) ?? entry.id,
           files: entry.files,
           symbols: entry.symbols,
           languages: [...entry.languages]

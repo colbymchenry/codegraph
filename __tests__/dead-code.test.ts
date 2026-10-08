@@ -20,7 +20,7 @@
  * Every one of those must be OFF the list, and the reason must be counted.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -481,5 +481,388 @@ describe('GET /api/map — generated files and islands', () => {
         expect(module.fileList.items).toContain(file);
       }
     }
+  });
+});
+
+describe('an ancestor outside the index (#1973)', () => {
+  let root: string;
+  let graph: CodeGraph;
+
+  beforeEach(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-external-'));
+    write(
+      root,
+      'src/clock.tsx',
+      `import React from 'react';
+import { Transform } from 'stream';
+import { OnModuleInit } from '@nestjs/common';
+export class Clock extends React.Component { componentDidMount() {} render() { return null; } }
+export class Upper extends Transform { _transform(c, e, cb) { cb(null, c); } }
+export class Boot implements OnModuleInit { onModuleInit() {} }
+export class Ticker extends Clock { componentDidUpdate() {} }
+export class Third extends Ticker { componentWillUnmount() {} componentDidCatch() {} }
+export class Plain { neverCalledMember() {} }
+function reallyUnused() {}
+`
+    );
+    write(root, 'src/main.ts', `import { Clock, Upper, Boot, Ticker, Third, Plain } from './clock';\nexport const all = [Clock, Upper, Boot, Ticker, Third, Plain];\n`);
+    graph = CodeGraph.initSync(root, { config: { include: ['src/**/*.ts', 'src/**/*.tsx'], exclude: [] } });
+    await graph.indexAll();
+  }, 60_000);
+
+  afterEach(() => {
+    graph?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not list members a framework base class calls', () => {
+    const report = buildDeadCodeReport(graph);
+    for (const name of ['componentDidMount', 'componentWillUnmount', 'render', '_transform', 'onModuleInit']) {
+      expect(names(report)).not.toContain(name);
+    }
+    // A project class whose own ancestor extends an external base inherits the doubt.
+    expect(names(report)).not.toContain('componentDidUpdate');
+    expect(names(report)).not.toContain('componentDidCatch');
+    expect(report.excluded.overriding).toBeGreaterThanOrEqual(7);
+  });
+
+  it('still lists what nothing reaches outside such a class', () => {
+    const report = buildDeadCodeReport(graph);
+    expect(names(report)).toContain('reallyUnused');
+    expect(names(report)).toContain('neverCalledMember');
+  });
+});
+
+describe('a framework that calls members by name', () => {
+  let root: string;
+  let graph: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-by-name-'));
+    // Three components that write the interface out: together they are the
+    // index's own record of what Angular's `OnInit` carries. The third inherits
+    // `ngOnInit` rather than declaring it, and lacks the `refresh` the other
+    // two happen to share.
+    write(
+      root,
+      'src/app/first.component.ts',
+      `import { Component, OnInit } from '@angular/core';
+
+@Component({ selector: 'app-first', template: '' })
+export class FirstComponent implements OnInit {
+  ngOnInit(): void {}
+  refresh(): void {}
+}
+`
+    );
+    write(
+      root,
+      'src/app/second.component.ts',
+      `import { AfterViewInit, Component, OnInit } from '@angular/core';
+
+@Component({ selector: 'app-second', template: '' })
+export class SecondComponent implements OnInit, AfterViewInit {
+  ngOnInit(): void {}
+  ngAfterViewInit(): void {}
+  reload(): void {}
+  refresh(): void {}
+}
+`
+    );
+    write(
+      root,
+      'src/app/base-page.ts',
+      `import { Directive } from '@angular/core';
+
+@Directive()
+export abstract class BasePage {
+  ngOnInit(): void {
+    void 0;
+  }
+}
+`
+    );
+    write(
+      root,
+      'src/app/third.component.ts',
+      `import { Component, OnInit } from '@angular/core';
+import { BasePage } from './base-page';
+
+@Component({ selector: 'app-third', template: '' })
+export class ThirdComponent extends BasePage implements OnInit {}
+`
+    );
+    // Writes no `implements` clause. Angular calls `ngOnInit` all the same.
+    write(
+      root,
+      'src/app/demo.component.ts',
+      `import { Component, HostListener } from '@angular/core';
+
+@Component({ selector: 'app-demo', template: '' })
+export class DemoComponent {
+  ngOnInit(): void {
+    void 0;
+  }
+
+  @HostListener('window:keyup', ['$event'])
+  keyEvent(event: KeyboardEvent): void {
+    void event;
+  }
+
+  reload(): void {
+    void 0;
+  }
+
+  refresh(): void {
+    void 0;
+  }
+
+  unusedHelper(): number {
+    return 1;
+  }
+}
+`
+    );
+    // No decorator, so no framework registers it: the name alone is no evidence.
+    write(root, 'src/app/plain.ts', `export class Plain {\n  ngOnInit(): void {\n    void 0;\n  }\n}\n`);
+    write(
+      root,
+      'src/api/cron.service.ts',
+      `import { Injectable } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import { Cron } from '@nestjs/schedule';
+
+@Injectable()
+export class CronService {
+  @Cron('0 * * * *')
+  runEveryHour(): void {
+    void 0;
+  }
+
+  @OnEvent('portfolio.changed')
+  handlePortfolioChanged(): void {
+    void 0;
+  }
+
+  hasCurrencyPair(): boolean {
+    return false;
+  }
+}
+`
+    );
+    write(
+      root,
+      'src/main.ts',
+      `import { FirstComponent } from './app/first.component';
+import { SecondComponent } from './app/second.component';
+import { ThirdComponent } from './app/third.component';
+import { DemoComponent } from './app/demo.component';
+import { Plain } from './app/plain';
+import { CronService } from './api/cron.service';
+
+export const declarations = [FirstComponent, SecondComponent, ThirdComponent, DemoComponent, Plain, CronService];
+`
+    );
+    // Java checks the interface itself: Spring calls `afterPropertiesSet` on a
+    // bean that implements InitializingBean, never on one that only has the name.
+    for (const bean of ['FirstBean', 'SecondBean']) {
+      write(
+        root,
+        `src/main/java/demo/${bean}.java`,
+        `package demo;
+
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ${bean} implements InitializingBean {
+  public void afterPropertiesSet() {}
+}
+`
+      );
+    }
+    write(
+      root,
+      'src/main/java/demo/LooseBean.java',
+      `package demo;
+
+import org.springframework.stereotype.Component;
+
+@Component
+public class LooseBean {
+  public void afterPropertiesSet() {}
+}
+`
+    );
+    write(
+      root,
+      'src/main/java/demo/App.java',
+      `package demo;
+
+public class App {
+  public static void main(String[] args) {
+    new FirstBean();
+    new SecondBean();
+    new LooseBean();
+  }
+}
+`
+    );
+    graph = CodeGraph.initSync(root, {
+      config: { include: ['src/**/*.ts', 'src/**/*.java'], exclude: [] },
+    });
+    await graph.indexAll();
+  }, 60_000);
+
+  afterAll(() => {
+    graph?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const listed = (report: ReturnType<typeof buildDeadCodeReport>, qualifiedName: string): boolean =>
+    report.entries.some((entry) => entry.node.qualifiedName === qualifiedName);
+
+  it('does not list a method whose decorator resolves outside the index', () => {
+    for (const readSource of [undefined, null] as const) {
+      const report = buildDeadCodeReport(graph, readSource === null ? { readSource } : {});
+      expect(listed(report, 'DemoComponent::keyEvent')).toBe(false);
+      expect(listed(report, 'CronService::runEveryHour')).toBe(false);
+      expect(listed(report, 'CronService::handlePortfolioChanged')).toBe(false);
+      expect(report.excluded.decorated).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it('does not list a hook its class fills by name, without writing the interface', () => {
+    for (const readSource of [undefined, null] as const) {
+      const report = buildDeadCodeReport(graph, readSource === null ? { readSource } : {});
+      expect(listed(report, 'DemoComponent::ngOnInit')).toBe(false);
+      // The base a component inherits the hook from is reached the same way.
+      expect(listed(report, 'BasePage::ngOnInit')).toBe(false);
+      expect(report.excluded.hooks).toBe(2);
+    }
+  });
+
+  it('still lists what nothing reaches in a class a framework registers', () => {
+    const report = buildDeadCodeReport(graph);
+    // A decorator on the class is not evidence for each of its members.
+    expect(listed(report, 'DemoComponent::unusedHelper')).toBe(true);
+    expect(listed(report, 'CronService::hasCurrencyPair')).toBe(true);
+    // One implementer is not a contract: `reload` is only SecondComponent's.
+    expect(listed(report, 'DemoComponent::reload')).toBe(true);
+    // Two implementers sharing a method is no contract while a third lacks it.
+    expect(listed(report, 'DemoComponent::refresh')).toBe(true);
+    // Nothing registers an undecorated class.
+    expect(listed(report, 'Plain::ngOnInit')).toBe(true);
+  });
+
+  it('infers a contract only where the interface has no runtime effect', () => {
+    // Java has no export marker in the index, so ask for the exported list,
+    // where every other rule still runs.
+    const report = buildDeadCodeReport(graph, { includeExported: true });
+    expect(listed(report, 'demo::LooseBean::afterPropertiesSet')).toBe(true);
+    expect(listed(report, 'DemoComponent::ngOnInit')).toBe(false);
+  });
+});
+
+describe('a declaration that merges into a type outside the index', () => {
+  let root: string;
+  let graph: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-ambient-'));
+    // ghostfolio's chart.registry.ts: chart.js reads both interfaces through
+    // the types they extend, and nothing in the repository names either.
+    write(
+      root,
+      'src/chart.registry.ts',
+      `import { Chart, Tooltip, type ChartType } from 'chart.js';
+
+interface VerticalHoverLinePluginOptions {
+  color?: string;
+}
+
+declare module 'chart.js' {
+  interface PluginOptionsByType<TType extends ChartType> {
+    verticalHoverLine: TType extends 'line' ? VerticalHoverLinePluginOptions : never;
+  }
+  interface TooltipPositionerMap {
+    top: (items: unknown[]) => { x: number; y: number };
+  }
+}
+
+export function registerChartConfiguration(): void {
+  Chart.register(Tooltip);
+}
+
+function unusedChartHelper(): void {}
+`
+    );
+    // angular-realworld's app.config.ts, with a Node.js augmentation beside it.
+    write(
+      root,
+      'src/app.config.ts',
+      `declare global {
+  interface Window {
+    __conduit_debug__?: { token(): string | null };
+  }
+  namespace NodeJS {
+    interface ProcessEnv {
+      API_URL?: string;
+    }
+  }
+}
+
+// In a module file this namespace is the file's own: it merges with nothing.
+declare namespace Settings {
+  interface NotMergedAnywhere {
+    retries: number;
+  }
+}
+
+export const appConfig = { providers: [] };
+`
+    );
+    write(
+      root,
+      'src/main.ts',
+      `import { registerChartConfiguration } from './chart.registry';
+import { appConfig } from './app.config';
+
+registerChartConfiguration();
+export const config = appConfig;
+`
+    );
+    graph = CodeGraph.initSync(root, { config: { include: ['src/**/*.ts'], exclude: [] } });
+    await graph.indexAll();
+  }, 60_000);
+
+  afterAll(() => {
+    graph?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const merged = ['PluginOptionsByType', 'TooltipPositionerMap', 'Window', 'ProcessEnv'];
+
+  it('does not list what a declare module or declare global block declares', () => {
+    for (const readSource of [undefined, null] as const) {
+      const report = buildDeadCodeReport(graph, readSource === null ? { readSource } : {});
+      for (const name of merged) expect(names(report)).not.toContain(name);
+      // TypeScript exports them without the keyword, so the exported rule
+      // takes them, and counts them.
+      expect(report.excluded.exported).toBe(merged.length);
+    }
+  });
+
+  it('lists them with the outside-reach caveat when exported symbols are asked for', () => {
+    const report = buildDeadCodeReport(graph, { includeExported: true });
+    for (const name of merged) {
+      expect(report.entries.find((entry) => entry.node.name === name)?.exported).toBe(true);
+    }
+  });
+
+  it('still lists what nothing reaches beside them', () => {
+    const report = buildDeadCodeReport(graph);
+    expect(names(report)).toContain('unusedChartHelper');
+    expect(names(report)).toContain('NotMergedAnywhere');
   });
 });

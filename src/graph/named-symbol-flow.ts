@@ -287,7 +287,14 @@ export function resolveNamedTokens(
 ): NamedSymbolFlow {
   const directed = opts.mode === 'directed';
   const out = EMPTY_FLOW();
-  const tokens = flowTokens(query);
+  // A directed question names its two ends exactly — a symbol's own name, as
+  // the viewer's links write it: an Objective-C selector (`initWithFrame:`), a
+  // Ruby predicate (`valid?`), a two-letter method (`ok`, Go's `Do`). The
+  // free-text filter below is for explore's bag of words, and it dropped every
+  // one of those, leaving the other end reported as naming nothing.
+  const tokens = directed && opts.from && opts.to
+    ? [...new Set([normalizeToken(opts.from), normalizeToken(opts.to)])]
+    : flowTokens(query);
   out.tokens = tokens;
   if (tokens.length < 2) return out;
 
@@ -382,6 +389,19 @@ function callSitesOf(steps: readonly FlowStep[]): Map<string, number> {
 const NAMED_VISIT_CAP = 1500;
 const DIRECTED_VISIT_CAP = 12_000;
 
+/** How the `named` walk reached a node, and what the route there carries. */
+interface WalkStep {
+  prev: string | null;
+  edge: Edge | null;
+  node: Node;
+  /** Hops from the seed. */
+  depth: number;
+  /** Unnamed hops the route ends on, held against `maxBridge`. */
+  streak: number;
+  /** Named symbols on the route, the seed and this node included. */
+  named: number;
+}
+
 /**
  * Breadth-first over `calls` edges — synthesized ones included, which is what
  * carries a flow across a callback, a re-render or a JSX child.
@@ -389,6 +409,19 @@ const DIRECTED_VISIT_CAP = 12_000;
  * This is the `named` walk: every named symbol is a possible destination, and
  * at most `maxBridge` unnamed symbols may sit between two of them. That cap is
  * what bounds the frontier, so {@link NAMED_VISIT_CAP} is generous.
+ *
+ * Two routes of the same length to one node are settled by the agent's naming,
+ * not by the order the index lists callees in: the route through more named
+ * symbols wins. An interface method calls every implementation, so
+ * prometheus's `Queryable.Querier` reaches `NewMergeQuerier` through
+ * `fanout.Querier` and the TSDB's `DB.Querier` alike; keeping whichever was
+ * listed first took the Flow through `DB.Querier` when the query named
+ * `fanout.Querier`. A rival route comes from another node at the same depth,
+ * and every node at one depth is expanded before any node at the next, so the
+ * choice is final before anything is reached through it. Ending on fewer
+ * unnamed hops ranks first, so a choice never spends bridge budget that a later
+ * hop needs (with the default budget of one, only a route node's streak can
+ * differ).
  *
  * Returns the parent map, so a caller can reconstruct any reached node's path.
  */
@@ -398,25 +431,41 @@ function walkCalls(
   named: ReadonlySet<string>,
   maxHops: number,
   maxBridge: number
-): { parent: Map<string, { prev: string | null; edge: Edge | null; node: Node }>; reached: string[] } {
-  const parent = new Map<string, { prev: string | null; edge: Edge | null; node: Node }>();
-  parent.set(seed.id, { prev: null, edge: null, node: seed });
-  const queue: Array<{ id: string; depth: number; streak: number }> = [
-    { id: seed.id, depth: 0, streak: 0 },
-  ];
+): { parent: Map<string, WalkStep>; reached: string[] } {
+  const parent = new Map<string, WalkStep>();
+  parent.set(seed.id, {
+    prev: null,
+    edge: null,
+    node: seed,
+    depth: 0,
+    streak: 0,
+    named: named.has(seed.id) ? 1 : 0,
+  });
+  const queue: string[] = [seed.id];
   const reached: string[] = [];
   for (let head = 0; head < queue.length && parent.size < NAMED_VISIT_CAP; head++) {
-    const { id, depth, streak } = queue[head]!;
+    const id = queue[head]!;
+    const at = parent.get(id)!;
     if (id !== seed.id && named.has(id)) reached.push(id);
-    if (depth >= maxHops - 1) continue;
+    if (at.depth >= maxHops - 1) continue;
     for (const c of cg.getCallees(id)) {
-      if (!FLOW_EDGE_KINDS.has(c.edge.kind) || parent.has(c.node.id)) continue;
+      if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
+      const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget.
-      const newStreak = named.has(c.node.id) ? 0 : c.node.kind === 'route' ? streak : streak + 1;
-      if (newStreak > maxBridge) continue;
-      parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node });
-      queue.push({ id: c.node.id, depth: depth + 1, streak: newStreak });
+      const streak = isNamed ? 0 : c.node.kind === 'route' ? at.streak : at.streak + 1;
+      if (streak > maxBridge) continue;
+      const depth = at.depth + 1;
+      const namedOnRoute = at.named + (isNamed ? 1 : 0);
+      const prior = parent.get(c.node.id);
+      if (prior) {
+        // Reached already: only a better route of the same length replaces it.
+        if (prior.depth !== depth) continue;
+        if (streak > prior.streak || (streak === prior.streak && namedOnRoute <= prior.named)) continue;
+      } else {
+        queue.push(c.node.id);
+      }
+      parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node, depth, streak, named: namedOnRoute });
     }
   }
   return { parent, reached };
@@ -589,13 +638,20 @@ export function resolveNamedSymbolFlow(
     } else {
       for (const seed of [...flow.named.values()].slice(0, MAX_SEEDS)) {
         const { parent, reached } = walkCalls(cg, seed, namedIds, maxHops, maxBridge);
-        // Explore's rule: the DEEPEST named sink this seed can reach.
-        let deepest: FlowStep[] | null = null;
+        // Explore's rule: the DEEPEST named sink this seed can reach. Of two as
+        // deep, the one whose route passes more named symbols, as in the walk.
+        let deepest: WalkStep | null = null;
         for (const id of reached) {
-          const steps = chainTo(parent, id);
-          if (!deepest || steps.length > deepest.length) deepest = steps;
+          const at = parent.get(id)!;
+          if (
+            !deepest ||
+            at.depth > deepest.depth ||
+            (at.depth === deepest.depth && at.named > deepest.named)
+          ) {
+            deepest = at;
+          }
         }
-        if (deepest) found.push(deepest);
+        if (deepest) found.push(chainTo(parent, deepest.node.id));
       }
     }
 

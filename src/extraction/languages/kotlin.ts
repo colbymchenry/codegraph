@@ -161,7 +161,75 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
   return hasFun && hasInterfaceType;
 }
 
+/**
+ * The qualifier of a function type's receiver — `DatabaseConfig.` in
+ * `configure: (DatabaseConfig.Builder.() -> Unit)?`. The grammar reads a
+ * single-segment receiver (`Builder.() -> Unit`) but not a qualified one, and
+ * its error recovery then drops the enclosing class: Exposed's
+ * `DatabaseTestsBase` came out as a file of loose functions. `X.(` is not an
+ * expression, so the shape only occurs in a type.
+ */
+const QUALIFIED_RECEIVER = /\b(?:[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.)+(?=[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.\()/g;
+
+/** Blank a function type's receiver qualifier to spaces (offsets survive), leaving its simple type name. */
+export function blankKotlinQualifiedReceivers(source: string): string {
+  if (!source.includes('.(')) return source;
+  return source.replace(QUALIFIED_RECEIVER, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * A primary constructor written on the line after its class name —
+ * `expect open class ByteString` / `internal constructor(data: ByteArray) :
+ * Comparable<ByteString> {` (okio, and Kotlin Multiplatform code generally) —
+ * with a supertype list after it: the grammar reads it as two statements and
+ * drops the class, its members coming out as loose functions. Blanking the
+ * constructor's modifiers and keyword (`(data: ByteArray) : …` parses) keeps
+ * the class, its supertypes and every offset; only the visibility is lost.
+ */
+const SPLIT_PRIMARY_CONSTRUCTOR =
+  /(\bclass\s+[A-Za-z_]\w*(?:\s*<[^<>{}]*(?:<[^<>{}]*>[^<>{}]*)*>)?[ \t]*\r?\n(?:[ \t]*\/\/[^\n]*\n)*[ \t]*)((?:(?:public|private|protected|internal|actual|expect)\s+|@[\w.]+(?:\([^)]*\))?\s+)*constructor)(?=\s*\()/g;
+
+export function joinKotlinSplitConstructors(source: string): string {
+  if (!source.includes('constructor')) return source;
+  return source.replace(SPLIT_PRIMARY_CONSTRUCTOR, (_m, head: string, ctor: string) => head + ' '.repeat(ctor.length));
+}
+
+/**
+ * Kotlin syntax newer than the grammar (tree-sitter-kotlin 0.3.8), rewritten
+ * to an older equivalent of the same length so every offset survives — each
+ * one otherwise made error recovery drop the class around it (Exposed: 158 of
+ * 1,004 files):
+ *
+ * - a `when` guard (Kotlin 2.1), `is H2Dialect if dialect.mode == X ->`,
+ *   becomes a second condition, `is H2Dialect,   dialect.mode == X ->`, so
+ *   the guard's references are kept;
+ * - an open-ended range (1.9), `1..<n`, becomes `1.. n`;
+ * - a multi-dollar string (2.1), `$$"?(@.a == $x)"`, loses its prefix;
+ * - a nullable receiver in a function type, `Op<Boolean>?.() -> Op<Boolean>`,
+ *   becomes `Op<Boolean>.( ) -> …`.
+ */
+const WHEN_GUARD = /^([ \t]*!?(?:is|in)[ \t]+(?:(?!->)[^\n])*?[\w>?)\]'"])([ \t]+)if(?=[ \t(])/gm;
+const MULTI_DOLLAR_STRING = /(?<![\w$"])\$\$+(?=")/g;
+const NULLABLE_RECEIVER_FN = /([\w>])\?\.\(\)(?=\s*->)/g;
+
+export function rewriteNewerKotlinSyntax(source: string): string {
+  let out = source;
+  if (out.includes(' if')) {
+    // (the condition stops short of `->`: `is X -> if (…)` is a branch whose body is an if)
+    out = out.replace(WHEN_GUARD, (_m, cond: string, gap: string) => `${cond},${' '.repeat(gap.length + 1)}`);
+  }
+  if (out.includes('..<')) out = out.replace(/\.\.</g, '.. ');
+  if (out.includes('$$')) out = out.replace(MULTI_DOLLAR_STRING, (m) => ' '.repeat(m.length));
+  if (out.includes('?.()')) out = out.replace(NULLABLE_RECEIVER_FN, '$1.( )');
+  return out;
+}
+
+function preParseKotlin(source: string): string {
+  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source)));
+}
+
 export const kotlinExtractor: LanguageExtractor = {
+  preParse: preParseKotlin,
   functionTypes: ['function_declaration'],
   classTypes: ['class_declaration'],
   methodTypes: ['function_declaration'], // Methods are functions inside classes

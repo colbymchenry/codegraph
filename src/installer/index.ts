@@ -28,7 +28,7 @@ import type { AgentTarget, Location, TargetId } from './targets/types';
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { getCodeGraphDir } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 import { maybeOfferBetaSignup } from './beta-signup';
 
@@ -514,8 +514,9 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
 
   // Step 4: for local uninstall, the index dir is separate — point at
   // `uninit` so the user knows it's still there (and how to remove it).
-  if (location === 'local' && fs.existsSync(getCodeGraphDir(process.cwd()))) {
-    clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
+  const indexDir = location === 'local' ? getCodeGraphDir(process.cwd()) : null;
+  if (indexDir && fs.existsSync(indexDir)) {
+    clack.log.info(`The ${path.basename(indexDir)}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
   }
 
   // Step 4b: the CLI binary itself (global uninstall only — a project-scoped

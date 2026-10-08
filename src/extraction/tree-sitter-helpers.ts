@@ -29,6 +29,23 @@ export function generateNodeId(
   return `${kind}:${hash}`;
 }
 
+/** Per-extraction identities: preserve legacy IDs unless distinct source positions collide. */
+export class NodeIdAllocator {
+  private firstColumns = new Map<string, number>();
+
+  generate(filePath: string, kind: NodeKind, name: string, line: number, column: number): string {
+    const id = generateNodeId(filePath, kind, name, line);
+    const firstColumn = this.firstColumns.get(id);
+    if (firstColumn === undefined) {
+      this.firstColumns.set(id, column);
+      return id;
+    }
+    // Columns are zero-based UTF-16 code units in both wasm and the kernel.
+    // Revisiting the same declaration must still produce the same identity.
+    return firstColumn === column ? id : `${id}:${column}`;
+  }
+}
+
 /**
  * Extract text from a syntax node
  */
@@ -42,6 +59,27 @@ export function getNodeText(node: SyntaxNode, source: string): string {
 export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode | null {
   return node.childForFieldName(fieldName);
 }
+
+/**
+ * Built-in/primitive type names that shouldn't create references. Shared by the
+ * core type-annotation walker and the per-language ones (Dart's), so every type
+ * position skips the same names.
+ */
+export const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
+  'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
+  'object', 'symbol', 'bigint', 'true', 'false',
+  // Rust
+  'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
+  // Java/C#
+  'int', 'long', 'short', 'byte', 'float', 'double', 'char',
+  // Go
+  'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
+  'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+  // Scala (capitalized primitives + ubiquitous stdlib aliases)
+  'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
+  'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
+]);
 
 /**
  * Node types that *wrap* a declaration so a leading comment is a sibling of the
@@ -91,8 +129,23 @@ function cleanCommentMarkers(comment: string): string {
 
 /**
  * Get the docstring/comment preceding a node
+ *
+ * `stepOver` lists node types that may stand between the comments and the
+ * declaration without ending the run: Dart's annotations, in `/// Builds it.`
+ * `@override` `Widget build(…)`. They are not part of the docstring, and the
+ * comments on either side of one join as if it weren't there. Default: none.
+ *
+ * `skipTrailing` leaves out the comments the run opens with that belong to
+ * the line above: one written after code on its line (`const n = 4 // four.`),
+ * and any that begins on the line such a comment ends. Go reads them as that
+ * line's comment, never the next declaration's doc. Default: off.
  */
-export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
+export function getPrecedingDocstring(
+  node: SyntaxNode,
+  source: string,
+  stepOver: readonly string[] = [],
+  skipTrailing = false
+): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
   // The emitted node's own `previousNamedSibling` is empty (export/const) or a
@@ -104,7 +157,7 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
   }
 
   let sibling = anchor.previousNamedSibling;
-  const comments: string[] = [];
+  const comments: SyntaxNode[] = [];
 
   while (sibling) {
     if (
@@ -113,15 +166,39 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
       sibling.type === 'block_comment' ||
       sibling.type === 'documentation_comment'
     ) {
-      comments.unshift(getNodeText(sibling, source));
+      comments.unshift(sibling);
+      sibling = sibling.previousNamedSibling;
+    } else if (stepOver.includes(sibling.type)) {
       sibling = sibling.previousNamedSibling;
     } else {
       break;
     }
   }
 
-  if (comments.length === 0) return undefined;
+  let first = 0;
+  if (skipTrailing) {
+    let endRow = -1;
+    for (const comment of comments) {
+      const trails =
+        first === 0 ? followsCodeOnItsLine(comment, source) : comment.startPosition.row === endRow;
+      if (!trails) break;
+      endRow = comment.endPosition.row;
+      first++;
+    }
+  }
+  if (first === comments.length) return undefined;
 
   // Strip each comment's syntax markers (language-aware), then join.
-  return comments.map(cleanCommentMarkers).join('\n').trim();
+  return comments
+    .slice(first)
+    .map((c) => cleanCommentMarkers(getNodeText(c, source)))
+    .join('\n')
+    .trim();
+}
+
+/** Whether code comes before `node` on the line it starts on. */
+function followsCodeOnItsLine(node: SyntaxNode, source: string): boolean {
+  let i = node.startIndex;
+  while (i > 0 && (source[i - 1] === ' ' || source[i - 1] === '\t')) i--;
+  return i > 0 && source[i - 1] !== '\n' && source[i - 1] !== '\r';
 }

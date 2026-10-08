@@ -226,3 +226,86 @@ function tick() {}
     expect(rows[1].registered_at).toBe('App.tsx:4');
   });
 });
+
+describe('RN event channel — event names held in constants', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-event-const-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  };
+  const channel = (cg: CodeGraph) =>
+    ((cg as any).db.db
+      .prepare(
+        `SELECT s.name s, t.name t, json_extract(e.metadata,'$.event') event FROM edges e
+         JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'rn-event-channel' ORDER BY s, t`
+      )
+      .all() as Array<{ s: string; t: string; event: string }>).map((r) => `${r.s} -> ${r.t} (${r.event})`);
+
+  it('NetInfo: a JS listener on `PrivateTypes.DEVICE_CONNECTIVITY_EVENT`, native sends the literal', async () => {
+    write('package.json', '{"name":"netinfo","dependencies":{"react-native":"^0.73"}}');
+    write('ios/RNCNetInfo.m', `@implementation RNCNetInfo
+- (void)connectionChanged {
+  [self sendEventWithName:@"netInfo.networkStatusDidChange" body:@{}];
+}
+@end
+`);
+    write('src/internal/privateTypes.ts', `export const DEVICE_CONNECTIVITY_EVENT = 'netInfo.networkStatusDidChange';
+`);
+    write('src/internal/state.ts', `import * as PrivateTypes from './privateTypes';
+export default class State {
+  start(emitter: any) {
+    emitter.addListener(
+      PrivateTypes.DEVICE_CONNECTIVITY_EVENT,
+      this._handleNativeStateUpdate,
+    );
+  }
+  _handleNativeStateUpdate(state: unknown) { return state; }
+}
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      expect(channel(cg)).toEqual(['connectionChanged -> _handleNativeStateUpdate (netInfo.networkStatusDidChange)']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('a Java constant emit and a Kotlin const val meet a JS literal listener', async () => {
+    write('package.json', '{"name":"lib","dependencies":{"react-native":"^0.73"}}');
+    write('android/src/main/java/app/Tracker.java', `package app;
+public class Tracker {
+  private static final String PROGRESS_EVENT = "downloadProgress";
+  void report(ReactContext ctx) {
+    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(PROGRESS_EVENT, null);
+  }
+}
+`);
+    write('android/src/main/java/app/Finisher.kt', `package app
+const val DONE_EVENT = "downloadDone"
+class Finisher {
+  fun finish(ctx: ReactContext) {
+    sendEvent(ctx, DONE_EVENT, null)
+  }
+}
+`);
+    write('src/index.js', `export function onProgress(e) { return e; }
+export function onDone(e) { return e; }
+emitter.addListener('downloadProgress', onProgress);
+emitter.addListener('downloadDone', onDone);
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      expect(channel(cg)).toEqual(['finish -> onDone (downloadDone)', 'report -> onProgress (downloadProgress)']);
+    } finally {
+      cg.close();
+    }
+  });
+});

@@ -63,6 +63,20 @@ describe('MCP catch-up gate', () => {
     expect(res.content[0].text).toMatch(/survivor/);
   });
 
+  it('keeps concurrent calls behind the same unfinished gate', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    handler.setCatchUpGate(gate);
+    let completed = 0;
+    const calls = [1, 2].map(() => handler.execute('codegraph_search', { query: 'survivor' })
+      .then((result) => { completed++; return result; }));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(completed).toBe(0);
+    } finally { release(); }
+    expect((await Promise.all(calls)).every((result) => !result.isError)).toBe(true);
+  });
+
   it('drops the gate after first await — second call does not re-wait', async () => {
     let awaitCount = 0;
     const gate = new Promise<void>((resolve) => {

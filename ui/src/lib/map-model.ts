@@ -414,7 +414,7 @@ export function buildMapLayout(
   const widths = new Map(
     modules.map((m) => {
       const island = islands.has(m.id);
-      const lines = options.sizing?.(m, island) ?? { label: m.id, meta: moduleMetaLabel(m, island) };
+      const lines = options.sizing?.(m, island) ?? { label: m.label || m.id, meta: moduleMetaLabel(m, island) };
       const count = portCount.get(m.id) ?? { top: 0, bottom: 0 };
       const forPorts = (Math.max(count.top, count.bottom) + 1) * portPitch;
       return [m.id, Math.max(nodeWidth(lines.label, lines.meta), forPorts)];

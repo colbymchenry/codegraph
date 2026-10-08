@@ -158,10 +158,12 @@ describe('WAL heal after killed sessions (#1431)', () => {
 
     const conn = DatabaseConnection.open(dbPath); // fire-and-forget heal
     try {
-      const deadline = Date.now() + 30_000;
-      while (walSize() > WAL_HEAL_THRESHOLD_BYTES && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 200));
-      }
+      // Private-field peek: the pass open() started. Awaiting it, instead of
+      // polling the file against a 30s wall clock, keeps a loaded machine from
+      // reporting a heal that is still running as a heal that failed (#1773).
+      const started = (conn as unknown as { walHeal: Promise<{ afterBytes: number }> | null }).walHeal;
+      expect(started).not.toBeNull();
+      expect((await started!).afterBytes).toBeLessThanOrEqual(WAL_HEAL_THRESHOLD_BYTES);
       expect(walSize()).toBeLessThanOrEqual(WAL_HEAL_THRESHOLD_BYTES);
     } finally {
       conn.close();

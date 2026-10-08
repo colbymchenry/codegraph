@@ -15,9 +15,10 @@ import { nextjsResolver } from './nextjs';
 import { reactRouterResolver } from './react-router';
 import { tanstackRouterResolver } from './tanstack-router';
 import { vueRouterResolver } from './vue-router';
+import { angularRouterResolver } from './angular-router';
 import { svelteKitRouterResolver } from './sveltekit-router';
 import { svelteResolver } from './svelte';
-import { vueResolver } from './vue';
+import { vueResolver, nuxtResolver } from './vue';
 import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
@@ -30,7 +31,7 @@ import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
-import { expoModulesResolver } from './expo-modules';
+import { expoModulesResolver, expoModulesJsResolver } from './expo-modules';
 import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
@@ -57,8 +58,11 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // SvelteKit — `src/routes/**/+page.svelte` routes are `svelteResolver`'s; `goto('/x')` / `redirect(303, '/x')` → navigates edges
   svelteKitRouterResolver,
   vueResolver,
+  // Nuxt — `pages/**` screens, `server/api/**` endpoints and `middleware/`, in a Nuxt app only
+  nuxtResolver,
   // Vue Router — `createRouter({ routes })` → route nodes; `router.push({ name })` / `router.push('/x')` → navigates edges
   vueRouterResolver,
+  angularRouterResolver,
   astroResolver,
   // Python
   djangoResolver,
@@ -86,6 +90,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactNativeBridgeResolver,
   // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
   expoModulesResolver,
+  // Expo Modules, JS side — `M.fn()` on a `requireNativeModule('N')` binding → module N's `fn`
+  expoModulesJsResolver,
   // Expo Router — `app/` screen files → route nodes; `router.push('/x')` → navigates edges
   expoRouterResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
@@ -137,6 +143,27 @@ export function getApplicableFrameworks(
 }
 
 /**
+ * Filter a list of detected frameworks down to ones whose `resolve()` reads a
+ * reference written in `language`: its `resolveLanguages`, else its
+ * `languages`. Frameworks that declare neither are treated as universal.
+ *
+ * A framework's conventions are its languages': Express's `logger` middleware
+ * rule took a Go method's `*zap.Logger` result type for the method itself.
+ * Bridges list the language their references are written in — the React
+ * Native bridge JS, the Swift ↔ Objective-C bridge both, Drupal the
+ * `routing.yml` it reads controllers from.
+ */
+export function getResolvingFrameworks(
+  detected: FrameworkResolver[],
+  language: Language
+): FrameworkResolver[] {
+  return detected.filter((fw) => {
+    const languages = fw.resolveLanguages ?? fw.languages;
+    return !languages || languages.includes(language);
+  });
+}
+
+/**
  * Register a custom framework resolver
  */
 export function registerFrameworkResolver(resolver: FrameworkResolver): void {
@@ -157,9 +184,10 @@ export { reactResolver } from './react';
 export { reactRouterResolver } from './react-router';
 export { tanstackRouterResolver } from './tanstack-router';
 export { vueRouterResolver } from './vue-router';
+export { angularRouterResolver } from './angular-router';
 export { svelteKitRouterResolver } from './sveltekit-router';
 export { svelteResolver } from './svelte';
-export { vueResolver } from './vue';
+export { vueResolver, nuxtResolver } from './vue';
 export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
@@ -172,6 +200,6 @@ export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
-export { expoModulesResolver } from './expo-modules';
+export { expoModulesResolver, expoModulesJsResolver } from './expo-modules';
 export { expoRouterResolver } from './expo-router';
 export { fabricViewResolver } from './fabric';

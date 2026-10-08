@@ -124,6 +124,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -157,6 +158,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -265,7 +267,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -300,7 +302,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1; // no resolveBody for java
 
         let qualified = {
@@ -692,7 +695,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_constant" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_constant_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -700,12 +704,26 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = self.text(name_node).to_string();
-            self.create_node("enum_member", &name, node, Extra::default());
-        }
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = self.text(name_node).to_string();
+        let row = self.create_node("enum_member", &name, node, Extra::default())?;
         // (identifier-children / leaf fallbacks are other grammars' shapes)
+        Some((row, name))
+    }
+
+    /// `PLUS { int apply(…) { … } }`: a constant's own class_body declares
+    /// members of its own, scoped under the constant.
+    fn visit_enum_constant_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractField — each declarator becomes a field/constant node.

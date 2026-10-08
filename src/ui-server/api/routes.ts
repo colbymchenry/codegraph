@@ -23,6 +23,8 @@
 import type { CodeGraph } from '../../index';
 import { intParam } from './respond';
 import { toPosixPath } from './wire';
+import { routeRoots } from './route-roots';
+import { isTestFile } from '../../search/query-utils';
 
 /**
  * HTTP verbs a route name may lead with, plus the two stand-ins the resolvers
@@ -56,6 +58,8 @@ export interface WireRoute {
   routeFile: string;
   routeLine: number;
   routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
 }
 
 export interface WireRoutes {
@@ -79,9 +83,6 @@ export function splitRouteName(url: string): { method: string | null; path: stri
   return { method: head.toUpperCase(), path: url.slice(space + 1).trimStart() };
 }
 
-/** Distinct handler files we will resolve node ids for. */
-const MAX_HANDLER_FILES = 60;
-
 /**
  * The engine needs three surviving rows to call a project routed, and applies
  * `limit` before that test — so anything below three is a question that cannot
@@ -89,11 +90,62 @@ const MAX_HANDLER_FILES = 60;
  */
 const MIN_LIMIT = 3;
 
+/** Manifest rows fetched per route shown, so folding repeats still fills the page. */
+const ROWS_PER_ROUTE = 4;
+
+type ManifestRow = NonNullable<ReturnType<CodeGraph['getRoutingManifest']>>['entries'][number];
+
+/**
+ * The manifest's rows folded to one per route, in its order: the row naming
+ * the route's root (the handler a resolver bound, or the component a screen
+ * renders), else the route's first row. A route whose root is its own inline
+ * body is that route, labelled as an inline handler — not whichever call in
+ * the body sorted first — and is left out when it is written in a test, as
+ * the manifest leaves out test handlers.
+ */
+function oneRowPerRoute(cg: CodeGraph, entries: readonly ManifestRow[]): Array<ManifestRow & { inline: boolean }> {
+  const byRoute = new Map<string, ManifestRow[]>();
+  for (const entry of entries) {
+    const list = byRoute.get(entry.routeId);
+    if (list) list.push(entry);
+    else byRoute.set(entry.routeId, [entry]);
+  }
+  const routes = [...cg.getNodesByIds([...byRoute.keys()]).values()];
+  const roots = routeRoots(cg, routes);
+  const out: Array<ManifestRow & { inline: boolean }> = [];
+  for (const [routeId, list] of byRoute) {
+    const root = roots.get(routeId);
+    if (root?.inline) {
+      const first = list[0]!;
+      if (isTestFile(first.routeFile)) continue;
+      out.push({
+        ...first,
+        handler: 'inline handler',
+        handlerKind: 'route',
+        handlerFile: first.routeFile,
+        handlerLine: first.routeLine,
+        inline: true,
+      });
+      continue;
+    }
+    const named = root
+      ? list.find((e) => e.handlerFile === root.node.filePath && e.handlerLine === root.node.startLine && e.handler === root.node.name)
+      : undefined;
+    out.push({ ...(named ?? list[0]!), inline: false });
+  }
+  return out;
+}
+
 export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
   const limit = intParam(query, 'limit', { min: MIN_LIMIT, max: 500, default: 200 });
 
-  // One row over the limit, purely to learn whether there were more.
-  const manifest = cg.getRoutingManifest(limit + 1);
+  // The engine's manifest is a row per (route, edge): a route bound to two
+  // symbols, or an inline handler whose every call reads as a "handler"
+  // (hono's `GET /stream/text` came back three times, as `streamText`,
+  // `writeln` and `sleep`), repeats. A route has ONE answer to "what serves
+  // this" — route-roots.ts's — so rows are over-fetched and folded onto it.
+  const fetched = limit * ROWS_PER_ROUTE + 1;
+  const manifest = cg.getRoutingManifest(fetched);
   const routeCount = cg.getStats().nodesByKind.route ?? 0;
 
   if (!manifest) {
@@ -108,21 +160,20 @@ export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
     };
   }
 
-  const truncated = manifest.entries.length > limit;
-  const rows = manifest.entries.slice(0, limit);
+  const folded = oneRowPerRoute(cg, manifest.entries);
+  const truncated = folded.length > limit || manifest.entries.length >= fetched;
+  const rows = folded.slice(0, limit);
 
-  // One `getNodesInFile` per distinct handler file — typically one or two, and
-  // capped so a project that scatters handlers across hundreds of files cannot
-  // turn one request into hundreds of queries.
-  const handlerFiles = [...new Set(rows.map((e) => e.handlerFile))].slice(0, MAX_HANDLER_FILES);
+  // Every row's handler file in one batched query, so a project that scatters
+  // handlers across hundreds of files still costs one query per chunk, and no
+  // row past a cap is reported as "not in the index" (#1975).
+  const handlerFiles = [...new Set(rows.map((e) => e.handlerFile))];
   const byFileLineName = new Map<string, string>();
-  for (const file of handlerFiles) {
-    for (const node of cg.getNodesInFile(file)) {
-      // Keyed on what the manifest actually knows: file, line and name. Two
-      // symbols can share a line (a decorator and its method); the name breaks
-      // the tie, and a miss simply leaves that entry unlinked.
-      byFileLineName.set(`${node.filePath} ${node.startLine} ${node.name}`, node.id);
-    }
+  for (const node of cg.getNodesInFiles(handlerFiles)) {
+    // Keyed on what the manifest actually knows: file, line and name. Two
+    // symbols can share a line (a decorator and its method); the name breaks
+    // the tie, and a miss simply leaves that entry unlinked.
+    byFileLineName.set(`${node.filePath} ${node.startLine} ${node.name}`, node.id);
   }
 
   const entries: WireRoute[] = rows.map((entry) => ({
@@ -132,11 +183,13 @@ export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
     handlerKind: entry.handlerKind,
     file: toPosixPath(entry.handlerFile),
     line: entry.handlerLine,
-    handlerId:
-      byFileLineName.get(`${entry.handlerFile} ${entry.handlerLine} ${entry.handler}`) ?? null,
+    handlerId: entry.inline
+      ? entry.routeId
+      : byFileLineName.get(`${entry.handlerFile} ${entry.handlerLine} ${entry.handler}`) ?? null,
     routeFile: toPosixPath(entry.routeFile),
     routeLine: entry.routeLine,
     routeId: entry.routeId,
+    inline: entry.inline,
   }));
 
   return {

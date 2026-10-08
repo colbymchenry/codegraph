@@ -5,11 +5,12 @@
  */
 
 import { SqliteDatabase } from './sqlite-adapter';
+import { referenceNameTail } from './reference-tail';
 
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 /**
  * Migration definition
@@ -175,6 +176,127 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description: 'Track synthesis inputs and stabilize synthesis traversal for incremental refresh (#1988)',
+    up: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_nodes_kind;
+        CREATE INDEX idx_nodes_kind ON nodes(kind, file_path, start_line, id);
+        CREATE TABLE IF NOT EXISTS synthesis_inputs (
+          file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+        UPDATE edges SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy', 'go-method-contains')
+          WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
+            SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
+            WHERE s.id = edges.source AND s.language = 'go' AND t.language = 'go'
+              AND s.kind IN ('struct', 'class', 'interface', 'enum', 'type_alias') AND t.kind = 'method'
+              AND s.file_path != t.file_path
+          );
+        INSERT OR REPLACE INTO project_metadata(key, value, updated_at)
+          VALUES ('synthesis_pending', '1', 0);
+      `);
+    },
+  },
+  {
+    version: 11,
+    description: 'Guard synthesis metadata lookups against malformed JSON',
+    up: (db) => {
+      // Existing v10 indexes keep their old expression under IF NOT EXISTS.
+      // Rebuild transactionally; the guarded v10 definition also lets older
+      // databases containing malformed metadata reach this migration safely.
+      db.exec(`
+        DROP INDEX IF EXISTS idx_edges_synthesis_site;
+        CREATE INDEX idx_edges_synthesis_site
+          ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description: 'Retry a failed import when sync adds the file it names: path tails and failed-import indexes',
+    up: (db) => {
+      // Partial over failed imports, so both stay small. Keep the definitions
+      // in lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_tail ON unresolved_refs(reference_kind, name_tail) WHERE status = 'failed' AND reference_kind = 'imports';
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_name ON unresolved_refs(reference_kind, reference_name) WHERE status = 'failed' AND reference_kind = 'imports';
+      `);
+      // A path import parked before this version carries its dotted tail —
+      // the extension or a path fragment — which no file's keys match.
+      // Rewrite it to the path tail a failed import is parked under now.
+      // Idempotent: a rewritten tail rewrites to itself.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare("SELECT id, reference_name FROM unresolved_refs WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name LIKE '%/%'")
+        .all() as Array<{ id: number; reference_name: string }>;
+      for (const row of rows) update.run(referenceNameTail(row.reference_name, 'imports'), row.id);
+    },
+  },
+  {
+    version: 13,
+    description: 'Retry a failed path reference when sync adds the file it names: file-name tails',
+    up: (db) => {
+      // A path reference parked before this version — a Liquid
+      // `snippets/price.liquid` — carries its extension as its tail, which no
+      // node is named. Rewrite it to the file name a failed path reference is
+      // parked under now. Idempotent: a rewritten tail rewrites to itself.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare("SELECT id, reference_name, name_tail FROM unresolved_refs WHERE status = 'failed' AND reference_kind = 'references' AND reference_name LIKE '%/%.%'")
+        .all() as Array<{ id: number; reference_name: string; name_tail: string }>;
+      for (const row of rows) {
+        const tail = referenceNameTail(row.reference_name, 'references');
+        if (tail !== row.name_tail) update.run(tail, row.id);
+      }
+    },
+  },
+  {
+    version: 14,
+    description: 'Retry a failed route module reference when sync adds or changes its file: module tails',
+    up: (db) => {
+      // A route's reference to the module it lazily loads, parked before this
+      // version — React Router's `lazy-import:./pages/Team`, Vue Router's and
+      // Angular's `import:./home/home.component#HomeComponent`, each also
+      // behind `layout:` — carries a fragment of its path as its tail
+      // ('/pages/Team', 'component#HomeComponent'), which no file's keys
+      // match. Rewrite it to the module tail it is parked under now.
+      // Idempotent: a rewritten tail rewrites to itself.
+      //
+      // Each prefix is a range of idx_unresolved_name. The `+` keeps the
+      // planner off idx_unresolved_status, which it otherwise picks although
+      // 'failed' is nearly every row: on vscode's index that read 830K rows,
+      // about a second, to select none.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare(`SELECT id, reference_name, reference_kind, name_tail FROM unresolved_refs
+          WHERE (reference_name GLOB 'lazy-import:*' OR reference_name GLOB 'import:*' OR reference_name GLOB 'layout:*')
+            AND +status = 'failed' AND +reference_kind IN ('references', 'calls')`)
+        .all() as Array<{ id: number; reference_name: string; reference_kind: string; name_tail: string }>;
+      for (const row of rows) {
+        const tail = referenceNameTail(row.reference_name, row.reference_kind);
+        if (tail !== row.name_tail) update.run(tail, row.id);
+      }
+    },
+  },
+  {
+    version: 15,
+    description: 'Retry a failed reference through an import binding by its whole name: module-tail name index',
+    up: (db) => {
+      // A failed reference through an import binding the module declares
+      // under another name is parked under the module's key from this
+      // version on, and still looked up by its whole name. Rows parked before
+      // keep the tail their name gives, which the name lookup already finds;
+      // a re-index parks them under their modules. Keep the definition in
+      // lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_name ON unresolved_refs(status, reference_name) WHERE status = 'failed' AND name_tail GLOB 'module:*';
+      `);
     },
   },
 ];

@@ -34,7 +34,9 @@ export const playResolver: FrameworkResolver = {
     if (buildSbt && /playframework|"play"|sbt-plugin|PlayScala|PlayJava/i.test(buildSbt)) return true;
     if (context.fileExists('conf/routes')) return true;
     if (context.fileExists('conf/application.conf')) return true;
-    return false;
+    // A repository of Play projects (playframework/play-samples) keeps each
+    // one's `conf/routes` in its own directory.
+    return context.getAllFiles().some((f) => isPlayRoutesFile(f));
   },
 
   // The handler is `Controller.method` (a class-qualified action), which names no

@@ -26,16 +26,37 @@ import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
-import { CodeGraphPackageVersion } from './version';
+import { CodeGraphPackageVersion, isOlderRelease } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
+import { ErrorCodes } from './transport';
 import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import type { MCPEngine } from './engine';
+import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * How long a proxy serving in-process waits before trying the shared daemon
+ * again, doubling after each miss up to the cap (#2277). Tunable through
+ * `CODEGRAPH_DAEMON_RETRY_MS` (`0` turns retrying off) and
+ * `CODEGRAPH_DAEMON_RETRY_MAX_MS`.
+ */
+const DEFAULT_DAEMON_RETRY_MS = 5_000;
+const DEFAULT_DAEMON_RETRY_MAX_MS = 300_000;
+
+/**
+ * Longest the proxy waits, once it is shutting down, for its in-process engines
+ * to stop before exiting anyway. An engine's stop waits up to
+ * {@link WORKER_START_SETTLE_MS} for a query worker still starting up (exiting
+ * mid-start can crash the process on Windows); this bounds a stop that never
+ * settles (#2311).
+ */
+const SHUTDOWN_BACKSTOP_MS = WORKER_START_SETTLE_MS + 5_000;
 
 /**
  * Env var that opts INTO the "attached to shared daemon" log line. Off by
@@ -127,14 +148,17 @@ export async function runProxy(
 
 /**
  * Connect to a daemon at `socketPath` and verify its hello (exact version match).
- * Returns the live socket (hello already consumed) or null if unreachable / stale
- * / version-mismatched. Unlike {@link runProxy} it does NOT pipe — the caller
- * owns the socket. Used by the local-handshake proxy's background connect.
+ * Returns the live socket (hello already consumed), null if unreachable / stale,
+ * or — for a daemon of another version — `'older-version'` when it runs an older
+ * release ({@link isOlderRelease}; the launcher replaces it, #2335) and
+ * `'version-mismatch'` for any other version, which is left alone. Unlike
+ * {@link runProxy} it does NOT pipe — the caller owns the socket. Used by the
+ * local-handshake proxy's background connect.
  */
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
-): Promise<net.Socket | 'version-mismatch' | null> {
+): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
@@ -155,12 +179,14 @@ export async function connectWithHello(
   }
   if (hello.codegraph !== expectedVersion) {
     // A daemon IS up but it's the wrong version — definitive, not a "not yet".
-    // Don't poll; the caller serves in-process so we never run stale-vs-new.
+    socket.destroy();
+    // An older release is the launcher's to replace (#2335); it says what it did.
+    if (isOlderRelease(hello.codegraph, expectedVersion)) return 'older-version';
+    // Any other: don't poll; the caller serves in-process so we never run stale-vs-new.
     process.stderr.write(
       `[CodeGraph MCP] Found a daemon on ${socketPath} but version (${hello.codegraph}) ` +
       `differs from ours (${expectedVersion}); serving this session in-process.\n`
     );
-    socket.destroy();
     return 'version-mismatch';
   }
   logAttachedDaemon(socketPath, hello);
@@ -191,11 +217,13 @@ type JsonRpc = Record<string, unknown>;
 /** Dependencies the local-handshake proxy needs, injected by MCPServer (which
  *  owns the daemon-spawn machinery and the engine factory). */
 export interface LocalHandshakeDeps {
-  /** Probe → spawn → retry → hello-verify; resolves a connected daemon socket,
-   *  or null when the daemon path is genuinely unavailable (→ in-process fallback). */
+  /** Probe (replacing a daemon of an older release, #2335) → spawn → retry →
+   *  hello-verify; resolves a connected daemon socket, or null when the daemon
+   *  path is genuinely unavailable (→ in-process fallback). */
   getDaemonSocket(): Promise<net.Socket | null>;
-  /** Lazily create an in-process engine — used ONLY if the daemon never comes up,
-   *  preserving the "a broken daemon never wedges a session" guarantee. */
+  /** Lazily create an in-process engine — used only while the daemon is
+   *  unreachable, preserving the "a broken daemon never wedges a session"
+   *  guarantee. Called again whenever the previous engine was retired (#2277). */
   makeEngine(): MCPEngine;
   /** Project root for the fallback engine's lazy init. */
   root: string;
@@ -213,11 +241,22 @@ export interface LocalHandshakeDeps {
  * the local one). If the daemon never comes up (version mismatch / spawn fail),
  * a lazily-created in-process engine serves the calls — so the handshake speedup
  * never costs the old fall-back-to-direct robustness.
+ *
+ * Serving in-process is not for the rest of the session (#2277): that engine
+ * may own the project's writer lock, and no daemon can start while it does, so
+ * every other session on the project would be stuck without auto-sync. The
+ * proxy retries the daemon with backoff, handing the writer lock back first,
+ * and proxies again once one answers.
  */
 export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<void> {
+  // The proxy is long-lived and can serve fallback tool calls in-process. Match
+  // direct/daemon mode by killing this launcher if its main thread wedges, so an
+  // MCP host retry cannot accumulate abandoned `serve --mcp` wrapper processes.
+  const livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog();
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  let clientInitLine: string | undefined;  // replayed to a daemon that comes up mid-session (#2277)
   // Telemetry attribution for the in-process fallback only — calls routed to
   // the daemon are counted by the daemon's own session (which receives the
   // forwarded initialize, clientInfo included), never double-counted here.
@@ -225,7 +264,16 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const pending: string[] = [];            // client lines buffered until the daemon resolves
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
+  // Calls being served in-process; the engine is only ever stopped after they finish.
+  const localCalls = new Set<Promise<void>>();
+  // Engines retired but not yet stopped; shutdown() waits for them too.
+  const retiring = new Set<MCPEngine>();
   let shuttingDown = false;
+  const retryBaseMs = parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MS, DEFAULT_DAEMON_RETRY_MS);
+  const retryMaxMs = Math.max(retryBaseMs, parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MAX_MS, DEFAULT_DAEMON_RETRY_MAX_MS));
+  let retryDelayMs = retryBaseMs;
+  let retryTimer: NodeJS.Timeout | null = null;
+  let attachedAt = 0;
   // Requests forwarded to the daemon and not yet answered, keyed by JSON-RPC id.
   // If the daemon dies mid-session (#662 — e.g. an MCP host SIGTERM's it when a
   // new session starts), these would otherwise hang forever; we re-serve them
@@ -280,24 +328,64 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
   const shutdown = (): void => {
     if (shuttingDown) return; shuttingDown = true;
+    try { livenessWatchdog?.stop(); } catch { /* ignore */ }
+    if (retryTimer) clearTimeout(retryTimer);
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
-    try { engine?.stop(); } catch { /* ignore */ }
-    process.exit(0);
+    // Exit once every engine has stopped, a retiring one included: exiting while
+    // a query worker is still starting up can crash the process on Windows (see
+    // QueryPool.destroy), and stopping releases the writer lock. The backstop
+    // bounds a stop that never settles; it stays ref'd so the process lives
+    // until one of the two exits it.
+    setTimeout(() => {
+      process.stderr.write(`[CodeGraph MCP] In-process engine did not stop within ${SHUTDOWN_BACKSTOP_MS}ms; exiting anyway.\n`);
+      process.exit(0);
+    }, SHUTDOWN_BACKSTOP_MS);
+    const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => e?.stop()));
+    void Promise.allSettled(stopping).then(() => process.exit(0));
   };
-  const ensureEngine = (): Promise<void> => {
-    if (!engine) engine = deps.makeEngine();
-    if (!engineReady) engineReady = engine.ensureInitialized(deps.root).catch(() => { /* degraded */ });
-    return engineReady;
+  // Resolves the engine a call was started on, so a call in flight while the
+  // engine is being retired still finishes on it.
+  const ensureEngine = async (): Promise<MCPEngine> => {
+    // shutdown() stops only the engines it can see; never start one after it.
+    if (!engine && shuttingDown) throw new Error('codegraph is shutting down');
+    if (!engine) {
+      engine = deps.makeEngine();
+      engineReady = engine.ensureInitialized(deps.root).catch(() => { /* degraded */ });
+    }
+    const current = engine;
+    await engineReady;
+    return current;
+  };
+  // Stop the in-process engine once the calls it is serving have answered.
+  // Stopping it releases the writer lock if it held one.
+  const retireEngine = async (): Promise<void> => {
+    const retired = engine;
+    engine = null;
+    engineReady = null;
+    if (retired) retiring.add(retired);
+    try {
+      await Promise.allSettled([...localCalls]);
+      try { await retired?.stop(); } catch { /* best-effort */ }
+    } finally {
+      if (retired) retiring.delete(retired);
+    }
   };
   // Daemon-unavailable fallback: serve a client message in-process.
-  const handleLocally = async (line: string): Promise<void> => {
+  const handleLocally = (line: string): Promise<void> => {
+    const call = serveLocally(line);
+    localCalls.add(call);
+    const done = (): void => { localCalls.delete(call); };
+    call.then(done, done);
+    return call;
+  };
+  const serveLocally = async (line: string): Promise<void> => {
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
     if (msg.method === 'tools/call' && id !== undefined) {
       try {
-        await ensureEngine();
+        const local = await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await engine!.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
@@ -329,6 +417,9 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let stdinBuf = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk: string) => {
+    // Nothing is served once shutdown starts: a call now could start an engine
+    // shutdown() never sees, and the process exits as soon as the others stop.
+    if (shuttingDown) return;
     stdinBuf += chunk;
     let idx: number;
     while ((idx = stdinBuf.indexOf('\n')) !== -1) {
@@ -339,6 +430,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
+        clientInitLine = line;
         const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
         if (initParams.clientInfo) {
           telemetryClient = {
@@ -358,6 +450,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { resourceTemplates: [] } });
       } else if (msg.method === 'prompts/list') {
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { prompts: [] } });
+      } else if (msg.method === 'server/discover' && msg.id !== undefined) {
+        // Newer clients (Antigravity 2.5) probe this before `initialize` and wait
+        // for the answer. We don't implement it; Method-not-found is what sends
+        // them on to `initialize`. Answer locally — forwarded, it waited on the
+        // daemon connection and was lost if the client closed stdin first. (#2084)
+        writeClient({ jsonrpc: '2.0', id: msg.id, error: { code: ErrorCodes.MethodNotFound, message: 'Method not found: server/discover' } });
       } else {
         routeToDaemon(line);
       }
@@ -383,15 +481,58 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   });
 
   // ---- daemon connection (background) ----
-  let socket: net.Socket | null = null;
-  try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
+  const connectDaemon = async (): Promise<net.Socket | null> => {
+    let socket: net.Socket | null = null;
+    try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
+    // `socket.destroyed`: the connect-window error guard above can absorb an
+    // 'error' that already destroyed the socket before we got here (#974) — treat
+    // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
+    if (socket && (socket.destroyed || shuttingDown)) {
+      try { socket.destroy(); } catch { /* ignore */ }
+      socket = null;
+    }
+    return socket;
+  };
+  // Every buffered call binds to the engine now, so a later retirement waits for all of them.
+  const serveBufferedLocally = (): void => {
+    for (const line of pending.splice(0)) void handleLocally(line);
+  };
+  const scheduleDaemonRetry = (): void => {
+    if (shuttingDown || retryTimer || retryBaseMs <= 0) return;
+    const delay = retryDelayMs;
+    retryDelayMs = Math.min(retryDelayMs * 2, retryMaxMs);
+    retryTimer = setTimeout(() => { retryTimer = null; void retryDaemon(); }, delay);
+    retryTimer.unref?.();
+  };
+  const retryDaemon = async (): Promise<void> => {
+    if (shuttingDown || daemonStatus !== 'failed') return;
+    // While a writing engine owns writer.pid no daemon can start (#2277). Hand
+    // the lock back first, once the calls it is serving have answered, and
+    // buffer new calls until a daemon answers or we resume in-process. One
+    // writer at a time: the engine is fully stopped before a daemon is spawned.
+    const handover = engine !== null && !engine.isReadOnly();
+    if (handover) {
+      daemonStatus = 'connecting';
+      await retireEngine();
+    }
+    const socket = await connectDaemon();
+    if (shuttingDown) return;
+    if (socket) {
+      process.stderr.write('[CodeGraph MCP] Shared daemon reachable; proxying this session to it instead of serving in-process.\n');
+      attachDaemon(socket, true);
+      // A read-only engine holds no lock: let its calls finish, then close it.
+      if (!handover) void retireEngine();
+      return;
+    }
+    daemonStatus = 'failed';
+    serveBufferedLocally();
+    scheduleDaemonRetry();
+  };
 
-  // `!socket.destroyed`: the connect-window error guard above can absorb an
-  // 'error' that already destroyed the socket before we got here (#974) — treat
-  // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
-  if (socket && !socket.destroyed && !shuttingDown) {
+  const attachDaemon = (socket: net.Socket, replayInitialize: boolean): void => {
     daemonSocket = socket;
     daemonStatus = 'ready';
+    attachedAt = Date.now();
     let sockBuf = '';
     socket.setEncoding('utf8');
     socket.on('data', (chunk: string) => {
@@ -416,33 +557,48 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     // The daemon going away does NOT end the session (#662). An MCP host can
     // SIGTERM the shared daemon when another session starts; if we exited here,
     // this host would silently lose CodeGraph and any in-flight request would
-    // hang. Instead, fall back to the in-process engine for the rest of the
-    // session and re-serve whatever the dead daemon never answered.
+    // hang. Instead, fall back to the in-process engine until a daemon answers
+    // again, and re-serve whatever the dead daemon never answered.
     const onDaemonLost = (): void => {
-      if (shuttingDown || daemonStatus !== 'ready') return; // host teardown, or already handled
+      if (shuttingDown || daemonSocket !== socket) return; // host teardown, or already handled
       daemonStatus = 'failed';
-      try { daemonSocket?.destroy(); } catch { /* ignore */ }
       daemonSocket = null;
+      try { socket.destroy(); } catch { /* ignore */ }
       process.stderr.write(
         `[CodeGraph MCP] Shared daemon connection lost; serving this session in-process (degraded), re-serving ${inflight.size} in-flight request(s).\n`
       );
       const orphaned = [...inflight.values()];
       inflight.clear();
       for (const line of orphaned) void handleLocally(line);
+      // A link that stayed up past the longest wait starts the backoff over; one
+      // that keeps dropping right after it attaches keeps backing off.
+      if (Date.now() - attachedAt >= retryMaxMs) retryDelayMs = retryBaseMs;
+      scheduleDaemonRetry();
     };
     socket.on('close', onDaemonLost);
     socket.on('error', onDaemonLost);
+    // A daemon that came up mid-session has never seen this client: prime its
+    // session with the client's own initialize, whose reply is suppressed
+    // above like the first one.
+    if (replayInitialize && clientInitLine !== undefined) {
+      try { socket.write(clientInitLine + '\n'); } catch { /* close path */ }
+    }
     for (const line of pending) {
       trackInflight(line);
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy-flush ${line.slice(0, 80)}\n`);
       try { socket.write(line + '\n'); } catch { /* ignore */ }
     }
     pending.length = 0;
+  };
+
+  const socket = await connectDaemon();
+  if (socket) {
+    attachDaemon(socket, false);
   } else if (!shuttingDown) {
     daemonStatus = 'failed';
     process.stderr.write('[CodeGraph MCP] Shared daemon unavailable; serving this session in-process (degraded).\n');
-    const buffered = pending.splice(0);
-    for (const line of buffered) await handleLocally(line);
+    serveBufferedLocally();
+    scheduleDaemonRetry();
   }
 
   await new Promise<void>(() => { /* stdin keeps the loop alive; exit via shutdown() */ });
@@ -607,10 +763,15 @@ function startPpidWatchdog(socket: net.Socket): void {
 }
 
 function parsePollMs(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
+  return parseDelayMs(raw, DEFAULT_PPID_POLL_MS);
+}
+
+/** A non-negative millisecond env value; unset or malformed gives `fallback`. */
+function parseDelayMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
-  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < 0) return fallback;
   return Math.floor(parsed);
 }
 

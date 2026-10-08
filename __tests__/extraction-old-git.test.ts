@@ -6,12 +6,19 @@
  * after it pushed the worker past its memory ceiling.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { scanDirectory } from '../src/extraction';
+
+// Fail only the unsupported invocation; repository discovery and fallback Git
+// commands still execute against real repositories on every platform.
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
+});
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-test-'));
@@ -25,11 +32,9 @@ function createTempDir(): string {
 // git-visible path went with it: `includeIgnored`, gitlink recursion and the
 // `codegraph.json` `include` allowlist all silently stopped applying (#1549).
 //
-// A PATH shim reproduces that on any git version, which is what makes this
-// testable in CI at all.
+// Inject the old Git error on any installed version, including Git for Windows.
 describe('Old git without `ls-files -s --recurse-submodules` support (#1549)', () => {
   let tempDir: string;
-  let originalPath: string | undefined;
 
   const runGit = (cwd: string, ...args: string[]) =>
     execFileSync('git', args, { cwd, stdio: 'pipe' });
@@ -44,42 +49,18 @@ describe('Old git without `ls-files -s --recurse-submodules` support (#1549)', (
     runGit(dir, 'commit', '-q', '-m', `${base} init`);
   };
 
-  /** A `git` that dies exactly like < 2.36 when it sees -s with --recurse-submodules. */
-  const installOldGitShim = () => {
-    const shimDir = path.join(tempDir, '.shim');
-    fs.mkdirSync(shimDir, { recursive: true });
-    const realGit = execFileSync('which', ['git']).toString().trim();
-    const shim = path.join(shimDir, 'git');
-    fs.writeFileSync(
-      shim,
-      [
-        '#!/bin/sh',
-        'for a in "$@"; do',
-        '  [ "$a" = "--recurse-submodules" ] && rs=1',
-        '  [ "$a" = "-s" ] && st=1',
-        'done',
-        'if [ -n "$rs" ] && [ -n "$st" ]; then',
-        '  echo "fatal: ls-files --recurse-submodules unsupported mode" >&2',
-        '  exit 128',
-        'fi',
-        `exec ${JSON.stringify(realGit)} "$@"`,
-      ].join('\n'),
-    );
-    fs.chmodSync(shim, 0o755);
-    originalPath = process.env.PATH;
-    process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
-  };
-
-  beforeEach(() => {
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('child_process')>('child_process');
+    vi.mocked(execFileSync).mockImplementation(actual.execFileSync);
     tempDir = createTempDir();
   });
 
   afterEach(() => {
-    if (originalPath !== undefined) process.env.PATH = originalPath;
-    originalPath = undefined;
+    vi.mocked(execFileSync).mockReset();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('still honours includeIgnored when `ls-files --recurse-submodules` is unsupported', () => {
+  it('still honours includeIgnored when `ls-files --recurse-submodules` is unsupported', async () => {
     const root = path.join(tempDir, 'root');
     makeRepo(root, 'a');
     // An embedded repo that .gitignore excludes but codegraph.json opts back in.
@@ -95,13 +76,27 @@ describe('Old git without `ls-files -s --recurse-submodules` support (#1549)', (
     // Baseline: the real git resolves both files.
     const withRealGit = scanDirectory(root);
     expect(withRealGit).toContain('a.ts');
-    expect(withRealGit).toContain(path.join('dir_b', 'b.ts'));
+    expect(withRealGit).toContain('dir_b/b.ts');
 
-    installOldGitShim();
+    const actual = await vi.importActual<typeof import('child_process')>('child_process');
+    let rejected = 0;
+    let retried = 0;
+    vi.mocked(execFileSync).mockImplementation(((file, args, options) => {
+      if (file === 'git' && Array.isArray(args) && args[0] === 'ls-files' && args.includes('-s')) {
+        if (args.includes('--recurse-submodules')) {
+          rejected++;
+          throw new Error('fatal: ls-files --recurse-submodules unsupported mode');
+        }
+        retried++;
+      }
+      return actual.execFileSync(file, args, options);
+    }) as typeof execFileSync);
 
     // The opted-in file must survive the unsupported-mode failure, not vanish.
     const withOldGit = scanDirectory(root);
     expect(withOldGit).toContain('a.ts');
-    expect(withOldGit).toContain(path.join('dir_b', 'b.ts'));
+    expect(withOldGit).toContain('dir_b/b.ts');
+    expect(rejected).toBeGreaterThan(0);
+    expect(retried).toBe(rejected);
   });
 });

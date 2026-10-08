@@ -132,12 +132,18 @@ describe('git index currency across commits and restores (#1829)', () => {
 
   it('keeps a committed path pending when sync cannot read it', async () => {
     write('new.ts', 'newSymbol'); commit();
-    const real = fs.readFileSync;
+    // Sync reads a source file through a bounded reader that opens a
+    // descriptor (#1910), so the failure is injected at openSync as well as
+    // readFileSync: it must reach whichever one the read goes through.
+    const realRead = fs.readFileSync;
+    const realOpen = fs.openSync;
     let injected = 0;
-    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: any, ...args: any[]) => {
+    const failNewTs = (real: (...args: any[]) => unknown) => (file: any, ...args: any[]) => {
       if (String(file) === path.join(root, 'new.ts')) { injected++; throw new Error('Injected transient read error'); }
-      return (real as any)(file, ...args);
-    }) as typeof fs.readFileSync);
+      return real(file, ...args);
+    };
+    vi.spyOn(fs, 'readFileSync').mockImplementation(failNewTs(realRead as any) as typeof fs.readFileSync);
+    vi.spyOn(fs, 'openSync').mockImplementation(failNewTs(realOpen as any) as typeof fs.openSync);
     await cg.sync();
     expect(injected).toBeGreaterThan(0);
     expect(symbols('newSymbol')).not.toContain('newSymbol');

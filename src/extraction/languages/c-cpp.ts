@@ -3,6 +3,77 @@ import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
+ * Resolve the declared identifier inside a C declarator. A `declaration`'s
+ * `declarator` field nests the name through `init_declarator` (with value),
+ * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
+ * wrappers (each via their own `declarator` field) down to an `identifier`.
+ * A `function_declarator` means the declaration is a function prototype (or a
+ * function-pointer var) — return null so it isn't extracted as a variable.
+ */
+export function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
+  let cur: SyntaxNode | null = node;
+  let guard = 0;
+  while (cur && guard++ < 12) {
+    switch (cur.type) {
+      case 'identifier':
+        return cur;
+      case 'function_declarator':
+        return null;
+      case 'init_declarator':
+      case 'pointer_declarator':
+      case 'array_declarator':
+      case 'parenthesized_declarator':
+        cur = getChildByField(cur, 'declarator');
+        break;
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
+/** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
+const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
+
+/**
+ * Whether a C/C++ type specifier defines a class, struct, union or enum, as
+ * opposed to naming one (`struct Foo *p`, the forward declaration `class Foo;`).
+ */
+export function isClassLikeDefinition(node: SyntaxNode): boolean {
+  return CLASS_LIKE_SPECIFIERS.has(node.type) && getChildByField(node, 'body') !== null;
+}
+
+/**
+ * The `declaration` a class, struct, union or enum is defined in the type of —
+ * `struct Foo { … } foo;` — or null for one written on its own, in a typedef or
+ * in a member's type.
+ */
+function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
+  if (!isClassLikeDefinition(node)) return null;
+  const parent = node.parent;
+  return parent?.type === 'declaration' && getChildByField(parent, 'type')?.id === node.id ? parent : null;
+}
+
+/**
+ * The name of an unnamed class, struct, union or enum that a declaration
+ * defines: the first variable the declaration declares. No code can name the
+ * type of `static struct { … } SPT;` (only `SPT`), so the struct is indexed as
+ * `SPT`, the way `typedef struct { … } Name;` is indexed as `Name`. Undefined
+ * for a named type, and when the declaration declares no variable (a
+ * function's return type). Mirrored in the kernel (ccpp/mod.rs).
+ */
+function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
+  if (getChildByField(node, 'name')) return undefined;
+  const declaration = definingDeclaration(node);
+  if (!declaration) return undefined;
+  for (const declarator of declaration.childrenForFieldName('declarator')) {
+    const identifier = cDeclaratorIdentifier(declarator);
+    if (identifier) return getNodeText(identifier, source);
+  }
+  return undefined;
+}
+
+/**
  * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
  * declarator, skipping the `parameter_list` — a parameter with a qualified type
  * (`const std::string& x`) must NOT be mistaken for the method name. Without the
@@ -22,6 +93,55 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
       if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
         queue.push(child);
       }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Single-argument macros are ambiguous without their definition (#1373).
+ * Require a preceding local #define whose replacement uses its sole parameter
+ * as the function declarator; registration, token-pasting, and K&R forms stay
+ * untouched. Walk enclosing scopes, but never guess across conditional macros.
+ */
+function recoverSingleArgMacroDefinedName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  const declarator = getChildByField(node, 'declarator');
+  let macro: SyntaxNode | null = null;
+  let argument: SyntaxNode | null = null;
+  if (declarator?.type === 'parenthesized_declarator' && declarator.namedChildCount === 1) {
+    // C: NATIVE_FN is parsed as the return type, (name) as the declarator.
+    macro = getChildByField(node, 'type');
+    argument = declarator.namedChild(0);
+    if (macro?.type !== 'type_identifier' || argument?.type !== 'identifier') return undefined;
+  } else if (declarator?.type === 'function_declarator' && !getChildByField(node, 'type')) {
+    // C++: NATIVE_FN(name) is parsed as an implicit-return-type function.
+    macro = getChildByField(declarator, 'declarator');
+    const params = getChildByField(declarator, 'parameters');
+    const param = params?.namedChild(0);
+    if (macro?.type !== 'identifier' || params?.namedChildCount !== 1 ||
+        param?.type !== 'parameter_declaration' || param.namedChildCount !== 1) return undefined;
+    argument = param.namedChild(0);
+    if (argument?.type !== 'type_identifier') return undefined;
+  }
+  if (!macro || !argument) return undefined;
+  const macroName = getNodeText(macro, source);
+  for (let scope: SyntaxNode | null = node; scope; scope = scope.parent) {
+    if (scope.type === 'preproc_else' || scope.type.startsWith('preproc_elif')) return undefined;
+    for (let prev = scope.previousNamedSibling; prev; prev = prev.previousNamedSibling) {
+      if (prev.type.startsWith('preproc_if')) return undefined;
+      if (prev.type === 'preproc_call' && getChildByField(prev, 'directive')?.text === '#undef' &&
+          getChildByField(prev, 'argument')?.text.trim() === macroName) return undefined;
+      if (prev.type !== 'preproc_function_def' && prev.type !== 'preproc_def') continue;
+      if (getChildByField(prev, 'name')?.text !== macroName) continue;
+      const params = getChildByField(prev, 'parameters');
+      const param = params?.namedChild(0);
+      const value = getChildByField(prev, 'value');
+      if (params?.namedChildCount !== 1 || param?.type !== 'identifier' || !value) return undefined;
+      const replacement = getNodeText(value, source).replace(/\\\r?\n/g, ' ').trim();
+      const match = replacement.match(/^(?:[A-Za-z_][A-Za-z0-9_:]*\s+)+[*&\s]*([A-Za-z_]\w*)\s*\([^(){};#]*\)\s*$/);
+      if (!match || /\btypedef\b/.test(replacement) || match[1] !== param.text) return undefined;
+      return getNodeText(argument, source);
     }
   }
   return undefined;
@@ -73,7 +193,7 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
 }
 
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
-  const macroDefined = recoverCppMacroDefinedName(node, source);
+  const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
   const declarator = getChildByField(node, 'declarator');
   if (!declarator) return undefined;
@@ -207,6 +327,11 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  resolveName: (node, source) =>
+    recoverSingleArgMacroDefinedName(node, source) ?? unnamedTypeVariableName(node, source),
+  // A struct, union or enum defined in a declaration's type is documented by
+  // the comment above the declaration.
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   // CUDA in C-detected headers (content-gated blank; see preParseCSource).
   preParse: preParseCSource,
   // Universal net: recover a real name from any macro-mangled function name.
@@ -328,13 +453,389 @@ function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
  * declarations (`struct FOO var;`, `class FOO obj = …`) untouched, since those
  * end in `;` / `=` / `[`, never `:` / `{`. C++-only (wired into cppExtractor),
  * so C's heavier use of `struct TAG var;` never reaches it.
+ *
+ * The head may carry several macros, and a macro may take arguments: protobuf's
+ * generated `class PROTOBUF_EXPORT PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Any
+ * final : public Message`, `class ABSL_ATTRIBUTE_WARN_UNUSED
+ * PROTOBUF_DECLSPEC_EMPTY_BASES RepeatedField final`, rocksdb's `struct
+ * ALIGN_AS(64U) HandleImpl : public ClockHandle`. The whole run is blanked; the
+ * last name before the guard is the class. The name may be followed by template
+ * arguments, for a specialization (`class PROTOBUF_DECLSPEC_EMPTY_BASES
+ * RepeatedFieldProxyWithSet<ElementType, …> {`). Matched on the code alone, so
+ * a comment or string never takes part.
  */
+const CPP_CLASS_HEAD_MACROS_RE =
+  /\b(?:class|struct)\s+((?:[A-Z][A-Z0-9_]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s+)+)(?!final\b)[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*/g;
 export function blankCppExportMacros(source: string): string {
   if (source.indexOf('class') === -1 && source.indexOf('struct') === -1) return source;
-  return source.replace(
-    /\b(class|struct)(\s+)([A-Z][A-Z0-9_]+)(?=\s+[A-Za-z_]\w*(?:\s+final)?\s*[:{])/g,
-    (_m, kw, ws, macro) => kw + ws + ' '.repeat(macro.length)
-  );
+  if (!/\b(?:class|struct)\s+[A-Z][A-Z0-9_]/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_CLASS_HEAD_MACROS_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    let i = skipCppSpace(code, m.index + m[0].length);
+    if (code[i] === '<') {
+      i = skipCppAngleArgs(code, i);
+      if (i < 0) continue;
+      i = skipCppSpace(code, i);
+    }
+    if (/^final\b/.test(code.slice(i, i + 6))) i = skipCppSpace(code, i + 5);
+    if (code[i] !== '{' && !(code[i] === ':' && code[i + 1] !== ':')) continue;
+    const run = m[1] as string;
+    const start = m.index + m[0].indexOf(run);
+    pushCppRunTokens(spans, run, start);
+  }
+  return blankCppSpans(source, spans, code);
+}
+
+// Comments and string/char literals (raw strings are masked beforehand by
+// maskCppRawStrings). The char-literal boundary leaves digit separators alone.
+const CPP_COMMENT_OR_LITERAL_RE =
+  /\/\/(?:\\\r?\n|[^\r\n])*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g;
+
+/**
+ * The source with comments and string/char literals turned to spaces, line
+ * endings kept. The macro scans below match on this, so a word in a comment or
+ * a literal (`* NOTE: …` in a doc comment) is never blanked, and every offset
+ * still lines up with the source.
+ */
+function maskCppCommentsAndLiterals(source: string): string {
+  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, ' '));
+}
+
+/**
+ * The code the macro scans below match on, at the source's offsets: comments
+ * are spaces, a string or char literal keeps its place as `\x01`s (it is a
+ * token, not space: in `"… using " GTEST_NAME_` the macro does not start a
+ * line, and a run of macros never reaches across a literal), and
+ * preprocessor directives with their `\` continuation lines are spaces — the
+ * `)` ending `#if !defined(__MINGW32__)` closes no parameter list, so the
+ * `TEST(file_test, open_windows_file) {` under it is not a trailing macro.
+ */
+function maskCppCode(source: string): string {
+  if (cppMaskMemo !== null && cppMaskMemo.source === source) return cppMaskMemo.code;
+  const code = source
+    .replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, m.startsWith('/') ? ' ' : '\x01'))
+    .replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, ' '));
+  cppMaskMemo = { source, code };
+  return code;
+}
+
+// The last source maskCppCode masked. The passes run one after another on
+// the same text: one that blanks nothing hands the next the same string, and
+// one that blanks hands it a mask blanked the same way (blankCppSpans), so a
+// file is masked once rather than once per pass.
+let cppMaskMemo: { source: string; code: string } | null = null;
+
+// One macro, with its arguments, inside a run matched on the masked code.
+const CPP_RUN_TOKEN_RE = /[A-Z][A-Z0-9_]*(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?/g;
+
+/** Add a span for each macro of `run` (found at `start`), leaving what lies between them. */
+function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: number): void {
+  for (const t of run.matchAll(CPP_RUN_TOKEN_RE)) spans.push([start + t.index, start + t.index + t[0].length]);
+}
+
+/**
+ * Replace each [start, end) span of `source` with spaces, keeping line
+ * endings. Given the mask the spans were found on, blank it the same way and
+ * keep it for the next pass: a span holds whole macros (with their arguments),
+ * so the result is what masking the new source would give.
+ */
+function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>, code?: string): string {
+  if (spans.length === 0) return source;
+  const blank = (text: string): string => {
+    const chars = text.split('');
+    for (const [start, end] of spans) {
+      for (let k = start; k < end; k++) {
+        if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+      }
+    }
+    return chars.join('');
+  };
+  const out = blank(source);
+  if (code !== undefined) cppMaskMemo = { source: out, code: blank(code) };
+  return out;
+}
+
+function skipCppSpace(code: string, i: number): number {
+  while (i < code.length && /\s/.test(code[i] as string)) i++;
+  return i;
+}
+
+/**
+ * The index just past the template argument list opening at `code[open]`
+ * (`<`), or -1 when it doesn't close before a `;`, `{` or `}` — then it was a
+ * comparison, not template arguments. Angle brackets inside parentheses don't
+ * count (`Foo<sizeof(a) < 4>`).
+ */
+function skipCppAngleArgs(code: string, open: number): number {
+  let angles = 0;
+  let parens = 0;
+  const limit = Math.min(code.length, open + 4000);
+  for (let i = open; i < limit; i++) {
+    const c = code[i];
+    if (c === '(') parens++;
+    else if (c === ')') {
+      if (--parens < 0) return -1;
+    } else if (c === ';' || c === '{' || c === '}') return -1;
+    else if (parens === 0 && c === '<') angles++;
+    else if (parens === 0 && c === '>' && code[i - 1] !== '-') {
+      if (--angles === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Blank attribute macros between a pointer or reference and the name it
+ * declares: protobuf's nullability annotations (`const Descriptor*
+ * PROTOBUF_NONNULL descriptor()`, `Any* PROTOBUF_RESTRICT PROTOBUF_NONNULL
+ * other`, `const FieldDescriptor* PROTOBUF_NULLABLE* PROTOBUF_NONNULL field`).
+ * tree-sitter takes the macro for the declared name and the real name for an
+ * error: a member keeps a broken declarator, an out-of-line definition gets the
+ * macro glued into its qualified name (`PROTOBUF_NONNULL Any::mutable_type_url`),
+ * and a definition whose parameter carries one (`void Any::Swap(Any*
+ * PROTOBUF_NONNULL other) { … }`) parses as a variable and drops out of the
+ * index. Generated `.pb.h`/`.pb.cc` files carry thousands of them.
+ *
+ * Matched on the code alone: the macro is ALL-CAPS with an underscore, right
+ * after `*` or `&`, and followed by the name (or, after `*`, by another `*`).
+ * C++ never puts two names in a row there, and a product (`a * MAX_LEN + 1`)
+ * or a bit test (`flags & FOO_BIT)`) is followed by an operator or a closer
+ * instead; a `*` after `)`, `]` or a number is a product too (`sizeof(int) *
+ * CHAR_BIT * 3`). A trailing macro with nothing after it (`Foo*
+ * PROTOBUF_NONNULL)`) parses as the parameter name and is left alone.
+ * C++-only.
+ */
+const CPP_POINTER_ANNOTATION_RE =
+  /([*&])\s*((?:[A-Z][A-Z0-9]*_[A-Z0-9_]*(?:\s+|(?=\*)))+)(?=\*|::|(?!(?:and|and_eq|bitand|bitor|compl|not|not_eq|or|or_eq|xor|xor_eq)\b)[A-Za-z_~])/g;
+export function blankCppPointerAnnotationMacros(source: string): string {
+  if (!/[*&]\s*[A-Z][A-Z0-9]*_/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_POINTER_ANNOTATION_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const run = m[2] as string;
+    const start = m.index + m[0].length - run.length;
+    // After `&`, only a name: `flags & FOO_BIT\n  && ok` is an expression.
+    if (m[1] === '&' && code[start + run.length] === '*') continue;
+    // A `*` after a closing bracket or a number multiplies: `sizeof(int) * CHAR_BIT * 3`.
+    if (/(?:[)\]]|\b\d[\w.]*)\s*$/.test(code.slice(Math.max(0, m.index - 40), m.index))) continue;
+    pushCppRunTokens(spans, run, start);
+  }
+  return blankCppSpans(source, spans, code);
+}
+
+// Keywords that take a parenthesized operand: a `)` closing one of these is
+// not a parameter list, so a token after it is not a trailing attribute.
+// `constexpr` / `consteval` stand before the condition of `if constexpr (…)`.
+const CPP_PAREN_KEYWORDS = new Set([
+  'if', 'while', 'for', 'switch', 'catch', 'return', 'sizeof', 'alignof', 'alignas', 'decltype',
+  'typeid', 'noexcept', 'throw', 'static_assert', 'new', 'delete', 'case', 'requires', 'co_await',
+  'co_yield', 'co_return', 'asm', '__asm__', '__attribute__', '__attribute', '__declspec', '_Pragma',
+  'else', 'do', 'constexpr', 'consteval', 'explicit', 'typeof', '__typeof__', '__typeof', '_Alignof',
+  '__alignof__', 'volatile', '__volatile__',
+]);
+
+/**
+ * Blank attribute macros after a function's parameter list: protobuf's
+ * `unknown_fields() const\n ABSL_ATTRIBUTE_LIFETIME_BOUND {` and `~Any()
+ * PROTOBUF_FINAL;`, and the thread-safety annotations of leveldb, rocksdb and
+ * abseil (`void Wait() LOCKS_EXCLUDED(mu_) {`, `void Lock()
+ * EXCLUSIVE_LOCK_FUNCTION();`). tree-sitter reads the macro as the start of a
+ * new declaration, so the method loses its `;` or its body: an inline body
+ * becomes a stray block, and in a long run of members the class can end early.
+ *
+ * Matched on the code alone, so it can't touch an expression:
+ *  - the `)` closes a parameter list: the `(` it matches follows a function
+ *    name (`name(`, `~Name(`, `operator==(`, `operator()(`), not a keyword
+ *    (`if (x) FOO;`), a cast (`= (int) MAX_VALUE;`) or a macro call
+ *    (`FMT_PRAGMA_CLANG(…)` above `TEST(std_test, bitint) {`);
+ *  - between `)` and the macro only `const`, `volatile`, `&`, `&&`,
+ *    `noexcept`, `override` or `final` may stand, and no blank line;
+ *  - the macro (ALL-CAPS, optionally with balanced arguments; several may
+ *    stack) is followed by what may end a declarator: `{`, `;`, `=`, a
+ *    constructor's `:`, `->`, or `override`/`final`/`const`/`noexcept`.
+ * C++-only.
+ */
+const CPP_TRAILING_ATTR_CANDIDATE_RE =
+  /\)((?:\s*(?:const|volatile|noexcept|override|final|&&|&)(?![\w]))*)\s*(?=[A-Z][A-Z0-9_]{2,}\b)/g;
+const CPP_TRAILING_ATTR_RUN_RE =
+  /(?:[A-Z][A-Z0-9_]{2,}\b(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?\s*)+/y;
+const CPP_TRAILING_ATTR_FOLLOW_RE = /(?:\{|;|=(?!=)|:(?!:)|->|(?:override|final|const|noexcept)\b)/y;
+export function blankCppTrailingAttributeMacros(source: string): string {
+  if (!/\)[\s\w&]*?\b[A-Z][A-Z0-9_]{2,}\b/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_TRAILING_ATTR_CANDIDATE_RE.source, 'g');
+  const run = new RegExp(CPP_TRAILING_ATTR_RUN_RE.source, 'y');
+  const follow = new RegExp(CPP_TRAILING_ATTR_FOLLOW_RE.source, 'y');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const macroStart = m.index + m[0].length;
+    if (/\n[ \t]*\r?\n/.test(m[0])) continue;
+    run.lastIndex = macroStart;
+    const r = run.exec(code);
+    if (!r) continue;
+    follow.lastIndex = macroStart + r[0].length;
+    if (!follow.test(code)) continue;
+    if (!closesParameterList(code, m.index)) continue;
+    pushCppRunTokens(spans, r[0], macroStart);
+    re.lastIndex = macroStart + r[0].length;
+  }
+  return blankCppSpans(source, spans, code);
+}
+
+// Type keywords that may stand right before a declared name (`int count_ …`).
+const CPP_TYPE_KEYWORDS = new Set([
+  'void', 'bool', 'char', 'char8_t', 'char16_t', 'char32_t', 'wchar_t', 'short', 'int', 'long', 'float',
+  'double', 'signed', 'unsigned', 'auto',
+]);
+const CPP_KEYWORDS = new Set([
+  ...CPP_TYPE_KEYWORDS, ...CPP_PAREN_KEYWORDS, 'const', 'volatile', 'static', 'extern', 'inline', 'virtual',
+  'explicit', 'constexpr', 'consteval', 'constinit', 'friend', 'mutable', 'thread_local', 'register',
+  'typedef', 'using', 'template', 'typename', 'class', 'struct', 'union', 'enum', 'namespace', 'operator',
+  'goto', 'break', 'continue', 'default', 'public', 'private', 'protected', 'this', 'true', 'false',
+  'nullptr', 'and', 'or', 'not', 'xor', 'bitand', 'bitor', 'compl', 'and_eq', 'or_eq', 'xor_eq', 'not_eq',
+]);
+
+/**
+ * Blank attribute macros after the name a declaration declares, or after its
+ * array brackets: thread-safety annotations on fields (leveldb's `port::CondVar
+ * cv GUARDED_BY(mu);`, abseil's `ABSL_GUARDED_BY`), annotated parameters
+ * (`const absl::Cord* cord ABSL_ATTRIBUTE_LIFETIME_BOUND)`), and the section
+ * attributes of protobuf's generated globals (`Any_globals_
+ * PROTOBUF_MESSAGE_GLOBALS_SECTION(.data.rel.ro);`, `offsets[]
+ * ABSL_ATTRIBUTE_SECTION_VARIABLE(protodesc_cold) = {`). tree-sitter reads
+ * the macro as a second declarator and errors.
+ *
+ * Matched on the code alone, so it can't touch a variable named in capitals:
+ *  - the macro is ALL-CAPS with an underscore, optionally with balanced
+ *    arguments, and is followed by `;`, `=`, `,` or `)`;
+ *  - before it stands `]`, or a name with a lowercase letter that itself
+ *    follows a type: a type name, a type keyword, `*`, `&`, `>`, or `const`
+ *    after a pointer. `Foo DEFAULT_OPTIONS;` and `const Foo kMAX_SIZE;`
+ *    declare those capitals (nothing names a type before `Foo`), `typedef Foo
+ *    BAR_T;` names a type, and `return x FOO;` or `f(a, b FOO)` have no type
+ *    before the name.
+ * C++-only.
+ */
+const CPP_DECLARATOR_ATTR_CANDIDATE_RE = /(?<![\w$])[A-Z][A-Z0-9]*_[A-Z0-9_]*\b/g;
+const CPP_DECLARATOR_ATTR_RUN_RE =
+  /(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?\s*)+/y;
+export function blankCppDeclaratorAttributeMacros(source: string): string {
+  if (!/[\w\]]\s+[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*[(;=,)]/.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_DECLARATOR_ATTR_CANDIDATE_RE.source, 'g');
+  const run = new RegExp(CPP_DECLARATOR_ATTR_RUN_RE.source, 'y');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const macroStart = m.index;
+    // Whitespace before the macro, and before that a name or `]`.
+    let last = macroStart - 1;
+    while (last >= 0 && /\s/.test(code[last] as string)) last--;
+    if (last === macroStart - 1 || last < 0 || !/[\w\]]/.test(code[last] as string)) continue;
+    run.lastIndex = macroStart;
+    const r = run.exec(code);
+    if (!r || !/^[;,)]|^=(?!=)/.test(code.slice(macroStart + r[0].length, macroStart + r[0].length + 2))) continue;
+    if (code[last] !== ']' && !followsDeclaredName(code, last)) continue;
+    pushCppRunTokens(spans, r[0], macroStart);
+    re.lastIndex = macroStart + r[0].length;
+  }
+  return blankCppSpans(source, spans, code);
+}
+
+/** True when the identifier ending at `code[last]` is a name a declaration declares. */
+function followsDeclaredName(code: string, last: number): boolean {
+  let start = last;
+  while (start > 0 && /\w/.test(code[start - 1] as string)) start--;
+  const name = code.slice(start, last + 1);
+  if (!/^[A-Za-z_]\w*$/.test(name) || !/[a-z]/.test(name) || CPP_KEYWORDS.has(name)) return false;
+  let i = start - 1;
+  while (i >= 0 && /\s/.test(code[i] as string)) i--;
+  const c = code[i];
+  if (c === '*' || c === '&') return true;
+  if (c === '>') return code[i - 1] !== '-';
+  if (!c || !/\w/.test(c)) return false;
+  let j = i;
+  while (j > 0 && /\w/.test(code[j - 1] as string)) j--;
+  const before = code.slice(j, i + 1);
+  if (before === 'const' || before === 'volatile') {
+    let k = j - 1;
+    while (k >= 0 && /\s/.test(code[k] as string)) k--;
+    return code[k] === '*' || code[k] === '&';
+  }
+  if (CPP_TYPE_KEYWORDS.has(before)) return true;
+  return /^[A-Za-z_]\w*$/.test(before) && !CPP_KEYWORDS.has(before);
+}
+
+/** True when the `)` at `code[close]` closes a function declarator's parameter list. */
+function closesParameterList(code: string, close: number): boolean {
+  let depth = 0;
+  let open = -1;
+  for (let i = close; i >= 0 && close - i < 4000; i--) {
+    const c = code[i];
+    if (c === ')') depth++;
+    else if (c === '(') {
+      if (--depth === 0) { open = i; break; }
+    } else if (c === ';' || c === '{' || c === '}') return false;
+  }
+  if (open < 0) return false;
+  const before = code.slice(Math.max(0, open - 200), open);
+  // `operator()(…)`, `operator==(…)`, `operator bool(…)`
+  if (/\boperator\s*(?:\(\s*\)|\[\s*\]|[^\s\w()[\]]{1,3}|\s+[A-Za-z_][\w\s:<>*&]*)\s*$/.test(before)) return true;
+  const name = /([A-Za-z_]\w*)\s*$/.exec(before)?.[1];
+  return !!name && !CPP_PAREN_KEYWORDS.has(name) && !/^[A-Z][A-Z0-9_]*$/.test(name);
+}
+
+/**
+ * Blank attribute macros that open a declaration, at the start of a line or
+ * after a `[[…]]` attribute: protobuf's `PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+ * absl::string_view name() const {` (250 members of descriptor.h alone),
+ * `ABSL_ATTRIBUTE_REINITIALIZES void Clear()`, `[[nodiscard]]
+ * PROTOBUF_NDEBUG_INLINE Ptr<T> Make(…)`, googletest's `GTEST_API_
+ * std::string JoinAsTuple(…)`, {fmt}'s `FMT_EXPORT struct …`. tree-sitter
+ * takes the macro for the type and everything after it for an error, which
+ * swallows the members that follow. `blankCLeadingAttrMacros` only knows a
+ * plain `MACRO Ret name(`; C++ adds qualified and template types, specifiers
+ * and keywords.
+ *
+ * The macro (ALL-CAPS with an underscore; several may stack) must be followed
+ * by what can't follow a type name: a declaration keyword (`static`,
+ * `inline`, `virtual`, `void`, `struct`, `template`, `return`, `[[`, …) or a
+ * whole declaration of its own, a type and then the declared name (`Type
+ * name(`, `ns::Type<T>* name;`). A type is followed by the name alone
+ * (`DWORD_PTR value = 0;`, `HANDLE_T Open(…)`), so it never matches. `const`
+ * after the token could be either (`SIZE_T const n`), so it only counts with a
+ * type and name after it. Matched on the code alone. C++-only.
+ */
+const CPP_TYPE_ARGS = '<(?:[^<>;{}]|<(?:[^<>;{}]|<[^<>;{}]*>)*>)*>';
+const CPP_TYPE_NAME = `(?:::\\s*)?(?!(?:const|volatile|operator|return)\\b)[A-Za-z_]\\w*(?:\\s*${CPP_TYPE_ARGS})?(?:\\s*::\\s*[A-Za-z_]\\w*(?:\\s*${CPP_TYPE_ARGS})?)*`;
+const CPP_DECLARED_NAME = '(?:(?:::\\s*)?~?[A-Za-z_]\\w*(?:\\s*::\\s*~?[A-Za-z_]\\w*)*\\s*[(;=[{]|operator\\b)';
+const CPP_LEADING_ATTR_RE = new RegExp(
+  '(^[ \\t]*|\\]\\][ \\t]*)((?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\\s+)+)(?=' +
+    '(?:static|inline|virtual|explicit|constexpr|consteval|constinit|friend|extern|thread_local|mutable|' +
+    'typedef|using|template|typename|class|struct|union|enum|void|bool|char|char8_t|char16_t|char32_t|' +
+    'wchar_t|short|int|long|float|double|signed|unsigned|auto|decltype|return)\\b|\\[\\[|' +
+    // An out-of-line constructor or destructor: `Any::Impl_::Impl_(`, `Any::~Any(`.
+    '(?:[A-Za-z_]\\w*\\s*::\\s*)*([A-Za-z_]\\w*)\\s*::\\s*~?\\3\\s*\\(|' +
+    `(?:(?:const|volatile)\\s+)*${CPP_TYPE_NAME}(?:\\s*(?:const|volatile)\\b)?(?:\\s*[*&]+\\s*|\\s+)(?:(?:const|volatile)\\s+)?${CPP_DECLARED_NAME})`,
+  'gm'
+);
+export function blankCppLeadingAttributeMacros(source: string): string {
+  if (!/(?:^|\]\])[ \t]*[A-Z][A-Z0-9]*_[A-Z0-9_]*\s/m.test(source)) return source;
+  const code = maskCppCode(source);
+  const spans: Array<[number, number]> = [];
+  const re = new RegExp(CPP_LEADING_ATTR_RE.source, 'gm');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const start = m.index + (m[1] as string).length;
+    pushCppRunTokens(spans, m[2] as string, start);
+  }
+  return blankCppSpans(source, spans, code);
 }
 
 /**
@@ -489,7 +990,7 @@ export function blankMetalAttributes(source: string): string {
  * removed in full. The pipeline masks once, and individual paren blankers also
  * use this helper so they are safe when called directly.
  */
-function maskCppRawStrings(source: string): { source: string; restore: (blanked: string) => string } {
+export function maskCppRawStrings(source: string): { source: string; restore: (blanked: string) => string } {
   const unchanged = { source, restore: (blanked: string): string => blanked };
   if (source.indexOf('R"') === -1) return unchanged;
   // Skip comments and ordinary literals before looking for a raw opener. The
@@ -630,9 +1131,11 @@ export function blankCppAnnotationMacroCalls(source: string): string {
  *    continuation) — so an ALL-CAPS operand split onto its own line inside a
  *    multi-line expression (`int x =\n  SOME_CONST\n  | OTHER;`) is left
  *    alone; and
- *  - the NEXT non-blank line starts like a declaration/scope token
+ *  - the NEXT line of code starts like a declaration/scope token
  *    (letter, `_`, `#`, `{`, `}`, or `~`) or the file ends — an operator,
- *    string literal, or `;` continuation rejects the match.
+ *    string literal, or `;` continuation rejects the match. Comments in
+ *    between are skipped: {fmt}'s `FMT_BEGIN_EXPORT` sits above `// A
+ *    generic formatting context …` and then the class it opens.
  * Shared by C and C++ (the idiom is identical in both).
  */
 const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
@@ -651,19 +1154,44 @@ export function blankLoneMacroLines(source: string): string {
     if (!(m[1] as string).includes('_')) continue;
     let prev = i - 1;
     while (prev >= 0 && content(lines[prev] as string) === '') prev--;
-    if (prev >= 0 && LONE_MACRO_CONTINUATION_END_RE.test(content(lines[prev] as string))) continue;
-    let next = i + 1;
-    while (next < lines.length && content(lines[next] as string) === '') next++;
-    if (next < lines.length) {
-      const first = content(lines[next] as string)[0];
-      if (!first || !/[A-Za-z_#{}~]/.test(first)) continue;
-    }
+    // Judged on the line's code: a comment — `/// @sa https://…/meta/`, a
+    // block comment's `*/` — ends in whatever it likes but continues nothing,
+    // while `CURLE_TOO_LARGE, /* 100 */` continues with its comma. A template
+    // head (`template<typename T, typename... Args>`) before a declaration
+    // continues nothing either.
+    const prevText = prev >= 0 ? content(lines[prev] as string) : '';
+    const prevCode = /^(?:\/\/|\/\*|\*)/.test(prevText) ? '' : prevText.replace(/\/\*.*?\*\/|\/\/.*$/g, '').trim();
+    if (prevCode !== '' && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
+    const first = firstCodeCharAfter(lines, i + 1);
+    if (first !== undefined && !/[A-Za-z_#{}~]/.test(first)) continue;
     const start = line.indexOf(m[1] as string);
     lines[i] =
       line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
     changed = true;
   }
   return changed ? lines.join('\n') : source;
+}
+
+/** The first character of code at or after line `from`, past blank lines and
+ * comments; undefined at the end of the file. */
+function firstCodeCharAfter(lines: readonly string[], from: number): string | undefined {
+  let inBlock = false;
+  for (let k = from; k < lines.length; k++) {
+    let text = (lines[k] as string).trim();
+    for (;;) {
+      if (inBlock) {
+        const end = text.indexOf('*/');
+        if (end < 0) { text = ''; break; }
+        text = text.slice(end + 2).trim();
+        inBlock = false;
+      }
+      if (text.startsWith('//')) text = '';
+      else if (text.startsWith('/*')) { inBlock = true; text = text.slice(2); continue; }
+      break;
+    }
+    if (text !== '') return text[0];
+  }
+  return undefined;
 }
 
 /**
@@ -868,6 +1396,31 @@ function restoreDirectiveLines(original: string, blanked: string): string {
   return changed ? b.join('\n') : blanked;
 }
 
+/** Recover MSVC's COM alias only at type-definition sites. Match on a lexical
+ * mask so comments, literals and directives cannot supply declaration evidence;
+ * replace just the keyword, preserving source offsets on both parser arms. */
+function normalizeCppComInterfaces(source: string): string {
+  if (!source.includes('interface')) return source;
+  // Raw strings have already been masked by preParseCppSource.
+  let code = maskCppCommentsAndLiterals(source);
+  const hasAlias = /^[ \t]*#[ \t]*define[ \t]+interface[ \t]+struct\b/m.test(code);
+  code = code.replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, '\0'));
+  const declaration = /(^|[;{}])\s*\binterface\s+[A-Za-z_]\w*\s*(:[^;{}]+)?\{/gm;
+  const offsets: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = declaration.exec(code)) !== null) {
+    const bodyEnd = code.indexOf('}', declaration.lastIndex);
+    const hasVirtual = /\bvirtual\b/.test(code.slice(declaration.lastIndex, bodyEnd < 0 ? code.length : bodyEnd));
+    if (!hasAlias && !match[2] && !hasVirtual) continue;
+    offsets.push(match.index + match[0].indexOf('interface'));
+    declaration.lastIndex--; // allow the opening brace to start a nested declaration
+  }
+  for (const offset of offsets) {
+    source = source.slice(0, offset) + 'struct   ' + source.slice(offset + 9);
+  }
+  return source;
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
  * definitions, macro-prefixed function definitions, macro-prefixed members, and
  * macro-decorated members (Unreal-Engine reflection markup) — plus the non-C++
@@ -875,17 +1428,128 @@ function restoreDirectiveLines(original: string, blanked: string): string {
  * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
  * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving;
  * directive lines are restored at the end (see restoreDirectiveLines). */
+/**
+ * An access specifier spelled as a macro — nlohmann/json's
+ * `JSON_PRIVATE_UNLESS_TESTED:` (private, or public under test), Qt's
+ * `Q_SIGNALS:` — is rewritten to the keyword it stands for, padded to the
+ * same length. tree-sitter-cpp reads `NAME:` inside a class as an error, and
+ * json.hpp's recovery lost members around each one.
+ */
+const ACCESS_MACRO_LINE = /^([ \t]*)([A-Z][A-Z0-9]*_[A-Z0-9_]*)([ \t]*):(?!:)(?=[ \t]*(?:\/\/[^\n]*)?\r?$)/gm;
+export function rewriteCppAccessMacros(source: string): string {
+  if (!/_[A-Z0-9_]*[ \t]*:(?!:)/.test(source)) return source;
+  return source.replace(ACCESS_MACRO_LINE, (m, indent: string, name: string, gap: string) => {
+    const keyword = /PRIVATE/.test(name) ? 'private' : /PROTECTED/.test(name) ? 'protected'
+      : /PUBLIC|^Q_SIGNALS$|^Q_SLOTS$/.test(name) ? 'public' : null;
+    if (!keyword || keyword.length > name.length + gap.length) return m;
+    return `${indent}${keyword}${' '.repeat(name.length + gap.length - keyword.length)}:`;
+  });
+}
+
+/**
+ * A preprocessor conditional in the middle of a declaration or expression —
+ * inside a constructor's member-initializer list (nlohmann/json's
+ * `noexcept\n#ifdef JSON_NO_THREAD_LOCAL\n : m_okay(false)\n#else\n :
+ * m_okay(…)\n#endif`), between a template head and its function
+ * (`template <…>\n#if defined(JSON_HAS_CPP_14)\n constexpr\n#endif\n auto
+ * get()`), inside an argument list — is an error to tree-sitter-cpp, and
+ * json.hpp's recovery took the whole `basic_json` class with it. Where the
+ * code before the `#if` has not ended a statement or declaration (`;`, `{`,
+ * `}`, a label's `:`), its directives are blanked and so is every branch
+ * after the first: one consistent configuration, every newline and offset
+ * kept. A conditional between whole declarations is left alone.
+ */
+export function flattenMidStatementConditionals(source: string): string {
+  if (!source.includes('#')) return source;
+  const lines = source.split('\n');
+  const directive = (i: number) => /^[ \t]*#[ \t]*(\w+)/.exec(lines[i] ?? '')?.[1] ?? null;
+  const code = (i: number) => (lines[i] ?? '').replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '').trim();
+  let changed = false;
+  const blank = (i: number) => {
+    lines[i] = (lines[i] ?? '').replace(/[^\r]/g, ' ');
+    changed = true;
+  };
+  let lastCode = '';          // the last non-directive code line, trimmed
+  let inBlockComment = false;
+  let region = 0;             // #if depth inside a flattened conditional (0 = none)
+  let skipFrom = 0;           // the depth whose later branches are blanked (0 = none)
+  let continued = false;      // inside a `\`-continued directive (a multi-line #define)
+  for (let i = 0; i < lines.length; i++) {
+    if (continued) {
+      continued = /\\\s*$/.test(lines[i] ?? '');
+      continue;
+    }
+    const d = directive(i);
+    if (d !== null && !inBlockComment) {
+      // A directive continued with `\` spans lines; its body is not code.
+      if (/\\\s*$/.test(lines[i]!)) {
+        continued = true;
+        if (region === 0) continue;
+      }
+      const opens = /^if/.test(d);
+      if (region === 0) {
+        // Not after a statement macro written without its `;`
+        // (`RAPIDJSON_DIAG_OFF(padded)`), either.
+        const mid = opens && lastCode !== '' && !/[;{}]$|^[\w\s]*:$|\*\/$/.test(lastCode) &&
+          !/^(?:public|private|protected)\s*:$/.test(lastCode) && !/^[A-Z][A-Z0-9_]*(?:\s*\(.*\))?$/.test(lastCode);
+        if (!mid) continue;
+        region = 1;
+        blank(i);
+        continue;
+      }
+      if (opens) region++;
+      else if ((d === 'else' || d === 'elif') && skipFrom === 0) skipFrom = region;
+      else if (d === 'endif') {
+        if (skipFrom === region) skipFrom = 0;
+        region--;
+      }
+      if (/^(?:if|ifdef|ifndef|else|elif|elifdef|elifndef|endif)$/.test(d)) blank(i);
+      continue;
+    }
+    const text = lines[i] ?? '';
+    if (region > 0 && skipFrom > 0) {
+      if (text.trim() !== '') blank(i);
+      continue;
+    }
+    // Track block comments so a `#` or `;` inside one is not read as code.
+    const trimmed = code(i);
+    if (inBlockComment) {
+      if (text.includes('*/')) inBlockComment = false;
+      continue;
+    }
+    if (/\/\*(?!.*\*\/)/.test(text.replace(/\/\/.*$/, ''))) {
+      inBlockComment = true;
+      const before = trimmed.split('/*')[0]!.trim();
+      if (before !== '') lastCode = before;
+      continue;
+    }
+    if (trimmed !== '') lastCode = trimmed;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
 function preParseCppSource(source: string, filePath?: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = rawStrings.source;
+  source = flattenMidStatementConditionals(rewriteCppAccessMacros(rawStrings.source));
   // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
   // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
-  // it matches (the _API token is already spaces by then).
+  // it matches (the _API token is already spaces by then). The C++ leading
+  // blank runs after the pointer, trailing and declarator ones, so the
+  // declaration it looks for (`Type* name(`, `Type name;`) is already free of
+  // their macros.
   let blanked = blankLoneMacroLines(
-    blankCLeadingAttrMacros(
-      blankCppAnnotationMacroCalls(
-        blankCppInlineAnnotationMacros(
-          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+    blankCppLeadingAttributeMacros(
+      blankCLeadingAttrMacros(
+        blankCppAnnotationMacroCalls(
+          blankCppDeclaratorAttributeMacros(
+            blankCppTrailingAttributeMacros(
+              blankCppPointerAnnotationMacros(
+                blankCppInlineAnnotationMacros(
+                  blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(normalizeCppComInterfaces(source))))
+                )
+              )
+            )
+          )
         )
       )
     )
@@ -1685,6 +2349,16 @@ function preParseCSource(source: string): string {
   return rawStrings.restore(blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked)));
 }
 
+/** A constructor prototype carries defaults even when its body is in another file. */
+export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
+  if (node.type !== 'declaration' || getChildByField(node, 'type')) return false;
+  const owner = node.parent?.parent;
+  if (!owner || !['class_specifier', 'struct_specifier', 'union_specifier'].includes(owner.type)) return false;
+  const declarator = getChildByField(node, 'declarator');
+  return declarator?.type === 'function_declarator'
+    && getChildByField(declarator, 'declarator')?.text === getChildByField(owner, 'name')?.text;
+}
+
 export const cppExtractor: LanguageExtractor = {
   // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
   // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
@@ -1725,9 +2399,23 @@ export const cppExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  resolveName: extractCppQualifiedMethodName,
+  resolveName: (node, source) =>
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
+  // Constructors (definitions and class-body declarations) carry their
+  // parameter list as the signature; a trailing semicolon marks a prototype, so a local `T obj(args)` can be matched
+  // to the one overload with a compatible arity (#1839). Macro-shaped
+  // definitions whose real name was recovered from an argument are excluded:
+  // their "parameters" are macro arguments. Mirrored in the kernel.
+  getSignature: (node, source) => {
+    if ((node.type !== 'function_definition' && !isCppConstructorDeclaration(node)) || getChildByField(node, 'type')) return undefined;
+    if (recoverCppMacroDefinedName(node, source)) return undefined;
+    const declarator = getChildByField(node, 'declarator');
+    const parameters = declarator && getChildByField(declarator, 'parameters');
+    return parameters ? getNodeText(parameters, source) + (node.type === 'declaration' ? ';' : '') : undefined;
+  },
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;

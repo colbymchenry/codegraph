@@ -241,9 +241,6 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-
   constructor(lockPath: string) {
     this.lockPath = lockPath;
   }
@@ -257,18 +254,16 @@ export class FileLock {
       try {
         const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
         const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // A long sync can hold the lock for hours. Its age says nothing about
+        // whether the writer is still alive; only a dead PID is stale.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Stale lock (dead process or malformed PID) - remove it
         fs.unlinkSync(this.lockPath);
       } catch (err) {
         if (err instanceof Error && err.message.includes('locked by another')) {

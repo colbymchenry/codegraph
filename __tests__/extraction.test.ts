@@ -11,9 +11,10 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, shopifyThemeRoot } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
+import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
 
 beforeAll(async () => {
   await initGrammars();
@@ -31,6 +32,76 @@ function cleanupTempDir(dir: string): void {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('same-line node identity (#1349)', () => {
+  let dir: string;
+  let cg: CodeGraph | undefined;
+  let kernel: string | undefined;
+
+  beforeEach(() => {
+    dir = createTempDir();
+    kernel = process.env.CODEGRAPH_KERNEL;
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    cg = undefined;
+    cleanupTempDir(dir);
+    if (kernel === undefined) delete process.env.CODEGRAPH_KERNEL;
+    else process.env.CODEGRAPH_KERNEL = kernel;
+  });
+
+  it.each(['default', 'wasm'])('persists both accessors and their separate call edges (%s)', async (backend) => {
+    if (backend === 'wasm') process.env.CODEGRAPH_KERNEL = '0';
+    else delete process.env.CODEGRAPH_KERNEL;
+    fs.writeFileSync(path.join(dir, 'point.ts'), [
+      'function read() { return 1; } function write(v: number) {}',
+      'export class Point { /* é😀 */ get x() { return read(); } set x(v: number) { write(v); }',
+      '  get y() { return read(); }',
+      '  set y(v: number) { write(v); }',
+      '}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    cg.resolveReferences();
+    const nodes = cg.getNodesInFile('point.ts');
+    const x = nodes.filter((n) => n.name === 'x').sort((a, b) => a.startColumn - b.startColumn);
+    expect(x).toHaveLength(2);
+    expect(new Set(nodes.map((n) => n.id)).size).toBe(nodes.length);
+    expect(nodes.filter((n) => n.name === 'y')).toHaveLength(2);
+    expect(x[0]!.id).toBe(generateNodeId('point.ts', 'method', 'x', 2));
+    expect(x[1]!.id).toBe(`${x[0]!.id}:${x[1]!.startColumn}`);
+    const cls = nodes.find((n) => n.name === 'Point')!;
+    for (const accessor of x) {
+      expect(cg.getIncomingEdges(accessor.id)).toContainEqual(expect.objectContaining({ source: cls.id, kind: 'contains' }));
+    }
+    expect(cg.getCallees(x[0]!.id).map((c) => c.node.name)).toEqual(['read']);
+    expect(cg.getCallees(x[1]!.id).map((c) => c.node.name)).toEqual(['write']);
+    for (const node of nodes.filter((n) => n.name !== 'x' && n.kind !== 'file')) {
+      expect(node.id).toBe(generateNodeId(node.filePath, node.kind, node.name, node.startLine));
+    }
+  });
+
+  it.each([
+    ['template.liquid', 'é😀 {% render "x" %}{% render "x" %}{% assign v = 1 %}{% assign v = 2 %}', 'component'],
+    ['Service.cfc', '<cfcomponent><!--- é😀 ---><cffunction name="x"></cffunction><cffunction name="x"></cffunction></cfcomponent>', 'method'],
+  ] as const)('persists repeated same-line declarations in %s', async (file, source, kind) => {
+    fs.writeFileSync(path.join(dir, file), source);
+    cg = CodeGraph.initSync(dir, { config: { include: [file], exclude: [] } });
+    await cg.indexAll();
+    const nodes = cg.getNodesInFile(file);
+    const xs = nodes.filter((n) => n.name === 'x' && n.kind === kind);
+    expect(xs).toHaveLength(2);
+    expect(new Set(xs.map((n) => n.id)).size).toBe(2);
+    for (const node of xs) {
+      expect(cg.getIncomingEdges(node.id).some((e) => e.kind === 'contains')).toBe(true);
+    }
+    if (file.endsWith('.liquid')) {
+      expect(nodes.filter((n) => n.kind === 'import' && n.name === 'x')).toHaveLength(2);
+      expect(nodes.filter((n) => n.name === 'v')).toHaveLength(2);
+    }
+  });
+});
 
 describe('Language Detection', () => {
   it('should detect TypeScript files', () => {
@@ -1109,7 +1180,7 @@ export const exported = { handler: () => target() };
       return result.unresolvedReferences
         .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
         .map((u) => byId.get(u.fromNodeId))
-        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .map((n) => (n ? `${n.kind}:${n.qualifiedName}` : '?'))
         .sort();
     };
 
@@ -1120,16 +1191,54 @@ export const exported = { handler: () => target() };
     });
 
     it('a non-exported object literal contributes calls (it was skipped outright)', () => {
-      // `exported`'s members are minted as their own function nodes, so its
-      // arrow's call comes from `handler`; the non-exported ones attribute to
-      // the declared constant.
+      // A named literal's function members are its own nodes, exported or not
+      // (#2300), so each arrow's call comes from its `handler`; the literal's
+      // eager value and the array's arrow attribute to the declared constant.
       expect(callersOf('target')).toEqual([
         'constant:list',
         'constant:obj',
-        'constant:obj',
-        'function:handler',
+        'function:exported::handler',
+        'function:obj::handler',
       ]);
     });
+  });
+
+  // A destructuring declaration mints no symbol, so its initializer was never
+  // walked at module scope: `const { a } = useFoo(1)` recorded no call at all,
+  // where the same line inside a function did (#2340).
+  it.each(['ts', 'tsx', 'js', 'jsx'])('records the calls of a module-scope destructuring declaration (%s, #2340)', (ext) => {
+    const code = [
+      'const { a } = useFoo(1)',
+      'let [b, c] = pair()',
+      'var { d: { e } } = nested()',
+      'const { f = fallback() } = withDefault()',
+      'const [g = other(), ...rest] = list()',
+      'export const { h } = exported()',
+      'const { i } = await load(() => inArrow())',
+      'export function probe() { const { j } = inner(); return j }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(`app.${ext}`, code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${byId.get(r.fromNodeId)?.kind}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'file:exported@6',
+      'file:fallback@4',
+      'file:inArrow@7',
+      'file:list@5',
+      'file:load@7',
+      'file:nested@3',
+      'file:other@5',
+      'file:pair@2',
+      'file:useFoo@1',
+      'file:withDefault@4',
+      'function:inner@8', // inside a function: the function's, as before
+    ]);
+    // Still no symbol for a destructured binding.
+    expect(result.nodes.filter((n) => n.kind === 'constant' || n.kind === 'variable')).toEqual([]);
   });
 });
 
@@ -4001,6 +4110,52 @@ enum class EDenseMode : uint8
     });
   });
 
+  describe('C/C++ single-argument function macros (#1373)', () => {
+    it.each(['c', 'cpp'] as const)('recovers single-argument function macros in %s (#1373)', (language) => {
+      const code = '#define NATIVE_FN(name) int name(void)\n'
+        + 'NATIVE_FN(get_version) { return helper(); }\n'
+        + 'int use_it(void) { return get_version(); }\n';
+      const result = extractFromSource(`main.${language}`, code, language);
+      const functions = result.nodes.filter((n) => n.kind === 'function');
+      expect(functions.map((n) => n.name)).toEqual(['get_version', 'use_it']);
+      expect(functions[0]).toMatchObject({ qualifiedName: 'get_version', startLine: 2, endLine: 2, startColumn: 0 });
+      expect(result.unresolvedReferences).toEqual(expect.arrayContaining([
+        expect.objectContaining({ fromNodeId: functions[0].id, referenceName: 'helper', referenceKind: 'calls' }),
+        expect.objectContaining({ fromNodeId: functions[1].id, referenceName: 'get_version', referenceKind: 'calls' }),
+      ]));
+    });
+
+    it.each(['c', 'cpp'] as const)('does not guess single-argument macro names in %s (#1373)', (language) => {
+      for (const prefix of [
+        '',
+        '// #define NATIVE_FN(name) int name(void)\n',
+        '#define NATIVE_FN(name) int fixed(name)\n',
+        '#define NATIVE_FN(name) int test_ ## name(void)\n',
+        '#define NATIVE_FN(name) register_test(name)\n',
+        '#define NATIVE_FN(name) typedef int name(void)\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN int\n',
+        '#define NATIVE_FN(name) int name(void)\n#ifdef OTHER\n#undef NATIVE_FN\n#endif\n',
+        '#define NATIVE_FN(name) int name(void)\n#undef NATIVE_FN\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN(name) int fixed(name)\n',
+      ]) {
+        const result = extractFromSource(`main.${language}`, prefix + 'NATIVE_FN(candidate) { return 1; }\n', language);
+        expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      }
+      const alternate = extractFromSource(`main.${language}`, [
+        '#ifdef OTHER', '#define NATIVE_FN(name) int name(void)', '#else',
+        'NATIVE_FN(candidate) { return 1; }', '#endif', '',
+      ].join('\n'), language);
+      expect(alternate.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      const ordinary = extractFromSource(`main.${language}`, 'int (parenthesized)(void) { return 1; }\n', language);
+      expect(ordinary.nodes.find((n) => n.kind === 'function')?.name).toBe('(parenthesized)');
+      if (language === 'c') {
+        const knr = extractFromSource('knr.c', 'int old_style(arg) int arg; { return arg; }\n', 'c');
+        expect(knr.nodes.find((n) => n.kind === 'function')?.name).toBe('old_style');
+      }
+    });
+
+  });
+
   describe('CUDA extraction (#387)', () => {
     // CUDA parses with the C++ grammar. Three CUDA-only shapes misparse:
     // execution-space specifiers (`__global__ void f(…)`) shunt the real return
@@ -4416,7 +4571,7 @@ class APXCharacter {  // the one real definition
 
       const scala = extractFromSource('M.scala', 'trait Marker\ncase object Red\nclass Foo\n');
       const scalaNames = scala.nodes
-        .filter((n) => ['class', 'trait', 'interface'].includes(n.kind))
+        .filter((n) => ['class', 'trait', 'interface', 'module'].includes(n.kind))
         .map((n) => n.name);
       expect(scalaNames).toEqual(expect.arrayContaining(['Marker', 'Red', 'Foo']));
     });
@@ -4865,6 +5020,13 @@ CPPType* ApiHelper<CType,
       expect(instNames('Widget w{1, 2};')).toEqual(['Widget']);
     });
 
+    it('records constructor defaults and array element arities (#1839)', () => {
+      const result = extractFromSource('f.cpp', 'struct Widget { Widget(int x = 1); };\nvoid run() { Widget a[2]; Widget b[3]{{2}, {3}}; }');
+      expect(result.nodes.find((n) => n.kind === 'method')?.signature).toBe('(int x = 1);');
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName))
+        .toEqual(['Widget::Widget/0', 'Widget::Widget/1', 'Widget::Widget/1', 'Widget::Widget/0']);
+    });
+
     it('strips template args and namespace to the bare class name', () => {
       // `std::vector<int> v(10)` → `vector`; `ns::Widget w(0)` → `Widget`.
       expect(instNames('std::vector<int> v(10);')).toEqual(['vector']);
@@ -5058,6 +5220,121 @@ import 'package:flutter/material.dart';
       const importNode = result.nodes.find((n) => n.kind === 'import');
       expect(importNode).toBeDefined();
       expect(importNode?.name).toBe('price');
+    });
+
+    /* Inside a {% liquid %} tag, each body line is a tag with no braces of
+       its own. Patterns anchored on `{%` miss these references. */
+    it('should extract render inside a {% liquid %} block', () => {
+      const code = [
+        '{% liquid',
+        '  assign heading = section.settings.title',
+        "  render 'card', title: heading",
+        '%}',
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('should extract assign inside a {% liquid %} block', () => {
+      const code = ['{% liquid', '  assign heading = section.settings.title', '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('heading');
+    });
+
+    it('should extract section inside a {% liquid %} block', () => {
+      const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
+      const result = extractFromSource('layout/theme.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('header');
+    });
+
+    it('should report the real line number for a tag inside a {% liquid %} block', () => {
+      const code = ['<div>', '{% liquid', '  assign x = 1', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const card = result.nodes.find((n) => n.kind === 'import' && n.name === 'card');
+      expect(card?.startLine).toBe(4);
+    });
+
+    it('should not count a tag twice when both spellings appear', () => {
+      const code = ["{% render 'card' %}", '{% liquid', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const cards = result.nodes.filter((n) => n.kind === 'import' && n.name === 'card');
+      expect(cards.length).toBe(2);
+      expect(new Set(cards.map((n) => n.startLine)).size).toBe(2);
+    });
+
+    it('should not read a bare `render` outside a {% liquid %} block as a tag', () => {
+      // Prose and filters mentioning the word must not become references.
+      const code = ['<p>We render the card below.</p>', "{{ product | render_as: 'card' }}"].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).not.toContain('card');
+    });
+
+    it('should handle whitespace control on the {% liquid %} tag itself', () => {
+      const code = ['{%- liquid', "  render 'card'", '-%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('does not scan tag-like strings or inline comments twice', () => {
+      const code = [
+        `{% assign example = "{% render 'ghost'" %}`,
+        `{% # {% render 'ghost' %}`,
+        '{% liquid', `  assign example = "{% include 'ghost'"`,
+        "  # section 'ghost'", "  echo 'render ghost'", '%}',
+        "{% liquid render 'live' %}", "{% liquid include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => [n.name, n.startLine, n.startColumn]))
+        .toEqual([['live', 8, 10], ['after', 9, 10]]);
+      expect(result.unresolvedReferences.map((r) => r.referenceName))
+        .toEqual(['snippets/live.liquid', 'snippets/after.liquid']);
+    });
+
+    it.each(['\n', '\r\n'])('preserves Liquid block positions with %j line endings', (newline) => {
+      const code = [
+        '<div>', '{%- liquid', "  assign heading = 'x'", "\tinclude 'legacy'",
+        "  render 'card'", "  section 'footer'", '-%}', "  {% render 'after' %}",
+      ].join(newline);
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable' || n.kind === 'import')
+        .map((n) => [n.name, n.startLine, n.startColumn, n.endColumn]).sort())
+        .toEqual([
+          ['after', 8, 2, 19], ['card', 5, 2, 15], ['footer', 6, 2, 18],
+          ['heading', 3, 2, 18], ['legacy', 4, 1, 17],
+        ]);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]).sort())
+        .toEqual([
+          ['sections/footer.liquid', 6, 2], ['snippets/after.liquid', 8, 2],
+          ['snippets/card.liquid', 5, 2], ['snippets/legacy.liquid', 4, 1],
+        ]);
+    });
+
+    it.each(['comment', 'raw'])('ignores %s regions in both tag spellings', (tag) => {
+      const code = [
+        `{%- ${tag} -%}`, "{% render 'ghost' %}", "{% include 'ghost' %}",
+        "{% section 'ghost' %}", '{% assign ghost = 1 %}',
+        '{% liquid', "  render 'ghost'", '%}', `{%- end${tag} -%}`,
+        '{% liquid', `  ${tag}`, "  render 'ghost'", "  include 'ghost'",
+        "  section 'ghost'", '  assign ghost = 1', `  end${tag}`,
+        "  # render 'ghost'", "  render 'live'", '%}', "{% include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind !== 'file').map((n) => n.name))
+        .toEqual(['live', 'live', 'after', 'after']);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line]))
+        .toEqual([['snippets/live.liquid', 18], ['snippets/after.liquid', 20]]);
     });
 
     it('should extract multiple imports', () => {
@@ -5705,6 +5982,89 @@ end`;
 
     const components = result.nodes.filter((n) => n.kind === 'component');
     expect(components.length).toBe(2);
+  });
+
+  describe('component source ranges (#1350)', () => {
+    let tempDir: string;
+    let cg: CodeGraph | undefined;
+
+    beforeEach(() => {
+      tempDir = createTempDir();
+    });
+
+    afterEach(() => {
+      cg?.close();
+      cg = undefined;
+      cleanupTempDir(tempDir);
+    });
+
+    it.each(['dfm', 'fmx'])('persists complete nested %s bodies and retrieves event bindings', async (extension) => {
+      const source = `inherited Form1: TForm1
+  inline Frame1: TFrame
+    object Button1: TButton
+      Caption = 'Click'
+      Items.Strings = (
+        'First'
+        'Second')
+      Panels = <
+        item
+          Width = 100
+        end
+        item
+          Width = 200
+        end>
+      OnClick = Button1Click
+    end
+    OnEnter = FrameEnter
+  end
+  object Label1: TLabel
+    Caption = 'Sibling'
+  end
+end`;
+      const fileName = `Form1.${extension}`;
+      fs.writeFileSync(path.join(tempDir, fileName), source);
+      cg = CodeGraph.initSync(tempDir);
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+
+      const nodes = cg.getNodesInFile(fileName);
+      const components = nodes.filter((node) => node.kind === 'component');
+      expect(components.map(({ name, startLine, endLine, endColumn }) => ({
+        name, startLine, endLine, endColumn,
+      }))).toEqual(expect.arrayContaining([
+        { name: 'Form1', startLine: 1, endLine: 22, endColumn: 3 },
+        { name: 'Frame1', startLine: 2, endLine: 18, endColumn: 5 },
+        { name: 'Button1', startLine: 3, endLine: 16, endColumn: 7 },
+        { name: 'Label1', startLine: 19, endLine: 21, endColumn: 5 },
+      ]));
+      expect(components).toHaveLength(4);
+
+      const extracted = extractFromSource(fileName, source);
+      const file = extracted.nodes.find((node) => node.kind === 'file')!;
+      const form = components.find((node) => node.name === 'Form1')!;
+      const frame = components.find((node) => node.name === 'Frame1')!;
+      const button = components.find((node) => node.name === 'Button1')!;
+      const label = components.find((node) => node.name === 'Label1')!;
+      for (const [parent, child] of [[file, form], [form, frame], [frame, button], [form, label]]) {
+        expect(extracted.edges).toContainEqual({ source: parent!.id, target: child!.id, kind: 'contains' });
+      }
+      expect(extracted.unresolvedReferences).toEqual([
+        expect.objectContaining({ fromNodeId: button.id, referenceName: 'Button1Click' }),
+        expect.objectContaining({ fromNodeId: frame.id, referenceName: 'FrameEnter' }),
+      ]);
+      expect(file.endLine).toBe(22);
+
+      const { ToolHandler } = await import('../src/mcp/tools');
+      const handler = new ToolHandler(cg);
+      for (const [tool, args] of [
+        ['codegraph_node', { symbol: 'Button1', includeCode: true }],
+        ['codegraph_explore', { query: 'Button1' }],
+      ] as const) {
+        const result = await handler.execute(tool, args);
+        expect(result.isError).toBeUndefined();
+        expect(result.content[0]!.text).toContain("Caption = 'Click'");
+        expect(result.content[0]!.text).toContain('OnClick = Button1Click');
+      }
+    });
   });
 
   describe('Full fixture: MainForm.dfm', () => {
@@ -7038,12 +7398,38 @@ describe('Liquid Shopify JSON template section resolution', () => {
     if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('resolves Liquid block snippets and sections without linking commented references', async () => {
+    for (const dir of ['sections', 'snippets', 'layout']) fs.mkdirSync(path.join(tempDir, dir));
+    for (const file of ['snippets/card.liquid', 'snippets/legacy.liquid', 'snippets/ghost.liquid', 'sections/footer.liquid']) {
+      fs.writeFileSync(path.join(tempDir, file), '<div>content</div>');
+    }
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), [
+      '{% liquid', "  assign heading = 'x'", "  render 'card'", "  include 'legacy'",
+      "  section 'footer'", '  comment', "  render 'ghost'", '  endcomment', '%}',
+      '{% raw %}', "{% render 'ghost' %}", '{% endraw %}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    for (const name of ['card', 'legacy', 'footer', 'ghost']) {
+      const file = cg.getNodesByKind('file').find((n) => n.name === `${name}.liquid`)!;
+      expect(file).toBeDefined();
+      expect(cg.getFileDependents(file.filePath).some((p) => p.endsWith('layout/theme.liquid')))
+        .toBe(name !== 'ghost');
+    }
+    expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
+  });
+
   it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
     // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
     // a `{% section %}` Liquid tag — so a section used only from a JSON template
     // looked unused. The JSON is now indexed and its `type`s linked.
     fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
     fs.mkdirSync(path.join(tempDir, 'templates/customers'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'layout'), { recursive: true });
+    // Every Shopify theme has layout/theme.liquid beside templates/ and sections/.
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
     fs.writeFileSync(path.join(tempDir, 'sections/main-login.liquid'), `<form>{{ 'customer.login' | t }}</form>\n`);
     fs.writeFileSync(path.join(tempDir, 'templates/product.json'), JSON.stringify({ sections: { main: { type: 'main-product' } }, order: ['main'] }));
@@ -7060,6 +7446,238 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(login, 'main-login section').toBeDefined();
     expect(cg.getFileDependents(product!.filePath).some((p) => p.endsWith('templates/product.json')), 'top-level JSON template links its section').toBe(true);
     expect(cg.getFileDependents(login!.filePath).some((p) => p.endsWith('customers/login.json')), 'nested JSON template links its section').toBe(true);
+  });
+
+  const jsonTemplate = (type: string): string => JSON.stringify({ sections: { main: { type } }, order: ['main'] });
+  const indexedJson = (): string[] =>
+    cg.getNodesByKind('file').map((n) => n.filePath).filter((p) => p.endsWith('.json')).sort();
+
+  it('leaves JSON under templates/ or sections/ out when no Shopify theme holds it', async () => {
+    // jasontaylordev/CleanArchitecture ships a .NET project template under
+    // templates/, and a CMS keeps its content under sections/: JSON in folders
+    // with those names, but nothing beside them makes a Shopify theme, so it is
+    // not Liquid — even when a Liquid file is named like one of its "types".
+    fs.mkdirSync(path.join(tempDir, 'templates/ca-use-case/.template.config'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/dotnetcli.host.json'), JSON.stringify({ symbolInfo: { UseCase: { longName: 'name' } } }));
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/template.json'), JSON.stringify({ identity: 'CleanArchitecture.UseCase', sections: { main: { type: 'hero' } } }));
+    fs.writeFileSync(path.join(tempDir, 'sections/home.json'), jsonTemplate('hero'));
+    fs.writeFileSync(path.join(tempDir, 'sections/hero.liquid'), `<h1>{{ page.title }}</h1>\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual([]);
+    const hero = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/hero.liquid'));
+    expect(hero, 'the Liquid file itself is still indexed').toBeDefined();
+    expect(cg.getFileDependents(hero!.filePath)).toEqual([]);
+  });
+
+  it('finds a Shopify theme in a subdirectory by its config/settings_schema.json', async () => {
+    // A theme under theme/ with no layout/theme.liquid committed: its settings
+    // schema marks it. The same JSON under tools/templates/ is in no theme.
+    for (const dir of ['theme/config', 'theme/sections', 'theme/templates', 'tools/templates']) {
+      fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(tempDir, 'theme/config/settings_schema.json'), JSON.stringify([{ name: 'theme_info' }]));
+    fs.writeFileSync(path.join(tempDir, 'theme/sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'theme/templates/product.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'tools/templates/product.json'), jsonTemplate('main-product'));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual(['theme/templates/product.json']);
+    expect(cg.getFileDependents('theme/sections/main-product.liquid')).toEqual(['theme/templates/product.json']);
+    // Extracting without storing tells them apart the same way.
+    const refsOf = (file: string) => cg.extractFromSource(file, jsonTemplate('main-product')).unresolvedReferences.map((r) => r.referenceName);
+    expect(refsOf('theme/templates/product.json')).toEqual(['sections/main-product.liquid']);
+    expect(refsOf('tools/templates/product.json')).toEqual([]);
+  });
+
+  it('drops JSON templates once their folder is no longer a theme, and takes them back when it is', async () => {
+    // The same path an index built before this check takes: JSON it stored as
+    // Liquid outside any theme leaves on the next sync, without a re-index.
+    for (const dir of ['layout', 'sections', 'templates']) fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/page.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), jsonTemplate('main-product'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+
+    fs.rmSync(path.join(tempDir, 'layout'), { recursive: true, force: true });
+    // A sync of only the reported paths (the watcher's) and a full sync agree.
+    await cg.sync({ paths: ['templates/product.json'] });
+    expect(indexedJson()).toEqual(['templates/page.json']);
+    await cg.sync();
+    expect(indexedJson()).toEqual([]);
+
+    fs.mkdirSync(path.join(tempDir, 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'config/settings_schema.json'), '[]');
+    await cg.sync();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+  });
+
+  it('reads JSON under templates/ or sections/ as Liquid only inside a theme under the project root', () => {
+    fs.mkdirSync(path.join(tempDir, 'shop/layout'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'shop/layout/theme.liquid'), '');
+
+    for (const file of ['shop/templates/product.json', 'shop/templates/customers/login.json', 'shop/sections/header-group.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(true);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('liquid');
+      // Without the project root there is no theme to look for.
+      expect(isSourceFile(file), file).toBe(false);
+      expect(detectLanguage(file), file).toBe('unknown');
+    }
+    // Beside the theme, not in it; and the theme's other JSON was never a template.
+    for (const file of ['templates/product.json', 'other/sections/header-group.json', 'shop/config/settings_data.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(false);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('unknown');
+    }
+    // Outside a theme, JSON gets whatever the project maps `.json` to, as any other JSON does.
+    expect(detectLanguage('templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('yaml');
+    expect(detectLanguage('shop/templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('liquid');
+  });
+
+  const writeFiles = (files: Record<string, string>, root = tempDir): void => {
+    for (const [file, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+  };
+  // A theme at the project root, a theme in a folder marked only by its settings
+  // schema, and one in a folder with no 404 section and no price snippet of its
+  // own — the shape of panoply/syncify's example themes.
+  const severalThemes = {
+    'layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'sections/header.liquid': `{% render 'price' %}\n`,
+    'sections/main.liquid': `<main></main>\n`,
+    'snippets/price.liquid': `{{ product.price | money }}\n`,
+    'straps/dusk/config/settings_schema.json': '[]',
+    'straps/dusk/sections/404.liquid': `<h1>{{ 'templates.404.title' | t }}</h1>\n`,
+    'straps/dusk/templates/404.json': jsonTemplate('404'),
+    'examples/tailwind/layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'examples/tailwind/sections/header.liquid': `{% liquid\n  render 'price'\n  render 'icon'\n%}\n`,
+    'examples/tailwind/sections/main.liquid': `<main class="p-4"></main>\n`,
+    'examples/tailwind/snippets/icon.liquid': `<svg></svg>\n`,
+    'examples/tailwind/templates/index.json': jsonTemplate('main'),
+    'examples/tailwind/templates/404.json': jsonTemplate('404'),
+    // Liquid in no theme: an app's theme extension.
+    'extensions/reviews/blocks/stars.liquid': `{% render 'star' %}\n`,
+    'extensions/reviews/snippets/star.liquid': `<svg></svg>\n`,
+  };
+
+  it("links a theme's sections and snippets only inside that theme", async () => {
+    // Shopify looks a `{% render %}`, a `{% section %}` or a JSON template's
+    // section `type` up in the theme the file belongs to, never in another one.
+    // Matched by path tail, a theme without the 404 section linked to another
+    // theme's, and a theme in a folder even linked the project root's
+    // sections/header.liquid over its own.
+    writeFiles(severalThemes);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('straps/dusk/templates/404.json')).toEqual(['straps/dusk/sections/404.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header.liquid']);
+    expect(linksOf('examples/tailwind/templates/index.json')).toEqual(['examples/tailwind/sections/main.liquid']);
+    // What the theme lacks stays unlinked: no other theme's 404 section or price snippet.
+    expect(linksOf('examples/tailwind/templates/404.json')).toEqual([]);
+    expect(linksOf('examples/tailwind/sections/header.liquid')).toEqual(['examples/tailwind/snippets/icon.liquid']);
+    // Outside any theme, a path still resolves as before.
+    expect(linksOf('extensions/reviews/blocks/stars.liquid')).toEqual(['extensions/reviews/snippets/star.liquid']);
+  });
+
+  it("keeps a theme's references inside it when its own section is deleted", async () => {
+    // Sync resolves again what named a deleted file; another theme's 404
+    // section is no stand-in for the theme's own.
+    writeFiles({ ...severalThemes, 'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n` });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual(['examples/tailwind/sections/404.liquid']);
+
+    fs.rmSync(path.join(tempDir, 'examples/tailwind/sections/404.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual([]);
+  });
+
+  it('links a section or snippet that appears after the files naming it', async () => {
+    // Sync retries a reference it could not resolve once a file it may name
+    // appears. A section or snippet reference was parked under its extension,
+    // `liquid`, which no file is named, so it stayed unlinked until the file
+    // naming it changed or the project was indexed again.
+    const later: Record<string, string> = {
+      'sections/404.liquid': `<h1>404</h1>\n`,
+      'snippets/price.liquid': severalThemes['snippets/price.liquid'],
+      // Only straps/dusk had a 404 section, which is no stand-in for this theme's own.
+      'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n`,
+      'extensions/reviews/snippets/star.liquid': severalThemes['extensions/reviews/snippets/star.liquid'],
+    };
+    const initial = Object.fromEntries(Object.entries(severalThemes).filter(([file]) => !(file in later)));
+    writeFiles({ ...initial, 'templates/404.json': jsonTemplate('404') });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
+      'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
+    const links = (graph = cg) => Object.fromEntries(naming.map((file) => [file, graph.getFileDependencies(file).sort()]));
+    expect(links()).toEqual({
+      'templates/404.json': [],
+      'sections/header.liquid': [],
+      'examples/tailwind/templates/404.json': [],
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': [],
+    });
+
+    writeFiles(later);
+    expect((await cg.sync()).filesAdded).toBe(4);
+    const synced = links();
+    expect(synced).toEqual({
+      'templates/404.json': ['sections/404.liquid'],
+      'sections/header.liquid': ['snippets/price.liquid'],
+      'examples/tailwind/templates/404.json': ['examples/tailwind/sections/404.liquid'],
+      // The root theme's new price snippet is not this theme's.
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    // A fresh index of the same files links the same. (Indexing again over
+    // this index would skip the unchanged files that name the new ones.)
+    const freshDir = createTempDir();
+    writeFiles({ ...severalThemes, 'templates/404.json': jsonTemplate('404'), ...later }, freshDir);
+    const fresh = CodeGraph.initSync(freshDir);
+    try {
+      await fresh.indexAll();
+      expect(links(fresh)).toEqual(synced);
+    } finally {
+      fresh.close();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // A deleted snippet's references wait for it the same way.
+    fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual([]);
+    writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  it('finds the theme a file is in from the theme folder it sits in', () => {
+    const markers = new Set(['layout/theme.liquid', 'examples/tailwind/config/settings_schema.json']);
+    const exists = (relativePath: string): boolean => markers.has(relativePath);
+    expect(shopifyThemeRoot('sections/header.liquid', exists)).toBe('');
+    expect(shopifyThemeRoot('templates/customers/login.json', exists)).toBe('');
+    expect(shopifyThemeRoot('examples/tailwind/snippets/icon.liquid', exists)).toBe('examples/tailwind');
+    // A copy kept elsewhere under the root theme is not part of it, nor is a file beside its folders.
+    expect(shopifyThemeRoot('vendor/legacy/snippets/icon.liquid', exists)).toBeUndefined();
+    expect(shopifyThemeRoot('theme.liquid', exists)).toBeUndefined();
   });
 });
 
@@ -8248,6 +8866,29 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('scratch/tmp.ts')).toBe(true);
   });
 
+  it('filesystem fallback retains git info/exclude and core.excludesFile when ls-files fails (#1959)', async () => {
+    const { execFileSync } = await import('child_process');
+    const root = path.join(tempDir, 'fallback-excludes-root');
+    fs.mkdirSync(root, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'pipe' });
+    const globalExcludes = path.join(tempDir, 'fallback-global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    execFileSync('git', ['config', 'core.excludesFile', globalExcludes], { cwd: root, stdio: 'pipe' });
+    fs.writeFileSync(path.join(root, '.git', 'info', 'exclude'), 'worktrees/\n');
+    fs.mkdirSync(path.join(root, 'scratch'));
+    fs.mkdirSync(path.join(root, 'worktrees'));
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const app = 1;\n');
+    fs.writeFileSync(path.join(root, 'scratch', 'hidden.ts'), 'export const hidden = 1;\n');
+    fs.writeFileSync(path.join(root, 'worktrees', 'hidden.ts'), 'export const hidden = 2;\n');
+
+    // rev-parse/config still work, but both ls-files and status fail as they
+    // would under a Git timeout. This exercises the real filesystem walk.
+    fs.writeFileSync(path.join(root, '.git', 'index'), 'not a git index');
+    expect(() => execFileSync('git', ['ls-files'], { cwd: root, stdio: 'pipe' })).toThrow();
+    expect(scanDirectory(root)).toEqual(['app.ts']);
+    expect(await scanDirectoryAsync(root)).toEqual(['app.ts']);
+  });
+
   it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
     const { execFileSync } = await import('child_process');
     const git = (cwd: string, ...args: string[]) =>
@@ -8269,6 +8910,117 @@ describe('Nested non-submodule git repos', () => {
     expect(scope.ignores('pkg/app.ts')).toBe(false);
     expect(scope.ignores('pkg/build/')).toBe(true);
     expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
+
+  it.each(['filesystem', 'untracked', 'tracked'])(
+    'keeps Java packages named build while excluding build output (%s, #1642)',
+    async (mode) => {
+      const sources = ['', 'module/'].flatMap((prefix) => ['main', 'test'].flatMap((sourceSet) => [
+        `${prefix}src/${sourceSet}/java/com/acme/build/RealtimePlusService.java`,
+        `${prefix}src/${sourceSet}/java/build/nested/build/Example.java`,
+      ]).concat([
+        `${prefix}src/androidTest/java/com/acme/build/DeviceProbe.java`,
+        `${prefix}src/main/kotlin/com/acme/build/KotlinProbe.kt`,
+        `${prefix}src/test/scala/com/acme/build/ScalaProbe.scala`,
+      ]));
+      const ignored = [
+        'build/generated/Generated.java',
+        'module/build/generated/Generated.java',
+        'build/src/main/java/com/build/Generated.java',
+        'module/build/src/test/java/build/Generated.java',
+        'src/main/resources/build/Generated.java',
+        'node_modules/pkg/src/main/java/com/build/Generated.java',
+        'target/src/test/java/com/build/Generated.java',
+        ...['src/main/java/com/build/', 'module/src/test/java/build/'].flatMap((prefix) => [
+          `${prefix}node_modules/pkg/a.js`,
+          `${prefix}target/A.java`,
+          `${prefix}target/build/A.java`,
+          `${prefix}dist/A.java`,
+          `${prefix}vendor/A.java`,
+          `${prefix}cmake-build-debug/A.java`,
+          `${prefix}res/layout/A.xml`,
+        ]),
+      ];
+      for (const rel of [...sources, ...ignored]) {
+        const abs = path.join(tempDir, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'class Example {}\n');
+      }
+      if (mode !== 'filesystem') {
+        execFileSync('git', ['init', '-q'], { cwd: tempDir });
+        if (mode === 'tracked') execFileSync('git', ['add', '-f', '.'], { cwd: tempDir });
+      }
+
+      const defaults = buildDefaultIgnore(tempDir);
+      const scope = buildScopeIgnore(tempDir);
+      const files = scanDirectory(tempDir);
+      expect(await scanDirectoryAsync(tempDir)).toEqual(files);
+      for (const rel of sources) {
+        expect(defaults.ignores(rel), rel).toBe(false);
+        expect(scope.ignores(rel), rel).toBe(false);
+        // The watcher and filesystem walker must be able to reach each file.
+        const parts = rel.split('/');
+        for (let i = 1; i < parts.length; i++) {
+          expect(scope.ignores(parts.slice(0, i).join('/') + '/'), rel).toBe(false);
+        }
+        expect(files).toContain(rel);
+      }
+      for (const rel of ignored) {
+        expect(defaults.ignores(rel), rel).toBe(true);
+        expect(scope.ignores(rel), rel).toBe(true);
+        expect(files).not.toContain(rel);
+      }
+    },
+  );
+
+  it.each(['.gitignore', 'codegraph.json', 'src/main/java/.gitignore'])(
+    'lets explicit %s rules exclude a Java package named build (#1642)',
+    (ignoreFile) => {
+      const sourceFile = 'src/main/java/com/acme/build/Hidden.java';
+      const abs = path.join(tempDir, sourceFile);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'class Hidden {}\n');
+      execFileSync('git', ['init', '-q'], { cwd: tempDir });
+      fs.writeFileSync(path.join(tempDir, ignoreFile), ignoreFile === 'codegraph.json'
+        ? JSON.stringify({ exclude: ['src/main/java/**/build/'] })
+        : 'build/\n');
+
+      expect(buildScopeIgnore(tempDir).ignores(sourceFile)).toBe(true);
+      expect(scanDirectory(tempDir)).not.toContain(sourceFile);
+    },
+  );
+
+  it('retrieves and syncs indexed Java packages named build (#1642)', async () => {
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const sourceFile = 'src/main/java/com/ctrip/panda/es/build/RealtimePlusService.java';
+    const ignoredFile = 'src/main/java/com/ctrip/panda/es/build/target/Generated.java';
+    for (const rel of [sourceFile, ignoredFile]) {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+    }
+    const source = 'package com.ctrip.panda.es.build;\npublic class RealtimePlusService { public int run() { return 1; } }\n';
+    fs.writeFileSync(path.join(tempDir, sourceFile), source);
+    fs.writeFileSync(path.join(tempDir, ignoredFile), 'public class Generated {}\n');
+    const cg = CodeGraph.initSync(tempDir);
+    try {
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'RealtimePlusService')).toBe(true);
+      const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'RealtimePlusService' });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0]!.text).toContain('public class RealtimePlusService');
+
+      fs.writeFileSync(path.join(tempDir, sourceFile), source.replace('run()', 'updatedRun()'));
+      await cg.sync({ paths: [sourceFile, ignoredFile] });
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'updatedRun')).toBe(true);
+      expect(cg.getNodesInFile(ignoredFile)).toEqual([]);
+
+      const addedFile = 'src/test/java/com/build/ServiceTest.java';
+      fs.mkdirSync(path.dirname(path.join(tempDir, addedFile)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, addedFile), 'package com.build; public class ServiceTest {}\n');
+      expect((await cg.sync()).filesAdded).toBe(1);
+      expect(cg.getNodesInFile(addedFile).some((node) => node.name === 'ServiceTest')).toBe(true);
+    } finally {
+      cg.close();
+    }
   });
 });
 
@@ -8303,15 +9055,27 @@ class UserService(private val repo: UserRepository) {
       expect(cls?.language).toBe('scala');
     });
 
-    it('should extract object definitions as class kind', () => {
-      const code = `
-object DatabaseConfig {
-  val url = "jdbc:postgresql://localhost/mydb"
-}
-`;
+    it.each(['\n', '\r\n'])('extracts objects as modules with method ownership (%j)', (eol) => {
+      const code = [
+        'object DatabaseConfig {',
+        '  val url = "jdbc:postgresql://localhost/mydb"',
+        '  def connect(): String = url',
+        '}',
+        'def scope(): Int = {',
+        '  object Local { def value(): Int = 1 }',
+        '  Local.value()',
+        '}',
+        'case object Empty',
+      ].join(eol);
       const result = extractFromSource('Config.scala', code);
-      const obj = result.nodes.find((n) => n.kind === 'class' && n.name === 'DatabaseConfig');
-      expect(obj).toBeDefined();
+      for (const [name, method] of [['DatabaseConfig', 'connect'], ['Local', 'value']]) {
+        const obj = result.nodes.find((n) => n.kind === 'module' && n.name === name)!;
+        const member = result.nodes.find((n) => n.kind === 'method' && n.name === method)!;
+        expect(obj).toBeDefined();
+        expect(member).toBeDefined();
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === obj.id && e.target === member.id)).toBe(true);
+      }
+      expect(result.nodes.some((n) => n.kind === 'module' && n.name === 'Empty')).toBe(true);
     });
 
     it('should extract trait definitions as trait kind', () => {
@@ -8674,6 +9438,33 @@ const token = getTokenMp();
     expect(call).toBeDefined();
   });
 
+  it.each(['LF', 'CRLF'])('should attribute calls in <script setup> destructuring and in the template to the component (%s, #2340)', (ending) => {
+    const lf = `<template>
+  <NuxtLink :to="useBar(link.location)">{{ useBar(link) }}</NuxtLink>
+  <li v-for="item in items" @click="item.open()">{{ label(item) }}</li>
+</template>
+
+<script setup lang="ts">
+const { a } = useFoo(1)
+const [b] = useFoo(2)
+</script>
+`;
+    const code = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+    const result = extractFromSource('Card.vue', code);
+    const component = result.nodes.find((n) => n.kind === 'component')!;
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${r.fromNodeId === component.id ? 'component' : r.fromNodeId}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'component:label@3',
+      'component:useBar@2',
+      'component:useBar@2',
+      'component:useFoo@7',
+      'component:useFoo@8',
+    ]);
+  });
+
   it('should extract calls from Vue Options API object methods', () => {
     const code = `<template>
   <button @click="save">Save</button>
@@ -8768,8 +9559,10 @@ function greet() {
     expect(componentNode?.name).toBe('Static');
     expect(componentNode?.language).toBe('vue');
 
-    // Only the component node should exist (no script nodes)
-    expect(result.nodes.length).toBe(1);
+    // The file and the component it is — no script nodes. (A file with no
+    // script used to have no file node at all.)
+    expect(result.nodes.map((n) => n.kind).sort()).toEqual(['component', 'file']);
+    expect(result.edges).toContainEqual(expect.objectContaining({ source: 'file:Static.vue', target: componentNode!.id, kind: 'contains' }));
   });
 
   it('should create containment edges from component to script nodes', () => {
@@ -10604,6 +11397,162 @@ import foo.cfm;
       const result = extractFromSource('Outer.cfc', code);
       expect(result.nodes.find((n) => n.name === 'outer')?.kind).toBe('method');
       expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
+    });
+  });
+
+  describe('Calls in tag expressions outside <cfscript>/<cfquery> (#2091)', () => {
+    const callsFrom = (result: ReturnType<typeof extractFromSource>, fromId: string | undefined) =>
+      result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fromId && (r.referenceKind === 'calls' || r.referenceKind === 'instantiates'))
+        .map((r) => `${r.referenceKind === 'instantiates' ? 'new ' : ''}${r.referenceName}@${r.line}`)
+        .sort();
+
+    it('should extract calls in <cfset>, <cfif>, <cfelseif> and <cfreturn>, attributed to the enclosing method', () => {
+      const code = `<cfcomponent>
+\t<cffunction name="a">
+\t\t<cfset x = b(1)>
+\t\t<cfif c(2)>
+\t\t<cfelseif e(3)>
+\t\t</cfif>
+\t\t<cfreturn d()>
+\t</cffunction>
+\t<cffunction name="b"></cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Svc.cfc', code);
+      const a = result.nodes.find((n) => n.kind === 'method' && n.name === 'a');
+      expect(a).toBeDefined();
+      expect(callsFrom(result, a?.id)).toEqual(['b@3', 'c@4', 'd@7', 'e@5']);
+    });
+
+    it('should extract #hash# expressions in output, strings and tag attributes — once each, alongside <cfquery> bodies', () => {
+      const code = `<cfcomponent>
+<cffunction name="render">
+  <cfset var y = svc.load(1)>
+  <cfset local.msg = "Hi #userName()#">
+  <cfoutput>#fmt(y)# and #variables.mailer.send()#</cfoutput>
+  <cfloop array="#getItems()#" index="i"></cfloop>
+  <cfquery name="q" datasource="#dsn()#">SELECT #col()# FROM t</cfquery>
+  <cfset obj = new Widget()>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('View.cfc', code);
+      const render = result.nodes.find((n) => n.kind === 'method' && n.name === 'render');
+      expect(callsFrom(result, render?.id)).toEqual([
+        'col@7',
+        'dsn@7',
+        'fmt@5',
+        'getItems@6',
+        'new Widget@8',
+        'svc.load@3',
+        'userName@4',
+        'variables.mailer.send@5',
+      ]);
+      // `<cfset var y = …>` is a function local — no variable node for it.
+      expect(result.nodes.find((n) => n.name === 'y')).toBeUndefined();
+    });
+
+    it('should attribute component-scope and template-scope calls to the component and the file', () => {
+      const component = `<cfcomponent>\n<cfset setup()>\n<cffunction name="m"></cffunction>\n</cfcomponent>\n`;
+      const cfc = extractFromSource('Pseudo.cfc', component);
+      const cls = cfc.nodes.find((n) => n.kind === 'class');
+      expect(callsFrom(cfc, cls?.id)).toEqual(['setup@2']);
+
+      const template = `<cfset items = loadItems()>\n<cfoutput>#renderList(items)#</cfoutput>\n`;
+      const cfm = extractFromSource('index.cfm', template);
+      const file = cfm.nodes.find((n) => n.kind === 'file');
+      expect(callsFrom(cfm, file?.id)).toEqual(['loadItems@1', 'renderList@2']);
+    });
+
+    it("should keep each call's own line and column (several per line, and across lines)", () => {
+      const code = `<cfcomponent>
+<cffunction name="m"><cfset a()><cfif   b.c()><cfset d(e())></cfif>
+  <cfset total = sum(
+      count(), other.fetch())><cfoutput>#last()#</cfoutput>
+</cffunction>
+</cfcomponent>
+`;
+      const lines = code.split('\n');
+      const result = extractFromSource('Pos.cfc', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((r) => r.referenceName).sort()).toEqual(['a', 'b.c', 'count', 'd', 'e', 'last', 'other.fetch', 'sum']);
+      for (const r of calls) {
+        expect(lines[r.line - 1]!.slice(r.column).startsWith(r.referenceName)).toBe(true);
+      }
+    });
+
+    it('should read a <cfloop condition="…"> attribute as an expression', () => {
+      const code = `<cfcomponent>\n<cffunction name="drain">\n<cfloop condition="hasNext()">\n</cfloop>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Queue.cfc', code);
+      const drain = result.nodes.find((n) => n.kind === 'method' && n.name === 'drain');
+      expect(callsFrom(result, drain?.id)).toEqual(['hasNext@3']);
+    });
+
+    it('should not read HTML <script> bodies or plain text as CFML calls', () => {
+      const code = `<cfcomponent>\n<cffunction name="page">\n<script>notACall();</script>\n<p>also(not)</p>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Page.cfc', code);
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls')).toEqual([]);
+    });
+  });
+
+  describe('<cffunction> inside a generic container tag (#2091)', () => {
+    it('should extract a method nested in <cfprocessingdirective> (the Application.cfc shape)', () => {
+      const code = `<cfcomponent>
+\t<cfprocessingdirective suppresswhitespace="true">
+\t\t<cffunction name="onRequestStart">
+\t\t\t<cfset loadConfig()>
+\t\t</cffunction>
+\t</cfprocessingdirective>
+</cfcomponent>
+`;
+      const result = extractFromSource('Application.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'onRequestStart');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('Application::onRequestStart');
+      expect(result.edges.some((e) => e.kind === 'contains' && e.source === cls?.id && e.target === method?.id)).toBe(true);
+      const call = result.unresolvedReferences.find((r) => r.referenceName === 'loadConfig');
+      expect(call?.fromNodeId).toBe(method?.id);
+    });
+
+    it('should extract a top-level function nested in <cfsilent> in a template', () => {
+      const code = `<cfsilent>\n<cffunction name="helper"><cfreturn 1></cffunction>\n</cfsilent>\n`;
+      const result = extractFromSource('lib.cfm', code);
+      expect(result.nodes.find((n) => n.name === 'helper')?.kind).toBe('function');
+    });
+  });
+
+  describe('<cfinterface> (#2091)', () => {
+    const code = `<cfinterface extends="IBase, IOther">
+\t<cffunction name="search" access="public" returntype="any">
+\t\t<cfargument name="q" type="string">
+\t</cffunction>
+\t<cffunction name="count"></cffunction>
+</cfinterface>
+`;
+
+    it('should extract an interface node named from the file, with its functions as methods', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      expect(iface?.name).toBe('ISearchable');
+      expect(iface?.startLine).toBe(1);
+      expect(iface?.endLine).toBe(6);
+      expect(result.nodes.filter((n) => n.kind === 'class')).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.qualifiedName).sort()).toEqual(['ISearchable::count', 'ISearchable::search']);
+      for (const m of methods) {
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === iface?.id && e.target === m.id)).toBe(true);
+      }
+      expect(methods.find((m) => m.name === 'search')?.returnType).toBe('any');
+    });
+
+    it('should extract each interface it extends', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      const ext = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+      expect(ext.map((r) => r.referenceName)).toEqual(['IBase', 'IOther']);
+      expect(ext.every((r) => r.fromNodeId === iface?.id)).toBe(true);
     });
   });
 });
@@ -12787,5 +13736,72 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
     expect(files).toEqual(['a.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
+  });
+});
+
+
+describe('C++ COM interface declarations (#1519)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+  afterEach(() => {
+    cg?.close();
+    cg = undefined;
+    if (tempDir) cleanupTempDir(tempDir);
+  });
+
+  it.each(['\n', '\r\n'])('indexes COM owners, methods and inheritance with %j line endings', async (eol) => {
+    const source = [
+      '#define interface struct',
+      'struct IParentInterface { virtual void Parent() = 0; };',
+      'interface IMyComInterface : IParentInterface {',
+      '    virtual void Foo() = 0;',
+      '    virtual void Bar() = 0;',
+      '};',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join(eol);
+    expect(detectLanguage('MyInterface.h', source)).toBe('cpp');
+    tempDir = createTempDir();
+    fs.writeFileSync(path.join(tempDir, 'MyInterface.h'), source);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+    const nodes = cg.getNodesInFile('MyInterface.h');
+    const owner = nodes.find((n) => n.name === 'IMyComInterface');
+    expect(owner).toMatchObject({ kind: 'struct', startLine: 3 });
+    for (const [name, line] of [['Foo', 4], ['Bar', 5]] as const) {
+      expect(nodes.find((n) => n.name === name)).toMatchObject({
+        kind: 'method', qualifiedName: `IMyComInterface::${name}`, isAbstract: true, startLine: line,
+      });
+    }
+    expect(nodes.find((n) => n.name === 'IStandalone')).toMatchObject({ kind: 'struct' });
+    expect(nodes.find((n) => n.name === 'Run')).toMatchObject({ qualifiedName: 'IStandalone::Run', isAbstract: true });
+    expect(nodes.filter((n) => n.kind === 'function')).toEqual([]);
+    const parent = nodes.find((n) => n.name === 'IParentInterface');
+    expect(cg.getOutgoingEdges(owner!.id)).toContainEqual(expect.objectContaining({ kind: 'extends', target: parent!.id }));
+    expect(await cg.getCode(owner!.id)).toContain('interface IMyComInterface');
+  });
+
+  it('normalizes declaration evidence without a local alias and preserves all other bytes', async () => {
+    const { cppExtractor } = await import('../src/extraction/languages/c-cpp');
+    const source = [
+      '// interface Comment : Base {};',
+      '/* interface Block { virtual void Fake() = 0; }; */',
+      'const char* text = "interface String : Base {};";',
+      'const char* raw = R"tag(interface Raw : Base {})tag";',
+      '#define SAMPLE interface Macro : Base {}',
+      '#define MULTI \\',
+      'interface Continued : Base {}',
+      'int interface = 1;',
+      'void interface();',
+      'interface value;',
+      'interface ordinary{};',
+      'interface IDerived : Base { virtual void Foo() = 0; };',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join('\r\n');
+    const expected = source.replace('interface IDerived', 'struct    IDerived').replace('interface IStandalone', 'struct    IStandalone');
+    expect(cppExtractor.preParse!(source, 'com.hpp')).toBe(expected);
+    expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
   });
 });

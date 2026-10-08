@@ -1,5 +1,5 @@
 diff --git a/grammar.js b/grammar.js
-index 21c8523..00bf2b1 100644
+index 21c8523..c9c1d85 100644
 --- a/grammar.js
 +++ b/grammar.js
 @@ -21,10 +21,14 @@ const PRECEDENCE = {
@@ -53,14 +53,46 @@ index 21c8523..00bf2b1 100644
      [
        $.class_declaration,
        $.structure_declaration,
-@@ -89,7 +88,6 @@ module.exports = grammar({
+@@ -89,30 +88,29 @@ module.exports = grammar({
      ],
    ],
  
 -  word: ($) => $._identifier_token,
  
    rules: {
++    // An attribute list on the line above a top-level declaration belongs to
++    // it: VB continues the line after the closing `>`. With no standalone
++    // attribute-line rule, the newline after the list is an extra here, as it
++    // already is inside a class or namespace.
      source_file: ($) =>
+       seq(
+         optional($.option_statements),
+         repeat(choice(
+           prec(10, $.imports_statement),
+           prec(10, $.global_attribute_section),
+-          prec(10, $.file_attribute_section),
+           $._declaration,
+           $._statement,
+           $._block_terminator
+         ))
+       ),
+ 
+-    file_attribute_section: ($) =>
+-      seq(
+-        $.attribute_list,
+-        $._terminator
+-      ),
+-
+-
+-    option_statements: ($) => repeat1($.option_statement),
++    // Files often open with a comment banner, so newlines may come before the
++    // first `Option` line. Only this path can be followed by `Option`, so it
++    // needs no precedence against a top-level empty line.
++    option_statements: ($) =>
++      seq(optional($._block_terminator), repeat1($.option_statement)),
+ 
+     option_statement: ($) =>
+       seq(
 @@ -157,13 +155,14 @@ module.exports = grammar({
        ),
  
@@ -79,15 +111,87 @@ index 21c8523..00bf2b1 100644
  
      identifier: ($) =>
        choice(
-@@ -194,7 +193,6 @@ module.exports = grammar({
-             ci("MustInherit"),
-             ci("NotInheritable"),
-             ci("Overrides"),
+@@ -174,41 +173,45 @@ module.exports = grammar({
+     _implements_keyword: ($) => token(prec(10, ci("Implements"))),
+     _inherits_keyword: ($) => token(prec(10, ci("Inherits"))),
+ 
+-    _sub_new: ($) => token(prec(100, seq(ci("Sub"), /\s+/, ci("New")))),
+-
++    // `Sub New` as two keywords rather than one token(prec(100, ...)). The
++    // single token ended at `New`, so `Sub NewItem()` lexed as a constructor
++    // followed by a stray `Item`. The keyword lexer reads `NewItem` whole.
++    _sub_new: ($) => seq(ci("Sub"), ci("New")),
++
++    // Each modifier is its own keyword, not one token(prec(10, choice(...))).
++    // That token outranked the prec(-1) identifier, so the lexer stopped at the
++    // end of a modifier spelled at the start of a name: `Public SharedCache`
++    // lexed as Shared + Cache, `Public Dimension` as Dim + ension. Keywords go
++    // through the `word` lexer, which reads the whole identifier first.
++    // `Protected Friend` and `Private Protected` are two modifiers. `Dim` and
++    // `Const` are now the same tokens as local_declaration_modifier's, so
++    // `Constants.X = 1` no longer lexes as `Const ants.X = 1`; prec(1) keeps
++    // the old reading (a member modifier) where a line could start either.
+     member_modifier: ($) =>
+-      token(
+-        prec(
+-          10,
+-          choice(
+-            ci("Public"),
+-            ci("Private"),
+-            ci("Protected"),
+-            ci("Friend"),
+-            ci("Protected Friend"),
+-            ci("Private Protected"),
+-            ci("ReadOnly"),
+-            ci("WriteOnly"),
+-            ci("Shared"),
+-            ci("Shadows"),
+-            ci("MustInherit"),
+-            ci("NotInheritable"),
+-            ci("Overrides"),
 -            ci("MustOverride"),
-             ci("NotOverridable"),
-             ci("Overridable"),
-             ci("Overloads"),
-@@ -225,43 +223,6 @@ module.exports = grammar({
+-            ci("NotOverridable"),
+-            ci("Overridable"),
+-            ci("Overloads"),
+-            ci("WithEvents"),
+-            ci("Widening"),
+-            ci("Narrowing"),
+-            ci("Partial"),
+-            ci("Async"),
+-            ci("Iterator"),
+-            ci("Dim"),
+-            ci("Const")
+-          )
+-        )
+-      ),
++      prec(1, choice(
++        ci("Public"),
++        ci("Private"),
++        ci("Protected"),
++        ci("Friend"),
++        ci("ReadOnly"),
++        ci("WriteOnly"),
++        ci("Shared"),
++        ci("Shadows"),
++        ci("MustInherit"),
++        ci("NotInheritable"),
++        ci("Overrides"),
++        ci("NotOverridable"),
++        ci("Overridable"),
++        ci("Overloads"),
++        ci("WithEvents"),
++        ci("Widening"),
++        ci("Narrowing"),
++        ci("Partial"),
++        ci("Async"),
++        ci("Iterator"),
++        ci("Dim"),
++        ci("Const")
++      )),
+ 
+     _method_body_statement: ($) =>
+       choice(
+@@ -225,43 +228,6 @@ module.exports = grammar({
          $._statement  // Fallback to regular statements
        ),
  
@@ -131,7 +235,7 @@ index 21c8523..00bf2b1 100644
      local_declaration_modifier: ($) =>
        choice(ci("Dim"), ci("Const"), ci("Static")),
  
-@@ -300,6 +261,8 @@ module.exports = grammar({
+@@ -300,6 +266,8 @@ module.exports = grammar({
      _primary_expression: ($) =>
        choice(
          $._literal,
@@ -140,7 +244,7 @@ index 21c8523..00bf2b1 100644
          $.identifier,
          $.parenthesized_expression,
          $.generic_invocation_expression,  // Add this before regular invocation
-@@ -320,17 +283,26 @@ module.exports = grammar({
+@@ -320,17 +288,26 @@ module.exports = grammar({
        ),
  
      generic_invocation_expression: ($) =>
@@ -170,7 +274,7 @@ index 21c8523..00bf2b1 100644
      member_access_expression: ($) =>
        prec.left(
          PRECEDENCE.MEMBER_ACCESS,
-@@ -350,20 +322,23 @@ module.exports = grammar({
+@@ -350,20 +327,23 @@ module.exports = grammar({
          )
        ),
  
@@ -199,7 +303,7 @@ index 21c8523..00bf2b1 100644
            ")"
          )
        ),
-@@ -471,16 +446,53 @@ module.exports = grammar({
+@@ -471,16 +451,53 @@ module.exports = grammar({
        ),
  
      lambda_expression: ($) =>
@@ -258,7 +362,7 @@ index 21c8523..00bf2b1 100644
  
      typeof_is_expression: ($) =>
        prec.left(
-@@ -488,7 +500,7 @@ module.exports = grammar({
+@@ -488,7 +505,7 @@ module.exports = grammar({
          seq(
            ci("TypeOf"),
            field("expression", $._expression),
@@ -267,7 +371,7 @@ index 21c8523..00bf2b1 100644
            field("type", $._type)
          )
        ),
-@@ -504,29 +516,12 @@ module.exports = grammar({
+@@ -504,29 +521,12 @@ module.exports = grammar({
              "initializer",
              choice(
                $.object_initializer, 
@@ -298,7 +402,7 @@ index 21c8523..00bf2b1 100644
  
  
      object_initializer: ($) =>
-@@ -551,6 +546,8 @@ module.exports = grammar({
+@@ -551,6 +551,8 @@ module.exports = grammar({
      collection_initializer: ($) =>
        seq(ci("From"), "{", commaSep($._expression), "}"),
  
@@ -307,7 +411,7 @@ index 21c8523..00bf2b1 100644
  
      array_creation_expression: ($) =>
        seq(
-@@ -646,6 +643,9 @@ module.exports = grammar({
+@@ -646,6 +648,9 @@ module.exports = grammar({
        seq(field("object", $._expression), "!", field("member", $.identifier)),
      _literal: ($) =>
        choice(
@@ -317,7 +421,7 @@ index 21c8523..00bf2b1 100644
          $.string_literal,
          $.character_literal,
          $.integer_literal,
-@@ -654,16 +654,49 @@ module.exports = grammar({
+@@ -654,16 +659,49 @@ module.exports = grammar({
          $.nothing_literal,
          $.date_literal
        ),
@@ -371,7 +475,7 @@ index 21c8523..00bf2b1 100644
          )
        ),
      boolean_literal: ($) => choice(ci("True"), ci("False")),
-@@ -672,7 +705,7 @@ module.exports = grammar({
+@@ -672,7 +710,7 @@ module.exports = grammar({
  
      // Names and types
      _name_reference: ($) =>
@@ -380,7 +484,7 @@ index 21c8523..00bf2b1 100644
  
      simple_name: ($) => $.identifier,
  
-@@ -682,7 +715,7 @@ module.exports = grammar({
+@@ -682,7 +720,7 @@ module.exports = grammar({
          seq(
            field("qualifier", $._name_reference),
            ".",
@@ -389,7 +493,7 @@ index 21c8523..00bf2b1 100644
          )
        ),
      global_qualified_name: ($) =>
-@@ -694,6 +727,7 @@ module.exports = grammar({
+@@ -694,6 +732,7 @@ module.exports = grammar({
          $.simple_name,
          $.qualified_name,
          $.generic_name,
@@ -397,7 +501,7 @@ index 21c8523..00bf2b1 100644
          $.predefined_type,
          $.array_type,
          $.tuple_type
-@@ -720,7 +754,8 @@ module.exports = grammar({
+@@ -720,7 +759,8 @@ module.exports = grammar({
        ),
  
      generic_name: ($) => seq(field("name", $.identifier), $.type_argument_list),
@@ -407,7 +511,7 @@ index 21c8523..00bf2b1 100644
      array_type: ($) =>
        seq(field("element_type", $._type), $.array_rank_specifier),
      array_rank_specifier: ($) => seq("(", repeat(","), ")"),
-@@ -742,10 +777,14 @@ module.exports = grammar({
+@@ -742,10 +782,14 @@ module.exports = grammar({
          field("type", $._type)
        ),
  
@@ -426,7 +530,7 @@ index 21c8523..00bf2b1 100644
  
      implements_member_clause: ($) =>
        seq(ci("Implements"), commaSep1($._name_reference)),
-@@ -856,7 +895,7 @@ module.exports = grammar({
+@@ -856,7 +900,7 @@ module.exports = grammar({
  
      enum_member_declaration: ($) =>
        seq(
@@ -435,7 +539,7 @@ index 21c8523..00bf2b1 100644
          field("name", $.identifier),
          optional(seq("=", field("value", $._expression))),
          $._terminator
-@@ -882,6 +921,10 @@ module.exports = grammar({
+@@ -882,6 +926,10 @@ module.exports = grammar({
          prec(10, $.inherits_statement),
          prec(10, $.implements_statement),
          prec(100, $.constructor_declaration),
@@ -446,7 +550,7 @@ index 21c8523..00bf2b1 100644
          // Explicitly add statements that can appear at class level
          prec(200, $.try_statement),      // Very high precedence
          prec(200, $.select_statement),   // Very high precedence
-@@ -936,33 +979,21 @@ module.exports = grammar({
+@@ -936,33 +984,21 @@ module.exports = grammar({
      variable_declarator: ($) =>
        seq(
          field("name", $.identifier),
@@ -483,7 +587,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))),
          commaSep1($.variable_declarator),
          $._terminator
-@@ -970,7 +1001,8 @@ module.exports = grammar({
+@@ -970,7 +1006,8 @@ module.exports = grammar({
  
      field_variable_declarator: ($) =>
        seq(
@@ -493,7 +597,7 @@ index 21c8523..00bf2b1 100644
          optional($.array_rank_specifier),
          optional($.as_clause),
          optional(seq("=", field("initializer", $._expression)))
-@@ -978,12 +1010,13 @@ module.exports = grammar({
+@@ -978,12 +1015,13 @@ module.exports = grammar({
  
      property_declaration: ($) =>
        seq(
@@ -509,7 +613,7 @@ index 21c8523..00bf2b1 100644
          optional($.implements_member_clause),
          optional(seq("=", field("initializer", $._expression))),
          choice(
-@@ -1001,7 +1034,7 @@ module.exports = grammar({
+@@ -1001,7 +1039,7 @@ module.exports = grammar({
  
      property_getter: ($) =>
        seq(
@@ -518,7 +622,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))),
          ci("Get"),
          $._block_terminator,
-@@ -1013,7 +1046,7 @@ module.exports = grammar({
+@@ -1013,7 +1051,7 @@ module.exports = grammar({
  
      property_setter: ($) =>
        seq(
@@ -527,7 +631,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))),
          ci("Set"),
          optional(seq("(", field("parameter", $.parameter), ")")),
-@@ -1028,7 +1061,7 @@ module.exports = grammar({
+@@ -1028,7 +1066,7 @@ module.exports = grammar({
        prec(
          1,
          seq(
@@ -536,7 +640,7 @@ index 21c8523..00bf2b1 100644
            optional(field("modifiers", repeat1($.member_modifier))),
            choice(
              seq(
-@@ -1063,7 +1096,7 @@ module.exports = grammar({
+@@ -1063,7 +1101,7 @@ module.exports = grammar({
        prec(
          100,
          seq(
@@ -545,7 +649,7 @@ index 21c8523..00bf2b1 100644
            optional(field("modifiers", repeat1($.member_modifier))),
            $._sub_new,
            optional(field("parameters", $.parameter_list)),
-@@ -1087,7 +1120,7 @@ module.exports = grammar({
+@@ -1087,7 +1125,7 @@ module.exports = grammar({
  
      event_declaration: ($) =>
        seq(
@@ -554,7 +658,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))), // Changed
          ci("Event"),
          field("name", $.identifier),
-@@ -1098,7 +1131,7 @@ module.exports = grammar({
+@@ -1098,7 +1136,7 @@ module.exports = grammar({
  
      operator_declaration: ($) =>
        seq(
@@ -563,7 +667,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))), // Changed
          ci("Operator"),
          field(
-@@ -1152,7 +1185,7 @@ module.exports = grammar({
+@@ -1152,7 +1190,7 @@ module.exports = grammar({
  
      interface_method_declaration: ($) =>
        seq(
@@ -572,7 +676,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))), // Changed
          choice(ci("Sub"), ci("Function")),
          field("name", $.identifier),
-@@ -1164,7 +1197,7 @@ module.exports = grammar({
+@@ -1164,7 +1202,7 @@ module.exports = grammar({
  
      interface_property_declaration: ($) =>
        seq(
@@ -581,7 +685,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))), // Changed
          ci("Property"),
          field("name", $.identifier),
-@@ -1175,7 +1208,7 @@ module.exports = grammar({
+@@ -1175,7 +1213,7 @@ module.exports = grammar({
  
      interface_event_declaration: ($) =>
        seq(
@@ -590,7 +694,7 @@ index 21c8523..00bf2b1 100644
          optional(field("modifiers", repeat1($.member_modifier))), // Changed
          ci("Event"),
          field("name", $.identifier),
-@@ -1209,7 +1242,7 @@ module.exports = grammar({
+@@ -1209,7 +1247,7 @@ module.exports = grammar({
  
      parameter: ($) =>
        seq(
@@ -599,7 +703,7 @@ index 21c8523..00bf2b1 100644
          optional(
            field(
              "modifiers",
-@@ -1273,7 +1306,7 @@ module.exports = grammar({
+@@ -1273,7 +1311,7 @@ module.exports = grammar({
  
      declaration_statement: ($) =>
        prec(1, seq(  // Add precedence
@@ -608,7 +712,7 @@ index 21c8523..00bf2b1 100644
          field("modifiers", choice(
            $.local_declaration_modifier,
            repeat1($.local_declaration_modifier)
-@@ -1282,6 +1315,65 @@ module.exports = grammar({
+@@ -1282,6 +1320,65 @@ module.exports = grammar({
          $._terminator
        )),
  
@@ -674,7 +778,7 @@ index 21c8523..00bf2b1 100644
      expression_statement: ($) => seq($._expression, $._terminator),
  
      assignment_statement: ($) =>
-@@ -1301,21 +1393,96 @@ module.exports = grammar({
+@@ -1301,21 +1398,96 @@ module.exports = grammar({
            $._terminator
          )
        ),
@@ -775,7 +879,7 @@ index 21c8523..00bf2b1 100644
              $._block_terminator,
              field("then_branch", repeat($._statement)),
              repeat($.elseif_clause),
-@@ -1331,7 +1498,7 @@ module.exports = grammar({
+@@ -1331,7 +1503,7 @@ module.exports = grammar({
        seq(
          ci("ElseIf"),
          field("condition", $._expression),
@@ -784,7 +888,7 @@ index 21c8523..00bf2b1 100644
          $._block_terminator,
          field("body", repeat($._statement))
        ),
-@@ -1445,7 +1612,7 @@ module.exports = grammar({
+@@ -1445,7 +1617,7 @@ module.exports = grammar({
      using_statement: ($) =>
        seq(
          ci("Using"),
@@ -793,7 +897,7 @@ index 21c8523..00bf2b1 100644
          $._block_terminator,
          field("body", repeat($._statement)),
          ci("End"),
-@@ -1590,14 +1757,25 @@ module.exports = grammar({
+@@ -1590,14 +1762,25 @@ module.exports = grammar({
          $._terminator
        ), // LINQ Query expressions
      query_expression: ($) =>
@@ -826,7 +930,7 @@ index 21c8523..00bf2b1 100644
        ),
      query_body_clause: ($) =>
        choice(
-@@ -1606,48 +1784,62 @@ module.exports = grammar({
+@@ -1606,48 +1789,62 @@ module.exports = grammar({
          $.where_clause,
          $.join_clause,
          $.order_by_clause,
@@ -914,7 +1018,7 @@ index 21c8523..00bf2b1 100644
      aggregate_function: ($) =>
        seq(
          field(
-@@ -1668,42 +1860,44 @@ module.exports = grammar({
+@@ -1668,42 +1865,44 @@ module.exports = grammar({
      select_or_group_clause: ($) => choice($.select_clause, $.group_by_clause),
      select_clause: ($) => seq(ci("Select"), commaSep1($.select_element)),
      select_element: ($) =>
@@ -973,7 +1077,7 @@ index 21c8523..00bf2b1 100644
  
      // Comments
      comment: ($) => token(prec(100, choice(
-@@ -1714,7 +1908,7 @@ module.exports = grammar({
+@@ -1714,7 +1913,7 @@ module.exports = grammar({
      ))),
  
      // Preprocessor Directives

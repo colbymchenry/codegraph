@@ -27,6 +27,14 @@ import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
+import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
+
+/**
+ * Most top-level declarations of one copybook that become entry points — its
+ * record layouts, or the first paragraphs of a procedure copybook. The rest of
+ * the copybook is one hop away (explore pins the whole file).
+ */
+const MAX_COPYBOOK_DECLARATION_ENTRIES = 3;
 
 /**
  * Extract likely symbol names from a natural language query
@@ -590,13 +598,61 @@ export class ContextBuilder {
       exactMatches = exactMatches.slice(0, Math.ceil(opts.searchLimit * 3));
     }
 
+    // Step 2c: Match an exact Han filename (with or without its extension).
+    // Keep this separate from natural-language terms so partial Chinese words
+    // do not become broad FTS queries.
+    const filenameQuery = query.trim();
+    const hasHanInFilename = Array.from(filenameQuery).some(
+      (char) => /\p{Script_Extensions=Han}/u.test(char)
+    );
+    const allowsFileNodes = options.nodeKinds === undefined
+      || options.nodeKinds.length === 0
+      || options.nodeKinds.includes('file');
+    const exactFileMatches: SearchResult[] = [];
+
+    if (hasHanInFilename && allowsFileNodes) {
+      const candidates = [
+        ...this.queries.getNodesByName(filenameQuery)
+          .filter((node) => node.kind === 'file'),
+        ...this.queries.getFileNodesByNamePrefix(`${filenameQuery}.`),
+      ];
+      for (const node of candidates) {
+        const fileName = path.basename(node.filePath);
+        const fileExtension = path.extname(fileName);
+        const fileStem = fileExtension
+          ? fileName.slice(0, -fileExtension.length)
+          : fileName;
+        const isExactMatch = fileName === filenameQuery || fileStem === filenameQuery;
+        if (isExactMatch) exactFileMatches.push({ node, score: 1 });
+      }
+    }
+
+    // Step 2d: COBOL copybook members (#2342). `COPY CVACT01Y` / `EXEC SQL
+    // INCLUDE MYCOPYBOOK` are `import` nodes, which the default kind filter
+    // drops — so a query naming a copybook found nothing at all, though the
+    // include statement and the copybook are exactly what it asks for. Gathered
+    // apart from the kind-filtered channels and admitted ahead of them below,
+    // like an exact filename. Honors an explicit kind filter that leaves
+    // imports out.
+    const allowsIncludes = options.nodeKinds === undefined
+      || options.nodeKinds.length === 0
+      || options.nodeKinds.includes('import');
+    const copybooks = allowsIncludes
+      ? this.findCopybookEntries(query)
+      : { entries: [], members: new Set<string>() };
+
     // Step 3: Run text search for natural language term matching
     // This catches file-name and node-name matches that semantic search may miss,
     // which is critical for template-heavy codebases (e.g., Liquid/Shopify themes)
     // where file names are the primary identifiers.
     let textResults: SearchResult[] = [];
     try {
-      const searchTerms = extractSearchTerms(query);
+      // A copybook member Step 2d resolved is not searched again as text: its
+      // only FTS hits are the import nodes this channel excludes, so the search
+      // fell through to the fuzzy fallback and returned whatever program name
+      // sat within edit distance (`CVACT01Y` → `CBACT01C`).
+      const searchTerms = extractSearchTerms(query)
+        .filter((term) => !copybooks.members.has(term.toUpperCase()));
       if (searchTerms.length > 0) {
         // Search each term individually to get broader coverage,
         // then boost results that match multiple terms
@@ -987,6 +1043,40 @@ export class ContextBuilder {
     // they want the TerminalPanel class, not the import statement
     filteredResults = this.resolveImportsToDefinitions(filteredResults);
 
+    // An exact filename is the query's requested entry point. Keep it ahead of
+    // broader text matches before applying the entry-point cap.
+    if (exactFileMatches.length > 0) {
+      const exactFileIds = new Set(exactFileMatches.map((result) => result.node.id));
+      filteredResults = [
+        ...exactFileMatches,
+        ...filteredResults.filter((result) => !exactFileIds.has(result.node.id)),
+      ];
+    }
+
+    // A named copybook leads too: its own declarations, then its include
+    // statements. When the query also matched other things, the copybook takes
+    // at most half the entry slots so they are not capped away.
+    const copybookIds = new Set(copybooks.entries.map((r) => r.node.id));
+    const leafEntryIds = new Set<string>();
+    if (copybooks.entries.length > 0) {
+      const matchedElsewhere = new Set(filteredResults.map((r) => r.node.id));
+      const others = filteredResults.filter((r) => !copybookIds.has(r.node.id));
+      // Include statements in a file the rest of the query also matched come
+      // first ("COACTUPC CVACT01Y" wants COACTUPC's COPY, not the first one by
+      // path). Stable, so the declarations stay ahead of every include.
+      const otherFiles = new Set(others.map((r) => r.node.filePath));
+      const rank = (r: SearchResult): number =>
+        !isCopybookInclude(r.node) ? 0 : otherFiles.has(r.node.filePath) ? 1 : 2;
+      const ordered = [...copybooks.entries].sort((a, b) => rank(a) - rank(b));
+      const kept = others.length > 0 ? ordered.slice(0, Math.ceil(opts.searchLimit / 2)) : ordered;
+      // The copybook's own entries are not walked: an include statement has
+      // nothing to walk but the program around it, and a record layout's
+      // neighbourhood is whichever program happens to MOVE into it — walking
+      // either spent the answer on unrelated paragraphs of an including program.
+      for (const r of kept) if (!matchedElsewhere.has(r.node.id)) leafEntryIds.add(r.node.id);
+      filteredResults = [...kept, ...others];
+    }
+
     // Cap entry points so traversal budget isn't spread too thin.
     // With 36 entry points and maxNodes=120, each gets only 3 nodes — useless.
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
@@ -1009,6 +1099,8 @@ export class ContextBuilder {
         symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
       );
       const anyStrong = filteredResults.some(r => {
+        // A copybook the query named is an exact identifier match, not prose.
+        if (copybookIds.has(r.node.id)) return true;
         if (distinctive.has(r.node.name.toLowerCase())) return true;
         const nameLower = r.node.name.toLowerCase();
         const dirSegs = path.dirname(r.node.filePath).toLowerCase().split('/');
@@ -1088,6 +1180,7 @@ export class ContextBuilder {
 
     // Traverse from each entry point
     for (const result of filteredResults) {
+      if (leafEntryIds.has(result.node.id)) continue;
       const traversalResult = this.traverser.traverseBFS(result.node.id, {
         maxDepth: opts.traversalDepth,
         edgeKinds: opts.edgeKinds && opts.edgeKinds.length > 0 ? opts.edgeKinds : undefined,
@@ -1231,6 +1324,45 @@ export class ContextBuilder {
     }
 
     return { nodes: finalNodes, edges: finalEdges, roots, confidence };
+  }
+
+  /**
+   * Entry points for the COBOL copybooks a query names (#2342): each indexed
+   * copybook's top-level declarations (its record layouts, or the paragraphs
+   * of a procedure copybook), then the include statements themselves — taken
+   * round-robin across the named members, so one widely-included copybook
+   * cannot crowd out another the query also names. `members` holds the
+   * matched member names, upper-cased. Both are empty when the query names no
+   * copybook, which is every query on a project without COBOL.
+   */
+  private findCopybookEntries(query: string): { entries: SearchResult[]; members: Set<string> } {
+    const named = findNamedCopybooks(this.queries, query);
+    const members = new Set(named.map((c) => c.member.toUpperCase()));
+    const entries: SearchResult[] = [];
+    const seen = new Set<string>();
+    const add = (node: Node): void => {
+      if (seen.has(node.id)) return;
+      seen.add(node.id);
+      entries.push({ node, score: 1 });
+    };
+    for (const copybook of named) {
+      for (const file of copybook.files) {
+        const declarationIds = this.queries.getOutgoingEdges(file.id, ['contains']).map((e) => e.target);
+        [...this.queries.getNodesByIds(declarationIds).values()]
+          .filter((n) => n.kind !== 'import' && n.kind !== 'export')
+          .sort((a, b) => a.startLine - b.startLine || a.id.localeCompare(b.id))
+          .slice(0, MAX_COPYBOOK_DECLARATION_ENTRIES)
+          .forEach(add);
+      }
+    }
+    const longest = Math.max(0, ...named.map((c) => c.includes.length));
+    for (let i = 0; i < longest; i++) {
+      for (const copybook of named) {
+        const include = copybook.includes[i];
+        if (include) add(include);
+      }
+    }
+    return { entries, members };
   }
 
   /**

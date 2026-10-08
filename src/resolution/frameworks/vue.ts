@@ -1,12 +1,17 @@
 /**
  * Vue / Nuxt Framework Resolver
  *
- * Handles Vue component references, compiler macros (defineProps, etc.),
- * Nuxt auto-imports, and Nuxt file-based routing patterns.
+ * Handles Vue component references, compiler macros (defineProps, etc.) and
+ * Nuxt auto-imports; `nuxtResolver` reads Nuxt's file-based routes.
  */
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { dependsOn } from './package-deps';
+import { pageComponentRef, resolvePageComponent } from './page-component';
+
+/** The languages a Vue app's scripts are written in. */
+const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
 
 /**
  * Vue 3 compiler macros — compiler-provided, not user code
@@ -101,6 +106,11 @@ export const vueResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Vue's macros, auto-imports and components are a script's, never a
+    // backend's: mealie's Python `QueryFilterBuilder(...)` is not the
+    // `QueryFilterBuilder.vue` component.
+    if (!VUE_SCRIPT_LANGUAGES.has(ref.language)) return null;
+
     // Pattern 1: Vue compiler macros (defineProps, defineEmits, etc.)
     if (VUE_COMPILER_MACROS.has(ref.referenceName)) {
       return {
@@ -111,8 +121,10 @@ export const vueResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 2: Nuxt auto-imported composables
-    if (NUXT_AUTO_IMPORTS.has(ref.referenceName)) {
+    // Pattern 2: Nuxt auto-imported composables — unless the file declares
+    // its own function of that name, which shadows the auto-import: elk's
+    // lists page calls its own `clearError(true)`, not Nuxt's (#2340).
+    if (NUXT_AUTO_IMPORTS.has(ref.referenceName) && !declaresOwnFunction(ref, context)) {
       return {
         original: ref,
         targetNodeId: ref.fromNodeId,
@@ -186,20 +198,43 @@ export const vueResolver: FrameworkResolver = {
 
     return null;
   },
+};
+
+/**
+ * Nuxt's file-based routes: `pages/` screens, `server/api/` endpoints and
+ * `middleware/`. Its own resolver, detected only in a Nuxt app: a plain Vue
+ * app keeps its views in a `pages/` folder just as often (halo's console
+ * does), and those are components a router config names, not addresses.
+ */
+export const nuxtResolver: FrameworkResolver = {
+  name: 'nuxt',
+  appDependencies: ['nuxt', 'nuxt3', '@nuxt/kit'],
+
+  detect(context: ResolutionContext): boolean {
+    if (dependsOn(context, 'nuxt', 'nuxt3', '@nuxt/kit')) return true;
+    return context.getAllFiles().some((f) => /(?:^|\/)nuxt\.config\.(?:[cm]?[jt]s)$/.test(f));
+  },
+
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A page route names the component its file is.
+    return resolvePageComponent(ref, context);
+  },
 
   extract(filePath: string, _content: string) {
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
 
-    // Normalize to forward slashes
-    const normalized = filePath.replace(/\\/g, '/');
+    // Forward slashes, and a leading `/` so an app at the repository root
+    // (`pages/index.vue`) is found by the same `/pages/` search as a nested one.
+    const normalized = '/' + filePath.replace(/\\/g, '/');
 
     // Detect Nuxt page routes (pages/ directory)
     const pagesIndex = normalized.indexOf('/pages/');
     if (pagesIndex !== -1 && normalized.endsWith('.vue')) {
       const routePath = filePathToNuxtRoute(normalized, pagesIndex + '/pages/'.length);
       if (routePath !== null) {
-        nodes.push({
+        const route: Node = {
           id: `route:${filePath}:${routePath}:1`,
           kind: 'route',
           name: routePath,
@@ -211,7 +246,9 @@ export const vueResolver: FrameworkResolver = {
           endColumn: 0,
           language: 'vue',
           updatedAt: now,
-        });
+        };
+        nodes.push(route);
+        references.push(pageComponentRef(route, '.vue', 'vue'));
       }
     }
 
@@ -221,8 +258,10 @@ export const vueResolver: FrameworkResolver = {
       const afterApi = normalized.substring(apiIndex + '/server/api/'.length);
       const routeName = afterApi
         .replace(/\.[^/.]+$/, '') // Remove extension
-        .replace(/\/index$/, ''); // index -> parent path
-      const apiRoute = '/api/' + routeName;
+        .replace(/(?:^|\/)index$/, '') // index -> parent path
+        .replace(/\[\.\.\.([^\]]+)\]/g, '*$1') // [...slug] -> *slug
+        .replace(/\[([^\]]+)\]/g, ':$1'); // [id] -> :id, as a page's params are
+      const apiRoute = routeName === '' ? '/api' : '/api/' + routeName;
 
       nodes.push({
         id: `route:${filePath}:${apiRoute}:1`,
@@ -260,9 +299,16 @@ export const vueResolver: FrameworkResolver = {
       });
     }
 
-    return { nodes, references: [] };
+    return { nodes, references };
   },
 };
+
+/** Does the reference's own file declare a function (or a const holding one) by that name? */
+function declaresOwnFunction(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return context
+    .getNodesInFile(ref.filePath)
+    .some((n) => n.name === ref.referenceName && (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable'));
+}
 
 /**
  * Check if string is PascalCase
@@ -317,7 +363,7 @@ function filePathToNuxtRoute(normalized: string, afterPagesStart: number): strin
   const withoutExt = afterPages.replace(/\.vue$/, '');
 
   // Remove /index suffix (index.vue -> parent route)
-  const withoutIndex = withoutExt.replace(/\/index$/, '');
+  const withoutIndex = withoutExt.replace(/(?:^|\/)index$/, '');
 
   // Convert Nuxt param syntax [param] to :param
   let route = '/' + withoutIndex

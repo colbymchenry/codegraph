@@ -17,7 +17,7 @@
 #
 # Output:
 #   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
-#   windows: release/codegraph-<target>.zip      (launcher: bin/codegraph.cmd)
+#   windows: release/codegraph-<target>.zip      (launchers: bin/codegraph + .cmd)
 set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
@@ -112,6 +112,15 @@ if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
   printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
+  # Git Bash (including Claude Code hooks) does not resolve .cmd via PATHEXT.
+  cat > "$STAGE/bin/codegraph" <<'LAUNCH'
+#!/bin/sh
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Preserve an inherited CODEGRAPH_HOST_PPID; do not replace it with MSYS's
+# $PPID, which is not a native Windows PID usable by the orphan watchdog.
+exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
+LAUNCH
+  chmod +x "$STAGE/bin/codegraph"
 else
   cp "$NODE_BIN" "$STAGE/node"
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'

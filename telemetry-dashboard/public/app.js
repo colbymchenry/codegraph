@@ -32,13 +32,29 @@ const DAY_MS = 86_400_000;
 
 const Chart = window.Chart;
 
+/** Pause before the one retry a failed panel gets. */
+const RETRY_DELAY_MS = 800;
+
 /** Every fetch goes through here so an expired session lands on /login instead
- *  of failing silently mid-render. */
-export async function api(path) {
-  const response = await fetch(path, { headers: { accept: 'application/json' } });
+ *  of failing silently mid-render. A 5xx or a dropped connection gets exactly one
+ *  retry: D1 sheds queued queries under load and the second ask usually lands,
+ *  while a real failure still reaches the panel a moment later. */
+export async function api(path, { retry = true } = {}) {
+  let response;
+  try {
+    response = await fetch(path, { headers: { accept: 'application/json' } });
+  } catch (err) {
+    if (!retry) throw err;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    return api(path, { retry: false });
+  }
   if (response.status === 401) {
     window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
     throw new Error('session expired');
+  }
+  if (response.status >= 500 && retry) {
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    return api(path, { retry: false });
   }
   if (!response.ok) {
     const detail = await response.json().catch(() => null);
@@ -61,8 +77,15 @@ const isDay = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(da
 // ---------------------------------------------------------------------------
 
 const state = {
-  /** Latest day the nightly rollup has written; every preset ends here. */
+  /**
+   * Today, as a UTC day — every preset ends here. Days are UTC because that is
+   * what every event and rollup is keyed on. Rolled-up numbers stop at the last
+   * day the nightly rollup has written; the API returns those later days as null,
+   * so a chart ending today shows a gap there rather than a zero.
+   */
   anchor: utcDay(Date.now()),
+  /** /api/meta, once it has answered: what each kind of number is current through. */
+  meta: null,
   earliest: null,
   preset: DEFAULT_PRESET,
   custom: { from: null, to: null },
@@ -341,16 +364,70 @@ async function drawPanel(panel, request, token) {
 // ---------------------------------------------------------------------------
 
 async function refreshMeta() {
+  // Re-read on every refresh, so a page left open overnight moves on to the new day.
+  state.anchor = utcDay(Date.now());
   try {
     const meta = await api('/api/meta');
-    if (meta.latest_day) state.anchor = meta.latest_day;
+    state.meta = meta;
+    if (meta.today) state.anchor = meta.today;
     state.earliest = meta.earliest_day ?? null;
-    syncFilters();
   } catch {
-    // A meta failure is not fatal: the picker falls back to today's date and
-    // every panel still answers. The banner is what says so.
-    document.getElementById('data-through').textContent = 'Could not read the data range.';
+    // A meta failure is not fatal: the presets still end today and every panel
+    // still answers. The status line is what says so.
+    state.meta = null;
   }
+  for (const input of document.querySelectorAll('.custom-range input')) input.max = state.anchor;
+  syncFilters();
+  drawDataWarning();
+}
+
+const plural = (n, one, many) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
+
+/** What each kind of number is current through, as one line of fact. */
+function dataThroughText() {
+  const meta = state.meta;
+  if (!meta) return 'Could not read how current the data is.';
+  const parts = [
+    meta.latest_rollup_day ? `Event counts through ${shortDay(meta.latest_rollup_day)}` : 'No event counts rolled up yet',
+  ];
+  // The one number that shows an ingest collapse at a glance: production runs at
+  // thousands a day, so a handful here means events are not being stored.
+  parts.push(`${plural(meta.machines_yesterday ?? 0, 'machine', 'machines')} active yesterday`);
+  return parts.join(' · ');
+}
+
+/**
+ * The stale-data warning. Silent when both writers are keeping up; otherwise says
+ * which one stopped, since when, and what that leaves the page unable to show.
+ */
+function drawDataWarning() {
+  const host = document.getElementById('data-warning');
+  host.replaceChildren();
+  const meta = state.meta;
+  const lines = [];
+
+  if (meta?.ingest_stalled) {
+    lines.push([
+      // The last day anything was stored, lifecycle event or usage counter.
+      `No new events since ${shortDay(meta.latest_ingest_day ?? meta.latest_raw_day)}.`,
+      ' The ingest worker at telemetry.getcodegraph.com is not storing anything; its logs and the D1 database are where to look.',
+    ]);
+  }
+  if (meta?.rollup_behind) {
+    lines.push([
+      meta.latest_rollup_day
+        ? `The nightly rollup has not run since ${shortDay(meta.latest_rollup_day)}.`
+        : 'The nightly rollup has never run.',
+      ' Installs, indexing runs, tool calls and every breakdown stop there. Machine counts, new installs and retention are live.',
+    ]);
+  }
+
+  for (const [lead, rest] of lines) {
+    const p = el('p');
+    p.append(el('strong', null, lead), document.createTextNode(rest));
+    host.append(p);
+  }
+  host.hidden = lines.length === 0;
 }
 
 async function render() {
@@ -358,8 +435,8 @@ async function render() {
   const { from, to } = currentRange();
   const query = `from=${from}&to=${to}`;
 
-  setRangeSummary(`${shortDay(from)} – ${shortDay(to)}, ${to.slice(0, 4)}`);
-  document.getElementById('data-through').textContent = `Data through ${shortDay(state.anchor)}`;
+  setRangeSummary(`${shortDay(from)} – ${shortDay(to)}, ${to.slice(0, 4)} (UTC)`);
+  document.getElementById('data-through').textContent = dataThroughText();
 
   // Deduplicate identical URLs within THIS render only — the four stat tiles
   // share one /api/summary. Discarded when the render ends, so refresh refetches.

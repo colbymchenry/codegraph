@@ -64,7 +64,7 @@ const GENERATED_PATTERNS: ReadonlyArray<RegExp> = [
   /_grpc_pb\.[jt]s$/,
   // Minified bundles vendored into a repo (docs sites, examples). Their
   // single-letter symbols make name-based edges pure noise.
-  /\.min\.m?js$/,
+  /[.-]min\.m?js$/,
   // Python — protobuf / gRPC / openapi-codegen
   /_pb2(_grpc)?\.py$/,
   /_pb2\.pyi$/,
@@ -249,5 +249,42 @@ export function hasGeneratedHeader(content: string): boolean {
  * indexer persists to `files.generated`.
  */
 export function detectGeneratedFile(filePath: string, content: string): boolean {
-  return isGeneratedFile(filePath) || hasGeneratedHeader(content);
+  return isGeneratedFile(filePath) || hasGeneratedHeader(content) || isMinifiedContent(filePath, content);
+}
+
+/** Scripts a bundler or minifier writes as a few enormous lines. */
+const MINIFIABLE_SCRIPT = /\.(?:m?js|cjs)$/i;
+/** The loader every webpack bundle defines for its modules. */
+const WEBPACK_RUNTIME = /\bfunction __webpack_require__\s*\(/;
+/** A line this long is not written by hand. */
+const MINIFIED_LINE_CHARS = 1000;
+
+/**
+ * A minified or bundled script that is not NAMED so — a docs site's
+ * `bundle.js`, a sample's vendored `app.js`: most of its text sits on lines of
+ * a thousand characters or more, and that text is code, dense with `;{}(),`,
+ * not one long string literal (a base64 fixture) in an ordinary file. Its
+ * one-letter functions (`n`, `t`, `e`) otherwise topped the most-depended-on
+ * lists of the projects that vendor it.
+ */
+export function isMinifiedContent(filePath: string, content: string): boolean {
+  if (!MINIFIABLE_SCRIPT.test(filePath) || content.length < 4 * MINIFIED_LINE_CHARS) return false;
+  // A webpack build carries its module loader, however readable its lines.
+  if (WEBPACK_RUNTIME.test(content)) return true;
+  let long = 0;
+  let punctuation = 0;
+  for (let start = 0; start < content.length; ) {
+    let end = content.indexOf('\n', start);
+    if (end < 0) end = content.length;
+    if (end - start >= MINIFIED_LINE_CHARS) {
+      long += end - start;
+      for (let i = start; i < end; i++) {
+        const c = content.charCodeAt(i);
+        // ; { } ( ) ,
+        if (c === 59 || c === 123 || c === 125 || c === 40 || c === 41 || c === 44) punctuation++;
+      }
+    }
+    start = end + 1;
+  }
+  return long >= content.length * 0.5 && punctuation >= long * 0.03;
 }

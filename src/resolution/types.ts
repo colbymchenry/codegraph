@@ -29,6 +29,9 @@ export interface UnresolvedRef {
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
+  /** The tail a ref that failed to resolve is parked under, when it is not
+   * the one its name gives (see `importBindingTail`). */
+  nameTail?: string;
 }
 
 /**
@@ -90,6 +93,12 @@ export interface ResolutionResult {
 export interface ResolutionContext {
   /** Get all nodes in a file */
   getNodesInFile(filePath: string): Node[];
+  /** Whether any node in the file is exported (`getNodesInFile(f).some(n => n.isExported)`), as one indexed probe. */
+  fileHasExportedNode?(filePath: string): boolean;
+  /** `getNodesInFile(f).filter(n => n.isExported)`, without decoding the rest of the file. */
+  getExportedNodesInFile?(filePath: string): Node[];
+  /** `getNodesInFile(f).filter(n => n.name === name)`, without decoding the rest of the file. */
+  getNodesInFileNamed?(filePath: string, name: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
   /** Get all nodes by qualified name */
@@ -109,6 +118,8 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
+  fileContains?(filePath: string, needle: string): boolean;
   /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting
@@ -159,6 +170,13 @@ export interface ResolutionContext {
    * Minimal contexts without import resolution may omit this capability. */
   resolveImport?(ref: UnresolvedRef): ResolvedRef | null;
   /**
+   * Whether an import specifier, written in `fromFile`, names a module outside
+   * the repository: a package that is not a relative path, a tsconfig alias, a
+   * workspace member or the repository's own package name, and that resolves
+   * to no project file. Supplied by the coordinator, like `resolveImport`.
+   */
+  isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
@@ -167,13 +185,21 @@ export interface ResolutionContext {
    */
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
   /**
-   * Go module info from `go.mod` at the project root. Returns `null`
-   * when the project has no `go.mod` (non-Go projects, pre-modules
-   * Go code, or projects whose modules live in subdirectories). Used
-   * by the Go branch of import resolution to distinguish in-module
-   * cross-package imports from third-party packages.
+   * The aliases of the tsconfig / jsconfig nearest `fromFile` below the
+   * project root that declares `paths` — a monorepo app's own `@/*` — or null.
    */
-  getGoModule?(): import('./go-module').GoModule | null;
+  getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
+  /**
+   * The project-relative directory (`/`-separated, `.` for the root) of
+   * the Go package an import path names, when it is a package of one of the
+   * project's own modules — the `go.mod` at the root or any `go.mod` above
+   * an indexed `.go` file (#2322) — else `null` (the standard library,
+   * third-party modules, a project with no `go.mod`). `fromFile`, the
+   * importing file, breaks a tie between two modules declaring one path.
+   * Used by the Go branch of resolution to tell in-project cross-package
+   * imports from outside ones, and to find the package's files.
+   */
+  getGoPackageDir?(importPath: string, fromFile?: string): string | null;
   /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
@@ -204,6 +230,13 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The import node of every C / C++ `#include`, narrowed to the path it
+   * spells and where it is written: what ./cpp-includers builds the include
+   * graph from. Optional so minimal contexts compile; it falls back to
+   * reading the import nodes themselves.
+   */
+  getCppIncludeNodes?(): Array<Pick<Node, 'id' | 'name' | 'filePath' | 'language' | 'startLine' | 'startColumn'>>;
 }
 
 /**
@@ -217,13 +250,68 @@ export interface FrameworkExtractionResult {
 }
 
 /**
+ * Nodes a framework can name only from several files at once, with the
+ * references that bind each — and how to recognise the ones an earlier run
+ * produced, so a run can remove those it no longer wants.
+ */
+export interface CrossFileNodes extends FrameworkExtractionResult {
+  /** The kind every one of these nodes has. */
+  kind: Node['kind'];
+  /** True for a node this pass produces, and for no node extraction does. */
+  owns(node: Node): boolean;
+}
+
+/**
+ * The navigation calls a router binds to its routes — `navigate('/login')`,
+ * `router.push('/x')` — described so a sync can find the ones a changed route
+ * may answer (see `FrameworkResolver.navigation`).
+ */
+export interface NavigationCalls {
+  /**
+   * The name tails of the calls `claimsReference` accepts as navigation —
+   * `push` for `history.push` — which find them through the failed-tail
+   * index; `claimsReference` then decides on the whole name.
+   */
+  tails: readonly string[];
+  /**
+   * The files whose navigation calls can name `route`: the path prefixes of
+   * the apps whose table it is in (`''` for every file), or null when it is
+   * not one of this router's routes.
+   */
+  scope(route: Node, context: ResolutionContext): readonly string[] | null;
+}
+
+/**
  * Framework-specific resolver
  */
 export interface FrameworkResolver {
   /** Framework name */
   name: string;
-  /** Languages this framework applies to. If omitted, applies to all languages. */
+  /**
+   * Languages this framework applies to: `extract()` runs only on files in
+   * them, and `resolve()` sees only references written in them (unless
+   * `resolveLanguages` says otherwise). If omitted, applies to all languages.
+   */
   languages?: Language[];
+  /**
+   * The languages whose references `resolve()` sees, when they are not
+   * `languages`. For a resolver that reads references in languages it
+   * extracts nothing from: SvelteKit's `$lib/…` imports and Svelte 5 runes
+   * are written in `.ts` / `.js` modules too, but only a `.svelte` file holds
+   * a route. Widening `languages` instead would run `extract()` on those
+   * files.
+   */
+  resolveLanguages?: readonly Language[];
+  /**
+   * Packages an app declares when it is built on this framework. When set,
+   * `extract()` runs only on files of an app whose package.json — the file's
+   * own or an enclosing one — declares one of them: in a monorepo with an Expo
+   * app beside a Next.js app, Expo Router must not read the Next app's
+   * `app/layout.tsx` as a `/layout` screen. When no manifest in the project
+   * declares any, detection found the framework by other evidence and the
+   * extractor runs on every file, as before.
+   */
+  appDependencies?: readonly string[];
   /** Detect if project uses this framework (project-level, called once at startup) */
   detect(context: ResolutionContext): boolean;
   /** Resolve a reference using framework-specific patterns */
@@ -234,6 +322,7 @@ export interface FrameworkResolver {
    * an attribute/descriptor, not a declared symbol (e.g. Django's
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
+   * Asked only about references written in the languages `resolve()` sees.
    */
   claimsReference?(name: string): boolean;
   /**
@@ -259,6 +348,29 @@ export interface FrameworkResolver {
    * second run can recover the original in-file form from `qualifiedName`.
    */
   postExtract?(context: ResolutionContext): Node[];
+  /**
+   * Nodes no single file's `extract()` can decide on — a React Router route
+   * table written in one file is a table of routes only because another
+   * file hands it to the router. Called after `postExtract` on every index
+   * and every sync, it returns the COMPLETE set the framework wants now. The
+   * orchestrator inserts the new ones (their references pending, for the
+   * resolution that follows), removes the ones an earlier run inserted that
+   * are no longer wanted, renames the ones whose name changed, and leaves
+   * the rest alone, so an unchanged node keeps its edges. A node lives in the
+   * file it is written in, so re-extracting that file drops it until the
+   * next run puts it back.
+   */
+  crossFileNodes?(context: ResolutionContext): CrossFileNodes;
+  /**
+   * Set by a router whose `resolve()` binds a navigation call to one of its
+   * route nodes. A call whose route did not exist yet was parked as failed, or
+   * bound to whatever answered it then (a catch-all, a parameter route), and
+   * the retry that matches a failed ref's name tail against the names a sync
+   * adds (#1240) never finds it: its name is the router's method, never the
+   * route's path. So a sync that adds, removes or renames a route puts the
+   * calls this describes back for its resolution sweep.
+   */
+  navigation?: NavigationCalls;
 }
 
 /**
@@ -298,6 +410,12 @@ export type ReExport =
       kind: 'wildcard';
       /** Module specifier of the upstream module. */
       source: string;
+    }
+  | {
+      /** `export * as ns from './other'`: only `ns` is exported, the module's members through it. */
+      kind: 'namespace';
+      exportedName: string;
+      source: string;
     };
 
 /**
@@ -329,6 +447,12 @@ export const SUPERTYPE_TARGET_KINDS = new Set<Node['kind']>([
   'type_alias', 'component', 'module', 'namespace',
 ]);
 
+/** Scala singleton objects are values, unlike inheritable Ruby modules. */
+export function isSupertypeTarget(node: Node): boolean {
+  return SUPERTYPE_TARGET_KINDS.has(node.kind) &&
+    !(node.language === 'scala' && node.kind === 'module');
+}
+
 /** True for the reference kinds that assert an inheritance/conformance relation. */
 export function isInheritanceRef(ref: UnresolvedRef): boolean {
   return ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
@@ -350,3 +474,12 @@ const NON_IMPORTABLE_KINDS = new Set<Node['kind']>([
 export function isImportableKind(kind: Node['kind']): boolean {
   return !NON_IMPORTABLE_KINDS.has(kind);
 }
+
+/**
+ * The signature extraction gives a C/C++ `constant` minted from a
+ * function-like `preproc_function_def` (`#define NAME(args) …`, #1838). A
+ * macro is a value: it is never a `calls` target, and its presence in a
+ * translation unit is what makes `NAME(x)` a macro expansion rather than a
+ * call.
+ */
+export const CPP_DEFINE_SIGNATURE = /^\s*#\s*define\b/;

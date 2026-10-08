@@ -64,6 +64,7 @@ import {
   type RouteTable,
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
+import { resolveImportPath } from '../import-resolver';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'vue'];
 
@@ -72,75 +73,137 @@ const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'vue']
 // =============================================================================
 
 export interface VueRouteEntry {
-  /** `/profile/:username` — the path, in the form every other framework's routes use. */
+  /** `/profile/:username` — the full path, a child's joined onto its parents'. */
   path: string;
   /** `profile` — what `router.push({ name })` names, when the entry has one. */
   name: string | null;
   /** The component the entry names, by identifier or by the tail of its lazy import. */
   component: string | null;
+  /** `@/views/dashboard/index` — the file a lazy `() => import(…)` component names. */
+  spec: string | null;
+  /** The components of the parent routes it renders inside, outermost first. */
+  layouts: VueLayout[];
   line: number;
 }
 
+export interface VueLayout {
+  component: string;
+  spec: string | null;
+}
+
 /** A file that builds a router — the cheap gate before parsing anything. */
-const ROUTER_FACTORY = /\b(?:createRouter|createWebHistory|createWebHashHistory|createMemoryHistory)\s*\(|\bnew\s+VueRouter\s*\(/;
+const ROUTER_FACTORY = /\b(?:createRouter|createWebHistory|createWebHashHistory|createMemoryHistory)\s*\(|\bnew\s+(?:VueRouter|Router)\s*\(/;
 
 /** `routes: [` / `routes = [` — the array itself, for a file that only holds the table. */
 const ROUTES_ARRAY = /\broutes\s*[:=]\s*\[/;
 
+/** A file that imports from `vue-router`. */
+const VUE_ROUTER_IMPORT = /\bfrom\s*['"]vue-router['"]/;
+
+/** A file in a `router/` or `routes/` directory, or named `router.js` / `routes.ts`. */
+const ROUTE_FILE_PATH = /(?:^|\/)(?:router|routes)(?:\/|\.[cm]?[jt]s$)/;
+
 /**
- * Every top-level entry of a `routes: [...]` array.
+ * Where a routes table starts: a `routes: [` field, or a declaration named
+ * for what it holds — `export const constantRoutes = [`, `const routes:
+ * RouteRecordRaw[] = [`, vue-element-admin's per-module `const tableRouter = {`.
+ */
+const TABLE_OPENERS = /\broutes\s*[:=]\s*\[|\b(?:const|let|var)\s+(?:[A-Za-z_$][\w$]*)?(?:[Rr]outes?|[Rr]outers?)\s*(?::[^=;\n]*)?=\s*([[{])/g;
+
+/**
+ * Every route a file's routes tables declare.
  *
- * The array is walked, not pattern-matched: a `name` is written ABOVE the
+ * The tables are walked, not pattern-matched: a `name` is written ABOVE the
  * `path` it belongs to, so reading fields out of a window around each `path`
  * hands an entry its PREDECESSOR's name — vue-realworld's `login` came out as
- * `/register`, silently, for every route in the file. So each top-level `{…}`
- * is matched as a unit and only its own depth-1 fields are read; a nested
- * `children:` array, a `meta: {…}` and a lazy `component: () => import(…)`
- * are stepped over rather than searched.
+ * `/register`, silently, for every route in the file. So each `{…}` is
+ * matched as a unit and only its own depth-1 fields are read; a `meta: {…}`
+ * and a lazy `component: () => import(…)` are stepped over rather than
+ * searched, and `children` are walked in turn with the parent's path in front
+ * of theirs.
  *
- * An entry whose path does not start with `/` is a child route, relative to a
- * parent this does not compose, and is not a destination on its own.
+ * A route with children is a layout: its component renders the outlet they
+ * fill. It is a screen of its own only when no child claims its address and
+ * it does not `redirect` elsewhere — vue-element-admin's `{ path: '/table',
+ * component: Layout, redirect: '/table/complex-table', children }` is the
+ * frame around four tables, not a fifth page.
+ *
+ * A top-level entry whose path does not start with `/` (`*`, a catch-all) is
+ * not an address. A table is read from a file that builds a router, imports
+ * `vue-router`, or lives in a `router/` directory.
  */
-export function parseVueRoutes(content: string): VueRouteEntry[] {
-  if (!ROUTER_FACTORY.test(content) && !ROUTES_ARRAY.test(content)) return [];
+export function parseVueRoutes(content: string, filePath = ''): VueRouteEntry[] {
+  const routeFile = ROUTER_FACTORY.test(content) || ROUTES_ARRAY.test(content) || VUE_ROUTER_IMPORT.test(content) || ROUTE_FILE_PATH.test(filePath);
+  if (!routeFile) return [];
   const safe = stripCommentsForRegex(content, 'typescript');
   const out: VueRouteEntry[] = [];
   const seen = new Set<string>();
-  const arrays = /\broutes\s*[:=]\s*\[/g;
-  let a: RegExpExecArray | null;
-  while ((a = arrays.exec(safe)) !== null) {
-    const open = a.index + a[0].length - 1;
-    const close = matchBracket(safe, open);
-    if (close < 0) continue;
-    for (const obj of topLevelObjects(safe, open + 1, close)) {
-      const fields = readFields(safe, obj.start, obj.end);
-      const pathField = fields.get('path');
-      if (!pathField) continue;
-      const path = readStringAt(pathField.text.trimStart(), 0);
-      if (path === null || !path.startsWith('/')) continue;
-      const componentField = fields.get('component') ?? fields.get('components');
-      if (!componentField) continue; // no component in the entry → not a route object
-      const component = componentName(componentField.text);
-      if (!component) continue;
-      const nameField = fields.get('name');
-      const name = nameField ? readStringAt(nameField.text.trimStart(), 0) : null;
-      const line = safe.slice(0, pathField.at).split('\n').length;
-      const key = `${path} ${name ?? ''}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ path, name, component, line });
+  const walked = new Set<number>();
+  const lineOf = (at: number) => safe.slice(0, at).split('\n').length;
+
+  const visit = (obj: { start: number; end: number }, prefix: string | null, layouts: VueLayout[], depth: number): void => {
+    const fields = readFields(safe, obj.start, obj.end);
+    const pathField = fields.get('path');
+    if (!pathField) return;
+    const own = readStringAt(pathField.text.trimStart(), 0);
+    if (own === null) return;
+    let path: string;
+    if (own.startsWith('/')) path = own;
+    else if (prefix === null) return; // a top-level `*` or relative path is no address
+    else path = own === '' ? prefix : `${prefix === '/' ? '' : prefix}/${own}`;
+    if (path.length > 1) path = path.replace(/\/+$/, '');
+
+    const componentField = fields.get('component') ?? fields.get('components');
+    const component = componentField ? componentOf(componentField.text) : null;
+
+    const children = fields.get('children');
+    let childClaimsAddress = false;
+    if (children && depth < 12) {
+      const open = safe.indexOf('[', children.at);
+      const close = open < 0 ? -1 : matchBracket(safe, open);
+      if (open >= 0 && close > open) {
+        const inner = component ? [...layouts, component] : layouts;
+        for (const child of topLevelObjects(safe, open + 1, close)) {
+          const childPath = readFields(safe, child.start, child.end).get('path');
+          const childOwn = childPath ? readStringAt(childPath.text.trimStart(), 0) : null;
+          if (childOwn === '' || childOwn === path) childClaimsAddress = true;
+          visit(child, path, inner, depth + 1);
+        }
+      }
     }
-    arrays.lastIndex = close;
+    if (!component) return;
+    if (children && (childClaimsAddress || fields.has('redirect'))) return;
+    const nameField = fields.get('name');
+    const name = nameField ? readStringAt(nameField.text.trimStart(), 0) : null;
+    const key = `${path} ${name ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ path, name, component: component.component, spec: component.spec, layouts: [...layouts], line: lineOf(pathField.at) });
+  };
+
+  TABLE_OPENERS.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TABLE_OPENERS.exec(safe)) !== null) {
+    const open = m.index + m[0].length - 1;
+    const close = matchBracket(safe, open);
+    if (close < 0 || walked.has(open)) continue;
+    walked.add(open);
+    if (safe[open] === '{') visit({ start: open, end: close }, null, [], 0);
+    else for (const obj of topLevelObjects(safe, open + 1, close)) visit(obj, null, [], 0);
+    TABLE_OPENERS.lastIndex = close;
   }
   return out;
 }
 
 /** The component an entry names: an identifier, or the file a lazy import names. */
-function componentName(value: string): string | null {
+function componentOf(value: string): VueLayout | null {
   const lazy = /\bimport\s*\(\s*['"`]([^'"`]+)['"`]/.exec(value);
-  if (lazy) return (lazy[1]!.split('/').pop() ?? '').replace(/\.\w+$/, '') || null;
+  if (lazy) {
+    const tail = (lazy[1]!.split('/').pop() ?? '').replace(/\.\w+$/, '');
+    return tail ? { component: tail, spec: lazy[1]! } : null;
+  }
   const ident = /^\s*([A-Z][A-Za-z0-9_]*)\s*$/.exec(value);
-  return ident?.[1] ?? null;
+  return ident ? { component: ident[1]!, spec: null } : null;
 }
 
 function languageForFile(filePath: string): Language {
@@ -175,9 +238,14 @@ function isVueConfigRoute(node: Node): boolean {
 function isNuxtPage(node: Node): boolean {
   return (
     node.language === 'vue' &&
-    node.filePath.includes('/pages/') &&
+    `/${node.filePath}`.includes('/pages/') &&
     node.id === `route:${node.filePath}:${node.name}:1`
   );
+}
+
+/** True for a route the table holds: a config route or a Nuxt page, at an absolute path. */
+function inVueTable(node: Node): boolean {
+  return (isVueConfigRoute(node) || isNuxtPage(node)) && node.name.startsWith('/');
 }
 
 const tables = new WeakMap<ResolutionContext, VueRouteTable>();
@@ -194,12 +262,10 @@ export function vueRouteTable(context: ResolutionContext): VueRouteTable {
     return t;
   };
   for (const node of all) {
-    const config = isVueConfigRoute(node);
-    if (!config && !isNuxtPage(node)) continue;
-    if (!node.name.startsWith('/')) continue;
+    if (!inVueTable(node)) continue;
     const root = appRootFor(node.filePath);
     addRouteTo(tableAt(root), node.name, node);
-    if (config) {
+    if (isVueConfigRoute(node)) {
       const group = configFiles.get(node.filePath);
       if (group) group.nodes.push(node);
       else configFiles.set(node.filePath, { root, nodes: [node] });
@@ -212,7 +278,7 @@ export function vueRouteTable(context: ResolutionContext): VueRouteTable {
     if (!content) continue;
     const byName = tableAt(group.root).byName;
     const byPath = new Map(group.nodes.map((n) => [n.name, n]));
-    for (const entry of parseVueRoutes(content)) {
+    for (const entry of parseVueRoutes(content, filePath)) {
       if (!entry.name) continue;
       const node = byPath.get(entry.path);
       if (node && !byName.has(entry.name)) byName.set(entry.name, node);
@@ -228,13 +294,13 @@ export function vueRouteTable(context: ResolutionContext): VueRouteTable {
 // =============================================================================
 
 /**
- * `router.push` / `.replace` (the Composition API), `$router.push` /
- * `.replace` (the Options API and templates), and Nuxt's `navigateTo`.
+ * `router.push` / `.replace` (the Composition API), `this.$router.push` /
+ * `$router.push` (the Options API and templates), and Nuxt's `navigateTo`.
  *
  * As everywhere else, `push` and `replace` need a receiver that names a
  * router: an unqualified `push` is an array's.
  */
-const NAV_CALL = /^\$?router\.(?:push|replace)$|^navigateTo$/;
+const NAV_CALL = /^(?:this\.)?\$?router\.(?:push|replace)$|^navigateTo$/;
 
 /** The verb a navigation call name stands for, or null. */
 export function vueNavVerb(name: string): string | null {
@@ -282,6 +348,56 @@ function vueComponentNamed(name: string, fromFile: string, context: ResolutionCo
   return near.length === 1 ? near[0]! : null;
 }
 
+/** `import:@/views/Login#Login` for a lazy component, the bare name for an identifier. */
+function componentRefName(component: string, spec: string | null): string {
+  return spec === null ? component : `import:${spec}#${component}`;
+}
+
+/**
+ * The component a route's reference names. A lazy import names a FILE, and
+ * the component is that file's: vue-element-admin's views are all
+ * `…/index.vue`, so the name alone (`index`) fits dozens. The import is
+ * resolved as the router file would resolve it, or — through an alias the
+ * resolver doesn't know, like vben's `#/views/…` — by the one file in the
+ * same app whose path ends the way the specifier does.
+ */
+function routeComponent(encoded: string, fromFile: string, context: ResolutionContext): Node | null {
+  const lazy = /^import:(.+)#([^#]+)$/.exec(encoded);
+  // `component: Layout` — the file's own import of it says which file that is
+  // (`import Layout from '@/layout'`, a `layout/index.vue`).
+  const spec = lazy ? lazy[1]! : (context.getImportMappings(fromFile, languageForFile(fromFile)).find((m) => m.localName === encoded)?.source ?? null);
+  const name = lazy ? lazy[2]! : encoded;
+  if (spec !== null) {
+    const file = resolveImportPath(spec, fromFile, 'vue', context) ?? fileBySuffix(spec, fromFile, context);
+    const component = file ? componentInFile(file, context) : null;
+    if (component) return component;
+  }
+  return name === 'index' ? null : vueComponentNamed(name, fromFile, context);
+}
+
+function componentInFile(file: string, context: ResolutionContext): Node | null {
+  const nodes = context.getNodesInFile(file);
+  return nodes.find((n) => n.kind === 'component') ?? nodes.find((n) => n.kind === 'function' && /^[A-Z]/.test(n.name)) ?? null;
+}
+
+const COMPONENT_EXTENSIONS = ['', '.vue', '.tsx', '.jsx', '.ts', '.js', '/index.vue', '/index.tsx', '/index.ts', '/index.js'];
+
+/** The one file under `fromFile`'s app whose path ends like `spec` minus its alias (`#/`, `@/`, `~/`). */
+function fileBySuffix(spec: string, fromFile: string, context: ResolutionContext): string | null {
+  const rest = spec.replace(/^(?:[@#~$][\w-]*\/|\.{1,2}\/)+/, '');
+  if (rest === spec || rest.length === 0) return null;
+  const root = appRootFor(fromFile);
+  const hits = new Set<string>();
+  for (const file of context.getAllFiles()) {
+    if (!file.startsWith(root)) continue;
+    for (const ext of COMPONENT_EXTENSIONS) {
+      const tail = rest + ext;
+      if (file === tail || file.endsWith('/' + tail)) hits.add(file);
+    }
+  }
+  return hits.size === 1 ? [...hits][0]! : null;
+}
+
 // =============================================================================
 // The resolver
 // =============================================================================
@@ -289,17 +405,24 @@ function vueComponentNamed(name: string, fromFile: string, context: ResolutionCo
 export const vueRouterResolver: FrameworkResolver = {
   name: 'vue-router',
   languages: [...ROUTE_LANGUAGES],
+  appDependencies: ['vue-router', 'nuxt', 'nuxt3'],
 
   detect(context: ResolutionContext): boolean {
     return dependsOn(context, 'vue-router', 'nuxt', 'nuxt3');
   },
 
   claimsReference(name: string): boolean {
-    return NAV_CALL.test(name);
+    return NAV_CALL.test(name) || name.startsWith('import:') || name.startsWith('layout:');
+  },
+
+  navigation: {
+    tails: ['push', 'replace', 'navigateTo'],
+    // A call matches against the table of the app its file is in.
+    scope: (route) => (inVueTable(route) ? [appRootFor(route.filePath)] : null),
   },
 
   extract(filePath: string, content: string): FrameworkExtractionResult {
-    const entries = parseVueRoutes(content);
+    const entries = parseVueRoutes(content, filePath);
     if (entries.length === 0) return { nodes: [], references: [] };
     const language = languageForFile(filePath);
     const now = Date.now();
@@ -329,7 +452,7 @@ export const vueRouterResolver: FrameworkResolver = {
         // a `calls` edge to a component as the page a screen renders.
         references.push({
           fromNodeId: node.id,
-          referenceName: entry.component,
+          referenceName: componentRefName(entry.component, entry.spec),
           referenceKind: 'calls',
           line: entry.line,
           column: 0,
@@ -338,11 +461,30 @@ export const vueRouterResolver: FrameworkResolver = {
           candidates: [entry.component],
         });
       }
+      // The layouts around it: what they render — a sidebar, a navbar — is on
+      // this screen too.
+      for (const layout of entry.layouts) {
+        references.push({
+          fromNodeId: node.id,
+          referenceName: `layout:${componentRefName(layout.component, layout.spec)}`,
+          referenceKind: 'references',
+          line: entry.line,
+          column: 0,
+          filePath,
+          language,
+        });
+      }
     }
     return { nodes, references };
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    if (ref.referenceKind === 'references' && isVueRouteRef(ref) && ref.referenceName.startsWith('layout:')) {
+      const layout = routeComponent(ref.referenceName.slice('layout:'.length), ref.filePath, context);
+      return layout
+        ? { original: ref, targetNodeId: layout.id, confidence: 0.95, resolvedBy: 'framework', metadata: { layout: true } }
+        : null;
+    }
     if (ref.referenceKind !== 'calls') return null;
 
     // A route naming the component it renders — this resolver's own reference,
@@ -350,7 +492,7 @@ export const vueRouterResolver: FrameworkResolver = {
     // `Login` view AND a `login` action in a store, and only one of them is
     // the screen.
     if (isVueRouteRef(ref)) {
-      const component = vueComponentNamed(ref.referenceName, ref.filePath, context);
+      const component = routeComponent(ref.referenceName, ref.filePath, context);
       return component
         ? { original: ref, targetNodeId: component.id, confidence: 0.95, resolvedBy: 'framework' }
         : null;

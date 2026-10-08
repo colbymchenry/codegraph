@@ -7,9 +7,17 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { isWslWindowsDrive } from './sync/watch-policy';
 
 /** The default per-project data directory name. */
-const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+
+/**
+ * The data directory name WSL gives a fresh project on a Windows drive, so it
+ * never shares one index with CodeGraph on Windows (issue #995). Indexing and
+ * watching skip every `.codegraph-*` sibling on both sides (#636).
+ */
+export const WSL_CODEGRAPH_DIR = '.codegraph-wsl';
 
 let warnedBadDirName = false;
 
@@ -80,15 +88,55 @@ export function isCodeGraphDataDir(name: string): boolean {
 }
 
 /**
- * Get the .codegraph directory path for a project
+ * The data directory name for one project: {@link codeGraphDirName}, except
+ * for a project on a Windows drive under WSL (`/mnt/c/...`) with no
+ * `CODEGRAPH_DIR` set. Windows-native CodeGraph opens `.codegraph` in that
+ * same tree, and SQLite's locking doesn't hold across the 9p/DrvFs bridge, so
+ * the two sharing one index fails with "disk I/O error" (issue #995). There:
+ *
+ *   1. `.codegraph-wsl/` exists → it. Once WSL has its own index it keeps it,
+ *      even after Windows builds a `.codegraph` beside it.
+ *   2. `.codegraph/codegraph.db` exists → `.codegraph`. An index built before
+ *      this default is kept rather than silently rebuilt somewhere else.
+ *   3. neither → `.codegraph-wsl`, so a fresh WSL index never shares.
+ *
+ * Every other host keeps the plain name without a stat: the WSL check is
+ * cached per process.
  */
-export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, codeGraphDirName());
+export function codeGraphDirNameFor(projectRoot: string): string {
+  if (process.env.CODEGRAPH_DIR?.trim() || !isWslWindowsDrive(projectRoot)) return codeGraphDirName();
+  try {
+    if (fs.statSync(path.join(projectRoot, WSL_CODEGRAPH_DIR)).isDirectory()) return WSL_CODEGRAPH_DIR;
+  } catch {
+    // absent — fall through
+  }
+  if (fs.existsSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR, 'codegraph.db'))) return DEFAULT_CODEGRAPH_DIR;
+  return WSL_CODEGRAPH_DIR;
 }
 
 /**
- * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Get the .codegraph directory path for a project
+ */
+export function getCodeGraphDir(projectRoot: string): string {
+  return path.join(projectRoot, codeGraphDirNameFor(projectRoot));
+}
+
+/**
+ * Check if a project has been initialized with CodeGraph.
+ *
+ * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph
+ * schema. A file that merely exists — empty, or a SQLite database with no
+ * tables, as an interrupted `init` or a stray `touch` leaves behind — used to
+ * count as initialized, so one such file in an ANCESTOR directory (worst
+ * case: `$HOME`) captured the upward resolution of every project beneath it
+ * and made their real indexes unreachable (#1895).
+ *
+ * The probe is cheap and gated so hot callers (the prompt hook, MCP root
+ * resolution on every call) pay one `stat`: file size, then a read-only
+ * SQLite open with a single `sqlite_master` lookup — memoized per path +
+ * mtime + size so an unchanged db is never reopened. A database that cannot
+ * be inspected counts as initialized (see probeSchema) — only a proven-absent
+ * schema, or a file SQLite refuses as not a database, says no.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -97,7 +145,88 @@ export function isInitialized(projectRoot: string): boolean {
   }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dbPath);
+  } catch {
+    return false;
+  }
+  return hasCodeGraphSchema(dbPath, st);
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
+ * `init` can add it in place: an empty file, or a SQLite database without the
+ * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * see {@link hasForeignDbFile}.
+ */
+export function hasSchemalessDb(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  if (!st.isFile() || isInitialized(projectRoot)) return false;
+  return st.size === 0 || probeSchema(dbPath) === 'no-schema';
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` and is not a SQLite database (no
+ * header magic): SQLite refuses to open it, so `init` cannot rebuild it in
+ * place. The caller must say so rather than promise a repair; nothing here
+ * deletes the file.
+ */
+export function hasForeignDbFile(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  return st.isFile() && st.size > 0 && probeSchema(dbPath) === 'not-sqlite';
+}
+
+/** A SQLite file header is 100 bytes; anything shorter cannot hold a schema. */
+const SQLITE_HEADER_SIZE = 100;
+/** SQLITE_NOTADB: SQLite read the file and it is not a database. */
+const SQLITE_NOTADB = 26;
+const schemaProbeCache = new Map<string, { mtimeMs: number; size: number; ok: boolean }>();
+
+function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
+  if (!st.isFile() || st.size < SQLITE_HEADER_SIZE) return false;
+  const cached = schemaProbeCache.get(dbPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.ok;
+  const probe = probeSchema(dbPath);
+  const ok = probe === 'schema' || probe === 'unknown';
+  schemaProbeCache.set(dbPath, { mtimeMs: st.mtimeMs, size: st.size, ok });
+  return ok;
+}
+
+/**
+ * What `codegraph.db` holds, asked of SQLite itself through a read-only
+ * connection: the codegraph schema, a database without it, not a database at
+ * all (SQLITE_NOTADB), or `unknown` — locked, busy, a WAL db in a directory we
+ * cannot create `-shm` in (read-only checkout, mount, another user's tree),
+ * disk I/O. Callers treat `unknown` as initialized: the pre-existing behaviour
+ * for a database we cannot inspect.
+ *
+ * The file is never read through a descriptor of our own, not even for its
+ * 16-byte header. Closing ANY descriptor on a database file drops every POSIX
+ * lock this process holds on it, including those of a connection it already
+ * has open (sqlite.org/howtocorrupt.html §2.2.1) — and the MCP server resolves
+ * projects through isInitialized on every call while it holds the index as
+ * its writer. SQLite's own connections share one lock table per file, so a
+ * second connection opened and closed here leaves the first one's locks alone.
+ */
+function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DatabaseSync } = require('node:sqlite');
+  let db: any = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
+    return row !== undefined ? 'schema' : 'no-schema';
+  } catch (error) {
+    return (error as { errcode?: number })?.errcode === SQLITE_NOTADB ? 'not-sqlite' : 'unknown';
+  } finally {
+    // Never hold the handle: Windows file locking would block the owner.
+    try { db?.close(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -153,6 +282,80 @@ export function unsafeIndexRootReason(projectRoot: string): string | null {
     return 'a parent of your home directory';
   }
   return null;
+}
+
+/**
+ * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
+ * report a usable inode. Read as bigints: WSL DrvFs (`/mnt/c`) reports inodes
+ * above 2^53, where a plain number rounds nearby inodes onto one value. Windows
+ * st_ino is unreliable across handle reopens, so we deliberately return null
+ * there — the deleted-but-open-inode hazard this guards (#925) is a POSIX
+ * file-semantics issue that doesn't arise on Windows (an open file can't be
+ * unlinked).
+ */
+export function statInode(p: string): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const s = fs.statSync(p, { bigint: true });
+    return `${s.dev}:${s.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonicalize a project root for IDENTITY: hashing it into a rendezvous key
+ * (the daemon's named pipe / tmpdir socket, a registry record). Not for display
+ * — the caller-visible root keeps its own spelling.
+ *
+ * The contract is that two spellings of ONE directory yield ONE string, because
+ * a client that derives a different key silently fails to meet the daemon that
+ * is already running: it probes a socket nobody bound, spawns a redundant
+ * daemon, and that daemon dies on the lock the first one holds, so the session
+ * degrades to a single-process engine. `path.resolve` alone does NOT satisfy
+ * that contract — NTFS is case-insensitive, so `d:\work\codegraph` and
+ * `D:\work\codegraph` name one directory but two strings, and non-native
+ * `fs.realpathSync` keeps whichever casing the caller passed (only `.native`
+ * asks the filesystem for the on-disk name — the same reason
+ * {@link isSameIndexRoot} uses it). Both spellings really do occur: a
+ * cwd-derived root is the on-disk case, while a client-supplied
+ * `rootUri`/`workspaceFolders` path arrives as `file:///d%3A/…`.
+ *
+ * The Windows lowercase is belt-and-braces on top of the native realpath — NTFS
+ * can't hold two directories differing only by case, and it also absorbs a
+ * `\\?\`-prefixed native result diverging from a plain one.
+ */
+export function canonicalProjectRoot(projectRoot: string): string {
+  const resolved = path.resolve(projectRoot);
+  let canonical = resolved;
+  try {
+    canonical = fs.realpathSync.native(resolved);
+  } catch {
+    // ENOENT/EACCES/ELOOP — the root is normally there (`.codegraph/` lives in
+    // it), so this is a fallback rather than a path we expect to take.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+/**
+ * Whether two resolved index roots are one index spelled two ways — a symlinked
+ * checkout, or a case-variant on a case-insensitive mount (macOS, NTFS, WSL
+ * DrvFs `/mnt/c`), where `realpathSync` keeps the caller's casing (#1057).
+ * Compares the identity of both data directories as they are NOW, so an inode
+ * reused after a delete can't match: the deleted root no longer stats. Windows
+ * has no usable inode, so it compares the on-disk-cased native realpaths.
+ */
+export function isSameIndexRoot(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (process.platform === 'win32') {
+    try {
+      return fs.realpathSync.native(getCodeGraphDir(a)) === fs.realpathSync.native(getCodeGraphDir(b));
+    } catch {
+      return false;
+    }
+  }
+  const id = statInode(getCodeGraphDir(a));
+  return id !== null && id === statInode(getCodeGraphDir(b));
 }
 
 export function findNearestCodeGraphRoot(startPath: string): string | null {
@@ -310,8 +513,9 @@ const NOT_WORD_AFTER = /(?![\p{L}\p{N}_])/u.source;
  * Structural keywords matched as EXACT words (boundary on both sides): short
  * or ambiguous tokens where prefix matching would false-positive ("flow" in
  * "flower", "path" in "pathological"). Grouped by language; a term appears once
- * even when several languages share it ("como" is Portuguese for how AND
- * unaccented-typed Spanish "cómo").
+ * even when several languages share it. Ambiguous everyday words like PT/ES
+ * "como" and DE "wie" are excluded: the hook instead requires another strong
+ * keyword, a verified code token, or indexed prose segments (#1654).
  */
 const STRUCTURAL_WORDS = [
   // English — the pre-#1126 list minus what moved to STRUCTURAL_STEMS: the
@@ -320,17 +524,16 @@ const STRUCTURAL_WORDS = [
   'how', 'where', 'tracing', 'flows?', 'paths?', 'reach(?:es|ed)?', 'wired?', 'breaks?', 'why does',
   // French (où=where, flux=flow, chemin=path, casse=breaks)
   'comment', 'où', 'flux', 'chemins?', 'casse',
-  // Spanish (cómo/como=how, dónde/donde=where, flujo=flow, ruta/camino=path,
+  // Spanish (cómo=how, dónde/donde=where, flujo=flow, ruta/camino=path,
   // rompe=breaks, llaman / quién llama = call(s) — bare "llama" is excluded:
   // it's also the animal/model name in English prompts)
   'cómo', 'dónde', 'donde', 'flujos?', 'rutas?', 'caminos?', 'rompe', 'llaman', 'quién llama', 'quien llama',
-  // Portuguese (como=how — also covers unaccented Spanish; onde=where,
-  // fluxo=flow, caminho=path)
-  'como', 'onde', 'fluxos?', 'caminhos?',
-  // German (wie=how, wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
+  // Portuguese (onde=where, fluxo=flow, caminho=path)
+  'onde', 'fluxos?', 'caminhos?',
+  // German (wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
   // bricht/kaputt=breaks, ruft=calls, hängt=depends — "hängt … von X ab"
   // splits the separable verb "abhängen", so the "abhäng" stem can't catch it)
-  'wie', 'wo', 'woher', 'wohin', 'pfade?', 'fluss', 'ablauf', 'bricht', 'kaputt', 'ruft', 'hängt',
+  'wo', 'woher', 'wohin', 'pfade?', 'fluss', 'ablauf', 'bricht', 'kaputt', 'ruft', 'hängt',
   // Italian (dove=where, flusso=flow, percorso/i=path)
   'dove', 'flusso', 'percors[oi]',
   // Russian (как=how, где=where, путь/пути=path, работает=works)
@@ -731,11 +934,11 @@ function ensureGitignore(gitignorePath: string): boolean {
  */
 export function createDirectory(projectRoot: string): void {
   const codegraphDir = getCodeGraphDir(projectRoot);
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
 
-  // Only throw if CodeGraph is actually initialized (db exists)
-  // .codegraph/ folder alone is fine
-  if (fs.existsSync(dbPath)) {
+  // Only throw if CodeGraph is actually initialized (db with a schema).
+  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
+  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
+  if (isInitialized(projectRoot)) {
     throw new Error(`CodeGraph already initialized in ${projectRoot}`);
   }
 
@@ -898,4 +1101,25 @@ export function validateDirectory(projectRoot: string): {
     valid: errors.length === 0,
     errors,
   };
+}
+
+/**
+ * Claude Code injects `<task-notification>…</task-notification>` blocks as
+ * `user` messages when a background agent finishes, and UserPromptSubmit
+ * hooks receive them exactly like typed prompts (#1832). The whole prompt
+ * must be that single envelope; a user question that merely mentions the
+ * marker is still a prompt.
+ */
+export function isTaskNotification(prompt: string): boolean {
+  return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
+}
+
+/**
+ * Claude Code hands a subagent's report back to the parent session as a
+ * `<agent-message from="…">…</agent-message>` prompt, which UserPromptSubmit
+ * hooks also receive (#2184). Same rule as {@link isTaskNotification}: only a
+ * prompt that is entirely that envelope is skipped.
+ */
+export function isAgentMessage(prompt: string): boolean {
+  return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
 }

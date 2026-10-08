@@ -89,6 +89,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
 - `src/ui/` — terminal UI (shimmer progress, worker).
 - `src/ui-server/` -- read-only JSON API for the `codegraph ui` browser viewer (`api/`: `node`, `flow`, `map`, `screens`, `steps`, `deadcode`, `trails`, `program`, ...) plus static server; Svelte viewer lives in `ui/` (see `docs/design/codegraph-ui-design-spec.md`). `screens`/`steps`/`program` share one fold (`via`/`when` via `graph/branch-guards.ts`); `api/effects.ts` curates calls that leave the index; `api/route-roots.ts` names where a route's code starts. Derivations rendered by more than one surface belong in `src/graph/`, not `ToolHandler`.
+  **Not released yet:** `codegraph ui` / `web` are refused (and hidden from `--help`) unless `CODEGRAPH_UI=1` is set — `src/bin/viewer-gate.ts`. Viewer changelog entries wait in `docs/viewer-launch-changelog.md`, not under `[Unreleased]`. At launch: delete the gate, move those entries back, drop the "not released yet" notes from `site/`.
 
 ### NodeKind / EdgeKind
 
@@ -180,6 +181,8 @@ Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond
 
 Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.
 
+Every engine test file runs in a throwaway home dir (`__tests__/setup-home-sandbox.ts`, a `setupFiles` entry): `HOME`/`USERPROFILE` (+ Windows vars), `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` point into it, and `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/… are cleared; spawned children inherit it. It's a backstop — still inject writes to global state (e.g. `UpgradeDeps.wirePromptHook`, #2275).
+
 ### Windows-gated tests
 
 Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
@@ -210,7 +213,8 @@ For any Windows-specific PR, bug, or implementation, validate it on the real Win
 - Clone fresh into a **Windows-local** path (`C:\dev\codegraph`) and `npm ci` there — never run npm against the shared Mac repo, since `esbuild`/`rollup` ship platform-specific binaries.
 - Guest toolchain (winget): Node LTS, Git, and the **VC++ ARM64 redistributable** (required by `@rollup/rollup-win32-arm64-msvc`, which vitest pulls in).
 - Fetch a contributor PR head straight from their fork to dodge `pull/<n>/head` lag: `git fetch <fork-url> <branch>` then `git checkout -f FETCH_HEAD`.
-- Known pre-existing Windows failures (they reproduce on `main`, unrelated to your change — confirm against `origin/main` before blaming your PR, and don't let them mask new regressions): `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink` (symlink creation needs privileges on Windows); and the `mcp-initialize.test.ts` / `mcp-roots.test.ts` suites, which fail in `afterEach` with `EPERM` removing the temp dir because a spawned `serve --mcp` (its `--liftoff-only` re-exec grandchild) still holds the cwd / SQLite file open — a Windows file-locking quirk, not a logic bug.
+- Windows baseline: as of #2053 the full suite passes on the Windows 11 (ARM64) VM. The only expected exception is `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink`, which needs symlink privileges (Developer Mode) — confirm any other failure against `origin/main` before blaming your PR. The former `mcp-initialize.test.ts` / `mcp-roots.test.ts` `EPERM` teardown failures came from tests spawning `serve --mcp` without the runtime flags (its `--liftoff-only` re-exec grandchild kept the cwd / SQLite file open); spawn it with `WASM_RUNTIME_FLAGS` and await the child's exit before removing the temp dir. Windows checkouts may be CRLF — split source lines on `/\r?\n/` in tests.
+- Windows worker crashes: a worker thread that ends (`terminate()`, its own `process.exit()`, or the process exiting) while V8's concurrent marker is marking its heap kills the process with exit 3221225477 (0xC0000005) and leaves no error or dump. It's worst while the worker is still loading its modules. Owners must not terminate a worker before its first message (`workerStarted` / `terminateOnceStarted`, or the pool's own handshake), and a worker that exits itself calls `collectBeforeExit()` first — both in `src/worker-teardown.ts`. `--no-concurrent-marking` also stops it, but measured about a third slower indexing on the Windows VM, so it is not used.
 
 ## Releases
 
@@ -255,7 +259,10 @@ mismatch between `package.json` and `package-lock.json`, runs
 version fields (top-level + `packages.""`), and auto-commits + pushes the
 result back to `main` with `[skip ci]`. So a GitHub-web-UI single-file edit to
 `package.json` is enough to kick off a clean release. (If they edit both files
-locally, that's fine too — the sync step no-ops.)
+locally, that's fine too — the sync step no-ops.) Bump `ui/package.json` to the
+same version in that change: the component library is versioned with the
+engine, `ui-package.test.ts` pins it, and the workflow does not sync it — the
+1.6.1 bump left `main` red on exactly that.
 
 Once `package.json` is at the target version on `main`, trigger
 **Actions → Release → Run workflow** (on `main`). The workflow:

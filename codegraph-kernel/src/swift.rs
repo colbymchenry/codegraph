@@ -110,6 +110,24 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
+/// SWIFT_TYPE_PATH_RECEIVER (tree-sitter.ts): `API.PackageController.GetRoute` —
+/// two segments or more, each an ASCII capital then `[A-Za-z0-9_]*` (JS `\w`),
+/// not led by `Self.`.
+fn is_type_path(s: &str) -> bool {
+    if s.starts_with("Self.") {
+        return false;
+    }
+    let mut segments = 0;
+    for seg in s.split('.') {
+        let b = seg.as_bytes();
+        if b.is_empty() || !b[0].is_ascii_uppercase() || !b[1..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -152,6 +170,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -182,6 +201,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -332,7 +352,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1; // no resolveBody for swift
 
         let qualified = {
@@ -1058,8 +1079,16 @@ impl<'t> Walker<'t> {
                     } else {
                         method_name.to_string()
                     };
+                } else if let Some(path) = receiver
+                    .filter(|r| r.kind() == "navigation_expression")
+                    .map(|r| strip_js_ws(self.text(r)))
+                    .filter(|p| is_type_path(p))
+                {
+                    // A type path, `API.PackageController.GetRoute.query(on:)`:
+                    // keep it for the resolver (tree-sitter.ts SWIFT_TYPE_PATH_RECEIVER).
+                    callee_name = format!("{path}.{method_name}");
                 } else {
-                    // self_expression / super_expression / inner nav /
+                    // self_expression / super_expression / instance nav /
                     // postfix / multi_line_string_literal → bare method name.
                     callee_name = method_name.to_string();
                 }

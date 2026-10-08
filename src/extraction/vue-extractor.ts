@@ -2,6 +2,9 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
+import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { vueOptionsMembers } from './vue-options-api';
+import { vueTemplateCalls } from './vue-template-calls';
 
 /**
  * Vue built-in components — skipped so a `<Transition>` / `<KeepAlive>` in the
@@ -55,8 +58,10 @@ export class VueExtractor {
     const startTime = Date.now();
 
     try {
-      // Create component node for the .vue file itself
+      // The file, holding the component the .vue file is
+      this.nodes.push(sfcFileNode(this.filePath, this.source, 'vue'));
       const componentNode = this.createComponentNode();
+      this.edges.push({ source: `file:${this.filePath}`, target: componentNode.id, kind: 'contains' });
 
       // Extract and process script blocks
       const scriptBlocks = this.extractScriptBlocks();
@@ -70,6 +75,11 @@ export class VueExtractor {
       // markup (incl. through a barrel import) is invisible to callers /
       // impact (#629 follow-up).
       this.extractTemplateComponents(componentNode.id);
+
+      // Calls the template makes — `{{ useBar(link) }}`, `:to="localePath(x)"`,
+      // `@click="save(item)"` — are the component's, like the calls its
+      // `<script setup>` makes (#2340).
+      this.extractTemplateCalls(componentNode.id);
     } catch (error) {
       this.errors.push({
         message: `Vue extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -112,6 +122,67 @@ export class VueExtractor {
 
     this.nodes.push(node);
     return node;
+  }
+
+  /**
+   * Method nodes for an Options API component's members (see
+   * ./vue-options-api), and the references and edges written inside each —
+   * which the TS extractor attributed to the file — re-attributed to it.
+   * Lines are block-relative here; the caller offsets them with the rest.
+   */
+  private addOptionsMembers(
+    block: { content: string; startLine: number },
+    result: ExtractionResult,
+    componentNodeId: string
+  ): void {
+    const members = vueOptionsMembers(block.content);
+    if (members.length === 0) return;
+    const component = this.nodes.find((n) => n.id === componentNodeId);
+    const owner = component?.name ?? 'component';
+    const lineAt = (offset: number) => block.content.slice(0, offset).split('\n').length;
+    const colAt = (offset: number) => offset - block.content.lastIndexOf('\n', offset - 1) - 1;
+    const now = Date.now();
+    const created: Node[] = [];
+    for (const m of members) {
+      const startLine = lineAt(m.start);
+      const endLine = lineAt(m.end);
+      created.push({
+        id: generateNodeId(this.filePath, 'method', `${owner}.${m.name}`, startLine + block.startLine),
+        kind: 'method',
+        name: m.name,
+        qualifiedName: `${owner}::${m.name}`,
+        filePath: this.filePath,
+        language: 'vue',
+        startLine,
+        endLine,
+        startColumn: colAt(m.start),
+        endColumn: colAt(m.end),
+        updatedAt: now,
+      });
+    }
+    // Innermost member for a line: `computed: { x: { get() {…} } }` is one member.
+    const memberAt = (line: number): Node | undefined => {
+      let best: Node | undefined;
+      for (const n of created) {
+        if (n.startLine <= line && n.endLine >= line && (!best || n.startLine >= best.startLine)) best = n;
+      }
+      return best;
+    };
+    // What the TS extractor attributed to the file (or to nothing narrower).
+    const fileNode = result.nodes.find((n) => n.kind === 'file');
+    const narrower = new Set(result.nodes.filter((n) => n.kind !== 'file').map((n) => n.id));
+    const isFileLevel = (id: string) => (fileNode ? id === fileNode.id : !narrower.has(id));
+    for (const ref of result.unresolvedReferences) {
+      if (!isFileLevel(ref.fromNodeId)) continue;
+      const member = memberAt(ref.line);
+      if (member) ref.fromNodeId = member.id;
+    }
+    for (const edge of result.edges) {
+      if (edge.kind === 'contains' || !edge.line || !isFileLevel(edge.source)) continue;
+      const member = memberAt(edge.line);
+      if (member) edge.source = member.id;
+    }
+    result.nodes.push(...created);
   }
 
   /**
@@ -187,45 +258,16 @@ export class VueExtractor {
     const extractor = new TreeSitterExtractor(this.filePath, block.content, scriptLanguage);
     const result = extractor.extract();
 
-    // Offset line numbers from script block back to .vue file positions
-    for (const node of result.nodes) {
-      node.startLine += block.startLine;
-      node.endLine += block.startLine;
-      node.language = 'vue'; // Mark as vue, not TS/JS
+    // An Options API component's functions — `methods`, `computed`, `watch`,
+    // lifecycle hooks — are object-literal members the TS extractor leaves as
+    // part of the file. Name each one, and hand it the calls written inside it.
+    if (!block.isSetup) this.addOptionsMembers(block, result, componentNodeId);
 
-      this.nodes.push(node);
-
-      // Add containment edge from component to this node
-      this.edges.push({
-        source: componentNodeId,
-        target: node.id,
-        kind: 'contains',
-      });
-    }
-
-    // Offset edges (they reference line numbers)
-    for (const edge of result.edges) {
-      if (edge.line) {
-        edge.line += block.startLine;
-      }
-      this.edges.push(edge);
-    }
-
-    // Offset unresolved references
-    for (const ref of result.unresolvedReferences) {
-      ref.line += block.startLine;
-      ref.filePath = this.filePath;
-      ref.language = 'vue';
-      this.unresolvedReferences.push(ref);
-    }
-
-    // Carry over errors
-    for (const error of result.errors) {
-      if (error.line) {
-        error.line += block.startLine;
-      }
-      this.errors.push(error);
-    }
+    foldScriptResult(
+      result,
+      { filePath: this.filePath, componentNodeId, lineOffset: block.startLine, language: 'vue', perInstance: block.isSetup },
+      { nodes: this.nodes, edges: this.edges, unresolvedReferences: this.unresolvedReferences, errors: this.errors }
+    );
   }
 
   /**
@@ -288,6 +330,52 @@ export class VueExtractor {
           language: 'vue',
         });
       }
+    }
+  }
+
+  /**
+   * Calls written in the `<template>` (see ./vue-template-calls), each made by
+   * the component at the line it is written on — the same `calls` reference a
+   * call in `<script setup>` makes, so a composable or helper used only in
+   * markup has its callers.
+   *
+   * A template calls an Options API component's own methods by their bare
+   * name (`{{ price(item) }}`, `@click="save(form)"`), where script code
+   * writes `this.save()`. Resolution only binds a bare call to a component
+   * method when it reads `this.` at the call site, so these are linked here,
+   * where the method is known to be this component's.
+   */
+  private extractTemplateCalls(componentNodeId: string): void {
+    const calls = vueTemplateCalls(this.source);
+    if (calls.length === 0) return;
+    const component = this.nodes.find((n) => n.id === componentNodeId);
+    const ownMethods = new Map<string, string>();
+    for (const n of this.nodes) {
+      if (n.kind === 'method' && n.qualifiedName === `${component?.name}::${n.name}`) ownMethods.set(n.name, n.id);
+    }
+    const lineStarts = [0];
+    for (let i = 0; i < this.source.length; i++) {
+      if (this.source.charCodeAt(i) === 10) lineStarts.push(i + 1);
+    }
+    let line = 0;
+    for (const call of calls) {
+      // Calls come in source order, so the line only moves forward.
+      while (line + 1 < lineStarts.length && lineStarts[line + 1]! <= call.offset) line++;
+      const column = call.offset - lineStarts[line]!;
+      const ownMethod = call.name.includes('.') ? undefined : ownMethods.get(call.name);
+      if (ownMethod) {
+        this.edges.push({ source: componentNodeId, target: ownMethod, kind: 'calls', line: line + 1, column });
+        continue;
+      }
+      this.unresolvedReferences.push({
+        fromNodeId: componentNodeId,
+        referenceName: call.name,
+        referenceKind: 'calls',
+        line: line + 1, // 1-indexed
+        column,
+        filePath: this.filePath,
+        language: 'vue',
+      });
     }
   }
 }

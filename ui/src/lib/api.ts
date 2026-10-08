@@ -65,8 +65,22 @@ export function fetchSearch(
 }
 
 /** Names and locations for ids you already have — what the trail redraws with. */
-export function fetchNodeRefs(ids: readonly string[], signal?: AbortSignal): Promise<WireNodeRefs> {
-  return getGraphAdapter().nodes(ids, signal);
+/** Ids `/api/nodes` answers per request (`MAX_NODE_REFS` on the server). */
+const NODE_REFS_PER_REQUEST = 60;
+
+/**
+ * Names and kinds for a set of ids. A trail can hold more hops than one request
+ * answers, so the ids go out in batches and the answers are merged (#1976).
+ */
+export async function fetchNodeRefs(ids: readonly string[], signal?: AbortSignal): Promise<WireNodeRefs> {
+  if (ids.length <= NODE_REFS_PER_REQUEST) return getGraphAdapter().nodes(ids, signal);
+  const merged: WireNodeRefs = { items: [], missing: [] };
+  for (let i = 0; i < ids.length; i += NODE_REFS_PER_REQUEST) {
+    const batch = await getGraphAdapter().nodes(ids.slice(i, i + NODE_REFS_PER_REQUEST), signal);
+    merged.items.push(...batch.items);
+    merged.missing.push(...batch.missing);
+  }
+  return merged;
 }
 
 export function fetchEntryPoints(

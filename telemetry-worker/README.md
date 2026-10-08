@@ -31,15 +31,19 @@ Telemetry is stored in the `codegraph-telemetry` D1 database on the same account
 events are written in a single `batch()` (one implicit transaction) under `ctx.waitUntil`,
 so the write is off the response path. It is deliberately **fail-silent**: a D1 error is
 logged to Workers Logs (counts only, never the payload) and the client still gets its `204`,
-because clients never retry — losing a datapoint beats losing availability. Alongside the
-raw rows, the worker upserts `machine_days` and `machine_first_seen`; when a batch is emptied
-by the allowlist, nothing at all is written, so those tables only ever describe stored events.
+because clients never retry — losing a datapoint beats losing availability. Lifecycle events
+(`install`, `index`, `uninstall`) are one `events` row each. `usage_rollup` counters are
+**added** into `usage_daily`, one row per machine × day × tool: clients upload a counter per
+process rather than per day, and storing a row per upload is what filled the database in
+August 2026. Alongside those, the worker upserts `machine_days` and `machine_first_seen`; when
+a batch is emptied by the allowlist, nothing at all is written, so those tables only ever
+describe stored events.
 
-The complete schema is [`migrations/0001_init.sql`](migrations/0001_init.sql) —
+The complete schema is [`migrations/`](migrations/) (applied in order) —
 checked in for the same reason this worker's source is public: it is the entire list of what
 gets kept, with a comment on every column and on which dashboard chart each rollup table
-serves. Shape: raw sanitized `events`, `daily_*` rollups recomputed nightly, and
-`machine_days` / `machine_first_seen` for retention cohorts. The dashboard reads rollups; raw
+serves. Shape: raw sanitized `events`, `usage_daily` counters, `daily_*` rollups recomputed
+nightly, and `machine_days` / `machine_first_seen` for retention cohorts. The dashboard reads rollups; raw
 events exist for drill-down and are purged past the retention window.
 
 ```bash
@@ -56,29 +60,55 @@ edit to a migration that has been applied.
 Volume, at ~97k accepted POSTs/day: ≈30M D1 row writes/month against the 50M included on
 Workers Paid, plus roughly as much again once the purge reaches steady state — a delete bills
 like an insert, and at steady state every row written is eventually deleted, so budget ≈48M.
-D1 bills a row write per index touched on top of the table row, which is why `events` carries
-only two indexes; dropping `events_machine_day` is the first lever if that gets tight. Storage
-is the other constraint, and it is what sets the window: raw events grow ≈74 MB/day, so 90 days
-lands at ≈6.7 GB against D1's 10 GB per-database cap, while 180 days would exceed it. Full
+D1 bills a row write per index touched on top of the table row, which is why `events` now
+carries one index (`events_machine_day` is dropped by `0004`, once the legacy usage rows are
+folded out — on the full table the drop runs past D1's per-query limit). Storage is the other
+constraint, and it is what sets the window: the estimate here was ≈74 MB/day of raw events
+(≈6.7 GB at 90 days against D1's 10 GB per-database cap), but it assumed one usage row per
+machine × day × tool. Clients actually sent one per process — ≈3.8M rows a day by early
+August — and the database hit the cap on 2026-08-11. `usage_daily` bounds that by
+construction; re-measure with `npx wrangler d1 info codegraph-telemetry` before widening the
+window. Full
 arithmetic and the remaining levers are in the migration's footer comment.
+
+**A full database fails quietly.** D1 caps a database at 10 GB on Workers Paid (500 MB on
+Free), and upgrading cannot raise it. Once full, nearly every write fails with
+`D1_ERROR: Exceeded maximum DB size`: ingest stops storing events (the client never retries,
+so they are lost) and the nightly rollup stops too, while deletes and reads still work, so
+nothing looks broken from the outside. That ran from 2026-08-11 to October 2026.
+`npx wrangler d1 info codegraph-telemetry` shows the current size.
 
 ## Rollups & retention (nightly cron)
 
-`src/rollup.ts` runs on a Cron Trigger at **00:30 UTC** and does two things.
+`src/rollup.ts` runs on a Cron Trigger at **00:30 UTC** and does two things, the purge
+first.
 
-**Rolls up** the day that just ended into `daily_machines`, `daily_event_counts` and
-`daily_dim_counts`, then re-runs the two days before it — offline clients ship completed-day
-rollups late, so a day keeps growing after it ends. The aggregation is one
+**Rolls up** the day that just ended into `daily_machines`, `daily_event_counts`,
+`daily_dim_counts` and `machine_first_seen.first_index_day`, then re-runs the two days before
+it — offline clients ship completed-day rollups late, so a day keeps growing after it ends.
+It then **catches up** on any earlier day that saw activity but never got a rollup (a
+`machine_days` day with no `daily_machines` row — a night the run failed or the database
+refused writes), newest first, up to 31 a night. An outage heals on the first good night
+instead of leaving a hole someone has to notice. Cloudflare ends a Cron Trigger after 15
+minutes of wall-clock time, and a day that still holds millions of legacy usage rows (below)
+takes minutes, so the run starts no new day and no new fold chunk once 10 minutes have
+passed (`NIGHTLY_BUDGET_MS`). A day it stops partway gets no rollup at all, so it is still a
+missed day the next night, which carries on from the last folded chunk; the summary line
+counts those days as `deferred`. The aggregation is one
 `INSERT … SELECT … ON CONFLICT DO UPDATE` per table or dimension, so it happens inside D1 and
 no event row crosses the wire. Every write overwrites the recomputed value rather than adding
 to it: **re-running a day is a no-op, never a double count.** Two things the SQL is careful
-about — a `usage_rollup` row is a counter the client pre-aggregated, so its `count` prop is
-summed rather than the rows counted; and `index.languages` / `install.targets` are unnested
-with `json_each`, one row per element. Adding a breakdown is a line in `ROLLUP_STATEMENTS`,
+about — usage figures are sums of `usage_daily.count` (calls), not row counts; and
+`index.languages` / `install.targets` are unnested with `json_each`, one row per element.
+Before rolling up a day it folds any legacy `usage_rollup` rows still in `events` (how usage
+was stored before `0003`) into `usage_daily`, 50k rows per transaction, so re-running the
+rollup over old days is the whole migration. Adding a breakdown is a line in `ROLLUP_STATEMENTS`,
 never a migration — that is what the generic `(dim, value)` shape buys.
 
-**Purges** raw `events` older than `RETENTION_DAYS` (90, a var in `wrangler.jsonc`) in bounded
-`DELETE` batches, and logs one line of counts. `machine_days` and `machine_first_seen` are
+**Purges** raw `events` and `usage_daily` rows older than `RETENTION_DAYS` (90, a var in
+`wrangler.jsonc`) in bounded `DELETE` batches, before any rollup: behind a long catch-up it
+would be the part the 15-minute limit cuts off, night after night, while the database
+grows. The run ends with one line of counts. `machine_days` and `machine_first_seen` are
 never purged — retention cohorts need the full history and they are two orders of magnitude
 smaller. Rollups are kept forever, so shortening the window costs ad-hoc drill-back, never a
 chart.
@@ -97,6 +127,40 @@ changed and a value that no longer exists would otherwise linger. It is ignored 
 retention window, where it would delete rows and then find no events to rebuild them from —
 the response says which days it refused. Keep manual ranges to a few days at production volume;
 each day is a full scan of that day's events, and the request has a wall-clock budget.
+
+### Backfilling first_index_day
+
+`first_index_day` (migration `0002`) is what the dashboard's activation funnel reads. The
+ingest worker lowers it as each index event is stored, so an index run that uploads days late
+still counts, and the rollup re-derives it from the raw events of every day it rolls up. Days
+rolled up before the migration left it NULL, an index event stored before the ingest worker
+began setting it (#2333) counts only once its day is rolled up again, and days stored before
+`0003` still hold their usage as one `events` row per upload. Re-running the rollup over every
+day that still has raw events fixes all three — it folds that day's legacy usage rows into
+`usage_daily`, sets `first_index_day`, and recomputes the day's rollups. It is idempotent, so
+overlapping or repeating a range is harmless. A day with millions of legacy rows takes several
+minutes, so go a day at a time:
+
+```bash
+# One day per call, from the earliest raw event (2026-07-04) through yesterday.
+for day in $(node -e 'for (let t = Date.parse("2026-07-04"); t < Date.now() - 864e5; t += 864e5)
+                        console.log(new Date(t).toISOString().slice(0, 10))'); do
+  curl -sS -X POST -H "x-admin-token: $ADMIN_TOKEN" \
+    "https://telemetry.getcodegraph.com/admin/rollup?day=$day"; echo
+done
+```
+
+Move the start to the earliest day `events` still holds (`/api/meta` on the dashboard
+reports it as `earliest_raw_day`). A machine whose index events were purged before the backfill stays NULL
+and counts as not activated — so run it before the retention window passes those days.
+
+### When the dashboard says ingest stalled or the rollup is behind
+
+Both banners mean a writer stopped. In order: `npx wrangler tail codegraph-telemetry` (look
+for `d1 write failed` / `rollup day failed` and the error text), then
+`npx wrangler d1 info codegraph-telemetry` against the plan's database cap (see Storage
+above). Once writes succeed again the next nightly run catches the rollup up on its own; the
+events that arrived while writes were failing are gone.
 
 ## Deploy
 
@@ -246,6 +310,15 @@ To drive the cron body by hand, run `wrangler dev --test-scheduled` and hit
 `localhost:8787/__scheduled?cron=30+0+*+*+*`. For `POST /admin/rollup` locally, copy
 `.dev.vars.example` to `.dev.vars` — without an `ADMIN_TOKEN` the route 404s, exactly as a
 deploy that never set the secret does.
+
+The repo's own test suite also covers this worker and the dashboard API without wrangler:
+it runs their source against these migrations in an in-memory SQLite database, including
+late uploads and a nightly run whose catch-up outlasts the cron's time limit. From the repo
+root (it is part of `npm test` there):
+
+```bash
+npx vitest run __tests__/telemetry-services.test.ts
+```
 
 ## Changing the schema
 

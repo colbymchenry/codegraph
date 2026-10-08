@@ -136,6 +136,24 @@ fn is_vue_collection_name(name: &str) -> bool {
     matches!(name, "actions" | "mutations" | "getters")
 }
 
+/// OBJECT_MEMBER_FUNCTION_TYPES (tree-sitter.ts, #2300): the function values an
+/// owned object literal's member can hold.
+fn is_object_member_function(kind: &str) -> bool {
+    matches!(kind, "arrow_function" | "function_expression" | "generator_function")
+}
+
+/// STATIC_OBJECT_KEY_TYPES (tree-sitter.ts, #2300): keys that name a member — a
+/// computed `[expr]` key names nothing static.
+fn is_static_object_key(kind: &str) -> bool {
+    matches!(kind, "property_identifier" | "string" | "number")
+}
+
+/// HOST_GLOBAL_ROOTS (tree-sitter.ts, #2300): `window.App = {…}` defines the
+/// global `App`. (`self` is usually `var self = this` in page code, not the global.)
+fn is_host_global_root(name: &str) -> bool {
+    matches!(name, "window" | "globalThis")
+}
+
 /// One scope-stack entry (TS keeps node IDs; rows are our equivalent).
 struct Scope {
     row: u32,
@@ -153,6 +171,9 @@ struct Extra {
     is_async: Option<bool>,
     is_static: Option<bool>,
     qualified_name: Option<String>,
+    /// Never a value-read target: a local, or an object hung on a dotted path
+    /// (createNode's `valueTarget = false`, #2300).
+    not_value_target: bool,
 }
 
 struct ValueScope<'t> {
@@ -167,6 +188,7 @@ pub struct Walker<'t> {
     variant: Variant,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     /// Node id string per row. Rows are unique but IDS COLLIDE for same
@@ -184,6 +206,12 @@ pub struct Walker<'t> {
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
     vue_store_file: Option<bool>,
+    /// An object literal hung on a path (`window.App = {…}`) is qualified by
+    /// the path, and so is what it holds (#2300): row → that qualified name.
+    /// Mirrors TreeSitterExtractor.objectPathOwners.
+    object_path_owners: HashMap<u32, String>,
+    /// ownsObjectLiterals: false for a generated or minified bundle (#2300).
+    owns_objects: bool,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -222,6 +250,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         variant,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -232,6 +261,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
         vue_store_file: None,
+        object_path_owners: HashMap::new(),
+        owns_objects: !util::is_generated_file(file_path) && !util::is_minified_content(file_path, source),
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -348,7 +379,9 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
+        let value_target = !extra.not_value_target;
 
         // endLine body extension: resolveBody only (TS/JS: function-valued
         // class fields whose body nests in the arrow / HOF-wrapped arrow).
@@ -366,6 +399,13 @@ impl<'t> Walker<'t> {
         let qualified = extra.qualified_name.unwrap_or_else(|| {
             let mut parts: Vec<&str> = Vec::new();
             for s in &self.stack {
+                // A path-hung object literal qualifies what it holds by its
+                // path (`window.App::init`), which carries its own scope.
+                if let Some(path) = self.object_path_owners.get(&s.row) {
+                    parts.clear();
+                    parts.push(path);
+                    continue;
+                }
                 if s.kind != "file" {
                     parts.push(&s.name);
                 }
@@ -431,18 +471,19 @@ impl<'t> Walker<'t> {
         if kind == "function" || kind == "method" {
             self.defined_fn_names.insert(name.to_string());
         }
-        self.capture_value_ref_scope(kind, name, row, node);
+        self.capture_value_ref_scope(kind, name, row, node, value_target);
         Some(row)
     }
 
     // --- value references (captureValueRefScope / flushValueRefs) --------------
 
-    fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>) {
+    fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>, value_target: bool) {
         if !self.variant.value_refs() {
             return;
         }
         let target_kind_ok = kind == "constant" || kind == "variable";
-        if target_kind_ok
+        if value_target
+            && target_kind_ok
             && util::utf16_len(name) >= 3
             && util::has_upper_or_underscore().is_match(name)
         {
@@ -637,6 +678,12 @@ impl<'t> Walker<'t> {
         // Function-as-value capture — independent of the dispatch ladder.
         self.maybe_capture_fn_refs(node);
 
+        // `window.App = {…}` / `App.utils = {…}`: the object's functions are
+        // the path's members (#2300). Its whole subtree is handled there.
+        if kind == "assignment_expression" && self.extract_assigned_object_owner(node, true) {
+            return;
+        }
+
         if is_function_type(kind) {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
             self.extract_function(node, None);
@@ -726,6 +773,16 @@ impl<'t> Walker<'t> {
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
+        // A named object literal in a body (an IIFE's `const App = {…}`) owns
+        // its function members as one at module scope does, and so does
+        // `window.App = {…}` written in here (#2300). Each handles its subtree.
+        if kind == "variable_declarator" && self.extract_local_object_owner(node) {
+            return;
+        }
+        if kind == "assignment_expression" && self.extract_assigned_object_owner(node, false) {
+            return;
+        }
+
         if kind == "call_expression" {
             self.extract_call(node);
         } else if kind == "new_expression" {
@@ -749,6 +806,13 @@ impl<'t> Walker<'t> {
                 return;
             }
             if let Some(bound) = self.react_hook_bound_name(node) {
+                self.extract_function(node, Some(bound));
+                return;
+            }
+            // `const run = Effect.fn("Session.run")(function* () {…})` (#1747):
+            // the same declarator binding through a curried wrapper. Mirrors
+            // TreeSitterExtractor's curriedWrapperBoundName.
+            if let Some(bound) = self.curried_wrapper_bound_name(node) {
                 self.extract_function(node, Some(bound));
                 return;
             }
@@ -842,6 +906,71 @@ impl<'t> Walker<'t> {
         Some(self.text(name_node).to_string())
     }
 
+    /// The declarator name for an anonymous function passed to a CURRIED
+    /// wrapper call — `const NAME = factory(...)(function () {…})` — or the
+    /// property key when the call is an object member, `{ NAME: factory(...)(fn) }`;
+    /// else None.
+    ///
+    /// `react_hook_bound_name` above names a function through the declarator
+    /// that binds it; the shape is general, but that method is bounded to the
+    /// three React handler hooks. This is the same shape with a different,
+    /// equally decidable bound: the callee is itself a call, i.e. a factory
+    /// that returns the wrapper (#1747). Requiring that keeps it narrow —
+    /// `useMemo(|| …, [])` and `arr.map(…)` are single calls and stay
+    /// anonymous, exactly as before.
+    ///
+    /// Generators are admitted here and not in `react_hook_bound_name`: a
+    /// React handler is never a generator, while `function*` is the common
+    /// form in the ecosystem this shape comes from.
+    ///
+    /// Mirrors TreeSitterExtractor's curriedWrapperBoundName.
+    fn curried_wrapper_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        // The bound that replaces the hook allowlist: the thing being called
+        // is itself a call, so this is a curried wrapper's second application.
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != "call_expression" {
+            return None;
+        }
+        let binder = call.parent()?;
+        // `{ getMode: Effect.fn("…")(function* () {…}) }`: an object member is
+        // named by its property key, as extract_object_literal_functions names
+        // `key: () => {}`.
+        if binder.kind() == "pair" {
+            let key = binder.child_by_field_name("key")?;
+            let value = binder.child_by_field_name("value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            return Some(util::object_key_name(self.text(key)));
+        }
+        if binder.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = binder.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(name_node).to_string())
+    }
+
     /// extractName / extractNameRaw for the TS/JS configs.
     fn extract_name(&self, node: Node) -> String {
         // javascriptExtractor.resolveName: field_definition names its key the
@@ -901,7 +1030,8 @@ impl<'t> Walker<'t> {
         None
     }
 
-    /// isExported: walk the parent chain for an export_statement.
+    /// isExported: walk the parent chain for an export_statement, then ask
+    /// whether a `declare module '…'` / `declare global` body exports it.
     fn is_exported(&self, node: Node) -> bool {
         let mut cur = node.parent();
         while let Some(p) = cur {
@@ -910,7 +1040,7 @@ impl<'t> Walker<'t> {
             }
             cur = p.parent();
         }
-        false
+        is_ambient_export(node)
     }
 
     fn has_keyword_child(&self, node: Node, kw: &str) -> bool {
@@ -1005,6 +1135,48 @@ fn resolve_field_body(node: Node) -> Option<Node> {
 /// resolveBody ?? getChildByField(node, 'body') — the body-walk resolution.
 fn body_of(node: Node) -> Option<Node> {
     resolve_field_body(node).or_else(|| node.child_by_field_name("body"))
+}
+
+/// isAmbientExport (languages/typescript.ts): declared in a `declare module
+/// 'x' { … }` or `declare global { … }` body, which TypeScript exports without
+/// an `export` keyword unless the body holds an export declaration of its own.
+fn is_ambient_export(node: Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "statement_block" && has_export_declaration(p) {
+            return false;
+        }
+        if p.kind() == "ambient_declaration" {
+            // `declare global` is the keyword and a bare block, with no field names.
+            for i in 0..p.child_count() {
+                if p.child(i).is_some_and(|c| c.kind() == "global") {
+                    return true;
+                }
+            }
+            if let Some(declared) = p.named_child(0) {
+                if declared.kind() == "module"
+                    && declared.child_by_field_name("name").is_some_and(|n| n.kind() == "string")
+                {
+                    return true;
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// hasExportDeclaration: a statement that exports by name or by assignment
+/// (`export {…}`, `export =`, `export default x`), not by declaring.
+fn has_export_declaration(block: Node) -> bool {
+    for i in 0..block.named_child_count() {
+        if let Some(statement) = block.named_child(i) {
+            if statement.kind() == "export_statement" && statement.child_by_field_name("declaration").is_none() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn opt_str(arena: &mut Arena, s: Option<&str>) -> StrRef {

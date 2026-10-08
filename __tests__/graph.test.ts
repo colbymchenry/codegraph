@@ -612,4 +612,121 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     // The regression: this direct dependency edge used to vanish.
     expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'P' && e.kind === 'calls')).toBe(true);
   });
+
+  // The issue's graph: a→t, b→a, b→t, c→b. Edge order sends the walk to b
+  // through a first, at the depth limit, before the direct b→t edge (#1974).
+  const depthNodes = ['t', 'a', 'b', 'c'].map((n) => tNode(n));
+  const depthEdges: Edge[] = [
+    { source: 'a', target: 't', kind: 'calls', line: 1 },
+    { source: 'b', target: 'a', kind: 'calls', line: 2 },
+    { source: 'b', target: 't', kind: 'calls', line: 3 },
+    { source: 'c', target: 'b', kind: 'calls', line: 4 },
+  ];
+
+  it('getImpactRadius finds a dependent within the depth even when a longer path reaches its parent first (#1974)', () => {
+    const sub = tGraph(depthNodes, depthEdges).getImpactRadius('t', 2);
+    // c → b → t is two hops. Pre-fix: b was first reached via a at depth 2 and
+    // never expanded again, so c was missing.
+    expect([...sub.nodes.keys()].sort()).toEqual(['a', 'b', 'c', 't']);
+    expect(sub.edges.some((e) => e.source === 'c' && e.target === 'b')).toBe(true);
+    // Re-expanding b does not record its incoming edges twice.
+    const keys = sub.edges.map((e) => `${e.source}>${e.target}:${e.line}`);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('getCallers at depth N finds every caller within N hops, each once (#1974)', () => {
+    const callers = tGraph(depthNodes, depthEdges).getCallers('t', 2);
+    expect(callers.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('getCallees at depth N finds every callee within N hops, each once (#1974)', () => {
+    // Mirror image: t→a, a→b, t→b, b→c. From t, b is 1 hop and c is 2.
+    const edges: Edge[] = [
+      { source: 't', target: 'a', kind: 'calls', line: 1 },
+      { source: 'a', target: 'b', kind: 'calls', line: 2 },
+      { source: 't', target: 'b', kind: 'calls', line: 3 },
+      { source: 'b', target: 'c', kind: 'calls', line: 4 },
+    ];
+    const callees = tGraph(depthNodes, edges).getCallees('t', 2);
+    expect(callees.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('findPath enqueue-once (#1359)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-findpath-'));
+    fs.writeFileSync(path.join(testDir, 'graph.ts'), 'export function start() {}\n');
+    cg = CodeGraph.initSync(testDir);
+  });
+
+  afterEach(() => {
+    cg?.close();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function seed(ids: string[], edges: Edge[]) {
+    for (const id of ids) {
+      cg['queries'].insertNode({ ...tNode(id), filePath: 'graph.ts' });
+    }
+    edges.forEach((edge, i) => cg['queries'].insertEdge({ ...edge, line: i + 1 }));
+  }
+
+  it('enqueues each dense fan-in target once while preserving the shortest path', () => {
+    const layerA = Array.from({ length: 16 }, (_, i) => `a${i}`);
+    const layerB = Array.from({ length: 16 }, (_, i) => `b${i}`);
+    const ids = ['start', ...layerA, ...layerB, 'end'];
+    const edges: Edge[] = [];
+    for (const a of layerA) {
+      edges.push({ source: 'start', target: a, kind: 'calls' });
+      for (const b of layerB) edges.push({ source: a, target: b, kind: 'calls' });
+    }
+    for (const b of layerB) edges.push({ source: b, target: 'end', kind: 'calls' });
+    seed(ids, edges);
+
+    // Count actual queue insertions, without timing thresholds or replacing SQLite.
+    const counts = new Map<string, number>();
+    const push = Array.prototype.push;
+    let result: ReturnType<CodeGraph['findPath']>;
+    try {
+      Array.prototype.push = function (...items) {
+        for (const item of items) {
+          if (item && typeof item.nodeId === 'string' && Array.isArray(item.path)) {
+            counts.set(item.nodeId, (counts.get(item.nodeId) ?? 0) + 1);
+          }
+        }
+        return Reflect.apply(push, this, items);
+      };
+      result = cg.findPath('start', 'end', ['calls']);
+    } finally {
+      Array.prototype.push = push;
+    }
+    expect(result?.map((step) => step.node.id)).toEqual(['start', 'a0', 'b0', 'end']);
+    expect(result?.slice(1).every((step) => step.edge?.kind === 'calls')).toBe(true);
+    expect(counts).toEqual(new Map(ids.slice(1).map((id) => [id, 1])));
+  });
+
+  it('preserves shortest paths and edge filters with cycles and parallel edges', () => {
+    seed(['start', 'a', 'b', 'end', 'isolated'], [
+      { source: 'start', target: 'start', kind: 'calls' },
+      { source: 'start', target: 'a', kind: 'calls' },
+      { source: 'start', target: 'a', kind: 'calls' },
+      { source: 'a', target: 'start', kind: 'calls' },
+      { source: 'a', target: 'b', kind: 'calls' },
+      { source: 'b', target: 'end', kind: 'calls' },
+      { source: 'start', target: 'end', kind: 'references' },
+    ]);
+    const result = cg.findPath('start', 'end', ['calls']);
+    expect(result?.map((step) => step.node.id)).toEqual(['start', 'a', 'b', 'end']);
+    expect(result?.[1].edge?.line).toBe(2);
+    expect(cg.findPath('start', 'end')?.map((step) => step.node.id)).toEqual(['start', 'end']);
+    expect(cg.findPath('start', 'start')?.map((step) => step.node.id)).toEqual(['start']);
+    expect(cg.findPath('start', 'isolated')).toBeNull();
+    expect(cg.findPath('missing', 'end')).toBeNull();
+    expect(cg.findPath('start', 'missing')).toBeNull();
+    expect(cg.findPath('missing', 'missing')).toBeNull();
+    expect(cg.findPath('start', 'end', ['imports'])).toBeNull();
+  });
 });

@@ -7,9 +7,10 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
-import { Language } from '../types';
+import { ExtractionError, Language } from '../types';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -172,6 +173,67 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tofu': 'terraform',
 };
 
+/** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+/**
+ * Consecutive packets whose sync byte must line up before a file counts as
+ * video — 3 KB of head. A stream shorter than that is cheap to parse anyway;
+ * the cost #1910 is about comes from clips hundreds of KB long.
+ */
+const MPEG_TS_MIN_PACKETS = 16;
+/**
+ * Share of the head that must be control bytes (below 0x20, other than the
+ * whitespace ones) for it to count as binary. Compressed audio and video put
+ * about one byte in eight there; source text puts none.
+ */
+const MPEG_TS_MIN_CONTROL_SHARE = 1 / 64;
+/**
+ * How many bytes of a file's head `isMpegTransportStream` needs — enough to
+ * see `MPEG_TS_MIN_PACKETS` sync bytes plus the packets between them.
+ */
+export const MPEG_TS_SNIFF_BYTES = MPEG_TS_PACKET_SIZE * MPEG_TS_MIN_PACKETS;
+
+/**
+ * Whether these leading bytes are an MPEG transport stream — the OTHER thing a
+ * `.ts` file can be. Golden video fixtures (`testdata/*.ts`, e2e clips) share
+ * TypeScript's extension, and tree-sitter takes ~28 s to chew through a 900 KB
+ * clip for zero symbols (#1910), so the decision has to be made from the head
+ * of the file, before any parse.
+ *
+ * Two conditions, both required:
+ *   1. the sync byte 0x47 sits at every 188-byte packet boundary of the first
+ *      `MPEG_TS_MIN_PACKETS` packets — every packet of a transport stream
+ *      opens with it, and nothing else pads to 188;
+ *   2. the head is binary: at least `MPEG_TS_MIN_CONTROL_SHARE` of it is
+ *      control bytes, as any compressed payload is.
+ * 0x47 is the letter `G`, so (1) alone could match source whose lines happen
+ * to put a `G` at every 188-byte stride. Checking for a single NUL was not
+ * enough to close that: one NUL in a comment is still TypeScript. (2) asks for
+ * dozens of control bytes, which no source file carries.
+ *
+ * `head` is the first `MPEG_TS_SNIFF_BYTES` (or fewer) bytes of the file.
+ */
+export function isMpegTransportStream(head: Uint8Array): boolean {
+  const lastSync = MPEG_TS_PACKET_SIZE * (MPEG_TS_MIN_PACKETS - 1);
+  if (head.length <= lastSync) return false;
+  for (let off = 0; off <= lastSync; off += MPEG_TS_PACKET_SIZE) {
+    if (head[off] !== MPEG_TS_SYNC_BYTE) return false;
+  }
+  let control = 0;
+  for (let i = 0; i < head.length; i++) {
+    const b = head[i]!;
+    // Tab, newline, vertical tab, form feed and carriage return are text.
+    if (b < 0x20 && (b < 0x09 || b > 0x0d)) control++;
+  }
+  return control >= head.length * MPEG_TS_MIN_CONTROL_SHARE;
+}
+
+/** Whether `filePath` carries the one extension MPEG-TS shares with a language. */
+export function hasMpegTsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.ts';
+}
+
 /**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived
@@ -180,10 +242,14 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its extensions count as indexable in addition
  * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to. A Shopify theme's
+ * JSON templates count only when it is given, since telling a theme apart takes
+ * a look at the files beside them (see `isShopifyLiquidJson`).
  */
-export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
-  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isShopifyLiquidJson(filePath, rootDir)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
@@ -192,14 +258,54 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
 }
 
 /**
+ * What marks a Shopify theme's root, beside its `templates/` and `sections/`:
+ * the `layout/theme.liquid` every theme must have, or its settings schema.
+ */
+const SHOPIFY_THEME_MARKERS = ['layout/theme.liquid', 'config/settings_schema.json'];
+
+/** The folders a Shopify theme is made of. */
+const SHOPIFY_THEME_FOLDERS = /^(assets|blocks|config|layout|locales|sections|snippets|templates)$/i;
+
+/**
+ * The root of the Shopify theme `filePath` is in: the directory holding the
+ * theme folder (one `folders` matches) the file sits in, when that directory
+ * also holds one of `SHOPIFY_THEME_MARKERS`. Project-relative and
+ * `/`-separated, '' for the project root; undefined when the file is in no
+ * theme. `exists` says whether a project-relative path exists. The folder
+ * nearest the file is tried first.
+ */
+export function shopifyThemeRoot(
+  filePath: string,
+  exists: (relativePath: string) => boolean,
+  folders: RegExp = SHOPIFY_THEME_FOLDERS,
+): string | undefined {
+  const segments = filePath.split('/');
+  for (let i = segments.length - 2; i >= 0; i--) {
+    if (!folders.test(segments[i]!)) continue;
+    const themeDir = segments.slice(0, i).join('/');
+    if (SHOPIFY_THEME_MARKERS.some((marker) => exists(themeDir ? `${themeDir}/${marker}` : marker))) return themeDir;
+  }
+  return undefined;
+}
+
+/**
  * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
  * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
  * extractor links them. (config/ + locales/ JSON have no section refs.)
+ *
+ * Only inside a Shopify theme: the directory holding that `templates/` or
+ * `sections/` must also hold one of `SHOPIFY_THEME_MARKERS`. Plenty of other
+ * projects keep JSON in folders with those names — a .NET project template's
+ * `templates/<name>/.template.config/template.json`, schematics, CMS content —
+ * and it is not Liquid. The theme is looked for under `rootDir`, the project
+ * root `filePath` is relative to; without one there is no theme to find.
  */
-export function isShopifyLiquidJson(filePath: string): boolean {
+export function isShopifyLiquidJson(filePath: string, rootDir?: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
-  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+  if (rootDir === undefined || !/(^|\/)(templates|sections)\/.+\.json$/i.test(filePath)) return false;
+  const exists = (relativePath: string): boolean => fs.existsSync(path.join(rootDir, relativePath));
+  return shopifyThemeRoot(filePath, exists, /^(templates|sections)$/i) !== undefined;
 }
 
 /**
@@ -329,6 +435,8 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
   // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
   // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
+  // Both carry docs/grammars/tree-sitter-kotlin.patch (scanner: no automatic
+  // semicolon before a same-line `e` word, e.g. an `eq` infix call).
   'kotlin',
   // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
   // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/
@@ -473,19 +581,27 @@ export function getParser(language: Language): Parser | null {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its mappings take precedence over the built-in
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to, as for
+ * `isSourceFile`: a Shopify theme's JSON templates are Liquid only with it.
  */
-export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>, rootDir?: string): Language {
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
-  // links each section `"type"` to its `sections/<type>.liquid`).
-  if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // A Shopify theme's OS 2.0 JSON templates / section groups → the Liquid
+  // extractor (it links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath, rootDir)) return 'liquid';
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
+
+  // A Flow-typed `.js` (`// @flow` in its leading comments) parses as TSX:
+  // the JavaScript grammar can't read its annotations — `render(): React.Node`
+  // cut a class short — and TypeScript's syntax covers most of Flow's.
+  if ((lang === 'javascript' || lang === 'jsx') && source && hasFlowPragma(source)) return 'tsx';
 
   // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
@@ -493,7 +609,106 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
     if (looksLikeObjc(source)) return 'objc';
   }
 
+  // `.inc` is PHP's include extension (Drupal) and Pascal/Delphi's too
+  // (`{$I defs.inc}`: directive blocks, declaration fragments), so it is
+  // decided per file by content (#2279). An explicit codegraph.json mapping
+  // for `.inc` is the user's answer and is not second-guessed.
+  if (lang === 'php' && ext === '.inc' && source && !(overrides && overrides[ext]) && looksLikePascalInclude(source)) {
+    return 'pascal';
+  }
+
   return lang;
+}
+
+/** A PHP open tag: `<?php` in any case, or the short echo `<?=` (never `<?xml`). */
+const PHP_OPEN_TAG_RE = /<\?(?:php|=)/i;
+
+// Building blocks for the Pascal line shapes below. A line start allows
+// indentation and the BOM Windows editors write (a BOM'd Delphi include must
+// not drop back to PHP). A section keyword's break runs to the end of its line
+// and over blank / comment-only lines, up to the first declaration.
+const PAS_LINE = String.raw`^[ \t\uFEFF]*`;
+const PAS_NAME = String.raw`[a-z_]\w*(?:<[^>\n]*>)?`;
+const PAS_QNAME = String.raw`[a-z_][\w.]*(?:<[^>\n]*>)?`;
+const PAS_COMMENT = String.raw`(?:\/\/[^\n]*|\{[^$}\n][^}\n]*\}[ \t]*)?`;
+const PAS_SECTION_BREAK = String.raw`[ \t]*${PAS_COMMENT}(?:\r?\n[ \t]*${PAS_COMMENT})+`;
+const pascalLine = (shape: string): RegExp => new RegExp(PAS_LINE + shape, 'im');
+
+/**
+ * Line shapes only Pascal writes, any one of which makes an untagged `.inc`
+ * Pascal. Each leans on Pascal's own punctuation, so the dialects that share a
+ * keyword with it stay out: JavaScript `const x = 1;` / `function f() {`,
+ * SourcePawn `function void (int client);`, C++ `const T X::Y = …`, VBScript
+ * `Const X = 1` / `Function F(a)`, Smarty `{$var}`, Makefile `X := y`, prose
+ * with `Begin` on a line of its own. Every pattern stays linear on a long
+ * whitespace run: no run can be split two ways between neighbouring
+ * quantifiers.
+ */
+const PASCAL_INCLUDE_SIGNALS: readonly RegExp[] = [
+  // A compiler directive: a name and an argument (`{$IFDEF X}`, `{$DEFINE X}`,
+  // `{$I file.inc}`, `{$WARN X OFF}`), a bare `{$ELSE}` / `{$ENDIF}` /
+  // `{$IFEND}`, or a switch (`{$R-}`, `{$A+,B-}`) — or the `{%MainUnit x.pp}`
+  // line Lazarus opens its include files with.
+  pascalLine(String.raw`\{(?:\$(?:[a-z]\w*[ \t]+[^\s}]|(?:else|endif|ifend)[ \t]*\}|[a-z][+-][,}])|%MainUnit\b)`),
+  // A routine header, closed by `;`: `procedure Foo;`, `procedure TForm1.Click(Sender: TObject);`,
+  // `class constructor Create;` — and a function's result type after its
+  // parameters (`function Bar(A: Integer): string;`; bare `function Bar;` is
+  // the implementation-section short form). The parameter list stops at any
+  // parenthesis, so a file of unclosed `procedure X(` lines stays linear.
+  pascalLine(
+    String.raw`(?:class[ \t]+)?(?:(?:procedure|constructor|destructor)[ \t]+${PAS_QNAME}[ \t]*(?:\([^()]*\)[ \t]*)?` +
+      String.raw`|function[ \t]+${PAS_QNAME}[ \t]*(?:(?:\([^()]*\)[ \t]*)?:[ \t]*[\w.]+(?:<[^>\n]*>)?[ \t]*)?);`
+  ),
+  // `unit Foo;` and a `uses A, B;` clause.
+  pascalLine(String.raw`unit[ \t]+[a-z_][\w.]*[ \t]*;`),
+  pascalLine(String.raw`uses\s+[a-z_][\w.]*(?:\s*,\s*[a-z_][\w.]*)*\s*;`),
+  // A `const` section, then `X = …` / `X: T = …`; or a typed constant on one
+  // line (`const Max: Integer = 10;`). The type never holds a `:`.
+  pascalLine(
+    String.raw`(?:const|resourcestring)(?:${PAS_SECTION_BREAK}[a-z_]\w*[ \t]*(?::[^=;:\n]+)?=|[ \t]+[a-z_]\w*[ \t]*:[^=;:\n]+=)`
+  ),
+  // A `var` section: `G, H: Integer;`, on the keyword's line or below it.
+  pascalLine(
+    String.raw`(?:var|threadvar)(?:${PAS_SECTION_BREAK}|[ \t]+)[a-z_]\w*(?:[ \t]*,[ \t]*[a-z_]\w*)*[ \t]*:(?!:)[^;\n]*;`
+  ),
+  // A `type` section, then `TFoo =`; or `type TFoo = class…` (record /
+  // interface / set of / array / procedure type) on one line.
+  pascalLine(
+    String.raw`type(?:${PAS_SECTION_BREAK}${PAS_NAME}[ \t]*=|[ \t]+${PAS_NAME}[ \t]*=[ \t]*(?:packed[ \t]+)?` +
+      String.raw`(?:class|record|object|interface|dispinterface|set[ \t]+of|array|reference[ \t]+to|procedure|function)\b)`
+  ),
+];
+
+/** A `begin` … `end;` block: both halves needed, so neither alone flips a file. */
+const PASCAL_BEGIN_RE = pascalLine(String.raw`begin\b`);
+const PASCAL_END_RE = pascalLine(String.raw`end[ \t]*[;.][ \t]*$`);
+
+/**
+ * Whether an `.inc` file is a Pascal include rather than a PHP one (#2279).
+ *
+ * A PHP include always opens a PHP tag somewhere, so a tag anywhere keeps the
+ * file PHP. Without one, a Pascal-only line shape (`PASCAL_INCLUDE_SIGNALS`,
+ * or a `begin` … `end;` pair) makes it Pascal. Anything else keeps the PHP
+ * mapping — untagged text is inline HTML to PHP, so nothing is extracted —
+ * rather than handing a C / assembly / POV-Ray / ASP `.inc` to the Pascal
+ * grammar's error recovery.
+ *
+ * Deliberately per file, not "does this project have `.pas` files": the
+ * answer depends only on the file's own bytes, so a full index, a sync of one
+ * edited include, and a fresh re-index always agree — a project-level gate
+ * would flip an untouched include whenever the last `.pas` file came or went.
+ */
+function looksLikePascalInclude(source: string): boolean {
+  if (PHP_OPEN_TAG_RE.test(source)) return false;
+  if (PASCAL_INCLUDE_SIGNALS.some((re) => re.test(source))) return true;
+  return PASCAL_BEGIN_RE.test(source) && PASCAL_END_RE.test(source);
+}
+
+/** Whether a JavaScript file's leading comments carry Flow's `@flow` pragma (and not `@noflow`). */
+export function hasFlowPragma(source: string): boolean {
+  const head = source.slice(0, 4096).replace(/^#![^\n]*\n/, '');
+  const lead = /^(?:\s*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/))*/.exec(head)?.[0] ?? '';
+  return /@flow\b/.test(lead) && !/@noflow\b/.test(lead);
 }
 
 /**
@@ -659,6 +874,21 @@ export function getUnavailableGrammarErrors(): Partial<Record<Language, string>>
     out[language] = message;
   }
   return out;
+}
+
+/**
+ * Whether these extraction errors say the file was never parsed because its
+ * grammar was not available (`parser_error`, recorded by the extractor when
+ * `getParser` has nothing for the language).
+ *
+ * That is a fact about the running process, not about the file: a daemon whose
+ * install was upgraded or deleted underneath it fails every lazy grammar load
+ * (#2335). Such a result must never replace a file's index data, and a row an
+ * older engine stored that way must be re-indexed — not treated as current
+ * because its content hash still matches.
+ */
+export function hasGrammarLoadFailure(errors: readonly ExtractionError[] | undefined): boolean {
+  return !!errors && errors.some((e) => e.code === 'parser_error');
 }
 
 /**

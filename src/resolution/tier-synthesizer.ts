@@ -36,8 +36,10 @@
  * `href` it was paired on, and `registeredAt` — the route registration, the
  * decorator, the `.on` — so a reader can check the pairing. Fan-out is capped
  * per event as the emitter pass caps it; an HTTP pairing needs no cap because
- * it is exact. Test suites and generated files are never sources: a supertest
- * call is the test's story, and forty of them would make the route a hub.
+ * it is exact. Test suites and generated files are never sources of these
+ * passes: a supertest call is the test's story, and forty of them would make
+ * the route a hub. The one exception is section 4, a Spring / Laravel test's
+ * request onto its route, whose edges are kept out of fan-in for that reason.
  */
 
 import type { Edge, Language, Node } from '../types';
@@ -248,12 +250,13 @@ function decorators(safe: string, name: string): Array<{ args: string; index: nu
 interface FileFacts {
   file: string;
   safe: string;
-  nodes: Node[];
+  /** Read on first use: most files that pass a gate hold no site, and never need them. */
+  readonly nodes: Node[];
   lineOf: (idx: number) => number;
   /** The 0-based column of an index on its line — where the site reader looks for the call. */
   columnOf: (idx: number) => number;
   /** Lines a framework resolver made a route node on — registrations, never client calls. */
-  routeLines: Set<number>;
+  readonly routeLines: Set<number>;
   /** Local names bound to an HTTP client instance, with their literal base URL when written. */
   clients: Map<string, { baseURL: string | null }>;
   /** The module's default export is a client instance. */
@@ -284,9 +287,8 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   const content = ctx.readFile(file);
   if (!content) return null;
   const safe = stripCommentsForRegex(content, 'typescript');
-  const nodes = ctx.getNodesInFile(file);
-  const routeLines = new Set<number>();
-  for (const n of nodes) if (n.kind === 'route') routeLines.add(n.startLine);
+  let nodes: Node[] | null = null;
+  let routeLines: Set<number> | null = null;
   const clients = new Map<string, { baseURL: string | null }>();
   CLIENT_FACTORY.lastIndex = 0;
   let m: RegExpExecArray | null;
@@ -303,10 +305,18 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   return {
     file,
     safe,
-    nodes,
+    get nodes() {
+      return (nodes ??= ctx.getNodesInFile(file));
+    },
     lineOf: makeLineAt(safe, 1),
     columnOf: (idx: number) => idx - (safe.lastIndexOf('\n', idx - 1) + 1),
-    routeLines,
+    get routeLines() {
+      if (!routeLines) {
+        routeLines = new Set<number>();
+        for (const n of this.nodes) if (n.kind === 'route') routeLines.add(n.startLine);
+      }
+      return routeLines;
+    },
     clients,
     defaultClient,
     queues,
@@ -347,9 +357,20 @@ const CLIENT_NAMES =
 const SERVER_NAMES = /^(?:app|router|route|routes|express|fastify|koa|hono|elysia|apiRouter|v1|v2|r)$/;
 /** A type argument between the callee and its `(` — `useSWR<TeamData>('/api/team')`, `ky.get<User>('/x')`. */
 const GENERIC = String.raw`(?:<[^()<>]*(?:<[^()<>]*>[^()<>]*)*>)?`;
+/**
+ * Where a receiver chain (`this.api.client`) may begin: not after an earlier
+ * identifier-start character of the same word (the second lookbehind is the
+ * whole rule; the first is its one-character fast path). A match from the
+ * middle of a word implies one from its first letter — the chain regexes read
+ * the rest of the word either way — and each of their matches ends on a
+ * non-word character, so a scan never resumes mid-word: this only skips starts
+ * bound to fail. Without it every letter of every identifier re-read the
+ * dotted chain behind it, which on vscode made this the slowest pass.
+ */
+const CHAIN_START = String.raw`(?<![A-Za-z_$])(?<![A-Za-z_$][\w$]+)`;
 const BARE_CLIENT_CALL = new RegExp(String.raw`(?:(?:window|globalThis|global)\s*\.\s*)?\b(fetch|\$fetch|ofetch|axios|ky|got|useFetch|useSWR)\s*${GENERIC}\s*\(`, 'g');
 const MEMBER_CLIENT_CALL = new RegExp(
-  String.raw`((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*(get|post|put|patch|delete|head|options|request|\$get|\$post|\$put|\$patch|\$delete)\s*${GENERIC}\s*\(`,
+  String.raw`${CHAIN_START}((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*(get|post|put|patch|delete|head|options|request|\$get|\$post|\$put|\$patch|\$delete)\s*${GENERIC}\s*\(`,
   'g'
 );
 
@@ -508,12 +529,12 @@ function clientFor(
 }
 
 function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpSite[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   const add = (index: number, open: number, verb: string | null, baseURL: string | null): void => {
     const line = lineOf(index);
     const callee = safe.slice(index, open).replace(/\s+/g, '').replace(/<.*>$/, '');
     if (facts.routeLines.has(line)) return; // a registration the resolver already read
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) return;
     const args = argumentsAt(safe, open);
     if (!args || !args[0]) return;
@@ -556,10 +577,10 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
 // 2. Queue job → consumer
 // =============================================================================
 
-const QUEUE_ADD = /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*add\s*\(\s*(['"`])([^'"`]+)\2/g;
+const QUEUE_ADD = new RegExp(CHAIN_START + /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*add\s*\(\s*(['"`])([^'"`]+)\2/.source, 'g');
 const QUEUE_SHAPED = /queue|jobs?$|worker|bull|flow|producer/i;
 const NEW_WORKER = /\bnew\s+Worker\s*(?:<[^>]*>)?\s*\(\s*(['"`])([^'"`]+)\1\s*,\s*/g;
-const QUEUE_PROCESS = /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*process\s*\(\s*(?:(['"`])([^'"`]+)\2\s*,\s*)?(?:\d+\s*,\s*)?/g;
+const QUEUE_PROCESS = new RegExp(CHAIN_START + /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*process\s*\(\s*(?:(['"`])([^'"`]+)\2\s*,\s*)?(?:\d+\s*,\s*)?/.source, 'g');
 /** A handler argument: a named function (group 1), or an inline function. */
 const HANDLER_ARG = /^(?:(?:async\s+)?([A-Za-z_$][\w$.]*)\s*(?:[,)]|$)|(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>))/;
 
@@ -644,7 +665,7 @@ function decoratedMethod(facts: FileFacts, end: number, cls: Node | null): Node 
 }
 
 function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: QueueProducer[], consumers: QueueConsumer[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   let m: RegExpExecArray | null;
   QUEUE_ADD.lastIndex = 0;
   while ((m = QUEUE_ADD.exec(safe)) !== null) {
@@ -653,7 +674,7 @@ function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: Queue
     const last = receiver.replace(/\s+/g, '').split('.').pop()!;
     if (queue === null && !QUEUE_SHAPED.test(last)) continue;
     const line = lineOf(m.index);
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) continue;
     producers.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: `${receiver.replace(/\s+/g, '')}.add`, queue, job: m[3]! });
   }
@@ -674,7 +695,7 @@ function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: Queue
       consumers.push({ node: method, file: facts.file, line, queue, job: firstLiteral(job.args) });
     }
     if (!any) {
-      const process = nodes.find((n) => n.kind === 'method' && n.name === 'process' && n.startLine >= cls.startLine && n.endLine <= cls.endLine);
+      const process = facts.nodes.find((n) => n.kind === 'method' && n.name === 'process' && n.startLine >= cls.startLine && n.endLine <= cls.endLine);
       if (process) consumers.push({ node: process, file: facts.file, line: process.startLine, queue, job: null });
     }
   }
@@ -745,8 +766,10 @@ function pairQueue(producers: readonly QueueProducer[], consumers: readonly Queu
 // 3. Events: a bus, and sockets both ways
 // =============================================================================
 
-const EMIT = /((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(emit|emitAsync)\s*\(\s*(['"`])([^'"`\n]+)\3/g;
-const SOCKET_ON = /((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(?:on|once)\s*\(\s*(['"`])([^'"`\n]+)\2\s*,\s*/g;
+// A word character opens these chains, so a word's first character is the
+// only start that can match (same argument as CHAIN_START).
+const EMIT = /(?<![\w$])((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(emit|emitAsync)\s*\(\s*(['"`])([^'"`\n]+)\3/g;
+const SOCKET_ON = /(?<![\w$])((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(?:on|once)\s*\(\s*(['"`])([^'"`\n]+)\2\s*,\s*/g;
 const SOCKET_WORDS = /^(?:socket|io|ws|wss|client|server|namespace|nsp|conn|connection|gateway|broadcast|to|in|of|except|volatile|local|sockets|socketServer|wsServer|room|channel|pusher|ably|ioClient|socketClient|sock)$/;
 const BUS_WORDS = /^(?:eventEmitter|emitter|events|eventBus|bus|dispatcher|pubsub|publisher|eventPublisher|ee|hub|mediator|broker|messageBus|appEvents|domainEvents|eventsService|eventService)$/;
 /** The transport's own events — every socket emits and handles them; pairing them says nothing. */
@@ -782,7 +805,7 @@ function shapeOf(receiver: string): 'bus' | 'socket' | null {
 }
 
 function collectEvents(ctx: ResolutionContext, facts: FileFacts, dispatches: Dispatch[], handlers: Handler[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   const side: 'server' | 'client' = facts.socketServer ? 'server' : 'client';
   let m: RegExpExecArray | null;
   EMIT.lastIndex = 0;
@@ -790,7 +813,7 @@ function collectEvents(ctx: ResolutionContext, facts: FileFacts, dispatches: Dis
     const shape = shapeOf(m[1]!);
     if (!shape || GENERIC_EVENT.test(m[4]!)) continue;
     const line = lineOf(m.index);
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) continue;
     dispatches.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: `${m[1]!.replace(/\s+/g, '')}.${m[2]!}`, event: m[4]!, shape, side });
   }
@@ -876,9 +899,331 @@ function pairEvents(dispatches: readonly Dispatch[], handlers: readonly Handler[
 // The pass
 // =============================================================================
 
+// =============================================================================
+// 4. Test request → route
+// =============================================================================
+
+/*
+ * Spring and Laravel tests reach a controller by URL, never by a call:
+ * MockMvc's `perform(post("/owners/new"))`, WebTestClient's `.get().uri(…)`,
+ * TestRestTemplate, RestAssured, and Laravel's `$this->postJson('api/me')`.
+ * Without an edge every controller those suites exercise reads as untested —
+ * the viewer's "No test reaches this" and explore's `tests:` line both walk
+ * callers. One edge per (test, route), from the test method (the file, for a
+ * Pest closure) to the route; the route's own edge reaches the handler.
+ *
+ * These are the one kind of edge whose source is a test. They don't count
+ * toward a route's fan-in (countIncomingEdges), so a well-tested endpoint
+ * never becomes a hub the Steps walk refuses to enter.
+ */
+
+const TEST_REQUEST_FILE = /\.(?:java|kt|kts|php)$/;
+const TEST_VERBS = 'get|post|put|patch|delete|head|options';
+/** A bare `get("/x")` is MockMvc's only where the file imports its builders. */
+const MOCKMVC_BUILDERS = /\bMockMvcRequestBuilders\b/;
+const MOCKMVC_BUILDER = new RegExp(String.raw`(?<![\w$.])(?:MockMvcRequestBuilders\s*\.\s*)?(${TEST_VERBS}|multipart)\s*\(`, 'g');
+const MOCKMVC_REQUEST = /(?<![\w$.])(?:MockMvcRequestBuilders\s*\.\s*)?request\s*\(\s*HttpMethod\s*\.\s*([A-Z]+)\s*,/g;
+const KOTLIN_MOCKMVC = new RegExp(String.raw`\b\w*[mM]ockMvc\s*\.\s*(${TEST_VERBS})\s*\(`, 'g');
+const WEB_TEST_CLIENT = new RegExp(String.raw`\.\s*(${TEST_VERBS})\s*\(\s*\)\s*\.\s*uri\s*\(`, 'g');
+const REST_TEMPLATE = /\b\w*[Rr]estTemplate\s*\.\s*(getForEntity|getForObject|postForEntity|postForObject|postForLocation|put|delete|patchForObject|exchange)\s*\(/g;
+const REST_ASSURED = new RegExp(String.raw`(?:\.\s*when\s*\(\s*\)\s*|\bRestAssured\s*)\.\s*(${TEST_VERBS})\s*\(`, 'g');
+const LARAVEL_REQUEST = new RegExp(String.raw`->\s*(${TEST_VERBS})(Json)?\s*\(`, 'g');
+const LARAVEL_JSON_CALL = /->\s*(?:json|call)\s*\(\s*(['"])([A-Za-z]+)\1\s*,/g;
+/** A project's own request helper, named for its verb: koel's `getAs($url, $user)`, `postAsAdmin(…)`. */
+const LARAVEL_HELPER = new RegExp(String.raw`->\s*((${TEST_VERBS})[A-Z]\w*)\s*\(`, 'g');
+const LARAVEL_BUILTIN_JSON = new RegExp(String.raw`^(?:${TEST_VERBS})Json$`);
+/** A Laravel request made in a method body: the call a request helper must end in. */
+const LARAVEL_REQUEST_IN_BODY = new RegExp(String.raw`->\s*(?:(?:${TEST_VERBS})(?:Json)?|json|call)\s*\(`);
+/** Pest's `get('/x')` / `postJson(…)` helpers, where the file imports them. */
+const PEST_HELPERS = /Pest\\Laravel/;
+const PEST_REQUEST = new RegExp(String.raw`(?<![\w$>:\\])(${TEST_VERBS})(Json)?\s*\(`, 'g');
+const TEST_REQUEST_GATE = /[mM]ockMvc|[wW]ebTestClient\b|[rR]estTemplate\b|\bRestAssured\b|\.\s*when\s*\(\s*\)|\$this\s*->|Pest\\Laravel/;
+
+export function hasTestRequestPattern(filePath: string, content: string): boolean {
+  return TEST_REQUEST_FILE.test(filePath) && isTestPath(filePath) && TEST_REQUEST_GATE.test(content);
+}
+
+interface TestSite {
+  from: Node;
+  line: number;
+  column: number;
+  callee: string;
+  method: string;
+  segs: string[];
+  display: string;
+}
+
+/**
+ * The string a request's path argument builds, starting at `i`: literals
+ * verbatim, each computed piece (a concatenated operand, an interpolation, a
+ * Spring `{var}` template) as one HOLE. Null unless it starts with a literal —
+ * `route('songs.index')` or `$url` names no path this pass can read.
+ */
+function readRequestPath(s: string, i: number, lang: 'java' | 'kotlin' | 'php'): string | null {
+  const concat = lang === 'php' ? '.' : '+';
+  let out = '';
+  let literal = false;
+  for (;;) {
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      const q = ch;
+      const interpolates = q === '"' && lang !== 'java';
+      for (i++; i < s.length && s[i] !== q; i++) {
+        const c = s[i]!;
+        if (c === '\\') { out += s[++i] ?? ''; continue; }
+        if (interpolates && c === '$' && /[{\w]/.test(s[i + 1] ?? '')) {
+          // `${expr}`, `$name`, PHP's `$user->id` / `$row['k']`
+          if (s[i + 1] === '{') i = closeBrace(s, i + 1);
+          else {
+            while (/\w/.test(s[i + 1] ?? '')) i++;
+            if (lang === 'php') {
+              while (s.startsWith('->', i + 1) && /\w/.test(s[i + 3] ?? '')) for (i += 2; /\w/.test(s[i + 1] ?? ''); i++);
+            }
+          }
+          out += HOLE;
+          continue;
+        }
+        if (interpolates && lang === 'php' && c === '{' && s[i + 1] === '$') {
+          i = closeBrace(s, i);
+          out += HOLE;
+          continue;
+        }
+        out += c;
+      }
+      if (i >= s.length) return null;
+      i++;
+      literal = true;
+    } else {
+      if (!literal) return null;
+      const end = operandEnd(s, i, concat);
+      if (end === i) break;
+      out += HOLE;
+      i = end;
+    }
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    if (s[i] === concat && !(concat === '.' && /\d/.test(s[i + 1] ?? ''))) { i++; continue; }
+    break;
+  }
+  if (!literal) return null;
+  // Spring's URI templates: `get("/owners/{ownerId}", id)`.
+  return lang === 'php' ? out : out.replace(/\{[^{}/]*\}/g, HOLE);
+}
+
+/** Index of the `}` closing the `{` at `open` (or the end of `s`). */
+function closeBrace(s: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    if (s[i] === '{') depth++;
+    else if (s[i] === '}' && --depth === 0) return i;
+  }
+  return s.length - 1;
+}
+
+/** End of a concatenated operand starting at `i`: the next top-level operator, `,` or `)`. */
+function operandEnd(s: string, i: number, concat: string): number {
+  let depth = 0;
+  for (; i < s.length; i++) {
+    const c = s[i]!;
+    if (c === '"' || c === "'") {
+      for (i++; i < s.length && s[i] !== c; i++) if (s[i] === '\\') i++;
+      continue;
+    }
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') {
+      if (depth === 0) return i;
+      depth--;
+    } else if (depth === 0 && (c === ',' || c === ';' || (c === concat && !(concat === '.' && /\d/.test(s[i + 1] ?? ''))))) return i;
+    // `$user->id`: an arrow is part of the operand, not a concatenation.
+    if (c === '-' && s[i + 1] === '>') i++;
+  }
+  return i;
+}
+
+/** A test URL as route segments: app-relative, holes as `*`; null when nothing literal is left. */
+function testRequestPath(raw: string): { segs: string[]; display: string } | null {
+  let p = raw;
+  const cut = p.search(/[?#]/);
+  if (cut >= 0) p = p.slice(0, cut);
+  const absolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*(\/.*)?$/i.exec(p);
+  if (absolute) p = absolute[1] ?? '/';
+  const segs = p
+    .split('/')
+    .filter((s) => s.length > 0)
+    .map((s) => (s.includes(HOLE) ? '*' : s));
+  if (segs.some((s) => s !== '*') === false && segs.length > 0) return null;
+  return { segs, display: '/' + segs.map((s) => (s === '*' ? '${…}' : s)).join('/') };
+}
+
+/**
+ * Whether `name` is a request helper in the project's tests: a PHP method
+ * defined in a test file whose body makes a Laravel request, directly or
+ * through one more `$this->helper(…)` (koel's `getAs` → `jsonAs` →
+ * `$this->json($method, $uri)`). The name alone never decides it.
+ */
+function isRequestHelper(ctx: ResolutionContext, name: string, memo: Map<string, boolean>, depth = 0): boolean {
+  const known = memo.get(name);
+  if (known !== undefined) return known;
+  memo.set(name, false); // cycle guard
+  let ok = false;
+  for (const n of ctx.getNodesByName(name)) {
+    if (n.kind !== 'method' || n.language !== 'php' || !isTestPath(n.filePath)) continue;
+    const lines = ctx.getFileLines?.(n.filePath) ?? ctx.readFile(n.filePath)?.split(/\r?\n/) ?? null;
+    if (!lines) continue;
+    const body = lines.slice(n.startLine - 1, n.endLine).join('\n');
+    if (LARAVEL_REQUEST_IN_BODY.test(body)) ok = true;
+    else if (depth === 0) {
+      for (const call of body.matchAll(/\$this\s*->\s*(\w+)\s*\(/g)) {
+        if (call[1] !== name && isRequestHelper(ctx, call[1]!, memo, depth + 1)) { ok = true; break; }
+      }
+    }
+    if (ok) break;
+  }
+  // A depth-limited "no" is not final; only remember it at the top level.
+  if (ok || depth === 0) memo.set(name, ok);
+  else memo.delete(name);
+  return ok;
+}
+
+/**
+ * Whether the `->` at `arrow` ends a chain rooted at `$this` that only CALLS
+ * methods — `$this->actingAs($u)->withHeaders([…])->` — so `$this->app->get(
+ * 'config')` (a container lookup through a property) is never a request.
+ */
+function thisRootedCalls(s: string, arrow: number): boolean {
+  let from = arrow;
+  for (let tries = 0; tries < 4; tries++) {
+    const root = s.lastIndexOf('$this', from - 1);
+    if (root < 0) return false;
+    let i = root + '$this'.length;
+    for (;;) {
+      while (/\s/.test(s[i] ?? '')) i++;
+      if (i === arrow) return true;
+      if (!s.startsWith('->', i)) break;
+      i += 2;
+      while (/\s/.test(s[i] ?? '')) i++;
+      const ident = /^\w+/.exec(s.slice(i, i + 64));
+      if (!ident) break;
+      i += ident[0].length;
+      while (/\s/.test(s[i] ?? '')) i++;
+      if (s[i] !== '(') break;
+      const close = closeParen(s, i);
+      if (close < 0) break;
+      i = close + 1;
+    }
+    from = root;
+  }
+  return false;
+}
+
+function collectTestRequests(ctx: ResolutionContext, file: string, sites: TestSite[], helpers: Map<string, boolean>): void {
+  const content = ctx.readFile(file);
+  if (!content || !TEST_REQUEST_GATE.test(content)) return;
+  const lang: 'java' | 'kotlin' | 'php' = file.endsWith('.php') ? 'php' : /\.kts?$/.test(file) ? 'kotlin' : 'java';
+  const safe = stripCommentsForRegex(content, lang === 'php' ? 'php' : 'java');
+  const lineOf = makeLineAt(safe, 1);
+  let nodes: Node[] | null = null;
+  const add = (index: number, argAt: number, method: string, callee: string): void => {
+    const raw = readRequestPath(safe, argAt, lang);
+    if (raw === null) return;
+    const path = testRequestPath(raw);
+    if (!path) return;
+    const line = lineOf(index);
+    nodes ??= ctx.getNodesInFile(file);
+    const from = enclosingFn(nodes, line) ?? nodes.find((n) => n.kind === 'file');
+    if (!from) return;
+    const column = index - (safe.lastIndexOf('\n', index - 1) + 1);
+    sites.push({ from, line, column, callee, method: method.toUpperCase(), segs: path.segs, display: path.display });
+  };
+  const each = (re: RegExp, fn: (m: RegExpExecArray) => void): void => {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(safe)) !== null) fn(m);
+  };
+  const openOf = (m: RegExpExecArray) => m.index + m[0].length;
+
+  if (lang === 'php') {
+    each(LARAVEL_REQUEST, (m) => {
+      if (thisRootedCalls(safe, m.index)) add(m.index, openOf(m), m[1]!, `$this->${m[1]}${m[2] ?? ''}`);
+    });
+    each(LARAVEL_JSON_CALL, (m) => {
+      if (thisRootedCalls(safe, m.index)) add(m.index, openOf(m), m[2]!, '$this->json');
+    });
+    each(LARAVEL_HELPER, (m) => {
+      const name = m[1]!;
+      if (LARAVEL_BUILTIN_JSON.test(name)) return; // getJson / postJson, read above
+      if (thisRootedCalls(safe, m.index) && isRequestHelper(ctx, name, helpers)) add(m.index, openOf(m), m[2]!, `$this->${name}`);
+    });
+    if (PEST_HELPERS.test(safe)) each(PEST_REQUEST, (m) => add(m.index, openOf(m), m[1]!, `${m[1]}${m[2] ?? ''}`));
+    return;
+  }
+  if (MOCKMVC_BUILDERS.test(safe)) {
+    each(MOCKMVC_BUILDER, (m) => add(m.index, openOf(m), m[1] === 'multipart' ? 'post' : m[1]!, m[1]!));
+    each(MOCKMVC_REQUEST, (m) => add(m.index, openOf(m), m[1]!, 'request'));
+  }
+  each(KOTLIN_MOCKMVC, (m) => add(m.index, openOf(m), m[1]!, `mockMvc.${m[1]}`));
+  each(WEB_TEST_CLIENT, (m) => add(m.index, openOf(m), m[1]!, `${m[1]}().uri`));
+  each(REST_ASSURED, (m) => add(m.index, openOf(m), m[1]!, m[1]!));
+  each(REST_TEMPLATE, (m) => {
+    const name = m[1]!;
+    let method: string | null = name.startsWith('get') ? 'GET' : name.startsWith('post') ? 'POST'
+      : name === 'put' ? 'PUT' : name === 'delete' ? 'DELETE' : name.startsWith('patch') ? 'PATCH' : null;
+    if (name === 'exchange') {
+      const args = argumentsAt(safe, openOf(m) - 1);
+      method = /HttpMethod\s*\.\s*([A-Z]+)/.exec(args?.[1] ?? '')?.[1] ?? null;
+    }
+    if (method) add(m.index, openOf(m), method, `restTemplate.${name}`);
+  });
+}
+
+/** Edges from a test's request to the route it reaches. */
+export async function testRequestEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  const routes = httpRoutes(ctx);
+  if (routes.length === 0) return [];
+  const sites: TestSite[] = [];
+  const helpers = new Map<string, boolean>();
+  let scanned = 0;
+  for (const file of ctx.getAllFiles()) {
+    if (!TEST_REQUEST_FILE.test(file) || !isTestPath(file)) continue;
+    if ((++scanned & 63) === 0) await onYield();
+    collectTestRequests(ctx, file, sites, helpers);
+  }
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const site of sites) {
+    const route = matchHttp({ fn: site.from, file: site.from.filePath, line: site.line, column: site.column, callee: site.callee,
+      method: site.method, segs: site.segs, suffix: false, display: site.display }, routes);
+    if (!route) continue;
+    const key = `${site.from.id}>${route.node.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({
+      source: site.from.id,
+      target: route.node.id,
+      kind: 'calls',
+      line: site.line,
+      column: site.column,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'test-request',
+        channel: 'http',
+        callee: site.callee,
+        method: site.method,
+        href: site.display,
+        registeredAt: `${route.node.filePath}:${route.node.startLine}`,
+      },
+    });
+  }
+  return edges;
+}
+
 const HTTP_GATE = /\b(?:fetch|\$fetch|ofetch|axios|ky|got|useFetch|useSWR)\b|\.\s*(?:get|post|put|patch|delete|head|options|request|\$get|\$post)\s*[<(]/;
 const QUEUE_GATE = /\.\s*add\s*\(|@Processor\s*\(|\bnew\s+Worker\s*[<(]|\.\s*process\s*\(/;
 const EVENT_GATE = /\.\s*(?:emit|emitAsync|on|once)\s*\(|@OnEvent\s*\(|@SubscribeMessage\s*\(/;
+
+export function hasCrossTierPattern(content: string): boolean {
+  return HTTP_GATE.test(content) || QUEUE_GATE.test(content) || EVENT_GATE.test(content);
+}
 
 export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const routes = httpRoutes(ctx);
