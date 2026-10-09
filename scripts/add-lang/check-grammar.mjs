@@ -11,16 +11,41 @@
 // newer build instead of using the tree-sitter-wasms one.
 //
 // Usage: node scripts/add-lang/check-grammar.mjs <lang|wasm-path> <valid-sample> [iterations]
-// Exit: 0 healthy, 1 corruption / parse errors, 2 could not run.
+// Exit: 0 healthy, 1 corruption / parse errors / crashed, 2 could not run.
 // NOTE: the sample must be SYNTACTICALLY VALID — a broken sample fails for the
 //       wrong reason.
 
 import { readFileSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { Parser, Language } from 'web-tree-sitter';
 
 const require = createRequire(import.meta.url);
 const fail = (code, msg) => { console.error(`[check-grammar] ${msg}`); process.exit(code); };
+
+// The parse loop runs in a child process and the parent owns the verdict: a
+// grammar can finish every parse and then take the process down (e.g. a V8
+// "Fatal process out of memory: Zone" while compiling the wasm), so PASS is only
+// printed once the child has actually exited cleanly.
+if (!process.env.CHECK_GRAMMAR_CHILD) {
+  const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    stdio: 'inherit',
+    env: { ...process.env, CHECK_GRAMMAR_CHILD: '1' },
+  });
+  if (r.error) fail(2, `could not start the check: ${r.error.message}`);
+  if (r.status === 0) {
+    console.log('RESULT: PASS — grammar parses cleanly, reuses safely, and the process exited cleanly.');
+    process.exit(0);
+  }
+  if (r.status === 1 || r.status === 2) process.exit(r.status); // child already explained
+  console.log(
+    `RESULT: FAIL — the check process died (${r.signal ? `signal ${r.signal}` : `exit code ${r.status}`}) ` +
+    `after or during the parse loop. Completing the parses is not the same as being safe to use; ` +
+    `do not vendor this grammar.`
+  );
+  process.exit(1);
+}
 
 const [token, sample, iterArg] = process.argv.slice(2);
 if (!token || !sample) fail(2, 'usage: check-grammar.mjs <lang|wasm-path> <valid-sample> [iterations]');
@@ -58,6 +83,7 @@ let ok = 0, err = 0;
 for (let i = 0; i < iters; i++) {
   const tree = parser.parse(source);
   if (tree.rootNode.hasError) err++; else ok++;
+  tree.delete();
 }
 
 console.log(`grammar: ${wasmPath.split('/').pop()}`);
@@ -71,5 +97,4 @@ if (err > 0) {
   );
   process.exit(1);
 }
-console.log('RESULT: PASS — grammar parses cleanly and reuses safely.');
-process.exit(0);
+process.exit(0); // the parent prints PASS only after this process exits cleanly
