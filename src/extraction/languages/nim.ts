@@ -202,6 +202,31 @@ function moduleNamesOf(entry: SyntaxNode, source: string): string[] {
     const name = getNodeText(entry, source).trim().replace(/^`|`$/g, '');
     return name ? [name] : [];
   }
+  // `./sibling` and `../top` are a prefix_expression whose `operator` field IS the
+  // path prefix. Dropping this case made every RELATIVE import vanish silently —
+  // no import node and no reference — and relative imports are the norm in a
+  // multi-directory Nim project, so that was most of a project's module graph.
+  // The prefix has to survive into the reference name: it is what tells the
+  // resolver this is file-relative rather than a search-path module.
+  if (entry.type === 'prefix_expression') {
+    const op = getChildByField(entry, 'operator');
+    const inner = entry.namedChildren.find((c) => c.type !== 'operator');
+    if (!op || !inner) return [];
+    const prefix = getNodeText(op, source).trim();
+    return moduleNamesOf(inner, source).map((moduleName) => `${prefix}${moduleName}`);
+  }
+  // A QUOTED path: `import "../foo"` / `include "inc.nim"`. The node's own text
+  // carries the quotes, so read its content child.
+  if (entry.type === 'interpreted_string_literal' || entry.type === 'string_literal') {
+    const content = entry.namedChildren.find((c) => c.type === 'string_content');
+    const quoted = getNodeText(content ?? entry, source).trim();
+    return quoted ? [quoted] : [];
+  }
+  // Everything else names no module. NOTE: this function has now silently dropped
+  // three shapes it did not enumerate — `./x`/`../x` (prefix_expression), the quoted
+  // path above, and whichever the grammar adds next. Before assuming an import is
+  // unresolvable, DUMP THE AST for it: an unlisted shape produces no node and no
+  // reference at all, so it is invisible in every downstream count.
   if (entry.type !== 'infix_expression') return [];
 
   const left = getChildByField(entry, 'left') ?? entry.namedChild(0);
@@ -234,7 +259,15 @@ function emitImport(ctx: ExtractorContext, moduleName: string, anchor: SyntaxNod
   });
 }
 
-/** `import a, std/b` / `include c` — one module node per named path. */
+/**
+ * `import a, std/b` / `include c` — one module node per named path.
+ *
+ * `include` carries the SAME `imports` reference kind as `import`, deliberately:
+ * a Nim `include` is textual inclusion of another source file, so it creates a real
+ * file dependency and the resolver treats it identically (both resolve to the
+ * module file). Nim has no separate "textual include" edge kind, and inventing one
+ * would leave `include` edges invisible to every dependency query.
+ */
 function emitImportStatement(ctx: ExtractorContext, node: SyntaxNode): void {
   for (const list of node.namedChildren) {
     if (list.type !== 'expression_list') continue;

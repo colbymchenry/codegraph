@@ -606,6 +606,43 @@ include common
     expect(importRefs).toEqual(['std/tables', 'std/sets', 'os', 'std/math', 'common']);
   });
 
+  it('should emit a reference for a RELATIVE import (./ and ../)', () => {
+    // `./sibling` and `../top` parse as a prefix_expression, not as the path
+    // infix the search-path form uses. Missing that case dropped every relative
+    // import SILENTLY — no import node and no reference at all — and relative
+    // imports are the norm in a multi-directory Nim project, so that was most of
+    // a project's module graph. The prefix has to survive into the name: it is
+    // what tells the resolver this path is file-relative.
+    const code = `
+import ./sibling
+import ../top
+include ../../shared
+`;
+    const result = extractFromSource('nested/rel.nim', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+
+    expect(imports).toEqual(['./sibling', '../top', '../../shared']);
+    expect(importRefs).toEqual(['./sibling', '../top', '../../shared']);
+  });
+
+  it('should emit a reference for a QUOTED module path', () => {
+    // The third shape to slip past moduleNamesOf: `import "../foo"` / `include
+    // "inc.nim"` parse as an interpreted_string_literal, whose own text carries the
+    // quotes. Unlisted shapes produce no import node and no reference at all, so
+    // they are invisible in every downstream count.
+    const code = `
+import "../quoted"
+include "inc.nim"
+`;
+    const result = extractFromSource('nested/quoted.nim', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+
+    expect(imports).toEqual(['../quoted', 'inc.nim']);
+  });
+
   it('should extract let, var and const with the kind each section means', () => {
     const code = `
 let counter = 0
@@ -7414,6 +7451,105 @@ describe('Default import resolution (renamed default export)', () => {
     expect(controller, 'controller.ts indexed').toBeDefined();
     const deps = [...cg.getImpactRadius(controller!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
     expect(deps.some((p) => p.endsWith('routes.ts')), 'importer depends on the default-exporting module').toBe(true);
+  });
+});
+
+describe('Nim module import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  // Both tests deliberately declare NO call between the modules: the only thing
+  // that can relate the two files is the import edge, so a pass cannot come from
+  // the cross-file call resolution that already worked.
+  it('links a search-path module import to its file, and leaves stdlib alone', async () => {
+    // Nim resolves a non-relative module path against the compiler's SEARCH
+    // PATHS (`src/`), not against the importing file — so `import lib/helper`
+    // from `src/app.nim` names `src/lib/helper.nim`, which no project-root
+    // lookup can reach. `std/strutils` names no project file and must stay
+    // unresolved (silent beats wrong).
+    fs.mkdirSync(path.join(tempDir, 'src/lib'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib/helper.nim'), `proc help*(): string =\n  result = "h"\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'src/app.nim'),
+      `import std/strutils\nimport lib/helper\n\nproc run*(): string =\n  result = "imports only"\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const app = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/app.nim'));
+    const helper = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/lib/helper.nim'));
+    expect(app, 'app.nim indexed').toBeDefined();
+    expect(helper, 'helper.nim indexed').toBeDefined();
+
+    const deps = [...cg.getImpactRadius(helper!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('src/app.nim')), 'search-path import linked').toBe(true);
+
+    // The other half of this test's NAME: `std/strutils` names no project file, so
+    // it must leave no cross-file edge at all. app.nim declares exactly two imports
+    // and only the search-path one can resolve, so a single outgoing edge IS that
+    // assertion — without it the name promised a guarantee the body never checked.
+    const outgoing = cg.getOutgoingEdgesFrom([app!.id], ['imports']);
+    expect(outgoing).toHaveLength(1);
+    expect(outgoing[0]?.target).toBe(helper!.id);
+  });
+
+  it('resolves a file-relative import (../) to its file', async () => {
+    fs.mkdirSync(path.join(tempDir, 'src/nested'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/top.nim'), `proc top*(): int =\n  result = 1\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'src/nested/deep.nim'),
+      `import ../top\n\nproc deep*(): int =\n  result = 2\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const deep = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/nested/deep.nim'));
+    const top = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/top.nim'));
+    expect(deep, 'deep.nim indexed').toBeDefined();
+    expect(top, 'top.nim indexed').toBeDefined();
+
+    // getImpactRadius walks INCOMING edges (who depends on this file), so it is
+    // asserted from the imported module towards its importer.
+    const dependents = [...cg.getImpactRadius(top!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(dependents.some((p) => p.endsWith('src/nested/deep.nim')), 'relative import linked').toBe(true);
+  });
+  it('resolves a quoted module path that already carries the extension', async () => {
+    // `include "lib/inc.nim"` names the file outright. Without stripping the
+    // extension the suffix matcher builds `inc.nim.nim`, finds nothing, and the ref
+    // is only saved by the generic name-matcher landing on the file node's basename
+    // — a coincidence that two same-named files would break.
+    fs.mkdirSync(path.join(tempDir, 'src/lib'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib/inc.nim'), `proc incProc*(): int =\n  result = 7\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'src/uses.nim'),
+      `import "lib/inc.nim"\n\nproc uses*(): int =\n  result = 2\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const uses = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/uses.nim'));
+    const inc = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('src/lib/inc.nim'));
+    expect(uses, 'uses.nim indexed').toBeDefined();
+    expect(inc, 'inc.nim indexed').toBeDefined();
+
+    const outgoing = cg.getOutgoingEdgesFrom([uses!.id], ['imports']);
+    expect(outgoing).toHaveLength(1);
+    expect(outgoing[0]?.target).toBe(inc!.id);
   });
 });
 
