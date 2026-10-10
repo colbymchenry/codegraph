@@ -1516,6 +1516,10 @@ function stripJsComments(content: string): string {
  *   export * from './a';
  *   export * as ns from './a';   (treated as wildcard for chasing)
  *   export { default as Foo } from './a';
+ * and their type-only spellings, which re-export the same names:
+ *   export type * from './a';
+ *   export type { Foo } from './a';
+ *   export { foo, type Foo } from './a';
  *
  * The walker intentionally stays regex-based — the import-resolver
  * elsewhere in this file already chooses regex over a fresh
@@ -1542,19 +1546,20 @@ export function extractReExports(content: string, language: Language): ReExport[
   const cleaned = stripJsComments(content);
 
   // Wildcard: `export * from '...'`; `export * as ns from '...'` exports `ns` alone.
-  const wildcardRe = /export\s*\*(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
+  const wildcardRe = /export(?:\s+type)?\s*\*(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
   let m: RegExpExecArray | null;
   while ((m = wildcardRe.exec(cleaned)) !== null) {
     out.push(m[1] ? { kind: 'namespace', exportedName: m[1], source: m[2]! } : { kind: 'wildcard', source: m[2]! });
   }
 
   // Named: `export { a, b as c } from '...'`
-  const namedRe = /export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g;
+  const namedRe = /export(?:\s+type)?\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g;
   while ((m = namedRe.exec(cleaned)) !== null) {
     const inner = m[1]!;
     const source = m[2]!;
     for (const raw of inner.split(',')) {
-      const item = raw.trim();
+      // `type Foo` is `Foo`; `type as foo` is a value named `type`.
+      const item = raw.trim().replace(/^type\s+(?!as\s)/, '');
       if (!item) continue;
       const aliasMatch = item.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
       if (aliasMatch) {
