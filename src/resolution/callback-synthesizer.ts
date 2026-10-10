@@ -4626,7 +4626,17 @@ export async function synthesizeCallbackEdges(
   // fan out across its read-only workers and the per-pass wall-clock comes from
   // the worker; a pass that fails on a worker falls back to running on the main
   // thread, so a worker crash isolates to a retry instead of failing synthesis.
-  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const passEdges: Array<Edge[] | undefined> = new Array(SYNTH_PASSES.length);
+  const merged: Edge[] = [];
+  const seen = new Set<string>();
+  const mergeEdges = (edges: Edge[]): void => {
+    for (const e of edges) {
+      const key = `${e.source}>${e.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(e);
+    }
+  };
   const markPass = (label: string, dt: number): void => {
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
@@ -4634,10 +4644,12 @@ export async function synthesizeCallbackEdges(
     passesDone++;
     emit(passesDone);
   };
-  const runPassOnMain = async (i: number): Promise<void> => {
+  const runPassOnMain = async (i: number, retainForOrderedMerge: boolean): Promise<void> => {
     const pass = SYNTH_PASSES[i]!;
     const t0 = Date.now();
-    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    const edges = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    if (retainForOrderedMerge) passEdges[i] = edges;
+    else mergeEdges(edges);
     await yieldToLoop();
     markPass(pass.name, Date.now() - t0);
   };
@@ -4691,7 +4703,7 @@ export async function synthesizeCallbackEdges(
         }
         // Worker-side failure (crash, OOM, unknown pass after a version
         // mismatch): retry this one pass on the main thread.
-        await runPassOnMain(i);
+        await runPassOnMain(i, true);
       }
     };
     // One pass per worker at a time, heaviest first. Handing every pass out
@@ -4715,17 +4727,19 @@ export async function synthesizeCallbackEdges(
     await fanOut;
   } else {
     for (const i of gatedIn) {
-      await runPassOnMain(i);
+      // Merge before starting the next pass so the just-produced array can be
+      // reclaimed instead of retaining every pass result until the end.
+      await runPassOnMain(i, false);
     }
   }
 
-  const merged: Edge[] = [];
-  const seen = new Set<string>();
-  for (const e of passEdges.flat()) {
-    const key = `${e.source}>${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(e);
+  markT.t = Date.now();
+  if (pool && gatedIn.length > 1) {
+    // Worker results arrive out of order, so merge them in registry order to
+    // preserve which duplicate edge wins while releasing each array promptly.
+    for (const edges of passEdges) {
+      if (edges) mergeEdges(edges);
+    }
   }
   __mark('dedupe-merge');
   // Chunked insert with yields: on the Linux kernel the merged synthesized
