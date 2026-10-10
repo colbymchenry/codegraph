@@ -58,6 +58,16 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
 }
 
 /**
+ * `export type * from './types'` and `export type * as ns from './types'`
+ * (TypeScript 5.0) are not in the grammar: `type` is an error there, and a
+ * barrel made only of such lines parses to nothing. With `type` blanked to
+ * spaces (offsets survive) each reads as the `export *` it is to the graph.
+ */
+export function blankExportTypeStar(source: string): string {
+  return source.replace(/^([ \t]*export[ \t]+)type(?=[ \t]*\*)/gm, '$1    ');
+}
+
+/**
  * Whether `node` is declared in a `declare module 'x' { … }` or `declare
  * global { … }` body, which exports it without an `export` keyword.
  *
@@ -95,7 +105,7 @@ function hasExportDeclaration(block: SyntaxNode): boolean {
 }
 
 export const typescriptExtractor: LanguageExtractor = {
-  preParse: blankFlowSyntax,
+  preParse: (source, filePath) => blankExportTypeStar(blankFlowSyntax(source, filePath)),
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   // `method_signature` is the interface/type-literal form of a method; without it
