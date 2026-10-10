@@ -6,7 +6,7 @@ import (
 	pkga "example.com/other/pkga"
 )
 
-const MAX_ITEMS = 128
+const MAX_ITEMS = 128 // the line's own comment, not DefaultRegistry's doc
 
 var DefaultRegistry = NewRegistry()
 
@@ -14,6 +14,7 @@ var handlerTable = map[string]func(int){
 	"recv": TargetCb,
 }
 
+// Widget is documented above its own type declaration.
 type Widget struct {
 	*Base
 	Queryable
@@ -27,6 +28,13 @@ type Widget struct {
 type Stack[T any] struct {
 	items []T
 }
+
+// Units of time: the group's comment, no member's doc.
+type (
+	Seconds int
+	// Minutes is documented inside its group.
+	Minutes int
+)
 
 type Core interface {
 	Reader
@@ -66,6 +74,29 @@ type IfaceAlias = interface {
 }
 
 type WordAlias = uint
+
+// Defined types reference what they are defined from, but their own type
+// parameters, predeclared types and their own name written bare.
+type HandlerFunc func(*Widget, pkga.Item) error
+
+type HandlersChain []HandlerFunc
+
+type WatchChan <-chan *Stack[int]
+
+type (
+	Lookup  map[Dur][]*pkga.Widget
+	Grid    [MAX_ITEMS]Widget
+	Wrapped (Widget)
+	Item    pkga.Item
+	Nested  map[string]struct {
+		w Widget
+		*Base
+	}
+)
+
+type Tree[T any] []*Tree[T]
+
+type stateFn func(*Widget) stateFn
 
 func useAlias(a *Alias) LocalAlias {
 	return LocalAlias{}

@@ -60,6 +60,100 @@ export const Rewrapped = memo(Button);
     }
   });
 
+  it('classifies typed styled consts as component nodes too', async () => {
+    // tree-sitter's tagged-template call takes no type arguments, so a type
+    // argument that also reads as an expression turns the initializer into
+    // comparisons: `(styled.div < WrapperProps) > \`…\``. These shapes come from
+    // outline/outline (FloatingToolbar's Wrapper and Background, Lightbox's
+    // CloseAction, NudeButton, HStack).
+    fs.writeFileSync(
+      path.join(dir, 'typed.tsx'),
+      `import styled from 'styled-components';
+import { s, depths } from './theme';
+type WrapperProps = { active: boolean };
+type Props = { align: 'start' | 'end' };
+const Plain = styled.div\`color: red;\`;
+export const Wrapper = styled.div<WrapperProps>\`
+  z-index: \${depths.editorToolbar};
+  color: \${(props) => (props.active ? s("accent") : s("text"))};
+\`;
+const Background = styled.div<{ align: Props["align"] }>\`color: red;\`;
+const CloseAction = styled.div<{ animation: Animation | null }>\`top: 0;\`;
+const Content = styled(Plain)<WrapperProps>\`padding: 4px;\`;
+const NudeButton = styled(Plain).attrs((props: Props) => ({ type: "button" }))<Props>\`width: 24px;\`;
+export const HStack = styled(Plain)
+  .withConfig({ shouldForwardProp: (prop) => prop !== "spacing" })
+  .attrs<Props>((props) => ({ align: props.align }))<Props>\`\`;
+const Either = styled.div<WrapperProps | Props>\`color: red;\`;
+const Both = styled.span<WrapperProps & { open: boolean }>\`color: red;\`;
+const Nested = styled.div<Partial<WrapperProps>>\`color: red;\`;
+const Deeper = styled.div<Partial<Record<string, WrapperProps>>>\`color: red;\`;
+const Named = styled("figure")<Props>\`margin: 0;\`;
+`
+    );
+    const db = await index();
+    for (const name of [
+      'Wrapper', 'Background', 'CloseAction', 'Content', 'NudeButton', 'HStack',
+      'Either', 'Both', 'Nested', 'Deeper', 'Named',
+    ]) {
+      expect(kindsOf(db, name), `${name} should be a component`).toEqual(['component']);
+    }
+  });
+
+  it('gives a typed styled const its jsx-render callers', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'toolbar.tsx'),
+      `import styled from 'styled-components';
+type WrapperProps = { active: boolean };
+export const Wrapper = styled.div<WrapperProps>\`opacity: 0;\`;
+export function FloatingToolbar() {
+  return <Wrapper active>menu</Wrapper>;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'page.tsx'),
+      `import { Wrapper } from './toolbar';
+export function Page() {
+  return <Wrapper active={false} />;
+}
+`
+    );
+    const db = await index();
+    const callers = db
+      .prepare(
+        `SELECT s.name caller FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata, '$.synthesizedBy') = 'jsx-render'
+           AND t.kind = 'component' AND t.name = 'Wrapper'
+         ORDER BY s.name`
+      )
+      .all()
+      .map((r: any) => r.caller);
+    expect(callers).toEqual(['FloatingToolbar', 'Page']);
+  });
+
+  it('keeps other typed template tags and real comparisons constants (precision)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'tags.tsx'),
+      `import styled, { css, createGlobalStyle, keyframes } from 'styled-components';
+type Props = { open: boolean };
+export const Mixin = css<Props>\`color: red;\`;
+export const GlobalStyle = createGlobalStyle<Props>\`body { margin: 0; }\`;
+export const Fade = keyframes<Props>\`from { opacity: 0; }\`;
+export const Styledish = styledLike<Props>\`color: red;\`;
+export const Compared = styled.length < LIMIT > 2;
+export const Untagged = styled.div < Props > other;
+const lowerCase = styled.div<Props>\`color: red;\`;
+`
+    );
+    const db = await index();
+    for (const name of ['Mixin', 'GlobalStyle', 'Fade', 'Styledish', 'Compared', 'Untagged', 'lowerCase']) {
+      expect(kindsOf(db, name), `${name} must stay a constant`).toEqual(['constant']);
+    }
+  });
+
   it('emits jsx-render edges so getCallers/getImpactRadius resolve a forwardRef component', async () => {
     fs.writeFileSync(
       path.join(dir, 'button.tsx'),

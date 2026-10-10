@@ -232,6 +232,52 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     assertParity('fixtures/kern.cu', cuda, 'cpp');
   });
 
+  // protobuf's generated headers and leveldb's thread annotations put
+  // attribute macros where tree-sitter can't read them: stacked in a class
+  // head, between a pointer and its name, after a parameter list or a field,
+  // opening a member. The hoisted preParse blanks them all, so the file parses
+  // clean and goes through the kernel instead of deferring — at parity.
+  it.each(['\n', '\r\n'])('attribute-macro shapes parse clean through the hoisted preParse (%j)', (eol) => {
+    const source = [
+      'namespace google {',
+      'namespace protobuf {',
+      'class PROTOBUF_EXPORT  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Any final : public ::google::protobuf::Message',
+      '/* @@protoc_insertion_point(class_definition:google.protobuf.Any) */ {',
+      ' public:',
+      '  ~Any() PROTOBUF_FINAL;',
+      '  [[nodiscard]] const ::google::protobuf::UnknownFieldSet& unknown_fields() const',
+      '      ABSL_ATTRIBUTE_LIFETIME_BOUND {',
+      '    return _internal_metadata_.unknown_fields();',
+      '  }',
+      '  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL',
+      '  GetDescriptor() {',
+      '    return default_instance().GetMetadata().descriptor;',
+      '  }',
+      '  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view name() const { return name_; }',
+      '  void Swap(Any* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) { InternalSwap(other); }',
+      '',
+      ' private:',
+      '  void InternalSwap(Any* PROTOBUF_NONNULL other);',
+      '  int count_ GUARDED_BY(mu_);',
+      '};',
+      'void Any::InternalSwap(Any* PROTOBUF_NONNULL other) { swap(*other); }',
+      '}  // namespace protobuf',
+      '}  // namespace google',
+      '',
+    ].join(eol);
+    assertParity('fixtures/any.pb.h', source, 'cpp', 6);
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    const result = tryKernelExtract('fixtures/any.pb.h', source, 'cpp')!;
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toEqual(expect.arrayContaining([
+      'google::protobuf::Any::GetDescriptor',
+      'google::protobuf::Any::InternalSwap',
+      'google::protobuf::Any::Swap',
+      'google::protobuf::Any::name',
+      'google::protobuf::Any::unknown_fields',
+    ]));
+  });
+
   // Every torture fixture again with CRLF line endings — the shape every
   // Windows autocrlf checkout has. Derived in memory (not a checked-in CRLF
   // file) so no platform or editor can silently normalize it away. Pins the

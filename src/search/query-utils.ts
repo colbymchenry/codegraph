@@ -317,8 +317,10 @@ export function isTestPath(filePath: string): boolean {
   if (
     lowerName.startsWith('test_') ||                              // python: test_foo.py
     lowerName.startsWith('test.') ||
-    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py
-    /[._-](test|tests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
+    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py,
+    // and Google's C++ foo_unittest.cc (protobuf, Chromium). A bare
+    // `unittest.go` is no test: promtool's is the code that runs rule tests.
+    /[._-](test|tests|unittest|unittests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
     // CamelCase suffix (Java/Kotlin/Swift/C#/Scala): FooTest.kt, BarTests.swift,
     // BazSpec.scala, QuxTestCase.java. Capital-led so "latest.kt"/"manifest.kt"
     // (lowercase "test") are NOT matched.
