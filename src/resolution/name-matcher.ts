@@ -14,7 +14,9 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
+import { cppAliasedTypeName, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
+import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
+import { cppClassWritten } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -304,8 +306,11 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
   }
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
-    const decl: { raw?: string } = {};
+    const decl: GoReceiverDecl = {};
     const type = inferLocalReceiverType(receiver, ref, context, decl);
+    if (decl.asserted !== undefined) {
+      return decl.asserted && resolveMethodOnType(decl.asserted.name, member, ref, context, 0.9, 'function-ref', decl.asserted.dir);
+    }
     if (type) {
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
         goDeclaredTypePackage(decl.raw, ref.filePath, context));
@@ -8876,11 +8881,107 @@ function normalizeCppTypeName(typeName: string): string | null {
 // `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
 // (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
 // terminator rules out uses like `return receiver->m()` where the preceding
-// token is a keyword, not a type.
+// token is a keyword, not a type. A range-based for's `Type receiver :` is read
+// by cppRangeForDeclaration instead.
 function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   return new RegExp(
     `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
   );
+}
+
+// A range-based for's declaration, `for (const Foo& name :`, up to the single
+// colon (not `::`) that ends it. What may precede the type — `const`, a
+// global-scope `::` — is never an initializer, a call or a member access.
+const CPP_RANGE_FOR_DECLARATION = /\bfor\s*\(([^;=(){}?."']*?)\b([A-Za-z_]\w*)\s*:(?!:)/g;
+// The type a declaration ends with, read as the declarator regex reads it.
+const CPP_DECLARED_TYPE_TAIL = /([A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*[*&]+)?)\s*$/;
+
+/**
+ * The type the range-based for on `line` (comments blanked) declares
+ * `receiverName` with — `for (ConformanceTestSuite *suite : suites)` — and
+ * the column of the header's `(`. The declarator regex never reads one: a
+ * loop's name is followed by its `:`. (Neither is a bit-field, `unsigned car
+ * : 1;`, which no method is called on.)
+ */
+function cppRangeForDeclaration(line: string, receiverName: string): { type: string; paren: number } | null {
+  if (!line.includes('for')) return null;
+  for (const m of line.matchAll(CPP_RANGE_FOR_DECLARATION)) {
+    if (m[2] !== receiverName) continue;
+    const tail = m[1]!.match(CPP_DECLARED_TYPE_TAIL);
+    return tail ? { type: tail[1]!, paren: m.index! + m[0].indexOf('(') } : null;
+  }
+  return null;
+}
+
+/** Where the C or C++ string or character literal opening at `text[start]` closes (the line's end if it doesn't). */
+function cppLiteralEnd(text: string, start: number): number {
+  for (let i = start + 1; i < text.length; i++) {
+    if (text[i] === '\\') i++;
+    else if (text[i] === text[start]) return i;
+  }
+  return text.length;
+}
+
+/**
+ * Is column `useColumn` of line `useLine` inside the body of the `for` whose
+ * header opens at `lines[line][paren]`? A range-based for's variable is in
+ * scope there and nowhere else: after the loop, or in a later function, the
+ * same name is some other variable. The body runs to the `}` closing a braced
+ * body, or to the end of its one statement — taken to be the first `;` or
+ * closing `}` at its own depth, so an `else` after it is not counted.
+ * Comments and literals are skipped, and a `for` inside one (commented-out
+ * code, a code generator's template) has no body.
+ */
+function cppForBodyEncloses(lines: readonly string[], line: number, paren: number, useLine: number, useColumn: number): boolean {
+  let phase: 'before' | 'header' | 'gap' | 'block' | 'statement' = 'before';
+  let depth = 0;
+  let comment = false;
+  for (let l = line; l <= useLine && l < lines.length; l++) {
+    const text = lines[l]!;
+    const end = l === useLine ? Math.min(useColumn, text.length) : text.length;
+    for (let c = 0; c < end; c++) {
+      const ch = text[c]!;
+      if (comment) {
+        if (ch === '*' && text[c + 1] === '/') {
+          comment = false;
+          c++;
+        }
+        continue;
+      }
+      if (ch === '/' && text[c + 1] === '/') break;
+      if (ch === '/' && text[c + 1] === '*') {
+        comment = true;
+        c++;
+        continue;
+      }
+      // (A `'` after a digit separates digits: `1'000'000`.)
+      if (ch === '"' || (ch === '\'' && !/\d/.test(text[c - 1] ?? ''))) {
+        c = cppLiteralEnd(text, c);
+        continue;
+      }
+      if (phase === 'before') {
+        if (l === line && c === paren) {
+          phase = 'header';
+          depth = 1;
+        }
+        continue;
+      }
+      if (phase === 'header') {
+        if (ch === '(') depth++;
+        else if (ch === ')' && --depth === 0) phase = 'gap';
+        continue;
+      }
+      if (phase === 'gap') {
+        if (/\s/.test(ch)) continue;
+        phase = ch === '{' ? 'block' : 'statement';
+      }
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']') depth--;
+      else if (ch === '}' && --depth <= 0) return false;
+      else if (ch === ';' && depth <= 0 && phase === 'statement') return false;
+    }
+  }
+  return phase !== 'before' && phase !== 'header';
 }
 
 /** What C++ receiver inference made of a receiver's declared type. */
@@ -9037,6 +9138,59 @@ function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   if (segments[0] !== 'std') return declared.length === 0;
   const spelled = segments.join('::');
   return !declared.some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
+}
+
+/** Standard-library types whose `->` reaches the value they hold. */
+const CPP_STD_HOLDERS: ReadonlySet<string> = new Set(['unique_ptr', 'shared_ptr', 'optional']);
+
+/**
+ * A `->` call on a C++ receiver declared as a standard smart pointer or
+ * optional (`std::unique_ptr<Iterator> iter; iter->Valid()`) calls a member of
+ * the type it holds. That type is looked up as C++ looks it up where the call
+ * is written (cpp-supertypes.ts): the scopes around the call, the file's
+ * `using`s, and aliases followed. Looking it up by its last name instead
+ * finds namesakes: 21 other classes in rocksdb are named `Iterator`, nested
+ * ones like `MemTableRep::Iterator`, while the `Iterator` the call means
+ * inherits `Valid` from `IteratorBase`.
+ *  - The member of the class it names, or of a class that class derives from.
+ *  - null when no project method is called: the type is a template
+ *    parameter's, a library type (`std::unique_ptr<std::deque<…>>`) or an
+ *    alias of one, or a class that lacks the method (but a class template's
+ *    specialization may declare it, so not there).
+ *  - undefined when `raw` declares no such holder, or the type it holds is
+ *    none the project declares (a generated message, a class the index
+ *    doesn't name): the call goes on as before.
+ */
+function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const holder = cppTypeSegments(raw);
+  if (holder?.length !== 2 || holder[0] !== 'std' || !CPP_STD_HOLDERS.has(holder[1]!) || !isCppLibraryType(raw, context)) return undefined;
+  const held = cppTemplateArguments(raw)?.[0];
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!held || !caller || isCppPointerType(held)) return undefined;
+  if (isCppLibraryType(held, context)) return null;
+  // A template parameter's type (`std::unique_ptr<T>`, `typename T::Iter`) names no particular class: null.
+  const found = cppClassWritten(held, {
+    // A class local to the calling function is found first.
+    scope: caller.kind === 'file' ? '' : caller.qualifiedName,
+    file: ref.filePath,
+    line: ref.line,
+    parameters: cppTemplateParameters(caller, context),
+  }, ref, context);
+  if (found === undefined) return undefined;
+  if (found === null) return null;
+  if (!CPP_CLASS_KINDS.has(found.node.kind)) {
+    // An alias that leads to none of the project's classes. When it names a
+    // library type (`using VectorWalPtr = std::vector<…>;`) or a template
+    // parameter's, nothing of the project's is called. Otherwise it may be one
+    // each `#if` arm declares differently (rocksdb's `port::Thread`, a
+    // `std::thread` or a `WindowsThread`) or name a class the index keeps
+    // under another namespace (protobuf's `MapField`): no telling.
+    const aliased = resolveCppAliasedType(held, ref, context);
+    return aliased === null || (aliased && isCppLibraryType(aliased.target.join('::'), context)) ? null : undefined;
+  }
+  const method = cppMethodOf(found.node, methodName, ref, context);
+  if (method) return { original: ref, targetNodeId: method.id, confidence: found.exact ? 0.9 : 0.85, resolvedBy: 'instance-method' };
+  return cppTemplateParameters(found.node, context).size > 0 ? undefined : null;
 }
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
@@ -9451,8 +9605,20 @@ function inferCppReceiverType(
         // receiver's: one found further up may be another variable.
         found.shadowed = true;
       }
-    } else if (found && cppRebindsReceiver(line, escapedReceiver)) {
-      found.shadowed = true;
+    } else {
+      // `for (ConformanceTestSuite *suite : suites)`, when the call is in the
+      // loop's body. A loop over `auto` elements has no initializer to read,
+      // so the scan goes on as for an `auto` local whose initializer is unreadable.
+      const loopVar = cppRangeForDeclaration(line, receiverName);
+      if (loopVar && cppForBodyEncloses(lines, i, loopVar.paren, callLineIndex, ref.column)) {
+        const normalized = normalizeCppTypeName(loopVar.type);
+        if (normalized && normalized !== 'auto') {
+          const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
+          noteCppDeclaration(found, loopVar.type, inCallerScope);
+          return cppDeclaredType(loopVar.type, normalized, inCallerScope, ref, context, found);
+        }
+      }
+      if (found && cppRebindsReceiver(line, escapedReceiver)) found.shadowed = true;
     }
   }
 
@@ -9991,9 +10157,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_RECEIVER_TYPES.delete(context);
   KOTLIN_HIERARCHIES.delete(context);
   KOTLIN_FRAMES.delete(context);
-  CPP_NS_MACROS.delete(context);
-  CPP_NS_FRAMES.delete(context);
-  CPP_NS_ALIASES.delete(context);
+  clearCppNamespaceMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
   SOLIDITY_SUPERS.delete(context);
@@ -10025,6 +10189,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GO_EMBEDS.delete(context);
   GO_ALIAS_TARGETS.delete(context);
   GO_DOT_IMPORTS.delete(context);
+  GO_ASSERTION_BINDINGS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -10624,9 +10789,10 @@ function inferLocalReceiverType(
    * Receives the found type as the declaration spells it, before the
    * normalization the return value gets: Go's package qualifier (`pkg.Type`
    * vs a bare `server`) says which package declares it. Set on the
-   * incremental-scan path only, the one every Go receiver takes.
+   * incremental-scan path, the one every Go receiver takes, and with
+   * `asserted` for a Go local bound from a type assertion (GoReceiverDecl).
    */
-  decl?: { raw?: string },
+  decl?: GoReceiverDecl,
 ): string | null {
   // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
   // field whose assignment or `property` declaration usually lives outside the
@@ -10663,6 +10829,21 @@ function inferLocalReceiverType(
       scanReceiver = scoped[1]!;
       componentScoped = true;
       phpProperty = true;
+    }
+  }
+  // A Go local bound from a type assertion (`f, ok := w.(http.Flusher)`) has
+  // the asserted type. The patterns below read no assertion, and scan lines
+  // with no block scope: an `if` header's `f` would type a loop's `f` below it.
+  // A type goWrittenType can't tell leaves the local to them and to name
+  // matching, as before: grpc-go's `ci.GetCommonAuthInfo()`, through an
+  // interface its function declares, reaches the one method of that name.
+  if (ref.language === 'go' && decl) {
+    const written = goAssertedLocalType(scanReceiver, ref, context);
+    const asserted = written === undefined ? undefined : goWrittenType(written, ref, context);
+    if (asserted !== undefined) {
+      decl.raw = written;
+      decl.asserted = asserted;
+      return normalizeInferredTypeName(written!) ?? written!;
     }
   }
 
@@ -11140,7 +11321,7 @@ export function matchMethodCall(
         matchVbTypedCall(objectOrClass!, methodName!, ref, context, (name) => isStdMethodName('vbnet', name)));
       if (typed !== undefined) return typed;
     }
-    const decl: { raw?: string } = {};
+    const decl: GoReceiverDecl = {};
     const cppDecl: CppReceiverDeclaration = {};
     let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
@@ -11179,6 +11360,12 @@ export function matchMethodCall(
       inferredType = awaited.name;
     }
     if (inferredType) {
+      // A Go local bound from a type assertion calls a method of the type Go
+      // finds for it, or nothing the project declares: `flusher.Flush()` after
+      // `flusher, ok := w.(http.Flusher)` went to a project type named after it.
+      if (decl.asserted !== undefined) {
+        return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
+      }
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323).
       // Other languages disambiguate by call-site file.
@@ -11262,6 +11449,15 @@ export function matchMethodCall(
         cppMemberOperator(objectOrClass!, ref, context) === (cppDecl.pointer ? '->' : '.') &&
         isCppLibraryType(cppDecl.raw!, context)) {
       return null;
+    }
+    // A `->` call on a standard smart pointer or optional the calling
+    // function or its class declares is a call on the type it holds:
+    // rocksdb's `std::unique_ptr<Iterator> iter; iter->Valid()` reached
+    // `ArenaWrappedDBIter::Valid` by the method's name.
+    if (ref.language === 'cpp' && cppDecl.callers && !cppDecl.aliased && !cppDecl.shadowed && !cppDecl.pointer &&
+        cppMemberOperator(objectOrClass!, ref, context) === '->') {
+      const held = nmTimedT('mc-cppheld', ref, () => matchCppHeldTypeCall(cppDecl.raw!, methodName!, ref, context));
+      if (held !== undefined) return held;
     }
   }
 
@@ -11873,30 +12069,132 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  * column where its receiver expression starts, and name matching took any
  * method of that name: every gRPC handler etcd generates went to the
  * `UnimplementedKVServer` stub beside the `KVServer` interface. The type is
- * the one Go finds: in the call's own package or a package it dot-imports for
- * a bare name, in the imported package for a qualified one, and an alias is
- * the type it names. A type found in none — one from outside the project
- * (`http.Flusher`), a predeclared one (`error`) — an alias of such a type, or
- * a type literal (`interface{ Flush() }`) links nothing.
- * Undefined when the call is not made through an assertion.
+ * the one Go finds (goWrittenType). Through any other the call links
+ * nothing, even one goWrittenType can't tell: a bare name gives name matching
+ * no receiver to go on. Undefined when the call is not made through an
+ * assertion.
  */
 export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
   const asserted = goAssertedType(ref, context);
   if (asserted === undefined) return undefined;
+  const type = goWrittenType(asserted, ref, context);
+  return type ? resolveMethodOnType(type.name, ref.referenceName, ref, context, 0.9, 'instance-method', type.dir) : null;
+}
+
+/**
+ * The project type a Go type written at `ref` names — `KVServer`, `*pipe`,
+ * `storage.Store`, `*List[int]` — with the directory of the package that
+ * declares it, found where Go finds it: in the file's own package or a
+ * package it dot-imports for a bare name, in the imported package for a
+ * qualified one. Null for a type found in none — one from outside the
+ * project (`http.Flusher`), a predeclared one (`error`) or an alias of such a
+ * type: none has a method the project declares. Undefined for one it can't
+ * tell: a type literal (`interface{ Flush() }`), a name no package of the
+ * project declares (a type declared inside a function, a type parameter), a
+ * type the imported project package doesn't hold.
+ */
+function goWrittenType(written: string, ref: UnresolvedRef, context: ResolutionContext): GoProjectType | null | undefined {
   // `KVServer`, `*pipe`, `storage.Store`, `*List[int]`: anything else is a type literal.
-  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(asserted);
-  if (!type) return null;
-  const [, qualifier, typeName] = type;
-  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(typeName!, dir, context).length > 0;
-  const dir = qualifier !== undefined
-    ? goImportPackageDir(qualifier, ref.filePath, context)
-    : [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
-  if (!declares(dir)) return null;
+  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(written);
+  if (!type) return undefined;
+  const [, qualifier, name] = type;
+  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(name!, dir, context).length > 0;
+  let dir: string | null | undefined;
+  if (qualifier !== undefined) {
+    dir = goImportPackageDir(qualifier, ref.filePath, context);
+    if (!dir) return null;
+    if (!declares(dir)) return undefined;
+  } else {
+    dir = [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
+    if (!dir) return GO_BUILTIN_FIELD_TYPES.has(name!) ? null : undefined;
+  }
   // An alias of a type from outside the project (`type Ctx = context.Context`)
   // has that type's methods, none the project declares.
-  if (goPackageTypes(typeName!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
-  return resolveMethodOnType(typeName!, ref.referenceName, ref, context, 0.9, 'instance-method', dir);
+  if (goPackageTypes(name!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
+  return { name: name!, dir };
+}
+
+/** A Go type the project declares, with the directory of its package. */
+interface GoProjectType {
+  name: string;
+  dir: string;
+}
+
+/**
+ * What inferLocalReceiverType tells its caller besides the type: the type as
+ * the declaration spells it (`raw`), and for a Go local bound from a type
+ * assertion, the type goWrittenType finds for it (`asserted`; null for one
+ * with no method the project declares). `asserted` is unset when the local
+ * is declared some other way, or goWrittenType can't tell its type.
+ */
+interface GoReceiverDecl {
+  raw?: string;
+  asserted?: GoProjectType | null;
+}
+
+const GO_ASSERTION_BINDINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * The type a Go local was asserted to, as written (`http.Flusher`,
+ * `*Wrapper`, `storage.Store`), when the declaration of `name` in scope at
+ * `ref` binds the value of a type assertion: `f, ok := w.(http.Flusher)` in
+ * an `if` header, `wr := v.(*Wrapper)`, `var st, _ = v.(storage.Store)`. The
+ * scope reader says which declaration that is, so an `if` header's binding
+ * does not reach a later variable of the name, one in a block that has ended
+ * does not hide it, and a comment declares nothing. Undefined when the name
+ * in scope is declared some other way: a parameter, a type switch's
+ * variable, a value that only starts with an assertion (`x.(T).field`).
+ */
+function goAssertedLocalType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!goAssertionBindings(ref.filePath, context).has(name)) return undefined;
+  const decl = goLocalDecl(name, ref, context);
+  const code = decl && decl.kind !== 'param' ? goScopeIndex(ref.filePath, context)?.code : undefined;
+  if (!decl || code === undefined) return undefined;
+  // The asserted value goes to the first name of `v, ok := x.(T)`.
+  if (/,[ \t]*$/.test(code.slice(code.lastIndexOf('\n', decl.at - 1) + 1, decl.at))) return undefined;
+  const head = /[A-Za-z_]\w*[ \t]*(?:,[ \t]*[A-Za-z_]\w*[ \t]*)?:?=(?!=)[ \t]*/y;
+  head.lastIndex = decl.at;
+  if (!head.exec(code)) return undefined;
+  const end = { at: 0 };
+  const links = goChainLinks(code, head.lastIndex, end);
+  const last = links[links.length - 1];
+  // The assertion is the whole value: nothing follows it, not even another
+  // value (`a, b := x.(T), y`).
+  if (links.length < 2 || last!.kind !== 'assert' || last!.text === 'type' || !/^(?:[;\r\n]|$)/.test(code.slice(end.at, end.at + 1))) {
+    return undefined;
+  }
+  return last!.text;
+}
+
+/**
+ * Whether `name` at `ref` is a Go local bound from a type assertion whose
+ * type goWrittenType can tell, so that the call through it is that type's to
+ * resolve: after `parser, ok := b.(balancer.ConfigParser)`, `parser` is not
+ * the standard library's package.
+ */
+export function isGoAssertedLocal(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const written = goAssertedLocalType(name, ref, context);
+  return written !== undefined && goWrittenType(written, ref, context) !== undefined;
+}
+
+/**
+ * The names a Go file may bind from a type assertion — the first name before
+ * each `:=` or `=` on a line that asserts a type — so that only calls through
+ * those names read the file's scopes.
+ */
+function goAssertionBindings(filePath: string, context: ResolutionContext): Set<string> {
+  let memo = GO_ASSERTION_BINDINGS.get(context);
+  if (!memo) GO_ASSERTION_BINDINGS.set(context, (memo = new Map()));
+  let names = memo.get(filePath);
+  if (names) return names;
+  names = new Set();
+  for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
+    if (!line.includes('.(') || line.length > 10_000) continue;
+    for (const m of line.matchAll(/(?:^|[^\w.])([A-Za-z_]\w*)\s*(?:,\s*[A-Za-z_]\w*\s*)?:?=(?!=)/g)) names.add(m[1]!);
+  }
+  memo.set(filePath, names);
+  return names;
 }
 
 /** How many lines past a Go call's first its chain is read on. */
@@ -11937,9 +12235,9 @@ interface GoChainLink {
  * The links of the Go expression that starts at `start`: its operand (a name
  * or a parenthesized expression), then each selector, type assertion, call
  * and index. A line break ends it, except right after a `.`, where Go
- * inserts no semicolon.
+ * inserts no semicolon. `end.at` receives the offset reading stopped at.
  */
-function goChainLinks(text: string, start: number): GoChainLink[] {
+function goChainLinks(text: string, start: number, end?: { at: number }): GoChainLink[] {
   const links: GoChainLink[] = [];
   const NAME = /[A-Za-z_]\w*/y;
   let i = start;
@@ -11957,7 +12255,10 @@ function goChainLinks(text: string, start: number): GoChainLink[] {
     return inner;
   };
   const operand = text[i] === '(' ? group() : name();
-  if (operand === null) return links;
+  if (operand === null) {
+    if (end) end.at = i;
+    return links;
+  }
   links.push({ kind: 'operand', text: operand });
   for (;;) {
     while (text[i] === ' ' || text[i] === '\t') i++;
@@ -11975,6 +12276,7 @@ function goChainLinks(text: string, start: number): GoChainLink[] {
       if (group() === null) break;
     } else break;
   }
+  if (end) end.at = i;
   return links;
 }
 
@@ -12053,14 +12355,18 @@ function matchGoFieldChainCall(
   if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
   const [base, field] = segs;
 
-  const decl: { raw?: string } = {};
+  const decl: GoReceiverDecl = {};
   const baseType = inferLocalReceiverType(base!, ref, context, decl);
   if (!baseType) return null;
+  // A base bound from a type assertion has the type Go finds for it, or one
+  // whose fields the project doesn't declare.
+  const asserted = decl.asserted;
+  if (asserted === null) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
 
-  let structs = context.getNodesByName(baseType).filter(
+  let structs = context.getNodesByName(asserted?.name ?? baseType).filter(
     (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
   );
   // The struct the declaring package has is the one the base's type means (a
@@ -12068,9 +12374,9 @@ function matchGoFieldChainCall(
   // names repeat across packages — harbor has a `daoTestSuite` in every DAO
   // package — and another package's same-named struct with a same-named
   // field is not this one (#2323).
-  const basePkg = goDeclaredTypePackage(decl.raw, ref.filePath, context);
+  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, ref.filePath, context);
   const declared = structs.filter((n) => goPackageDir(n.filePath) === basePkg);
-  if (declared.length > 0) structs = declared;
+  if (declared.length > 0 || asserted) structs = declared;
   structs = preferCallSiteFile(structs, ref.filePath);
   for (const s of structs) {
     const source = context.readFile(s.filePath);
@@ -13971,104 +14277,6 @@ function erlangImportedModule(name: string, arity: string, ref: UnresolvedRef, c
     if (new RegExp(`(?:^|[\\s,])'?${fn}'?\\s*/\\s*${arity}\\b`).test(m[2]!)) return m[1]!;
   }
   return undefined;
-}
-
-const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
-const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; path: string[] }>>>();
-/** A closing macro's body: `}` / `} }`, maybe beside a pragma macro (`PYBIND11_WARNING_POP }`). */
-const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
-const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
-
-/** The project's namespace aliases: `namespace py = pybind11;`. */
-export function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
-  const hit = CPP_NS_ALIASES.get(context);
-  if (hit) return hit;
-  const aliases = new Map<string, string>();
-  for (const file of context.getAllFiles()) {
-    if (!/\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i.test(file)) continue;
-    const source = context.readFile(file);
-    if (!source || !source.includes('namespace')) continue;
-    for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
-      if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
-    }
-  }
-  CPP_NS_ALIASES.set(context, aliases);
-  return aliases;
-}
-
-/**
- * The project's namespace-opening macros — `#define FMT_BEGIN_NAMESPACE
- * namespace fmt { inline namespace v12 {`, `#define RAPIDJSON_NAMESPACE_BEGIN
- * namespace RAPIDJSON_NAMESPACE {` (through `#define RAPIDJSON_NAMESPACE
- * rapidjson`) — as the namespace path each opens (inline namespaces are
- * transparent), and the closing macros as how many scopes each closes.
- */
-function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> } {
-  const hit = CPP_NS_MACROS.get(context);
-  if (hit) return hit;
-  const openers = new Map<string, string[]>();
-  // `#define PYBIND11_NAMESPACE_BEGIN(name) namespace name {`, used as `PYBIND11_NAMESPACE_BEGIN(detail)`.
-  const openerFns = new Set<string>();
-  const closers = new Map<string, number>();
-  const aliases = new Map<string, string>();
-  const bodies: Array<[string, string]> = [];
-  for (const file of context.getAllFiles()) {
-    if (!/\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc)$/i.test(file)) continue;
-    const raw = context.readFile(file);
-    if (!raw || !raw.includes('#') || !raw.includes('define')) continue;
-    const source = stripCommentsForRegex(raw.replace(/\\\r?\n/g, ' '), 'cpp');
-    for (const m of source.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]+([^\n]*)$/gm)) {
-      const body = m[4]!.trim();
-      if (m[2] !== undefined) {
-        // (a trailing pragma macro — `PYBIND11_WARNING_PUSH` — rides along)
-        if (m[3] && new RegExp(`^namespace\\s+${m[3]}\\s*\\{[\\w\\s]*$`).test(body)) openerFns.add(m[1]!);
-        else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
-        continue;
-      }
-      if (/^[A-Za-z_]\w*$/.test(body)) aliases.set(m[1]!, body);
-      else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
-      // An inline namespace (transparent, and often named by a macro call) is skipped.
-      else if (/^(?:inline\s+namespace\s+[^{}]*\{\s*|namespace\s+[A-Za-z_]\w*\s*\{\s*)+[\w\s]*$/.test(body)) bodies.push([m[1]!, body]);
-    }
-  }
-  for (const [name, body] of bodies) {
-    if (openers.has(name)) continue;
-    const path = [...body.replace(/inline\s+namespace\s+[^{}]*\{/g, '').matchAll(/namespace\s+([A-Za-z_]\w*)/g)]
-      .map((m) => aliases.get(m[1]!) ?? m[1]!);
-    if (path.length > 0) openers.set(name, path);
-  }
-  const macros = { openers, openerFns, closers, aliases };
-  CPP_NS_MACROS.set(context, macros);
-  return macros;
-}
-
-/** The line ranges of a C / C++ file each namespace macro opens, with the namespace path it opens. */
-export function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
-  let memo = CPP_NS_FRAMES.get(context);
-  if (!memo) {
-    memo = new Map();
-    CPP_NS_FRAMES.set(context, memo);
-  }
-  const hit = memo.get(file);
-  if (hit) return hit;
-  const frames: Array<{ start: number; end: number; path: string[] }> = [];
-  const { openers, openerFns, closers, aliases } = cppNamespaceMacros(context);
-  if (openers.size > 0 || openerFns.size > 0) {
-    const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
-    const open: Array<{ start: number; path: string[] }> = [];
-    lines.forEach((text, i) => {
-      const m = /^[ \t]*([A-Z_][A-Z0-9_]*)(?:\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]*;?[ \t]*(?:\/\/.*|\/\*.*\*\/[ \t]*)?\r?$/.exec(text);
-      const token = m?.[1];
-      if (!token) return;
-      const arg = m[2];
-      const path = arg !== undefined && openerFns.has(token) ? [aliases.get(arg) ?? arg] : arg === undefined ? openers.get(token) : undefined;
-      if (path) open.push({ start: i + 1, path });
-      else if (closers.has(token) && open.length > 0) frames.push({ ...open.pop()!, end: i + 1 });
-    });
-    for (const frame of open) frames.push({ ...frame, end: lines.length });
-  }
-  memo.set(file, frames);
-  return frames;
 }
 
 /**
