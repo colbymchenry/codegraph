@@ -22,6 +22,7 @@
   import { buildEntryPanel, flowPair, type EntryRow } from '../lib/entry-model';
   import { flowHref, navigate } from '../lib/navigation';
   import { openEntryTarget } from '../lib/walk';
+  import { i18n } from '../lib/i18n.svelte';
 
   interface Props {
     project?: string | null;
@@ -87,9 +88,8 @@
   <div class="head">
     <h2>Entry points</h2>
     <p>
-      Where a flow starts{project ? ` in ${project}` : ''} — every list below is read out of the
-      graph, not guessed from a filename. Open a row to read the code, or use
-      <span class="chiplike">Flow ›</span> to draw the path from it to a second symbol.
+      {i18n.t('entry.intro', { project: project ?? 'CodeGraph' })}
+      <span class="chiplike">{i18n.t('nav.flow')} ›</span> {i18n.t('entry.drawPath')}
     </p>
   </div>
 

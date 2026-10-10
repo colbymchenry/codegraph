@@ -25,9 +25,20 @@ body {
   background: var(--paper);
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
+}
+
+/* 页面外框形成线路板边界；坐标网格由各画布自行绘制，页面底层保持安静，
+   避免干扰代码阅读。 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px var(--rule-faint);
+  z-index: 100;
 }
 
 *,
@@ -86,7 +97,7 @@ h3 {
 #app {
   height: 100vh;
   display: grid;
-  grid-template-rows: var(--topbar-h) auto 1fr;
+  grid-template-rows: 64px minmax(0, 1fr) auto;
 }
 
 /* ---------- cross-view primitives ---------- */
@@ -126,4 +137,8 @@ h3 {
   font-size: 12px;
   background: var(--press);
   padding: 1px 4px;
+}
+
+@media (max-width: 1023px) {
+  .inspector, .graph-inspector { position: absolute; inset: 0 0 0 auto; z-index: 15; width: min(360px, 90vw); box-shadow: -8px 0 24px #0002; }
 }

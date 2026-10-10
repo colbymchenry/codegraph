@@ -2049,6 +2049,7 @@ program
   .description('Open the CodeGraph viewer in your browser — read your indexed project as a graph')
   .option('--port <number>', `Port to listen on (default: ${DEFAULT_UI_PORT}, or the next free one)`)
   .option('--no-open', 'Print the URL instead of opening a browser')
+  .option('--workspace <file>', '读取包含多个本地项目的工作区 JSON 配置')
   .option('--read-only', 'Refuse every write — saved trails can be opened but not saved or deleted')
   .addHelpText(
     'after',
@@ -2095,7 +2096,7 @@ Set ${BROWSER_ENV}=<command> to choose which browser opens, or
 ${BROWSER_ENV}=none to never open one.
 `
   )
-  .action(async (pathArg: string | undefined, options: { port?: string; open?: boolean; readOnly?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { port?: string; open?: boolean; readOnly?: boolean; workspace?: string }) => {
     // An explicit --port stays explicit: a scripted `--port 8080` that quietly
     // lands on 8081 is worse than one that says the port is busy. The default
     // port is the only one we're free to walk away from.
@@ -2108,24 +2109,27 @@ ${BROWSER_ENV}=none to never open one.
       }
     }
 
-    const projectPath = resolveProjectPath(pathArg);
+    const { loadWorkspaceConfig, createWorkspaceApi } = await import('../ui-server/workspace');
+    const workspace = options.workspace ? loadWorkspaceConfig(options.workspace) : undefined;
+    const projectPath = workspace && !pathArg ? workspace.projects[0]!.path : resolveProjectPath(pathArg);
 
     // Sensitive-directory refusal before anything opens: the same guard the MCP
     // entry points use, so `codegraph ui /etc` is turned away here rather than
     // becoming a browsable view of the system.
     const { validateProjectPath } = await import('../utils');
-    const rootError = validateProjectPath(projectPath);
+    // 配置已校验安全边界；默认项目离线时仍启动其余项目。
+    const rootError = !workspace || pathArg ? validateProjectPath(projectPath) : null;
     if (rootError) {
       error(rootError);
       process.exit(1);
     }
 
-    if (!isInitialized(projectPath)) {
+    if (!workspace && !isInitialized(projectPath)) {
       printNoIndexGuidance(projectPath);
       process.exit(1);
     }
 
-    const { startUiServer, openBrowser, createGraphApi, ViewerMissingError } = await import(
+    const { startUiServer, openBrowser, ViewerMissingError } = await import(
       '../ui-server'
     );
 
@@ -2133,12 +2137,10 @@ ${BROWSER_ENV}=none to never open one.
     // on the first request, so a slow first paint is the only cost of mounting
     // it here rather than after the browser connects.
     const readOnly = options.readOnly === true;
-    const api = createGraphApi({
-      projectRoot: projectPath,
+    const api = createWorkspaceApi({
+      workspace: workspace ?? { name: path.basename(projectPath), projects: [{ id: 'default', name: path.basename(projectPath), path: projectPath }] },
       readOnly,
-      readOnlyReason: readOnly
-        ? 'This viewer was started with --read-only, so trails cannot be saved.'
-        : undefined,
+      defaultProjectRoot: projectPath,
     });
 
     let handle: UiServerHandle;

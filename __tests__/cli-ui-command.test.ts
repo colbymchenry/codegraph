@@ -233,6 +233,20 @@ describe('codegraph ui — serving', () => {
     }
   }
 
+  it('工作区第一项目录缺失时其他项目仍可启动', async () => {
+    const config = path.join(markerDir, 'offline-workspace.json');
+    fs.writeFileSync(config, JSON.stringify({ name: '离线首项目', projects: [
+      { id: 'offline', name: '离线', path: path.join(projectDir, 'missing-project') },
+      { id: 'live', name: '可用', path: projectDir },
+    ] }));
+    const viewer = await startViewer(['--workspace', config, '--no-open', '--port', '0'], {});
+    try {
+      const response = await get(viewer.port, '/api/workspace');
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body).projects.map((project: { available: boolean }) => project.available)).toEqual([false, true]);
+    } finally { await stopViewer(viewer.child); }
+  }, 60_000);
+
   it('serves the viewer and prints where it is', async () => {
     const viewer = await startViewer(['--no-open', '--port', '0', projectDir], {});
     try {

@@ -1,0 +1,290 @@
+{
+  "scenario": "skewed",
+  "nodes": 100000,
+  "edges": 1000000,
+  "projects": [
+    {
+      "id": "project-0",
+      "name": "合成项目 0",
+      "nodes": 80000,
+      "edges": 800000
+    },
+    {
+      "id": "project-1",
+      "name": "合成项目 1",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-2",
+      "name": "合成项目 2",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-3",
+      "name": "合成项目 3",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-4",
+      "name": "合成项目 4",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-5",
+      "name": "合成项目 5",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-6",
+      "name": "合成项目 6",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-7",
+      "name": "合成项目 7",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-8",
+      "name": "合成项目 8",
+      "nodes": 2222,
+      "edges": 22220
+    },
+    {
+      "id": "project-9",
+      "name": "合成项目 9",
+      "nodes": 2224,
+      "edges": 22240
+    }
+  ],
+  "configFile": "/var/folders/6b/g3p29l4s631_z92lg4wkb7xc0000gp/T/codegraph-workspace-benchmark-gCeYXZ/workspace.json",
+  "directory": "/var/folders/6b/g3p29l4s631_z92lg4wkb7xc0000gp/T/codegraph-workspace-benchmark-gCeYXZ",
+  "generationMs": 0.6408749999999941,
+  "reusedFixture": true,
+  "environment": {
+    "date": "2026-09-06T04:52:28.194Z",
+    "node": "v24.16.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M2",
+    "logicalCpus": 8,
+    "totalMemoryBytes": 17179869184
+  },
+  "overview": {
+    "cold": {
+      "ms": 1303.176,
+      "status": 200,
+      "available": 10
+    },
+    "warm": {
+      "ms": 39.88233300000002,
+      "status": 200,
+      "available": 10
+    }
+  },
+  "search": {
+    "p95Ms": 280.0667090000002,
+    "samples": [
+      {
+        "q": "sharedName",
+        "ms": 58.19450000000006,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler",
+        "ms": 277.115,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler123",
+        "ms": 24.41166700000008,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "kind:function handler9",
+        "ms": 79.15075000000002,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "notPresentAnywhere",
+        "ms": 34.01454199999989,
+        "status": 200,
+        "count": 0,
+        "incomplete": 0,
+        "limited": false
+      },
+      {
+        "q": "sharedName",
+        "ms": 43.990540999999894,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler",
+        "ms": 263.68670900000006,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler123",
+        "ms": 23.98299999999972,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "kind:function handler9",
+        "ms": 77.2378749999998,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "notPresentAnywhere",
+        "ms": 34.90995799999973,
+        "status": 200,
+        "count": 0,
+        "incomplete": 0,
+        "limited": false
+      },
+      {
+        "q": "sharedName",
+        "ms": 47.227458999999726,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler",
+        "ms": 280.0667090000002,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "handler123",
+        "ms": 21.98333300000013,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "kind:function handler9",
+        "ms": 76.80237500000021,
+        "status": 200,
+        "count": 60,
+        "incomplete": 0,
+        "limited": true
+      },
+      {
+        "q": "notPresentAnywhere",
+        "ms": 31.880667000000358,
+        "status": 200,
+        "count": 0,
+        "incomplete": 0,
+        "limited": false
+      }
+    ]
+  },
+  "map": {
+    "cold": {
+      "ms": 1375.537917,
+      "status": 200
+    },
+    "warm": {
+      "ms": 1.0161669999997684,
+      "status": 200
+    },
+    "secondRequestIsRetry": false
+  },
+  "cancellation": {
+    "totalMs": 167.3051660000001,
+    "samples": [
+      {
+        "ms": 23.426916999999776,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      },
+      {
+        "ms": 23.385208000000603,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      },
+      {
+        "ms": 23.326000000000022,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      },
+      {
+        "ms": 23.32391600000028,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      },
+      {
+        "ms": 23.316417,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      },
+      {
+        "ms": 23.317791999999827,
+        "cancelled": true,
+        "error": "This operation was aborted"
+      }
+    ],
+    "recovery": {
+      "ms": 143.2215409999999,
+      "status": 200,
+      "incomplete": 0
+    }
+  },
+  "memory": {
+    "before": {
+      "rss": 83853312,
+      "heapTotal": 33980416,
+      "heapUsed": 22080816,
+      "external": 2583131,
+      "arrayBuffers": 29223
+    },
+    "after": {
+      "rss": 542638080,
+      "heapTotal": 59031552,
+      "heapUsed": 33797888,
+      "external": 5386439,
+      "arrayBuffers": 1441910
+    },
+    "rssPeakBytes": 751288320,
+    "note": "RSS 包含当前 Node 进程与 Worker；heapUsed 仅主线程。复用已有数据，本次进程没有生成数据的内存残留。未测浏览器。"
+  },
+  "limitations": [
+    "冷请求指新启动 Worker；操作系统文件缓存未清空。",
+    "本基准只测真实服务端 HTTP，不代表浏览器 FPS、绘制或堆占用。"
+  ]
+}

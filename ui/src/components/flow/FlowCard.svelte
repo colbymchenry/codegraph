@@ -2,7 +2,7 @@
   One hop of a flow: the symbol, where it lives, and the seven lines around the
   call that carries the reader to the next card (design spec §3.5).
 
-  The card is a Svelte Flow node, but nothing about it is Svelte Flow's: the
+  The card is a G6 node, but nothing about it is G6's: the
   handles are hidden ports at the vertical middle of each side, the position
   came from `buildFlowLayout`, and the height is the one that layout computed —
   pinned here so the arrows land where the arithmetic said they would.
@@ -14,7 +14,6 @@
   neither a gutter worth reading nor anything to fold.
 -->
 <script lang="ts">
-  import { Handle, Position } from '@xyflow/svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import { tokenClass, tokensByLine, type Token } from '../../lib/highlight';
   import { assignRefs, basename, type LineRef } from '../../lib/symbol-model';
@@ -89,8 +88,6 @@
   class:dim={data.dimmed}
   style={`width:${card.width}px;height:${card.height}px`}
 >
-  <Handle type="target" position={Position.Left} id="in" isConnectable={false} />
-  <Handle type="source" position={Position.Right} id="out" isConnectable={false} />
 
   <button type="button" class="head" onclick={() => data.onOpen(card)}>
     <KindGlyph kind={hop.node.kind} />
@@ -126,20 +123,28 @@
 
 <style>
   .card {
+    position: relative;
     display: flex;
     flex-direction: column;
     overflow: hidden;
     background: var(--paper);
     border: 1px solid var(--rule-soft);
+    box-shadow: inset 3px 0 0 var(--route-branch);
     text-align: left;
+    transition: border-color 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
   }
+
+
 
   .card:hover {
-    border-color: var(--ink);
+    border-color: var(--route-main);
   }
 
+
+
   .card.cur {
-    border-color: var(--accent);
+    border-color: var(--route-main);
+    box-shadow: inset 3px 0 0 var(--route-main), 0 0 0 1px var(--route-main);
   }
 
   .card.dim {
@@ -159,7 +164,7 @@
   }
 
   .head:hover .nm {
-    color: var(--accent);
+    color: var(--accent-ink);
   }
 
   .nm {

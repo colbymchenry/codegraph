@@ -37,7 +37,8 @@
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
 import { isTestFile } from '../../search/query-utils';
-import { badRequest } from './respond';
+import { badRequest, intParam } from './respond';
+import { workbenchRevision } from './revision';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
 
 /**
@@ -180,6 +181,8 @@ export interface WireMapCycle {
 }
 
 export interface WireMapPayload {
+  budget?: { exceeded: boolean; nodes: number; edges: number; maxNodes: number; maxEdges: number; edgesExact?: boolean };
+  detailsDeferred?: boolean;
   root: string;
   depth: number;
   /** Every root the selector may offer, this index's own directories. */
@@ -581,6 +584,10 @@ function collapseLoneRootFiles(ids: ReadonlySet<string>): Map<string, string> {
 
 export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchParams): WireMapPayload {
   const started = Date.now();
+  const bounded = query.get('bounded') === '1';
+  const includeTests = query.get('tests') !== '0';
+  const details = query.get('details') === '1';
+  const minWeight = intParam(query, 'minWeight', { min: 1, max: 10000, default: 1 });
   const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query);
 
   const fileRecords = cg.getFiles().map((file) => {
@@ -604,13 +611,18 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   const stats = cg.getStats();
   const key = [
     projectRoot,
+    workbenchRevision(projectRoot),
+    includeTests,
+    details,
+    minWeight,
     cg.getLastIndexedAt() ?? 0,
     stats.edgeCount,
     stats.fileCount,
     root,
     depth,
+    bounded,
   ].join('\u0000');
-  const hit = cache.get(key);
+  const hit = bounded ? undefined : cache.get(key);
   if (hit) {
     // Re-stamp rather than mutate: the cached body is shared, and a caller
     // must not see another request's elapsed time.
@@ -637,6 +649,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   const assigned = new Map<string, { id: string; facade: boolean; label: string }>();
   const labelOf = new Map<string, string>();
   for (const file of fileRecords) {
+    if (!includeTests && file.test) continue;
     const at = moduleIdFor(file.path, root, depth, passThrough);
     if (at === null) continue;
     assigned.set(file.path, at);
@@ -679,15 +692,30 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     entry.languages.set(file.language, (entry.languages.get(file.language) ?? 0) + 1);
   }
 
+  // Check the node budget before aggregating relationships or scanning file cycles.
+  if (bounded && modules.size > 400) {
+    return {
+      root, depth, roots: rootOptions(fileRecords), modules: [], links: [],
+      cycles: { total: 0, shown: 0, truncated: true, items: [] },
+      excluded: { uncertainEdges: 0, confidenceBelow: UNCERTAIN_BELOW },
+      index: { lastIndexedAt: cg.getLastIndexedAt(), edges: stats.edgeCount, files: stats.fileCount },
+      timing: { elapsedMs: Date.now() - started, cached: false },
+      budget: { exceeded: true, nodes: modules.size, edges: 0, edgesExact: false, maxNodes: 400, maxEdges: 2000 },
+      detailsDeferred: true,
+    };
+  }
+
   const aggregation = cg.getModuleAggregation(assignments, {
     kinds: MAP_EDGE_KINDS,
     minConfidence: UNCERTAIN_BELOW,
     topPairsPerLink: TOP_PAIRS_PER_LINK,
     pairKinds: PAIR_EDGE_KINDS,
+    bounded,
+    minWeight,
   });
 
   const links = new Map<string, WireMapLink>();
-  let uncertainEdges = 0;
+  let uncertainEdges = aggregation.uncertainEdges ?? 0;
   for (const row of aggregation.links) {
     // The same pass counts what the confidence floor left out, so the "N
     // name-only matches excluded" note reports the number the map actually
@@ -722,8 +750,10 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   // ONE fetch of the file edge list, read twice: the cycle finder and the
   // dependent counts are both questions about it, and it is the expensive query
   // on this screen.
-  const filePairs = cg.getFileDependencyPairs(UNCERTAIN_BELOW);
-  const dependents = countDependents(filePairs, moduleOfFile);
+  const filePairs = bounded ? [] : cg.getFileDependencyPairs(UNCERTAIN_BELOW);
+  const dependents = bounded
+    ? new Map<string, { files: number; modules: number }>()
+    : countDependents(filePairs, moduleOfFile);
 
   const payload: WireMapPayload = {
     root,
@@ -756,7 +786,9 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     links: [...links.values()].sort(
       (a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target)
     ),
-    cycles: fileCycles(filePairs, moduleOfFile),
+    cycles: bounded
+      ? { total: 0, shown: 0, truncated: true, items: [] }
+      : fileCycles(filePairs, moduleOfFile),
     excluded: { uncertainEdges, confidenceBelow: UNCERTAIN_BELOW },
     index: {
       lastIndexedAt: cg.getLastIndexedAt(),
@@ -766,11 +798,33 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     timing: { elapsedMs: Date.now() - started, cached: false },
   };
 
+  if (bounded) {
+    payload.budget = {
+      exceeded: aggregation.truncated === true,
+      nodes: payload.modules.length,
+      edges: payload.links.length,
+      edgesExact: aggregation.truncated !== true,
+      maxNodes: 400,
+      maxEdges: 2000,
+    };
+    payload.detailsDeferred = true;
+    if (details && !payload.budget.exceeded && moduleOfFile.size <= 400) {
+      const pairs = cg.getUiFileDependencyPairs([...moduleOfFile.keys()], UNCERTAIN_BELOW);
+      if (pairs.length <= 2000) {
+        payload.cycles = fileCycles(pairs, moduleOfFile);
+        payload.detailsDeferred = false;
+      }
+    }
+    if (payload.budget.exceeded) {
+      payload.modules = [];
+      payload.links = [];
+    }
+  }
   if (cache.size >= CACHE_LIMIT) {
     const oldest = cache.keys().next();
     if (!oldest.done) cache.delete(oldest.value);
   }
-  cache.set(key, payload);
+  if (!bounded) cache.set(key, payload);
   return payload;
 }
 

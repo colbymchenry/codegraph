@@ -276,3 +276,20 @@ export function navigate(href: string, opts: { replace?: boolean } = {}): void {
 export function back(): void {
   driver.back();
 }
+
+/** 工作区链接保留原阅读器地址，仅添加项目作用域。 */
+export function createProjectNavigation(projectId: string): NavigationDriver {
+  const scope = (href: string) => `#/p/${encodeURIComponent(projectId)}${href.slice(1)}`;
+  return {
+    symbolHref: (id, opts) => scope(hashNavigation.symbolHref(id, opts)),
+    fileHref: (path, opts) => scope(hashNavigation.fileHref(path, opts)),
+    mapHref: (opts) => scope(hashNavigation.mapHref(opts)),
+    flowHref: (opts) => scope(hashNavigation.flowHref(opts)),
+    entryHref: () => scope(hashNavigation.entryHref()),
+    screensHref: () => scope(hashNavigation.screensHref()),
+    stepsHref: (opts) => scope(hashNavigation.stepsHref(opts)),
+    deadHref: (opts) => scope(hashNavigation.deadHref(opts)),
+    navigate: (href, opts) => hashNavigation.navigate(href.startsWith('#/p/') || href.startsWith('#/workspace') ? href : scope(href), opts),
+    back: hashNavigation.back,
+  };
+}

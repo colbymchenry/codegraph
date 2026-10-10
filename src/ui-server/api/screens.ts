@@ -35,6 +35,7 @@ import { resolveProjectFile } from '../security';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import { createWhenReader } from './when';
 import { toNodeRef, type WireNodeRef } from './wire';
+import { graphBudget, GRAPH_BUDGET_REASON, type GraphBudgetMetadata } from './graph-budget';
 
 // =============================================================================
 // Wire shapes
@@ -110,7 +111,7 @@ export interface WireScreenLink {
   synthesized: boolean;
 }
 
-export interface WireScreensPayload {
+export interface WireScreensPayload extends GraphBudgetMetadata {
   /** False when the graph holds no screen navigation at all. */
   routed: boolean;
   /** The route named `/`, when there is one. */
@@ -221,16 +222,24 @@ function isScreenRoute(route: Node): boolean {
   return route.name.startsWith('/') && !`/${route.filePath}`.includes('/server/api/');
 }
 
-export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<WireScreensPayload> {
+export async function buildScreens(cg: CodeGraph, projectRoot: string, query = new URLSearchParams()): Promise<WireScreensPayload> {
   const started = Date.now();
   const stats = cg.getStats();
   const index = { lastIndexedAt: cg.getLastIndexedAt() ?? null, edges: stats.edgeCount, files: stats.fileCount };
 
+  const bounded = query.get('bounded') === '1';
+  const summary = (nodes: number, edges: number): WireScreensPayload => ({
+    routed: true, entry: null, screens: [], origins: [], links: [], dropped: 0, index,
+    timing: { elapsedMs: Date.now() - started }, budget: graphBudget(nodes, edges),
+    detailsDeferred: true, reason: GRAPH_BUDGET_REASON,
+  });
   const routes = cg.getNodesByKind('route').filter(isScreenRoute);
+  if (bounded && routes.length > 400) return summary(routes.length, 0);
   const routeIds = routes.map((r) => r.id);
   const navEdges = routeIds.length === 0 ? [] : cg.getIncomingEdgesTo(routeIds, ['navigates']);
   if (navEdges.length === 0) {
     return {
+      ...(bounded ? { budget: graphBudget(0, 0) } : {}),
       routed: false,
       entry: null,
       screens: [],
@@ -332,6 +341,7 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
       continue;
     }
     starts = collapseSharedChrome(starts, origins);
+    if (bounded && routes.length + origins.size > 400) return summary(routes.length + origins.size, links.size);
     const attributions =
       starts.length > 0
         ? starts
@@ -349,6 +359,8 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
         fromOrigin = true;
         if (!origins.has(head.id)) origins.set(head.id, { id: head.id, node: toNodeRef(head), outgoing: 0 });
       }
+
+      if (bounded && routes.length + origins.size > 400) return summary(routes.length + origins.size, links.size);
 
       // `path` is [screen component, …, holder]; `path[i].edge` is the call
       // from `path[i-1]` into `path[i]`, so its site is in `path[i-1]`'s file.
@@ -382,6 +394,7 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
         }
         continue;
       }
+      if (bounded && links.size >= 2000) return summary(routes.length + origins.size, links.size + 1);
       links.set(id, {
         id,
         from: fromId,
@@ -417,6 +430,7 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
   const entry = screens.find((s) => s.path === '/')?.id ?? null;
   const ordered = [...links.values()].sort((a, b) => a.id.localeCompare(b.id));
   return {
+    ...(bounded ? { budget: graphBudget(screens.length + origins.size, ordered.length) } : {}),
     routed: true,
     entry,
     screens,

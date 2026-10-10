@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { graphText } from '../../lib/graph-copy';
   /**
    * The Steps view's key.
    *
@@ -61,11 +62,7 @@
       {#if !order}
         <div class="lrow">
           <span class="k-label mono">→ name</span>
-          <span
-            >What a box leads to, or what reaches it (←), when the two are too far apart for a line to be followed — said
-            in words under the box rather than drawn across the picture. Select the box and every one of its real lines
-            draws</span
-          >
+          <span>{graphText('当两个方框距离太远、连线难以跟随时，在方框下方用文字说明它通向哪里，或谁到达它（←），而非横跨图形绘线。选中方框后会显示它的全部真实连线', 'What a box leads to, or what reaches it (←), when the two are too far apart for a line to be followed — said in words under the box rather than drawn across the picture. Select the box and every one of its real lines draws')}</span>
         </div>
       {/if}
       {#if project === 'api'}
@@ -155,8 +152,8 @@
           <span>Established by a synthesized hop (an event channel, a callback, a helper's return value)</span>
         </div>
         <div class="lrow">
-          <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-back" /></svg>
-          <span>Goes back up the picture — leaves the top of its box, arrives at the bottom of the other</span>
+          <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line" /></svg>
+          <span>{graphText('返回关系保留原有方向；循环分析使用真实有向关系', 'A return relationship keeps its direction; cycle analysis uses actual directed relationships')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">x? · yes</span>
@@ -186,8 +183,8 @@
   bottom: 12px;
   z-index: 4;
   max-width: 400px;
-  border: 1px solid var(--rule);
-  background: var(--paper);
+  border: 1px solid var(--route-branch);
+  background: var(--paper-2);
   font-size: 11.5px;
   color: var(--ink-2);
 }
@@ -218,18 +215,13 @@
   justify-content: center;
 }
 .k-line {
-  stroke: var(--ink);
-  stroke-opacity: 0.6;
+  stroke: var(--route-branch);
+  stroke-opacity: 0.8;
   stroke-width: 1.5;
   fill: none;
 }
 .k-line.k-synth {
   stroke-dasharray: 5 3;
-}
-.k-line.k-back {
-  stroke: var(--accent);
-  stroke-opacity: 0.8;
-  stroke-dasharray: 4 3;
 }
 .k-label {
   font-size: 10.5px;
@@ -238,30 +230,30 @@
 .k-cap {
   font-size: 10.5px;
   color: var(--ink-3);
-  border-bottom: 1px solid var(--rule-soft);
+  border-bottom: 1px solid var(--route-branch);
   padding-bottom: 2px;
 }
 .k-box {
   box-sizing: border-box;
   padding: 1px 5px;
-  border: 1px solid var(--ink);
+  border: 1px solid var(--route-branch);
   font-size: 10.5px;
   color: var(--ink);
   line-height: 14px;
 }
 .k-box.k-cross {
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--route-main);
 }
 .k-box.k-store {
   background: var(--paper-2);
 }
 .k-box.k-effect {
   border-style: dashed;
-  border-color: var(--ink-3);
+  border-color: var(--route-muted);
 }
 /* The decision's point draws quieter than a step, on the canvas and here. */
 .k-box.k-fork {
-  border-color: var(--ink-2);
+  border-color: var(--route-branch);
 }
 .k-anchor .mark {
   font-size: 8px;

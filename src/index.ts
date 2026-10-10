@@ -1778,6 +1778,8 @@ export class CodeGraph {
       minConfidence: number;
       topPairsPerLink: number;
       pairKinds: readonly Edge['kind'][];
+      bounded?: boolean;
+      minWeight?: number;
     }
   ): ReturnType<QueryBuilder['aggregateModuleGraph']> {
     return this.queries.aggregateModuleGraph(assignments, options);
@@ -1787,6 +1789,10 @@ export class CodeGraph {
    * Every ordered pair of files where one reaches into the other — the edge
    * list a cycle finder runs on. See {@link QueryBuilder.getCrossFileDependencyPairs}.
    */
+  getUiFileDependencyPairs(files: string[], minConfidence: number, limit?: number) {
+    return this.queries.getUiFileDependencyPairs(files, minConfidence, limit);
+  }
+
   getFileDependencyPairs(minConfidence = 0): Array<{ source: string; target: string }> {
     return this.queries.getCrossFileDependencyPairs(minConfidence);
   }
@@ -1837,6 +1843,26 @@ export class CodeGraph {
    * Used to enumerate every overload of a heavily-overloaded name so the specific
    * definition the caller wants is never dropped below a search cut.
    */
+  /** 工作台有界读取，不修改索引。 */
+  getUiSearchCandidates(parsed: Parameters<QueryBuilder['getUiSearchCandidates']>[0], limit: number): ReturnType<QueryBuilder['getUiSearchCandidates']> {
+    return this.queries.getUiSearchCandidates(parsed, limit);
+  }
+
+  /** 工作台有界读取，不修改索引。 */
+  getUiNeighborPage(id: string, direction: 'in' | 'out', after: number, limit: number): ReturnType<QueryBuilder['getUiNeighborPage']> {
+    return this.queries.getUiNeighborPage(id, direction, after, limit);
+  }
+
+  /** 工作台有界读取，不修改索引。 */
+  getUiSymbolPage(file: string, after: string, limit: number): ReturnType<QueryBuilder['getUiSymbolPage']> {
+    return this.queries.getUiSymbolPage(file, after, limit);
+  }
+
+  /** 工作台有界读取，不修改索引。 */
+  getUiBrowsePage(root: string, kind: 'directories' | 'files', after: string, limit: number): ReturnType<QueryBuilder['getUiBrowsePage']> {
+    return this.queries.getUiBrowsePage(root, kind, after, limit);
+  }
+
   getNodesByName(name: string): Node[] {
     return this.queries.getNodesByName(name);
   }

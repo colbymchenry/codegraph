@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { graphText } from '../../lib/graph-copy';
   /**
    * The Map's key (design spec §3.6), matching the Screens and Steps views'.
    *
@@ -31,13 +32,12 @@
     <div class="legend-body">
       <div class="lrow">
         <span class="k-box mono">src/api</span>
-        <span>A module — one directory, with the symbols and files in it</span>
+        <span>{graphText('模块——一个目录及其中的符号和文件', 'A module — one directory, with the symbols and files in it')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-weight mono">src/db</span>
         <span>
-          The bar along the bottom is how much leans on it — files elsewhere that reference
-          straight into it, against the most depended-on box here. The count is on the box
+          {graphText('底部横条表示依赖程度：其他位置直接引用该模块的文件数，相对于当前被依赖最多的模块。数量显示在方框上', 'The bar along the bottom is how much leans on it — files elsewhere that reference straight into it, against the most depended-on box here. The count is on the box')}
         </span>
       </div>
       <div class="lrow">
@@ -52,32 +52,30 @@
       <div class="lrow">
         <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-back" /></svg>
         <span>
-          Points back up — the lighter half of a mutual dependency, or a link with no import or
-          declared type behind it. Drawn only while a module it touches is selected
+          {graphText('向上返回——相互依赖中较轻的一侧，或没有导入或声明类型依据的连接。仅在选中其关联模块时绘制', 'Points back up — the lighter half of a mutual dependency, or a link with no import or declared type behind it. Drawn only while a module it touches is selected')}
         </span>
       </div>
       <div class="lrow">
         <span class="k-label">top / bottom</span>
         <span>
-          A module sits one layer above everything it depends on, so entry points end up at the top
-          and the foundations — which depend on nothing below — at the bottom
+          {graphText('模块位于其所有依赖的上一层，因此入口点在顶部，不依赖更下层模块的基础部分在底部', 'A module sits one layer above everything it depends on, so entry points end up at the top and the foundations — which depend on nothing below — at the bottom')}
         </span>
       </div>
       <div class="lrow">
         <span class="k-box k-sel mono">src/api</span>
-        <span>Selected: click a module to bring out its links and list its files; everything more than one hop away fades</span>
+        <span>{graphText('选中：点击模块以突出显示其连接并列出文件；距离超过一跳的内容会淡化', 'Selected: click a module to bring out its links and list its files; everything more than one hop away fades')}</span>
       </div>
       <div class="lrow">
         <span class="k-label">nothing depends on this</span>
-        <span>No link in the index arrives here — a script, a workflow, an unreferenced corner</span>
+        <span>{graphText('索引中没有连接到达这里——可能是脚本、工作流或未被引用的部分', 'No link in the index arrives here — a script, a workflow, an unreferenced corner')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-test mono">__tests__</span>
-        <span>More than half its files are tests; off unless you turn tests on</span>
+        <span>{graphText('超过一半的文件是测试；只有开启测试显示后才可见', 'More than half its files are tests; off unless you turn tests on')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-gen mono">gen</span>
-        <span>Every file in it is tool-generated — nobody wrote it and nobody edits it</span>
+        <span>{graphText('其中每个文件均由工具生成，并非人工编写或编辑', 'Every file in it is tool-generated — nobody wrote it and nobody edits it')}</span>
       </div>
       {#if thinCount > 0}
         <div class="lrow">

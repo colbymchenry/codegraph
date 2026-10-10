@@ -46,7 +46,6 @@ function mod(id: string, over: Partial<WireMapModule> = {}): WireMapModule {
     test: over.test ?? false,
     facade: over.facade ?? false,
     fileList: over.fileList ?? { total: 3, shown: 3, truncated: false, items: [] },
-    dependents: over.dependents ?? { files: 0, modules: 0 },
   };
 }
 
@@ -475,48 +474,52 @@ describe('directional ports and room', () => {
   });
 });
 
-describe('how much leans on a box', () => {
-  it('scales the bar against the heaviest module DRAWN', () => {
-    const modules = [
-      mod('src/types', { dependents: { files: 90, modules: 5 } }),
-      mod('src/db', { dependents: { files: 45, modules: 3 } }),
-      mod('src/cli', { dependents: { files: 0, modules: 0 } }),
-    ];
-    const links = [link('src/db', 'src/types', 20), link('src/cli', 'src/db', 20)];
-    const layout = buildMapLayout({ modules, links }, OPTS);
-    const weightOf = (id: string) => layout.nodes.find((n) => n.id === id)!.weight;
-
-    expect(weightOf('src/types')).toBe(1);
-    expect(weightOf('src/db')).toBeCloseTo(0.5, 5);
-    // Nothing depends on the CLI, so it draws no bar at all rather than a
-    // sliver a reader would have to squint at to call empty.
-    expect(weightOf('src/cli')).toBe(0);
+describe('大型强连通分量紧凑布局', () => {
+  const ring = (size: number) => {
+    const modules = Array.from({ length: size }, (_, i) => mod(`module-${String(i).padStart(3, '0')}`));
+    const links = modules.flatMap((module, i) => Array.from({ length: 5 }, (_, offset) => link(module.id, modules[(i + offset + 1) % size]!.id, 10)));
+    return { modules, links };
+  };
+  it('400节点2000边保持完整、有限端口且节点不重叠', () => {
+    const layout = buildMapLayout(ring(400), OPTS);
+    expect(layout.nodes).toHaveLength(400);
+    expect(layout.edges).toHaveLength(2000);
+    expect(layout.compactCycles?.[0]).toHaveLength(400);
+    expect(new Set(layout.nodes.map(n => n.y)).size).toBe(20);
+    expect(layout.height).toBeLessThan(4000);
+    expect(layout.width).toBeLessThan(10000);
+    const nodes = new Map(layout.nodes.map(n => [n.id, n]));
+    for (let i = 0; i < layout.nodes.length; i++) {
+      const a = layout.nodes[i]!;
+      for (const b of layout.nodes.slice(i + 1)) {
+        expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y).toBe(true);
+      }
+    }
+    for (const edge of layout.edges) {
+      const from = nodes.get(edge.source)!; const to = nodes.get(edge.target)!;
+      expect(from.sourceHandles).toContain(edge.id);
+      expect(to.targetHandles).toContain(edge.id);
+      const source = portPoint(from, edge.sourceHandle, 'source');
+      const target = portPoint(to, edge.targetHandle, 'target');
+      expect(Number.isFinite(source.x) && Number.isFinite(target.x)).toBe(true);
+      expect(source.y).toBe(from.y + from.height);
+      expect(target.y).toBe(to.y);
+      expect(isEdgeVisible(edge, null)).toBe(true);
+    }
   });
-
-  it('rescales when a heavier test module joins the picture', () => {
-    const modules = [
-      mod('src/types', { dependents: { files: 40, modules: 4 } }),
-      mod('src/app', { dependents: { files: 10, modules: 1 } }),
-      mod('__tests__', { test: true, dependents: { files: 80, modules: 6 } }),
-    ];
-    const links = [link('src/app', 'src/types', 20), link('__tests__', 'src/app', 20)];
-    const spec = { modules, links };
-    // Tests off: the app's own busiest box is the full bar.
-    const off = buildMapLayout(spec, { includeTests: false });
-    expect(off.nodes.find((n) => n.id === 'src/types')!.weight).toBe(1);
-    // Tests on: the scale moves, rather than leaving a bar running past a
-    // maximum the reader cannot see.
-    const on = buildMapLayout(spec, { includeTests: true });
-    expect(on.nodes.find((n) => n.id === 'src/types')!.weight).toBeCloseTo(0.5, 5);
-    expect(on.nodes.find((n) => n.id === '__tests__')!.weight).toBe(1);
+  it('顺序不依赖输入排列，跨分量的依赖仍向下', () => {
+    const payload = ring(25);
+    payload.modules.push(mod('entry'), mod('foundation'));
+    payload.links.push(link('entry', 'module-000', 10), link('module-010', 'foundation', 10));
+    const layout = buildMapLayout(payload, OPTS);
+    const reversed = buildMapLayout({ modules: [...payload.modules].reverse(), links: [...payload.links].reverse() }, OPTS);
+    const positions = (value: MapLayout) => value.nodes.map(({ id, x, y }) => ({ id, x, y })).sort((a,b) => a.id.localeCompare(b.id));
+    expect(positions(layout)).toEqual(positions(reversed));
+    expect(layerOf(layout, 'entry')).toBeGreaterThan(Math.max(...layout.nodes.filter(n => n.id.startsWith('module-')).map(n => n.layer)));
+    expect(layerOf(layout, 'foundation')).toBeLessThan(Math.min(...layout.nodes.filter(n => n.id.startsWith('module-')).map(n => n.layer)));
   });
-
-  it('says the count on the box, and says nothing when nothing depends on it', () => {
-    expect(moduleMetaLabel(mod('src/db', { dependents: { files: 45, modules: 3 } }))).toBe(
-      '30 symbols · 3 files · 45 depend on it'
-    );
-    expect(moduleMetaLabel(mod('src/cli'))).toBe('30 symbols · 3 files');
-    // An island's line is still the one sentence that matters about it.
-    expect(moduleMetaLabel(mod('src/cli'), true)).toBe('nothing depends on this');
+  it('小型循环继续使用原有逐层布局', () => {
+    const layout = buildMapLayout(ring(19), OPTS);
+    expect(layout.compactCycles).toBeUndefined();
   });
 });
