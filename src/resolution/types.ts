@@ -157,6 +157,14 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * The nodes one type declaration extends or implements, through its own
+   * resolved `implements`/`extends` edges: where getSupertypes unions those of
+   * every type sharing a simple name, this is the supertypes of the node
+   * `id`. Empty during the first resolution pass, as getSupertypes is.
+   * Optional so external/test contexts compile without it.
+   */
+  getSupertypeNodes?(id: string): Node[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile

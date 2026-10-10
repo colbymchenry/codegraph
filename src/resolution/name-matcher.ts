@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
+import { cppAliasedTypeName, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -9039,6 +9039,329 @@ function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   return !declared.some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
 }
 
+const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
+
+/**
+ * C++ class `cls`'s method `name`: its own, else the nearest one of a class
+ * it derives from, through the base edges every declaration of `cls` has.
+ */
+function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
+  const want = `${cls.qualifiedName}::${name}`;
+  const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
+    context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
+  const own = named.filter((n) => n.qualifiedName === want);
+  if (own.length > 0) return preferCallSiteFile(own, ref.filePath)[0]!;
+  seen.add(cls.qualifiedName);
+  if (depth >= 4 || !context.getSupertypeNodes) return null;
+  for (const decl of context.getNodesByQualifiedName(cls.qualifiedName)) {
+    if ((decl.language !== 'cpp' && decl.language !== 'c') || !CPP_CLASS_KINDS.has(decl.kind)) continue;
+    for (const base of context.getSupertypeNodes(decl.id)) {
+      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName)) continue;
+      const inherited = cppMethodOf(base, name, ref, context, depth + 1, seen);
+      if (inherited) return inherited;
+    }
+  }
+  return null;
+}
+
+/**
+ * A C++ call written with no receiver, or on `this` (`this->Clear()`,
+ * `(*this).Clear()`), in a member function — or in a lambda in one, whose
+ * calls the extractor gives to the function — calls what C++ name lookup
+ * finds there: a member of the function's class, else of a class it derives
+ * from, else of a class it is nested in, before anything at namespace scope.
+ * By its name alone, protobuf's generated `Api::operator=` calling
+ * `InternalSwap(&from)` reached `Any::InternalSwap`, and `Any::InternalSwap`
+ * calling the `GetArena()` it inherits from `MessageLite` reached
+ * `Arena::InternalHelper::GetArena`.
+ *  - Bases are the class's own base edges, so a namesake class elsewhere
+ *    lends it nothing. A bare call skips a base that depends on the class's
+ *    template parameters, which C++ doesn't look in (`this->` is how such a
+ *    member is called).
+ *  - `this` is an object of the innermost class: never an enclosing class's.
+ *  - A parameter or local the function declares before a bare call is what
+ *    it calls: `void Set(Callback callback) { callback(); }`.
+ * Undefined when the call is not of that shape or no class on the way has a
+ * method of that name in the index — a free function, `static` or not, has
+ * no class; a base outside the project lends no node: the name strategies
+ * decide, as before.
+ */
+function matchCppImplicitThisCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | undefined {
+  const name = ref.referenceName;
+  if (ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(name)) return undefined;
+  const receiver = cppImplicitReceiver(ref, context);
+  if (receiver === null) return undefined;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const owner = caller ? cppMemberOwner(caller, context) : null;
+  if (!caller || owner === null) return undefined;
+  let found: Node | null = null;
+  for (const scope of cppEnclosingClasses(owner, caller, context)) {
+    found = cppScopeMethod(scope, name, receiver, ref, context);
+    if (found || receiver === 'this') break;
+  }
+  // (A recursive call names the function itself, which no local shadows.)
+  if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
+  return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'instance-method' };
+}
+
+/** `this->` / `(*this).` before a member's name, with a `template` keyword after it. */
+const CPP_THIS_RECEIVER = /^(?:this\s*->|\(\s*\*\s*this\s*\)\s*\.)\s*(?:template\s+)?/;
+
+/**
+ * How a C++ call the extractor recorded by its bare name is written, read at
+ * its column: `'bare'` with no receiver, `'this'` on `this->` / `(*this).`,
+ * null for anything else. The extractor also drops receivers it can't spell
+ * (`arr_[0].Foo()`, `(p_)->Foo()`, `this->p_->Foo()`), whose calls are no
+ * member of the caller's class; and a name its argument list doesn't follow
+ * is no call of it.
+ */
+function cppImplicitReceiver(ref: UnresolvedRef, context: ResolutionContext): 'bare' | 'this' | null {
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (line === undefined) return null;
+  const at = (column: number): 'bare' | 'this' | null => {
+    const text = line.slice(column);
+    const self = CPP_THIS_RECEIVER.exec(text)?.[0] ?? '';
+    const before = line.slice(0, column).replace(/\s+$/, '');
+    // A column past the receiver: on `this`, or some other object's call.
+    const onThis = self !== '' || /(?:^|[^\w$])(?:this\s*->|\(\s*\*\s*this\s*\)\s*\.)$/.test(before);
+    if (!onThis && /(?:\.|->|::)$/.test(before)) return null;
+    const rest = text.slice(self.length);
+    if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
+    return cppArgumentListFollows(rest, ref.referenceName.length) ? (onThis ? 'this' : 'bare') : null;
+  };
+  const verdict = at(Math.max(0, ref.column));
+  if (verdict !== null || !/[^\x00-\x7f]/.test(line)) return verdict;
+  // The column may count UTF-8 bytes, which wider characters before the call outnumber.
+  let bytes = 0;
+  let index = 0;
+  while (index < line.length && bytes < ref.column) {
+    const point = line.codePointAt(index)!;
+    bytes += point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+    index += point > 0xffff ? 2 : 1;
+  }
+  return bytes === ref.column && index !== ref.column ? at(index) : null;
+}
+
+/** Whether `text` from `from` on is an argument list, after any template arguments (`<Foo, 3>(`). */
+function cppArgumentListFollows(text: string, from: number): boolean {
+  let i = from;
+  while (i < text.length && /\s/.test(text[i]!)) i++;
+  if (text[i] === '<') {
+    let depth = 0;
+    for (; i < text.length; i++) {
+      const c = text[i]!;
+      if (c === '<') depth++;
+      else if (c === '>' && --depth === 0) break;
+      else if (c === ';' || c === '{' || c === '}') return false;
+    }
+    if (depth !== 0) return false;
+    i++;
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+  }
+  return text[i] === '(';
+}
+
+/** The C and C++ class, struct and union declarations of a qualified name. */
+function cppClassDecls(qualifiedName: string, context: ResolutionContext): Node[] {
+  return context.getNodesByQualifiedName(qualifiedName).filter((n) =>
+    CPP_CLASS_KINDS.has(n.kind) && (n.language === 'cpp' || n.language === 'c'));
+}
+
+/**
+ * The qualified name of the class whose scope a C++ caller's body is in: a
+ * member function's, defined in the class or out of line (`void
+ * Api::InternalSwap(…) {…}`), static or not — or a class's own, for code in
+ * its body. A function node counts only when its definition is written
+ * `Class::name(…)`. Null for a free function, and for one defined through a
+ * namespace (`void detail::helper() {}` is a method node of no class).
+ */
+function cppMemberOwner(caller: Node, context: ResolutionContext): string | null {
+  if (CPP_CLASS_KINDS.has(caller.kind)) return caller.qualifiedName;
+  if (caller.kind !== 'method' && caller.kind !== 'function') return null;
+  const cut = caller.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return null;
+  const owner = caller.qualifiedName.slice(0, cut);
+  if (caller.kind === 'function') {
+    const lines = context.getFileLines?.(caller.filePath) ?? context.readFile(caller.filePath)?.split(/\r?\n/);
+    const head = lines?.slice(caller.startLine - 1, caller.startLine + 2).join(' ') ?? '';
+    const cls = cppLastSegment(owner).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const fn = caller.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!new RegExp(`\\b${cls}\\s*(?:<[^<>;{}]*>\\s*)?::\\s*~?${fn}\\s*\\(`).test(head)) return null;
+  }
+  if (cppClassDecls(owner, context).length > 0) return owner;
+  // A class declared in another and defined elsewhere, which the index has
+  // no node for: protobuf's `Any::_Internal`, declared in `Any`.
+  const outer = owner.lastIndexOf('::');
+  return outer > 0 && cppClassDecls(owner.slice(0, outer), context).length > 0 ? owner : null;
+}
+
+/** One class C++ lookup passes through, with the declarations that are the class there. */
+interface CppClassScope {
+  qualifiedName: string;
+  decls: Node[];
+  /** `decls[0]` holds the code the lookup starts from. */
+  holds: boolean;
+}
+
+/**
+ * The classes a C++ caller's name lookup passes through, innermost first:
+ * the caller's class, then each class it is nested in. After a class
+ * declared in a function body comes that function's class. Several classes
+ * can share a qualified name — another translation unit's local fixture or
+ * helper — so each scope keeps only the declaration holding the code, else
+ * those in its file, else those its file includes, else all of them.
+ */
+function cppEnclosingClasses(owner: string, caller: Node, context: ResolutionContext): CppClassScope[] {
+  const scopes: CppClassScope[] = [];
+  let qualifiedName = owner;
+  let inner = caller;
+  for (let hops = 0; hops < 8 && qualifiedName !== ''; hops++) {
+    const decls = cppClassDecls(qualifiedName, context);
+    if (decls.length === 0 && hops > 0) {
+      // A namespace: lookup leaves the classes. Unless it is the function a
+      // local class is declared in (`Clear::Local`), whose class comes next.
+      const fn = (context.getNodesInFileNamed?.(inner.filePath, cppLastSegment(qualifiedName)) ?? [])
+        .find((n) => (n.kind === 'method' || n.kind === 'function') && rangeWithin(inner, n) && !sameRange(inner, n));
+      const fnOwner = fn ? cppMemberOwner(fn, context) : null;
+      if (!fn || fnOwner === null) break;
+      qualifiedName = fnOwner;
+      inner = fn;
+      continue;
+    }
+    const scope = cppScopeDeclarations(qualifiedName, decls, inner, context);
+    scopes.push(scope);
+    if (scope.decls.length > 0) inner = scope.decls[0]!;
+    const cut = qualifiedName.lastIndexOf('::');
+    qualifiedName = cut > 0 ? qualifiedName.slice(0, cut) : '';
+  }
+  return scopes;
+}
+
+/** A class scope's declarations as cppEnclosingClasses keeps them. */
+function cppScopeDeclarations(qualifiedName: string, decls: Node[], inner: Node, context: ResolutionContext): CppClassScope {
+  const holding = decls.filter((d) => d.filePath === inner.filePath && rangeWithin(inner, d) && d.id !== inner.id);
+  if (holding.length > 0) return { qualifiedName, decls: holding, holds: true };
+  const local = decls.filter((d) => d.filePath === inner.filePath);
+  if (local.length > 0 || decls.length < 2) return { qualifiedName, decls: local.length > 0 ? local : decls, holds: false };
+  const included = decls.filter((d) => cppIncluders(d.filePath, context).has(inner.filePath));
+  return { qualifiedName, decls: included.length > 0 ? included : decls, holds: false };
+}
+
+/**
+ * The method `name` a class scope gives C++ lookup: the class's own — first
+ * one written in the very declaration holding the code, as an inline member
+ * — else the nearest one of a class it derives from, through the kept
+ * declarations' base edges.
+ */
+function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | 'this', ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const own = context.getNodesByQualifiedName(`${scope.qualifiedName}::${name}`)
+    .filter((n) => n.kind === 'method' && (n.language === 'cpp' || n.language === 'c'));
+  const holder = scope.holds ? scope.decls[0]! : null;
+  const inline = holder ? own.filter((n) => n.filePath === holder.filePath && rangeWithin(n, holder)) : [];
+  if (inline.length > 0) return cppOverloadFor(inline, name, ref, context);
+  // A class with no name (a partial specialization, an unnamed struct)
+  // shares its qualified name with every other: only its inline members are its own.
+  if (own.length > 0 && cppLastSegment(scope.qualifiedName) !== '<anonymous>') {
+    return cppOverloadFor(preferCallSiteFile(own, ref.filePath), name, ref, context);
+  }
+  if (!context.getSupertypeNodes) return null;
+  for (const decl of scope.decls) {
+    for (const base of context.getSupertypeNodes(decl.id)) {
+      if (!CPP_CLASS_KINDS.has(base.kind)) continue;
+      if (receiver === 'bare' && isCppDependentBase(decl, base, context)) continue;
+      const inherited = cppMethodOf(base, name, ref, context, 1, new Set([scope.qualifiedName]));
+      if (inherited) return inherited;
+    }
+  }
+  return null;
+}
+
+/** Of one class's overloads of `name` (in preference order), the one the call's arguments fit best. */
+function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
+  if (overloads.length === 1) return overloads[0]!;
+  const args = cppCallArguments(ref, name, context);
+  if (!args) return overloads[0]!;
+  let best = overloads[0]!;
+  let bestFit = cppOverloadFit(best, name, args, context);
+  for (const n of overloads.slice(1)) {
+    const fit = cppOverloadFit(n, name, args, context);
+    if (fit > bestFit) {
+      best = n;
+      bestFit = fit;
+    }
+  }
+  return best;
+}
+
+const CPP_BASE_SPECS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * The base specifiers a C or C++ class declaration writes (`public
+ * Base<T>`, `private Mixin`), read from its own head; none for a forward
+ * declaration.
+ */
+function cppBaseSpecifiers(decl: Node, context: ResolutionContext): string[] {
+  let memo = CPP_BASE_SPECS.get(context);
+  if (!memo) CPP_BASE_SPECS.set(context, (memo = new Map()));
+  const hit = memo.get(decl.id);
+  if (hit) return hit;
+  const specs: string[] = [];
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
+  const head = lines?.slice(decl.startLine - 1, decl.startLine + 11) ?? [];
+  if (head.length > 0) {
+    head[0] = head[0]!.slice(decl.startColumn);
+    const text = head.map((l) => cppCodeOf(l) ?? '').join('\n');
+    const brace = text.indexOf('{');
+    const colon = brace < 0 ? -1 : text.slice(0, brace).search(/(?<!:):(?!:)/);
+    if (colon >= 0 && !text.slice(0, brace).includes(';')) {
+      specs.push(...splitCppTopLevel(text.slice(colon + 1, brace)).map((s) => s.replace(/\b(?:public|protected|private|virtual)\b/g, ' ').trim()));
+    }
+  }
+  memo.set(decl.id, specs);
+  return specs;
+}
+
+/**
+ * Whether `base`, a base of the C++ class declaration `decl`, depends on the
+ * template parameters of `decl` or a class around it: `template <class T>
+ * class Foo : public Base<T>`. A bare name is not looked up in such a base.
+ */
+function isCppDependentBase(decl: Node, base: Node, context: ResolutionContext): boolean {
+  const parameters = cppTemplateParameters(decl, context);
+  if (parameters.size === 0) return false;
+  const spec = cppBaseSpecifiers(decl, context).find((s) => cppLastSegment(stripCppTemplateArguments(s).trim()) === base.name);
+  return spec !== undefined && [...parameters].some((p) => new RegExp(`(?<![\\w$])${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(spec));
+}
+
+/**
+ * Whether the C++ function `caller` declares `name` before the call at
+ * `ref` — a parameter, a local, a lambda's parameter, a range-`for` variable,
+ * a structured binding — which a bare call then calls, not a member. A
+ * declaration in an earlier block the call is outside of counts too: the
+ * name strategies decide, as before.
+ */
+function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (caller.filePath !== ref.filePath || CPP_CLASS_KINDS.has(caller.kind)) return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return false;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const word = new RegExp(`\\b${escaped}\\b`);
+  const declarator = buildDeclaratorRegex(escaped);
+  for (let i = Math.max(0, caller.startLine - 1); i < Math.min(lines.length, ref.line); i++) {
+    if (!word.test(lines[i]!)) continue;
+    const code = cppCodeOf(lines[i]!);
+    if (!code || !word.test(code)) continue;
+    if (cppRebindsReceiver(code, escaped)) return true;
+    // `std::function<void()> done;` reads as a declaration once its template arguments are gone.
+    for (const variant of [code, stripCppTemplateArguments(code)]) {
+      const type = declarator.exec(variant)?.[1];
+      // `Owner::name(` is a definition's own declarator; `return name(` no declaration.
+      if (type !== undefined && !/::\s*$/.test(type) && normalizeCppTypeName(type) !== null) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * A C++ source line as code, for reading declarations: null for a line of a
  * comment (`// …`, ` * …`), else the line with its comments blanked, columns
@@ -9672,6 +9995,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_NS_FRAMES.delete(context);
   CPP_NS_ALIASES.delete(context);
   CPP_CLASSES_IN_FILE.delete(context);
+  CPP_BASE_SPECS.delete(context);
   SOLIDITY_SUPERS.delete(context);
   DECLARED_SUPERS.delete(context);
   INHERITED_METHODS.delete(context);
@@ -10783,6 +11107,10 @@ export function matchMethodCall(
 
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {
+    // A C++ call written with no receiver, or on `this`, in a member function
+    // is a call on the function's object: a member of its class, of a class
+    // it derives from or of one it is nested in, when one has that name.
+    if (ref.language === 'cpp') return nmTimedT('mc-cppthis', ref, () => matchCppImplicitThisCall(ref, context)) ?? null;
     return null;
   }
 
