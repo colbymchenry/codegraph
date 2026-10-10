@@ -173,6 +173,8 @@ const CODE_FAMILY: Record<string, string> = {
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
+  // DAML compiles to its own ledger runtime: it can't call Haskell, and vice versa.
+  haskell: 'haskell', daml: 'daml',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
@@ -13811,7 +13813,9 @@ function splitCppTopLevel(text: string): string[] {
 function cppParenListAfter(file: string, line: number, column: number, name: string, context: ResolutionContext): string | null {
   const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
   const text = lines.slice(line - 1, line + 11).join('\n');
-  const at = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
+  // Escape every metacharacter: operator method names (`~Foo`, Scala's `++`) reach here too.
+  const escaped = name.replace(/[.*+?^${}()|[\]\\~]/g, '\\$&');
+  const at = new RegExp(`\\b${escaped}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
   if (!at) return null;
   const open = column + at.index + at[0].length - 1;
   let depth = 0;

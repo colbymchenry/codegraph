@@ -51,6 +51,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  haskell: 'tree-sitter-haskell.wasm',
+  daml: 'tree-sitter-daml.wasm',
 };
 
 /**
@@ -171,6 +173,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // Haskell — vendored grammar from tree-sitter-haskell 0.23.1 (ABI 14).
+  '.hs': 'haskell',
+  '.lhs': 'haskell',
+  // DAML (Digital Asset / Canton smart contracts) — tree-sitter-daml, which
+  // extends the tree-sitter-haskell 0.23.1 grammar.
+  '.daml': 'daml',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -397,6 +405,18 @@ export async function initGrammars(): Promise<void> {
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  // Haskell: tree-sitter-wasms doesn't ship it; we vendor the prebuilt
+  // tree-sitter-haskell.wasm from the tree-sitter-haskell 0.23.1 npm package
+  // (MIT, ABI 14) — byte-identical to the npm tarball's artifact.
+  'haskell',
+  // DAML: tree-sitter-wasms doesn't ship it; we vendor tree-sitter-daml.wasm built
+  // from tree-sitter-daml 0.1.0 (github.com/ferranguardian/tree-sitter-daml
+  // @ c7f98ae, MIT), a derivative of
+  // tree-sitter-haskell 0.23.1 that keeps its node names and adds DAML's
+  // templates, choices, interfaces, exceptions, `with` records and swapped
+  // `:`/`::`. Built with tree-sitter-cli 0.25.10 (`generate` + `build --wasm`,
+  // ABI 15).
+  'daml',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -937,6 +957,8 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    haskell: 'Haskell',
+    daml: 'DAML',
     unknown: 'Unknown',
   };
   return names[language] || language;

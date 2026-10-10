@@ -37,6 +37,7 @@ import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClas
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
+import { gateHaskellNearestCopy, gateHaskellScope, resolveHaskellModuleRef } from './haskell-modules';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -1017,6 +1018,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      candidates: ref.candidates,
       rowId: ref.rowId,
     }));
 
@@ -1187,9 +1189,16 @@ export class ReferenceResolver {
     // A name a declaration around the reference declares as a type parameter
     // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters),
     // and a Dart call to a parameter or local calls that (./dart-local-scope).
+    // A Haskell/DAML reference also resolves through its module scope
+    // (see ./haskell-modules).
+    const inner = gateHaskellScope(
+      gateHaskellNearestCopy(this.resolveOneInner(ref) ?? resolveHaskellModuleRef(ref, this.context), ref, this.context),
+      ref,
+      this.context,
+    );
     const candidate = gateDartLocal(
       gateTypeParameter(
-        gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+        gateSwiftTypeTarget(this.gateTargetKind(inner, ref), ref, this.context),
         ref,
         this.context,
       ),
@@ -1911,6 +1920,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -2031,6 +2041,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -3235,6 +3246,21 @@ export class ReferenceResolver {
    * stays in `unresolved_refs` as `failed`, which is the honest record for a
    * supertype that lives outside the repo — silent beats wrong.
    */
+  /**
+   * The type a Haskell/DAML `type I = Account` alias names, when that type is
+   * declared in the alias's own file — the DAML interface convention. Null for
+   * any other alias: a cross-file or applied alias (`type T = Map Text Int`)
+   * needs real type resolution, and a wrong supertype edge is worse than none.
+   */
+  private sameFileTypeAliasTarget(alias: Node): Node | null {
+    if (alias.kind !== 'type_alias' || (alias.language !== 'daml' && alias.language !== 'haskell')) return null;
+    const named = /^type\s+\S+\s*=\s*([A-Z][\w']*)\s*$/.exec(alias.signature ?? '')?.[1];
+    if (!named) return null;
+    const candidates = this.context.getNodesByName(named)
+      .filter((n) => n.filePath === alias.filePath && isSupertypeTarget(n));
+    return candidates.length === 1 ? candidates[0]! : null;
+  }
+
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
 
@@ -3278,7 +3304,14 @@ export class ReferenceResolver {
     }
 
     if (!isInheritanceRef(ref)) return result;
-    const target = this.nodeById(result.targetNodeId);
+    let target = this.nodeById(result.targetNodeId);
+    // DAML names an interface through a same-module alias (`type I = Account`,
+    // implemented as `interface instance Account.I for T`): follow it.
+    const aliased = target ? this.sameFileTypeAliasTarget(target) : null;
+    if (aliased) {
+      result = { ...result, targetNodeId: aliased.id };
+      target = aliased;
+    }
     if (target && !isSupertypeTarget(target)) {
       const type = this.sameNamedTypeOfValue(target);
       if (!type) return null;
