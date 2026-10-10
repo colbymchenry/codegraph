@@ -45,6 +45,9 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+const SENSITIVE_REAL_PATHS = new Set([...SENSITIVE_PATHS].map((entry) => {
+  try { return fs.realpathSync(entry); } catch { return entry; }
+}));
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -174,19 +177,39 @@ export function validatePathWithinRoot(
  */
 export function validateProjectPath(dirPath: string): string | null {
   const resolved = path.resolve(dirPath);
+  let realResolved = resolved;
+  try {
+    realResolved = fs.realpathSync(resolved);
+  } catch {
+    // Preserve the existing error handling for paths that do not exist yet.
+  }
+  const pathsToCheck = realResolved === resolved ? [resolved] : [resolved, realResolved];
 
   // Block sensitive system directories
-  if (SENSITIVE_PATHS.has(resolved) || SENSITIVE_PATHS.has(resolved.toLowerCase())) {
-    return `Refusing to operate on sensitive system directory: ${resolved}`;
-  }
-
-  // Also block common sensitive home subdirectories
   const homeDir = require('os').homedir();
+  let realHomeDir = homeDir;
+  try {
+    realHomeDir = fs.realpathSync(homeDir);
+  } catch {
+    // Keep the lexical home path when it cannot be resolved.
+  }
   const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
-    const sensitivePath = path.join(homeDir, dir);
-    if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
-      return `Refusing to operate on sensitive directory: ${resolved}`;
+  const sensitiveHomePaths = new Set<string>();
+  for (const home of [homeDir, realHomeDir]) {
+    for (const dir of sensitiveHomeDirs) {
+      const sensitivePath = path.join(home, dir);
+      sensitiveHomePaths.add(sensitivePath);
+      try { sensitiveHomePaths.add(fs.realpathSync(sensitivePath)); } catch { /* keep the lexical path */ }
+    }
+  }
+  for (const candidate of pathsToCheck) {
+    if (SENSITIVE_REAL_PATHS.has(candidate) || SENSITIVE_PATHS.has(candidate.toLowerCase())) {
+      return `Refusing to operate on sensitive system directory: ${candidate}`;
+    }
+    for (const sensitivePath of sensitiveHomePaths) {
+      if (candidate === sensitivePath || candidate.startsWith(sensitivePath + path.sep)) {
+        return `Refusing to operate on sensitive directory: ${candidate}`;
+      }
     }
   }
 
