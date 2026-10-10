@@ -330,6 +330,20 @@ Each of these cost real debugging time; they are not hypothetical.
    calls again, failed or not; without it the synced index keeps an answer a
    full index does not have. `sync-navigation-retry.test.ts` runs all seven
    routers through it, and asserts each router's calls end in a declared tail.
+17. **A sync revisits a resolved route only by the names it carries.** A route
+   that renders a same-file `const Docs = lazy(() => import('./pages/Docs'))`
+   binds to the component that module exports, and to the declaration while
+   the module is missing or exports none (`declaredComponent`). The reference
+   resolved, so the failed-ref retry never sees it, and the rebind of the
+   names a sync defines (CG-33) reaches it only when the module's component
+   is named like the declaration: on minimal-ui-kit/material-kit-react,
+   `/user` stayed on its `UserPage` declaration after `src/pages/user.tsx`
+   (`Page`) came back. A router whose `resolve()` reads modules' content to
+   answer a route says which ones (`FrameworkResolver.lazyModules`), barrels it
+   follows included, and a sync that adds or edits one of them puts the
+   route's reference back for its resolution sweep. The same holds for the
+   JSX a component renders: a sync that adds a component redraws the
+   `jsx-render` edges, since a tag in a file it never touched may name it.
 
 ---
 

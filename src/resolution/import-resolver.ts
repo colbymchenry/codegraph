@@ -12,6 +12,7 @@ import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
+import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { moduleTail } from '../db/reference-tail';
 import {
@@ -84,8 +85,9 @@ const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | un
  * Built from the file's exported rows alone: every worker of the resolver
  * pool builds its own index for each file an import reaches, and decoding
  * whole files there cost more than resolving through them. The two answers
- * that need more — the default-export binding and names a local export
- * clause introduces — read the source and name-targeted rows on first use.
+ * that need more — what the `export default` statement exports and names a
+ * local export clause introduces — read the source and name-targeted rows on
+ * first use.
  */
 interface FileExportIndex {
   /** Exported declarations by name. Read through {@link exportedByName}. */
@@ -93,15 +95,11 @@ interface FileExportIndex {
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
   /**
-   * The node an `export default NAME` statement names, exported at its
-   * declaration or not — the precise answer where `defaultFnClass` is a
-   * guess. `const Home = () => …; export default Home` and the namespace
-   * object `const UploadApi = { uploadARCapture }; export default UploadApi`
-   * are both invisible to the `isExported` index above: neither declaration
-   * has an `export_statement` ancestor. `undefined` until first read through
-   * {@link defaultExportBindingNode}; `null` when there is none.
+   * What the file's own `export default` statement exports — the precise
+   * answer where `defaultComponent`/`defaultFnClass` are guesses. `undefined`
+   * until first read through {@link statedDefaultExport}.
    */
-  defaultBinding?: Node | null;
+  statedDefault?: StatedDefault;
   /**
    * Names a local export clause (`export { impl as alias }`) binds to a
    * declaration the extractor never flagged isExported, for names not in
@@ -111,17 +109,115 @@ interface FileExportIndex {
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
-const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+const DEFAULT_DECLARATION_KINDS = new Set<string>(['function', 'class', 'component']);
 /** Any `export default …` statement: the module is an ES module with a default export. */
 const ESM_DEFAULT_EXPORT_RE = /^[ \t]*export\s+default\b/m;
 const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
-/** The identifier `export default NAME` names in a JS-family file, or null. */
-function defaultExportBinding(filePath: string, context: ResolutionContext): string | null {
-  if (!JS_FAMILY_FILE.test(filePath)) return null;
-  const source = context.readFile(filePath);
-  if (!source || !source.includes('export default')) return null;
-  return source.match(DEFAULT_EXPORT_BINDING_RE)?.[1] ?? null;
+/**
+ * What a file's own `export default` statement exports: the node it declares
+ * or names, `'anonymous'` for a function or class with no name (no node
+ * stands for it), `'unstated'` when the file says nothing a node answers.
+ */
+type StatedDefault = Node | 'anonymous' | 'unstated';
+
+const EXPORT_DEFAULT_HEAD = /^[ \t]*export\s+default\s+/gm;
+/** `[async] function[*] [NAME]` / `[abstract] class [NAME]`; the name is group 1 or 2. */
+const DEFAULT_DECLARATION_RE =
+  /^(?:async\s+)?function\b\s*(?:\*\s*)?([A-Za-z_$][\w$]*)?|^(?:abstract\s+)?class\b(?:\s+(?!extends\b|implements\b)([A-Za-z_$][\w$]*))?/;
+/** `[async] x =>`, or `[async] (` opening what may be an arrow function's parameters. */
+const DEFAULT_ARROW_RE = /^(?:async\s+)?(?:[A-Za-z_$][\w$]*\s*=>|\()/;
+/** `NAME` alone on its line. */
+const DEFAULT_BINDING_RE = /^([A-Za-z_$][\w$]*)\s*;?[ \t]*(?:\r?\n|$)/;
+
+/**
+ * The value of the `export default` statement whose value starts at `at`, in
+ * comment-stripped code: the name a declaration or a binding gives it,
+ * `'anonymous'` for a function, class or arrow function without one, or null
+ * for any other expression.
+ */
+function readDefaultExport(code: string, at: number): { name: string; nameAt: number; declared: boolean } | 'anonymous' | null {
+  const rest = code.slice(at, at + 2048);
+  const decl = DEFAULT_DECLARATION_RE.exec(rest);
+  if (decl) {
+    const name = decl[1] ?? decl[2];
+    return name ? { name, nameAt: at + decl[0].length - name.length, declared: true } : 'anonymous';
+  }
+  const arrow = DEFAULT_ARROW_RE.exec(rest);
+  if (arrow) {
+    if (!arrow[0].endsWith('(')) return 'anonymous';
+    // A parenthesized list is an arrow function's parameters when `=>` or a
+    // return type (`(…): JSX.Element =>`) follows it; otherwise it is an
+    // expression (`(Foo)`).
+    let depth = 0;
+    for (let i = arrow[0].length - 1; i < rest.length; i++) {
+      if (rest[i] === '(') depth++;
+      else if (rest[i] === ')' && --depth === 0) return /^\s*(?:=>|:)/.test(rest.slice(i + 1)) ? 'anonymous' : null;
+    }
+    return null;
+  }
+  const binding = DEFAULT_BINDING_RE.exec(rest);
+  return binding ? { name: binding[1]!, nameAt: at, declared: false } : null;
+}
+
+/**
+ * What `filePath`'s own `export default` statement exports. The statement
+ * says it outright, where the export index can only guess:
+ * - `export default function Vans() {…}` / `export default class Store` —
+ *   the declaration the statement writes, found by position. A React Router
+ *   data-router page exports its `loader` or `action` above it, and the
+ *   first-exported guess bound the page's default import to the loader.
+ * - `export default Home` — the binding it names, exported at its
+ *   declaration or not: `const Home = () => …` and the namespace object
+ *   `const UploadApi = { uploadARCapture }` have no `export_statement`
+ *   ancestor, so the `isExported` index never sees them.
+ * - `export default function () {…}`, `export default class {…}`, `export
+ *   default () => …` — anonymous: no node is the default export, and any
+ *   exported function beside it (or nested in it, which the extractor flags
+ *   exported too) would be the wrong one.
+ * Anything else — an expression (`memo(Card)`, `new Service()`, `{ … }`), a
+ * binding the file doesn't declare, no statement at all, a non-JS file — is
+ * `'unstated'`. Comments are stripped first. Strings are not masked: a
+ * template whose `${…}` holds another template, or a regex with a backtick,
+ * sets a masker out of step, and it blanked the real statement after it
+ * (outline's 2,900-line styled-components `Styles.ts`). A statement must
+ * name a node of the file instead — one a template only writes as text
+ * names none — and of several statements, one that does wins.
+ */
+function statedDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): StatedDefault {
+  if (idx.statedDefault !== undefined) return idx.statedDefault;
+  let stated: StatedDefault | undefined;
+  const source = JS_FAMILY_FILE.test(filePath) ? context.readFile(filePath) : null;
+  if (source && /\bexport\s+default\b/.test(source)) {
+    const code = stripCommentsForRegex(source, 'typescript');
+    const lineAt = makeLineAt(code, 1);
+    EXPORT_DEFAULT_HEAD.lastIndex = 0;
+    for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
+      const value = readDefaultExport(code, m.index + m[0].length);
+      if (value === 'anonymous') {
+        stated ??= 'anonymous';
+        continue;
+      }
+      stated ??= 'unstated';
+      if (value === null) continue;
+      const named = nodesInFileNamed(filePath, value.name, context);
+      // A declaration starts on the statement's line, or on its name's when
+      // the statement breaks before it (`export default\nfunction X`).
+      const from = lineAt(m.index);
+      const to = lineAt(value.nameAt);
+      const node = value.declared
+        ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
+        : named
+            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+      if (node) {
+        stated = node;
+        break;
+      }
+    }
+  }
+  idx.statedDefault = stated ?? 'unstated';
+  return idx.statedDefault;
 }
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
@@ -168,27 +264,19 @@ function nodesInFileNamed(filePath: string, name: string, context: ResolutionCon
   return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
 }
 
-/** The declaration `export default NAME` names in this file (see FileExportIndex.defaultBinding). */
-function defaultExportBindingNode(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
-  if (idx.defaultBinding === undefined) {
-    const bound = defaultExportBinding(filePath, context);
-    idx.defaultBinding =
-      bound === null
-        ? null
-        : (nodesInFileNamed(filePath, bound, context)
-            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
-  }
-  return idx.defaultBinding ?? undefined;
-}
-
 /**
- * The declaration a module default-exports: the component a single-file
- * component file is, else what an `export default NAME` statement names, else
- * the first exported function or class (`export default class Foo`).
+ * The declaration a module default-exports: what its own `export default`
+ * statement declares or names (see {@link statedDefaultExport}), and nothing
+ * for an anonymous default. Only a default the statement leaves unnamed
+ * (`export default memo(Card)`, `new Service()`), or a module with no
+ * statement, falls back: to the component a single-file component file is,
+ * else to the first exported function or class.
  */
 function esmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
-  return idx.defaultComponent ?? defaultExportBindingNode(filePath, idx, context) ?? idx.defaultFnClass;
+  const stated = statedDefaultExport(filePath, idx, context);
+  if (stated === 'anonymous') return undefined;
+  if (stated !== 'unstated') return stated;
+  return idx.defaultComponent ?? idx.defaultFnClass;
 }
 
 /**
@@ -2709,14 +2797,14 @@ function findExportedSymbolWalk(
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
+    // What the file's own `export default` statement exports beats any
+    // guess; an anonymous default is no node at all, and no neighbour is it.
+    if (statedDefaultExport(filePath, exportIndex, context) === 'anonymous') return undefined;
     // Svelte/Vue single-file components ARE the module's default export,
-    // but are extracted as kind 'component' (not function/class). Prefer
-    // the component node; fall back to an exported function/class for the
-    // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
-    // branch, an `export { default as X } from './X.svelte'` barrel never
-    // resolves and the component shows a false 0 callers (#629).
-    // A component file IS its default export; otherwise the statement that
-    // names the binding beats the first-exported-function guess.
+    // but are extracted as kind 'component' (not function/class), so the
+    // fallback prefers the component node. Without it, an `export { default
+    // as X } from './X.svelte'` barrel never resolves and the component shows
+    // a false 0 callers (#629).
     const direct = esmDefaultExport(filePath, exportIndex, context);
     if (direct) return direct;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
