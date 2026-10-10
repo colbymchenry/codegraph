@@ -15,6 +15,7 @@ import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { moduleTail } from '../db/reference-tail';
+import { parseRustUseBindings } from './rust-use-bindings';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -22,6 +23,7 @@ import {
   localReceiverTypePatterns,
   normalizeInferredTypeName,
   goRefQualifier,
+  isLexicallyReachable,
 } from './name-matcher';
 
 /**
@@ -323,6 +325,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
   PY_MODULE_SYMBOLS.delete(context);
+  rustUseBindingMemos.delete(context);
 }
 
 export function resolveImportPath(
@@ -2477,9 +2480,17 @@ function resolveRustPathReference(
   const modSegs = segments.slice(0, -1);
 
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
-  if (!file || file === ref.filePath) return null;
+  if (!file) return null;
 
-  const target = context.getNodesInFile(file).find(
+  // The module's own item. A path never names a method (that is
+  // `Type::method`), nor a fn local to another fn's body: the file's first
+  // same-named node was taken, so an `impl Buf { fn take }` above
+  // `pub fn take` caught every `crate::util::take(…)`. Two module-level items
+  // of one name are `#[cfg]` variants of it; the first one stands for both.
+  // With none, the path reaches an inline module's item through a re-export
+  // (`#[cfg(…)] mod imp { … }` + `pub use imp::*;`), never an associated item
+  // of an `impl` or `trait` body.
+  const candidates = context.getNodesInFile(file).filter(
     (n) =>
       n.name === leaf &&
       (n.kind === 'function' ||
@@ -2489,14 +2500,107 @@ function resolveRustPathReference(
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
         n.kind === 'constant' ||
-        n.kind === 'method' ||
         n.kind === 'class' ||
-        n.kind === 'interface')
+        n.kind === 'interface') &&
+      isLexicallyReachable(n, ref, context)
   );
+  const target =
+    candidates.find((n) => rustUseBindings(file, context).isModuleLevelDeclaration(n.startLine, n.startColumn)) ??
+    candidates.find((n) => rustUseBindings(file, context).isInlineModuleDeclaration(n.startLine, n.startColumn));
   if (target) {
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
   }
   return null;
+}
+
+const rustUseBindingMemos = new WeakMap<ResolutionContext, Map<string, ReturnType<typeof parseRustUseBindings>>>();
+
+function rustUseBindings(filePath: string, context: ResolutionContext): ReturnType<typeof parseRustUseBindings> {
+  let memo = rustUseBindingMemos.get(context);
+  if (!memo) rustUseBindingMemos.set(context, (memo = new Map()));
+  let bindings = memo.get(filePath);
+  if (!bindings) {
+    bindings = parseRustUseBindings(context.readFile(filePath) ?? '');
+    memo.set(filePath, bindings);
+  }
+  return bindings;
+}
+
+/** Inspect parameter patterns, excluding their types (including nested fn types). */
+function rustParameterBinds(signature: string, name: string): boolean {
+  // Both Rust extractors store `(parameters) -> return_type`, without the fn head.
+  const open = signature.indexOf('(');
+  if (open < 0) return false;
+  let depth = 0;
+  let start = open + 1;
+  let typed = false;
+  for (let i = start; i < signature.length; i++) {
+    const ch = signature[i]!;
+    if (depth === 0 && ch === ')') break;
+    if (depth === 0 && ch === ',') { start = i + 1; typed = false; }
+    else if (!typed && depth === 0 && ch === ':' && signature[i + 1] !== ':' && signature[i - 1] !== ':') {
+      if (new RegExp(`\\b${name}\\b`).test(signature.slice(start, i))) return true;
+      typed = true;
+    }
+    if ('([{<'.includes(ch)) depth++;
+    else if (')]}'.includes(ch) || (ch === '>' && signature[i - 1] !== '-')) depth = Math.max(0, depth - 1);
+  }
+  return false;
+}
+
+/**
+ * A bare Rust call whose name a `use` binds: `use crate::util::take; take(3)`
+ * is `util`'s free function, not a same-named function of another module.
+ * Undefined leaves the call to the general resolution; null leaves it unresolved.
+ */
+export function resolveRustImportedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'rust' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return undefined;
+  const column = ref.column;
+  // Chained leaf refs point at the receiver/head. Never substitute another
+  // occurrence of the same name on the line for this call's recorded start.
+  if (!line.startsWith(ref.referenceName, column) || /(?:\.|::)\s*$/.test(line.slice(0, column))) return undefined;
+  const bindings = rustUseBindings(ref.filePath, context);
+  const usePath = bindings.get(ref.referenceName, ref.line, ref.column);
+  // No import of the name here, two different ones in one scope (`#[cfg]`
+  // variants), or a relative path inside an inline module that the file-based
+  // module walk cannot anchor (`mod tests { use super::parse; }`): the general
+  // resolution handles the call, as before.
+  if (!usePath) return undefined;
+  if (bindings.isShadowedByLocalValue(ref.referenceName, ref.line, ref.column)) return null;
+
+  // A block's function/variable or parameter shadows the module's import.
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (caller?.signature && rustParameterBinds(caller.signature, ref.referenceName) &&
+      bindings.isInBindingScope(ref.referenceName, ref.line, ref.column, caller.startLine, caller.startColumn)) return null;
+  const local = context.getNodesByName(ref.referenceName).filter((n) => n.filePath === ref.filePath &&
+    (n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant') && isLexicallyReachable(n, ref, context) &&
+    bindings.isInBindingScope(ref.referenceName, ref.line, ref.column, n.startLine, n.startColumn) &&
+    (n.kind === 'function' || n.startLine < ref.line || (n.startLine === ref.line && n.startColumn <= ref.column)));
+  if (local.some((n) => n.kind === 'function')) return undefined;
+  if (local.length > 0) return null;
+
+  const resolved = resolveRustPathReference({ ...ref, referenceName: usePath }, context);
+  if (resolved) return { ...resolved, original: ref };
+  // `use crate::models::E::Good as Build` names a particular enum's variant,
+  // never a same-named enum member elsewhere (or a free function).
+  const segments = usePath.split('::').filter(Boolean);
+  const ownerRef = { ...ref, referenceName: segments.slice(0, -1).join('::'), referenceKind: 'references' as const };
+  const ownerResult = resolveRustPathReference(ownerRef, context);
+  const owner = ownerResult && context.getNodeById?.(ownerResult.targetNodeId);
+  if (owner?.kind === 'enum') {
+    const variants = context.getNodesInFile(owner.filePath).filter((n) => n.kind === 'enum_member' &&
+      n.qualifiedName === `${owner.qualifiedName}::${segments.at(-1)}` &&
+      (n.startLine > owner.startLine || (n.startLine === owner.startLine && n.startColumn >= owner.startColumn)) &&
+      (n.endLine < owner.endLine || (n.endLine === owner.endLine && n.endColumn <= owner.endColumn)));
+    return variants.length === 1 ? { original: ref, targetNodeId: variants[0]!.id, confidence: 0.9, resolvedBy: 'import' } : null;
+  }
+  // A path this resolver cannot follow (another crate of the workspace, a
+  // `pub use` re-export, a path through an inline module to its item) keeps
+  // the general resolution, as before. An alias does not: no declaration carries its
+  // local name, so a same-named match is never the imported item.
+  return segments.at(-1) === ref.referenceName ? undefined : null;
 }
 
 /** The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file. */
@@ -2543,35 +2647,50 @@ function resolveRustModuleFile(
   // Walk a sequence of module segments down from `startDir`, mapping each to a
   // `<seg>.rs` or `<seg>/mod.rs` file. Returns the leaf module's file, or null
   // if `startDir` is null or any segment has no file on disk.
-  const resolveUnder = (startDir: string | null, rest: string[]): string | null => {
+  const resolveUnder = (startDir: string | null, rest: string[], sourceFile?: string): string | null => {
     if (!startDir) return null;
+    if (rest.length === 0) return sourceFile ?? null;
     let dir = startDir;
     let targetFile: string | null = null;
+    let inlinePath: string[] = [];
     for (const seg of rest) {
       if (seg === 'self' || seg === 'crate' || seg === 'super') continue;
       const asFile = toRel(path.join(dir, seg + '.rs'));
       const asMod = toRel(path.join(dir, seg, 'mod.rs'));
       if (context.fileExists(asFile)) targetFile = asFile;
       else if (context.fileExists(asMod)) targetFile = asMod;
-      else return null;
+      else {
+        inlinePath.push(seg);
+        if (!sourceFile || !rustUseBindings(sourceFile, context).hasInlineModule(inlinePath)) return null;
+        // Inline modules have no file/node namespace of their own. Only use
+        // this proof to reach a later file-backed submodule, never its flat nodes.
+        targetFile = null;
+      }
+      if (targetFile) { sourceFile = targetFile; inlinePath = []; }
       dir = path.join(dir, seg);
     }
     return targetFile;
   };
 
   const first = segments[0]!;
+  const crateRoot = rustCrateRootDir(fromAbs, context);
+  const rootFiles = crateRoot ? ['lib.rs', 'main.rs'].map((name) => toRel(path.join(crateRoot, name)))
+    .filter((file) => context.fileExists(file)) : [];
+  const rootFile = rootFiles.includes(fromFile) ? fromFile : rootFiles.length === 1 ? rootFiles[0] : undefined;
   if (first === 'crate') {
-    return resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
+    return resolveUnder(crateRoot, segments.slice(1), rootFile);
   }
   if (first === 'self') {
-    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1), fromFile);
   }
   if (first === 'super') {
     let supers = 0;
     while (segments[supers] === 'super') supers++;
     let dir: string | null = rustSelfModuleDir(fromAbs);
     for (let s = 0; s < supers && dir; s++) dir = path.dirname(dir);
-    return resolveUnder(dir, segments.slice(supers));
+    const parents = dir === crateRoot ? rootFiles : [toRel(path.join(dir, 'mod.rs')),
+      toRel(path.join(path.dirname(dir), path.basename(dir) + '.rs'))].filter((file) => context.fileExists(file));
+    return resolveUnder(dir, segments.slice(supers), parents.length === 1 ? parents[0] : undefined);
   }
   // Bare path. In expression position (`submodule::item()` — the router-assembly
   // and general cross-module-call pattern) the prefix is a SUBMODULE of the
@@ -2579,8 +2698,13 @@ function resolveRustModuleFile(
   // Fall back to crate-relative for 2015-edition / crate-root items. External
   // crate paths (`serde::de::Error`) miss both and fall through to name-matching.
   return (
-    resolveUnder(rustSelfModuleDir(fromAbs), segments) ??
-    resolveUnder(rustCrateRootDir(fromAbs, context), segments)
+    resolveUnder(rustSelfModuleDir(fromAbs), segments, fromFile) ??
+    // Cargo's standalone integration-test/example/bench files own their
+    // directory, unlike `src/foo.rs`. The source must prove the inline prefix.
+    (/(?:^|\/)(?:tests|examples|benches)\/[^/]+\.rs$/.test(fromFile) &&
+      rustUseBindings(fromFile, context).hasInlineModule([first])
+      ? resolveUnder(path.dirname(fromAbs), segments, fromFile) : null) ??
+    resolveUnder(crateRoot, segments, rootFile)
   );
 }
 
@@ -2986,70 +3110,6 @@ function resolveStaticMember(
 }
 
 /**
- * Rust `use` declarations, flattened to `localName → full path`.
- *
- * Rust is the one supported language with NO `ImportMapping` extraction (see
- * `extractImportMappings`), so this is the only channel that can tell whether
- * a bare type name in a Rust file was brought in by a `use`. Handles nested
- * groups (`use a::{b::C, d as E}`), globs (skipped — they bind no single
- * name), and `as` aliases.
- */
-function collectRustUseBindings(content: string): Map<string, string> {
-  const out = new Map<string, string>();
-
-  // Expand one level of `{...}` at a time so `a::{b::{C, D}, E}` flattens.
-  const expand = (spec: string): string[] => {
-    const open = spec.indexOf('{');
-    if (open === -1) return [spec.trim()];
-    const prefix = spec.slice(0, open);
-    let depth = 0;
-    let close = -1;
-    for (let i = open; i < spec.length; i++) {
-      if (spec[i] === '{') depth++;
-      else if (spec[i] === '}') {
-        depth--;
-        if (depth === 0) { close = i; break; }
-      }
-    }
-    if (close === -1) return [];
-    const suffix = spec.slice(close + 1);
-    const inner = spec.slice(open + 1, close);
-    const parts: string[] = [];
-    let depth2 = 0;
-    let start = 0;
-    for (let i = 0; i <= inner.length; i++) {
-      const ch = inner[i];
-      if (ch === '{') depth2++;
-      else if (ch === '}') depth2--;
-      if (i === inner.length || (ch === ',' && depth2 === 0)) {
-        const seg = inner.slice(start, i).trim();
-        if (seg) parts.push(seg);
-        start = i + 1;
-      }
-    }
-    return parts.flatMap((p) => expand(prefix + p + suffix));
-  };
-
-  // `use` items end at the first `;`. Attributes/visibility (`pub use`) are
-  // irrelevant to the binding itself.
-  const useRe = /(^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g;
-  let m: RegExpExecArray | null;
-  while ((m = useRe.exec(content)) !== null) {
-    for (const spec of expand(m[2]!.replace(/\s+/g, ' '))) {
-      const aliasMatch = /^(.*?)\s+as\s+([A-Za-z_]\w*)$/.exec(spec);
-      const rawPath = (aliasMatch ? aliasMatch[1]! : spec).trim();
-      if (!rawPath || rawPath.endsWith('*')) continue;
-      const segments = rawPath.split('::').map((s) => s.trim()).filter(Boolean);
-      const leaf = segments[segments.length - 1];
-      if (!leaf) continue;
-      const local = aliasMatch ? aliasMatch[2]! : leaf;
-      out.set(local, segments.join('::'));
-    }
-  }
-  return out;
-}
-
-/**
  * Is `name`, as used in `ref`'s file, bound by an import whose module lives
  * OUTSIDE the repository?
  *
@@ -3088,9 +3148,9 @@ export function isBoundToOutOfRepoImport(
   if (ref.language === 'rust') {
     const content = context.readFile(ref.filePath);
     if (!content) return false;
-    const usePath = collectRustUseBindings(content).get(name);
+    const usePath = rustUseBindings(ref.filePath, context).get(name, ref.line, ref.column);
     if (!usePath) return false;
-    const segments = usePath.split('::');
+    const segments = usePath.split('::').filter(Boolean);
     if (segments.length < 2 || !RUST_STDLIB_ROOTS.has(segments[0]!)) return false;
     // 2015-edition crate-relative paths can shadow a stdlib root with a local
     // module of the same name — if the path walks to a real file, it's local.

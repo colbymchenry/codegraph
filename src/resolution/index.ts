@@ -33,7 +33,7 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, resolveRustImportedCall } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -1333,6 +1333,11 @@ export class ReferenceResolver {
     // strategy ran, and PHP gives each one exactly one meaning; resolve it first.
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
+
+    // Rust `use …::take as consume; consume()` can have no node named
+    // `consume`. Its explicit binding takes precedence over name heuristics.
+    const rustImportedCall = resolveRustImportedCall(ref, this.context);
+    if (rustImportedCall !== undefined) return this.gateLanguage(rustImportedCall, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
