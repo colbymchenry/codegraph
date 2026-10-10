@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Next.js: a change to the proxy now shows the routes it affects.** A `proxy.ts` (`middleware.ts` before Next.js 16) beside `app` or `pages` is now linked to every page and API route its `config.matcher` covers, or to all of them when it has no matcher, so `codegraph impact proxy` and `codegraph_impact` list those routes instead of nothing. Matchers written as paths, like `/dashboard/:path*`, `['/api/:path+', '/account']` or `{ source: '/admin' }`, are read the way Next.js compiles them, and a regular-expression matcher is left out rather than guessed. Re-index after upgrading.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.

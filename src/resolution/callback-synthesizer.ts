@@ -29,7 +29,8 @@ import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
-import { nextLinkEdges } from './next-router-synthesizer';
+import { nextLinkEdges, nextProxyEdges } from './next-router-synthesizer';
+import { NEXT_PROXY_FILE, nextRouteForFile } from './frameworks/nextjs';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
 import { tanstackLinkEdges } from './tanstack-router-synthesizer';
 import { vueRouterLinkEdges } from './vue-router-synthesizer';
@@ -4342,6 +4343,8 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // These passes consume declarations/layouts as well as dispatch sites. A
   // header or markup edit can change a channel whose endpoints live elsewhere.
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
+  // A Next proxy and the routes its matcher covers are joined by file path and config.
+  if (NEXT_PROXY_FILE.test(filePath) || nextRouteForFile(filePath) !== null) return true;
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
@@ -4446,6 +4449,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'expoRouterReturnEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => expoRouterReturnEdges(c, y) },
   // `<Link href="/x">` / an internal `<a href>` — markup, not a call; the component navigates.
   { name: 'nextLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => nextLinkEdges(c, y) },
+  // `proxy.ts` / `middleware.ts` — the routes its `config.matcher` covers are wrapped by it.
+  { name: 'nextProxyEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => nextProxyEdges(c, y) },
   { name: 'reactRouterLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactRouterLinkEdges(c, y) },
   { name: 'tanstackLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => tanstackLinkEdges(c, y) },
   { name: 'vueRouterLinkEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vueRouterLinkEdges(c, y) },
