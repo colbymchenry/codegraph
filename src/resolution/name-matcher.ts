@@ -19,6 +19,7 @@ import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
+import { isFsharpCandidateInScope, clearFsharpScopeCaches } from './fsharp-scope';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -158,7 +159,7 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   c: 'native', cpp: 'native',
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
-  csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet',
+  csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet', fsharp: 'dotnet',
   svelte: 'web', vue: 'web', astro: 'web',
   cfml: 'cfml', cfscript: 'cfml',
 };
@@ -1836,7 +1837,7 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
  * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
  * same holds for Java, C#, Swift, Scala, Dart and PHP members.
  */
-const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php', 'fsharp']);
 
 /** Per-context memo: node id → "this C/C++ function is declared `static`". */
 const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -2770,6 +2771,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (!isPhpClassVisible(candidate, ref, context)) return false;
   // A bare Java type name is its package's, an import's, or a nested type in reach.
   if (!isJavaTypeVisible(candidate, ref, context)) return false;
+  // An F# name is its file's, its enclosing namespace or module's, or an opened one's.
+  if (!isFsharpCandidateInScope(candidate, ref, context)) return false;
   // A Dart `extension on Token { … }` has no name: `Token` is analyzer's type,
   // not bloc_lint's extension block (84 refs went there).
   if (dartExtensionDecl(candidate, context)?.named === false) return false;
@@ -7722,6 +7725,9 @@ export function matchByExactName(
     // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
     // a wire converter test's nested `CrashingPhone.Builder`.
     isJavaTypeVisible(n, ref, context) &&
+    // An F# name is its file's, its scope's, an opened or a qualified one: ahead of
+    // the ranking, so the namesake in reach wins over one in an unreached namespace.
+    isFsharpCandidateInScope(n, ref, context) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -9683,6 +9689,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
+  clearFsharpScopeCaches(context);
   RUBY_ANCESTRY.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);

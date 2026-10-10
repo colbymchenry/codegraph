@@ -104,6 +104,22 @@ const ERLANG_MFA_CALLS = new Set([
 ]);
 
 /**
+ * The source as the parser's input callback, in small chunks. The F# grammar's
+ * external scanner asks for the column of nearly every token, and each ask makes
+ * the wasm parser walk the string it was handed from the start of its chunk: with
+ * the whole file as one chunk that is quadratic, and parsing real F# takes 2.5 times
+ * as long as with 128-character chunks.
+ */
+function inChunks(source: string): (index: number) => string {
+  return (index) => {
+    let end = index + 128;
+    // A surrogate pair is never cut in two.
+    if (end < source.length && (source.charCodeAt(end - 1) & 0xfc00) === 0xd800) end++;
+    return source.slice(index, end);
+  };
+}
+
+/**
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
@@ -678,7 +694,7 @@ export class TreeSitterExtractor {
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
         this.source = this.extractor.preParse(this.source, this.filePath);
       }
-      this.tree = parser.parse(this.source) ?? null;
+      this.tree = parser.parse(this.language === 'fsharp' ? inChunks(this.source) : this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
