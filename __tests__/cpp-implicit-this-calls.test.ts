@@ -327,6 +327,149 @@ void Table::Compact() {
   });
 });
 
+describe('C++ overloads a call’s arguments pick', () => {
+  let root = '';
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    root = writeProject('cg-cpp-this-overloads-', {
+      'include/opts/configurable.h': `#pragma once
+#include <string>
+namespace opts {
+class Configurable {
+ public:
+  template <typename T>
+  void RegisterOptions(T* opt_ptr, const int* opt_map) {
+    RegisterOptions(T::kClassName(), opt_ptr, opt_map);
+  }
+  void RegisterOptions(const std::string& name, void* opt_ptr, const int* opt_map);
+
+  void Add(int key) { Add(key, 1); }
+  void Add(int key, int count);
+};
+}  // namespace opts
+`,
+      'src/opts/configurable.cc': `#include "opts/configurable.h"
+namespace opts {
+void Configurable::RegisterOptions(const std::string& name, void* opt_ptr, const int* opt_map) {}
+void Configurable::Add(int key, int count) {}
+}  // namespace opts
+`,
+      'test/simple.cc': `#include "opts/configurable.h"
+namespace opts {
+class SimpleConfigurable : public Configurable {
+ public:
+  SimpleConfigurable() {
+    RegisterOptions(std::string("Simple") + "Unique", &unique_, &info_);
+  }
+
+ private:
+  int unique_ = 0;
+  int info_ = 0;
+};
+}  // namespace opts
+`,
+    });
+    cg = await CodeGraph.init(root, { index: true });
+  }, 60_000);
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('takes the inherited overload the arguments fit', () => {
+    // Both overloads are `opts::Configurable::RegisterOptions`: the three-parameter one is defined in the .cc.
+    const threeParameters = cg.getNodesInFile('src/opts/configurable.cc').find((n) => n.name === 'RegisterOptions');
+    const ctor = cg.getNodesInFile('test/simple.cc').find((n) => n.qualifiedName === 'opts::SimpleConfigurable::SimpleConfigurable');
+    const edge = cg.getOutgoingEdges(ctor!.id).find((e) => (e.metadata as { refName?: string } | undefined)?.refName === 'RegisterOptions');
+    expect(edge?.target).toBe(threeParameters?.id);
+  });
+
+  it('weighs a class’s out-of-line overloads with its inline ones', () => {
+    const add = cg.getNodesInFile('include/opts/configurable.h').find((n) => n.name === 'Add');
+    const outOfLine = cg.getNodesInFile('src/opts/configurable.cc').find((n) => n.name === 'Add');
+    const edge = cg.getOutgoingEdges(add!.id).find((e) => (e.metadata as { refName?: string } | undefined)?.refName === 'Add');
+    expect(edge?.target).toBe(outOfLine?.id);
+  });
+});
+
+describe('C++ classes the index can only see part of', () => {
+  let root = '';
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    root = writeProject('cg-cpp-this-partial-', {
+      // Two translation units each declare a `FileState` of their own.
+      'helpers/memenv.cc': `namespace kv {
+namespace {
+class FileState {
+ public:
+  void Truncate() {}
+  ~FileState() { Truncate(); }
+};
+}  // namespace
+}  // namespace kv
+`,
+      'db/fault_injection_test.cc': `namespace kv {
+namespace {
+int Truncate(const char* name, long length) { return 0; }
+
+struct FileState {
+  const char* filename_;
+  long pos_;
+  int DropUnsyncedData() const;
+};
+}  // namespace
+
+int FileState::DropUnsyncedData() const {
+  return Truncate(filename_, pos_);
+}
+}  // namespace kv
+`,
+      'src/reflection.cc': `#define LOCAL_VAR_ACCESSOR(type, name) \\
+  type Get##name() const { return value; }
+
+namespace pb {
+class Message {};
+
+class Reflection {
+ public:
+  Message* GetMessage() const { return nullptr; }
+  void SwapField() const;
+};
+
+void Reflection::SwapField() const {
+  struct LocalVarWrapper {
+    LOCAL_VAR_ACCESSOR(Message*, Message);
+    Message* UnsafeGetMessage() const { return GetMessage(); }
+    Message* value;
+  };
+}
+}  // namespace pb
+`,
+    });
+    cg = await CodeGraph.init(root, { index: true });
+  }, 60_000);
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('never lends one translation unit’s class members to another’s class of the same name', () => {
+    expect(callsFrom(cg, 'helpers/memenv.cc', 'kv::FileState::~FileState')).toEqual(['Truncate -> kv::FileState::Truncate']);
+    expect(placedByLookup(cg, 'db/fault_injection_test.cc', 'kv::FileState::DropUnsyncedData', 'Truncate')).toBe(false);
+    expect(callsFrom(cg, 'db/fault_injection_test.cc', 'kv::FileState::DropUnsyncedData')).not.toContain('Truncate -> kv::FileState::Truncate');
+  });
+
+  it('stops at a class whose macro may declare the name, rather than take an outer class’s', () => {
+    const wrapper = cg.getNodesInFile('src/reflection.cc').find((n) => n.name === 'UnsafeGetMessage');
+    expect(wrapper).toBeDefined();
+    expect(placedByLookup(cg, 'src/reflection.cc', wrapper!.qualifiedName, 'GetMessage')).toBe(false);
+  });
+});
+
 describe('C++ name lookup in a class template', () => {
   let root = '';
   let cg: CodeGraph;

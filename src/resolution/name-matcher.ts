@@ -9235,6 +9235,8 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
  *  - `this` is an object of the innermost class: never an enclosing class's.
  *  - A parameter or local the function declares before a bare call is what
  *    it calls: `void Set(Callback callback) { callback(); }`.
+ *  - A class that may declare the name through a macro (`Get##name`), which
+ *    no node shows, ends the walk.
  * Undefined when the call is not of that shape or no class on the way has a
  * method of that name in the index — a free function, `static` or not, has
  * no class; a base outside the project lends no node: the name strategies
@@ -9248,10 +9250,10 @@ function matchCppImplicitThisCall(ref: UnresolvedRef, context: ResolutionContext
   const caller = context.getNodeById?.(ref.fromNodeId);
   const owner = caller ? cppMemberOwner(caller, context) : null;
   if (!caller || owner === null) return undefined;
-  let found: Node | null = null;
+  let found: Node | null | undefined = null;
   for (const scope of cppEnclosingClasses(owner, caller, context)) {
     found = cppScopeMethod(scope, name, receiver, ref, context);
-    if (found || receiver === 'this') break;
+    if (found !== null || receiver === 'this') break;
   }
   // (A recursive call names the function itself, which no local shadows.)
   if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
@@ -9355,6 +9357,8 @@ interface CppClassScope {
   decls: Node[];
   /** `decls[0]` holds the code the lookup starts from. */
   holds: boolean;
+  /** Other classes of that qualified name were left out: another translation unit's. */
+  narrowed: boolean;
 }
 
 /**
@@ -9393,38 +9397,52 @@ function cppEnclosingClasses(owner: string, caller: Node, context: ResolutionCon
 
 /** A class scope's declarations as cppEnclosingClasses keeps them. */
 function cppScopeDeclarations(qualifiedName: string, decls: Node[], inner: Node, context: ResolutionContext): CppClassScope {
-  const holding = decls.filter((d) => d.filePath === inner.filePath && rangeWithin(inner, d) && d.id !== inner.id);
-  if (holding.length > 0) return { qualifiedName, decls: holding, holds: true };
+  const scope = (kept: Node[], holds: boolean): CppClassScope => ({ qualifiedName, decls: kept, holds, narrowed: kept.length < decls.length });
+  // (Code in a class's own body, a member's initializer, has that class as `inner`.)
+  const holding = decls.filter((d) => d.filePath === inner.filePath && rangeWithin(inner, d));
+  if (holding.length > 0) return scope(holding, true);
   const local = decls.filter((d) => d.filePath === inner.filePath);
-  if (local.length > 0 || decls.length < 2) return { qualifiedName, decls: local.length > 0 ? local : decls, holds: false };
+  if (local.length > 0 || decls.length < 2) return scope(local.length > 0 ? local : decls, false);
   const included = decls.filter((d) => cppIncluders(d.filePath, context).has(inner.filePath));
-  return { qualifiedName, decls: included.length > 0 ? included : decls, holds: false };
+  return scope(included.length > 0 ? included : decls, false);
 }
 
 /**
  * The method `name` a class scope gives C++ lookup: the class's own — first
  * one written in the very declaration holding the code, as an inline member
  * — else the nearest one of a class it derives from, through the kept
- * declarations' base edges.
+ * declarations' base edges. Undefined when the class may declare `name`
+ * through a macro, which no node shows: lookup would stop there.
  */
-function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | 'this', ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  const own = context.getNodesByQualifiedName(`${scope.qualifiedName}::${name}`)
-    .filter((n) => n.kind === 'method' && (n.language === 'cpp' || n.language === 'c'));
+function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | 'this', ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
+  const own = context.getNodesByQualifiedName(`${scope.qualifiedName}::${name}`).filter((n) =>
+    n.kind === 'method' && (n.language === 'cpp' || n.language === 'c') &&
+    // A namesake class's members are defined where it is: leveldb's
+    // fault-injection test declares a `FileState` of its own, with no
+    // `Truncate`, beside memenv.cc's.
+    (!scope.narrowed || scope.decls.some((d) => d.filePath === n.filePath || cppIncluders(d.filePath, context).has(n.filePath))));
   const holder = scope.holds ? scope.decls[0]! : null;
   const inline = holder ? own.filter((n) => n.filePath === holder.filePath && rangeWithin(n, holder)) : [];
-  if (inline.length > 0) return cppOverloadFor(inline, name, ref, context);
   // A class with no name (a partial specialization, an unnamed struct)
   // shares its qualified name with every other: only its inline members are its own.
-  if (own.length > 0 && cppLastSegment(scope.qualifiedName) !== '<anonymous>') {
-    return cppOverloadFor(preferCallSiteFile(own, ref.filePath), name, ref, context);
+  const outOfLine = cppLastSegment(scope.qualifiedName) === '<anonymous>' ? [] : own.filter((n) => !inline.includes(n));
+  if (inline.length + outOfLine.length > 0) {
+    return cppOverloadFor([...inline, ...preferCallSiteFile(outOfLine, ref.filePath)], name, ref, context);
   }
+  if (scope.decls.some((d) => cppMemberMacroArguments(d, context).some((a) => name.startsWith(a) || name.endsWith(a)))) return undefined;
   if (!context.getSupertypeNodes) return null;
   for (const decl of scope.decls) {
     for (const base of context.getSupertypeNodes(decl.id)) {
       if (!CPP_CLASS_KINDS.has(base.kind)) continue;
       if (receiver === 'bare' && isCppDependentBase(decl, base, context)) continue;
       const inherited = cppMethodOf(base, name, ref, context, 1, new Set([scope.qualifiedName]));
-      if (inherited) return inherited;
+      if (!inherited) continue;
+      // Its class's other overloads, which the arguments may fit better
+      // (rocksdb's `RegisterOptions(name, &opts, &info)` is not the
+      // two-parameter template beside it).
+      const siblings = context.getNodesByQualifiedName(inherited.qualifiedName).filter((n) =>
+        n.id !== inherited.id && n.kind === 'method' && (n.language === 'cpp' || n.language === 'c'));
+      return cppOverloadFor([inherited, ...preferCallSiteFile(siblings, ref.filePath)], name, ref, context);
     }
   }
   return null;
@@ -9445,6 +9463,35 @@ function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, con
     }
   }
   return best;
+}
+
+const CPP_MEMBER_MACRO_ARGS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * The words in the arguments of the macros a C++ class declaration calls
+ * among its members, like `Message` in protobuf's
+ * `LOCAL_VAR_ACCESSOR(Message*, Message);`: such a macro can declare a member
+ * the index has no node for (`Get##name` makes `GetMessage`).
+ */
+function cppMemberMacroArguments(decl: Node, context: ResolutionContext): string[] {
+  let memo = CPP_MEMBER_MACRO_ARGS.get(context);
+  if (!memo) CPP_MEMBER_MACRO_ARGS.set(context, (memo = new Map()));
+  const hit = memo.get(decl.id);
+  if (hit) return hit;
+  const words: string[] = [];
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  let depth = 0;
+  for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.endLine); i++) {
+    const code = cppCodeOf(i === decl.startLine - 1 ? lines[i]!.slice(decl.startColumn) : lines[i]!) ?? '';
+    const call = depth === 1 ? /^\s*[A-Z][A-Z0-9_]*\s*\(([^;{}]*)\)\s*;?\s*$/.exec(code) : null;
+    if (call) words.push(...call[1]!.split(/\W+/).filter((w) => w.length >= 3));
+    for (const c of code) {
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+  }
+  memo.set(decl.id, words);
+  return words;
 }
 
 const CPP_BASE_SPECS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -10160,6 +10207,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   clearCppNamespaceMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
+  CPP_MEMBER_MACRO_ARGS.delete(context);
   SOLIDITY_SUPERS.delete(context);
   DECLARED_SUPERS.delete(context);
   INHERITED_METHODS.delete(context);
