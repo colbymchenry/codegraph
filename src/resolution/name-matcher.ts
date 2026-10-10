@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
+import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -1549,9 +1549,10 @@ const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum
 
 /**
  * A test suite — a test source set, a `tests/` / `__tests__/` / `spec/`
- * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` file — as opposed
- * to test-support code a project ships (`testing/`, `fakes/`, a `*-test`
- * module like kotlinx-coroutines-test), which its own code may use.
+ * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc`
+ * file — as opposed to test-support code a project ships (`testing/`,
+ * `fakes/`, a `*-test` module like kotlinx-coroutines-test), which its own
+ * code may use.
  */
 function isTestSuitePath(filePath: string): boolean {
   if (!isTestPath(filePath)) return false;
@@ -1559,7 +1560,7 @@ function isTestSuitePath(filePath: string): boolean {
   const name = lower.slice(lower.lastIndexOf('/') + 1);
   const original = filePath.slice(filePath.lastIndexOf('/') + 1);
   // (`…Spec.java` alone is no test: halo's `IndexSpecs`, okhttp's `ConnectionSpec`.)
-  if (name.startsWith('test_') || /[._-](?:test|tests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
+  if (name.startsWith('test_') || /[._-](?:test|tests|unittest|unittests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
       // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
       /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
   return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
@@ -1922,6 +1923,16 @@ interface GoQualification {
   written?: string;
   /** The file's import that name is. */
   imported?: ImportMapping;
+  /**
+   * For a call through a parameter or local that takes an import's name, the
+   * type it is declared as, when its declaration writes one (`*tokenJWT`,
+   * `clock.PassiveClock`), and the import that type is written through —
+   * `clock` in a parameter `clock clock.PassiveClock`, `atomic` in
+   * `cache := &atomic.Bool{}` — or its value comes from: `reflect` in
+   * `value := reflect.New(t)`.
+   */
+  declaredType?: string;
+  typePackage?: ImportMapping;
 }
 
 const GO_QUALIFIERS = new WeakMap<ResolutionContext, Map<string, GoQualification>>();
@@ -1935,24 +1946,58 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  const at = Math.max(0, ref.column);
-  // The qualifier right before the name at the reference's column, or the
-  // line's only spelling of the name. A variadic `...chunks.Meta` is written
-  // through `chunks` too: the ellipsis is no receiver.
-  const written = line.startsWith(name, at) ? /(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
-    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.]|\\.{3})([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
-  const imported = written ? context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === written) : undefined;
-  const found = { written, imported };
+  let written: string | undefined;
+  const dot = ref.referenceName.indexOf('.');
+  if (dot >= 0) {
+    // A dotted reference spells its receiver, and only the first segment can
+    // be a package: `klog` in `klog.Infof`, `s` in `s.cache.Get`. Reading
+    // the line for it found nothing where the name is spelled again —
+    // harbor's `Digest:` key beside `digest.Digest(dig)` — and another
+    // selector's where one comes first: `klog` for `err.Error` in
+    // `klog.Error(err.Error())`.
+    const head = ref.referenceName.slice(0, dot);
+    if (/^[A-Za-z_]\w*$/.test(head)) written = head;
+  } else {
+    const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+    const at = Math.max(0, ref.column);
+    // The qualifier right before the name at the reference's column, or the
+    // line's only spelling of the name. A variadic `...chunks.Meta` is written
+    // through `chunks` too: the ellipsis is no receiver.
+    written = line.startsWith(name, at) ? /(?:^|[^\w.]|\.{3})([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
+      : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.]|\\.{3})([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
+  }
+  const imports = context.getImportMappings(ref.filePath, 'go');
+  let imported = written ? imports.find((m) => m.localName === written) : undefined;
+  let declaredType: string | undefined;
+  let typePackage: ImportMapping | undefined;
+  // A call through a parameter or local that takes the import's name is a
+  // call on that variable: etcd's `jwt, err := newTokenProviderJWT(…)`, then
+  // `jwt.assign(…)` beside `import "github.com/golang-jwt/jwt/v5"`; harbor's
+  // testify suites' `func (suite *DaoTestSuite) …` beside testify's `suite`.
+  // A type's qualifier is always a package, and a value read through one
+  // (`quota.Name`) is no call.
+  const local = imported && dot >= 0 && ref.referenceKind === 'calls' ? goLocalDecl(written!, ref, context) : undefined;
+  if (local) {
+    declaredType = local.type;
+    // A value a package outside the project hands out is of a type it
+    // declares: kubernetes' `clock := clocktesting.NewFakePassiveClock(…)`
+    // has no project method `Now`.
+    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(declaredType ?? '')?.[1] ?? local.from;
+    typePackage = qualifier ? imports.find((m) => m.localName === qualifier) : undefined;
+    written = undefined;
+    imported = undefined;
+  }
+  const found = { written, imported, declaredType, typePackage };
   memo.set(key, found);
   return found;
 }
 
 /**
  * The import a Go reference is written through — `context` in
- * `context.Context`, `store` in `store.Manager` — read from its line, since
- * the index keeps only the name. Undefined for a name written bare, or
- * through anything that isn't one of the file's imports.
+ * `context.Context`, `store` in `store.Manager` — taken from a dotted
+ * reference's receiver, else read from its line, since the index keeps only
+ * the name. Undefined for a name written bare, or through anything that isn't
+ * one of the file's imports there.
  */
 export function goRefQualifier(ref: UnresolvedRef, context: ResolutionContext): ImportMapping | undefined {
   return goRefQualification(ref, context).imported;
@@ -2015,13 +2060,15 @@ export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, co
 /**
  * Whether a Go reference is written through an imported package from outside
  * the project's modules — `context.Context`, `fmt.Errorf`, a third-party
- * `gin.H`.
+ * `gin.H` — or is a call on a variable declared as such a package's type:
+ * kubernetes' `clock.Now()` on a parameter `clock clock.PassiveClock`.
  */
 function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const imported = goRefQualifier(ref, context);
-  if (!imported) return false;
-  return !(imported.source.startsWith('.') || imported.source.includes('/internal/') ||
-    context.getGoPackageDir?.(imported.source, ref.filePath) != null);
+  const { imported, typePackage } = goRefQualification(ref, context);
+  const pkg = imported ?? typePackage;
+  if (!pkg) return false;
+  return !(pkg.source.startsWith('.') || pkg.source.includes('/internal/') ||
+    context.getGoPackageDir?.(pkg.source, ref.filePath) != null);
 }
 
 /**
@@ -2039,6 +2086,404 @@ function isInGoQualifierPackage(candidate: Node, ref: UnresolvedRef, context: Re
   if (!imported) return true;
   const pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath);
   return pkgDir == null || goPackageDir(candidate.filePath) === pkgDir;
+}
+
+/**
+ * A Go file's blocks and the names its functions declare: the receivers,
+ * parameters and results of every `func` with a body, and each name a `:=`,
+ * `var` or `const` declares.
+ */
+interface GoScopeIndex {
+  /** The source, comments and string contents blanked, offsets kept. */
+  code: string;
+  lineStarts: number[];
+  /** Offsets of every `{` and `}`, with the innermost block open after each. */
+  events: number[];
+  open: number[];
+  close: Map<number, number>;
+  decls: Map<string, GoDecl[]>;
+  /** Where each declared name is bound, read on demand: [start, end, declaration]. */
+  scopes: Map<string, Array<[number, number, GoDecl]>>;
+}
+
+interface GoDecl {
+  /** Offset of the declared name. */
+  at: number;
+  /**
+   * A statement's local, an `if` / `for` / `switch` header's, a `select`
+   * case's, or a parameter of the function whose body opens at `body`.
+   */
+  kind: 'local' | 'header' | 'case' | 'param';
+  body?: number;
+  /** The declared type as written, when the declaration writes one. */
+  type?: string;
+  /** The package a `:=` takes its value from: `clocktesting` in `clock := clocktesting.NewFakeClock(…)`. */
+  from?: string;
+}
+
+const GO_SCOPE_INDEXES = new WeakMap<ResolutionContext, Map<string, GoScopeIndex | null>>();
+const GO_TYPE_KEYWORDS: ReadonlySet<string> = new Set(['chan', 'func', 'interface', 'map', 'struct']);
+
+/**
+ * The parameter or local of the Go function around `ref` that `name` is
+ * there, if one is. Go gives an identifier the innermost block that declares
+ * it, from the end of its declaration on: a header's names live in its
+ * statement's blocks (`else` included), a `select` case's in its clause, a
+ * parameter in its function's body.
+ */
+function goLocalDecl(name: string, ref: UnresolvedRef, context: ResolutionContext): GoDecl | undefined {
+  const index = goScopeIndex(ref.filePath, context);
+  if (!index?.decls.has(name)) return undefined;
+  const at = (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(0, ref.column);
+  let found: [number, number, GoDecl] | undefined;
+  for (const scope of goScopesOf(index, name)) {
+    if (at > scope[0] && at < scope[1] && (!found || scope[0] > found[0])) found = scope;
+  }
+  return found?.[2];
+}
+
+function goScopeIndex(filePath: string, context: ResolutionContext): GoScopeIndex | null {
+  let memo = GO_SCOPE_INDEXES.get(context);
+  if (!memo) GO_SCOPE_INDEXES.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/);
+  const index = lines ? readGoScopes(blankGoCode(lines.join('\n'))) : null;
+  // Refs arrive file by file; a few files' worth is all a pass revisits.
+  if (memo.size >= 64) memo.delete(memo.keys().next().value!);
+  memo.set(filePath, index);
+  return index;
+}
+
+function isGoIdentChar(c: number): boolean {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+}
+
+function readGoScopes(code: string): GoScopeIndex {
+  const lineStarts = [0];
+  for (let i = code.indexOf('\n'); i >= 0; i = code.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+  const events: number[] = [];
+  const open: number[] = [];
+  const close = new Map<number, number>();
+  const stack: number[] = [];
+  const braces = /[{}]/g;
+  for (let m = braces.exec(code); m; m = braces.exec(code)) {
+    const i = m.index;
+    if (code.charCodeAt(i) === 123) stack.push(i);
+    else {
+      const at = stack.pop();
+      if (at !== undefined) close.set(at, i);
+    }
+    events.push(i);
+    open.push(stack.length > 0 ? stack[stack.length - 1]! : -1);
+  }
+  const decls = new Map<string, GoDecl[]>();
+  const add = (name: string, decl: GoDecl): void => {
+    if (name === '_') return;
+    const list = decls.get(name);
+    if (list) list.push(decl);
+    else decls.set(name, [decl]);
+  };
+  // `a, b := …`: the identifiers before each `:=`.
+  for (let i = code.indexOf(':='); i >= 0; i = code.indexOf(':=', i + 2)) {
+    const names: Array<[string, number]> = [];
+    let p = i;
+    for (;;) {
+      while (p > 0 && (code[p - 1] === ' ' || code[p - 1] === '\t')) p--;
+      let s = p;
+      while (s > 0 && isGoIdentChar(code.charCodeAt(s - 1))) s--;
+      if (s === p || /\d/.test(code[s]!) || code[s - 1] === '.') break;
+      names.push([code.slice(s, p), s]);
+      p = s;
+      while (p > 0 && (code[p - 1] === ' ' || code[p - 1] === '\t')) p--;
+      if (code[p - 1] !== ',') break;
+      p--;
+    }
+    if (names.length === 0) continue;
+    const first = names[names.length - 1]![1];
+    const lead = code.slice(code.lastIndexOf('\n', first - 1) + 1, first);
+    const kind = /^\s*(?:\}\s*else\s+)?(?:if|for|switch)\b/.test(lead) ? 'header' : /^\s*case\b/.test(lead) ? 'case' : 'local';
+    // `x := &pkg.T{…}` writes the type it declares; `x := pkg.New(…)` the
+    // package its value comes from.
+    const rhs = code.slice(i + 2, i + 160);
+    const type = names.length === 1 ? /^[ \t]*&?[ \t]*([A-Za-z_]\w*\.[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] : undefined;
+    const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
+    for (const [name, at] of names) add(name, { at, kind, type, from });
+  }
+  // `var x T`, `var a, b = …`, `const (…)`: names before a type, an `=` or
+  // the line's end — in a group, on lines outside the brackets of a value
+  // spanning several (`http.MethodHead,` in a `[]string{…}` is no name).
+  const spec = /[ \t]*([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*)(?=[ \t]*(?:\n|$|=(?!=))|[ \t]+(?:[*[A-Za-z_(]|<-))/y;
+  const addSpec = (at: number): void => {
+    spec.lastIndex = at;
+    const s = spec.exec(code);
+    if (!s) return;
+    const type = /^[ \t]+([^\s=;][^=;\n]*?)[ \t]*(?:[=;\n]|$)/.exec(code.slice(at + s[0].length, at + s[0].length + 160))?.[1];
+    let p = at + s[0].length - s[1]!.length;
+    for (const part of s[1]!.split(',')) {
+      const name = part.trim();
+      add(name, { at: p + part.indexOf(name), kind: 'local', type });
+      p += part.length + 1;
+    }
+  };
+  for (const m of code.matchAll(/(?<![\w.])(?:var|const)\b[ \t]*/g)) {
+    const start = m.index! + m[0].length;
+    if (code[start] !== '(') { addSpec(start); continue; }
+    const end = goClosing(code, start);
+    addSpec(start + 1);
+    let depth = 0;
+    for (let i = start + 1; i < end; i++) {
+      const c = code[i];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth--;
+      else if (c === '\n' && depth === 0) addSpec(i + 1);
+    }
+  }
+  // Each `func`'s receiver, parameters and results, bound in its body. A
+  // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it.
+  for (const m of code.matchAll(/(?<![\w.])func\b/g)) {
+    if (/(?:\]|\bchan)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    const sig = goSignature(code, m.index! + 4);
+    if (!sig) continue;
+    for (const [from, to] of sig.groups) {
+      for (const [name, at, type] of goParamNames(code, from, to)) add(name, { at, kind: 'param', body: sig.body, type });
+    }
+  }
+  return { code, lineStarts, events, open, close, decls, scopes: new Map() };
+}
+
+/** The offset of the bracket closing the one at `at`, or the end of `code`. */
+function goClosing(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return code.length;
+}
+
+/**
+ * The parameter lists of the `func` whose keyword ends at `at` — receiver,
+ * parameters, results — as the offsets inside their parentheses, and the
+ * offset of its body's `{`. Null for a function type, which has no body.
+ */
+function goSignature(code: string, at: number): { groups: Array<[number, number]>; body: number } | null {
+  const groups: Array<[number, number]> = [];
+  let p = at;
+  const skip = (): void => { while (code[p] === ' ' || code[p] === '\t') p++; };
+  const group = (): boolean => {
+    if (code[p] !== '(') return false;
+    const end = goClosing(code, p);
+    groups.push([p + 1, end]);
+    p = end + 1;
+    skip();
+    return true;
+  };
+  // `func Name[T any](…)`, `func (r T) Name(…)`, or a literal / type `func(…)`.
+  const name = (): boolean => {
+    const m = /^[A-Za-z_]\w*/.exec(code.slice(p, p + 128));
+    if (!m || GO_TYPE_KEYWORDS.has(m[0])) return false;
+    let q = p + m[0].length;
+    while (code[q] === ' ' || code[q] === '\t') q++;
+    if (code[q] === '[') q = goClosing(code, q) + 1;
+    while (code[q] === ' ' || code[q] === '\t') q++;
+    if (code[q] !== '(') return false;
+    p = q;
+    return true;
+  };
+  skip();
+  if (code[p] !== '(') {
+    if (!name() || !group()) return null;
+  } else {
+    group();
+    if (name() && !group()) return null;
+  }
+  if (code[p] === '(') group();
+  // A result type up to the body; a function type ends at a `,`, `)`, `}`,
+  // `=`, `;` or the line's end instead.
+  let depth = 0;
+  for (; p < code.length; p++) {
+    const c = code[p];
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (--depth < 0) return null; }
+    else if (c === '{') {
+      if (depth > 0) continue;
+      // `struct{…}` / `interface{…}` is the result type's own brace.
+      if (/(?:struct|interface)\s*$/.test(code.slice(Math.max(0, p - 12), p))) { p = goClosing(code, p); continue; }
+      return { groups, body: p };
+    } else if (depth === 0 && (c === '\n' || c === ',' || c === ';' || c === '=' || c === '}')) return null;
+  }
+  return null;
+}
+
+/**
+ * The names a Go parameter list between `from` and `to` declares, with the
+ * type each is declared as: `(a, b int, c string)` declares a and b as `int`
+ * and c as `string`; `(int, pkg.T)` and `(*T, ...U)` declare none.
+ */
+function goParamNames(code: string, from: number, to: number): Array<[string, number, string]> {
+  const parts: Array<[number, number]> = [];
+  let depth = 0;
+  let start = from;
+  for (let i = from; i < to; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ',' && depth === 0) { parts.push([start, i]); start = i + 1; }
+  }
+  parts.push([start, to]);
+  const names: Array<[string, number, string]> = [];
+  let grouped: Array<[string, number]> = [];
+  for (const [s, e] of parts) {
+    const text = code.slice(s, e);
+    const m = /^\s*([A-Za-z_]\w*)/.exec(text);
+    if (!m || GO_TYPE_KEYWORDS.has(m[1]!)) continue;
+    const rest = text.slice(m[0].length);
+    // `pkg.T` is a type; a variadic `args ...T` is a name.
+    if (/^\s*\.(?!\.\.)/.test(rest)) continue;
+    const at = s + m[0].length - m[1]!.length;
+    if (/^\s*$/.test(rest)) { grouped.push([m[1]!, at]); continue; }
+    // `a, b int`: the names before a typed one share its type.
+    const type = rest.trim();
+    for (const [name, nameAt] of grouped) names.push([name, nameAt, type]);
+    grouped = [];
+    names.push([m[1]!, at, type]);
+  }
+  // A list with no typed name names no parameters: its lone identifiers are types.
+  return names;
+}
+
+/** The innermost `{…}` holding an offset, as [open, close] — null outside every block. */
+function goBlockAt(index: GoScopeIndex, offset: number): [number, number] | null {
+  let lo = 0;
+  let hi = index.events.length - 1;
+  let at = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (index.events[mid]! < offset) { at = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  const open = at < 0 ? -1 : index.open[at]!;
+  return open < 0 ? null : [open, index.close.get(open) ?? index.code.length];
+}
+
+/** Where the statement declaring at `at` ends: its line's end, or a `;`, outside brackets. */
+function goStatementEnd(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') { if (--depth < 0) return i; }
+    else if ((c === '\n' || c === ';') && depth === 0) return i;
+  }
+  return code.length;
+}
+
+/**
+ * The blocks of the `if` / `for` / `switch` statement whose header declares
+ * at `at`: gofmt ends a header's line with its block's `{` (a composite
+ * literal's in the header has more on its line), and an `else` chain keeps
+ * the header's names.
+ */
+function goHeaderBlocks(index: GoScopeIndex, at: number): Array<[number, number]> {
+  const code = index.code;
+  const blocks: Array<[number, number]> = [];
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') depth--;
+    else if (c === '}') break;
+    else if (c === '{') {
+      const end = index.close.get(i) ?? code.length;
+      if (depth !== 0 || !/^[ \t]*(?:\n|$)/.test(code.slice(i + 1, i + 80))) { i = end; continue; }
+      blocks.push([i, end]);
+      const chained = /^[ \t]*else\b[ \t]*/.exec(code.slice(end + 1, end + 40));
+      if (!chained) break;
+      i = end + chained[0].length;
+      depth = 0;
+    }
+  }
+  return blocks;
+}
+
+function goScopesOf(index: GoScopeIndex, name: string): Array<[number, number, GoDecl]> {
+  const hit = index.scopes.get(name);
+  if (hit) return hit;
+  const scopes: Array<[number, number, GoDecl]> = [];
+  for (const d of index.decls.get(name) ?? []) {
+    if (d.kind === 'param') {
+      scopes.push([d.body!, index.close.get(d.body!) ?? index.code.length, d]);
+      continue;
+    }
+    // Outside every block it is a package-level name, which no import shares.
+    const block = goBlockAt(index, d.at);
+    if (!block) continue;
+    if (d.kind === 'header') {
+      for (const [start, end] of goHeaderBlocks(index, d.at)) scopes.push([start, end, d]);
+      continue;
+    }
+    const from = goStatementEnd(index.code, d.at);
+    let to = block[1];
+    if (d.kind === 'case') {
+      const clause = /\n[ \t]*(?:case\b|default[ \t]*:)/g;
+      clause.lastIndex = from;
+      for (let m = clause.exec(index.code); m && m.index < to; m = clause.exec(index.code)) {
+        if (goBlockAt(index, m.index + 1)?.[0] === block[0]) { to = m.index; break; }
+      }
+    }
+    if (from < to) scopes.push([from, to, d]);
+  }
+  index.scopes.set(name, scopes);
+  return scopes;
+}
+
+/**
+ * Go source with its comments and the contents of its strings and runes
+ * blanked: offsets and newlines stay, so a regex match still maps to its
+ * line and column.
+ */
+function blankGoCode(src: string): string {
+  const parts: string[] = [];
+  let last = 0;
+  const blank = (from: number, to: number): void => {
+    parts.push(src.slice(last, from));
+    const newline = src.indexOf('\n', from);
+    parts.push(newline < 0 || newline >= to ? ' '.repeat(to - from) : src.slice(from, to).replace(/[^\n]/g, ' '));
+    last = to;
+  };
+  const special = /[/"'`]/g;
+  for (let m = special.exec(src); m; m = special.exec(src)) {
+    const i = m.index;
+    const c = src.charCodeAt(i);
+    if (c === 47) {
+      const d = src.charCodeAt(i + 1);
+      if (d === 47) { // `//`
+        const end = src.indexOf('\n', i);
+        blank(i, end < 0 ? src.length : end);
+      } else if (d === 42) { // `/*`
+        const end = src.indexOf('*/', i + 2);
+        blank(i, end < 0 ? src.length : end + 2);
+      } else continue;
+      special.lastIndex = last;
+    } else if (c === 96) { // a raw string
+      const end = src.indexOf('`', i + 1);
+      blank(i + 1, end < 0 ? src.length : end);
+      special.lastIndex = last + 1;
+    } else { // "…" or '…'
+      let j = i + 1;
+      while (j < src.length) {
+        const d = src.charCodeAt(j);
+        if (d === 92) { j += 2; continue; }
+        if (d === c || d === 10) break;
+        j++;
+      }
+      blank(i + 1, Math.min(j, src.length));
+      special.lastIndex = last + 1;
+    }
+  }
+  parts.push(src.slice(last));
+  return parts.join('');
 }
 
 const PHP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'trait', 'enum']);
@@ -2411,9 +2856,22 @@ function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { rec
   if (ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return null;
-  const text = lines.slice(ref.line - 1, ref.line + 7).join('\n').slice(Math.max(0, ref.column));
   const name = ref.referenceName.replace(/\$/g, '\\$');
-  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`).exec(text);
+  const call = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`);
+  // Search the ref's own line first: a minified bundle is one line, and
+  // joining it to the lines after it copied all of it for every call on it
+  // (about 1 MB a call on go-ethereum's graphiql.min.js). Every match starts
+  // with the name, so a match with no `name` before it on the line is where
+  // the joined lines match first too. Otherwise (no match, as for a call that
+  // continues on the next line, or the name earlier) the joined lines decide.
+  const span = lines.slice(ref.line - 1, ref.line + 7);
+  const from = Math.max(0, ref.column);
+  let text = span[0]?.slice(from) ?? '';
+  let at = call.exec(text);
+  if (!at || text.indexOf(ref.referenceName) < at.index) {
+    text = span.join('\n').slice(from);
+    at = call.exec(text);
+  }
   if (!at) return null;
   const before = text.slice(0, at.index).replace(/\s+$/, '');
   if (!/\??\.$/.test(before)) return null;
@@ -6857,7 +7315,7 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
   let scope: { start: number; end: number } | null = null;
   const fn = context.getNodeById?.(ref.fromNodeId);
   if (fn && (fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
-      jsCodeBindsName(name, fn, ref, context)) {
+      jsCodeBindsName(name, fn, ref.filePath, ref.line, context)) {
     scope = { start: fn.startLine, end: fn.endLine };
   }
   memo.set(key, scope);
@@ -6872,14 +7330,18 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
  */
 const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
-/** Whether the function's code through the reference's line declares `name`, or names it in a parameter list. */
-function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+/**
+ * Whether the function's code in `filePath`, from its first line through
+ * `line` (a reference's, or a JSX tag's), declares `name`, or names it in a
+ * parameter list.
+ */
+export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: number, context: ResolutionContext): boolean {
   let memo = JS_CODE_BINDS.get(context);
   if (!memo) JS_CODE_BINDS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${fn.startLine}\0${ref.line}\0${name}`;
+  const key = `${filePath}\0${fn.startLine}\0${line}\0${name}`;
   let binds = memo.get(key);
   if (binds === undefined) {
-    const text = jsFunctionCodeThrough(fn, ref, context);
+    const text = jsFunctionCodeThrough(fn, filePath, line, context);
     const { param } = localBindingPatterns(name, 'g');
     const n = name.replace(/\$/g, '\\$');
     // A plain declaration. Destructuring re-binds what a call returns under
@@ -6904,38 +7366,38 @@ function jsCodeBindsName(name: string, fn: Node, ref: UnresolvedRef, context: Re
 }
 
 /**
- * Per context: the comment-stripped lines of the functions jsFunctionLocalScope
+ * Per context: the comment-stripped lines of the functions jsCodeBindsName
  * read last, and where each line ends in that text, most recent last.
  */
 const JS_FN_CODE = new WeakMap<ResolutionContext, Map<string, { code: string; lineEnds: number[] }>>();
 const JS_FN_CODE_KEEP = 64;
 
 /**
- * The function's lines from its first through the reference's, comments
- * blanked. Stripping looks at most one character ahead — past a line's end,
- * a newline, which completes no comment marker — so this is the whole
+ * The function's lines from its first through `line`, comments blanked.
+ * Stripping looks at most one character ahead — past a line's end, a
+ * newline, which completes no comment marker — so this is the whole
  * function's stripped text cut at that line's end. Stripping the lines again
  * for every reference took time in the square of a large function's length;
  * in a minified script, every function's text runs to the end of its one
  * line (#2334).
  */
-function jsFunctionCodeThrough(fn: Node, ref: UnresolvedRef, context: ResolutionContext): string {
+function jsFunctionCodeThrough(fn: Node, filePath: string, line: number, context: ResolutionContext): string {
   let fns = JS_FN_CODE.get(context);
   if (!fns) JS_FN_CODE.set(context, (fns = new Map()));
-  const key = `${ref.filePath}\0${fn.startLine}\0${fn.endLine}`;
+  const key = `${filePath}\0${fn.startLine}\0${fn.endLine}`;
   let own = fns.get(key);
   if (own) {
     fns.delete(key);
   } else {
-    const lines = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [])
+    const lines = (context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [])
       .slice(fn.startLine - 1, fn.endLine);
     let end = -1;
-    own = { code: stripCommentsForRegex(lines.join('\n'), 'javascript'), lineEnds: lines.map((line) => (end += line.length + 1)) };
+    own = { code: stripCommentsForRegex(lines.join('\n'), 'javascript'), lineEnds: lines.map((text) => (end += text.length + 1)) };
     if (fns.size >= JS_FN_CODE_KEEP) fns.delete(fns.keys().next().value!);
   }
   fns.set(key, own);
-  // Through the reference's line, or the file's last when it ends sooner.
-  const last = Math.min(ref.line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
+  // Through `line`, or the file's last when it ends sooner.
+  const last = Math.min(line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
   return last < 0 ? '' : own.code.slice(0, own.lineEnds[last]);
 }
 
@@ -7348,6 +7810,26 @@ export function matchByQualifiedName(
           (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
         )
       : nodes;
+
+  // A C or C++ name written from the global scope (`::hpb::CreateMessage`,
+  // `::operator delete`) is the declaration of exactly that name. The suffix
+  // match below would take one nested in another namespace or class: for
+  // fmt's mock `test::open`, the `::open(…)` it wraps. Nor is it a declaration
+  // inside a namespace a macro opens, which only looks global in the index
+  // (fmt's `struct pipe`); step 5 of matchReference reads those.
+  if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.startsWith('::')) {
+    const global = keepForRef(context.getNodesByQualifiedName(ref.referenceName.slice(2))).filter((n) =>
+      (n.language === 'cpp' || n.language === 'c') &&
+      !cppMacroNamespaceFrames(n.filePath, context).some((f) => f.start <= n.startLine && f.end >= n.startLine));
+    const chosen = preferCallSiteFile(global, ref.filePath)[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: global.length === 1 || chosen.filePath === ref.filePath ? 0.95 : 0.85,
+      resolvedBy: 'qualified-name',
+    };
+  }
 
   let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
@@ -8346,11 +8828,39 @@ const CPP_NON_TYPE_TOKENS = new Set([
   'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
 ]);
 
+/**
+ * Does a `>` in a declared C++ type close no `<`? Then the type began on an
+ * earlier line — rocksdb's `std::unique_ptr<BlobContents>>>& blob_reqs` under
+ * `autovector<std::pair<BlobRangeReadRequest*,` — or the text is an
+ * expression (`i < a->b->c`).
+ */
+function cppTypeBeganAbove(typeName: string): boolean {
+  let depth = 0;
+  for (const c of typeName) {
+    if (c === '<') depth++;
+    else if (c === '>' && --depth < 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The last name of a declared C++ type: `const std::vector<std::pair<int,
+ * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
+ * names no type.
+ */
 function normalizeCppTypeName(typeName: string): string | null {
-  const normalized = typeName
-    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
-    .replace(/[&*]+/g, ' ')
-    .replace(/<[^>]*>/g, ' ')
+  // Without its head, what is left of a type begun above names a template
+  // argument's type, not the declared one.
+  if (cppTypeBeganAbove(typeName)) return null;
+  // Template arguments go with the ones nested in them. Cut at their first
+  // `>`, `Table<int, Box<int>>` was `Table >`, which names no type: a call
+  // on it never reached Table's method, and a capitalized name no class has
+  // ruled out any guess as well.
+  const normalized = stripCppTemplateArguments(
+    typeName
+      .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+      .replace(/[&*]+/g, ' '),
+  )
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -8613,6 +9123,10 @@ function inferCppReceiverType(
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
         noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
+      } else if (found && cppTypeBeganAbove(declaratorMatch[1] ?? '')) {
+        // The end of a declaration begun on an earlier line, maybe the
+        // receiver's: one found further up may be another variable.
+        found.shadowed = true;
       }
     } else if (found && cppRebindsReceiver(line, escapedReceiver)) {
       found.shadowed = true;
@@ -9183,7 +9697,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_QUALIFIERS.delete(context);
+  GO_SCOPE_INDEXES.delete(context);
   GO_EMBEDS.delete(context);
+  GO_ALIAS_TARGETS.delete(context);
+  GO_DOT_IMPORTS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -10304,6 +10821,17 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // A Go parameter named like an import is declared through a package as
+    // often as not (`logger logger.Interface`), which the patterns above
+    // don't read; the scope reader kept its type. Not a field's: in
+    // `metadata.Type.String()` that is the type of `metadata`.
+    if (!inferredType && ref.language === 'go' && dotMatch && !objectOrClass!.includes('.')) {
+      const declared = goRefQualification(ref, context).declaredType;
+      if (declared) {
+        inferredType = normalizeInferredTypeName(declared);
+        decl.raw = declared;
+      }
+    }
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
       inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
       // A field of a built-in type (`string _name`, `int count`) has no project method.
@@ -10899,7 +11427,18 @@ function resolveGoMethodInPackage(
   const types = goPackageTypes(typeName, pkgDir, context);
   if (types.length === 0) return undefined;
   if (depth >= 4) return null;
+  let unplaced = 0;
   for (const t of types) {
+    // An alias is the type it names, and has that type's methods.
+    const aliased = goAliasTarget(t, context);
+    if (aliased !== undefined) {
+      const via = aliased && resolveMethodOnType(
+        aliased.name, methodName, ref, context, confidence, resolvedBy, aliased.pkgDir, depth + 1,
+      );
+      if (via) return via;
+      if (!aliased) unplaced++;
+      continue;
+    }
     for (const embedded of goEmbeddedTypes(t, context)) {
       const via = resolveMethodOnType(
         embedded.name, methodName, ref, context, confidence, resolvedBy, embedded.pkgDir, depth + 1,
@@ -10907,7 +11446,48 @@ function resolveGoMethodInPackage(
       if (via) return via;
     }
   }
-  return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // or of no named type declares nothing here: the method is looked up by name,
+  // as it was before aliases had nodes.
+  return unplaced === types.length ? undefined : null;
+}
+
+const GO_ALIAS_TARGETS = new WeakMap<ResolutionContext, Map<string, { name: string; pkgDir: string } | null | undefined>>();
+
+/**
+ * The type a Go alias names, with the directory of the package that declares
+ * it — `mvccpb.Event` for `type Event = mvccpb.Event`, `Local` for `type Ptr
+ * = *Local`, `List` for `type Items[T any] = List[T]` — read from the
+ * declaration, as an embedding is. Null for an alias of anything else: a type
+ * from outside the project's packages, a predeclared one, a `func(…)` or
+ * `map[…]…`. Undefined when the node is no alias: a struct, an interface, or a
+ * defined type (`type Dur int`), which declares a type of its own.
+ */
+function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: string; pkgDir: string } | null | undefined {
+  if (typeNode.kind !== 'type_alias') return undefined;
+  let memo = GO_ALIAS_TARGETS.get(context);
+  if (!memo) GO_ALIAS_TARGETS.set(context, (memo = new Map()));
+  if (memo.has(typeNode.id)) return memo.get(typeNode.id);
+  const lines = context.getFileLines?.(typeNode.filePath) ?? context.readFile(typeNode.filePath)?.split(/\r?\n/) ?? [];
+  // From the alias's name, where the node starts, to the end of its type.
+  const decl = lines
+    .slice(Math.max(0, typeNode.startLine - 1), typeNode.endLine ?? typeNode.startLine)
+    .map((l, i) => (i === 0 ? l.slice(typeNode.startColumn ?? 0) : l).replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+    .join(' ');
+  // `Name =` or `Name[T any] =`; a defined type has no `=` there.
+  const head = /^\s*[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*=/.exec(decl);
+  // `T`, `*T`, `pkg.T`, each perhaps with type arguments.
+  const m = head && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(decl.slice(head[0].length));
+  let target: { name: string; pkgDir: string } | null | undefined;
+  if (m) {
+    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+    const name = m[2] ?? m[1]!;
+    target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
+  } else {
+    target = head ? null : undefined;
+  }
+  memo.set(typeNode.id, target);
+  return target;
 }
 
 /** The declarations of Go type `typeName` in the package at directory `pkgDir`. */
@@ -10955,6 +11535,162 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
   }
   memo.set(typeNode.id, embedded);
   return embedded;
+}
+
+/**
+ * A Go call made through a type assertion — `srv.(KVServer).Range(ctx, in)`,
+ * `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a method of
+ * the asserted type: its own, the one its interface declares, or one embedding
+ * promotes into it. The call reaches the resolver by its bare name, at the
+ * column where its receiver expression starts, and name matching took any
+ * method of that name: every gRPC handler etcd generates went to the
+ * `UnimplementedKVServer` stub beside the `KVServer` interface. The type is
+ * the one Go finds: in the call's own package or a package it dot-imports for
+ * a bare name, in the imported package for a qualified one, and an alias is
+ * the type it names. A type found in none — one from outside the project
+ * (`http.Flusher`), a predeclared one (`error`) — an alias of such a type, or
+ * a type literal (`interface{ Flush() }`) links nothing.
+ * Undefined when the call is not made through an assertion.
+ */
+export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
+  const asserted = goAssertedType(ref, context);
+  if (asserted === undefined) return undefined;
+  // `KVServer`, `*pipe`, `storage.Store`, `*List[int]`: anything else is a type literal.
+  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(asserted);
+  if (!type) return null;
+  const [, qualifier, typeName] = type;
+  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(typeName!, dir, context).length > 0;
+  const dir = qualifier !== undefined
+    ? goImportPackageDir(qualifier, ref.filePath, context)
+    : [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
+  if (!declares(dir)) return null;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // has that type's methods, none the project declares.
+  if (goPackageTypes(typeName!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
+  return resolveMethodOnType(typeName!, ref.referenceName, ref, context, 0.9, 'instance-method', dir);
+}
+
+/** How many lines past a Go call's first its chain is read on. */
+const GO_CHAIN_LINES = 30;
+
+/**
+ * The type a Go call's receiver is asserted to, as written (`KVServer`,
+ * `*pipe`, `storage.Store`). Every call of a chain records the chain's start,
+ * so the call is a `.name(…)` link of the chain read from there, and the link
+ * before it is the assertion. Two links of one name in a chain
+ * (`b.(*Builder).Add(1).Add(2)`) are told apart by nothing, and both are taken
+ * for the one made through the assertion: that call is there either way.
+ * Undefined when no link of the name follows an assertion, or no chain
+ * starts at the column.
+ */
+function goAssertedType(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  if (!lines || line === undefined || ref.column >= line.length) return undefined;
+  // Most calls through an expression assert nothing: no `.(` after the
+  // column, nor a chain that goes on past the line.
+  if (line.indexOf('.(', ref.column) < 0 && !/\.\s*$/.test(line)) return undefined;
+  const links = goChainLinks(lines.slice(ref.line - 1, ref.line + GO_CHAIN_LINES).join('\n'), ref.column);
+  for (let k = 1; k + 1 < links.length; k++) {
+    if (links[k - 1]!.kind === 'assert' && links[k]!.kind === 'select' && links[k]!.text === ref.referenceName &&
+        links[k + 1]!.kind === 'call') return links[k - 1]!.text;
+  }
+  return undefined;
+}
+
+interface GoChainLink {
+  kind: 'operand' | 'select' | 'assert' | 'call' | 'index';
+  /** An operand's or selector's name, an assertion's type. */
+  text: string;
+}
+
+/**
+ * The links of the Go expression that starts at `start`: its operand (a name
+ * or a parenthesized expression), then each selector, type assertion, call
+ * and index. A line break ends it, except right after a `.`, where Go
+ * inserts no semicolon.
+ */
+function goChainLinks(text: string, start: number): GoChainLink[] {
+  const links: GoChainLink[] = [];
+  const NAME = /[A-Za-z_]\w*/y;
+  let i = start;
+  const name = (): string | null => {
+    NAME.lastIndex = i;
+    const m = NAME.exec(text);
+    if (m) i += m[0].length;
+    return m ? m[0] : null;
+  };
+  const group = (): string | null => {
+    const close = goClosingBracket(text, i);
+    if (close < 0) return null;
+    const inner = text.slice(i + 1, close);
+    i = close + 1;
+    return inner;
+  };
+  const operand = text[i] === '(' ? group() : name();
+  if (operand === null) return links;
+  links.push({ kind: 'operand', text: operand });
+  for (;;) {
+    while (text[i] === ' ' || text[i] === '\t') i++;
+    if (text[i] === '.') {
+      i++;
+      while (i < text.length && WHITESPACE.test(text[i]!)) i++;
+      const type = text[i] === '(' ? group() : null;
+      const member = type === null ? name() : null;
+      if (type !== null) links.push({ kind: 'assert', text: type.trim() });
+      else if (member !== null) links.push({ kind: 'select', text: member });
+      else break;
+    } else if (text[i] === '(' || text[i] === '[') {
+      // A call whose arguments run past what was read is still a call.
+      links.push({ kind: text[i] === '(' ? 'call' : 'index', text: '' });
+      if (group() === null) break;
+    } else break;
+  }
+  return links;
+}
+
+/** The bracket closing the one at `open`, past Go strings, runes and comments; -1 when it does not close. */
+function goClosingBracket(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === '\'') {
+      for (i++; i < text.length && text[i] !== c && text[i] !== '\n'; i++) if (text[i] === '\\') i++;
+    } else if (c === '`') {
+      i = text.indexOf('`', i + 1);
+      if (i < 0) return -1;
+    } else if (c === '/' && text[i + 1] === '/') {
+      i = text.indexOf('\n', i);
+      if (i < 0) return -1;
+    } else if (c === '/' && text[i + 1] === '*') {
+      i = text.indexOf('*/', i + 2);
+      if (i < 0) return -1;
+      i++;
+    } else if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+const GO_DOT_IMPORTS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/** The project packages a Go file dot-imports (`import . "example.com/app/storage"`), by directory: their names it reads bare. */
+function goDotImportDirs(filePath: string, context: ResolutionContext): string[] {
+  let memo = GO_DOT_IMPORTS.get(context);
+  if (!memo) GO_DOT_IMPORTS.set(context, (memo = new Map()));
+  let dirs = memo.get(filePath);
+  if (dirs) return dirs;
+  dirs = [];
+  for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
+    // The imports come before any other declaration.
+    if (/^(?:func|type|var|const)\b/.test(line)) break;
+    const dot = /^\s*(?:import\s+)?\.\s+"([^"]+)"/.exec(line);
+    const dir = dot ? context.getGoPackageDir?.(dot[1]!, filePath) : null;
+    if (dir) dirs.push(dir);
+  }
+  memo.set(filePath, dirs);
+  return dirs;
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
@@ -13016,6 +13752,8 @@ export function cppMacroNamespaceFrames(file: string, context: ResolutionContext
  */
 function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   let target = ref.referenceName.replace(/^::/, '');
+  // `::memset` names no namespace for a macro or an alias to open.
+  if (!target.includes('::')) return null;
   const head = target.slice(0, target.indexOf('::'));
   const alias = cppNamespaceAliases(context).get(head);
   // `py::str` under `namespace py = pybind11;` is `pybind11::str`.

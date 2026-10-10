@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -33,7 +33,7 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -643,10 +643,19 @@ export class ReferenceResolver {
   private createContext(): ResolutionContext {
     return {
       resolveImport: (ref) => resolveViaImport(ref, this.context),
-      isOutOfRepoImport: (source, fromFile, language) =>
-        isExternalImport(source, language, this.context) &&
-        resolveImportPath(source, fromFile, language, this.context) === null &&
-        this.isDeclaredOutsidePackage(source, fromFile),
+      // A path alias makes an import the project's only when it maps the
+      // import to a file the index holds. Matching its prefix is not enough:
+      // cord-field's `"*": ["./typings/*"]` matches every package, and
+      // counting the match bound 169 imports of `@mui/material`'s Typography
+      // to its own. Nor is a path that exists on disk: home-assistant's
+      // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
+      // `node_modules`, topcoder's `config` package on its `config/` folder.
+      isOutOfRepoImport: (source, fromFile, language) => {
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        const resolved = resolveImportPath(source, fromFile, language, this.context);
+        if (resolved !== null && this.isIndexedFile(resolved)) return false;
+        return this.isDeclaredOutsidePackage(source, fromFile);
+      },
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -1022,7 +1031,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
 
       // Report progress every 1% to avoid too many updates
@@ -1233,6 +1242,11 @@ export class ReferenceResolver {
     // A Dart annotation (`@riverpod`, `@Riverpod(…)`) is a constant or a
     // constructor call, as written — never a method or function by its name.
     if (isDartAnnotation(ref)) return matchDartAnnotation(ref, this.context);
+    // A Go call through a type assertion (`srv.(KVServer).Range(ctx, in)`),
+    // which arrives by its bare name, is to a method of the asserted type, or
+    // to nothing the project declares.
+    const asserted = matchGoAssertedCall(ref, this.context);
+    if (asserted !== undefined) return asserted;
 
     // A section or snippet a Shopify theme's file names is that theme's own,
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
@@ -1287,6 +1301,11 @@ export class ReferenceResolver {
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // A C or C++ name written from the global scope (`::_pbi::PrivateAccess::
+    // GenerateParseTable`, `::memset`) exists when the name under the `::` does.
+    if ((ref.language === 'cpp' || ref.language === 'c') && existenceName.startsWith('::')) {
+      existenceName = existenceName.slice(2);
+    }
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -1296,11 +1315,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      // Every detected framework's claim, not only those that resolve this
-      // language: the check above reads no leading `::`, and protobuf's C++
-      // `::_pbi::…` calls get past it only on the Swift ↔ Objective-C
-      // bridge's claim of any name with a `:` in it.
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -1639,20 +1654,34 @@ export class ReferenceResolver {
    * ref's line), so a sibling must not inherit this row's failure (#1269).
    */
   private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
-    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }>;
-    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>;
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }>;
   } {
-    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }> = [];
-    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }> = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }> = [];
     for (const r of unresolved) {
-      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind });
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind, nameTail: r.nameTail });
       else legacyKeys.push({
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
         referenceKind: r.referenceKind,
+        nameTail: r.nameTail,
       });
     }
     return { byRowId, legacyKeys };
+  }
+
+  /**
+   * `ref`, which no strategy resolved, with the tail it is parked under when
+   * that is not the one its name gives: a reference through an import
+   * binding the module doesn't declare by that name waits for the module
+   * (see importBindingTail). Decided here, where the file's import mappings
+   * are still cached from the attempt — in a resolver-pool worker too.
+   */
+  private parkable(ref: UnresolvedRef): UnresolvedRef {
+    const tail = importBindingTail(ref, this.context);
+    if (tail) ref.nameTail = tail;
+    return ref;
   }
 
   /** A deferred attempt is unfinished work, not a final failure (#1577). */
@@ -1889,7 +1918,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
       // Fast-path the per-ref yield check: awaiting the async no-op costs a
       // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
@@ -2009,7 +2038,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
     }
     this.deferredRowIds.clear(); // the admission side now owns both queues
@@ -2819,12 +2848,15 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      // A leading `::` names the global scope: `::std::move` is `std::move`,
+      // `::memset` is `memset`.
+      const scoped = name.startsWith('::') ? name.slice(2) : name;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
-      if (name.startsWith('std::')) return true;
-      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
-        return !this.hasAnyPossibleMatch(name);
+      if (scoped.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(scoped) || CPP_BUILT_INS.has(scoped)) {
+        return !this.hasAnyPossibleMatch(scoped);
       }
     }
 
@@ -3231,6 +3263,12 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
+    // A Go alias names its type as an embedding does (below): written through
+    // a package that is none of the file's imports as indexed, the type found
+    // by its bare name is another package's namesake, or the alias itself.
+    if (ref.language === 'go' && ref.referenceKind === 'references' &&
+        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+
     // A Go type position — a parameter or result type, a composite literal's
     // type — names a type of the package Go reads it from (route handlers are
     // `references` too, but values).
@@ -3288,6 +3326,12 @@ export class ReferenceResolver {
     if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
     const target = this.nodeById(result.targetNodeId);
     return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+  }
+
+  /** Is `filePath` (project-relative) one of the files the index holds? */
+  private isIndexedFile(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/');
+    return this.knownFiles ? this.knownFiles.has(normalized) : this.queries.getFileByPath(normalized) !== null;
   }
 
   /** The repository's own package name, from its root package.json; null without one. */
