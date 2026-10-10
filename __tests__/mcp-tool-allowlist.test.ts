@@ -4,7 +4,8 @@
  * Filtering happens in ListTools (getTools) and is enforced again on execute().
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { ToolHandler } from '../src/mcp/tools';
+import { ToolHandler, getStaticTools } from '../src/mcp/tools';
+import { enabledAospAddendum } from '../src/mcp/session';
 
 const ENV = 'CODEGRAPH_MCP_TOOLS';
 
@@ -44,6 +45,14 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
   it('treats an empty/whitespace value as unset (default surface)', () => {
     process.env[ENV] = '   ';
     expect(listed()).toEqual(['codegraph_explore']);
+  });
+
+  it('treats comma-only input consistently across static, live, and instruction surfaces', () => {
+    process.env[ENV] = ',,,';
+
+    expect(getStaticTools().map((tool) => tool.name)).toEqual(['codegraph_explore']);
+    expect(listed()).toEqual(['codegraph_explore']);
+    expect(enabledAospAddendum()).toBe('');
   });
 
   it('rejects a disabled tool on execute (defense in depth)', async () => {
