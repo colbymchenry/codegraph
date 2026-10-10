@@ -19,6 +19,7 @@ import { kiroTarget } from './kiro';
 import { copilotVscodeTarget } from './copilot-vscode';
 import { copilotCliTarget } from './copilot-cli';
 import { copilotJetbrainsTarget } from './copilot-jetbrains';
+import { piTarget } from './pi';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
@@ -32,6 +33,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   copilotVscodeTarget,
   copilotCliTarget,
   copilotJetbrainsTarget,
+  piTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {
