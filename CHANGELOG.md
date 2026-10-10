@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` now sets up PiG (the Go coding agent harness, github.com/MichaelKinsy/PiG) by adding codegraph to its MCP servers, so PiG sessions can use the knowledge graph. Use `--target=pig`, or pick PiG in the prompt when it is installed. Start a new PiG session afterwards.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
