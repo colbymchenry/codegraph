@@ -171,7 +171,9 @@ export interface LanguageExtractor {
    * around it, when the grammar adds one. The doc comment and annotations
    * written before the declaration precede that wrapper, so both are looked up
    * from it. Dart wraps a member with no body (`Foo._();`, an abstract
-   * `void m();`) in a `declaration` node. Returns undefined when there is none.
+   * `void m();`) in a `declaration` node, and Go a type declared on its own
+   * (`type Foo struct{…}`) in a `type_declaration`. Returns undefined when
+   * there is none.
    */
   getDeclarationWrapper?: (node: SyntaxNode) => SyntaxNode | undefined;
   /**
@@ -181,6 +183,13 @@ export interface LanguageExtractor {
    * each one is stepped over, and comments on either side of it still join.
    */
   docstringStepOverTypes?: string[];
+  /**
+   * Leave out of a docstring the comments that belong to the line above it:
+   * one written after code on its line, and any that begins on the line such
+   * a comment ends. In Go, `var origin = Point{} // the origin.` comments that
+   * line and never documents the declaration below it.
+   */
+  docstringSkipsTrailingComments?: boolean;
   /**
    * Node types that may stand between a declaration and the decorators written
    * before it without ending the scan for them. Dart writes comments there
