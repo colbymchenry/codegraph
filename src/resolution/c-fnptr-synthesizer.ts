@@ -879,7 +879,9 @@ export async function cFnPointerDispatchEdges(
 
   // ---- function-name → node resolution (prefer a function in the same file) ----
   const resolveFn = (name: string, preferFile?: string): Node | null => {
-    const cands = ctx.getNodesByName(name).filter((n) => FN_KINDS.has(n.kind));
+    // C and C++ functions only: a same-named Python or Rust function is never
+    // what a C table registers, and must not displace the C one.
+    const cands = ctx.getNodesByName(name).filter((n) => FN_KINDS.has(n.kind) && C_CPP_EXT.test(n.filePath));
     if (cands.length === 0) return null;
     if (cands.length === 1) return cands[0]!;
     if (preferFile) {
