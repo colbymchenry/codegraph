@@ -346,6 +346,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **Oh My Pi can load CodeGraph context automatically before a new user run** through a native extension that reuses your existing index without installing tools or indexing code.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **Next.js pages and their navigation are in the graph.** App Router pages (`app/(group)/blog/[slug]/page.tsx` → `/blog/:slug`) and Pages Router pages are routes bound to the component they export, and `<Link href>`, an internal `<a href>`, `router.push` / `router.replace` (`next/navigation` and `next/router`), `redirect()` / `permanentRedirect()` and the middleware's `NextResponse.redirect(…)` are `navigates` edges between them. `app/api/**/route.ts` exports (`GET`, `POST`, …) are endpoints bound to their functions, and `pages/api/*` handlers are `ANY /api/…`. Re-index after upgrading.
