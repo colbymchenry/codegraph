@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -131,20 +131,6 @@ const PYTHON_BUILT_IN_METHODS = new Set([
   'startswith', 'endswith', 'find', 'index', 'count', 'encode', 'decode',
   'format', 'isdigit', 'isalpha', 'isalnum',
   'read', 'write', 'readline', 'readlines', 'close', 'flush', 'seek',
-]);
-
-const GO_STDLIB_PACKAGES = new Set([
-  'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
-  'time', 'path', 'bytes', 'strings', 'strconv', 'errors', 'context',
-  'json', 'xml', 'csv', 'html', 'template', 'regexp', 'reflect',
-  'runtime', 'testing', 'flag', 'bufio', 'crypto', 'encoding',
-  'filepath', 'hash', 'mime', 'rand', 'signal', 'sql', 'syscall',
-  'unicode', 'unsafe', 'atomic', 'binary', 'debug', 'exec', 'heap',
-  'ring', 'scanner', 'tar', 'zip', 'gzip', 'zlib', 'tls', 'url',
-  'user', 'pprof', 'trace', 'ast', 'build', 'parser', 'printer',
-  'token', 'types', 'cgo', 'plugin', 'race', 'ioutil',
-  // Kubernetes-common stdlib aliases
-  'utilruntime', 'utilwait', 'utilnet',
 ]);
 
 const GO_BUILT_INS = new Set([
@@ -2874,8 +2860,11 @@ export class ReferenceResolver {
         const pkg = name.substring(0, dotIdx);
         // Not a local bound from a type assertion that is named like one:
         // grpc-go's `parser.ParseConfig(…)` after `parser, ok :=
-        // b.(balancer.ConfigParser)`.
-        if (GO_STDLIB_PACKAGES.has(pkg) && !isGoAssertedLocal(pkg, ref, this.context)) {
+        // b.(balancer.ConfigParser)`. Nor a call on any other parameter or
+        // local of the name that can hold one of the project's values: gin's
+        // `context.AbortWithError(…)` in `func(context *Context)`.
+        if (GO_STDLIB_PACKAGES.has(pkg) && !isGoAssertedLocal(pkg, ref, this.context) &&
+            !isGoProjectLocalCall(ref, this.context)) {
           return true;
         }
       }
