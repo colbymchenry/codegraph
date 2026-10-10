@@ -102,6 +102,47 @@ describe('Telemetry', () => {
       t.setEnabled(false, 'cli');
       expect(fs.existsSync(t.queuePath)).toBe(false);
     });
+
+    it('turning telemetry off clears machine id, and turning it back on mints a new id', async () => {
+      const t = make();
+      t.recordLifecycle('install', { scope: 'local', kind: 'fresh' });
+      await t.flushNow();
+      const id1 = t.getStatus().machineId;
+      expect(id1).toBeTruthy();
+
+      t.setEnabled(false, 'cli');
+      expect(t.getStatus().machineId).toBeNull();
+
+      t.setEnabled(true, 'cli');
+      const id2 = t.getStatus().machineId;
+      expect(id2).toBeTruthy();
+      expect(id2).not.toBe(id1);
+    });
+
+    it('running instance immediately stops recording, flushing, and persisting when opted out externally', async () => {
+      const fetchSpy = mockFetch(calls);
+      const runningServer = make({ fetchImpl: fetchSpy });
+      // Initially enabled
+      runningServer.recordUsage('mcp_tool', 'codegraph_explore', true);
+      runningServer.persistSync();
+      expect(fs.existsSync(runningServer.queuePath)).toBe(true);
+
+      // Separate CLI process turns telemetry off
+      const cliProcess = make({ fetchImpl: fetchSpy });
+      cliProcess.setEnabled(false, 'cli');
+      expect(fs.existsSync(runningServer.queuePath)).toBe(false);
+
+      // Running server attempts subsequent recording
+      runningServer.recordUsage('mcp_tool', 'codegraph_node', true);
+      runningServer.persistSync();
+      // Must not resurrect the queue file
+      expect(fs.existsSync(runningServer.queuePath)).toBe(false);
+
+      // Running server attempts flush
+      await runningServer.flushNow();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(fs.existsSync(runningServer.queuePath)).toBe(false);
+    });
   });
 
   describe('first-run notice & machine id', () => {
