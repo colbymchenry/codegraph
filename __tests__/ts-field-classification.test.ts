@@ -99,7 +99,6 @@ describe('TS/JS class field classification (#808)', () => {
       expect(fontsProp.signature).toBe('Fonts fonts');
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -126,7 +125,6 @@ describe('TS/JS class field classification (#808)', () => {
       expect(cg.getNodesByName('onClick')[0]?.kind).toBe('method');
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -153,7 +151,6 @@ describe('TS/JS class field classification (#808)', () => {
       expect(fnRefs.length).toBeGreaterThan(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 });
