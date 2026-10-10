@@ -16,7 +16,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
-import { buildSteps, crossing, effectCategory, isStoreFile } from '../src/ui-server/api/steps';
+import { buildSteps, crossing, effectCategory, isGuardDecorator, isStoreFile } from '../src/ui-server/api/steps';
 
 let tmpDir: string;
 let cg: CodeGraph;
@@ -189,6 +189,12 @@ describe('classification helpers', () => {
     expect(effectCategory('DdRum.addAction')).toBe('telemetry');
     expect(effectCategory('Math.max')).toBeNull();
     expect(effectCategory('i18n.t')).toBeNull();
+  });
+  it('guard decorators: Authorize gates a handler, Author documents it', () => {
+    for (const d of ['Authorize', 'Authorized', `PreAuthorize("hasRole('A')")`, 'Authority', 'Authenticated', 'UseGuards(AuthGuard)', 'OAuth', 'RequireAuth'])
+      expect(isGuardDecorator(d), d).toBe(true);
+    for (const d of ['Author("me")', 'Authors', 'Authorship'])
+      expect(isGuardDecorator(d), d).toBe(false);
   });
 });
 

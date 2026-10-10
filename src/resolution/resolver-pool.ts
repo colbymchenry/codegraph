@@ -17,6 +17,8 @@ import type { Edge, UnresolvedReference } from '../types';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 import { terminateOnceStarted, workerStarted } from '../worker-teardown';
+import { isRecording } from '../decision/record';
+import { overridesActive } from '../decision/overrides';
 
 /** One synthesis pass's output: its edge list + worker-measured wall clock. */
 export interface SynthPassResult {
@@ -81,6 +83,15 @@ export function shouldEngageAdaptively(projectedMs: number, remainingRefs: numbe
   return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
 }
 
+/**
+ * Kill switch for the resolver pool. Recording decision instances also forces
+ * the sequential path: a worker's records never reach the main thread. So do
+ * decision overrides: their veto state is per thread.
+ */
+export function parallelResolveDisabled(): boolean {
+  return process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1' || isRecording() || overridesActive();
+}
+
 export class ResolverPool {
   private workers: PoolWorker[] = [];
   private nextId = 0;
@@ -139,7 +150,7 @@ export class ResolverPool {
    * (0 disables the pool; values are capped at 16).
    */
   static tryCreate(dbPath: string, projectRoot: string): ResolverPool | null {
-    if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
+    if (parallelResolveDisabled()) return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
     let dbSizeBytes = 0;

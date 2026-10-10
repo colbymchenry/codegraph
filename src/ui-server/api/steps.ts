@@ -43,13 +43,15 @@ import { badRequest, intParam, notFound } from './respond';
 import { createSiteReader } from './when';
 import type { BranchGuard, SiteLoop, SiteTrigger } from '../../graph/branch-guards';
 import { buildProgram, type ProgramSite, type WireProgram } from './program';
-import { classifyEffect, implicitResponseStatus, responseStatus, type Effect } from './effects';
+import { classifyEffect, implicitResponseStatus, responseStatus, type Effect, type EffectCategory } from './effects';
 import { guardLabel } from '../../graph/branch-guards';
 import { looksLikeComponent, routeRoots } from './route-roots';
 import { nextRouteForFile } from '../../resolution/frameworks/nextjs';
 import { splitRouteName } from './routes';
 import { HUB_THRESHOLD, UNCERTAIN_BELOW, toNodeRef, type WireNodeRef } from './wire';
 import { isTestPath } from '../../search/query-utils';
+import { decideLive, isLive } from '../../decision/live';
+import type { DecisionRecord } from '../../decision/types';
 
 // =============================================================================
 // Wire shapes
@@ -329,7 +331,7 @@ const REPOSITORY_CONTAINER = /(?:Repository|Repositories|Repo|Dao|DAO|Mapper|Sto
 
 /** Decorators that gate a handler: guards, interceptors, pipes, roles, auth, validation, transactions, throttles. */
 const GUARD_DECORATOR =
-  /^(?:UseGuards|UseInterceptors|UsePipes|UseFilters|Roles|Auth|Public|Permissions|Throttle|SkipThrottle|Authorize|AllowAnonymous|PreAuthorize|PostAuthorize|Secured|RolesAllowed|PermitAll|DenyAll|Transactional|Validated|login_required|permission_required|user_passes_test|staff_member_required|require_http_methods|require_POST|require_GET|csrf_exempt|csrf_protect|ratelimit|throttle_classes|permission_classes|authentication_classes|cache_page|ValidateAntiForgeryToken|RequireAuthorization|RequireRole|RequireHttps|EnableCors|CrossOrigin|Cacheable|CacheEvict|CachePut|RateLimiter|CircuitBreaker|Retry|Timeout|Bulkhead|jwt_required|Security|ApiBearerAuth|ApiKeyAuth|BearerAuth|OAuth|Scopes|Roles|HasRole|HasPermission|Idempotent|Lock|Locked|Retryable|Recover)$|Guard|Interceptor|Pipe$|Filter$|Auth|Role|Permission|Throttle|Valid|Transaction|Csrf|Limit/i;
+  /^(?:UseGuards|UseInterceptors|UsePipes|UseFilters|Roles|Auth|Public|Permissions|Throttle|SkipThrottle|Authorize|AllowAnonymous|PreAuthorize|PostAuthorize|Secured|RolesAllowed|PermitAll|DenyAll|Transactional|Validated|login_required|permission_required|user_passes_test|staff_member_required|require_http_methods|require_POST|require_GET|csrf_exempt|csrf_protect|ratelimit|throttle_classes|permission_classes|authentication_classes|cache_page|ValidateAntiForgeryToken|RequireAuthorization|RequireRole|RequireHttps|EnableCors|CrossOrigin|Cacheable|CacheEvict|CachePut|RateLimiter|CircuitBreaker|Retry|Timeout|Bulkhead|jwt_required|Security|ApiBearerAuth|ApiKeyAuth|BearerAuth|OAuth|Scopes|Roles|HasRole|HasPermission|Idempotent|Lock|Locked|Retryable|Recover)$|Guard|Interceptor|Pipe$|Filter$|Auth(?!or(?!i[sz]|it))|Role|Permission|Throttle|Valid|Transaction|Csrf|Limit/i;
 /** Decorators that ARE the route, the DI wiring, or documentation — never a guard. */
 const NOT_A_GUARD =
   /^(?:Get|Post|Put|Patch|Delete|Head|Options|All|Controller|RestController|Resolver|Query|Mutation|Subscription|Injectable|Module|Api\w*|Http(?:Get|Post|Put|Patch|Delete|Head|Options)|Route|RequestMapping|\w+Mapping|Component|Service|Repository|Bean|Autowired|Override|Inject|Param|Body|Res|Req|Headers|Ip|HostParam|Session|UploadedFiles?|HttpCode|Header|Redirect|Render|Version|SerializeOptions|ResponseBody|ResponseStatus|Produces|Consumes|FromBody|FromRoute|FromQuery|FromForm|FromHeader|FromServices|Path|PathVariable|RequestParam|RequestBody|RequestHeader|ModelAttribute|Valid|Args|Context|Parent|Info|Field|ObjectType|InputType|ArgsType|Entity|Column|PrimaryGeneratedColumn|OneToMany|ManyToOne|Prop|Schema|Type|Expose|Exclude|Transform|IsString|IsNumber|IsOptional|Length|Min|Max|Deprecated|SuppressWarnings|FunctionalInterface|Slf4j|Data|Builder|Getter|Setter|NoArgsConstructor|AllArgsConstructor|RequiredArgsConstructor|Value|ConfigurationProperties|Configuration|EnableScheduling|SpringBootApplication|Profile|Order|Primary|Qualifier|Lazy|Scope|JsonProperty|JsonIgnore|Nullable|NonNull|NotNull|Size|Pattern|Email|Positive|router\.\w+|app\.\w+|api\.\w+|bp\.\w+|blueprint\.\w+|\w+\.(?:route|get|post|put|patch|delete))$/;
@@ -348,10 +350,9 @@ function decoratorLiteral(text: string): string | null {
   return m ? `'${m[2]}'` : null;
 }
 
-function isGuardDecorator(text: string): boolean {
+export function isGuardDecorator(text: string): boolean {
   const name = decoratorName(text);
-  if (NOT_A_GUARD.test(name)) return false;
-  return GUARD_DECORATOR.test(name);
+  return !NOT_A_GUARD.test(name) && GUARD_DECORATOR.test(name);
 }
 
 /** FastAPI: `dependencies=[Depends(auth), Depends(rate_limit)]` inside the route decorator. */
@@ -929,6 +930,16 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
         args,
         projectType: fold.node.language === 'swift' && (await declaresSwiftType(text)),
       });
+      if (isLive('F1')) {
+        const rec: DecisionRecord = {
+          point: 'F1',
+          key: `${fold.node.id}:${ref.line}:${ref.column}`,
+          payload: { call: { text, kind: ref.referenceKind, language: fold.node.language, receiverType, args, enclosing: fold.node.qualifiedName, filePath: fold.node.filePath, line: ref.line }, project },
+          heuristic: { pick: effect?.category ?? 'none' },
+        };
+        const v = await decideLive(rec, { root: projectRoot });
+        if (v) effect = v.pick === null ? null : effect?.category === v.pick ? effect : { category: v.pick as EffectCategory };
+      }
     }
     if (effect === null) return false;
     // A reply's status, read before its box exists — the box is per outcome.

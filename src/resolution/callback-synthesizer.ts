@@ -40,6 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
+import { b2Asker, decideB1, deciding, splitLoc } from '../decision/record';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -172,23 +173,14 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     if (chDispatchers.length === 0) continue;
     const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
-    for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
+    const incoming = queries.getIncomingEdges(reg.node.id, ['calls']);
+    for (const e of incoming) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       if (!e.line) continue;
       const caller = queries.getNodeById(e.source);
       if (!caller) continue;
-      const line = ctx.readFile(caller.filePath)?.split('\n')[e.line - 1];
-      const am = line?.match(argRe);
-      if (!am) continue;
-      // Reuse the resolved value at this registration site: it retains the
-      // receiver's class/inheritance and import binding, unlike a name lookup.
-      const refs = queries.getOutgoingEdges(caller.id, ['references']).filter(
-        (r) => r.line === e.line && r.metadata?.fnRef === true && r.metadata.refName === am[1]
-      );
-      if (refs.length !== 1) continue;
-      const fn = queries.getNodeById(refs[0]!.target);
-      if (!fn || (fn.kind !== 'method' && fn.kind !== 'function')) continue;
-      if (!am[1]!.startsWith('this.') && fn.filePath !== caller.filePath && refs[0]!.metadata?.resolvedBy !== 'import') continue;
+      const fn = registeredCallback(queries, ctx, argRe, e.line, caller);
+      if (!fn) continue;
       for (const disp of chDispatchers) {
         if (disp.node.id === fn.id) continue;
         const key = `${disp.node.id}>${fn.id}`;
@@ -210,6 +202,25 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     }
   }
   return edges;
+}
+
+/**
+ * The function a registration call at `line` of `caller` passes as its callback
+ * (`argRe` captures the argument), or null when it passes none we can name.
+ */
+function registeredCallback(queries: QueryBuilder, ctx: ResolutionContext, argRe: RegExp, line: number, caller: Node): Node | null {
+  const am = ctx.readFile(caller.filePath)?.split('\n')[line - 1]?.match(argRe);
+  if (!am) return null;
+  // Reuse the resolved value at this registration site: it retains the
+  // receiver's class/inheritance and import binding, unlike a name lookup.
+  const refs = queries.getOutgoingEdges(caller.id, ['references']).filter(
+    (r) => r.line === line && r.metadata?.fnRef === true && r.metadata.refName === am[1]
+  );
+  if (refs.length !== 1) return null;
+  const fn = queries.getNodeById(refs[0]!.target);
+  if (!fn || (fn.kind !== 'method' && fn.kind !== 'function')) return null;
+  if (!am[1]!.startsWith('this.') && fn.filePath !== caller.filePath && refs[0]!.metadata?.resolvedBy !== 'import') return null;
+  return fn;
 }
 
 /**
@@ -307,6 +318,8 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
   let scannedFiles = 0;
   const emitsByEvent = new Map<string, Set<string>>();          // event → dispatcher node ids
   const handlersByEvent = new Map<string, Map<string, string>>(); // event → handler id → registration site (file:line)
+  const b1Picks = new Map<string, number>();                     // `${event}>${handler id}` → p of the B1 override that chose it
+  const askB1 = deciding('B1');
 
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
@@ -336,7 +349,16 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
       while ((m = ON_RE.exec(content))) {
         const handlerName = m[2] || m[3];
         if (!handlerName) continue;
-        const handler = ctx.getNodesByName(handlerName).find((n) => n.kind === 'function' || n.kind === 'method');
+        let handler = ctx.getNodesByName(handlerName).find((n) => n.kind === 'function' || n.kind === 'method');
+        const handlerCands = askB1 ? ctx.getNodesByName(handlerName).filter((n) => n.kind === 'function' || n.kind === 'method') : undefined;
+        if (handlerCands && handlerCands.length > 1) {
+          const at = lineOf(m.index);
+          const b1 = decideB1(`emitter:${file}:${at}:${handlerName}`, { kind: 'emitter', name: m[1]!, filePath: file, line: at }, handlerCands, handler);
+          if (b1) {
+            handler = b1.pick ?? undefined;
+            if (handler) b1Picks.set(`${m[1]}>${handler.id}`, b1.p);
+          }
+        }
         if (!handler) continue;
         const map = handlersByEvent.get(m[1]!) ?? new Map<string, string>();
         map.set(handler.id, `${file}:${lineOf(m.index)}`); handlersByEvent.set(m[1]!, map);
@@ -346,21 +368,59 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const askB2 = deciding('B2');
   for (const [event, dispatchers] of emitsByEvent) {
     const handlers = handlersByEvent.get(event);
     if (!handlers) continue;
     // Precision guard: a generic event name with many handlers/dispatchers can't
     // be matched without receiver-type info (Phase 3) — skip rather than over-link.
-    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) continue;
-    for (const d of dispatchers) for (const [h, registeredAt] of handlers) {
-      if (d === h) continue;
-      const key = `${d}>${h}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push({ source: d, target: h, kind: 'calls', provenance: 'heuristic', metadata: { synthesizedBy: 'event-emitter', event, registeredAt } });
+    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) {
+      if (askB2) linkOverCap(ctx, edges, seen, 'emitter', 'event-emitter', event, dispatchers, handlers);
+      continue;
     }
+    for (const d of dispatchers) for (const [h, registeredAt] of handlers) linkEvent(edges, seen, 'event-emitter', d, h, event, registeredAt);
   }
+  markB1(edges, b1Picks);
   return edges;
+}
+
+/** One event-channel edge, dispatcher → handler, at most once per pair (`seen` spans every event). */
+function linkEvent(
+  edges: Edge[], seen: Set<string>, synthesizedBy: string,
+  d: string, h: string, event: string, registeredAt: string, decision?: Record<string, unknown>
+): void {
+  if (d === h) return;
+  const key = `${d}>${h}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  edges.push({ source: d, target: h, kind: 'calls', provenance: 'heuristic', metadata: { synthesizedBy, event, registeredAt, ...decision } });
+}
+
+/**
+ * Decision point B2 (src/decision): an event over the fan-out cap links only the
+ * dispatcher → handler pairs a model judged to share one emitter (`b2Asker`).
+ * Callers run it only while recording B2 or with an overrides file.
+ */
+function linkOverCap(
+  ctx: ResolutionContext, edges: Edge[], seen: Set<string>, site: string, synthesizedBy: string,
+  event: string, dispatchers: ReadonlySet<string>, handlers: ReadonlyMap<string, string>
+): void {
+  const ask = b2Asker(site, event);
+  const loc = (id: string) => { const n = ctx.getNodeById?.(id); return { filePath: n?.filePath ?? '', line: n?.startLine ?? 0 }; };
+  for (const d of dispatchers) for (const [h, registeredAt] of handlers) {
+    const mark = ask(d, h, () => ({ dispatcher: loc(d), handler: splitLoc(registeredAt) }));
+    if (mark) linkEvent(edges, seen, synthesizedBy, d, h, event, registeredAt, mark);
+  }
+}
+
+/** An edge whose handler a B1 override chose carries that decision (src/decision); one a B2 verdict made keeps its own. */
+function markB1(edges: readonly Edge[], picks: ReadonlyMap<string, number>): void {
+  if (picks.size === 0) return;
+  for (const e of edges) {
+    const meta = e.metadata!;
+    const p = picks.get(`${meta.event}>${e.target}`);
+    if (p !== undefined && meta.decision === undefined) Object.assign(meta, { decision: 'B1', decisionP: p });
+  }
 }
 
 /**
@@ -1745,7 +1805,9 @@ function jsxChild(
   ctx: ResolutionContext,
   name: string,
   file: string,
-  importsOf: () => Map<string, string>
+  importsOf: () => Map<string, string>,
+  // Decision point B1 (src/decision), only while deciding: tag name → the marker of the override that chose it.
+  b1Marks?: Map<string, Record<string, unknown>>
 ): Node | undefined {
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
   if (candidates.length === 0) {
@@ -1770,7 +1832,12 @@ function jsxChild(
     const imported = candidates.find((n) => n.filePath === from);
     if (imported) return imported;
   }
-  return candidates.find((n) => JSX_CHILD_LANGUAGES.includes(n.language)) ?? candidates[0];
+  const heuristic = candidates.find((n) => JSX_CHILD_LANGUAGES.includes(n.language)) ?? candidates[0];
+  if (!b1Marks) return heuristic;
+  const b1 = decideB1(`jsx:${file}:0:${name}`, { kind: 'jsx', name, filePath: file, line: 0 }, candidates, heuristic);
+  if (!b1) return heuristic;
+  if (b1.pick) b1Marks.set(name, { decision: 'B1', decisionP: b1.p });
+  return b1.pick ?? undefined;
 }
 
 /**
@@ -1835,6 +1902,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
+  const askB1 = deciding('B1');
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
     if ((++scannedFiles & 15) === 0) await onYield();
@@ -1861,6 +1929,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // argument or parameter lists name it (`opensTag`). `bare` holds the
     // names it also writes outside a tag (`writtenBare`).
     const tagsBySpan = new Map<string, { tags: Map<string, number>; bare: Set<string> }>();
+    const b1Marks = askB1 ? new Map<string, Record<string, unknown>>() : undefined; // the B1 key is per file and tag
     for (const parent of parents) {
       if (!parent.startLine || !parent.endLine) continue;
       const span = `${parent.startLine}:${parent.endLine}`;
@@ -1887,7 +1956,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
         if (!line) continue;
-        let child = jsxChild(ctx, name, file, importsOf);
+        let child = jsxChild(ctx, name, file, importsOf, b1Marks);
         // A name the parent binds itself by its first tag is that local.
         if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
           child = declaredInside(ctx, name, parent, child);
@@ -1899,7 +1968,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
         edges.push({
           source: parent.id, target: child.id, kind: 'calls', line: parent.startLine,
           provenance: 'heuristic',
-          metadata: { synthesizedBy: 'jsx-render', via: name },
+          metadata: { synthesizedBy: 'jsx-render', via: name, ...b1Marks?.get(name) },
         });
         added++;
       }
@@ -1927,6 +1996,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
   const seen = new Set<string>();
   const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
   const HANDLER_KINDS = new Set(['method', 'function']);
+  const askB1 = deciding('B1');
   // A composable's returned member may be a fn (`function close(){}`) or an
   // arrow assigned to a const (`const close = () => {}`).
   const RETURN_KINDS = new Set(['method', 'function', 'variable', 'constant']);
@@ -1975,18 +2045,28 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       edges.push({ source: comp.id, target: target.id, kind: 'calls', line: comp.startLine, provenance: 'heuristic', metadata: meta });
       added++;
     };
+    // Decision point B1 (src/decision): the marker of the override behind the latest resolve().
+    let b1Mark: Record<string, unknown> | undefined;
     // Prefer a target in THIS SFC (handlers live in the same file's script) —
     // avoids cross-file mis-match when a name repeats across a monorepo.
-    const resolve = (name: string, kinds: Set<string>): Node | undefined => {
+    // null: a B1 "none" verdict — no edge, and no fallback either.
+    const resolve = (name: string, kinds: Set<string>): Node | null | undefined => {
+      b1Mark = undefined;
       const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind));
-      return matches.find((n) => n.filePath === file) ?? matches[0];
+      const heuristic = matches.find((n) => n.filePath === file) ?? matches[0];
+      if (!askB1 || matches.length < 2) return heuristic;
+      const b1 = decideB1(`vue:${file}:0:${name}`, { kind: 'vue', name, filePath: file, line: 0 }, matches, heuristic);
+      if (!b1) return heuristic;
+      if (b1.pick) b1Mark = { decision: 'B1', decisionP: b1.p };
+      return b1.pick;
     };
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
     while ((m = VUE_KEBAB_RE.exec(tpl))) {
       const tag = kebabToPascal(m[1]!);
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+      const target = resolve(tag, COMPONENT_KINDS);
+      if (target !== null) addEdge(target ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1], ...b1Mark });
     }
     // PascalCase component tags. Try a direct name match first (flat components
     // and explicit registrations), then the Nuxt dir-prefixed auto-import name
@@ -1994,7 +2074,8 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     VUE_PASCAL_RE.lastIndex = 0;
     while ((m = VUE_PASCAL_RE.exec(tpl))) {
       const tag = m[1]!;
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+      const target = resolve(tag, COMPONENT_KINDS);
+      if (target !== null) addEdge(target ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag, ...b1Mark });
     }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
@@ -2009,7 +2090,8 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       const name = expr.match(/^([A-Za-z_$][\w$]*)\s*(?:\(|$)/)?.[1];
       if (!name) continue;
       const direct = name === expr ? resolve(name, HANDLER_KINDS) : undefined;
-      if (direct) { addEdge(direct, { synthesizedBy: 'vue-handler', event }); continue; }
+      if (direct === null) continue; // "none": not the composable path either
+      if (direct) { addEdge(direct, { synthesizedBy: 'vue-handler', event, ...b1Mark }); continue; }
       // Composable-destructure handler → resolve to the composable's returned fn.
       const d = destructured.get(name);
       if (!d) continue;
@@ -2021,7 +2103,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       const keyFn = composable
         ? ctx.getNodesByName(d.key).find((n) => RETURN_KINDS.has(n.kind) && n.filePath === composable.filePath)
         : undefined;
-      if (keyFn) addEdge(keyFn, { synthesizedBy: 'vue-handler', event, via: d.composable });
+      if (keyFn) addEdge(keyFn, { synthesizedBy: 'vue-handler', event, via: d.composable, ...b1Mark });
     }
   }
   return edges;
@@ -2154,6 +2236,8 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
   // the listener) keyed by event name.
   const nativeDispatchersByEvent = new Map<string, Set<string>>();
   const jsHandlersByEvent = new Map<string, Map<string, string>>();
+  const b1Picks = new Map<string, number>(); // `${event}>${handler id}` → p of the B1 override that chose it
+  const askB1 = deciding('B1');
 
   for (const file of ctx.getAllFiles()) {
     if ((++scannedFiles & 15) === 0) await onYield();
@@ -2261,6 +2345,16 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
           .getNodesByName(bareName)
           .find((n) => n.kind === 'function' || n.kind === 'method');
         let targetId: string | null = namedHandler?.id ?? null;
+        const rnCands = askB1 && bareName ? ctx.getNodesByName(bareName).filter((n) => n.kind === 'function' || n.kind === 'method') : undefined;
+        if (rnCands && rnCands.length > 1) {
+          const at = lineOf(m.index);
+          const b1 = decideB1(`rn:${file}:${at}:${bareName}`, { kind: 'rn', name: event, filePath: file, line: at }, rnCands, namedHandler);
+          if (b1) {
+            if (!b1.pick) continue; // "none": no edge, not even the enclosing-function fallback below
+            targetId = b1.pick.id;
+            b1Picks.set(`${event}>${targetId}`, b1.p);
+          }
+        }
         if (!targetId) {
           // Fall back to the enclosing function — the subscribe-wrapper
           // pattern means the event fires THROUGH this function on its
@@ -2331,29 +2425,22 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const askB2 = deciding('B2');
   for (const [event, dispatchers] of nativeDispatchersByEvent) {
     const handlers = jsHandlersByEvent.get(event);
     if (!handlers) continue;
     // Same fan-out guard as the in-language channel: generic event names
     // (e.g. 'change', 'error', 'data') with many handlers/dispatchers
     // can't be matched precisely without receiver-type info.
-    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) continue;
+    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) {
+      if (askB2) linkOverCap(ctx, edges, seen, 'rn', 'rn-event-channel', event, dispatchers, handlers);
+      continue;
+    }
     for (const d of dispatchers) {
-      for (const [h, registeredAt] of handlers) {
-        if (d === h) continue;
-        const key = `${d}>${h}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        edges.push({
-          source: d,
-          target: h,
-          kind: 'calls',
-          provenance: 'heuristic',
-          metadata: { synthesizedBy: 'rn-event-channel', event, registeredAt },
-        });
-      }
+      for (const [h, registeredAt] of handlers) linkEvent(edges, seen, 'rn-event-channel', d, h, event, registeredAt);
     }
   }
+  markB1(edges, b1Picks);
   return edges;
 }
 
@@ -2742,13 +2829,17 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
   // 3. Link each dispatcher → each registered handler node (dedup, capped).
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const askB1 = deciding('B1');
   for (const disp of dispatchers) {
     let added = 0;
     for (const [name, registeredAt] of registered) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-      const handler = ctx.getNodesByName(name).find(
+      let handler = ctx.getNodesByName(name).find(
         (n) => (n.kind === 'function' || n.kind === 'method') && n.language === 'go'
       );
+      const ginCands = askB1 ? ctx.getNodesByName(name).filter((n) => (n.kind === 'function' || n.kind === 'method') && n.language === 'go') : undefined;
+      const b1 = ginCands && ginCands.length > 1 ? decideB1(`gin:${name}`, { kind: 'gin', name, ...splitLoc(registeredAt) }, ginCands, handler) : undefined;
+      if (b1) handler = b1.pick ?? undefined;
       if (!handler || handler.id === disp.id) continue;
       const key = `${disp.id}>${handler.id}`;
       if (seen.has(key)) continue;
@@ -2756,7 +2847,7 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
       edges.push({
         source: disp.id, target: handler.id, kind: 'calls', line: disp.startLine,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'gin-middleware-chain', via: name, registeredAt },
+        metadata: { synthesizedBy: 'gin-middleware-chain', via: name, registeredAt, ...(b1 ? { decision: 'B1', decisionP: b1.p } : {}) },
       });
       added++;
     }
@@ -2873,6 +2964,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const askB1 = deciding('B1');
   for (const node of queries.iterateNodesByKind('constant')) {
     if ((++scanned255 & 63) === 0) await onYield();
     // Cheap gate: the initializer (captured in `signature`) must be a create(Async)Thunk call —
@@ -2898,11 +2990,13 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
       const cands = ctx
         .getNodesByName(name)
         .filter((n) => n.kind === 'constant' || n.kind === 'function' || n.kind === 'method');
-      const target =
+      let target =
         cands.find((n) => !!n.signature && THUNK_DECL_RE.test(n.signature)) ??
         cands.find((n) => n.kind === 'constant') ??
         cands.find((n) => n.filePath === node.filePath) ??
         cands[0];
+      const b1 = askB1 && cands.length > 1 ? decideB1(`thunk:${node.id}:${name}`, { kind: 'thunk', name, filePath: node.filePath, line: node.startLine }, cands, target) : undefined;
+      if (b1) target = b1.pick ?? undefined;
       if (!target || target.id === node.id) continue;
       const key = `${node.id}>${target.id}`;
       if (seen.has(key)) continue;
@@ -2914,7 +3008,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
         kind: 'calls',
         line,
         provenance: 'heuristic',
-        metadata: { synthesizedBy: 'redux-thunk', via: name, registeredAt: `${node.filePath}:${line}` },
+        metadata: { synthesizedBy: 'redux-thunk', via: name, registeredAt: `${node.filePath}:${line}`, ...(b1 ? { decision: 'B1', decisionP: b1.p } : {}) },
       });
       added++;
     }
@@ -3003,6 +3097,32 @@ function registryEntryNames(body: string): string[] {
   return names;
 }
 
+/** A registered handler's callable entry: a class's `execute`-like method (preferring the
+ *  method chained at the dispatch site), else the class; any other node is its own entry. */
+function registryEntry(ctx: ResolutionContext, node: Node, chained: string | null): Node {
+  if (node.kind !== 'class' && node.kind !== 'struct') return node;
+  const methods = ctx
+    .getNodesInFile(node.filePath)
+    .filter((n) => n.kind === 'method' && n.startLine >= node.startLine && n.startLine <= (node.endLine ?? node.startLine));
+  const want = chained && REGISTRY_CLASS_ENTRY.has(chained) ? chained : null;
+  const entry =
+    (want && methods.find((m) => m.name === want)) ||
+    methods.find((m) => REGISTRY_CLASS_ENTRY.has(m.name)) ||
+    methods.find((m) => m.name === 'constructor');
+  return entry ?? node;
+}
+
+/** Decision point B1's candidates for a registered name: the callable entry of every same-named function, class or method. */
+function registryEntries(ctx: ResolutionContext, name: string, chained: string | null): Node[] {
+  const entries = new Map<string, Node>();
+  for (const n of ctx.getNodesByName(name)) {
+    if (n.kind !== 'function' && n.kind !== 'method' && n.kind !== 'class' && n.kind !== 'struct') continue;
+    const e = registryEntry(ctx, n, chained);
+    entries.set(e.id, e);
+  }
+  return [...entries.values()];
+}
+
 /** Resolve a registered handler name to its callable entry: a function value, or a class's
  *  `execute`-like method (preferring the method chained at the dispatch site), else the class. */
 function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: string | null): Node | null {
@@ -3010,17 +3130,7 @@ function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: s
   const fn = cands.find((n) => n.kind === 'function');
   if (fn) return fn;
   const cls = cands.find((n) => n.kind === 'class' || n.kind === 'struct');
-  if (cls) {
-    const methods = ctx
-      .getNodesInFile(cls.filePath)
-      .filter((n) => n.kind === 'method' && n.startLine >= cls.startLine && n.startLine <= (cls.endLine ?? cls.startLine));
-    const want = chained && REGISTRY_CLASS_ENTRY.has(chained) ? chained : null;
-    const entry =
-      (want && methods.find((m) => m.name === want)) ||
-      methods.find((m) => REGISTRY_CLASS_ENTRY.has(m.name)) ||
-      methods.find((m) => m.name === 'constructor');
-    return entry ?? cls;
-  }
+  if (cls) return registryEntry(ctx, cls, chained);
   // Require a CALLABLE target — a registry dispatched as `reg[k](…)` invokes a function/
   // method, never a data `constant` (dropping it removes false positives like a `{ x: URL }`
   // entry resolving to the global URL constant).
@@ -3031,6 +3141,7 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
   let scannedFiles = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const askB1 = deciding('B1');
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
     if ((++scannedFiles & 15) === 0) await onYield();
@@ -3087,7 +3198,12 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
       let added = 0;
       for (const name of reg.names) {
         if (added >= REGISTRY_FANOUT_CAP) break;
-        const target = resolveRegistryHandler(ctx, name, d.chained);
+        let target = resolveRegistryHandler(ctx, name, d.chained);
+        const entries = askB1 ? registryEntries(ctx, name, d.chained) : undefined;
+        const b1 = entries && entries.length > 1
+          ? decideB1(`registry:${file}:${reg.line}:${name}`, { kind: 'registry', name, filePath: file, line: reg.line }, entries, target)
+          : undefined;
+        if (b1) target = b1.pick;
         if (!target || target.id === disp.id) continue;
         const key = `${disp.id}>${target.id}`;
         if (seen.has(key)) continue;
@@ -3098,7 +3214,7 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
           kind: 'calls',
           line: d.line,
           provenance: 'heuristic',
-          metadata: { synthesizedBy: 'object-registry', via: name, registeredAt: `${file}:${reg.line}` },
+          metadata: { synthesizedBy: 'object-registry', via: name, registeredAt: `${file}:${reg.line}`, ...(b1 ? { decision: 'B1', decisionP: b1.p } : {}) },
         });
         added++;
       }

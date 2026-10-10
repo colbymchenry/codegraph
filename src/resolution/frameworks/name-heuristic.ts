@@ -13,6 +13,8 @@
 import { Node } from '../../types';
 import { UnresolvedRef, ResolutionContext } from '../types';
 import { isLexicallyReachable, isVisibleAcrossFiles } from '../name-matcher';
+import { decideB1, deciding, refKey } from '../../decision/record';
+import { noteApplied, vetoReference } from '../../decision/overrides';
 
 /** Node kinds a nested type can be declared in. */
 const TYPE_OWNER_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'trait', 'protocol', 'record']);
@@ -61,7 +63,15 @@ export function pickByNameAndKind(
     const sameDir = candidates.find((n) => n.filePath.startsWith(dir) && !n.filePath.slice(dir.length).includes('/'));
     if (sameDir) return sameDir.id;
   }
-  return (candidates.find((n) => inPreferredDir(n.filePath)) ?? candidates[0]!).id;
+  const heuristic = candidates.find((n) => inPreferredDir(n.filePath)) ?? candidates[0]!;
+  if (candidates.length < 2 || !deciding('B1')) return heuristic.id;
+  const key = refKey(ref);
+  const b1 = decideB1(`name-heuristic:${key}`, { kind: 'name-heuristic', name: ref.referenceName, filePath: ref.filePath, line: ref.line }, candidates, heuristic);
+  if (!b1) return heuristic.id;
+  // "None" ends the reference: no later strategy may link it.
+  if (!b1.pick) { vetoReference(key); return null; }
+  noteApplied(key, { pick: b1.pick.id, p: b1.p }); // the resolver loop stamps the decision on this answer
+  return b1.pick.id;
 }
 
 /** Whether a node is declared inside a type of its own file. */

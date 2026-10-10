@@ -39,6 +39,20 @@ export default defineConfig({
        * they inject their own `env` via the Telemetry constructor.
        */
       CODEGRAPH_TELEMETRY: '0',
+      // Decision settings must never inherit the contributor's shell configuration.
+      CODEGRAPH_DECISIONS: '',
+      CODEGRAPH_DECISION_POINTS: '',
+      CODEGRAPH_DECISION_RECORD: '',
+      CODEGRAPH_DECISION_OVERRIDES: '',
+      CODEGRAPH_DECISION_LEDGER: '',
+      CODEGRAPH_DECISION_CACHE: '',
+      CODEGRAPH_DECISION_FLOORS: '',
+      CODEGRAPH_DECISION_ALLOW_REMOTE_PROMPTS: '',
+      CODEGRAPH_DECISIONS_URL: '',
+      CODEGRAPH_DECISIONS_MODEL: '',
+      CODEGRAPH_CF_FREE_DAY: '',
+      CODEGRAPH_CF_FREE_NEURONS: '',
+      CODEGRAPH_CF_USAGE_DB: '',
     },
     /**
      * The same V8 flags every real launch path passes (the bundled launcher,

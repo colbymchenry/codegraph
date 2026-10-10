@@ -214,6 +214,11 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
   return [...tokens];
 }
 
+/** Whether a query is ABOUT tests. Whole words only: `latest`, `inspect`, `specific` are not. */
+export function isTestIntentQuery(query: string): boolean {
+  return /\b(?:tests?|testing|specs?|verify|verifies)\b/i.test(query);
+}
+
 /**
  * Score path relevance to a query
  * Higher score = more relevant path
@@ -274,9 +279,7 @@ export function scorePathRelevance(
   //    standing statement by the project, so it is NOT waived. The name-bonus
   //    damping at the call site is what keeps such a tree findable.
   //  - a path that is both is docked ONCE, not twice.
-  const queryLower = query.toLowerCase();
-  const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
-  const offTarget = (!isTestQuery && isTestFile(filePath)) || isDeprioritized === true;
+  const offTarget = (!isTestIntentQuery(query) && isTestFile(filePath)) || isDeprioritized === true;
   if (offTarget) {
     score -= 15;
   }

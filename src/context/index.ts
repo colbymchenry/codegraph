@@ -25,7 +25,7 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { isTestFile, isTestIntentQuery, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
@@ -173,7 +173,7 @@ const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
 /**
  * Default options for finding relevant context
  */
-const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
+const DEFAULT_FIND_OPTIONS: Required<Omit<FindRelevantContextOptions, 'rerank' | 'testIntent'>> = {
   searchLimit: 3,        // Reduced from 5
   traversalDepth: 1,     // Reduced from 2
   maxNodes: 20,          // Reduced from 50
@@ -710,8 +710,7 @@ export class ContextBuilder {
       }
     }
 
-    const queryLower = query.toLowerCase();
-    const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
+    const isTestQuery = opts.testIntent ?? isTestIntentQuery(query);
 
     // Deprioritize test files early so they don't take multi-term boost slots
     if (!isTestQuery) {
@@ -1068,6 +1067,10 @@ export class ContextBuilder {
     // With 36 entry points and maxNodes=120, each gets only 3 nodes — useless.
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
     if (filteredResults.length > opts.searchLimit) {
+      if (opts.rerank) {
+        const pool = filteredResults.slice(0, Math.max(24, opts.searchLimit));
+        filteredResults = await opts.rerank(query, pool, opts.searchLimit) ?? filteredResults;
+      }
       filteredResults = filteredResults.slice(0, opts.searchLimit);
     }
 

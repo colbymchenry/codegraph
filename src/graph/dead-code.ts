@@ -350,6 +350,8 @@ export interface DeadCodeEntry {
    * is reachable from outside the index by definition.
    */
   exported: boolean;
+  /** CODEGRAPH_DEADCODE_KEEP_UNKNOWN_EXPORTS=1: the language records no exports, so this may be public surface. */
+  exportsUnknown?: boolean;
 }
 
 /** How many candidates each rule removed, in the order the rules ran. */
@@ -463,6 +465,8 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
   const limit = Math.max(1, query.limit ?? 200);
   const readSource =
     query.readSource === undefined ? defaultSourceReader(cg) : query.readSource;
+  const keepUnknownExports = process.env.CODEGRAPH_DEADCODE_KEEP_UNKNOWN_EXPORTS === '1';
+  const unknownExport = new Set<string>();
 
   const excluded: DeadCodeExclusions = {
     tests: 0,
@@ -514,8 +518,11 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
       continue;
     }
     if (!includeExported && !languagesWithExports.has(node.language)) {
-      excluded.exportsUnknown += 1;
-      continue;
+      if (!keepUnknownExports) {
+        excluded.exportsUnknown += 1;
+        continue;
+      }
+      unknownExport.add(node.id);
     }
     if (node.isAbstract) {
       excluded.declarations += 1;
@@ -665,6 +672,7 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
       members: [],
       lines: Math.max(1, row.node.endLine - row.node.startLine + 1),
       exported: row.node.isExported === true,
+      ...(unknownExport.has(row.node.id) ? { exportsUnknown: true } : {}),
     });
   }
   for (const member of pending) {

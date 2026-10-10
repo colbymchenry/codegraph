@@ -8,7 +8,9 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 ### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and GitHub Copilot with Semantic Code Intelligence
 
-**The fastest complete code graph · surgical context · built for how agents actually work · 100% local**
+**The fastest complete code graph · surgical context · built for how agents actually work · local by default**
+
+Optional [JEV / hosted Clef decision modes](docs/decision-eval/model-modes/README.md) add model-assisted decisions with automatic free-allowance checks. The guide covers benchmark results, remote-data opt-in, API permissions, and a shared `.env` setup.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/rust-logo-dark.svg?v=1">
