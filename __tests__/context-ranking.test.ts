@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
-import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
+import { isDistinctiveIdentifier, nameMatchBonus, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
 
 describe('isDistinctiveIdentifier', () => {
   it('treats plain dictionary words as non-distinctive', () => {
@@ -36,6 +36,13 @@ describe('isDistinctiveIdentifier', () => {
     expect(isDistinctiveIdentifier('user_store')).toBe(true);
     expect(isDistinctiveIdentifier('REST')).toBe(true);
     expect(isDistinctiveIdentifier('v2')).toBe(true);
+  });
+});
+
+describe('nameMatchBonus', () => {
+  it('does not award a name match bonus for empty or whitespace-only queries', () => {
+    expect(nameMatchBonus('Anything', '')).toBe(0);
+    expect(nameMatchBonus('Anything', '   \n\t  ')).toBe(0);
   });
 });
 
