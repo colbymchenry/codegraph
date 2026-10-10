@@ -379,6 +379,16 @@ export interface FrameworkResolver {
    * calls this describes back for its resolution sweep.
    */
   navigation?: NavigationCalls;
+  /**
+   * The modules whose content `resolve()` reads to answer `ref`, a route
+   * node's reference — none for most. A React route that renders a same-file
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to the component
+   * that module exports, through any barrel that forwards it, and to the
+   * declaration while the module is missing or exports none: the answer
+   * changes with those files although no name the reference carries does, so
+   * a sync that adds or changes one of them resolves the reference again.
+   */
+  lazyModules?(ref: UnresolvedRef, context: ResolutionContext): readonly string[];
 }
 
 /**
