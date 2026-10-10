@@ -294,6 +294,49 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('project directory removed while watched', () => {
+    // On Windows a recursive watch on a deleted directory never ends: it re-reports the removal
+    // over 100,000 times a second (Node 25), which held a core until the process exited. The
+    // watcher must notice its root is gone and degrade, which closes the stream. Recursive
+    // watching is the macOS / Windows path; Linux's per-directory watches go silent instead.
+    it.runIf(process.platform === 'darwin' || process.platform === 'win32')(
+      'degrades once and closes the stream when the project root is deleted',
+      async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-rootgone-'));
+        const onDegraded = vi.fn();
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        let listener: ((event: string, filename: string | null) => void) | undefined;
+        let closed = 0;
+        const fakeWatcher = {
+          on: () => fakeWatcher,
+          close: () => {
+            closed += 1;
+          },
+        } as unknown as fs.FSWatcher;
+        __setFsWatchForTests(((_root: string, _opts: unknown, l: (e: string, f: string | null) => void) => {
+          listener = l;
+          return fakeWatcher;
+        }) as unknown as typeof fs.watch);
+        const watcher = new FileWatcher(
+          dir,
+          vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 }),
+          { debounceMs: 100, onDegraded }
+        );
+        unitWatchers.add(watcher);
+
+        expect(watcher.start()).toBe(true);
+        fs.rmSync(dir, { recursive: true, force: true });
+        for (let i = 0; i < 50; i++) listener?.('rename', 'src'); // the storm a deleted root sends
+        await new Promise((r) => setTimeout(r, 1200));
+
+        expect(watcher.isDegraded()).toBe(true);
+        expect(watcher.getDegradedReason()).toContain('removed');
+        expect(onDegraded).toHaveBeenCalledTimes(1);
+        expect(closed).toBe(1);
+      }
+    );
+  });
+
   describe('lock contention degradation (#876)', () => {
     it('disables auto-sync after prolonged lock contention, with bounded retries', async () => {
       const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
