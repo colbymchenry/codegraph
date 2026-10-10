@@ -1775,8 +1775,15 @@ export function resolvePhpQualifiedClassRef(
   if (separator === 0) {
     fqn = name.slice(1);
   } else {
-    const head = name.slice(0, separator);
-    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === head);
+    // PHP matches a namespace alias without regard to case.
+    const head = name.slice(0, separator).toLowerCase();
+    const imports = context.getImportMappings(ref.filePath, ref.language).filter((i) => i.localName.toLowerCase() === head);
+    // The use map is file-wide: when two `namespace { }` blocks bind the alias
+    // to different namespaces, it has no single meaning here, so don't guess.
+    if (new Set(imports.map((i) => i.source.replace(/^\\/, '').toLowerCase())).size > 1) {
+      return ref.referenceKind === 'references' ? undefined : null;
+    }
+    const imp = imports[0];
     if (imp) {
       fqn = imp.source.replace(/^\\/, '') + name.slice(separator);
     } else {
