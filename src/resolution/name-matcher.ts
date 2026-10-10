@@ -306,8 +306,11 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
   }
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
-    const decl: { raw?: string } = {};
+    const decl: GoReceiverDecl = {};
     const type = inferLocalReceiverType(receiver, ref, context, decl);
+    if (decl.asserted !== undefined) {
+      return decl.asserted && resolveMethodOnType(decl.asserted.name, member, ref, context, 0.9, 'function-ref', decl.asserted.dir);
+    }
     if (type) {
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
         goDeclaredTypePackage(decl.raw, ref.filePath, context));
@@ -9887,6 +9890,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GO_EMBEDS.delete(context);
   GO_ALIAS_TARGETS.delete(context);
   GO_DOT_IMPORTS.delete(context);
+  GO_ASSERTION_BINDINGS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -10486,9 +10490,10 @@ function inferLocalReceiverType(
    * Receives the found type as the declaration spells it, before the
    * normalization the return value gets: Go's package qualifier (`pkg.Type`
    * vs a bare `server`) says which package declares it. Set on the
-   * incremental-scan path only, the one every Go receiver takes.
+   * incremental-scan path, the one every Go receiver takes, and with
+   * `asserted` for a Go local bound from a type assertion (GoReceiverDecl).
    */
-  decl?: { raw?: string },
+  decl?: GoReceiverDecl,
 ): string | null {
   // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
   // field whose assignment or `property` declaration usually lives outside the
@@ -10525,6 +10530,21 @@ function inferLocalReceiverType(
       scanReceiver = scoped[1]!;
       componentScoped = true;
       phpProperty = true;
+    }
+  }
+  // A Go local bound from a type assertion (`f, ok := w.(http.Flusher)`) has
+  // the asserted type. The patterns below read no assertion, and scan lines
+  // with no block scope: an `if` header's `f` would type a loop's `f` below it.
+  // A type goWrittenType can't tell leaves the local to them and to name
+  // matching, as before: grpc-go's `ci.GetCommonAuthInfo()`, through an
+  // interface its function declares, reaches the one method of that name.
+  if (ref.language === 'go' && decl) {
+    const written = goAssertedLocalType(scanReceiver, ref, context);
+    const asserted = written === undefined ? undefined : goWrittenType(written, ref, context);
+    if (asserted !== undefined) {
+      decl.raw = written;
+      decl.asserted = asserted;
+      return normalizeInferredTypeName(written!) ?? written!;
     }
   }
 
@@ -10998,7 +11018,7 @@ export function matchMethodCall(
         matchVbTypedCall(objectOrClass!, methodName!, ref, context, (name) => isStdMethodName('vbnet', name)));
       if (typed !== undefined) return typed;
     }
-    const decl: { raw?: string } = {};
+    const decl: GoReceiverDecl = {};
     const cppDecl: CppReceiverDeclaration = {};
     let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
@@ -11037,6 +11057,12 @@ export function matchMethodCall(
       inferredType = awaited.name;
     }
     if (inferredType) {
+      // A Go local bound from a type assertion calls a method of the type Go
+      // finds for it, or nothing the project declares: `flusher.Flush()` after
+      // `flusher, ok := w.(http.Flusher)` went to a project type named after it.
+      if (decl.asserted !== undefined) {
+        return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
+      }
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323).
       // Other languages disambiguate by call-site file.
@@ -11740,30 +11766,132 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  * column where its receiver expression starts, and name matching took any
  * method of that name: every gRPC handler etcd generates went to the
  * `UnimplementedKVServer` stub beside the `KVServer` interface. The type is
- * the one Go finds: in the call's own package or a package it dot-imports for
- * a bare name, in the imported package for a qualified one, and an alias is
- * the type it names. A type found in none — one from outside the project
- * (`http.Flusher`), a predeclared one (`error`) — an alias of such a type, or
- * a type literal (`interface{ Flush() }`) links nothing.
- * Undefined when the call is not made through an assertion.
+ * the one Go finds (goWrittenType). Through any other the call links
+ * nothing, even one goWrittenType can't tell: a bare name gives name matching
+ * no receiver to go on. Undefined when the call is not made through an
+ * assertion.
  */
 export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
   const asserted = goAssertedType(ref, context);
   if (asserted === undefined) return undefined;
+  const type = goWrittenType(asserted, ref, context);
+  return type ? resolveMethodOnType(type.name, ref.referenceName, ref, context, 0.9, 'instance-method', type.dir) : null;
+}
+
+/**
+ * The project type a Go type written at `ref` names — `KVServer`, `*pipe`,
+ * `storage.Store`, `*List[int]` — with the directory of the package that
+ * declares it, found where Go finds it: in the file's own package or a
+ * package it dot-imports for a bare name, in the imported package for a
+ * qualified one. Null for a type found in none — one from outside the
+ * project (`http.Flusher`), a predeclared one (`error`) or an alias of such a
+ * type: none has a method the project declares. Undefined for one it can't
+ * tell: a type literal (`interface{ Flush() }`), a name no package of the
+ * project declares (a type declared inside a function, a type parameter), a
+ * type the imported project package doesn't hold.
+ */
+function goWrittenType(written: string, ref: UnresolvedRef, context: ResolutionContext): GoProjectType | null | undefined {
   // `KVServer`, `*pipe`, `storage.Store`, `*List[int]`: anything else is a type literal.
-  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(asserted);
-  if (!type) return null;
-  const [, qualifier, typeName] = type;
-  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(typeName!, dir, context).length > 0;
-  const dir = qualifier !== undefined
-    ? goImportPackageDir(qualifier, ref.filePath, context)
-    : [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
-  if (!declares(dir)) return null;
+  const type = /^\*?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[\s\S]*\])?$/.exec(written);
+  if (!type) return undefined;
+  const [, qualifier, name] = type;
+  const declares = (dir: string | null | undefined): dir is string => !!dir && goPackageTypes(name!, dir, context).length > 0;
+  let dir: string | null | undefined;
+  if (qualifier !== undefined) {
+    dir = goImportPackageDir(qualifier, ref.filePath, context);
+    if (!dir) return null;
+    if (!declares(dir)) return undefined;
+  } else {
+    dir = [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
+    if (!dir) return GO_BUILTIN_FIELD_TYPES.has(name!) ? null : undefined;
+  }
   // An alias of a type from outside the project (`type Ctx = context.Context`)
   // has that type's methods, none the project declares.
-  if (goPackageTypes(typeName!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
-  return resolveMethodOnType(typeName!, ref.referenceName, ref, context, 0.9, 'instance-method', dir);
+  if (goPackageTypes(name!, dir, context).every((t) => goAliasTarget(t, context) === null)) return null;
+  return { name: name!, dir };
+}
+
+/** A Go type the project declares, with the directory of its package. */
+interface GoProjectType {
+  name: string;
+  dir: string;
+}
+
+/**
+ * What inferLocalReceiverType tells its caller besides the type: the type as
+ * the declaration spells it (`raw`), and for a Go local bound from a type
+ * assertion, the type goWrittenType finds for it (`asserted`; null for one
+ * with no method the project declares). `asserted` is unset when the local
+ * is declared some other way, or goWrittenType can't tell its type.
+ */
+interface GoReceiverDecl {
+  raw?: string;
+  asserted?: GoProjectType | null;
+}
+
+const GO_ASSERTION_BINDINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * The type a Go local was asserted to, as written (`http.Flusher`,
+ * `*Wrapper`, `storage.Store`), when the declaration of `name` in scope at
+ * `ref` binds the value of a type assertion: `f, ok := w.(http.Flusher)` in
+ * an `if` header, `wr := v.(*Wrapper)`, `var st, _ = v.(storage.Store)`. The
+ * scope reader says which declaration that is, so an `if` header's binding
+ * does not reach a later variable of the name, one in a block that has ended
+ * does not hide it, and a comment declares nothing. Undefined when the name
+ * in scope is declared some other way: a parameter, a type switch's
+ * variable, a value that only starts with an assertion (`x.(T).field`).
+ */
+function goAssertedLocalType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!goAssertionBindings(ref.filePath, context).has(name)) return undefined;
+  const decl = goLocalDecl(name, ref, context);
+  const code = decl && decl.kind !== 'param' ? goScopeIndex(ref.filePath, context)?.code : undefined;
+  if (!decl || code === undefined) return undefined;
+  // The asserted value goes to the first name of `v, ok := x.(T)`.
+  if (/,[ \t]*$/.test(code.slice(code.lastIndexOf('\n', decl.at - 1) + 1, decl.at))) return undefined;
+  const head = /[A-Za-z_]\w*[ \t]*(?:,[ \t]*[A-Za-z_]\w*[ \t]*)?:?=(?!=)[ \t]*/y;
+  head.lastIndex = decl.at;
+  if (!head.exec(code)) return undefined;
+  const end = { at: 0 };
+  const links = goChainLinks(code, head.lastIndex, end);
+  const last = links[links.length - 1];
+  // The assertion is the whole value: nothing follows it, not even another
+  // value (`a, b := x.(T), y`).
+  if (links.length < 2 || last!.kind !== 'assert' || last!.text === 'type' || !/^(?:[;\r\n]|$)/.test(code.slice(end.at, end.at + 1))) {
+    return undefined;
+  }
+  return last!.text;
+}
+
+/**
+ * Whether `name` at `ref` is a Go local bound from a type assertion whose
+ * type goWrittenType can tell, so that the call through it is that type's to
+ * resolve: after `parser, ok := b.(balancer.ConfigParser)`, `parser` is not
+ * the standard library's package.
+ */
+export function isGoAssertedLocal(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const written = goAssertedLocalType(name, ref, context);
+  return written !== undefined && goWrittenType(written, ref, context) !== undefined;
+}
+
+/**
+ * The names a Go file may bind from a type assertion — the first name before
+ * each `:=` or `=` on a line that asserts a type — so that only calls through
+ * those names read the file's scopes.
+ */
+function goAssertionBindings(filePath: string, context: ResolutionContext): Set<string> {
+  let memo = GO_ASSERTION_BINDINGS.get(context);
+  if (!memo) GO_ASSERTION_BINDINGS.set(context, (memo = new Map()));
+  let names = memo.get(filePath);
+  if (names) return names;
+  names = new Set();
+  for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
+    if (!line.includes('.(') || line.length > 10_000) continue;
+    for (const m of line.matchAll(/(?:^|[^\w.])([A-Za-z_]\w*)\s*(?:,\s*[A-Za-z_]\w*\s*)?:?=(?!=)/g)) names.add(m[1]!);
+  }
+  memo.set(filePath, names);
+  return names;
 }
 
 /** How many lines past a Go call's first its chain is read on. */
@@ -11804,9 +11932,9 @@ interface GoChainLink {
  * The links of the Go expression that starts at `start`: its operand (a name
  * or a parenthesized expression), then each selector, type assertion, call
  * and index. A line break ends it, except right after a `.`, where Go
- * inserts no semicolon.
+ * inserts no semicolon. `end.at` receives the offset reading stopped at.
  */
-function goChainLinks(text: string, start: number): GoChainLink[] {
+function goChainLinks(text: string, start: number, end?: { at: number }): GoChainLink[] {
   const links: GoChainLink[] = [];
   const NAME = /[A-Za-z_]\w*/y;
   let i = start;
@@ -11824,7 +11952,10 @@ function goChainLinks(text: string, start: number): GoChainLink[] {
     return inner;
   };
   const operand = text[i] === '(' ? group() : name();
-  if (operand === null) return links;
+  if (operand === null) {
+    if (end) end.at = i;
+    return links;
+  }
   links.push({ kind: 'operand', text: operand });
   for (;;) {
     while (text[i] === ' ' || text[i] === '\t') i++;
@@ -11842,6 +11973,7 @@ function goChainLinks(text: string, start: number): GoChainLink[] {
       if (group() === null) break;
     } else break;
   }
+  if (end) end.at = i;
   return links;
 }
 
@@ -11920,14 +12052,18 @@ function matchGoFieldChainCall(
   if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
   const [base, field] = segs;
 
-  const decl: { raw?: string } = {};
+  const decl: GoReceiverDecl = {};
   const baseType = inferLocalReceiverType(base!, ref, context, decl);
   if (!baseType) return null;
+  // A base bound from a type assertion has the type Go finds for it, or one
+  // whose fields the project doesn't declare.
+  const asserted = decl.asserted;
+  if (asserted === null) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
 
-  let structs = context.getNodesByName(baseType).filter(
+  let structs = context.getNodesByName(asserted?.name ?? baseType).filter(
     (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
   );
   // The struct the declaring package has is the one the base's type means (a
@@ -11935,9 +12071,9 @@ function matchGoFieldChainCall(
   // names repeat across packages — harbor has a `daoTestSuite` in every DAO
   // package — and another package's same-named struct with a same-named
   // field is not this one (#2323).
-  const basePkg = goDeclaredTypePackage(decl.raw, ref.filePath, context);
+  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, ref.filePath, context);
   const declared = structs.filter((n) => goPackageDir(n.filePath) === basePkg);
-  if (declared.length > 0) structs = declared;
+  if (declared.length > 0 || asserted) structs = declared;
   structs = preferCallSiteFile(structs, ref.filePath);
   for (const s of structs) {
     const source = context.readFile(s.filePath);
