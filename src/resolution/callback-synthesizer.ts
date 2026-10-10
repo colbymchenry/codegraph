@@ -116,9 +116,30 @@ function nuxtComponentName(filePath: string): string | null {
   return out.join('');
 }
 
+// Passes call sliceLines once per node, so splitting the whole file each
+// time is quadratic in a file's node count. Keep the last file's lines.
+let sliceLinesSource: string | null = null;
+let sliceLinesSplit: string[] = [];
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
-  return content.split('\n').slice(startLine - 1, endLine).join('\n');
+  if (content !== sliceLinesSource) {
+    sliceLinesSource = content;
+    sliceLinesSplit = content.split('\n');
+  }
+  return sliceLinesSplit.slice(startLine - 1, endLine).join('\n');
+}
+
+// `src.slice(0, idx).split('\n').length` per match is quadratic in a file's
+// match count. The newline index is built once per text, and the last text's
+// index is kept.
+let lineOfSource: string | null = null;
+let lineOfIndex: (idx: number) => number = () => 1;
+function lineOf(src: string, idx: number): number {
+  if (src !== lineOfSource) {
+    lineOfSource = src;
+    lineOfIndex = makeLineAt(src, 1);
+  }
+  return lineOfIndex(idx);
 }
 
 function registrarField(src: string): string | null {
@@ -593,7 +614,7 @@ async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = ARKUI_EMITTER_CALL_RE.exec(safe))) {
       const verb = m[1]!;
       const arg = m[2]!.trim();
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -697,7 +718,7 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     let m: RegExpExecArray | null;
     while ((m = ARKUI_ROUTER_RE.exec(safe))) {
       const url = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -2730,7 +2751,7 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
       const parenIdx = m.index + m[0].length - 1;
       const argStr = goBalancedArgs(safe, parenIdx);
       if (!argStr) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       for (const arg of goSplitArgs(argStr)) {
         const name = goHandlerIdent(arg);
         if (name && !registered.has(name)) registered.set(name, `${file}:${line}`);
@@ -2907,7 +2928,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
       const key = `${node.id}>${target.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const line = node.startLine + safe.slice(0, m.index).split('\n').length - 1;
+      const line = node.startLine + lineOf(safe, m.index) - 1;
       edges.push({
         source: node.id,
         target: target.id,
@@ -3225,7 +3246,7 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
       const storeFile = varStore.get(cm[1]!);
       if (!storeFile) continue;
       const method = cm[2]!;
-      const line = safe.slice(0, cm.index).split('\n').length;
+      const line = lineOf(safe, cm.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallbackDispatcher;
       if (!disp) continue;
       const target = ctx
@@ -3317,7 +3338,7 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     let added = 0;
     while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
       const key = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallback;
       if (!disp) continue;
       const target = resolve(key, file);
@@ -3413,7 +3434,7 @@ async function celeryDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield):
     let added = 0;
     while ((m = CELERY_DISPATCH_RE.exec(safe)) && added < CELERY_FANOUT_CAP) {
       const name = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue; // module-level dispatch — no source symbol to attribute
       const target = resolve(name, file);
@@ -3535,7 +3556,7 @@ async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     while ((m = SPRING_PUBLISH_RE.exec(safe)) && added < SPRING_FANOUT_CAP) {
       const targets = listeners.get(m[1]!);
       if (!targets || !targets.length) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -3648,7 +3669,7 @@ async function mediatrDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     let added = 0;
     while ((m = MEDIATR_DISPATCH_RE.exec(safe)) && added < MEDIATR_FANOUT_CAP) {
       if (!MEDIATR_RECEIVER_RE.test(m[1]!)) continue; // not a mediator (MessagingCenter, HttpClient, …)
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const type = resolveMediatrArgType(m[2]!, safeLines, disp.startLine, line);
@@ -3744,7 +3765,7 @@ async function sidekiqDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = SIDEKIQ_DISPATCH_RE.exec(safe)) && added < SIDEKIQ_FANOUT_CAP) {
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const target = resolve(m[1]!);
@@ -4123,7 +4144,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       const behaviour = behaviours[0]!;
       const targets = targetsOf(behaviour, fn, arity);
       if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -4270,7 +4291,7 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = LARAVEL_DISPATCH_RE.exec(safe)) && added < LARAVEL_FANOUT_CAP) {
       const targets = listeners.get(phpSimpleName(m[1]!));
       if (!targets) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets.values()) {
