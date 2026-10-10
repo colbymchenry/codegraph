@@ -813,6 +813,21 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
   const to = kindOf(e.target);
   return to !== null && (kindOf(e.source) !== 'interface' || to === 'interface');
 }
+/** An exported Go identifier starts with an upper-case letter, in Unicode's sense. */
+const GO_EXPORTED_NAME = /^\p{Lu}/u;
+/**
+ * What a Go method matches an interface's method by: its name, and for an
+ * unexported name the package that declares it as well. Go makes the
+ * `refresh` declared in discovery/hetzner and the one declared in
+ * discovery/aws two different methods, so neither satisfies the other's
+ * interface. A package is a directory, the method's own file's, so a method
+ * that embedding promotes keeps the package of the type declaring it.
+ */
+function goMethodKey(m: Node): string {
+  if (GO_EXPORTED_NAME.test(m.name)) return m.name;
+  const file = m.filePath.replace(/\\/g, '/');
+  return `${file.slice(0, Math.max(file.lastIndexOf('/'), 0))}\0${m.name}`;
+}
 /**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
  * type satisfies an interface structurally when its method set covers the
@@ -842,12 +857,20 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
  * never followed (this pass writes them), and an embedding that resolved to
  * nothing (`io.Closer`) adds nothing.
  *
- * Name-only matching (signatures ignored, and a promoted name counted even
- * where Go finds it ambiguous or hidden by a field) — over-approximation
- * accepted, in line with the other dispatch synthesizers; capped per
- * interface. Empty interfaces (`any`) are skipped so they don't match every
- * type, and a struct that embeds the interface keeps the edge its embedding
- * already is.
+ * Methods match by name, and an unexported name by its package too
+ * ({@link goMethodKey}). prometheus has a `refresher { refresh(…) }` in each of
+ * several discovery packages, and only a type with a `refresh` declared in that
+ * package satisfies it, its own or one embedding brings in: aws's
+ * EC2Discovery, with a `refresh` of package aws, is no hetzner refresher. etcd's
+ * gRPC servers sit outside the generated package and still satisfy its
+ * `KVServer`, whose `mustEmbedUnimplementedKVServer` the `UnsafeKVServer` or
+ * `UnimplementedKVServer` they embed declares there.
+ *
+ * Signatures are ignored, and a promoted name is counted even where Go finds
+ * it ambiguous or hidden by a field — over-approximation accepted, in line with
+ * the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every type, and a struct that embeds
+ * the interface keeps the edge its embedding already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
@@ -877,7 +900,9 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   for (const i of goInterfaces) typeKind.set(i.id, 'interface');
   const kindOf = (id: string): NodeKind | null => typeKind.get(id) ?? null;
 
-  // Memoized: an embedded base is read once, however many types embed it.
+  // A type's own methods, each by its goMethodKey, so every method set below
+  // holds an unexported name with its package. Memoized: an embedded base is
+  // read once, however many types embed it.
   const ownMemo = new Map<string, Set<string>>();
   const ownMethods = (id: string): Set<string> => {
     let names = ownMemo.get(id);
@@ -887,7 +912,7 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
           .getOutgoingEdges(id, ['contains'])
           .map((e) => queries.getNodeById(e.target))
           .filter((n): n is Node => !!n && n.kind === 'method')
-          .map((n) => n.name),
+          .map(goMethodKey),
       );
       ownMemo.set(id, names);
     }
@@ -971,7 +996,9 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     };
     // A struct that needs promoted methods waits for the types declaring all
     // of them, every defined type among them: under the cap, those are what
-    // the interface-dispatch bridge links a call through the interface to.
+    // the interface-dispatch bridge links a call through the interface to. A
+    // namesake it declares of an unexported method from another package is
+    // not one of them: the method it needs is promoted.
     const throughEmbedding: Node[] = [];
     for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -1132,27 +1159,29 @@ async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYiel
   return edges;
 }
 
-/** The methods a Go struct runs for a name it does not declare, and the line of the embedding they come through. */
+/** The methods a Go struct runs for a method it does not declare, and the line of the embedding they come through. */
 interface GoPromotion {
   methods: Node[];
   line: number;
 }
 
 /**
- * Which embedded type's method a Go struct runs for a name it does not
+ * Which embedded type's method a Go struct runs for a method it does not
  * declare, picked the way Go's selector picks it: breadth-first through the
- * struct's embeddings, the shallowest depth holding the name wins, and the
- * name selects nothing when it occurs more than once at that depth, one type
+ * struct's embeddings, the shallowest depth holding the method wins, and it
+ * selects nothing when it occurs more than once at that depth, one type
  * reached along two paths included. A type met at a shallower depth is not
  * walked again. An embedded interface brings its whole method set at its own
  * depth, and a method it provides is a dynamic call once more, so that is no
  * promotion either. Struct fields are not in the graph: a field that hides a
- * promoted method is not seen.
+ * promoted method is not seen. The method is asked for by its
+ * {@link goMethodKey}: a namesake of an unexported method declared in another
+ * package is another method, so it neither provides nor hides it.
  */
 function goPromotions(
   queries: QueryBuilder,
   methodsOf: (id: string) => Node[]
-): (structId: string, name: string) => GoPromotion | null {
+): (structId: string, key: string) => GoPromotion | null {
   const kinds = new Map<string, NodeKind | null>();
   const kindOf = (id: string): NodeKind | null => {
     let kind = kinds.get(id);
@@ -1188,7 +1217,7 @@ function goPromotions(
       const pending = [id];
       while (pending.length > 0) {
         const at = pending.pop()!;
-        for (const m of methodsOf(at)) names.add(m.name);
+        for (const m of methodsOf(at)) names.add(goMethodKey(m));
         for (const e of embeds(at)) {
           if (reached.has(e.target)) continue;
           reached.add(e.target);
@@ -1199,13 +1228,13 @@ function goPromotions(
     }
     return names;
   };
-  const provides = (id: string, name: string): boolean =>
-    kindOf(id) === 'interface' ? ifaceMethods(id).has(name) : methodsOf(id).some((m) => m.name === name);
+  const provides = (id: string, key: string): boolean =>
+    kindOf(id) === 'interface' ? ifaceMethods(id).has(key) : methodsOf(id).some((m) => goMethodKey(m) === key);
 
   const memo = new Map<string, GoPromotion | null>();
-  return (structId, name) => {
-    const key = `${structId}>${name}`;
-    const hit = memo.get(key);
+  return (structId, key) => {
+    const memoKey = `${structId}>${key}`;
+    const hit = memo.get(memoKey);
     if (hit !== undefined) return hit;
     let found: GoPromotion | null = null;
     // Each type at the current depth, with how many paths reach it and the
@@ -1227,19 +1256,19 @@ function goPromotions(
       let provider: string | undefined;
       for (const [id, at] of next) {
         met.add(id);
-        if (!provides(id, name)) continue;
+        if (!provides(id, key)) continue;
         paths += at.paths;
         provider = id;
       }
       if (provider !== undefined) {
         if (paths === 1 && kindOf(provider) !== 'interface') {
-          found = { methods: methodsOf(provider).filter((m) => m.name === name), line: next.get(provider)!.line };
+          found = { methods: methodsOf(provider).filter((m) => goMethodKey(m) === key), line: next.get(provider)!.line };
         }
         break;
       }
       level = next;
     }
-    memo.set(key, found);
+    memo.set(memoKey, found);
     return found;
   };
 }
@@ -1320,17 +1349,22 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
       // link every base overload → every same-name impl overload (keying by name
-      // alone would drop all but one and miss the resolved overload).
-      const implByName = new Map<string, Node[]>();
+      // alone would drop all but one and miss the resolved overload). A Go
+      // interface's unexported method is matched in its own package only
+      // (goMethodKey): a namesake the type declares elsewhere is another
+      // method, and the one the interface asks for is promoted.
+      const keyOf = base.language === 'go' && base.kind === 'interface' ? goMethodKey : (m: Node): string => m.name;
+      const implsByKey = new Map<string, Node[]>();
       for (const m of implMethods) {
-        const arr = implByName.get(m.name);
-        if (arr) arr.push(m); else implByName.set(m.name, [m]);
+        const key = keyOf(m);
+        const arr = implsByKey.get(key);
+        if (arr) arr.push(m); else implsByKey.set(key, [m]);
       }
       let added = 0;
       const unmatched: Node[] = [];
       for (const bm of baseMethodsOf(base)) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-        const impls = implByName.get(bm.name);
+        const impls = implsByKey.get(keyOf(bm));
         if (!impls) {
           if (promotes) unmatched.push(bm);
           continue;
@@ -1365,7 +1399,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     let budget = left;
     for (const bm of methods) {
       if (budget <= 0) break;
-      const promotion = goPromotion(cls.id, bm.name);
+      const promotion = goPromotion(cls.id, goMethodKey(bm));
       if (!promotion) continue;
       for (const m of promotion.methods) {
         if (budget <= 0) break;
