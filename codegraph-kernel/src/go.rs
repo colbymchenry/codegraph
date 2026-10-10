@@ -16,7 +16,7 @@ use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
     RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FUNCTION_REF_CODE, NONE, NONE_STR,
 };
-use crate::docstring::preceding_docstring;
+use crate::docstring::preceding_docstring_skipping_trailing;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
@@ -380,6 +380,31 @@ impl<'t> Walker<'t> {
         receiver_re().captures(text).map(|c| c[1].to_string())
     }
 
+    /// goExtractor.getDeclarationWrapper: a type declared on its own, `type
+    /// Foo struct{…}`, is a `type_declaration` holding one spec, and its doc
+    /// comment comes before the declaration, outside the spec. A member of a
+    /// `type ( … )` group has its comment beside it, and the comment above the
+    /// group is the group's. A group of one is that type's declaration, as go
+    /// doc reads it, unless its member has a comment of its own.
+    fn declaration_wrapper(&self, node: Node<'t>) -> Option<Node<'t>> {
+        let parent = node.parent()?;
+        if parent.kind() != "type_declaration" || parent.named_child(0)? != node {
+            return None;
+        }
+        let specs = (0..parent.named_child_count())
+            .filter_map(|i| parent.named_child(i))
+            .filter(|c| matches!(c.kind(), "type_spec" | "type_alias"))
+            .count();
+        (specs == 1).then_some(parent)
+    }
+
+    /// docstringFor (tree-sitter.ts) — the preceding comment run, looked up
+    /// from the declaration wrapper when there is one, without the comments
+    /// that trail the code above it (docstringSkipsTrailingComments).
+    fn docstring_of(&self, node: Node<'t>) -> Option<String> {
+        preceding_docstring_skipping_trailing(self.declaration_wrapper(node).unwrap_or(node), self.src)
+    }
+
     // --- visitNode ------------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
@@ -465,7 +490,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: self.docstring_of(node),
             signature: self.signature_of(node),
             is_exported: Some(self.is_exported(node)),
             return_type: self.return_type_of(node),
@@ -487,7 +512,7 @@ impl<'t> Walker<'t> {
         let receiver_type = self.receiver_type_of(node);
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: self.docstring_of(node),
             signature: self.signature_of(node),
             return_type: self.return_type_of(node),
             qualified_name: receiver_type.as_ref().map(|r| format!("{r}::{name}")),
@@ -537,7 +562,7 @@ impl<'t> Walker<'t> {
         if name == "<anonymous>" {
             return false;
         }
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let is_exported = Some(self.is_exported(node));
         let type_child = node.child_by_field_name("type");
         let resolved = type_child.map(|t| t.kind());
@@ -590,8 +615,8 @@ impl<'t> Walker<'t> {
             Extra { docstring, is_exported, ..Extra::default() },
         );
         // (go has no `value` field — no TS-style type-ref walk or member
-        // extraction.) An alias references what its `type` field names; a
-        // defined type (`type_spec`) declares a type of its own.
+        // extraction.) An alias and a defined type (`type_spec`) alike
+        // reference what their `type` field names.
         if let Some(row) = row {
             let references = edge_kind_index("references").unwrap();
             for ty in self.alias_type_names(node) {
@@ -623,7 +648,7 @@ impl<'t> Walker<'t> {
 
     /// extractVariable's Go branch: var/const specs + short_var_declaration.
     fn extract_variable(&mut self, node: Node<'t>) {
-        let docstring = preceding_docstring(node, self.src);
+        let docstring = self.docstring_of(node);
         let is_const_decl = node.kind() == "const_declaration";
 
         for i in 0..node.named_child_count() {
@@ -873,16 +898,15 @@ impl<'t> Walker<'t> {
     }
 
     /// goAliasTypeNames (languages/go.ts): the name nodes of the types an
-    /// alias's `type` field names, in source order, but its own type
-    /// parameters and the predeclared types. Only a `type_alias` is one here:
-    /// a generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
+    /// alias's or a defined type's `type` field names, in source order, but
+    /// its own type parameters, the predeclared types and its own name written
+    /// bare (a recursive type's, `type stateFn func(*Lexer) stateFn`). A
+    /// generic alias, which tree-sitter-go 0.23 parses as a `type_spec`
     /// around an error, never reaches the kernel (its file defers to wasm).
     fn alias_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
         let mut names = Vec::new();
-        if node.kind() != "type_alias" {
-            return names;
-        }
         let Some(ty) = node.child_by_field_name("type") else { return names };
+        let own = node.child_by_field_name("name").map(|n| self.text(n));
         let mut params: HashSet<&str> = HashSet::new();
         if let Some(list) = node.child_by_field_name("type_parameters") {
             for decl in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
@@ -893,22 +917,32 @@ impl<'t> Walker<'t> {
                 }
             }
         }
-        self.collect_alias_type_names(ty, &params, &mut names);
+        self.collect_alias_type_names(ty, &params, own, false, &mut names);
         names
     }
 
-    fn collect_alias_type_names(&self, node: Node<'t>, params: &HashSet<&str>, out: &mut Vec<Node<'t>>) {
+    /// `qualified`: the name of a `pkg.Name`, which is that package's
+    /// whatever this one declares.
+    fn collect_alias_type_names(
+        &self,
+        node: Node<'t>,
+        params: &HashSet<&str>,
+        own: Option<&str>,
+        qualified: bool,
+        out: &mut Vec<Node<'t>>,
+    ) {
         stack_guard!();
         if node.kind() == "type_identifier" {
             let text = self.text(node);
-            if !params.contains(text) && !is_go_predeclared_type(text) {
+            if !is_go_predeclared_type(text) && (qualified || (!params.contains(text) && own != Some(text))) {
                 out.push(node);
             }
             return;
         }
+        let qualified = node.kind() == "qualified_type";
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.collect_alias_type_names(c, params, out);
+                self.collect_alias_type_names(c, params, own, qualified, out);
             }
         }
     }

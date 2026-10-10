@@ -3,6 +3,77 @@ import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
+ * Resolve the declared identifier inside a C declarator. A `declaration`'s
+ * `declarator` field nests the name through `init_declarator` (with value),
+ * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
+ * wrappers (each via their own `declarator` field) down to an `identifier`.
+ * A `function_declarator` means the declaration is a function prototype (or a
+ * function-pointer var) — return null so it isn't extracted as a variable.
+ */
+export function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
+  let cur: SyntaxNode | null = node;
+  let guard = 0;
+  while (cur && guard++ < 12) {
+    switch (cur.type) {
+      case 'identifier':
+        return cur;
+      case 'function_declarator':
+        return null;
+      case 'init_declarator':
+      case 'pointer_declarator':
+      case 'array_declarator':
+      case 'parenthesized_declarator':
+        cur = getChildByField(cur, 'declarator');
+        break;
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
+/** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
+const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
+
+/**
+ * Whether a C/C++ type specifier defines a class, struct, union or enum, as
+ * opposed to naming one (`struct Foo *p`, the forward declaration `class Foo;`).
+ */
+export function isClassLikeDefinition(node: SyntaxNode): boolean {
+  return CLASS_LIKE_SPECIFIERS.has(node.type) && getChildByField(node, 'body') !== null;
+}
+
+/**
+ * The `declaration` a class, struct, union or enum is defined in the type of —
+ * `struct Foo { … } foo;` — or null for one written on its own, in a typedef or
+ * in a member's type.
+ */
+function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
+  if (!isClassLikeDefinition(node)) return null;
+  const parent = node.parent;
+  return parent?.type === 'declaration' && getChildByField(parent, 'type')?.id === node.id ? parent : null;
+}
+
+/**
+ * The name of an unnamed class, struct, union or enum that a declaration
+ * defines: the first variable the declaration declares. No code can name the
+ * type of `static struct { … } SPT;` (only `SPT`), so the struct is indexed as
+ * `SPT`, the way `typedef struct { … } Name;` is indexed as `Name`. Undefined
+ * for a named type, and when the declaration declares no variable (a
+ * function's return type). Mirrored in the kernel (ccpp/mod.rs).
+ */
+function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
+  if (getChildByField(node, 'name')) return undefined;
+  const declaration = definingDeclaration(node);
+  if (!declaration) return undefined;
+  for (const declarator of declaration.childrenForFieldName('declarator')) {
+    const identifier = cDeclaratorIdentifier(declarator);
+    if (identifier) return getNodeText(identifier, source);
+  }
+  return undefined;
+}
+
+/**
  * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
  * declarator, skipping the `parameter_list` — a parameter with a qualified type
  * (`const std::string& x`) must NOT be mistaken for the method name. Without the
@@ -256,7 +327,11 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
-  resolveName: recoverSingleArgMacroDefinedName,
+  resolveName: (node, source) =>
+    recoverSingleArgMacroDefinedName(node, source) ?? unnamedTypeVariableName(node, source),
+  // A struct, union or enum defined in a declaration's type is documented by
+  // the comment above the declaration.
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   // CUDA in C-detected headers (content-gated blank; see preParseCSource).
   preParse: preParseCSource,
   // Universal net: recover a real name from any macro-mangled function name.
@@ -2324,7 +2399,9 @@ export const cppExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  resolveName: extractCppQualifiedMethodName,
+  resolveName: (node, source) =>
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
   // Constructors (definitions and class-body declarations) carry their

@@ -3,7 +3,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { matchCollapsedObjectCall } from '../src/resolution/name-matcher';
 import { stripCommentsForRegex } from '../src/resolution/strip-comments';
+import type { ResolutionContext, UnresolvedRef } from '../src/resolution/types';
 
 // Pass-through, so a test can count how often text is stripped.
 vi.mock('../src/resolution/strip-comments', async (importOriginal) => {
@@ -80,5 +82,90 @@ describe('JS resolution work (#2334)', () => {
     // Each call resolved, so each asked whether `host` binds `helper` itself.
     expect(callers(graph, 'lib.js', 'helper')).toEqual(['host']);
     expect(strips('javascript', host)).toBeLessThan(LINES / 4);
+  });
+});
+
+/**
+ * A call the extractor records by its bare name has its receiver read back
+ * from the source, from the ref's column on. A minified bundle is one long
+ * line, and joining it with the lines after it copied all of it for every
+ * call on it: about 1 MB per call on go-ethereum's graphiql.min.js. Counted,
+ * never timed.
+ */
+describe('a receiver read back from a minified line', () => {
+  /** How many characters arrays were joined into while `run` ran. */
+  function joinedDuring(run: () => void): number {
+    const join = Array.prototype.join;
+    let chars = 0;
+    Array.prototype.join = function (this: unknown[], separator?: string): string {
+      const text = join.call(this, separator);
+      chars += text.length;
+      return text;
+    };
+    try {
+      run();
+    } finally {
+      Array.prototype.join = join;
+    }
+    return chars;
+  }
+
+  /**
+   * Runs `refs` through the check for a call written on `window.App…`, which
+   * looks up the object the receiver it read back names.
+   */
+  function readBack(source: string, refs: UnresolvedRef[]): { holders: string[]; joined: number } {
+    const lines = source.split('\n');
+    const holders: string[] = [];
+    const context: ResolutionContext = {
+      getNodesInFile: () => [],
+      getNodesByName: (name) => {
+        holders.push(name);
+        return [];
+      },
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: () => [],
+      fileExists: () => false,
+      readFile: () => source,
+      getFileLines: () => lines,
+      getProjectRoot: () => '',
+      getAllFiles: () => [],
+      getImportMappings: () => [],
+    };
+    const joined = joinedDuring(() => {
+      for (const ref of refs) matchCollapsedObjectCall(ref, context);
+    });
+    return { holders, joined };
+  }
+
+  const call = (name: string, line: number, column: number): UnresolvedRef => ({
+    fromNodeId: 'bundle', referenceName: name, referenceKind: 'calls', line, column,
+    filePath: 'bundle.min.js', language: 'javascript',
+  });
+
+  it('reads every receiver on the line without copying the line once per call', () => {
+    const CALLS = 300;
+    const refs: UnresolvedRef[] = [];
+    let line = '!function(){';
+    for (let i = 0; i < CALLS; i++) {
+      refs.push(call(`m${i}`, 2, line.length));
+      line += `window.App${i}.m${i}(${i});`;
+    }
+    line += '}();';
+    const { holders, joined } = readBack(`/*! bundle */\n${line}\n//# sourceMappingURL=bundle.min.js.map`, refs);
+    // Each call's receiver was read back...
+    expect(holders).toEqual(refs.map((_, i) => `App${i}`));
+    // ...and all of them together copied less than the line once.
+    expect(joined).toBeLessThan(line.length);
+  });
+
+  it('reads on past the line when the line alone does not settle the call', () => {
+    // The call continues on the next lines.
+    expect(readBack('window.App\n  .go\n  (1);', [call('go', 1, 0)]).holders).toEqual(['App']);
+    // The line holds `foo(`, but the call is `foo[…](3)`, whose subscript runs onto the next line.
+    expect(readBack('window.App.foo[foo(1),\n2](3);', [call('foo', 1, 0)]).holders).toEqual(['App']);
+    // A column past the end of its line reads on from the next one.
+    expect(readBack('x\nwindow.App.go(1);', [call('go', 1, 2)]).holders).toEqual(['App']);
   });
 });

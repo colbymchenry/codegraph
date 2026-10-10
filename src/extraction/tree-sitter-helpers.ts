@@ -134,11 +134,17 @@ function cleanCommentMarkers(comment: string): string {
  * declaration without ending the run: Dart's annotations, in `/// Builds it.`
  * `@override` `Widget build(…)`. They are not part of the docstring, and the
  * comments on either side of one join as if it weren't there. Default: none.
+ *
+ * `skipTrailing` leaves out the comments the run opens with that belong to
+ * the line above: one written after code on its line (`const n = 4 // four.`),
+ * and any that begins on the line such a comment ends. Go reads them as that
+ * line's comment, never the next declaration's doc. Default: off.
  */
 export function getPrecedingDocstring(
   node: SyntaxNode,
   source: string,
-  stepOver: readonly string[] = []
+  stepOver: readonly string[] = [],
+  skipTrailing = false
 ): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
@@ -151,7 +157,7 @@ export function getPrecedingDocstring(
   }
 
   let sibling = anchor.previousNamedSibling;
-  const comments: string[] = [];
+  const comments: SyntaxNode[] = [];
 
   while (sibling) {
     if (
@@ -160,7 +166,7 @@ export function getPrecedingDocstring(
       sibling.type === 'block_comment' ||
       sibling.type === 'documentation_comment'
     ) {
-      comments.unshift(getNodeText(sibling, source));
+      comments.unshift(sibling);
       sibling = sibling.previousNamedSibling;
     } else if (stepOver.includes(sibling.type)) {
       sibling = sibling.previousNamedSibling;
@@ -169,8 +175,30 @@ export function getPrecedingDocstring(
     }
   }
 
-  if (comments.length === 0) return undefined;
+  let first = 0;
+  if (skipTrailing) {
+    let endRow = -1;
+    for (const comment of comments) {
+      const trails =
+        first === 0 ? followsCodeOnItsLine(comment, source) : comment.startPosition.row === endRow;
+      if (!trails) break;
+      endRow = comment.endPosition.row;
+      first++;
+    }
+  }
+  if (first === comments.length) return undefined;
 
   // Strip each comment's syntax markers (language-aware), then join.
-  return comments.map(cleanCommentMarkers).join('\n').trim();
+  return comments
+    .slice(first)
+    .map((c) => cleanCommentMarkers(getNodeText(c, source)))
+    .join('\n')
+    .trim();
+}
+
+/** Whether code comes before `node` on the line it starts on. */
+function followsCodeOnItsLine(node: SyntaxNode, source: string): boolean {
+  let i = node.startIndex;
+  while (i > 0 && (source[i - 1] === ' ' || source[i - 1] === '\t')) i--;
+  return i > 0 && source[i - 1] !== '\n' && source[i - 1] !== '\r';
 }

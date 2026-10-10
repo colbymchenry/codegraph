@@ -198,8 +198,10 @@ describe('Go alias declarations are extracted', () => {
       const source = eol(ALIAS_SOURCE);
       const result = extract(backend, 'client/v3/watch.go', source);
       // The package of mvccpb.Event / context.Context stays in the source;
-      // predeclared types (string, uint, error) are no references.
+      // predeclared types (string, uint, error) are no references. The
+      // defined types (WatchChan, Defined) reference theirs too.
       expect(typeRefs(result)).toEqual([
+        'Defined WatchResponse',
         'Event Event',
         'Handler Context',
         'Handler WatchResponse',
@@ -209,6 +211,7 @@ describe('Go alias declarations are extracted', () => {
         'Plain WatchResponse',
         'Ptr WatchResponse',
         'Slice WatchResponse',
+        'WatchChan WatchResponse',
       ]);
       expectRefsOnTheirNames(result, source);
     });
