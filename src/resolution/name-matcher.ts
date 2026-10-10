@@ -1834,7 +1834,9 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
 /**
  * Languages in which `visibility: 'private'` on a definition means no other
  * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
- * same holds for Java, C#, Swift, Scala, Dart and PHP members.
+ * same holds for Java, C#, Swift, Scala, Dart and PHP members. A Dart
+ * `_name` is the exception's exception: it is private to its library, which
+ * spans that library's `part` files, and is handled before this set is consulted.
  */
 const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
 
@@ -2802,6 +2804,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     const owner = rustModuleDir(candidate.filePath);
     return ref.filePath.startsWith(owner + '/');
   }
+  // Dart privacy is per library: a library's `part` files share its `_names`.
+  if (lang === 'dart' && candidate.visibility === 'private') return inSameDartLibrary(ref.filePath, candidate.filePath, context);
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
   // An R test file runs in an environment of its own (testthat): its top-level
   // `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls mean. The
