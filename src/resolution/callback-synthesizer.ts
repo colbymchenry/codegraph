@@ -41,6 +41,7 @@ import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
 import { declaredComponent, exportedComponent, lazyValueModules } from './frameworks/react';
+import { jsxCode } from './jsx-code';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -52,6 +53,8 @@ const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
+/** The languages that can write JSX: not TypeScript's `.ts` files. */
+const JSX_FAMILY = ['tsx', 'jsx', 'javascript'];
 // A tag's name ends at whitespace, `/` or `>`, or at the `<` of the type
 // arguments a generic component's tag passes: `<PaginatedList<Document>
 // items={…} />` renders PaginatedList. The lookahead leaves that `<` to open
@@ -1930,7 +1933,9 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
  * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
  * (read each JSX file once). Precision gates: the parent must write the name as
- * a tag, not only in a type argument or parameter list (`useState<User>()`,
+ * a tag in its code, not in a comment, a string or a template (react-router's
+ * "You cannot render a <Router> inside another <Router>"; `jsxCode`), and
+ * not only in a type argument or parameter list (`useState<User>()`,
  * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
  * read its `Document` model class as a child), and the name must resolve to a
  * component/function/class node, or to a value the file declares itself (see
@@ -1966,9 +1971,11 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
     // File-level language gate, not merely a project-level one: mixed C/JS
-    // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560).
+    // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560). A
+    // TypeScript `.ts` file holds no JSX either: a `<Name>` there is a type
+    // assertion or text, like outline's OpenSearch XML template.
     const parents = ctx.getNodesInFile(file).filter(
-      (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
+      (n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language)
     );
     if (parents.length === 0) continue;
     // Read once per file, and only when a name actually turns out ambiguous.
@@ -1985,7 +1992,8 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // the same lines share them: every function of a minified bundle spans
     // its one line, and reading that line again per function took 9 to 25 s
     // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
-    // file is split once, not once per function.
+    // file is split once, not once per function, and read as code once: a
+    // tag in a comment or a string is text (`jsxCode`).
     let lines: string[] | null = null;
     // Each name a span holds, and the line of its first tag: 0 while only type
     // argument or parameter lists name it (`opensTag`). `bare` holds the
@@ -1997,7 +2005,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       let names = tagsBySpan.get(span);
       if (!names) {
         names = { tags: new Map<string, number>(), bare: new Set<string>() };
-        lines ??= content.split('\n');
+        lines ??= (jsxCode(content) ?? content).split('\n');
         const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
         if (src.includes('</') || src.includes('/>')) {
           let line = parent.startLine;

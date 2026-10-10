@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
+import { jsxCode } from '../src/resolution/jsx-code';
 
 /**
  * A JSX tag names ONE component, and the file it is written in says which:
@@ -1000,5 +1001,234 @@ export default React.forwardRef<HTMLButtonElement, object>(Button);
     );
     await index();
     expect(renders('Deck')).toEqual(['Card components/Card.js:3']);
+  });
+});
+
+/**
+ * The pass reads tag names off a parent's source with a pattern, so it also
+ * read the tags that text only mentions. react-router's hooks rendered the
+ * `Router`, `Routes` and `Route` their invariant messages and comments name
+ * ("You cannot render a <Router> inside another <Router>"), shadcn's
+ * `useCarousel` the `Carousel` its error names, and a layout the `<Progress />`
+ * commented out of it. A tag in a comment, or in a string, template, regex or
+ * attribute value, is text; so is anything in a TypeScript `.ts` file, which
+ * holds no JSX at all.
+ */
+describe('JSX child: a tag written in a comment or a string', () => {
+  let dir: string;
+  let cg: any;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsx-text-'));
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react":"^18.0.0"}}');
+  });
+
+  afterEach(() => {
+    cg?.close?.();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (rel: string, lines: string[]) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, lines.join('\n') + '\n');
+  };
+  const component = (name: string, tag = 'div') => [`export function ${name}() {`, `  return <${tag} />;`, '}'];
+
+  async function index(): Promise<void> {
+    cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+  }
+
+  /** The names a jsx-render edge out of `parent` points at. */
+  const renders = (parent: string): string[] =>
+    cg.db.db
+      .prepare(
+        `SELECT t.name AS r FROM edges e
+           JOIN nodes s ON s.id = e.source
+           JOIN nodes t ON t.id = e.target
+          WHERE s.name = ? AND json_extract(e.metadata, '$.synthesizedBy') = 'jsx-render'
+          ORDER BY r`
+      )
+      .all(parent)
+      .map((row: any) => row.r);
+
+  it('renders nothing for a tag in a comment, a string, a template or a regex', async () => {
+    write('router/components.tsx', ['Router', 'Routes', 'Route', 'Outlet', 'Blog'].flatMap((n) => component(n)));
+    write('router/hooks.tsx', [
+      "import { Outlet } from './components';",
+      '',
+      'export function useRoutesImpl(routes, parentPath) {',
+      '  invariant(',
+      '    useInRouterContext(),',
+      '    `useRoutes() may be used only in the context of a <Router> component.`',
+      '  );',
+      "  // You won't get a warning about 2 different <Routes> under a <Route>:",
+      '  //',
+      '  //   <Route path="blog" element={<Blog />} />',
+      '  warning(',
+      '    !parentPath,',
+      '    `You rendered descendant <Routes> (under <Route path="${parentPath}">) ` +',
+      '      "but the parent route path has no trailing \\"*\\"."',
+      '  );',
+      '  const selfClosing = /<Router \\/>/;',
+      '  return <Outlet />;',
+      '}',
+    ]);
+    // shadcn's carousel hook, and excalidraw's docs theme toggle.
+    write('components/ui/carousel.tsx', [
+      "import * as React from 'react';",
+      'const CarouselContext = React.createContext(null);',
+      'export function useCarousel() {',
+      '  const context = React.useContext(CarouselContext);',
+      "  if (!context) throw new Error('useCarousel must be used within a <Carousel />');",
+      '  return context;',
+      '}',
+      'export function Carousel({ children }) {',
+      '  return <CarouselContext.Provider value={{}}>{children}</CarouselContext.Provider>;',
+      '}',
+    ]);
+    write('docs/Excalidraw.tsx', component('Excalidraw'));
+    write('docs/ToggleTheme.tsx', [
+      'export function ToggleTheme({ onThemeChange }) {',
+      '  if (!onThemeChange) {',
+      '    throw new Error("`<Excalidraw/> props.onThemeChange` must be defined when `theme` is set");',
+      '  }',
+      '  return <button onClick={onThemeChange} />;',
+      '}',
+    ]);
+    // bulletproof-react's layout and binner's inventory: markup commented out.
+    write('components/Drawer.tsx', component('Drawer'));
+    write('components/Progress.tsx', component('Progress'));
+    write('components/Layout.jsx', [
+      "import { Drawer } from './Drawer';",
+      "import { Progress } from './Progress';",
+      'export function Layout({ children }) {',
+      '  /*<Progress value={0} />*/',
+      '  return (',
+      '    <div>',
+      '      {/* <Progress /> */}',
+      '      <Drawer>{children}</Drawer>',
+      '    </div>',
+      '  );',
+      '}',
+    ]);
+    await index();
+    expect(renders('useRoutesImpl')).toEqual(['Outlet']);
+    expect(renders('useCarousel')).toEqual([]);
+    expect(renders('ToggleTheme')).toEqual([]);
+    expect(renders('Layout')).toEqual(['Drawer']);
+  });
+
+  it('renders nothing from a TypeScript .ts file', async () => {
+    // outline's OpenSearch description, an XML template in a `.ts` route.
+    write('app/components/Image.tsx', component('Image', 'img'));
+    write('app/components/Description.tsx', component('Description', 'p'));
+    write('server/routes/opensearch.ts', [
+      'export function opensearchResponse(baseUrl: string): string {',
+      '  return `<?xml version="1.0" encoding="UTF-8"?>',
+      '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">',
+      '  <Description>Search Outline</Description>',
+      '  <Image width="16" height="16">${baseUrl}/images/favicon-16.png</Image>',
+      '</OpenSearchDescription>`;',
+      '}',
+    ]);
+    // A type assertion names a class component. The regex right after
+    // `if (…)` reads as a division, so the file can't be followed and is read
+    // as it is: only its language says `<Editor>` is no tag.
+    write('app/editor/Editor.tsx', [
+      "import * as React from 'react';",
+      'export class Editor extends React.Component {',
+      '  render() {',
+      '    return <div />;',
+      '  }',
+      '}',
+    ]);
+    write('app/editor/focus.ts', [
+      "import { Editor } from './Editor';",
+      '',
+      'export function focusEditor(view: unknown, closing = "</p>") {',
+      "  if (closing) /'/.test(closing);",
+      '  const editor = <Editor>view;',
+      '  return editor;',
+      '}',
+    ]);
+    await index();
+    expect(renders('opensearchResponse')).toEqual([]);
+    expect(renders('focusEditor')).toEqual([]);
+  });
+
+  it('still renders the tags after an apostrophe, a URL or a backtick in JSX text', async () => {
+    for (const name of ['Link', 'Docs', 'Kbd', 'Field', 'Fake']) write(`app/${name}.tsx`, component(name));
+    write('app/Signup.tsx', [
+      "import { Link } from './Link';",
+      "import { Docs } from './Docs';",
+      "import { Kbd } from './Kbd';",
+      "import { Field } from './Field';",
+      '',
+      'const first = <T,>(items: T[]) => items[0];',
+      "const slug = (s: string) => s.replace(/[`'\"]/g, '').replace(/\\//g, '-');",
+      'const note = `${`nested ${first([1])}`} <Fake />`;',
+      '',
+      'export function Signup() {',
+      '  return (',
+      '    <form title="<Fake /> is not rendered">',
+      '      <p>Don\'t have an account? <Link to="/signup">Sign up</Link></p>',
+      '      <p>Read https://example.com/docs first: <Docs /></p>',
+      '      <p>Press `Ctrl` and <Kbd>K</Kbd></p>',
+      '      <Field label=\'It"s\' />',
+      '    </form>',
+      '  );',
+      '}',
+    ]);
+    await index();
+    expect(renders('Signup')).toEqual(['Docs', 'Field', 'Kbd', 'Link']);
+  });
+});
+
+describe('jsxCode', () => {
+  const TAG = /<([A-Z][A-Za-z0-9_]*)(?=[\s/><])/g;
+  const tags = (code: string) => [...code.matchAll(TAG)].map((m) => m[1]);
+
+  it('blanks comments and literal text, and keeps every offset and line break', () => {
+    const source = [
+      '/** Renders a <Route> in an <Outlet>. */',
+      'export function Page({ items }) {',
+      "  const re = /<Fake\\/>/g, s = 'a <Fake />', t = `<Fake /> ${items.map((i) => <Item key={i} />)}`;",
+      '  return (',
+      '    <Shell title="<Fake />">',
+      "      {/* <Fake /> */} Don't <Link to=\"/x\">go</Link> to https://a.b/c",
+      '    </Shell>',
+      '  );',
+      '}',
+    ].join('\r\n');
+    const code = jsxCode(source)!;
+    expect(code).not.toBeNull();
+    expect(code.length).toBe(source.length);
+    expect([...code].flatMap((c, i) => (c === '\n' || c === '\r' ? [i] : []))).toEqual(
+      [...source].flatMap((c, i) => (c === '\n' || c === '\r' ? [i] : []))
+    );
+    expect(tags(source)).toContain('Fake');
+    expect(tags(code)).toEqual(['Item', 'Shell', 'Link']);
+  });
+
+  it('reads a `<` that opens a type parameter list as an operator', () => {
+    const source = [
+      'type Fn = <T>(x: T) => T;',
+      'interface Call { <T>(x: T): T }',
+      'const first = <T,>(items: T[]) => items[0];',
+      "const Table = <Entry extends Base>({ rows }) => <Grid rows={rows} label='a \"b' />;",
+      'const c = i++ / 2, d = x! < y;',
+    ].join('\n');
+    const code = jsxCode(source)!;
+    expect(code).not.toBeNull();
+    expect(tags(code)).toEqual(['T', 'T', 'Entry', 'Grid']);
+  });
+
+  it('is null for a file it cannot read as one program', () => {
+    expect(jsxCode('const a = <p>a } b</p>;')).toBeNull();
+    expect(jsxCode('function f() {\n  return 1;\n')).toBeNull();
+    expect(jsxCode("const s = 'open\nconst b = 1;")).toBeNull();
+    expect(jsxCode('const a = <A><B></A></B>;')).toBeNull();
   });
 });
