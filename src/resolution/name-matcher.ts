@@ -1553,11 +1553,12 @@ const JVM_CALLABLE_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
 const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'trait', 'type_alias', 'annotation']);
 
 /**
- * A test suite — a test source set, a `tests/` / `__tests__/` / `spec/`
- * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc`
- * file — as opposed to test-support code a project ships (`testing/`,
- * `fakes/`, a `*-test` module like kotlinx-coroutines-test), which its own
- * code may use.
+ * A test suite — a test source set, a `tests/` / `__tests__/` / `spec/` /
+ * `unittests/` directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` /
+ * `foo_unittest.cc` file — as opposed to test-support code a project ships
+ * (`testing/`, `fakes/`, a `*-test` module like kotlinx-coroutines-test), which
+ * its own code may use. A `foo_unittest/` directory is a suite, as a
+ * `foo_unittest.cc` file is: glog builds each one as a test program of its own.
  */
 function isTestSuitePath(filePath: string): boolean {
   if (!isTestPath(filePath)) return false;
@@ -1568,7 +1569,7 @@ function isTestSuitePath(filePath: string): boolean {
   if (name.startsWith('test_') || /[._-](?:test|tests|unittest|unittests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
       // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
       /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
-  return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
+  return /(?:^|\/)(?:tests?|__tests__|specs?|e2e|unittests|[\w.]+[-_]unittests?)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
 }
 
 const fileStem = (filePath: string): string => {
