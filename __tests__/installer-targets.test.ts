@@ -21,7 +21,7 @@ import * as os from 'os';
 import { spawnSync } from 'child_process';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
-import { uninstallTargets, refreshTargets } from '../src/installer';
+import { uninstallTargets, refreshTargets, writeMcpConfig, writePermissions, hasMcpConfig, hasPermissions } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 
@@ -2907,6 +2907,54 @@ describe('Installer targets — Claude CLAUDE_CONFIG_DIR override (#1627)', () =
     expect(claude.detect('local').alreadyConfigured).toBe(false);
     expect(fs.existsSync(custom)).toBe(false);
     expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+
+  it('legacy config-writer shims read and write the CLAUDE_CONFIG_DIR profile', () => {
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    expect(hasMcpConfig('global')).toBe(false);
+    expect(hasPermissions('global')).toBe(false);
+
+    writeMcpConfig('global');
+    writePermissions('global');
+
+    expect(JSON.parse(fs.readFileSync(path.join(custom, '.claude.json'), 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(fs.existsSync(path.join(custom, 'settings.json'))).toBe(true);
+    expect(hasMcpConfig('global')).toBe(true);
+    expect(hasPermissions('global')).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+
+  it('legacy config-writer shims use ~/.claude.json and ~/.claude without CLAUDE_CONFIG_DIR', () => {
+    writeMcpConfig('global');
+    writePermissions('global');
+
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'settings.json'))).toBe(true);
+    expect(hasMcpConfig('global')).toBe(true);
+    expect(hasPermissions('global')).toBe(true);
+
+    // A profile that was never written to reports nothing configured.
+    process.env.CLAUDE_CONFIG_DIR = path.join(tmpHome, 'claude-profile');
+    expect(hasMcpConfig('global')).toBe(false);
+    expect(hasPermissions('global')).toBe(false);
+  });
+
+  it('refresh rewrites only the CLAUDE_CONFIG_DIR profile it finds configured', () => {
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const mcpPath = path.join(custom, '.claude.json');
+    const cfg = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    cfg.mcpServers.codegraph = { command: 'stale' };
+    fs.writeFileSync(mcpPath, JSON.stringify(cfg));
+
+    refreshTargets([claude], 'global');
+
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf-8')).mcpServers.codegraph.command).not.toBe('stale');
     expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
   });
 });
