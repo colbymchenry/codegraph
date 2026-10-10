@@ -12188,7 +12188,11 @@ function matchTsThisFieldCall(
         while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
         return i;
       };
-      const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+      // Ties break by code-unit order, not localeCompare: ICU collation
+      // depends on the host locale, so the same index could pick a
+      // different target on another machine.
+      const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) ||
+        (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0))[0]!;
       return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
     }
     return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
