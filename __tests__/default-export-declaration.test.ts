@@ -10,7 +10,8 @@
  * styled or memo component lost its default function or binding to that
  * component, and an anonymous default (`export default function () {…}`,
  * `export default () => …`) took whatever exported function came first — even
- * one nested inside the default itself.
+ * one nested inside the default itself. `require('./x').default` of an ES
+ * module reads the same default, through the same lookup.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -174,6 +175,37 @@ export default () => {
 
 export default new Service()
 `,
+  // An abstract class the statement declares, below an exported helper.
+  'src/repository.ts': `export function connect(): string {
+  return "db"
+}
+
+export default abstract class Repository {
+  abstract find(id: string): unknown
+
+  describe(): string {
+    return connect()
+  }
+}
+`,
+  // React Native's AnimatedColor shape, loaded with `require(…).default`
+  // (read the way a default import reads it) instead of imported.
+  'src/animated/AnimatedColor.ts': `export function getRgbaValueAndNativeColor(value: string): string {
+  return value
+}
+
+export default class AnimatedColor {
+  constructor(value: string) {
+    getRgbaValueAndNativeColor(value)
+  }
+}
+`,
+  'src/animated/load.ts': `export function makeColors(): unknown[] {
+  const AnimatedColor = require("./AnimatedColor").default
+  const { default: Color } = require("./AnimatedColor")
+  return [new AnimatedColor("red"), new Color("blue")]
+}
+`,
   'src/use.tsx': `import handler from "./api/vans"
 import Store from "./store"
 import headingToSlug from "./slug"
@@ -183,6 +215,7 @@ import Banner from "./components/Banner"
 import runAnonymous from "./anonymous"
 import Arrow from "./arrow"
 import service from "./service"
+import Repository from "./repository"
 
 export function consume() {
   handler({}, { json() {} })
@@ -194,6 +227,12 @@ export function consume() {
   runAnonymous()
   Arrow()
   service.run()
+}
+
+export class Users extends Repository {
+  find(id: string) {
+    return id
+  }
 }
 `,
 };
@@ -251,6 +290,28 @@ describe('a default import of a module that exports something above its default'
     expect(targets).not.toContain('src/store.ts:createStore');
     expect(targets).not.toContain('src/slug.ts:escapeHtml');
     expect(targets).not.toContain('src/stream.js:emit');
+  });
+
+  it('extends the abstract class the statement declares', () => {
+    const users = cg.getNodesInFile('src/use.tsx').find((n) => n.name === 'Users' && n.kind === 'class')!;
+    const bases = cg
+      .getOutgoingEdges(users.id)
+      .filter((e) => e.kind === 'extends')
+      .map((e) => `${cg.getNode(e.target)!.filePath}:${cg.getNode(e.target)!.name}`);
+    expect(bases).toEqual(['src/repository.ts:Repository']);
+  });
+
+  it('reads `require(…).default` and `{ default: X } = require(…)` the same way', () => {
+    const make = cg.getNodesInFile('src/animated/load.ts').find((n) => n.name === 'makeColors')!;
+    const created = cg
+      .getOutgoingEdges(make.id)
+      .filter((e) => e.kind === 'calls' || e.kind === 'instantiates')
+      .map((e) => `${e.kind} ${cg.getNode(e.target)!.filePath}:${cg.getNode(e.target)!.name}`)
+      .sort();
+    expect(created).toEqual([
+      'instantiates src/animated/AnimatedColor.ts:AnimatedColor',
+      'instantiates src/animated/AnimatedColor.ts:AnimatedColor',
+    ]);
   });
 
   it('prefers what the statement exports to an exported component above it', () => {
