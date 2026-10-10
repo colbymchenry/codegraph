@@ -18,11 +18,14 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
+import { memoDbPath, readPersistedMemo, writePersistedMemo } from './persisted-memo';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { referenceNameTail } from './reference-tail';
+
+const GRAPH_EPOCH_KEY = 'graph_epoch';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -1119,8 +1122,45 @@ export class QueryBuilder {
     }
     const stamp = this.getChangeStamp();
     if (this.dominantFileMemo?.stamp === stamp) return this.dominantFileMemo.value;
-    const value = this.computeDominantFile();
+    const value = this.persistedMemo('dominantFile', () => this.computeDominantFile());
     this.dominantFileMemo = { stamp, value };
+    return value;
+  }
+
+  hasGraphEpoch(): boolean {
+    return this.getMetadata(GRAPH_EPOCH_KEY) !== null;
+  }
+
+  /** Replace `graph_epoch`: every persisted memo computed before this is stale. */
+  bumpGraphEpoch(): void {
+    this.setMetadata(GRAPH_EPOCH_KEY, `${Date.now()}.${Math.random().toString(36).slice(2)}`);
+  }
+
+  /** Recompute and store the persisted aggregates under the current epoch. */
+  warmPersistedMemo(): void {
+    this.dominantFileMemo = undefined;
+    this.getDominantFile();
+    this.getStats();
+  }
+
+  /**
+   * Cross-process memo for a query-independent aggregate, so a fresh process
+   * (the prompt hook) reuses what another process computed. It lives in a
+   * sidecar file, not a `project_metadata` row: a reader must never need the
+   * database write lock the daemon's writer holds, and storing a row would
+   * make the hook's own connection a writer. The stamp is read before
+   * computing, so a write racing the compute leaves a stale stamp that the
+   * next call recomputes. Skipped inside a transaction (uncommitted state)
+   * and when the index has no `graph_epoch` yet.
+   */
+  private persistedMemo<T>(key: string, compute: () => T): T {
+    const dbPath = this.db.inTransaction === false ? memoDbPath(this.db) : null;
+    const stamp = dbPath ? this.getMetadata(GRAPH_EPOCH_KEY) : null;
+    if (!dbPath || !stamp) return compute();
+    const hit = readPersistedMemo<T>(dbPath, stamp, key);
+    if (hit !== undefined) return hit;
+    const value = compute();
+    writePersistedMemo(dbPath, stamp, key, value);
     return value;
   }
 
@@ -4194,6 +4234,11 @@ export class QueryBuilder {
    * Get graph statistics
    */
   getStats(): GraphStats {
+    const stats = this.persistedMemo('stats', () => this.computeStats());
+    return { ...stats, lastUpdated: Date.now() };
+  }
+
+  private computeStats(): GraphStats {
     // Single query for all three aggregate counts
     const counts = this.db.prepare(`
       SELECT
@@ -4282,6 +4327,7 @@ export class QueryBuilder {
       this.db.exec('DELETE FROM edges');
       this.db.exec('DELETE FROM nodes');
       this.db.exec('DELETE FROM files');
+      this.bumpGraphEpoch();
     })();
   }
 }
