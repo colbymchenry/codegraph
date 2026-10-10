@@ -1042,9 +1042,12 @@ export class CodeGraph {
             // `lazy-import:./pages/Team`), as does a reference through an
             // import binding the module declares under another name
             // (`module:tag` for `import tagsController from
-            // './tag/tag.controller'`): each resolves through the module, so
-            // an edit can satisfy it as well as an added file. On a sync
-            // where no failed ref matches, this is one indexed lookup.
+            // './tag/tag.controller'`) and a direct member reference through
+            // any binding (`module:constants` for `LIST.includes(x)` after
+            // `import { LIST } from './constants'`): each resolves through the
+            // module, so an edit can satisfy it as well as an added file. On
+            // a sync where no failed ref matches, this is a few indexed
+            // lookups.
             const tRetry = Date.now();
             edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
