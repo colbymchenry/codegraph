@@ -101,4 +101,7 @@ async function exprReceivers(x) {
   (() => 1).call(null);
   this.a.b.run();
   new Runner().go();
+  new RegExp(p).exec(s);
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
 }
