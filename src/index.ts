@@ -1030,10 +1030,12 @@ export class CodeGraph {
             // own, which a reference written as a path
             // (`snippets/price.liquid`) waits under, and the keys a route's
             // lazily loaded module waits under (`module:Team` for
-            // `lazy-import:./pages/Team`): a route renders the component its
-            // module exports, so an edit can satisfy it as well as an added
-            // file. On a sync where no failed ref matches, this is one
-            // indexed lookup.
+            // `lazy-import:./pages/Team`), as does a reference through an
+            // import binding the module declares under another name
+            // (`module:tag` for `import tagsController from
+            // './tag/tag.controller'`): each resolves through the module, so
+            // an edit can satisfy it as well as an added file. On a sync
+            // where no failed ref matches, this is one indexed lookup.
             const tRetry = Date.now();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),

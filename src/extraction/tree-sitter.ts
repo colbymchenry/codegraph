@@ -21,7 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
@@ -69,9 +69,6 @@ const REACT_COMPONENT_HOCS = new Set(['forwardRef', 'memo', 'React.forwardRef', 
  * the real `Handle::stop`.
  */
 const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature']);
-
-/** C++ specifiers that define a class-like type (or an enum) when they carry a body. */
-const CPP_CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
 /** Vue store collections whose object-literal members are the symbols an agent
  *  looks for. Extracted as function nodes so `actions`/`mutations`/`getters` are
@@ -266,36 +263,6 @@ function csharpClassTypeName(node: SyntaxNode | null, source: string): string | 
     default:
       return null;
   }
-}
-
-/**
- * Resolve the declared identifier inside a C declarator. A `declaration`'s
- * `declarator` field nests the name through `init_declarator` (with value),
- * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
- * wrappers (each via their own `declarator` field) down to an `identifier`.
- * A `function_declarator` means the declaration is a function prototype (or a
- * function-pointer var) — return null so it isn't extracted as a variable.
- */
-function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
-  let cur: SyntaxNode | null = node;
-  let guard = 0;
-  while (cur && guard++ < 12) {
-    switch (cur.type) {
-      case 'identifier':
-        return cur;
-      case 'function_declarator':
-        return null;
-      case 'init_declarator':
-      case 'pointer_declarator':
-      case 'array_declarator':
-      case 'parenthesized_declarator':
-        cur = getChildByField(cur, 'declarator');
-        break;
-      default:
-        return null;
-    }
-  }
-  return null;
 }
 
 /** First `simple_identifier` in `node`'s subtree (breadth-ish, first-found).
@@ -571,7 +538,8 @@ export class TreeSitterExtractor {
     const preceding = getPrecedingDocstring(
       anchor,
       this.source,
-      this.extractor?.docstringStepOverTypes
+      this.extractor?.docstringStepOverTypes,
+      this.extractor?.docstringSkipsTrailingComments
     );
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
@@ -611,6 +579,13 @@ export class TreeSitterExtractor {
   private cppBraceScopes: CppBraceScopes | null = null;
   private cppClassScopes = new NestedIntervals<string>();
   private cppClassScopeIds = new Set<string>();
+  // C/C++: whether a class, struct, union or enum defined in the type of a
+  // declaration outside any body is walked (see visitNode). Not in a C++ file
+  // whose tree has errors and whose braces don't balance: error recovery can
+  // close a namespace or a class at the wrong `}`, or run a class past its
+  // own, and with no brace scopes to correct it the walked class would land
+  // in the wrong scope.
+  private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
   // {flash_fwd_kernel}, so a later `kernel<<<grid, block>>>(params)` (or plain
@@ -710,6 +685,9 @@ export class TreeSitterExtractor {
       if (this.language === 'cpp' && this.tree.rootNode.hasError) {
         this.cppBraceScopes = scanCppBraceScopes(this.source);
       }
+      this.walkDeclaredTypes =
+        this.language === 'c' ||
+        (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
       const fileNode: Node = {
@@ -1477,14 +1455,17 @@ export class TreeSitterExtractor {
       this.extractor.variableTypes.includes(nodeType) &&
       (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
     ) {
-      // In a file walked in brace scopes, a class the tree reads as the type
-      // of a declaration (`class X {…}` glued to the tokens after it by
-      // error recovery) is still a class. In a class body the children walk
-      // reached it; out of one, this branch skips that walk.
-      const declaredType = this.cppBraceScopes ? getChildByField(node, 'type') : null;
-      if (declaredType && CPP_CLASS_LIKE_SPECIFIERS.has(declaredType.type) && getChildByField(declaredType, 'body')) {
-        this.visitNode(declaredType);
-      }
+      // C/C++: a class, struct, union or enum defined in the declaration's
+      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
+      // definition like one written on its own, and the variables keep their
+      // nodes beside it. So is a class the tree reads as a declaration's type
+      // in a file walked in brace scopes (`class X {…}` glued to the tokens
+      // after it by error recovery). In a class or function body the children
+      // walk reaches it; here, this branch skips that walk. Mirrored in the
+      // kernel (ccpp/mod.rs visit_node).
+      const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
+      const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
+      if (definedType) this.visitNode(definedType);
       this.extractVariable(node);
       // extractVariable doesn't walk every initializer shape (object literals
       // are deliberately skipped; Python/Ruby don't walk at all), so scan the
@@ -1492,8 +1473,9 @@ export class TreeSitterExtractor {
       // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
       // at nested function definitions (their bodies are walked — and
       // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk.
-      this.scanFnRefSubtree(node, 0);
+      // initializers extractVariable DOES walk. A type walked above captured
+      // its own.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : undefined);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
@@ -2029,7 +2011,8 @@ export class TreeSitterExtractor {
   /**
    * Detect a React component declared via an HOC wrapper whose result is itself a
    * component: `forwardRef(...)`, `memo(...)`, `React.forwardRef/memo(...)`, and
-   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``. These
+   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``, typed
+   * (`styled.tag<Props>\`…\``) or not. These
    * initializers are a call / tagged-template (not a bare arrow), so the const is
    * otherwise classified `constant` — and a constant is skipped by both the
    * JSX-render edge synthesizer and component resolution, so `<Button/>` usages
@@ -2041,6 +2024,7 @@ export class TreeSitterExtractor {
    * `undefined` when this initializer is not a recognized component wrapper.
    */
   private reactComponentHoc(valueNode: SyntaxNode): { inner: SyntaxNode | null } | undefined {
+    if (this.isTypedStyledTemplate(valueNode)) return { inner: null };
     if (valueNode.type !== 'call_expression') return undefined;
     const callee = getChildByField(valueNode, 'function');
     if (!callee) return undefined;
@@ -2066,6 +2050,42 @@ export class TreeSitterExtractor {
       }
     }
     return { inner };
+  }
+
+  /**
+   * A styled tag with type arguments: `styled.div<Props>\`…\``,
+   * `styled(Base)<Props>\`…\``. tree-sitter's tagged-template call takes no type
+   * arguments, so when the type argument also reads as an expression the
+   * initializer parses as comparisons around it: `(styled.div < Props) > \`…\``.
+   * (A type argument that can't be an expression, like `<{ open: boolean }>`,
+   * error-recovers into a call on the tag instead, which the callee test in
+   * reactComponentHoc takes.) The tag is the leftmost operand, against a `<`;
+   * the template is the rightmost, against a `>` (`>>` when the type argument
+   * ends in its own `<…>`). Operators in between belong to the type argument:
+   * `<A & B>` parses as `(styled.div < A) & (B > \`…\`)`. Mirrored in the
+   * kernel (tsjs/extractors.rs is_typed_styled_template).
+   */
+  private isTypedStyledTemplate(valueNode: SyntaxNode): boolean {
+    if (valueNode.type !== 'binary_expression') return false;
+    let tagParent = valueNode;
+    let tag = getChildByField(valueNode, 'left');
+    while (tag?.type === 'binary_expression') {
+      tagParent = tag;
+      tag = getChildByField(tag, 'left');
+    }
+    let templateParent = valueNode;
+    let template = getChildByField(valueNode, 'right');
+    while (template?.type === 'binary_expression') {
+      templateParent = template;
+      template = getChildByField(template, 'right');
+    }
+    return (
+      !!tag &&
+      template?.type === 'template_string' &&
+      getChildByField(tagParent, 'operator')?.type === '<' &&
+      /^>+$/.test(getChildByField(templateParent, 'operator')?.type ?? '') &&
+      /^styled\b/.test(getNodeText(tag, this.source))
+    );
   }
 
   /**

@@ -313,8 +313,11 @@ Each of these cost real debugging time; they are not hypothetical.
    A resolver that reads a language it extracts nothing from lists it in
    `resolveLanguages` instead — Svelte's `$lib/…` imports in `.ts` route
    modules, ASP.NET's Razor `@model` — because widening `languages` also runs
-   `extract()` on those files. `claimsReference()` is still asked of every
-   detected framework.
+   `extract()` on those files. `claimsReference()` is asked of the same
+   frameworks. It used to be asked of every detected one, because protobuf's
+   C++ `::_pbi::…` calls got past the name pre-filter only on the Swift ↔
+   Objective-C bridge's claim of any name with a `:` in it. The pre-filter
+   now reads a leading `::` as the global scope.
 16. **A navigation call waits for a route, not for a name.** A call indexed
    before its route existed is parked as failed (or bound to a catch-all, a
    parameter route, the other arm of a conditional), and sync revisits a

@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType } from './cpp-type-aliases';
+import { cppAliasedTypeName, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -7811,6 +7811,26 @@ export function matchByQualifiedName(
         )
       : nodes;
 
+  // A C or C++ name written from the global scope (`::hpb::CreateMessage`,
+  // `::operator delete`) is the declaration of exactly that name. The suffix
+  // match below would take one nested in another namespace or class: for
+  // fmt's mock `test::open`, the `::open(…)` it wraps. Nor is it a declaration
+  // inside a namespace a macro opens, which only looks global in the index
+  // (fmt's `struct pipe`); step 5 of matchReference reads those.
+  if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.startsWith('::')) {
+    const global = keepForRef(context.getNodesByQualifiedName(ref.referenceName.slice(2))).filter((n) =>
+      (n.language === 'cpp' || n.language === 'c') &&
+      !cppMacroNamespaceFrames(n.filePath, context).some((f) => f.start <= n.startLine && f.end >= n.startLine));
+    const chosen = preferCallSiteFile(global, ref.filePath)[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: global.length === 1 || chosen.filePath === ref.filePath ? 0.95 : 0.85,
+      resolvedBy: 'qualified-name',
+    };
+  }
+
   let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
@@ -8808,11 +8828,39 @@ const CPP_NON_TYPE_TOKENS = new Set([
   'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
 ]);
 
+/**
+ * Does a `>` in a declared C++ type close no `<`? Then the type began on an
+ * earlier line — rocksdb's `std::unique_ptr<BlobContents>>>& blob_reqs` under
+ * `autovector<std::pair<BlobRangeReadRequest*,` — or the text is an
+ * expression (`i < a->b->c`).
+ */
+function cppTypeBeganAbove(typeName: string): boolean {
+  let depth = 0;
+  for (const c of typeName) {
+    if (c === '<') depth++;
+    else if (c === '>' && --depth < 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The last name of a declared C++ type: `const std::vector<std::pair<int,
+ * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
+ * names no type.
+ */
 function normalizeCppTypeName(typeName: string): string | null {
-  const normalized = typeName
-    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
-    .replace(/[&*]+/g, ' ')
-    .replace(/<[^>]*>/g, ' ')
+  // Without its head, what is left of a type begun above names a template
+  // argument's type, not the declared one.
+  if (cppTypeBeganAbove(typeName)) return null;
+  // Template arguments go with the ones nested in them. Cut at their first
+  // `>`, `Table<int, Box<int>>` was `Table >`, which names no type: a call
+  // on it never reached Table's method, and a capitalized name no class has
+  // ruled out any guess as well.
+  const normalized = stripCppTemplateArguments(
+    typeName
+      .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+      .replace(/[&*]+/g, ' '),
+  )
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -9075,6 +9123,10 @@ function inferCppReceiverType(
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
         noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
+      } else if (found && cppTypeBeganAbove(declaratorMatch[1] ?? '')) {
+        // The end of a declaration begun on an earlier line, maybe the
+        // receiver's: one found further up may be another variable.
+        found.shadowed = true;
       }
     } else if (found && cppRebindsReceiver(line, escapedReceiver)) {
       found.shadowed = true;
@@ -13700,6 +13752,8 @@ export function cppMacroNamespaceFrames(file: string, context: ResolutionContext
  */
 function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   let target = ref.referenceName.replace(/^::/, '');
+  // `::memset` names no namespace for a macro or an alias to open.
+  if (!target.includes('::')) return null;
   const head = target.slice(0, target.indexOf('::'));
   const alias = cppNamespaceAliases(context).get(head);
   // `py::str` under `namespace py = pybind11;` is `pybind11::str`.
