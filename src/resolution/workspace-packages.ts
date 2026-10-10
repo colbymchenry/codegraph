@@ -17,11 +17,14 @@
  * Scope deliberately small for v1 (mirrors path-aliases.ts):
  *   - reads `workspaces` (array OR `{ packages: [...] }`) from package.json,
  *     plus a minimal `pnpm-workspace.yaml` `packages:` list
+ *   - reads a sibling directory any package.json depends on by path
+ *     (`"acme-shared": "file:../common"`, `link:`, `portal:`), which needs
+ *     no workspace declaration at all
  *   - expands one level of `*` / `**` globs (`packages/*`, `apps/*`)
  *   - subpath resolution is directory-based (`@scope/ui/sub` → `<ui>/sub`);
  *     it does NOT yet honour a member's `exports` map or `main` field
- *   - returns null when the project declares no workspaces, so single-
- *     package repos pay nothing and see no behaviour change.
+ *   - returns null when the project declares neither, so single-
+ *     package repos see no behaviour change.
  */
 
 import * as fs from 'fs';
@@ -45,8 +48,9 @@ export interface WorkspacePackages {
 
 /**
  * Load workspace member packages for `projectRoot`. Returns `null` when
- * the project declares no workspaces (the common single-package case) —
- * callers then skip all workspace logic.
+ * the project declares no workspaces and no dependency on a directory of its
+ * own (the common single-package case) — callers then skip all workspace
+ * logic.
  *
  * Cheap to call repeatedly only via the resolver's per-instance cache;
  * this function itself touches the filesystem, so the resolver memoises it
@@ -68,9 +72,10 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   // oh-package.json5 declares its local siblings as `"data": "file:../../
   // core/data"` dependencies, and code then imports the bare name
   // (`import { CartRepository } from "data"`). Same monorepo problem as npm
-  // workspaces, different manifest.
+  // workspaces, different manifest. An npm package does the same with
+  // `"acme-shared": "file:../common"` and no root `workspaces` (#2456).
   const entryByName = new Map<string, string>();
-  for (const [name, dir] of collectOhpmFileDeps(projectRoot)) {
+  for (const [name, dir] of collectFileDeps(projectRoot)) {
     if (byName.has(name)) continue;
     byName.set(name, dir);
     const entry = readOhpmMain(projectRoot, dir);
@@ -107,9 +112,11 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
 }
 
 /**
- * Scan the project for `oh-package.json5` manifests and collect their
- * `file:`-protocol dependencies as workspace members: dep name (what the
- * source imports) → target directory (projectRoot-relative posix).
+ * Scan the project for `oh-package.json5` and `package.json` manifests and
+ * collect their `file:`-protocol dependencies as workspace members: dep name
+ * (what the source imports) → target directory (projectRoot-relative posix).
+ * An npm dependency counts when it names a directory of the project other
+ * than the root — not a tarball, and nothing under `node_modules`.
  *
  * Precision rule: a name declared with DIFFERENT target directories in
  * different manifests (e.g. every sample in a samples monorepo has its own
@@ -118,10 +125,10 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
  * use `file:` and are ignored, staying external.
  *
  * The walk is bounded (depth + directory budget) and prunes build/dependency
- * dirs, so non-ArkTS projects pay one readdir at the root and nothing else
- * (they have no oh-package.json5 anywhere shallow).
+ * dirs; a manifest is parsed only where the walk finds one.
  */
 const OHPM_MANIFEST = 'oh-package.json5';
+const NPM_MANIFEST = 'package.json';
 const OHPM_WALK_MAX_DEPTH = 6;
 const OHPM_WALK_DIR_BUDGET = 8000;
 const OHPM_SKIP_DIRS = new Set([
@@ -129,7 +136,7 @@ const OHPM_SKIP_DIRS = new Set([
   'build', 'dist', 'out', 'oh-package-lock.json5',
 ]);
 
-function collectOhpmFileDeps(projectRoot: string): Map<string, string> {
+function collectFileDeps(projectRoot: string): Map<string, string> {
   const byName = new Map<string, string>();
   const ambiguous = new Set<string>();
 
@@ -154,13 +161,14 @@ function collectOhpmFileDeps(projectRoot: string): Map<string, string> {
         queue.push({ rel: rel ? `${rel}/${e.name}` : e.name, depth: depth + 1 });
         continue;
       }
-      if (e.name !== OHPM_MANIFEST) continue;
+      if (e.name !== OHPM_MANIFEST && e.name !== NPM_MANIFEST) continue;
 
-      const deps = readOhpmFileDeps(path.join(abs, e.name));
+      const deps = readFileDeps(path.join(abs, e.name));
       for (const [name, target] of deps) {
         const targetAbs = path.resolve(abs, target);
         const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
         if (targetRel.startsWith('..')) continue; // escapes the project
+        if (e.name === NPM_MANIFEST && (targetRel === '' || /(?:^|\/)node_modules(?:\/|$)/.test(targetRel) || !isDirectory(targetAbs))) continue;
         const existing = byName.get(name);
         if (existing === undefined) {
           if (!ambiguous.has(name)) byName.set(name, targetRel);
@@ -175,8 +183,20 @@ function collectOhpmFileDeps(projectRoot: string): Map<string, string> {
   return byName;
 }
 
-/** Parse one oh-package.json5's dependencies → [name, file-target] pairs. */
-function readOhpmFileDeps(manifestAbs: string): Array<[string, string]> {
+function isDirectory(abs: string): boolean {
+  try {
+    return fs.statSync(abs).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse one manifest's dependencies → [name, path-target] pairs: an
+ * oh-package.json5's `file:` dependencies, and a package.json's `file:`,
+ * `link:` and `portal:` ones from every dependency field.
+ */
+function readFileDeps(manifestAbs: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   let parsed: unknown;
   try {
@@ -187,12 +207,16 @@ function readOhpmFileDeps(manifestAbs: string): Array<[string, string]> {
   } catch {
     return out;
   }
-  const deps = (parsed as { dependencies?: Record<string, unknown> } | null)?.dependencies;
-  if (!deps || typeof deps !== 'object') return out;
-  for (const [name, value] of Object.entries(deps)) {
-    if (typeof value !== 'string' || !value.startsWith('file:')) continue;
-    const target = value.slice('file:'.length).trim();
-    if (target) out.push([name, target]);
+  const npm = path.basename(manifestAbs) === NPM_MANIFEST;
+  const protocol = npm ? /^(?:file|link|portal):/ : /^file:/;
+  for (const field of npm ? ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] : ['dependencies']) {
+    const deps = (parsed as Record<string, unknown> | null)?.[field];
+    if (!deps || typeof deps !== 'object') continue;
+    for (const [name, value] of Object.entries(deps)) {
+      if (typeof value !== 'string' || !protocol.test(value)) continue;
+      const target = value.replace(protocol, '').trim();
+      if (target) out.push([name, target]);
+    }
   }
   return out;
 }
