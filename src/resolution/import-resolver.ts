@@ -53,6 +53,11 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  // Nim modules are plain source files — `import ./a/b` and `include ../c`
+  // append `.nim` (`.nims` for a NimScript module). This covers only the
+  // RELATIVE form: a non-relative module path is relative to the compiler's
+  // search paths, not to the importing file (see resolveNimModule).
+  nim: ['.nim', '.nims'],
 };
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
@@ -430,6 +435,14 @@ const ESM_IMPORT_LANGUAGES = new Set<Language>([
 const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
 
 /**
+ * Nim path roots that always name the standard library, never a project file:
+ * `std/strutils`, and the compiler's own `system`/`posix`/`pure` modules. A
+ * module path rooted here is external, so it never reaches the suffix matcher —
+ * the same reason Rust's roots are listed above.
+ */
+const NIM_STDLIB_ROOTS = new Set(['std', 'system', 'posix', 'pure']);
+
+/**
  * Check if an import is external (npm package, etc.)
  *
  * `context` is consulted for project-defined path aliases
@@ -510,6 +523,14 @@ export function isExternalImport(
     }
     // Anything else is the Go standard library or a third-party module.
     return true;
+  }
+
+  if (language === 'nim') {
+    // Nim's standard library lives under `std/`; `system`/`posix`/`pure` are the
+    // compiler's own. None of them names a project file.
+    if (NIM_STDLIB_ROOTS.has(importPath.split('/')[0]!)) {
+      return true;
+    }
   }
 
   if (language === 'c' || language === 'cpp') {
@@ -1915,6 +1936,15 @@ export function resolveViaImport(
     if (luaResult) return luaResult;
   }
 
+  // Nim `import a/b` / `from a/b import c` / `include a/b`: a module path naming a
+  // source file. There is no declarative import binding to read, and the path is
+  // search-path-relative rather than file-relative, so it is matched as a suffix
+  // of an indexed file (see resolveNimModule).
+  if (ref.language === 'nim' && ref.referenceKind === 'imports') {
+    const nimResult = resolveNimModule(ref, context);
+    if (nimResult) return nimResult;
+  }
+
   // Whole-module / namespace imports → link the importing file to the module
   // file. Python `from . import certs` / `import mod`, and TS/JS `import * as ns
   // from './x'` (so a namespace touched only via a value-member read still
@@ -2170,6 +2200,72 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
     }
   }
   return null;
+}
+
+/**
+ * Nim `import a/b`, `from a/b import c`, `include a/b` — a module path is a
+ * slash-separated path resolved against the compiler's SEARCH PATHS (`src/`, the
+ * project root, a nimble package's own directory), never against the importing
+ * file. The project-root lookup in `resolveAliasedImport` therefore cannot find
+ * `src/neopi/lua.nim` from a ref reading `neopi/lua`, which is why every
+ * cross-module import in a Nim project stayed unresolved; match the path as a
+ * SUFFIX of an indexed file instead.
+ *
+ * `luaBasenameIndex` is reused verbatim: it is built from every indexed file, not
+ * only Lua's, so the suffix filter below is the whole mechanism.
+ *
+ * Precision over recall. A single suffix match resolves; two files carrying the
+ * same module path (two search-path roots holding the same module) are left
+ * unresolved rather than guessed, because which one wins depends on `--path`
+ * flags that are not visible from the source. Lua makes the opposite call —
+ * closest-to-the-importer wins — which is sound there because `require` IS
+ * file-relative. Nim's RELATIVE forms (`./x`, `../x`) are file-relative too, and
+ * do not come through here: `EXTENSION_RESOLUTION.nim` hands those to
+ * `resolveRelativeImport`.
+ */
+function resolveNimModule(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!name) return null;
+
+  // `./x` and `../x` ARE file-relative, so they go through the shared resolver —
+  // which is what EXTENSION_RESOLUTION['nim'] feeds. They cannot use the suffix
+  // match below: the `../` in the reference name is part of the module path, not
+  // a path segment of a project file.
+  if (name.startsWith('.')) {
+    const relative = resolveImportPath(name, ref.filePath, 'nim', context);
+    return relative ? nimFileRef(ref, relative, context) : null;
+  }
+
+  // A quoted path may name the file outright (`include "inc.nim"`). Without
+  // stripping the extension the suffix below is built as `inc.nim.nim`, which
+  // matches nothing — and the ref only survives because the generic name-matcher
+  // then lands on the file node, whose name IS the basename. That coincidence is
+  // what two same-named files in different directories would break.
+  const stem = name.replace(/\.nims?$/, '');
+  const byBasename = luaBasenameIndex(context);
+  for (const suffix of [`${stem}.nim`, `${stem}.nims`]) {
+    const candidates = (byBasename.get(suffix.split('/').pop() ?? '') ?? []).filter(
+      (f) => f === suffix || f.endsWith('/' + suffix)
+    );
+    // Two candidates is an ambiguity Nim itself resolves by `--path` order,
+    // which is invisible here: stay silent rather than pick a guess.
+    if (candidates.length !== 1) continue;
+    const hit = nimFileRef(ref, candidates[0]!, context);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** The `imports` edge target for a resolved Nim module path, or null (self). */
+function nimFileRef(
+  ref: UnresolvedRef,
+  resolvedPath: string,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (resolvedPath === ref.filePath) return null;
+  const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
+  if (!fileNode) return null;
+  return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
 }
 
 /**
