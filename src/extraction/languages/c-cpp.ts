@@ -1061,12 +1061,53 @@ export function maskCppRawStrings(source: string): { source: string; restore: (b
  *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
  *    args are skipped so an embedded `)` can't mis-close the balance.
  *
- * C++-only (wired into cppExtractor). A blanked macro inside a block comment is
- * harmless (comments don't parse), and the rare line-leading no-semicolon
- * ALL-CAPS call that isn't markup only loses that one annotation, never a whole
- * class.
+ * A blanked macro inside a block comment is harmless (comments don't parse), and
+ * the rare line-leading no-semicolon ALL-CAPS call that isn't markup only loses
+ * that one annotation, never a whole class.
+ *
+ * C runs it too, with `keepCReturnTypeMacros`: there a macro at column 0 that
+ * wraps a type and is followed by nothing but a function's declarator IS the
+ * return type — cJSON's `CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item)`,
+ * an `EXPORT(int) version(void);` — and tree-sitter-c reads it as one (a
+ * `macro_type_specifier`). Blanked, it left `cJSON_Print(…)` and a free block,
+ * which parse as a call: the function had no node (#2470). Only where the
+ * declaration starts, though: jemalloc's `size_t JEMALLOC_NOTHROW\n
+ * JEMALLOC_ATTR(pure)\n je_sallocx(…) {` has its type on the line above, and
+ * that macro is the attribute it looks like.
  */
-export function blankCppAnnotationMacroCalls(source: string): string {
+const C_RETURN_TYPE_MACRO_ARG_RE = /^\s*[A-Za-z_][\w\s*]*$/;
+const C_FUNCTION_DECLARATOR_HEAD_RE = /[A-Za-z_]\w*[ \t]*\(/y;
+
+/** Whether the code line above `at` leaves a declaration open: it ends in a type's last token. */
+function continuesCDeclaration(source: string, at: number): boolean {
+  let end = at;
+  while (end > 0) {
+    const start = source.lastIndexOf('\n', end - 2) + 1;
+    const line = source.slice(start, end).trim();
+    end = start;
+    if (line === '') continue;
+    return !/^(?:#|\/\/)/.test(line) && /[\w*]$/.test(line);
+  }
+  return false;
+}
+
+/** Whether `name(…)` at `at` is all that stands before a `{` or a `;`: a function's declarator. */
+function isBareCFunctionDeclarator(source: string, at: number): boolean {
+  C_FUNCTION_DECLARATOR_HEAD_RE.lastIndex = at;
+  const head = C_FUNCTION_DECLARATOR_HEAD_RE.exec(source);
+  if (!head) return false;
+  let depth = 0;
+  for (let i = at + head[0].length - 1; i < source.length; i++) {
+    const c = source[i];
+    if (c === '(') depth++;
+    else if (c === ')') {
+      if (--depth === 0) return /^\s*[{;]/.test(source.slice(i + 1, i + 200));
+    } else if (c === ';' || c === '{' || c === '}') return false;
+  }
+  return false;
+}
+
+export function blankCppAnnotationMacroCalls(source: string, keepCReturnTypeMacros = false): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
@@ -1075,7 +1116,8 @@ export function blankCppAnnotationMacroCalls(source: string): string {
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
     const macroStart = m.index + (m[1] ?? '').length; // skip leading indent
-    let i = m.index + m[0].length - 1; // index of the opening '('
+    const open = m.index + m[0].length - 1; // index of the opening '('
+    let i = open;
     let depth = 0;
     let end = -1;
     for (; i < source.length; i++) {
@@ -1102,6 +1144,8 @@ export function blankCppAnnotationMacroCalls(source: string): string {
     // Only markup is followed by the declaration it decorates; a statement call
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
+    if (keepCReturnTypeMacros && macroStart === m.index && C_RETURN_TYPE_MACRO_ARG_RE.test(source.slice(open + 1, end - 1)) &&
+        isBareCFunctionDeclarator(source, j) && !continuesCDeclaration(source, m.index)) continue;
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
@@ -2337,7 +2381,8 @@ function preParseCSource(source: string): string {
                   )
                 )
               )
-            )
+            ),
+            true
           )
         )
       )
