@@ -238,7 +238,7 @@ export function writerLockHeldMessage(
   return (
     'CodeGraph writer lock held by ' + who + '. ' +
     'Only one live MCP writer may serve a project (auto-sync / index). ' +
-    'Stop the other server (codegraph daemon stop if a shared daemon, or end the other MCP session), ' +
+    'Stop the other server (pick it in codegraph daemon if a shared daemon, or end the other MCP session), ' +
     'or unset CODEGRAPH_NO_DAEMON so additional clients proxy to the shared daemon. ' +
     'If this is stale, delete ' + pidPath
   );

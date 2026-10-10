@@ -119,3 +119,20 @@ it('preserves a foreign writer and the existing database', async () => {
     expect(fs.readFileSync(path.join(root, '.codegraph/codegraph.db'))).toEqual(before);
   } finally { releaseWriterLock(root); }
 });
+
+it('names a command the CLI accepts when it cannot verify the daemon has stopped', async () => {
+  // A legacy lock held by a live process that is not a daemon: there is no
+  // socket to prove it by, so it is neither signalled nor replaced.
+  fs.writeFileSync(path.join(root, '.codegraph/daemon.pid'), `${process.pid}\n`);
+  const cmd = start(['index', '--quiet']);
+  await until(() => cmd.child.exitCode !== null);
+  expect(cmd.child.exitCode).toBe(1);
+  expect(cmd.errors()).toContain('Could not verify that the active CodeGraph daemon has stopped');
+  const advised = /Run `codegraph ([^`]+)`/.exec(cmd.errors())?.[1];
+  expect(advised).toBeDefined();
+  // `daemon` takes no arguments: `codegraph daemon stop` is an error, not a stop.
+  const run = start(advised!.split(' '));
+  await until(() => run.child.exitCode !== null);
+  expect(run.errors()).not.toContain('too many arguments');
+  expect(run.child.exitCode).toBe(0);
+});
