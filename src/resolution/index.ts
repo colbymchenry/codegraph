@@ -291,6 +291,8 @@ export class ReferenceResolver {
   // 565s of combined worker time (~581µs each, recursion-multiplied).
   private supertypeGen = 0;
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+  // getSupertypeNodes' memo, by node id, under the same generation tag.
+  private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -298,6 +300,7 @@ export class ReferenceResolver {
     // Lazy invalidation via the gen tag; bound the map so a long run over many
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+    if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -459,6 +462,42 @@ export class ReferenceResolver {
   }
 
   /**
+   * Put back in the pending set the route references whose answer reads a
+   * module in `changedFilePaths` (`FrameworkResolver.lazyModules`), for a
+   * sync's resolution sweep. Returns the number put back.
+   *
+   * A route that renders a same-file `const Docs = lazy(() =>
+   * import('./pages/Docs'))` binds to the declaration while the module is
+   * missing, and nothing revisited it once the module was added: the
+   * reference had resolved, so it was never parked for the failed-ref retry,
+   * and the rebind of the names a sync defines (CG-33) reaches it only when
+   * the module's component is named like the declaration. An edit that gives
+   * the module its default export, or moves it to another component, changes
+   * the answer the same way: a route's edge follows its old target through
+   * the module's re-index. So does a page behind a barrel the module
+   * forwards. References written in a changed file were resolved against the
+   * new files already.
+   */
+  reopenRouteModuleReaders(changedFilePaths: readonly string[]): number {
+    const readers = this.frameworks.filter((f) => f.lazyModules);
+    if (readers.length === 0 || changedFilePaths.length === 0) return 0;
+    const changed = new Set(changedFilePaths);
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const edge of this.queries.getRouteEdgesMovedBy(changedFilePaths)) {
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (!ref) continue;
+      const asked: UnresolvedRef = { ...ref, filePath: edge.sourceFilePath, language: edge.sourceLanguage };
+      const reads = readers.some((f) => f.lazyModules!(asked, this.context).some((file) => changed.has(file)));
+      if (!reads) continue;
+      edgeIds.push(edge.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /**
    * Pre-build lightweight caches for resolution.
    * Node lookups are now handled by indexed SQLite queries instead of
    * loading all nodes into memory (which caused OOM on large codebases).
@@ -525,6 +564,7 @@ export class ReferenceResolver {
     this.methodMatchCache.clear();
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
+    this.supertypeNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -896,6 +936,18 @@ export class ReferenceResolver {
         }
         this.supertypeMemo.set(memoKey, { gen: this.supertypeGen, supers });
         return supers;
+      },
+
+      getSupertypeNodes: (id: string) => {
+        const hit = this.supertypeNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, RESOLUTION_READ_EDGE_KINDS)) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
       },
 
       getImportMappings: (filePath: string, language) => {

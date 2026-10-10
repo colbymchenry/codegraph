@@ -157,6 +157,14 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * The nodes one type declaration extends or implements, through its own
+   * resolved `implements`/`extends` edges: where getSupertypes unions those of
+   * every type sharing a simple name, this is the supertypes of the node
+   * `id`. Empty during the first resolution pass, as getSupertypes is.
+   * Optional so external/test contexts compile without it.
+   */
+  getSupertypeNodes?(id: string): Node[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile
@@ -371,6 +379,16 @@ export interface FrameworkResolver {
    * calls this describes back for its resolution sweep.
    */
   navigation?: NavigationCalls;
+  /**
+   * The modules whose content `resolve()` reads to answer `ref`, a route
+   * node's reference — none for most. A React route that renders a same-file
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to the component
+   * that module exports, through any barrel that forwards it, and to the
+   * declaration while the module is missing or exports none: the answer
+   * changes with those files although no name the reference carries does, so
+   * a sync that adds or changes one of them resolves the reference again.
+   */
+  lazyModules?(ref: UnresolvedRef, context: ResolutionContext): readonly string[];
 }
 
 /**
