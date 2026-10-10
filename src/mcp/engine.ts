@@ -12,8 +12,9 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
 import type CodeGraph from '../index';
-import { resolveServerRoot } from '../directory';
+import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
@@ -60,6 +61,14 @@ export interface MCPEngineOptions {
    * not just the later file watcher.
    */
   writerLockRoot?: string;
+  /**
+   * Daemon-mode only: the root the liveness watchdog is keyed on (#2404).
+   * When set, every project opened through this engine registers its SQLite
+   * DB (+ WAL) in `<watchdogPathsRoot>/.codegraph/watchdog-paths.json`, so
+   * the watchdog's disk-progress deferral covers long syncs on non-keyed
+   * roots instead of SIGKILLing a healthy daemon mid-sync.
+   */
+  watchdogPathsRoot?: string;
 }
 
 /**
@@ -86,7 +95,7 @@ export class MCPEngine {
   // Retained synchronization ownership for each cached explicit project.
   private explicitProjects = new Map<CodeGraph, ProjectLease>();
   private defaultLease: ProjectLease | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax' | 'watchdogPathsRoot'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax' | 'watchdogPathsRoot'>;
   private closed = false;
   private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
@@ -94,7 +103,7 @@ export class MCPEngine {
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
-    this.opts = { readOnly: opts.readOnly ?? false, watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
+    this.opts = { readOnly: opts.readOnly ?? false, watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax, watchdogPathsRoot: opts.watchdogPathsRoot };
     this.toolHandler = new ToolHandler(null);
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
@@ -103,6 +112,23 @@ export class MCPEngine {
         assertNoRebuild(root);
         if (this.opts.readOnly) return loadCodeGraph().openSync(root, { readOnly: true });
         if (!this.opts.watch) return open();
+        // #2404: register this root's DB with the daemon watchdog's dynamic
+        // progress paths, so a long sync here defers the kill exactly like a
+        // sync on the keyed root. Best-effort: any failure leaves the
+        // pre-#2404 behaviour, never a broken open.
+        const wpr = this.opts.watchdogPathsRoot;
+        if (wpr) {
+          try {
+            const db = path.join(getCodeGraphDir(root), 'codegraph.db');
+            const pf = path.join(getCodeGraphDir(wpr), 'watchdog-paths.json');
+            let raw: unknown = [];
+            try { raw = JSON.parse(fs.readFileSync(pf, 'utf8')); } catch { }
+            const paths = Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string') : [];
+            for (const p of [db, db + '-wal']) if (!paths.includes(p)) paths.push(p);
+            fs.mkdirSync(path.dirname(pf), { recursive: true });
+            fs.writeFileSync(pf, JSON.stringify(paths));
+          } catch { /* best-effort */ }
+        }
         const lease = acquireProject(root, open, this.watchOptions());
         this.explicitProjects.set(lease.cg, lease);
         return lease.cg;
