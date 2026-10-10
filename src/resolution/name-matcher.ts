@@ -8815,7 +8815,11 @@ export function resolveMethodOnType(
   // in ANOTHER file (#314) — is unaffected: that block returns early whenever
   // an import FQN pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(matches, ref.filePath);
+  // Java: a same-named type in another JVM language (Scala's `play.api.data.Form`
+  // beside Java's `play.data.Form`) is the weaker candidate when no import
+  // pins one — a wildcard `import play.data.*` or the same package names none.
+  const sameLanguage = ref.language === 'java' ? matches.filter((m) => m.language === 'java') : [];
+  const ordered = preferCallSiteFile(sameLanguage.length > 0 ? sameLanguage : matches, ref.filePath);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -10033,6 +10037,7 @@ function inferJavaFieldReceiverType(
 ): string | null {
   const inFile = context.getNodesInFile(ref.filePath);
   if (inFile.length === 0) return null;
+  if (ref.language === 'java') return javaEnclosingFieldType(receiverName, ref, inFile);
 
   // Find the class enclosing the call line (tightest match by latest start).
   let enclosing: Node | null = null;
@@ -10055,16 +10060,21 @@ function inferJavaFieldReceiverType(
       n.startLine >= enclosing.startLine &&
       (n.endLine ?? n.startLine) <= enclosingEnd,
   );
-  if (!field || !field.signature) return null;
+  return field ? fieldSignatureType(field) : null;
+}
 
-  // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
-  // strip generics + dotted package, drop array/varargs markers.
-  const beforeName = field.signature.slice(
-    0,
-    field.signature.lastIndexOf(field.name),
-  );
-  const typeRaw = beforeName.trim();
+/**
+ * The declared type of a Java/Kotlin field node, read from its signature
+ * ("<TypeName> <fieldName>", set by tree-sitter.ts extractField): generics,
+ * a dotted package and array/varargs markers stripped — for Java, in
+ * javaTypeName's form, which keeps a written package and outer class. Null
+ * for a primitive or a field without a signature.
+ */
+function fieldSignatureType(field: Node): string | null {
+  if (!field.signature) return null;
+  const typeRaw = field.signature.slice(0, field.signature.lastIndexOf(field.name)).trim();
   if (!typeRaw) return null;
+  if (field.language === 'java') return javaTypeName(typeRaw);
 
   const typeNoGenerics = typeRaw.replace(/<[^>]*>/g, '').trim();
   const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').replace(/\.\.\.$/, '').trim();
@@ -10073,6 +10083,257 @@ function inferJavaFieldReceiverType(
   if (!lastPart) return null;
   if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
   return lastPart;
+}
+
+/**
+ * A Java type as written (`Foo`, `java.util.List<Foo>`, `Map.Entry<K, V>`,
+ * `play.api.mvc.BodyParser<B>`, `Foo[]`), type arguments and array markers
+ * dropped. The class chain is joined with `::` (`Map::Entry`), so a nested
+ * type is never taken for a same-named type nested elsewhere, and a package
+ * written in source stays in front of it, dotted (`play.api.mvc.BodyParser`),
+ * for javaTypeRef to pin the declaration with. Null for a primitive.
+ */
+function javaTypeName(raw: string): string | null {
+  let type = raw;
+  for (let prev = ''; prev !== type; ) {
+    prev = type;
+    type = type.replace(/<[^<>]*>/g, '');
+  }
+  type = type.replace(/\[\s*\]/g, '').replace(/\.\.\.$/, '').replace(/\s+/g, '');
+  const segments = type.split('.').filter(Boolean);
+  let first = segments.length;
+  while (first > 0 && /^[A-Z][\w$]*$/.test(segments[first - 1]!)) first--;
+  const chain = segments.slice(first).join('::');
+  if (!chain || NON_TYPE_RECEIVER_TOKENS.has(chain)) return null;
+  const pkg = segments.slice(0, first).join('.');
+  return pkg ? `${pkg}.${chain}` : chain;
+}
+
+/**
+ * Java: the declared type of the field a receiver names — `mHandler`,
+ * `this.mHandler`, or `Outer.this.mHandler`. The field is looked up in the
+ * class enclosing the call and then in each class around it, tightest first,
+ * because an inner or anonymous class reads its outer classes' fields
+ * (`mHandler.post(...)` inside a `new Runnable() {…}`); `Outer.this.f` names
+ * the class to read. A `static final` field is indexed as a `constant`.
+ */
+function javaEnclosingFieldType(receiverName: string, ref: UnresolvedRef, inFile: Node[]): string | null {
+  const m = receiverName.match(/^(?:(?:(\w+)\.)?this\.)?(\w+)$/);
+  if (!m) return null;
+  const [, outer, fieldName] = m;
+  const enclosing = inFile
+    .filter(
+      (n) =>
+        (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
+        n.language === 'java' &&
+        n.startLine <= ref.line &&
+        (n.endLine ?? n.startLine) >= ref.line,
+    )
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const cls of enclosing) {
+    if (outer && cls.name !== outer) continue;
+    const field = inFile.find(
+      (n) =>
+        (n.kind === 'field' || n.kind === 'constant') &&
+        n.name === fieldName &&
+        n.qualifiedName === `${cls.qualifiedName}::${fieldName}`,
+    );
+    if (field) return fieldSignatureType(field);
+    if (outer) return null;
+  }
+  return null;
+}
+
+/**
+ * Stands for "a type the project does not declare" — a library class, or a
+ * field reached through one — so the caller can refuse a name-only guess.
+ */
+const JAVA_EXTERNAL_TYPE = '\u0000external';
+
+const JVM_DECLARED_TYPE_KINDS = new Set<Node['kind']>(['class', 'interface', 'enum', 'struct', 'trait']);
+
+/** JVM type declarations named `name`. */
+function jvmTypeDecls(name: string, context: ResolutionContext): Node[] {
+  return context
+    .getNodesByName(name)
+    .filter((n) => JVM_DECLARED_TYPE_KINDS.has(n.kind) && sameLanguageFamily(n.language, 'java'));
+}
+
+/**
+ * Whether `decl` is the type one of `fqns` (an import, or a package written
+ * in source) names: the Java declaration of that qualified name or file, or
+ * a Scala / Kotlin one in that package's directory (their qualified names
+ * carry no package, and their files need not be named after the type).
+ */
+function declaresJvmFqn(decl: Node, fqns: string[]): boolean {
+  const dotted = decl.qualifiedName.replace(/::/g, '.');
+  const declPath = decl.filePath.replace(/\\/g, '/');
+  const declFile = declPath.replace(/\.\w+$/, '');
+  const declDir = declPath.slice(0, declPath.lastIndexOf('/') + 1);
+  return fqns.some((fqn) => {
+    const fqnPath = fqn.replace(/\./g, '/');
+    if (dotted === fqn || declFile === fqnPath || declFile.endsWith('/' + fqnPath)) return true;
+    const pkgPath = fqnPath.slice(0, fqnPath.lastIndexOf('/') + 1);
+    return decl.language !== 'java' && pkgPath !== '' && (declDir === pkgPath || declDir.endsWith('/' + pkgPath));
+  });
+}
+
+/**
+ * Whether Java file `filePath` can name `decl` by its simple name without
+ * importing it — for a type read from a declaration (a field's, a local's),
+ * where isJavaTypeVisible judges a name written at a reference. A Java
+ * qualified name reads `package::Outer::Inner`; a nested type is named that
+ * way only in its own file, in its own package (as `Outer.Inner`), or where
+ * its top-level class is imported. A top-level type of another package is
+ * also reachable through a wildcard import, which the import mappings do not
+ * list, so it counts as visible, and so does a Scala or Kotlin declaration,
+ * whose qualified name carries no package to check.
+ */
+function isJavaTypeNameable(decl: Node, filePath: string, context: ResolutionContext): boolean {
+  if (decl.language !== 'java' || decl.filePath === filePath) return true;
+  const segments = decl.qualifiedName.split('::');
+  const hasPackage = segments.length > 1 && /^[a-z]/.test(segments[0]!);
+  const classChain = hasPackage ? segments.slice(1) : segments;
+  if (classChain.length <= 1) return true;
+  const pkg = hasPackage ? segments[0]! : '';
+  if (pkg === javaFileScope(filePath, context).pkg) return true;
+  const outer = pkg ? `${pkg}.${classChain[0]}` : classChain[0]!;
+  return context.getImportMappings(filePath, 'java').some((i) => i.source === outer || i.source.startsWith(outer + '.'));
+}
+
+/** A Java receiver type the project declares. */
+type JavaTypeRef = {
+  /** The class chain resolveMethodOnType matches (`Http::Cookie`). */
+  name: string;
+  /** The declaration an import or a written package pins, when one does. */
+  decl?: Node;
+};
+
+/**
+ * What a Java type written in `filePath` (javaTypeName's form) is: a project
+ * type, or null for a library one (`Parcel`, `Context`, `List`), which none
+ * of the project's methods belongs to. It is a library type when the project
+ * declares no JVM type of its outer name; when an import, or a package
+ * written in source, names a type the project does not declare (`import
+ * java.util.Iterator` beside a project `UByteArray.Iterator`); when every
+ * project type of that name is one the file cannot name that way (a nested
+ * type of another package); or when a project class declares no nested type
+ * of the written name (`MyLayout.LayoutParams`, inherited from a library
+ * class). A short all-caps name (`T`, `VH`) is taken for a type parameter,
+ * whose bound may be a project type, and left alone.
+ */
+function javaTypeRef(written: string, filePath: string, context: ResolutionContext): JavaTypeRef | null {
+  const chainStart = written.indexOf('::');
+  const head = chainStart < 0 ? written : written.slice(0, chainStart);
+  const lastDot = head.lastIndexOf('.');
+  const pkg = lastDot < 0 ? '' : head.slice(0, lastDot);
+  const chain = written.slice(lastDot + 1).split('::');
+  const outer = chain[0]!;
+  if (!pkg && chain.length === 1 && /^[A-Z][A-Z0-9]{0,2}$/.test(outer)) return { name: outer };
+  const decls = jvmTypeDecls(outer, context);
+  if (decls.length === 0) return null;
+  const pins = pkg
+    ? [`${pkg}.${outer}`]
+    : context.getImportMappings(filePath, 'java').filter((i) => i.localName === outer).map((i) => i.source);
+  if (pins.length === 0) {
+    if (!decls.some((d) => isJavaTypeNameable(d, filePath, context))) return null;
+    if (chain.length === 1) return { name: outer };
+    const name = chain.join('::');
+    const nested = jvmTypeDecls(chain[chain.length - 1]!, context).some(
+      (n) => n.qualifiedName === name || n.qualifiedName.endsWith(`::${name}`),
+    );
+    return nested ? { name } : null;
+  }
+  let decl = decls.find((d) => declaresJvmFqn(d, pins));
+  for (const segment of chain.slice(1)) {
+    if (!decl) break;
+    const owner: Node = decl;
+    decl = jvmTypeDecls(segment, context).find((n) => n.qualifiedName === `${owner.qualifiedName}::${segment}`);
+  }
+  if (!decl) return null;
+  const segments = decl.qualifiedName.split('::');
+  const hasPackage = decl.language === 'java' && segments.length > 1 && /^[a-z]/.test(segments[0]!);
+  return { name: (hasPackage ? segments.slice(1) : segments).join('::'), decl };
+}
+
+/**
+ * Resolve a method on a Java receiver type: the pinned declaration's own
+ * method first, then resolveMethodOnType on the class chain, then — for a
+ * nested chain, which the supertype walk there cannot look up — the
+ * supertypes of its simple name. A Scala or Kotlin declaration pinned by an
+ * import is not followed further than its own methods: the class chain alone
+ * matches a same-named Java type as well.
+ */
+function resolveOnJavaType(
+  type: JavaTypeRef,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  if (type.decl) {
+    const decl = type.decl;
+    const own = context
+      .getNodesByName(methodName)
+      .find((n) => n.kind === 'method' && n.qualifiedName === `${decl.qualifiedName}::${methodName}`);
+    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    if (decl.language !== 'java') return null;
+  }
+  const fqn = type.decl ? type.decl.qualifiedName.replace(/::/g, '.') : undefined;
+  const direct = resolveMethodOnType(type.name, methodName, ref, context, 0.9, 'instance-method', fqn);
+  if (direct || !type.name.includes('::') || !context.getSupertypes) return direct;
+  for (const supertype of context.getSupertypes(type.name.split('::').pop()!, 'java')) {
+    const via = resolveMethodOnType(supertype, methodName, ref, context, 0.9, 'instance-method', undefined, 1);
+    if (via) return via;
+  }
+  return null;
+}
+
+/**
+ * Java: the declared type of a receiver the field lookup reaches — a field
+ * (`mRepo`, `this.mRepo`, `Outer.this.mRepo`) or a chain of up to three
+ * fields after it (`mState.menu`, `this.mOwner.mRepo`), whose head may also
+ * be a local. Each hop reads the field declared on the previous hop's type,
+ * and reads that field's type with its own file's imports.
+ * JAVA_EXTERNAL_TYPE as soon as a hop's type is a library one; null when a
+ * hop cannot be typed (an inherited field, an untyped local).
+ */
+function javaReceiverDeclaredType(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): JavaTypeRef | typeof JAVA_EXTERNAL_TYPE | null {
+  const m = receiver.match(/^((?:\w+\.)?this\.\w+|[A-Za-z_$][\w$]*)((?:\.[a-zA-Z_$][\w$]*){0,3})$/);
+  if (!m) return null;
+  const [, head, rest] = m;
+  const segments = rest ? rest.slice(1).split('.').filter(Boolean) : [];
+  const headType =
+    // A plain receiver's local declaration was already read by the caller.
+    (segments.length > 0 && !head!.includes('.')
+      ? inferLocalReceiverType(head!, ref, context)
+      : null) ?? inferJavaFieldReceiverType(head!, ref, context);
+  if (!headType) return null;
+  let written = headType;
+  let filePath = ref.filePath;
+  for (const segment of segments) {
+    const type = javaTypeRef(written, filePath, context);
+    if (!type) return JAVA_EXTERNAL_TYPE;
+    const owner = type.decl?.qualifiedName;
+    const field = context
+      .getNodesByName(segment)
+      .find(
+        (n) =>
+          (n.kind === 'field' || n.kind === 'constant') &&
+          n.language === 'java' &&
+          (owner
+            ? n.qualifiedName === `${owner}::${segment}`
+            : n.qualifiedName.endsWith(`::${type.name}::${segment}`) || n.qualifiedName === `${type.name}::${segment}`),
+      );
+    const fieldType = field ? fieldSignatureType(field) : null;
+    if (!fieldType) return null;
+    written = fieldType;
+    filePath = field!.filePath;
+  }
+  return javaTypeRef(written, filePath, context) ?? JAVA_EXTERNAL_TYPE;
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
@@ -10926,7 +11187,7 @@ function inferLocalReceiverType(
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
-        const type = normalizeInferredTypeName(m[1]);
+        const type = ref.language === 'java' ? javaTypeName(m[1]) : normalizeInferredTypeName(m[1]);
         if (type) {
           lastRaw = m[1];
           return type;
@@ -11360,6 +11621,7 @@ export function matchMethodCall(
   // dedicated inferrer (header scan + `auto`); every other language uses the
   // shared source-based inferrer. resolveMethodOnType validates the method
   // exists on the inferred type, so a mis-inference produces no edge.
+  let localInferred = false;
   if (inferableReceiver) {
     // A VB.NET receiver's declared type decides the call, or that there is no
     // project method to call: SCrawler's `ThumbnailFile.Delete(…)` on an
@@ -11407,7 +11669,18 @@ export function matchMethodCall(
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
     }
-    if (inferredType) {
+    if (inferredType && ref.language === 'java') {
+      localInferred = true;
+      // Java: a local of a library type (`Parcel parcel`, `List<Foo> items`)
+      // has none of the project's methods — neither a same-named nested
+      // project type's (`Iterator<T> it` beside `UByteArray.Iterator`) nor
+      // whatever the name-only strategies below would bind the call to.
+      const type = javaTypeRef(inferredType, ref.filePath, context);
+      if (!type) return null;
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveOnJavaType(type, methodName!, ref, context));
+      if (typedMatch) return typedMatch;
+    } else if (inferredType) {
+      localInferred = true;
       // A Go local bound from a type assertion calls a method of the type Go
       // finds for it, or nothing the project declares: `flusher.Flush()` after
       // `flusher, ok := w.(http.Flusher)` went to a project type named after it.
@@ -11562,12 +11835,27 @@ export function matchMethodCall(
     return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
   }
 
-  // Java/Kotlin: receiver may be a field whose name doesn't match the type by
-  // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
+  // Java: a field receiver — `mRepo`, `this.mRepo`, `Outer.this.mRepo`, or a
+  // chain of fields `mState.menu` — resolves on its declared type, and a
+  // library type (`Handler`, `Context`) gets NO edge rather than the
+  // name-only guesses below.
+  if (ref.language === 'java' && dotMatch && !localInferred) {
+    const declared = nmTimedT('mc-java-declared', ref, () =>
+      javaReceiverDeclaredType(objectOrClass!, ref, context));
+    if (declared === JAVA_EXTERNAL_TYPE) return null;
+    if (declared) {
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveOnJavaType(declared, methodName!, ref, context));
+      if (typedMatch) return typedMatch;
+    }
+  }
+
+  // Kotlin (Java's fields are read in the branch above): receiver may be a
+  // field whose name doesn't match the type by Java naming convention
+  // (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
   // the method on that type. Covers Spring `@Resource`/`@Autowired` field
   // injection where the field type is the concrete bean class.
-  if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
+  if (ref.language === 'kotlin' && dotMatch) {
     const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
     if (inferredType) {
       // When two classes share the same simple name, the caller file's
