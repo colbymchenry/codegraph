@@ -90,9 +90,6 @@ export function splitRouteName(url: string): { method: string | null; path: stri
  */
 const MIN_LIMIT = 3;
 
-/** Manifest rows fetched per route shown, so folding repeats still fills the page. */
-const ROWS_PER_ROUTE = 4;
-
 type ManifestRow = NonNullable<ReturnType<CodeGraph['getRoutingManifest']>>['entries'][number];
 
 /**
@@ -143,9 +140,10 @@ export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
   // symbols, or an inline handler whose every call reads as a "handler"
   // (hono's `GET /stream/text` came back three times, as `streamText`,
   // `writeln` and `sleep`), repeats. A route has ONE answer to "what serves
-  // this" — route-roots.ts's — so rows are over-fetched and folded onto it.
-  const fetched = limit * ROWS_PER_ROUTE + 1;
-  const manifest = cg.getRoutingManifest(fetched);
+  // this" — route-roots.ts's — so every row of a route is fetched and folded
+  // onto it. The window counts routes, not rows: one inline handler with
+  // dozens of calls must not push the routes after it off the page.
+  const manifest = cg.getRoutingManifest(limit + 1, true);
   const routeCount = cg.getStats().nodesByKind.route ?? 0;
 
   if (!manifest) {
@@ -161,7 +159,7 @@ export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
   }
 
   const folded = oneRowPerRoute(cg, manifest.entries);
-  const truncated = folded.length > limit || manifest.entries.length >= fetched;
+  const truncated = folded.length > limit;
   const rows = folded.slice(0, limit);
 
   // Every row's handler file in one batched query, so a project that scatters

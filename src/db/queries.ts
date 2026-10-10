@@ -305,6 +305,7 @@ export class QueryBuilder {
     getChangeStamp?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
+    getRoutingManifestPerRoute?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
   } = {};
 
@@ -1219,8 +1220,12 @@ export class QueryBuilder {
    * Also returns the file with the most handler endpoints — used as the
    * "top handler file" to inline source for, so the agent has both the
    * mapping AND the handler implementations.
+   *
+   * `limit` caps rows, and a route has a row per symbol it reaches. With
+   * `perRoute` it caps routes instead and returns every row of those routes,
+   * so one inline handler's many calls can't take other routes' places.
    */
-  getRoutingManifest(limit: number = 40): {
+  getRoutingManifest(limit: number = 40, perRoute: boolean = false): {
     entries: Array<{
       url: string;
       handler: string;
@@ -1236,12 +1241,15 @@ export class QueryBuilder {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    if (!this.stmts.getRoutingManifest) {
+    const key = perRoute ? 'getRoutingManifestPerRoute' : 'getRoutingManifest';
+    if (!this.stmts[key]) {
       // Edge kind varies across framework resolvers: Spring/Rails/
       // Laravel/Drupal emit `references`, Express emits `calls`. Accept
       // both — the semantic is the same (route → its handler). A screen in
       // a Vue / Svelte / Astro app is served by a `component`.
-      this.stmts.getRoutingManifest = this.db.prepare(`
+      const serves = `e.kind IN ('references', 'calls')
+          AND h.kind IN ('function', 'method', 'class', 'constant', 'variable', 'component')`;
+      this.stmts[key] = this.db.prepare(`
         SELECT
           r.name AS url,
           r.id AS route_id,
@@ -1255,13 +1263,19 @@ export class QueryBuilder {
         JOIN edges e ON e.source = r.id
         JOIN nodes h ON e.target = h.id
         WHERE r.kind = 'route'
-          AND e.kind IN ('references', 'calls')
-          AND h.kind IN ('function', 'method', 'class', 'constant', 'variable', 'component')
+          AND ${serves}
+          ${perRoute ? `AND r.id IN (
+            SELECT r2.id FROM nodes r2
+            WHERE r2.kind = 'route'
+              AND EXISTS (SELECT 1 FROM edges e JOIN nodes h ON e.target = h.id WHERE e.source = r2.id AND ${serves})
+            ORDER BY r2.file_path, r2.start_line
+            LIMIT ?
+          )` : ''}
         ORDER BY r.file_path, r.start_line
-        LIMIT ?
+        ${perRoute ? '' : 'LIMIT ?'}
       `);
     }
-    const rows = this.stmts.getRoutingManifest.all(limit) as Array<{
+    const rows = this.stmts[key]!.all(limit) as Array<{
       url: string; route_id: string; route_file: string; route_line: number;
       handler: string; handler_file: string; handler_line: number; handler_kind: string;
     }>;

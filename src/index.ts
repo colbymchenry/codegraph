@@ -2070,7 +2070,7 @@ export class CodeGraph {
    * via the `references` edge that framework resolvers emit. Returns
    * null when fewer than 3 valid (non-test) routes exist.
    */
-  getRoutingManifest(limit?: number): {
+  getRoutingManifest(limit?: number, perRoute?: boolean): {
     entries: Array<{
       url: string;
       handler: string;
@@ -2085,7 +2085,7 @@ export class CodeGraph {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    return this.queries.getRoutingManifest(limit);
+    return this.queries.getRoutingManifest(limit, perRoute);
   }
 
   // ===========================================================================
