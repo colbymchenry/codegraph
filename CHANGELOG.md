@@ -354,6 +354,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Expo Router apps: screens and navigation are in the graph.** Every screen file under `app/` (or `src/app/`) is now a route node named by its path — `/object-detail`, `/item/[id]`, with `(group)` folders stripped — linked to the component it renders. Calls like `router.push('/object-detail?…')`, `router.navigate({ pathname: '/item/[id]', params })`, template-literal hrefs, an href held in a local `const`, and `router.push(await pickRoute())` where the helper returns screen paths (one edge per screen it can return) resolve to the screen they open as a new `navigates` edge that remembers the href, so "where does tapping this go" and "who opens this screen" are one hop in `codegraph_explore` and `callers` instead of a dead end at a string. Re-index after upgrading to pick the new edges up.
 
+- **Qoder joins the list of agents `codegraph install` sets up for you.** The MCP server is written into Qoder's own config — its user-level `SharedClientCache/mcp.json`, or a project's `.qoder/mcp.json` — exactly where Qoder looks for MCP servers, and `codegraph uninstall` takes it back out. Qoder is an AI-native editor built on a VS Code fork, so it takes the same JSON entry shape every other target does.
+
 ### Fixes
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
