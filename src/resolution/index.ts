@@ -1106,7 +1106,11 @@ export class ReferenceResolver {
       }
     }
     const colonIdx = name.indexOf('::');
-    if (colonIdx > 0) {
+    // `>= 0`, not `> 0`: a ROOT-qualified name (`::ns::proc` — Tcl namespaces,
+    // C++ global scope) starts with the separator itself, and without this the
+    // pre-filter dropped the ref before the qualified-name strategy could ever
+    // see it. The `lastColon > colonIdx` tail check below covers it (`log`).
+    if (colonIdx >= 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
       if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
