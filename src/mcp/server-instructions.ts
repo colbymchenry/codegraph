@@ -12,10 +12,11 @@
  *   - Anti-patterns (don't re-verify with grep; don't hand-reconstruct flows)
  *
  * Keep it tight. The agent reads this every session — long instructions
- * burn tokens. The DEFAULT MCP surface is `codegraph_explore` ALONE (see
- * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
- * tools (node/search/callers/…) stay defined and are re-enablable via
- * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
+ * burn tokens. The DEFAULT MCP surface is `codegraph_explore` + the Vue-only
+ * `codegraph_component` (see DEFAULT_MCP_TOOLS in tools.ts) — reference only
+ * those tools here. The others (node/search/callers/…) stay defined and are
+ * re-enablable via CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents,
+ * so don't name them.
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
@@ -31,15 +32,21 @@ verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
 round-trips than reading files yourself.
 
-## One tool: codegraph_explore — use it instead of reading files
+## Tools: codegraph_explore (primary) + codegraph_component (Vue)
 
-There is a single tool, \`codegraph_explore\`, and it is Read-equivalent. It
+There are two tools by default. \`codegraph_explore\` is Read-equivalent: it
 takes either a natural-language question or a bag of symbol/file names and
 returns the **verbatim, line-numbered source** of the relevant symbols
 grouped by file — the same \`<n>\\t<line>\` shape \`Read\` gives you, safe to
 \`Edit\` from — PLUS the call path among them (including dynamic-dispatch hops
 like callbacks, React re-render, and JSX children that grep can't follow) and
 a blast-radius summary of what depends on them.
+
+\`codegraph_component\` answers one narrower question for **Vue** projects: a
+component's public contract — props (with types/defaults/docs), emits, slots,
+exposed — plus the child components it renders and every parent
+\`@event="handler"\` binding attached to it. Call it before building with or
+refactoring a Vue component instead of reading the SFC.
 
 Whether you're answering "how does X work" or implementing a change (fixing a
 bug, adding a feature), call \`codegraph_explore\` before you Read. ONE call
@@ -54,6 +61,7 @@ calls; a grep/read exploration is dozens.
 - **Almost any question — "how does X work", architecture, a bug, "what/where is X", or surveying an area** → \`codegraph_explore\` with a natural-language question or the relevant names. ONE capped call returns the verbatim source grouped by file; most often the ONLY call you need.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
+- **Using, editing, or refactoring a Vue component** → \`codegraph_component\` with the component name — one call returns its props/emits/slots contract, what it renders, and which parent handlers its events feed, so changing an emit shows exactly who breaks. Everything else about it (its script's functions, its callers) stays an \`codegraph_explore\` question.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read. Suggested call counts are advisory only, NOT a quota; extra calls are never rejected or rate-limited.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.

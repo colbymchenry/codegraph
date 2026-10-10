@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
     return_type TEXT, -- normalized return/result type name (e.g. C++ method return, for receiver-type inference)
+    metadata TEXT, -- JSON object: kind-specific payload (component nodes carry componentApi)
     updated_at INTEGER NOT NULL
 );
 
