@@ -51,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  gdscript: 'tree-sitter-gdscript.wasm',
 };
 
 /**
@@ -76,6 +77,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.py': 'python',
   '.pyw': 'python',
   '.go': 'go',
+  '.gd': 'gdscript',
   '.rs': 'rust',
   '.java': 'java',
   '.c': 'c',
@@ -395,6 +397,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
+  'gdscript',
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
@@ -934,6 +937,7 @@ export function getLanguageDisplayName(language: Language): string {
     cfquery: 'CFQuery (SQL)',
     cobol: 'COBOL',
     vbnet: 'Visual Basic .NET',
+    gdscript: 'GDScript',
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
