@@ -1652,6 +1652,29 @@ function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: Resoluti
   return true;
 }
 
+/**
+ * `Modifier.pad()` after `import androidx.compose.ui.Modifier`: the type is
+ * outside the project, but Kotlin lets the project extend it. The call reaches
+ * a project extension on that type — `fun Modifier.pad()`, indexed as
+ * `Modifier::pad` — that the call site can see (its file, its package, an
+ * import of it by name or `.*`) and whose own file imports the same type.
+ * Compose's own `Modifier.fillMaxSize()` matches none and stays unlinked.
+ */
+function kotlinExtensionOnImportedType(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const call = /^(\w+)\.(\w+)$/.exec(ref.referenceName);
+  if (!call || ref.referenceKind !== 'calls') return null;
+  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === call[1]);
+  if (!binding) return null;
+  const pkg = binding.source.slice(0, binding.source.lastIndexOf('.'));
+  const extensions = context.getNodesByQualifiedName(`${binding.exportedName}::${call[2]}`).filter((n) => {
+    if (n.kind !== 'method' || n.language !== 'kotlin' || !isKotlinTopLevelVisible(n, ref, context)) return false;
+    const scope = kotlinFileScope(n.filePath, context);
+    return scope.imports.has(binding.source) || scope.stars.has(pkg);
+  });
+  const chosen = extensions.length > 1 ? extensions.filter((n) => n.filePath === ref.filePath) : extensions;
+  return chosen.length === 1 ? { original: ref, targetNodeId: chosen[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
+}
+
 /** Lua's global functions, and the test runner's: `local type = type` is the standard library's `type`. */
 const LUA_GLOBAL_FUNCTIONS: ReadonlySet<string> = new Set([
   'assert', 'error', 'ipairs', 'pairs', 'next', 'type', 'tostring', 'tonumber', 'setmetatable', 'getmetatable',
@@ -14031,10 +14054,11 @@ function matchReferenceInner(
 
   // `import java.lang.reflect.Field;` — the file's `Field` is the JDK's, never
   // a project class of that name (gson's production code bound it to a test's
-  // nested `ParameterizedTypesTest.Field`).
+  // nested `ParameterizedTypesTest.Field`). Only a Kotlin extension the
+  // project declares on that type is in the graph.
   if ((ref.language === 'java' || ref.language === 'kotlin') && ref.referenceKind !== 'imports' &&
       isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
-    return null;
+    return ref.language === 'kotlin' ? kotlinExtensionOnImportedType(ref, context) : null;
   }
 
   // A symbolic name in a Scala type is a type (`F ~> G`) or a kind-projector
