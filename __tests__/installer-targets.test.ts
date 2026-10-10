@@ -3106,7 +3106,7 @@ describe('Installer target — PiG', () => {
       exposure: 'direct',
       description: expect.any(String),
     });
-    // No `type` key: PiG's project-override rule keys off command/url/type.
+    // Same shape `pig mcp add` writes: no `type` key.
     expect(cfg.mcpServers.codegraph.type).toBeUndefined();
   });
 
@@ -3143,7 +3143,7 @@ describe('Installer target — PiG', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.pig'))).toBe(false);
   });
 
-  it('uninstall removes an empty mcpServers object it created, but keeps a sibling server', () => {
+  it('uninstall keeps a sibling server and other settings; deletes a file it would leave empty', () => {
     const pig = getTarget('pig')!;
     const file = path.join(tmpHome, '.config', 'pig', 'agent', 'mcp.json');
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -3155,9 +3155,22 @@ describe('Installer target — PiG', () => {
     expect(after.mcpServers).toEqual({ other: { command: 'x' } });
     expect(after.mcpServers.codegraph).toBeUndefined();
 
-    // Sole entry: uninstall drops the now-empty mcpServers key entirely.
-    fs.writeFileSync(file, JSON.stringify({ mcpServers: { codegraph: { command: 'codegraph' } } }) + '\n');
+    // Sole server, but another top-level setting: only mcpServers goes.
+    fs.writeFileSync(file, JSON.stringify({ autoEnableCodemode: false, mcpServers: { codegraph: { command: 'codegraph' } } }) + '\n');
     pig.uninstall('global');
-    expect(JSON.parse(fs.readFileSync(file, 'utf-8'))).toEqual({});
+    expect(JSON.parse(fs.readFileSync(file, 'utf-8'))).toEqual({ autoEnableCodemode: false });
+
+    // From-scratch install: uninstall leaves no empty mcp.json behind.
+    fs.rmSync(file);
+    pig.install('global', { autoAllow: true });
+    pig.uninstall('global');
+    expect(fs.existsSync(file)).toBe(false);
+    expect(pig.uninstall('global').files[0].action).toBe('not-found');
+  });
+
+  it('printConfig explains the global-only location instead of printing nothing', () => {
+    const pig = getTarget('pig')!;
+    expect(pig.printConfig('local')).toMatch(/--location=global/);
+    expect(pig.printConfig('global')).toContain('"exposure": "direct"');
   });
 });

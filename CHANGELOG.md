@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- `codegraph install` now sets up PiG (the Go coding agent harness, github.com/MichaelKinsy/PiG) by adding codegraph to its MCP servers, so PiG sessions can use the knowledge graph. Use `--target=pig`, or pick PiG in the prompt when it is installed. Start a new PiG session afterwards.
+- PiG, the Go port of the Pi coding agent, is now a supported agent: `codegraph install` detects it and adds CodeGraph to its MCP servers (`--target=pig` to pick it by hand), and `codegraph uninstall` removes it again.
 
 ### Fixes
 

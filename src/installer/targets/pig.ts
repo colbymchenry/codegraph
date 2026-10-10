@@ -13,6 +13,10 @@
  * PIG_HOME/agent, then XDG_CONFIG_HOME/pig/agent, then ~/.pig/agent. The
  * project-level `.pig/mcp.json` is only read after the user trusts the
  * project, so this target writes only the global file.
+ *
+ * No `--path` (unlike Cursor): PiG starts stdio servers in the session's
+ * working directory. No `type` key either — PiG tells stdio from HTTP by
+ * `command` vs `url`, and its own `pig mcp add` writes none.
  */
 
 import * as fs from 'fs';
@@ -107,12 +111,20 @@ class PigTarget implements AgentTarget {
     if (Object.keys(config.mcpServers).length === 0) {
       delete config.mcpServers;
     }
-    writeJsonFile(file, config);
+    if (Object.keys(config).length === 0) {
+      // Nothing left but the `{}` we'd write back — delete the file so
+      // uninstall fully reverses a from-scratch install.
+      fs.unlinkSync(file);
+    } else {
+      writeJsonFile(file, config);
+    }
     return { files: [{ path: file, action: 'removed' }] };
   }
 
   printConfig(loc: Location): string {
-    if (loc !== 'global') return '';
+    if (loc !== 'global') {
+      return '# PiG reads its MCP servers from the global agent dir — use --location=global.\n';
+    }
     const snippet = JSON.stringify({ mcpServers: { codegraph: buildPigMcpConfig() } }, null, 2);
     return `# Add to ${mcpJsonPath()}\n\n${snippet}\n`;
   }
