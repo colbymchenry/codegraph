@@ -3208,14 +3208,15 @@ export class ExtractionOrchestrator {
    * - edges whose source is in a file this sync already re-extracted are
    *   skipped — their references were re-resolved from scratch moments ago;
    * - very common names are skipped by the per-name ceiling in
-   *   `getResolutionEdgesByTargetName`.
+   *   `getResolutionEdgesByTargetName`, counted over the edges up to
+   *   `countedUpToEdgeId` when given (those before the sync's failed-ref retry).
    *
    * Returns the number of references resurrected.
    */
-  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): number {
+  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[], countedUpToEdgeId?: number): number {
     if (definitionDelta.length === 0) return 0;
     const alreadyFresh = new Set(changedFilePaths);
-    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta);
+    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta, undefined, countedUpToEdgeId);
 
     const edgeIds: number[] = [];
     const refs: UnresolvedReference[] = [];

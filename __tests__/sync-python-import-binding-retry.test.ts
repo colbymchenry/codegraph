@@ -12,6 +12,12 @@
  * importer changed or the project was indexed again. #2450 parked the ES-module
  * bindings under their module; a Python import names its module by a dotted
  * path, relative to the importing file's package when it starts with dots.
+ *
+ * An unaliased name has the same gap when a package re-exports it:
+ * `from fastapi import FastAPI` reaches `fastapi/applications.py` through
+ * `fastapi/__init__.py`, which declares no node named `FastAPI`. So a package
+ * `__init__.py` that appears after its importers, or gains the re-export,
+ * left them unlinked too.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -19,6 +25,7 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
+import { QueryBuilder } from '../src/db/queries';
 import { moduleReferenceKeys } from '../src/db/reference-tail';
 
 type Files = Record<string, string>;
@@ -104,6 +111,46 @@ const BY_NAME: Files = {
 };
 const BY_NAME_ADDED: Files = { 'app/schemas.py': 'class FormSchema:\n    pass\n' };
 
+/**
+ * Unaliased imports of what a package re-exports from the modules that declare
+ * it: absolutely (`from shop import Order`) and from the package above
+ * (`from .. import Order`). The package renames what it re-exports, so nothing
+ * named `Order` or `price` exists for a name lookup to find.
+ */
+const REEXPORT_IMPORTERS: Files = {
+  'shop/models.py': 'class _Order:\n    pass\n',
+  'shop/services/__init__.py': '',
+  'shop/services/pricing.py': 'def base_price():\n    return 1\n',
+  'shop/api/__init__.py': '',
+  'shop/api/views.py': 'from .. import Order\n\n\ndef view():\n    return Order()\n',
+  'checkout.py': 'from shop import Order, price\n\n\ndef run():\n    return Order(), price()\n',
+};
+const REEXPORT_PACKAGE: Files = {
+  'shop/__init__.py': 'from .models import _Order as Order\nfrom .services.pricing import base_price as price\n',
+};
+const REEXPORT_LINKS = [
+  'Order: imports file checkout.py -> class shop/models.py::_Order',
+  'Order: imports file shop/__init__.py -> class shop/models.py::_Order',
+  'Order: imports file shop/api/views.py -> class shop/models.py::_Order',
+  'Order: instantiates function checkout.py -> class shop/models.py::_Order',
+  'Order: instantiates function shop/api/views.py -> class shop/models.py::_Order',
+  'price: calls function checkout.py -> function shop/services/pricing.py::base_price',
+  'price: imports file checkout.py -> function shop/services/pricing.py::base_price',
+  'price: imports file shop/__init__.py -> function shop/services/pricing.py::base_price',
+];
+
+/** fastapi's shape: `from fastapi import FastAPI` through `from .applications import FastAPI as FastAPI`. */
+const SAME_NAME: Files = {
+  'kit/applications.py': 'class Kit:\n    pass\n',
+  'app.py': 'from kit import Kit\n\n\ndef make():\n    return Kit()\n',
+};
+const SAME_NAME_PACKAGE: Files = { 'kit/__init__.py': 'from .applications import Kit as Kit\n' };
+const SAME_NAME_LINKS = [
+  'Kit: imports file app.py -> class kit/applications.py::Kit',
+  'Kit: imports file kit/__init__.py -> class kit/applications.py::Kit',
+  'Kit: instantiates function app.py -> class kit/applications.py::Kit',
+];
+
 let roots: string[] = [];
 let graphs: CodeGraph[] = [];
 
@@ -145,9 +192,9 @@ function edgesOf(graph: CodeGraph): string[] {
     .sort();
 }
 
-/** The {@link LINKS} the graph has. */
-function linksOf(graph: CodeGraph): string[] {
-  const names = new Set(LINKS.map((link) => link.slice(0, link.indexOf(':'))));
+/** The links of `expected`'s reference names the graph has ({@link LINKS} by default). */
+function linksOf(graph: CodeGraph, expected: string[] = LINKS): string[] {
+  const names = new Set(expected.map((link) => link.slice(0, link.indexOf(':'))));
   const ids = graph.getFiles().flatMap((file) => graph.getNodesInFile(file.path)).map((n) => n.id);
   const links: string[] = [];
   for (const edge of graph.getOutgoingEdgesFrom(ids)) {
@@ -162,9 +209,13 @@ function linksOf(graph: CodeGraph): string[] {
 
 /** The final tree, indexed from scratch in a folder of its own: what the sync has to match. */
 async function fullIndexOf(files: Files): Promise<string[]> {
+  return edgesOf(await freshGraphOf(files));
+}
+
+async function freshGraphOf(files: Files): Promise<CodeGraph> {
   const root = tempRoot();
   write(root, files);
-  return edgesOf(await index(root));
+  return index(root);
 }
 
 describe('sync links references through a Python import alias to their module', () => {
@@ -229,21 +280,64 @@ describe('sync links references through a Python import alias to their module', 
   }, 120_000);
 });
 
+describe('sync links an unaliased Python import through the package that re-exports it', () => {
+  it('when the package is added after its importers', async () => {
+    const root = tempRoot();
+    write(root, REEXPORT_IMPORTERS);
+    const graph = await index(root);
+    expect(linksOf(graph, REEXPORT_LINKS)).toEqual([]);
+
+    write(root, REEXPORT_PACKAGE);
+    const result = await graph.sync();
+    expect(result.filesAdded).toBe(1);
+    expect(result.filesModified).toBe(0);
+    expect(linksOf(graph, REEXPORT_LINKS)).toEqual(REEXPORT_LINKS);
+    expect(edgesOf(graph)).toEqual(await fullIndexOf({ ...REEXPORT_IMPORTERS, ...REEXPORT_PACKAGE }));
+  }, 120_000);
+
+  it('when an edit gives the package the re-export', async () => {
+    const root = tempRoot();
+    write(root, { ...REEXPORT_IMPORTERS, 'shop/__init__.py': '' });
+    const graph = await index(root);
+
+    write(root, REEXPORT_PACKAGE);
+    expect((await graph.sync()).filesModified).toBe(1);
+    expect(linksOf(graph, REEXPORT_LINKS)).toEqual(REEXPORT_LINKS);
+    expect(edgesOf(graph)).toEqual(await fullIndexOf({ ...REEXPORT_IMPORTERS, ...REEXPORT_PACKAGE }));
+  }, 120_000);
+
+  it('when it re-exports the name its module declares', async () => {
+    // While the package is missing, the import itself is linked to `Kit` by
+    // name, which a full index links through the package: the same link.
+    const root = tempRoot();
+    write(root, SAME_NAME);
+    const graph = await index(root);
+
+    write(root, SAME_NAME_PACKAGE);
+    expect((await graph.sync()).filesAdded).toBe(1);
+    expect(linksOf(graph, SAME_NAME_LINKS)).toEqual(SAME_NAME_LINKS);
+    expect(linksOf(await freshGraphOf({ ...SAME_NAME, ...SAME_NAME_PACKAGE }), SAME_NAME_LINKS)).toEqual(SAME_NAME_LINKS);
+  }, 120_000);
+});
+
 describe('a failed reference through a Python import alias', () => {
   it('waits for its module, and every other reference keeps its own tail', async () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
       ...BY_NAME,
-      // An unaliased import, a standard-library alias and a member read
-      // through an alias wait for the name they use.
+      ...REEXPORT_IMPORTERS,
+      // An unaliased import of an outside package, a standard-library alias
+      // and a member read through an alias wait for the name they use; an
+      // unaliased import of the project's own module waits for its module.
       'app/other.py': [
         'from .models import Group',
+        'from django.db.models import Q',
         'from collections import OrderedDict as OD',
         'from .models import User as UserModel',
         '',
         'def build():',
-        '    return Group(), OD(), UserModel.create()',
+        '    return Group(), Q(), OD(), UserModel.create()',
         '',
       ].join('\n'),
     });
@@ -273,7 +367,13 @@ describe('a failed reference through a Python import alias', () => {
       // Still found by its own name too: sync's lookup by whole name.
       expect(tailOf('app/form.py', 'FormSchema', 'extends')).toBe('module:lib');
 
-      expect(tailOf('app/other.py', 'Group', 'calls')).toBe('Group');
+      // An unaliased import of a module in the project's own folders.
+      expect(tailOf('app/other.py', 'Group', 'calls')).toBe('module:models');
+      expect(tailOf('checkout.py', 'Order', 'calls')).toBe('module:shop');
+      expect(tailOf('checkout.py', 'price', 'imports')).toBe('module:shop');
+      expect(tailOf('shop/api/views.py', 'Order', 'calls')).toBe('module:shop');
+
+      expect(tailOf('app/other.py', 'Q', 'calls')).toBe('Q');
       expect(tailOf('app/other.py', 'OD', 'calls')).toBe('OD');
       expect(tailOf('app/other.py', 'UserModel.create', 'calls')).toBe('create');
 
@@ -286,4 +386,55 @@ describe('a failed reference through a Python import alias', () => {
       db.close();
     }
   }, 60_000);
+});
+
+describe('the retry ceiling', () => {
+  let db: DatabaseConnection | undefined;
+
+  afterEach(() => {
+    db?.close();
+    db = undefined;
+  });
+
+  /** 600 failed calls of `FastAPI` parked under 'module:fastapi', and 600 of `get` under their name. */
+  function fixture(): QueryBuilder {
+    db = DatabaseConnection.initialize(path.join(tempRoot(), 'test.db'));
+    const queries = new QueryBuilder(db.getDb());
+    queries.insertNode({ id: 'f', kind: 'file', name: 'app.py', qualifiedName: 'app.py', filePath: 'app.py',
+      language: 'python', startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0 });
+    const refs = Array.from({ length: 1200 }, (_, i) => ({
+      fromNodeId: 'f', referenceName: i < 600 ? 'FastAPI' : 'get', referenceKind: 'calls' as const,
+      line: i + 1, column: 0, filePath: 'app.py', language: 'python' as const,
+    }));
+    queries.insertUnresolvedRefsBatch(refs);
+    db.getDb().exec("UPDATE unresolved_refs SET status = 'failed', name_tail = CASE reference_name WHEN 'FastAPI' THEN 'module:fastapi' ELSE 'get' END");
+    return queries;
+  }
+
+  it('lets every importer of a package that appeared retry, and still skips a common name', () => {
+    const queries = fixture();
+    // Every importer of the package waits for it: a large population is not noise.
+    expect(queries.getRetryableFailedReferences(['module:fastapi'])).toHaveLength(600);
+    // A name shared by 600 failed calls is, as before; so is the by-name lookup of parked rows.
+    expect(queries.getRetryableFailedReferences(['get'])).toHaveLength(0);
+    expect(queries.getRetryableFailedReferences(['FastAPI'])).toHaveLength(0);
+    // The module ceiling still bounds the work.
+    expect(queries.getRetryableFailedReferences(['module:fastapi'], 500, 599)).toHaveLength(0);
+  });
+
+  it("leaves the edges a sync's retry just made out of the rebind's count, not out of the rebind", () => {
+    // Django: relinking every `from django.urls import path` must not stop a
+    // new definition of `path` from rebinding the calls it may now answer.
+    const queries = fixture();
+    queries.insertNode({ id: 'p', kind: 'variable', name: 'path', qualifiedName: 'path', filePath: 'conf.py',
+      language: 'python', startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0 });
+    const edge = (line: number) => ({ source: 'f', target: 'p', kind: 'calls' as const, line, column: 0,
+      metadata: { refName: 'path', resolvedBy: 'exact-match', confidence: 0.7 } });
+    queries.insertEdges([edge(1)]);
+    const beforeRetry = queries.getMaxEdgeId();
+    queries.insertEdges(Array.from({ length: 600 }, (_, i) => edge(i + 2)));
+
+    expect(queries.getResolutionEdgesByTargetName(['path'])).toHaveLength(0);
+    expect(queries.getResolutionEdgesByTargetName(['path'], 500, beforeRetry)).toHaveLength(601);
+  });
 });

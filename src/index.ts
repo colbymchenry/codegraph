@@ -998,6 +998,10 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        // The last edge before the failed-ref retry below: the rebind's
+        // per-name ceiling counts only edges up to it (see
+        // resurrectStaleResolutionEdges).
+        let edgesBeforeRetry: number | undefined;
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
@@ -1037,6 +1041,7 @@ export class CodeGraph {
             // an edit can satisfy it as well as an added file. On a sync
             // where no failed ref matches, this is one indexed lookup.
             const tRetry = Date.now();
+            edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
               ...result.changedFilePaths.flatMap(moduleReferenceKeys),
@@ -1122,7 +1127,8 @@ export class CodeGraph {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(
             result.definitionDelta,
-            result.changedFilePaths ?? []
+            result.changedFilePaths ?? [],
+            edgesBeforeRetry
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(

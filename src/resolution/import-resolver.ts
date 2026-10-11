@@ -323,6 +323,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
   PY_MODULE_SYMBOLS.delete(context);
+  PROJECT_FOLDER_SUFFIXES.delete(context);
 }
 
 export function resolveImportPath(
@@ -3151,20 +3152,74 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
  * import a submodule of it (`helpers` is `app/helpers.py`), whose keys hold
  * the package's name too (moduleReferenceKeys).
  *
- * An unaliased import keeps its tail: the module, or the one it re-exports the
- * name from, declares that name. So does an import of the standard library. An
- * installed package's import can't be told from a module the project doesn't
+ * An installed package's alias can't be told from a module the project doesn't
  * have yet (`from settings import Config as Cfg`), so it waits for its module
- * too, and a sync still finds it by its own name.
+ * too, and a sync still finds it by its own name. An import of the standard
+ * library keeps its tail.
+ *
+ * So does an unaliased `import x`, and an unaliased `from fastapi import
+ * FastAPI` unless its module is in one of the project's own folders
+ * ({@link isProjectPythonModule}). The name is the one the module has, but a
+ * package often re-exports it from the module that declares it
+ * (`fastapi/__init__.py`: `from .applications import FastAPI as FastAPI`), and
+ * a package `__init__.py` that appears or gains the re-export declares no node
+ * of that name. An outside package's names stay off the module keys: every
+ * `from django.db.models import Q` would crowd 'module:models' past the retry
+ * ceiling, and the project's own modules with it.
  */
 function pythonImportBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
   if (!IDENTIFIER.test(ref.referenceName)) return undefined;
   const binding = context.getImportMappings(ref.filePath, 'python').find((m) => m.localName === ref.referenceName);
-  if (!binding) return undefined;
+  if (!binding || isExternalImport(binding.source, 'python', context)) return undefined;
   const declared = binding.isNamespace ? binding.source.slice(binding.source.lastIndexOf('.') + 1) : binding.exportedName;
-  if (declared === binding.localName || isExternalImport(binding.source, 'python', context)) return undefined;
+  if (declared === binding.localName && (binding.isNamespace || !isProjectPythonModule(binding.source, context))) return undefined;
   const modulePath = pythonModulePath(binding.source, ref.filePath);
   return modulePath ? moduleTail(modulePath) || undefined : undefined;
+}
+
+/**
+ * Whether a Python import's module is in one of the project's own folders: a
+ * relative one is, and an absolute one when a folder of the project ends in its
+ * dotted path (`app/api` for `app.api`, the package) or in the package holding
+ * it (`app` for `app.api`, a module file), at any depth, as `src/` layouts put
+ * it. A folder, not a module: `fastapi/__init__.py` is what goes missing, while
+ * `fastapi/` keeps its other files.
+ */
+function isProjectPythonModule(source: string, context: ResolutionContext): boolean {
+  if (source.startsWith('.')) return true;
+  const folders = projectFolderSuffixes(context);
+  const modulePath = source.replace(/\./g, '/');
+  const slash = modulePath.lastIndexOf('/');
+  return folders.has(modulePath) || (slash > 0 && folders.has(modulePath.slice(0, slash)));
+}
+
+/**
+ * Per-context memo: every trailing run of folder names the project's files sit
+ * in (`a/b/c.py` gives 'a/b', 'b' and 'a'). The file set is that of the
+ * resolution pass; dropped by clearImportResolverMemos.
+ */
+const PROJECT_FOLDER_SUFFIXES = new WeakMap<ResolutionContext, Set<string>>();
+
+function projectFolderSuffixes(context: ResolutionContext): Set<string> {
+  let suffixes = PROJECT_FOLDER_SUFFIXES.get(context);
+  if (suffixes) return suffixes;
+  const folders = new Set<string>();
+  for (const file of context.getAllFiles()) {
+    for (let i = file.lastIndexOf('/'); i > 0; i = file.lastIndexOf('/', i - 1)) {
+      const folder = file.slice(0, i);
+      if (folders.has(folder)) break;
+      folders.add(folder);
+    }
+  }
+  suffixes = new Set<string>();
+  for (const folder of folders) {
+    for (let i = -1; ; i = folder.indexOf('/', i + 1)) {
+      suffixes.add(folder.slice(i + 1));
+      if (folder.indexOf('/', i + 1) === -1) break;
+    }
+  }
+  PROJECT_FOLDER_SUFFIXES.set(context, suffixes);
+  return suffixes;
 }
 
 /**

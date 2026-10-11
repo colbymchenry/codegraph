@@ -73,6 +73,11 @@ const MODULE_REFERENCE = /^(?:layout:)?(?:lazy-import:(.+)|import:(.+)#[^#]+)$/;
 /** What a module reference's tail starts with. No symbol's name does, so a lookup by symbol names never finds one. */
 const MODULE_KEY = 'module:';
 
+/** Whether a tail or lookup key waits for a module (`module:Team`) rather than for a name. */
+export function isModuleKey(key: string): boolean {
+  return key.startsWith(MODULE_KEY);
+}
+
 /**
  * The tail of a reference that waits for a module rather than for a name: the
  * module path's stem behind 'module:' — `./pages/Team` → 'module:Team',
