@@ -6437,7 +6437,7 @@ export class ToolHandler {
       // qualified `SQLCompiler.as_sql` is no longer outranked by a denser cluster
       // around `SQLInsertCompiler.as_sql` that merely matched the bare name.
       const EXACT_IMPORTANCE = 11;
-      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string }> = [...rangeNodes.values()]
+      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string; named?: boolean }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
@@ -6452,7 +6452,7 @@ export class ToolHandler {
           // processRunExecutionData, the named flow ENTRY at L1562, is a large
           // low-density method that lost the budget to denser blocks and got cut, so
           // the agent Read it back — the very thing explore exists to prevent).
-          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName };
+          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName, named: namedSeedIds.has(n.id) };
         });
 
       // Add edge source locations in this file — captures template references
@@ -6782,13 +6782,18 @@ export class ToolHandler {
           // exact cost of the protected set; each incidental member then adds its
           // own padded span, an over-estimate that errs toward the cluster below.
           let rendered: number | undefined;
+          // The best-ranked member dropped for size, if any (see below the loop).
+          let outsized: ExploreRange | undefined;
           for (const r of byImportance) {
             const sz = sizeOf(r) + GAP_MARKER.length;
             // Always keep the most important range, even if it alone is oversize —
             // an empty section sends the agent to Read, which costs far more. How
             // far it may overshoot is bounded by the caller's ceiling (CG-30), which
             // windows a runaway member instead of dropping it.
-            if (keep.length > 0 && kept + sz > cap) continue;
+            if (keep.length > 0 && kept + sz > cap) {
+              outsized ??= r;
+              continue;
+            }
             if (guarded && keep.length > 0 && !isProtectedMember(r)) {
               rendered ??= sectionText(dedupeSpans(partsOfMembers(keep)).parts).length;
               const cost = paddedCost(r) + GAP_MARKER.length;
@@ -6798,6 +6803,20 @@ export class ToolHandler {
             keep.push(r);
             kept += sz;
           }
+          // What is kept can still be a fragment, which is the empty section the
+          // rule above exists to prevent: ties on importance go to the shorter
+          // span, so a one-liner can outrank the body. In a file that is one long
+          // function and the line calling it, `path = build_report()` is an entry
+          // point as much as `build_report` is; it was kept first, the function
+          // the query spelled no longer fit, and the section was the last six
+          // lines of the file (#2486). So when the kept members render to less
+          // than a useful slice, the best-ranked member dropped for size is kept
+          // as a first-ranked one would be, if the query spelled its name — or
+          // if the query asked for this file by path and for no symbol in the
+          // cluster, where a bare edge line outranks every definition.
+          if (outsized && sectionText(dedupeSpans(partsOfMembers(keep)).parts).length < EXPLORE_ALLOCATION.MIN_CHARS
+              && (outsized.named
+                || (pinnedSet.has(filePath) && !guarded && !isProtectedMember(byImportance[0]!)))) keep.push(outsized);
         }
         if (keep.length === c.members.length) return null;
         return partsOfMembers(keep);
