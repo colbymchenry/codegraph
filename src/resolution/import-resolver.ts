@@ -3124,6 +3124,7 @@ export function isBoundToOutOfRepoImport(
  * keeps its tail. Undefined for every other reference.
  */
 export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (ref.language === 'python') return pythonImportBindingTail(ref, context);
   if (!ESM_IMPORT_LANGUAGES.has(ref.language) || !IDENTIFIER.test(ref.referenceName)) return undefined;
   const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === ref.referenceName);
   if (!binding || (!binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
@@ -3137,6 +3138,46 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
     ? path.posix.join(path.posix.dirname(ref.filePath), binding.source)
     : binding.source;
   return moduleTail(modulePath) || undefined;
+}
+
+/**
+ * {@link importBindingTail} for Python: `from .models import User as
+ * UserModel` and `from . import helpers as h` bind a name their module has as
+ * `User` and `helpers`, `import app.tools as tl` one it has as `tools`. The
+ * module is the one the import names by its dotted path, counted from the
+ * importing file's own package when it starts with dots (`.` is that package,
+ * each further dot the one above): `.models` in `app/main.py` is `app/models`,
+ * parked as 'module:models', and `.` is `app`, 'module:app'. The name may
+ * import a submodule of it (`helpers` is `app/helpers.py`), whose keys hold
+ * the package's name too (moduleReferenceKeys).
+ *
+ * An unaliased import keeps its tail: the module, or the one it re-exports the
+ * name from, declares that name. So does an import of the standard library. An
+ * installed package's import can't be told from a module the project doesn't
+ * have yet (`from settings import Config as Cfg`), so it waits for its module
+ * too, and a sync still finds it by its own name.
+ */
+function pythonImportBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!IDENTIFIER.test(ref.referenceName)) return undefined;
+  const binding = context.getImportMappings(ref.filePath, 'python').find((m) => m.localName === ref.referenceName);
+  if (!binding) return undefined;
+  const declared = binding.isNamespace ? binding.source.slice(binding.source.lastIndexOf('.') + 1) : binding.exportedName;
+  if (declared === binding.localName || isExternalImport(binding.source, 'python', context)) return undefined;
+  const modulePath = pythonModulePath(binding.source, ref.filePath);
+  return modulePath ? moduleTail(modulePath) || undefined : undefined;
+}
+
+/**
+ * A Python import's module as a project path: `app.models` → 'app/models';
+ * from `app/sub/views.py`, `.models` → 'app/sub/models', `..` → 'app' and
+ * `..forms` → 'app/forms'. Null when its dots climb above the project.
+ */
+function pythonModulePath(source: string, fromFile: string): string | null {
+  const name = source.replace(/^\.+/, '');
+  const dots = source.length - name.length;
+  if (dots === 0) return name.replace(/\./g, '/');
+  const modulePath = path.posix.join(path.posix.dirname(fromFile), '../'.repeat(dots - 1), name.replace(/\./g, '/'));
+  return modulePath === '..' || modulePath.startsWith('../') ? null : modulePath;
 }
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
