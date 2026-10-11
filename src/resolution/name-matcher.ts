@@ -1924,6 +1924,26 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
+/**
+ * Standard-library package names (and kubernetes' aliases of a few of its own
+ * util packages). A dotted Go reference through one is taken for a call into
+ * that package, unless the name is a parameter or local where the call is
+ * written (isGoProjectLocalCall).
+ */
+export const GO_STDLIB_PACKAGES: ReadonlySet<string> = new Set([
+  'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
+  'time', 'path', 'bytes', 'strings', 'strconv', 'errors', 'context',
+  'json', 'xml', 'csv', 'html', 'template', 'regexp', 'reflect',
+  'runtime', 'testing', 'flag', 'bufio', 'crypto', 'encoding',
+  'filepath', 'hash', 'mime', 'rand', 'signal', 'sql', 'syscall',
+  'unicode', 'unsafe', 'atomic', 'binary', 'debug', 'exec', 'heap',
+  'ring', 'scanner', 'tar', 'zip', 'gzip', 'zlib', 'tls', 'url',
+  'user', 'pprof', 'trace', 'ast', 'build', 'parser', 'printer',
+  'token', 'types', 'cgo', 'plugin', 'race', 'ioutil',
+  // Kubernetes-common stdlib aliases
+  'utilruntime', 'utilwait', 'utilnet',
+]);
+
 interface GoQualification {
   /** The package name written before the reference's name, as spelled. */
   written?: string;
@@ -2125,10 +2145,19 @@ interface GoDecl {
   type?: string;
   /** The package a `:=` takes its value from: `clocktesting` in `clock := clocktesting.NewFakeClock(…)`. */
   from?: string;
+  /** The function of the file's own package a `:=` takes its value from: `newStore` in `store := newStore(…)`. */
+  callee?: string;
 }
 
 const GO_SCOPE_INDEXES = new WeakMap<ResolutionContext, Map<string, GoScopeIndex | null>>();
 const GO_TYPE_KEYWORDS: ReadonlySet<string> = new Set(['chan', 'func', 'interface', 'map', 'struct']);
+/** What a `:=` can call that is no function of the file's package: a builtin, a conversion to a predeclared type, a literal. */
+const GO_PREDECLARED_CALLS: ReadonlySet<string> = new Set([
+  ...GO_TYPE_KEYWORDS, 'append', 'cap', 'clear', 'close', 'complex', 'copy', 'delete', 'imag', 'len', 'make', 'max', 'min',
+  'new', 'panic', 'print', 'println', 'real', 'recover', 'any', 'bool', 'byte', 'complex64', 'complex128', 'error',
+  'float32', 'float64', 'int', 'int8', 'int16', 'int32', 'int64', 'rune', 'string', 'uint', 'uint8', 'uint16',
+  'uint32', 'uint64', 'uintptr',
+]);
 
 /**
  * The parameter or local of the Go function around `ref` that `name` is
@@ -2209,12 +2238,17 @@ function readGoScopes(code: string): GoScopeIndex {
     const first = names[names.length - 1]![1];
     const lead = code.slice(code.lastIndexOf('\n', first - 1) + 1, first);
     const kind = /^\s*(?:\}\s*else\s+)?(?:if|for|switch)\b/.test(lead) ? 'header' : /^\s*case\b/.test(lead) ? 'case' : 'local';
-    // `x := &pkg.T{…}` writes the type it declares; `x := pkg.New(…)` the
-    // package its value comes from.
+    // `x := &pkg.T{…}`, `x := T{…}` and `x := new(T)` write the type they
+    // declare; `x := pkg.New(…)` the package its value comes from, `x :=
+    // newStore(…)` the function of its own package.
     const rhs = code.slice(i + 2, i + 160);
-    const type = names.length === 1 ? /^[ \t]*&?[ \t]*([A-Za-z_]\w*\.[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] : undefined;
+    const literal = /^[ \t]*&?[ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] ??
+      /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs)?.[1];
+    const type = names.length === 1 && literal && !GO_TYPE_KEYWORDS.has(literal) ? literal : undefined;
     const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
-    for (const [name, at] of names) add(name, { at, kind, type, from });
+    const call = from ? undefined : /^[ \t]*([A-Za-z_]\w*)[ \t]*(?:\[(?:[^[\]\n]|\[[^[\]\n]*\])*\][ \t]*)?\(/.exec(rhs)?.[1];
+    const callee = call && !GO_PREDECLARED_CALLS.has(call) ? call : undefined;
+    for (const [name, at] of names) add(name, { at, kind, type, from, callee });
   }
   // `var x T`, `var a, b = …`, `const (…)`: names before a type, an `=` or
   // the line's end — in a group, on lines outside the brackets of a value
@@ -11349,6 +11383,14 @@ export function matchMethodCall(
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
 
+  // A Go variable named like a standard-library package resolves by its
+  // declaration alone (isGoProjectLocalCall let it past the package list).
+  if (ref.language === 'go' && dotMatch && GO_STDLIB_PACKAGES.has(objectOrClass!)) {
+    const local = goLocalDecl(objectOrClass!, ref, context);
+    const value = local && goLocalValue(objectOrClass!, local, ref, context);
+    if (value !== undefined) return value && matchGoStdlibNamedLocalCall(objectOrClass!, methodName!, value, ref, context);
+  }
+
   // A Dart call through a type's name is to that type's own member, or to
   // nothing in the project.
   if (ref.language === 'dart' && dotMatch) {
@@ -12225,6 +12267,82 @@ function goAssertedLocalType(name: string, ref: UnresolvedRef, context: Resoluti
 export function isGoAssertedLocal(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = goAssertedLocalType(name, ref, context);
   return written !== undefined && goWrittenType(written, ref, context) !== undefined;
+}
+
+/**
+ * What a Go parameter or local holds where `ref` calls through it, by its
+ * declaration in scope there: the project type it is written or asserted as
+ * (`func(context *Context)`, `user *models.User`, `parser := &files{…}`);
+ * null for a value with no method the project declares — a type from outside
+ * the project or a predeclared one, or what an outside package's function
+ * hands out (`scanner := bufio.NewScanner(f)`, `url, err := url.Parse(s)`);
+ * otherwise the directory of the project package its value comes from, when
+ * a call says so (`trace := traceutil.Get(ctx)`, `context :=
+ * NewSecurityContext(…)`).
+ */
+type GoLocalValue = { type: GoProjectType } | { origin: string | undefined } | null;
+
+function goLocalValue(name: string, local: GoDecl, ref: UnresolvedRef, context: ResolutionContext): GoLocalValue {
+  const written = goAssertedLocalType(name, ref, context) ?? local.type;
+  const type = written === undefined ? undefined : goWrittenType(written, ref, context);
+  if (type !== undefined) return type && { type };
+  if (local.callee) return { origin: goPackageDir(ref.filePath) };
+  const dir = local.from === undefined ? undefined : goImportPackageDir(local.from, ref.filePath, context);
+  return dir === null ? null : { origin: dir };
+}
+
+/**
+ * Whether a dotted Go call through a name taken for a standard-library
+ * package (GO_STDLIB_PACKAGES) is made on a parameter or local of the
+ * function around it that may hold one of the project's values: gin's
+ * `context.AbortWithError(…)` in `func(context *Context)`, harbor's
+ * `context.IsAuthenticated()` after `context := NewSecurityContext(…)`.
+ */
+export function isGoProjectLocalCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const dot = ref.referenceName.indexOf('.');
+  if (dot <= 0 || ref.referenceKind !== 'calls') return false;
+  const name = ref.referenceName.slice(0, dot);
+  const local = goLocalDecl(name, ref, context);
+  return local !== undefined && goLocalValue(name, local, ref, context) !== null;
+}
+
+/**
+ * A call through a Go parameter or local named like a standard-library
+ * package — one isGoProjectLocalCall let past the package list — resolved by
+ * what its declaration says, never by its name: `plugin`, `printer`, `path`
+ * and `user` fit many of a big tree's types. kubernetes' `printer :=
+ * NewTablePrinter(…)` is no kubeadm `Printer`, and a `plugin` a volume plugin
+ * manager hands out is none of its forty `…Plugin` types in particular.
+ * - A project type calls its own method, an interface's or one embedding
+ *   promotes into it, or nothing: a `context PostStartHookContext`'s `Done`
+ *   comes from the `context.Context` it embeds.
+ * - A value a function of the project hands out calls a method of that
+ *   function's package: the one of a type named like the variable (`printer
+ *   := initPrinterFromCmd(cmd)` is a `printer`), or the only one of its name
+ *   there.
+ * - Any other value (a range or map value, a method's result), or one whose
+ *   package declares no method of the name (etcd's `tls := newTLS(…)` is a
+ *   `transport.TLSInfo`), calls only a method no other type of the project
+ *   declares, and none named like one of the standard library's.
+ */
+function matchGoStdlibNamedLocalCall(
+  receiver: string,
+  method: string,
+  value: Exclude<GoLocalValue, null>,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  if ('type' in value) return resolveMethodOnType(value.type.name, method, ref, context, 0.9, 'instance-method', value.type.dir);
+  const methods = context.getNodesByName(method).filter((n) => n.kind === 'method' && n.language === 'go' &&
+    n.id !== ref.fromNodeId && (isTestPath(ref.filePath) || !isTestPath(n.filePath)));
+  const own = value.origin === undefined ? [] : methods.filter((n) => goPackageDir(n.filePath) === value.origin);
+  if (own.length > 0) {
+    const named = own.filter((n) => n.qualifiedName === `${receiver}::${method}`);
+    const pool = named.length > 0 ? named : own;
+    return pool.length === 1 ? { original: ref, targetNodeId: pool[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' } : null;
+  }
+  return methods.length === 1 && !isStdMethodName('go', method)
+    ? { original: ref, targetNodeId: methods[0]!.id, confidence: 0.7, resolvedBy: 'instance-method' } : null;
 }
 
 /**
