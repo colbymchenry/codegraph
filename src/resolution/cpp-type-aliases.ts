@@ -503,6 +503,11 @@ export function cppAliasedTypeName(resolved: CppAliasedType): string {
   return [resolved.target[resolved.target.length - 1]!, ...resolved.rest].join('::');
 }
 
+/** The qualified name of the project class a type resolved through aliases is, if it is one: `leveldb::SkipList::Iterator`. */
+export function cppAliasedClass(resolved: CppAliasedType, context: ResolutionContext): string | undefined {
+  return classNamed([...resolved.target, ...resolved.rest], scopesWithin(resolved.scope), context);
+}
+
 /** What a C++ type name names when it is looked up for a class (see cppClassNamed). */
 export type CppNamedClass =
   /** A class, by its qualified name. */

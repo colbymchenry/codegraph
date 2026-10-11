@@ -14,9 +14,9 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedTypeName, cppAliasedTypeWritten, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments } from './cpp-type-aliases';
+import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
-import { cppClassWritten } from './cpp-supertypes';
+import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -9392,6 +9392,8 @@ interface CppReceiverDeclaration {
    * particular class.
    */
   aliased?: 'followed' | 'unreadable';
+  /** The type a `followed` alias names, looked up from the calling function (its own typedefs included). */
+  alias?: CppAliasedType;
   /** The type as written in the declaration, without following an alias (`Table`). */
   written?: string;
   /** The type is reached through a pointer (`Table* t`, `using Field = const FieldDescriptor*;`). */
@@ -9446,6 +9448,7 @@ function cppDeclaredType(
   if (aliased === undefined) return normalized;
   if (found) {
     found.aliased = aliased ? 'followed' : 'unreadable';
+    if (aliased) found.alias = aliased;
     found.written = normalized;
     found.pointer = aliased ? aliased.pointer : isCppPointerType(raw);
     found.classTemplate = aliased?.classTemplate ?? false;
@@ -9586,13 +9589,7 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
   if (!caller || isCppPointerType(held)) return undefined;
   if (isCppLibraryType(held, context)) return null;
   // A template parameter's type (`std::unique_ptr<T>`, `typename T::Iter`) names no particular class: null.
-  const found = cppClassWritten(held, {
-    // A class local to the calling function is found first.
-    scope: caller.kind === 'file' ? '' : caller.qualifiedName,
-    file: ref.filePath,
-    line: ref.line,
-    parameters: cppTemplateParameters(caller, context),
-  }, ref, context);
+  const found = cppClassWritten(held, cppCallSite(caller, ref, context), ref, context);
   if (found === undefined) return undefined;
   if (found === null) return null;
   if (!CPP_CLASS_KINDS.has(found.node.kind)) {
@@ -9611,6 +9608,89 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
 }
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
+
+/** Where a type the calling function writes is looked up from: the function itself, so a class local to it is found first. */
+function cppCallSite(caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppNameSite {
+  return {
+    scope: caller.kind === 'file' ? '' : caller.qualifiedName,
+    file: ref.filePath,
+    line: ref.line,
+    parameters: cppTemplateParameters(caller, context),
+  };
+}
+
+/**
+ * A C++ member call on a receiver the calling function or its class declares
+ * — `Iterator* iter; iter->Valid()`, `const Slice& key; key.size()` — with the
+ * operator that declaration takes (`->` on a pointer, `.` on a value or
+ * reference) calls a member of the class the declared type names, looked up as
+ * for a smart pointer's held type (matchCppHeldTypeCall); a type named through
+ * an alias is the class the alias names. The type's last name alone finds
+ * namesakes: rocksdb's `Iterator* iter; iter->Valid()` reached
+ * `MemTableRep::Iterator::Valid`, one of 22 classes named `Iterator`, while the
+ * `Iterator` the code means inherits `Valid` from `IteratorBase`.
+ *  - The member of that class, or of a class it derives from.
+ *  - null when that class has no such method: protobuf's descriptor accessors
+ *    aren't indexed, and `field->full_name()` reached unrelated classes' by
+ *    the method's name. (A class template's specialization may declare it, so
+ *    not there.)
+ *  - undefined when the declaration may be another variable's (read from
+ *    elsewhere, past one of the receiver the scan couldn't read, or not taking
+ *    that operator), or the lookup doesn't place the type: a library type, a
+ *    template parameter's, an alias of a type outside the project, a name
+ *    nothing the file sees declares, or one only the class of that name the
+ *    file can see shares (rocksdb's out-of-line `InlineSkipList<C>::Node` is
+ *    indexed unnamed, so its `Node` matched `FlushScheduler::Node`). The call
+ *    goes on as before.
+ */
+function matchCppDeclaredTypeCall(
+  receiver: string,
+  methodName: string,
+  decl: CppReceiverDeclaration,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (!decl.callers || decl.shadowed || !decl.raw || isCppLibraryType(decl.raw, context)) return undefined;
+  if (cppMemberOperator(receiver, ref, context) !== (decl.pointer ? '->' : '.')) return undefined;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return undefined;
+  // An alias was followed from the calling function, through typedefs of its
+  // own the index doesn't hold: the class it names, by its qualified name.
+  const aliasedClass = decl.alias && cppAliasedClass(decl.alias, context);
+  if (decl.aliased && !aliasedClass) return undefined;
+  // An `auto` loop's element type is looked up where its range's type is written.
+  const site = decl.element ?? cppCallSite(caller, ref, context);
+  const found = cppClassWritten(aliasedClass ? `::${aliasedClass}` : decl.raw, site, ref, context);
+  if (!found?.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
+  const method = cppMethodOf(found.node, methodName, ref, context);
+  if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return cppTemplateParameters(found.node, context).size === 0 && cppBasesKnown(found.node, context) ? null : undefined;
+}
+
+/**
+ * Whether every base C++ class `cls` writes, and every base of those, is one
+ * cppMethodOf walks — a base edge to a class — or a library type such as
+ * `std::runtime_error`, which declares no project method. A base the index
+ * doesn't link may declare any method: protobuf's `FlatAllocator` derives
+ * from a `decltype(…)` that names `FlatAllocatorImpl`, and rocksdb's
+ * `WritePreparedTxnDB` from an alias each `#if` arm declares differently.
+ */
+function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = new Set<string>()): boolean {
+  if (seen.has(cls.qualifiedName)) return true;
+  seen.add(cls.qualifiedName);
+  if (!context.getSupertypeNodes) return false;
+  for (const decl of context.getNodesByQualifiedName(cls.qualifiedName)) {
+    if ((decl.language !== 'cpp' && decl.language !== 'c') || !CPP_CLASS_KINDS.has(decl.kind)) continue;
+    const bases = context.getSupertypeNodes(decl.id);
+    const written = cppBaseSpecifiers(decl, context).filter((s) => !isCppLibraryType(s, context));
+    // (cppMethodOf looks no deeper than this.)
+    if (depth >= 4 ? bases.length + written.length > 0 : written.length > bases.length) return false;
+    for (const base of bases) {
+      if (!CPP_CLASS_KINDS.has(base.kind) || !cppBasesKnown(base, context, depth + 1, seen)) return false;
+    }
+  }
+  return true;
+}
 
 /**
  * C++ class `cls`'s method `name`: its own, else the nearest one of a class
@@ -11812,6 +11892,14 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context, 0, cppDecl)
         : inferLocalReceiverType(objectOrClass!, ref, context, decl));
+    // A C++ receiver the calling function or its class declares calls a
+    // member of the class C++ name lookup finds for its type, not of any
+    // class sharing the type's last name.
+    if (ref.language === 'cpp') {
+      const declared = nmTimedT('mc-cppdecl', ref, () =>
+        matchCppDeclaredTypeCall(objectOrClass!, methodName!, cppDecl, ref, context));
+      if (declared !== undefined) return declared;
+    }
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);

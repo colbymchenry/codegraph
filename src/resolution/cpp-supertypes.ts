@@ -13,14 +13,19 @@
  *
  * The name is looked up as C++ looks it up:
  *  - from the scope the class is declared in (its own members are not in
- *    scope in its base clause), outwards to the global scope; a class scope
- *    includes its bases, a qualified name is resolved a segment at a time and
- *    an alias is followed to the class it names (cpp-type-aliases.ts);
- *    `::Base` is the global one;
+ *    scope in its base clause), outwards to the outermost namespace; a class
+ *    scope includes its bases, a qualified name is resolved a segment at a
+ *    time and an alias is followed to the class it names
+ *    (cpp-type-aliases.ts); `::Base` is the global one;
  *  - then through what the file writes before the class: a namespace alias
  *    (`namespace _pbi = ::google::protobuf::internal;`), a using-declaration
  *    (`using leveldb::FilterPolicy;`), a using-directive (`using namespace
- *    ROCKSDB_NAMESPACE;`); and through a namespace a macro opens
+ *    ROCKSDB_NAMESPACE;`). These come before the global scope: they put the
+ *    name in a namespace around the code (`namespace upb::generator { using
+ *    google::protobuf::Descriptor; }`), and a global declaration of it is one
+ *    the file can't see at the same time (protobuf's PHP extension declares a
+ *    C struct `Descriptor`);
+ *  - then the global scope, and a namespace a macro opens
  *    (`fmt::detail::buffer` under fmt's FMT_BEGIN_NAMESPACE);
  *  - a class a source file (`.cc`, `.cpp`, `.c`) defines belongs to that
  *    translation unit, so only that file sees it (leveldb's skiplist test
@@ -132,8 +137,8 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const scopes = cppScopesWithin(site.scope);
   const resolved = (node: Node): CppWrittenClass => ({ node, exact: true });
 
-  // The scopes around the name, or only the global one for `::Base`.
-  const lexical = classNode(cppClassNamed(written, global ? [''] : scopes, ref, context, visible), site, context);
+  // The scopes around the name short of the global one, or only the global one for `::Base`.
+  const lexical = classNode(cppClassNamed(written, global ? [''] : scopes.slice(0, -1), ref, context, visible), site, context);
   if (lexical !== undefined) return lexical && resolved(lexical);
 
   // What the file writes before the name, the nearest first: each stands for
@@ -166,6 +171,9 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
       const hit = lookUp(`${u.path}::${written}`);
       if (hit) return resolved(hit);
     }
+    // The global scope.
+    const outermost = classNode(cppClassNamed(written, [''], ref, context, visible), site, context);
+    if (outermost !== undefined) return outermost && resolved(outermost);
   }
   // `fmt::detail::buffer`, where a macro opens `namespace fmt` around `detail::buffer`.
   if (segments.length > 1) {
