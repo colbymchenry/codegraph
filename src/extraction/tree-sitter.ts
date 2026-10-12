@@ -4920,10 +4920,17 @@ export class TreeSitterExtractor {
       // — is itself a dependency on that constant; emit a `references` ref so a
       // class used only via its class methods still records a dependent (the edge
       // the old receiver-only callee happened to provide, now made explicit).
-      if (!skip && receiverNode.type === 'constant') {
+      // A namespaced receiver (`Billing::ChargeCard.call`) references the class under
+      // its qualified name (a leading `::` dropped), so `Billing::Create` and
+      // `Users::Create` resolve apart; it needs a capitalized last segment.
+      const constantName = receiverName.replace(/^::/, '');
+      const isConstant = receiverNode.type === 'constant'
+        || (receiverNode.type === 'scope_resolution'
+          && /^[A-Z]/.test(constantName.split('::').pop()!));
+      if (!skip && isConstant) {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
-          referenceName: receiverName,
+          referenceName: constantName,
           referenceKind: 'references',
           line: receiverNode.startPosition.row + 1,
           column: receiverNode.startPosition.column,
