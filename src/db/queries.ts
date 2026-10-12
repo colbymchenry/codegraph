@@ -75,6 +75,16 @@ const IS_INTERFACE_MEMBER = (alias: string): string => `EXISTS (
 )`;
 
 /**
+ * A SQL predicate: is the reference name in `column` written through one of
+ * the names in the JSON array bound to the next two parameters, as the name
+ * itself or as a member read through it (`Order.objects` through `Order`)?
+ */
+const THROUGH_NAMES = (column: string): string => `(
+  ${column} IN (SELECT value FROM json_each(?))
+  OR (instr(${column}, '.') > 1 AND substr(${column}, 1, instr(${column}, '.') - 1) IN (SELECT value FROM json_each(?)))
+)`;
+
+/**
  * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
  * rather than zeroed: a query that genuinely targets that tree must still rank
  * it, the same "discount, don't erase" rule the path penalty follows.
@@ -3084,6 +3094,134 @@ export class QueryBuilder {
       sourceFilePath: row.source_file_path,
       sourceLanguage: row.source_language,
     }));
+  }
+
+  /**
+   * Resolution edges out of the nodes of `filePath` whose reference was
+   * written through one of `names` (see {@link THROUGH_NAMES}), with the source
+   * file and language a resurrection needs and the file of each target.
+   * Synthesized (`provenance='heuristic'`) and `contains` edges are left out.
+   */
+  getResolutionEdgesThrough(
+    filePath: string,
+    names: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM (
+           SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path,
+                  CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.refName') END AS ref_name
+             FROM nodes src
+             JOIN edges e ON e.source = src.id
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE src.file_path = ?
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+         ) WHERE ${THROUGH_NAMES('ref_name')}`
+      )
+      .all(filePath, JSON.stringify(names), JSON.stringify(names)) as Array<
+        EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }
+      >;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+      targetFilePath: row.target_file_path,
+    }));
+  }
+
+  /**
+   * The row ids of the failed references of `filePath` that import one of
+   * `modules` or are written through one of `names` (see {@link THROUGH_NAMES}).
+   */
+  getFailedReferencesThrough(filePath: string, modules: readonly string[], names: readonly string[]): number[] {
+    return (this.db
+      .prepare(
+        `SELECT id FROM unresolved_refs
+          WHERE file_path = ? AND status = 'failed'
+            AND ((reference_kind = 'imports' AND reference_name IN (SELECT value FROM json_each(?)))
+                 OR ${THROUGH_NAMES('reference_name')})`
+      )
+      .all(filePath, JSON.stringify(modules), JSON.stringify(names), JSON.stringify(names)) as Array<{ id: number }>)
+      .map((row) => row.id);
+  }
+
+  /** The targets, in other files, of the non-synthesized `imports` edges out of the nodes of `filePath`. */
+  getImportTargetsFromFile(filePath: string): string[] {
+    return (this.db
+      .prepare(
+        `SELECT DISTINCT e.target AS target
+           FROM nodes src
+           JOIN edges e ON e.source = src.id
+           JOIN nodes tgt ON tgt.id = e.target
+          WHERE src.file_path = ?
+            AND e.kind = 'imports'
+            AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+            AND tgt.file_path != ?`
+      )
+      .all(filePath, filePath) as Array<{ target: string }>)
+      .map((row) => row.target);
+  }
+
+  /**
+   * The `imports` edges into the node `targetId` from files other than
+   * `exceptFile`: each importing file, its language, and the module specifier
+   * it wrote (the edge's `refName`; null when it carries none).
+   */
+  getImportsInto(
+    targetId: string,
+    exceptFile: string
+  ): Array<{ filePath: string; language: Language; refName: string | null }> {
+    return (this.db
+      .prepare(
+        `SELECT src.file_path AS file_path, src.language AS language,
+                CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.refName') END AS ref_name
+           FROM edges e
+           JOIN nodes src ON src.id = e.source
+          WHERE e.target = ? AND e.kind = 'imports' AND src.file_path != ?`
+      )
+      .all(targetId, exceptFile) as Array<{ file_path: string; language: Language; ref_name: unknown }>)
+      .map((row) => ({
+        filePath: row.file_path,
+        language: row.language,
+        refName: typeof row.ref_name === 'string' ? row.ref_name : null,
+      }));
+  }
+
+  /** The files with a resolution edge into one of `targetIds`. */
+  getFilesWithEdgesInto(targetIds: string[]): string[] {
+    const files = new Set<string>();
+    for (let i = 0; i < targetIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = targetIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT src.file_path AS file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+            WHERE e.target IN (${placeholders})
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')`
+        )
+        .all(...chunk) as Array<{ file_path: string }>;
+      for (const row of rows) files.add(row.file_path);
+    }
+    return [...files];
+  }
+
+  /** The import nodes named one of `names` (an import node is named by the module path it imports). */
+  getImportNodesByNames(names: string[]): Array<{ filePath: string; name: string; language: Language }> {
+    const out: Array<{ filePath: string; name: string; language: Language }> = [];
+    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT file_path, name, language FROM nodes WHERE name IN (${placeholders}) AND kind = 'import'`)
+        .all(...chunk) as Array<{ file_path: string; name: string; language: Language }>;
+      for (const row of rows) out.push({ filePath: row.file_path, name: row.name, language: row.language });
+    }
+    return out;
   }
 
   // ===========================================================================

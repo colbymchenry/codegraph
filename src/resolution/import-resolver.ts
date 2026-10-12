@@ -3227,7 +3227,7 @@ function projectFolderSuffixes(context: ResolutionContext): Set<string> {
  * from `app/sub/views.py`, `.models` → 'app/sub/models', `..` → 'app' and
  * `..forms` → 'app/forms'. Null when its dots climb above the project.
  */
-function pythonModulePath(source: string, fromFile: string): string | null {
+export function pythonModulePath(source: string, fromFile: string): string | null {
   const name = source.replace(/^\.+/, '');
   const dots = source.length - name.length;
   if (dots === 0) return name.replace(/\./g, '/');
