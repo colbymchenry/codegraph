@@ -11,20 +11,18 @@
  * binds them through the module when it is there, and another way (by name)
  * or not at all when it is not.
  *
- * A Python module that re-exports another one (`from .shop import *`, or a
- * package's `__init__.py` importing names from it) is the way in for its own
- * importers, so theirs are followed too, as deep as the resolver chases a
- * name through such modules. An ES module's `export … from` leaves no import
- * edge or node to find it by, so an `index.ts` re-exporting another is not
- * followed.
+ * A module that re-exports another one (`export * from './components'` in an
+ * `index.ts`, `from .shop import *` or a package's `__init__.py` importing
+ * names from it) is the way in for its own importers, so theirs are followed
+ * too, as deep as the resolver chases a name through such modules.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import type { QueryBuilder } from '../db/queries';
 import type { Language, UnresolvedReference } from '../types';
-import type { ImportMapping } from './types';
-import { extractImportMappings, pythonModulePath } from './import-resolver';
+import type { ImportMapping, ReExport } from './types';
+import { extractImportMappings, extractReExports, pythonModulePath, REEXPORT_MAX_DEPTH } from './import-resolver';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 
 /**
@@ -37,11 +35,12 @@ const BINDING_LANGUAGES = new Set<Language>([
 ]);
 
 /**
- * How many re-exporting Python modules deep the importers of a file are
- * followed: as deep as the resolver chases a name through star imports and
- * re-exports (`pythonModuleSymbol`).
+ * How many re-exporting modules deep the importers of a file are followed: as
+ * deep as the resolver chases a name through them, three for Python's star
+ * imports and re-exports (`pythonModuleSymbol`), `REEXPORT_MAX_DEPTH` for
+ * ES-module `export … from`.
  */
-const PYTHON_REEXPORT_DEPTH = 3;
+const reExportDepth = (language: Language): number => (language === 'python' ? 3 : REEXPORT_MAX_DEPTH);
 
 /** A Python star import, read the way the resolver reads one. */
 const PYTHON_STAR_IMPORT = /^\s*from\s+([\w.]+)\s+import\s+\*/gm;
@@ -72,12 +71,14 @@ type AddImporter = (importer: string, language: Language, source: string, module
 export interface ImportReader {
   /** Its import mappings. */
   mappings(file: string, language: Language): ImportMapping[];
+  /** Its ES-module `export … from` statements, which have no import mapping. */
+  reExports(file: string, language: Language): ReExport[];
   /** The modules a Python file star-imports, which have no import mapping. */
   starImports(file: string, language: Language): string[];
 }
 
 export function createImportReader(rootDir: string): ImportReader {
-  const memo = new Map<string, { mappings: ImportMapping[]; starImports: string[] }>();
+  const memo = new Map<string, { mappings: ImportMapping[]; reExports: ReExport[]; starImports: string[] }>();
   const read = (file: string, language: Language) => {
     let entry = memo.get(file);
     if (!entry) {
@@ -89,6 +90,7 @@ export function createImportReader(rootDir: string): ImportReader {
       }
       entry = {
         mappings: content ? extractImportMappings(file, content, language) : [],
+        reExports: content ? extractReExports(content, language) : [],
         starImports: language === 'python' ? [...content.matchAll(PYTHON_STAR_IMPORT)].map((m) => m[1]!) : [],
       };
       memo.set(file, entry);
@@ -97,6 +99,7 @@ export function createImportReader(rootDir: string): ImportReader {
   };
   return {
     mappings: (file, language) => read(file, language).mappings,
+    reExports: (file, language) => read(file, language).reExports,
     starImports: (file, language) => read(file, language).starImports,
   };
 }
@@ -177,12 +180,11 @@ function importersOf(
     }
     const python = level.filter((module) => module.language === 'python');
     if (python.length > 0) addPythonImporters(queries, python, reader, add);
-    // The next level: the Python importers that pass on what they import from these.
-    if (depth > PYTHON_REEXPORT_DEPTH) break;
+    // The next level: the importers that pass on what they import from these.
     const next: Module[] = [];
     for (const [importer, { language, statements }] of naming) {
-      if (language !== 'python' || seen.has(importer)) continue;
-      const passes = pythonPassedOn(importer, statements, reader);
+      if (seen.has(importer) || depth > reExportDepth(language)) continue;
+      const passes = passedOn(importer, language, statements, reader);
       if (passes === undefined) continue;
       seen.add(importer);
       next.push({ path: importer, language, passes });
@@ -193,12 +195,14 @@ function importersOf(
 }
 
 /**
- * What the Python module `importer` passes on of what its `statements`
- * import, or undefined when the resolver reads no name through it: what it
- * star-imports, and for a package's `__init__.py`, the names it imports too.
+ * What `importer` passes on of what its `statements` import, or undefined
+ * when the resolver reads no name through it: an ES module what it `export …
+ * from`s; a Python module what it star-imports, and a package's `__init__.py`
+ * the names it imports too.
  */
-function pythonPassedOn(
+function passedOn(
   importer: string,
+  language: Language,
   statements: ReadonlyArray<{ source: string; module: Module; onlyName?: string }>,
   reader: ImportReader,
 ): Set<string> | null | undefined {
@@ -206,15 +210,25 @@ function pythonPassedOn(
   const pass = (names: Set<string> | null): void => {
     passes = passes === null || names === null ? null : new Set([...(passes ?? []), ...names]);
   };
-  const stars = new Set(reader.starImports(importer, 'python'));
+  const passing = (module: Module, name: string): boolean => module.passes === null || module.passes.has(name);
+  if (language !== 'python') {
+    for (const rex of reader.reExports(importer, language)) {
+      for (const { source, module } of statements) {
+        if (source !== rex.source) continue;
+        if (rex.kind === 'wildcard') pass(module.passes);
+        else if (rex.kind === 'namespace') pass(new Set([rex.exportedName]));
+        else if (passing(module, rex.originalName)) pass(new Set([rex.exportedName]));
+      }
+    }
+    return passes;
+  }
+  const stars = new Set(reader.starImports(importer, language));
   const isPackage = importer === '__init__.py' || importer.endsWith('/__init__.py');
   for (const { source, module, onlyName } of statements) {
     if (onlyName === undefined && stars.has(source)) pass(module.passes);
     if (!isPackage) continue;
-    const names = reader.mappings(importer, 'python')
-      .filter((m) => m.source === source && (onlyName !== undefined
-        ? m.exportedName === onlyName
-        : module.passes === null || module.passes.has(m.exportedName)))
+    const names = reader.mappings(importer, language)
+      .filter((m) => m.source === source && (onlyName !== undefined ? m.exportedName === onlyName : passing(module, m.exportedName)))
       .map((m) => m.localName);
     if (names.length > 0) pass(new Set(names));
   }
@@ -288,7 +302,8 @@ function addPythonImporters(
 
 /**
  * Per importer, what its statements naming the modules import: the modules
- * named whole (not the package around one), and the local names bound.
+ * named whole (not the package around one), and the local names bound. An ES
+ * namespace import (`import * as z`) reads whatever its module passes on.
  */
 function bindingsOf(importers: Importers, reader: ImportReader): Map<string, { modules: string[]; names: string[] }> {
   const bindings = new Map<string, { modules: string[]; names: string[] }>();
@@ -297,7 +312,9 @@ function bindingsOf(importers: Importers, reader: ImportReader): Map<string, { m
       reader.mappings(file, language)
         .filter((m) => {
           const only = sources.get(m.source);
-          return only === null || (only !== undefined && only.has(m.exportedName));
+          if (only === null) return true;
+          if (only === undefined) return false;
+          return only.has(m.exportedName) || (m.isNamespace && language !== 'python' && only.size > 0);
         })
         .map((m) => m.localName)
     );

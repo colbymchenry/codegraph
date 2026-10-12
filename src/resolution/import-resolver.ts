@@ -2732,7 +2732,7 @@ function findGoPackageMember(
 /** Recursive depth cap for re-export chain following. Real codebases
  *  rarely chain barrels more than 2–3 deep; 8 is a generous safety
  *  net that still bounds worst-case work. */
-const REEXPORT_MAX_DEPTH = 8;
+export const REEXPORT_MAX_DEPTH = 8;
 
 /**
  * Find an exported symbol in `filePath`, following `export { x } from
