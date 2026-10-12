@@ -48,6 +48,8 @@ import {
   realpathSync,
   statSync,
 } from 'fs';
+import { quotedPhrases, renderQuotedText } from '../graph/quoted-text';
+
 import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
@@ -4020,6 +4022,20 @@ export class ToolHandler {
       budget = getExploreOutputBudget(Infinity);
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    const quoted = quotedPhrases(rawQuery);
+    const unquotedNames = quoted.remainder.match(/[A-Za-z_$][\w$]*/g) ?? [];
+    const namedSymbols = unquotedNames.length > 64
+      || quoted.phrases.some(phrase => cg.getNodesByName(phrase).length > 0)
+      || unquotedNames.slice(0, 64).some(name => cg.getNodesByName(name).length > 0);
+    if (quoted.phrases.length > 0 && !namedSymbols && !queryMightContainPaths(rawQuery)
+      && !/->|\u2192|\b(?:callers|callees|flow|trace|impact|references|definitions)\b/i.test(quoted.remainder)) {
+      const report = await cg.queryQuotedText(rawQuery, {
+
+        maxMatchingFiles: maxFiles,
+        maxItems: maxFiles * 3,
+      });
+      return { content: [{ type: 'text', text: renderQuotedText(report, budget.maxOutputChars) }] };
+    }
 
     // File paths named in the query become PINNED files: guaranteed admission,
     // top of the rank order, funded first — and their span is REMOVED from the

@@ -45,6 +45,9 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
+import { queryQuotedText, type QuotedTextOptions, type QuotedTextReport } from './graph/quoted-text';
+export type { QuotedTextOptions, QuotedTextReport, QuotedTextMatch } from './graph/quoted-text';
+
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
@@ -2175,9 +2178,12 @@ export class CodeGraph {
     return this.queries.hasFilesUnder(dir);
   }
 
-  /**
-   * Get all tracked files
-   */
+  /** Locate bounded exact quoted text in current indexed source files. */
+  queryQuotedText(query: string, options: QuotedTextOptions = {}): Promise<QuotedTextReport> {
+    return queryQuotedText(this, query, options);
+  }
+
+  /** Get all tracked files. */
   getFiles(): FileRecord[] {
     return this.queries.getAllFiles();
   }
