@@ -503,6 +503,11 @@ export function cppAliasedTypeName(resolved: CppAliasedType): string {
   return [resolved.target[resolved.target.length - 1]!, ...resolved.rest].join('::');
 }
 
+/** The qualified name of the project class a type resolved through aliases is, if it is one: `leveldb::SkipList::Iterator`. */
+export function cppAliasedClass(resolved: CppAliasedType, context: ResolutionContext): string | undefined {
+  return classNamed([...resolved.target, ...resolved.rest], scopesWithin(resolved.scope), context);
+}
+
 /** What a C++ type name names when it is looked up for a class (see cppClassNamed). */
 export type CppNamedClass =
   /** A class, by its qualified name. */
@@ -554,6 +559,36 @@ export function cppClassNamed(
   if (cls) return { cls };
   // A member of a type outside the project (`Alias::Inner`) is not the alias.
   return next === name.names.length ? { alias } : null;
+}
+
+/**
+ * The type the C++ alias written as `written` names, as the alias's
+ * declaration writes it, template arguments and all — `std::vector<
+ * std::shared_ptr<BlobFileMetaData>>` for rocksdb's `BlobFiles` under `using
+ * BlobFiles = std::vector<…>;` — with the alias. The alias is looked up from
+ * `scopes` (innermost first), as cppClassNamed looks a name up, and only its
+ * own text is read: what that names is the caller's to look up in turn,
+ * from where the alias is declared.
+ *  - `undefined`: `written` names no alias the lookup finds.
+ *  - `null`: an alias whose type can't be read: one each `#if` arm declares
+ *    differently, a member of the aliased type (`Table::Iterator`), an alias
+ *    template, or a `decltype(…)` or `typename …` type.
+ */
+export function cppAliasedTypeWritten(
+  written: string,
+  scopes: readonly string[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): { text: string; alias: Node } | null | undefined {
+  const name = cppTypeName(written);
+  if (!name) return undefined;
+  const { found, next } = lookupSegments(name, scopes, ref, context);
+  if (!found || typeof found !== 'object' || 'cls' in found) return undefined;
+  if ('ambiguous' in found || next !== name.names.length || isAliasTemplate(found.alias, context)) return null;
+  const text = declarationText(found.alias, context);
+  const aliased = text ? aliasedTypeIn(text, found.alias.name) : null;
+  if (!aliased || /\b(?:typename|decltype)\b/.test(aliased)) return null;
+  return { text: aliased, alias: found.alias };
 }
 
 /** The scopes visible from inside the scope `qualified`, innermost first, ending with the global scope. */

@@ -53,6 +53,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
+import { createImportReader, reopenReferencesThroughAddedFiles } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -998,6 +999,13 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        // The last edge before the failed-ref retry below: the rebind's
+        // per-name ceiling counts only edges up to it (see
+        // resurrectStaleResolutionEdges).
+        let edgesBeforeRetry: number | undefined;
+        // And the last edge before this sync resolved anything: an importer's
+        // edge up to it was bound before a module this sync adds was there.
+        const edgesBeforeResolution = this.queries.getMaxEdgeId();
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
@@ -1037,6 +1045,7 @@ export class CodeGraph {
             // an edit can satisfy it as well as an added file. On a sync
             // where no failed ref matches, this is one indexed lookup.
             const tRetry = Date.now();
+            edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
               ...result.changedFilePaths.flatMap(moduleReferenceKeys),
@@ -1074,6 +1083,21 @@ export class CodeGraph {
               });
             }
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
+
+            // A module that appeared, such as a package `__init__.py` or an
+            // `index.ts` re-exporting what it imports: what the files importing
+            // it bound by name in its absence, or failed, goes back to pending
+            // for the sweep below, which binds it through the module as a fresh
+            // index does. (The removal half runs before removed files are deleted.)
+            if (result.addedFilePaths && result.addedFilePaths.length > 0) {
+              const tAdded = Date.now();
+              const added = result.addedFilePaths.flatMap((filePath) => {
+                const file = this.queries.getFileByPath(filePath);
+                return file ? [{ path: filePath, language: file.language }] : [];
+              });
+              const reopened = reopenReferencesThroughAddedFiles(this.queries, createImportReader(this.projectRoot), added, edgesBeforeResolution);
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
+            }
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -1122,7 +1146,8 @@ export class CodeGraph {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(
             result.definitionDelta,
-            result.changedFilePaths ?? []
+            result.changedFilePaths ?? [],
+            edgesBeforeRetry
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
