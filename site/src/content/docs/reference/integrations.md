@@ -3,7 +3,7 @@ title: Integrations
 description: Supported agents, and manual MCP setup.
 ---
 
-The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
+The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `QWEN.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
 
 ## Supported agents
 
@@ -15,6 +15,7 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **Qwen Code**
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
