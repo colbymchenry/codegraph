@@ -16,6 +16,7 @@ import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
+import { clearCppRawStringMemos, cppLiteralsBlanked, cppRawStringLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
@@ -10122,11 +10123,15 @@ function inferCppReceiverType(
   const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
   const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
+  // A declaration in a string literal is text: protobuf's upb generator
+  // writes `upb_MiniTableField field = $field_init$;` in the raw string it
+  // emits, above calls on its own `upb::FieldDefPtr field` parameter.
+  const rawLines = cppRawStringLines(ref.filePath, context);
 
   for (let i = callLineIndex; i >= 0; i--) {
     const text = lines[i];
     if (!text || !receiverPattern.test(text)) continue;
-    const line = cppCodeOf(text);
+    const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
     if (!line || !receiverPattern.test(line)) continue;
 
     const declaratorMatch = line.match(declaratorRegex);
@@ -10188,11 +10193,12 @@ function inferCppReceiverType(
       ? context.getFileLines(headerPath)
       : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
     if (!headerLines) continue;
+    const headerRawLines = cppRawStringLines(headerPath, context);
 
     for (let i = 0; i < headerLines.length; i++) {
       const text = headerLines[i]!;
       if (!receiverPattern.test(text)) continue;
-      const line = cppCodeOf(text);
+      const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, headerRawLines));
       if (!line) continue;
       const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
@@ -10713,6 +10719,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_HIERARCHIES.delete(context);
   KOTLIN_FRAMES.delete(context);
   clearCppNamespaceMemos(context);
+  clearCppRawStringMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
