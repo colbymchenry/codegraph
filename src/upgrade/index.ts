@@ -120,10 +120,16 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
     return { kind: 'npx' };
   }
 
-  // npm install (global or local): lives under a node_modules tree.
-  if (norm.includes('/node_modules/')) {
-    const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
-    return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
+  // npm install (global or local): lives under a node_modules tree. It's local
+  // only when that tree is <cwd>/node_modules — the one a plain `npm install`
+  // run here would update. Merely being under cwd isn't enough: a global
+  // prefix often sits inside the home dir (nvm, Windows %APPDATA%\npm), so
+  // running `upgrade` from home would skip -g and leave the global copy stale
+  // (#2477).
+  const nodeModulesAt = norm.indexOf('/node_modules/');
+  if (nodeModulesAt !== -1) {
+    const isLocal = norm.slice(0, nodeModulesAt) === toPosix(P.resolve(input.cwd));
+    return { kind: 'npm', scope: isLocal ? 'local' : 'global' };
   }
 
   // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.

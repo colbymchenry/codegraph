@@ -87,6 +87,28 @@ describe('detectInstallMethod', () => {
     expect(m).toEqual({ kind: 'npm', scope: 'local' });
   });
 
+  // #2477: a global prefix inside the user's home (nvm, Windows %APPDATA%\npm)
+  // sits under cwd when `upgrade` runs from home — that must stay global, or
+  // upgrade runs `npm install` without -g and leaves the global copy stale.
+  it('detects a global npm install under an nvm prefix inside cwd as global', () => {
+    const filename = '/home/u/.nvm/versions/node/v22.0.0/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
+    const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: () => false });
+    expect(m).toEqual({ kind: 'npm', scope: 'global' });
+  });
+
+  it('detects a Windows per-user global npm install as global when run from the home dir', () => {
+    const filename = 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js';
+    const m = detectInstallMethod({ filename, platform: 'win32', cwd: 'C:\\Users\\X', exists: () => false });
+    expect(m).toEqual({ kind: 'npm', scope: 'global' });
+  });
+
+  it('detects a Windows project npm install as local', () => {
+    const cwd = 'C:\\Users\\X\\project';
+    const filename = `${cwd}\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js`;
+    const m = detectInstallMethod({ filename, platform: 'win32', cwd, exists: () => false });
+    expect(m).toEqual({ kind: 'npm', scope: 'local' });
+  });
+
   it('detects an npx run from the _npx cache', () => {
     const filename = '/home/u/.npm/_npx/abc123/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
     const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: () => false });
