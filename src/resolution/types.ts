@@ -143,7 +143,7 @@ export interface ResolutionContext {
   /** Get project root */
   getProjectRoot(): string;
   /** Get all files */
-  getAllFiles(): string[];
+  getAllFiles(): readonly string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
   /**

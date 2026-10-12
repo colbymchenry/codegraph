@@ -21,7 +21,7 @@ const MAX_DEEP_PROBES = MAX_MANIFESTS * 8;
 const SCRIPT_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
 
 /**
- * Cached per context, keyed by how many files are indexed.
+ * Cached per context, keyed by the identity of the indexed file list.
  *
  * The resolver is constructed — and every `detect()` runs once — BEFORE any
  * file exists, so that first pass sees no directories to probe and reads only
@@ -30,15 +30,15 @@ const SCRIPT_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
  * framework whose dependency lives one directory down stayed undetected: a
  * proshop-shaped repo indexed its React Router routes (extraction is not
  * gated on detection) and then resolved none of its navigation. Re-reading
- * when the file count changes costs one manifest sweep per index.
+ * when the file list changes costs one manifest sweep per index.
  */
-const cache = new WeakMap<ResolutionContext, { files: number; names: Set<string> }>();
+const cache = new WeakMap<ResolutionContext, { files: readonly string[]; names: Set<string> }>();
 
 /** Every dependency name declared in the manifests read (see the file comment), de-duplicated. */
 export function declaredDependencies(context: ResolutionContext): Set<string> {
   const files = context.getAllFiles();
   const cached = cache.get(context);
-  if (cached && cached.files === files.length) return cached.names;
+  if (cached && cached.files === files) return cached.names;
   const names = new Set<string>();
   // The index lists source files, never manifests: the candidate directories
   // are the first one or two segments of what IS indexed, probed on disk.
@@ -76,7 +76,7 @@ export function declaredDependencies(context: ResolutionContext): Set<string> {
       // Not JSON — a template, a broken manifest; nothing to read.
     }
   }
-  cache.set(context, { files: files.length, names });
+  cache.set(context, { files, names });
   return names;
 }
 
