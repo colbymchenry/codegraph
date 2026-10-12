@@ -20,7 +20,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { QueryBuilder } from '../db/queries';
-import type { Language, UnresolvedReference } from '../types';
+import type { Edge, Language, UnresolvedReference } from '../types';
 import type { ImportMapping, ReExport } from './types';
 import { extractImportMappings, extractReExports, pythonModulePath, REEXPORT_MAX_DEPTH } from './import-resolver';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
@@ -123,6 +123,9 @@ export function reopenReferencesThroughRemovedFiles(
   return reopenEdges(queries, bindings, (e) => !gone.has(e.targetFilePath));
 }
 
+/** Resolves a module specifier written in `fromFile` as its import does: the project file it names, or null. */
+export type ModuleResolver = (specifier: string, fromFile: string, language: Language) => string | null;
+
 /**
  * The other half: after a sync's retries, re-open the references the files
  * importing any of `added` make through those imports — the edges a name
@@ -130,28 +133,96 @@ export function reopenReferencesThroughRemovedFiles(
  * `resolvedUpToEdgeId`: later ones were just resolved with the modules there)
  * and the references that failed, the import of the module itself among
  * them. (The failed-import retry looks those up by the module's name, and
- * skips a name as common as `models` or `test`.) Returns the number re-opened.
+ * skips a name as common as `models` or `test`.) With `resolveModule`, also an
+ * import that resolved to a file beside an added one that now outranks it
+ * (`./button` to `button.vue` while `button.ts` was missing), and what that
+ * statement binds. Returns the number re-opened.
  */
 export function reopenReferencesThroughAddedFiles(
   queries: QueryBuilder,
   reader: ImportReader,
   added: ReadonlyArray<{ path: string; language: Language }>,
   resolvedUpToEdgeId: number,
+  resolveModule?: ModuleResolver,
 ): number {
-  const bindings = bindingsOf(importersOf(queries, added, reader), reader);
+  const outranked = resolveModule ? outrankedImports(queries, added, resolveModule) : [];
+  const bindings = bindingsOf(importersOf(queries, added, reader, outranked), reader);
   const failed = [...bindings].flatMap(([file, { modules, names }]) => queries.getFailedReferencesThrough(file, modules, names));
-  return reopenEdges(queries, bindings, (e) => e.edgeId <= resolvedUpToEdgeId) + queries.reopenFailedReferences(failed);
+  return reopenModuleEdges(queries, outranked) +
+    reopenEdges(queries, bindings, (e) => e.edgeId <= resolvedUpToEdgeId) + queries.reopenFailedReferences(failed);
+}
+
+/** An import's module edge into a file that an added file now outranks. */
+interface OutrankedImport {
+  edge: Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language };
+  specifier: string;
+  added: string;
+}
+
+/**
+ * The module edges an import resolved into a file beside one of `added` —
+ * another extension of its name, or its folder's own entry — when the
+ * import's specifier now names the added file: `./button` resolved to
+ * `button.vue` while `button.ts` was missing, and `button.ts` comes first.
+ */
+function outrankedImports(
+  queries: QueryBuilder,
+  added: ReadonlyArray<{ path: string; language: Language }>,
+  resolveModule: ModuleResolver,
+): OutrankedImport[] {
+  const out: OutrankedImport[] = [];
+  for (const file of added) {
+    if (!BINDING_LANGUAGES.has(file.language)) continue;
+    const { dir, name } = importedName(file.path);
+    for (const edge of queries.getModuleImportsNamed(dir, name)) {
+      const specifier = edge.metadata?.refName;
+      if (edge.targetFilePath === file.path || typeof specifier !== 'string') continue;
+      if (resolveModule(specifier, edge.sourceFilePath, edge.sourceLanguage) === file.path) {
+        out.push({ edge, specifier, added: file.path });
+      }
+    }
+  }
+  return out;
+}
+
+/** The folder and name an import finds a file by: `a/b.ts` → `a`, `b`; a folder's own entry `a/b/index.ts` → `a`, `b`. */
+function importedName(filePath: string): { dir: string; name: string } {
+  const slash = filePath.lastIndexOf('/');
+  const base = filePath.slice(slash + 1);
+  const dir = slash < 0 ? '' : filePath.slice(0, slash);
+  if (base.startsWith('index.') || base === '__init__.py') {
+    const up = dir.lastIndexOf('/');
+    return { dir: up < 0 ? '' : dir.slice(0, up), name: dir.slice(up + 1) };
+  }
+  const dot = base.indexOf('.', 1);
+  return { dir, name: dot < 0 ? base : base.slice(0, dot) };
+}
+
+/** Swap the outranked module edges for their references, for the sweep. Returns how many. */
+function reopenModuleEdges(queries: QueryBuilder, outranked: readonly OutrankedImport[]): number {
+  const edgeIds: number[] = [];
+  const refs: UnresolvedReference[] = [];
+  for (const { edge } of outranked) {
+    const ref = resurrectRefFromDroppedEdge(edge);
+    if (!ref || edgeIds.includes(edge.edgeId)) continue;
+    edgeIds.push(edge.edgeId);
+    refs.push(ref);
+  }
+  if (refs.length > 0) queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+  return refs.length;
 }
 
 /**
  * The files with an import statement naming one of `files`, or one of the
  * modules re-exporting from them, other than `files` themselves (going away,
- * or just resolved with the others in place).
+ * or just resolved with the others in place); `outranked` imports name the
+ * added file they now resolve to.
  */
 function importersOf(
   queries: QueryBuilder,
   files: ReadonlyArray<{ path: string; language: Language }>,
   reader: ImportReader,
+  outranked: readonly OutrankedImport[] = [],
 ): Importers {
   const importers: Importers = new Map();
   const changed = new Set(files.map((file) => file.path));
@@ -176,6 +247,10 @@ function importersOf(
       // specifier, a dotted Python import.
       for (const i of queries.getImportsInto(`file:${module.path}`, module.path)) {
         if (i.refName !== null) add(i.filePath, i.language, i.refName, module);
+      }
+      if (depth > 1) continue;
+      for (const o of outranked) {
+        if (o.added === module.path) add(o.edge.sourceFilePath, o.edge.sourceLanguage, o.specifier, module);
       }
     }
     const python = level.filter((module) => module.language === 'python');

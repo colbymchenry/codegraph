@@ -3189,6 +3189,48 @@ export class QueryBuilder {
       }));
   }
 
+  /**
+   * The module edges (`imports` edges into a file node) into the files an
+   * import of `dir/name` can find instead of a file added there: `dir/name.*`
+   * under another extension, and the folder's own entry, `dir/name/index.*`
+   * or `dir/name/__init__.py`. With the source file and language a
+   * resurrection needs.
+   */
+  getModuleImportsNamed(
+    dir: string,
+    name: string
+  ): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const base = dir ? `${dir}/${name}` : name;
+    // `x.` up to `x/` and `x/index.` up to `x/index/` ('/' is the byte after '.').
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file'
+            AND ((tgt.file_path >= ? AND tgt.file_path < ?) OR (tgt.file_path >= ? AND tgt.file_path < ?) OR tgt.file_path = ?)`
+      )
+      .all(`${base}.`, `${base}/`, `${base}/index.`, `${base}/index/`, `${base}/__init__.py`) as Array<
+        EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
+      >;
+    return rows
+      // Not a deeper path that only shares the prefix (`dir/name.d/x.ts`).
+      .filter((row) => {
+        const file = row.target_file_path;
+        if (file === `${base}/__init__.py`) return true;
+        const index = `${base}/index.`;
+        return !(file.startsWith(index) ? file.slice(index.length) : file.slice(base.length + 1)).includes('/');
+      })
+      .map((row) => ({
+        ...rowToEdge(row),
+        edgeId: row.id,
+        targetFilePath: row.target_file_path,
+        sourceFilePath: row.source_file_path,
+        sourceLanguage: row.source_language,
+      }));
+  }
+
   /** The files with a resolution edge into one of `targetIds`. */
   getFilesWithEdgesInto(targetIds: string[]): string[] {
     const files = new Set<string>();

@@ -1118,7 +1118,10 @@ export class CodeGraph {
                 const file = this.queries.getFileByPath(filePath);
                 return file ? [{ path: filePath, language: file.language }] : [];
               });
-              const reopened = reopenReferencesThroughAddedFiles(this.queries, createImportReader(this.projectRoot), added, edgesBeforeResolution);
+              const reopened = reopenReferencesThroughAddedFiles(
+                this.queries, createImportReader(this.projectRoot), added, edgesBeforeResolution,
+                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language)
+              );
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
             }
           } else {
