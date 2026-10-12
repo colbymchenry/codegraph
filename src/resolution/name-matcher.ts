@@ -9576,8 +9576,9 @@ function cppStdHeldType(raw: string): string | null {
  *  - The member of the class it names, or of a class that class derives from.
  *  - null when no project method is called: the type is a template
  *    parameter's, a library type (`std::unique_ptr<std::deque<…>>`) or an
- *    alias of one, or a class that lacks the method (but a class template's
- *    specialization may declare it, so not there).
+ *    alias of one, or a class that surely lacks the method (cppLacksMethod:
+ *    not when a class template's specialization or a base the index doesn't
+ *    link may declare it).
  *  - undefined when `raw` declares no such holder, or the type it holds is
  *    none the project declares (a generated message, a class the index
  *    doesn't name): the call goes on as before.
@@ -9604,7 +9605,7 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
   }
   const method = cppMethodOf(found.node, methodName, ref, context);
   if (method) return { original: ref, targetNodeId: method.id, confidence: found.exact ? 0.9 : 0.85, resolvedBy: 'instance-method' };
-  return cppTemplateParameters(found.node, context).size > 0 ? undefined : null;
+  return cppLacksMethod(found.node, context) ? null : undefined;
 }
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
@@ -9630,10 +9631,9 @@ function cppCallSite(caller: Node, ref: UnresolvedRef, context: ResolutionContex
  * `MemTableRep::Iterator::Valid`, one of 22 classes named `Iterator`, while the
  * `Iterator` the code means inherits `Valid` from `IteratorBase`.
  *  - The member of that class, or of a class it derives from.
- *  - null when that class has no such method: protobuf's descriptor accessors
- *    aren't indexed, and `field->full_name()` reached unrelated classes' by
- *    the method's name. (A class template's specialization may declare it, so
- *    not there.)
+ *  - null when that class surely has no such method (cppLacksMethod):
+ *    protobuf's descriptor accessors aren't indexed, and `field->full_name()`
+ *    reached unrelated classes' by the method's name.
  *  - undefined when the declaration may be another variable's (read from
  *    elsewhere, past one of the receiver the scan couldn't read, or not taking
  *    that operator), or the lookup doesn't place the type: a library type, a
@@ -9664,7 +9664,17 @@ function matchCppDeclaredTypeCall(
   if (!found?.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
   const method = cppMethodOf(found.node, methodName, ref, context);
   if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
-  return cppTemplateParameters(found.node, context).size === 0 && cppBasesKnown(found.node, context) ? null : undefined;
+  return cppLacksMethod(found.node, context) ? null : undefined;
+}
+
+/**
+ * Whether a C++ class with no method of a name, its own or one it inherits
+ * through its base edges, surely has none: it is no class template, whose
+ * specializations may declare members the template doesn't, and every base on
+ * the way is one the walk follows (cppBasesKnown).
+ */
+function cppLacksMethod(cls: Node, context: ResolutionContext): boolean {
+  return cppTemplateParameters(cls, context).size === 0 && cppBasesKnown(cls, context);
 }
 
 /**
