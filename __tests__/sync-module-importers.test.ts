@@ -57,10 +57,18 @@ const PYTHON_BARRELS = ['app/shop/__init__.py', 'lib/api.py', 'app/orm/__init__.
  * ES modules: an `index.ts` re-exporting under the same name and under
  * another, and modules re-exporting it in turn — an outer `index.ts`, all of
  * it and one name renamed, and a module passing on one name, read through a
- * namespace import — imported in its stead.
+ * namespace import — imported in its stead. It is imported from Vue
+ * components too (one beside it, as `.`), and through a scoped package a
+ * `tsconfig` path maps to it.
  */
 const TS: Files = {
   'package.json': '{"name":"app"}',
+  'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@app/widgets': ['./src/components/index.ts'] } } }),
+  'src/View.vue':
+    "<script setup lang=\"ts\">\nimport { Button } from './components';\nconst label = Button();\n</script>\n<template><div>{{ label }}</div></template>\n",
+  'src/aliased.ts': "import { Button } from '@app/widgets';\nexport function aliased() { return Button(); }\n",
+  'src/components/Panel.vue':
+    "<script setup lang=\"ts\">\nimport { Button } from '.';\nconst inner = Button();\n</script>\n<template><div>{{ inner }}</div></template>\n",
   'src/components/Button.ts': 'export function Button() { return 1; }\n',
   'src/components/Icon.ts': 'export function BaseIcon() { return 2; }\n',
   'src/components/index.ts': "export { Button } from './Button';\nexport { BaseIcon as Icon } from './Icon';\n",

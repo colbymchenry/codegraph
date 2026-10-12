@@ -2641,6 +2641,11 @@ export class ReferenceResolver {
     return this.frameworks.map((f) => f.name);
   }
 
+  /** The project file a module specifier written in `fromFile` names, as its import resolves it; null when none. */
+  resolveModuleFile(specifier: string, fromFile: string, language: Language): string | null {
+    return resolveImportPath(specifier, fromFile, language, this.context);
+  }
+
   /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
   hasNavigationRouters(): boolean {
     return this.frameworks.some((f) => f.navigation !== undefined);
