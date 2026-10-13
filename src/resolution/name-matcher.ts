@@ -9129,26 +9129,186 @@ function cppWrittenClass(type: CppWrittenType, at: UnresolvedRef, context: Resol
  * (a base class may).
  */
 function cppDataMemberType(cls: string, name: string, context: ResolutionContext): CppWrittenType | null {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const word = new RegExp(`\\b${escaped}\\b`);
-  const declarator = buildDeclaratorRegex(escaped);
   for (const decl of context.getNodesByQualifiedName(cls)) {
-    if ((decl.language !== 'cpp' && decl.language !== 'c') || !CPP_CLASS_KINDS.has(decl.kind)) continue;
-    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
-    if (!lines) continue;
+    const member = cppDataMemberIn(decl, name, context);
+    if (member) return member;
+  }
+  return null;
+}
+
+const CPP_DATA_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWrittenType | null>>();
+const CPP_NESTED_SPANS = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
+const CPP_CLASS_PAREN_DEPTHS = new WeakMap<ResolutionContext, Map<string, number[]>>();
+
+/**
+ * cppDataMemberType for one declaration of the class, `decl`. A declarator
+ * inside parentheses is a parameter of a method the class declares — which
+ * has no node of its own, so its lines are the class's — not a member:
+ * rocksdb's `DB` declares `CreateColumnFamilies(const
+ * std::vector<ColumnFamilyDescriptor>& column_families, …)`. Nor is a name
+ * an argument list follows, a method.
+ */
+function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): CppWrittenType | null {
+  if ((decl.language !== 'cpp' && decl.language !== 'c') || !CPP_CLASS_KINDS.has(decl.kind)) return null;
+  let memo = CPP_DATA_MEMBERS.get(context);
+  if (!memo) CPP_DATA_MEMBERS.set(context, (memo = new Map()));
+  const key = `${decl.id}\u0000${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let member: CppWrittenType | null = null;
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
+  if (lines) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const word = new RegExp(`\\b${escaped}\\b`);
+    const declarator = buildDeclaratorRegex(escaped);
     const end = Math.min(decl.endLine ?? decl.startLine, lines.length);
-    const inner = context.getNodesInFile(decl.filePath).filter((n) => n.id !== decl.id && n.startLine >= decl.startLine &&
-      (n.endLine ?? n.startLine) <= end && (isCppFunctionNode(n) || CPP_CLASS_KINDS.has(n.kind)));
+    const nested = cppNestedSpans(decl, end, context);
+    const rawLines = cppRawStringLines(decl.filePath, context);
+    const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
-      if (!word.test(lines[l - 1]!) || inner.some((n) => l >= n.startLine && l <= (n.endLine ?? n.startLine))) continue;
-      const declared = cppCodeOf(lines[l - 1]!)?.match(declarator)?.[1];
-      const type = declared && normalizeCppTypeName(declared);
+      if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
+      const code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
+      const m = code ? declarator.exec(code) : null;
+      if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
+      let depth = depths[l - decl.startLine]!;
+      if (depth < 0) continue;
+      for (const c of code!.slice(l === decl.startLine ? decl.startColumn : 0, m.index)) {
+        if (c === '(') depth++;
+        else if (c === ')') depth--;
+      }
+      const type = depth <= 0 ? normalizeCppTypeName(m[1]!) : null;
       if (type && type !== 'auto') {
-        return { text: declared!, scope: cls, file: decl.filePath, line: l, parameters: cppTemplateParameters(decl, context) };
+        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: l, parameters: cppTemplateParameters(decl, context) };
+        break;
       }
     }
   }
+  memo.set(key, member);
+  return member;
+}
+
+/**
+ * How many parentheses are open where each line of the C++ class
+ * declaration `decl`, which ends on line `end`, begins, or -1 for one that
+ * begins inside a block comment. Comments are followed across lines, not
+ * guessed as cppCodeOf does: it takes a code line that starts with a
+ * dereference, `*first_key, scratch);`, for one.
+ */
+function cppClassParenDepths(
+  decl: Node,
+  lines: readonly string[],
+  end: number,
+  rawLines: ReturnType<typeof cppRawStringLines>,
+  context: ResolutionContext,
+): number[] {
+  let memo = CPP_CLASS_PAREN_DEPTHS.get(context);
+  if (!memo) CPP_CLASS_PAREN_DEPTHS.set(context, (memo = new Map()));
+  let depths = memo.get(decl.id);
+  if (!depths) {
+    depths = [];
+    let depth = 0;
+    let comment = false;
+    for (let l = decl.startLine; l <= end; l++) {
+      depths.push(comment ? -1 : depth);
+      const text = cppLiteralsBlanked(lines[l - 1] ?? '', l, rawLines);
+      for (let i = l === decl.startLine ? decl.startColumn : 0; i < text.length; i++) {
+        const c = text[i]!;
+        if (comment) {
+          if (c === '*' && text[i + 1] === '/') {
+            comment = false;
+            i++;
+          }
+        } else if (c === '/' && text[i + 1] === '/') {
+          break;
+        } else if (c === '/' && text[i + 1] === '*') {
+          comment = true;
+          i++;
+        } else if (c === '(') {
+          depth++;
+        } else if (c === ')' && depth > 0) {
+          depth--;
+        }
+      }
+    }
+    memo.set(decl.id, depths);
+  }
+  return depths;
+}
+
+/** The lines of the functions and classes nested in the C++ class declaration `decl`, which ends on line `end`. */
+function cppNestedSpans(decl: Node, end: number, context: ResolutionContext): Array<[number, number]> {
+  let memo = CPP_NESTED_SPANS.get(context);
+  if (!memo) CPP_NESTED_SPANS.set(context, (memo = new Map()));
+  let spans = memo.get(decl.id);
+  if (!spans) {
+    spans = context.getNodesInFile(decl.filePath)
+      .filter((n) => n.id !== decl.id && n.startLine >= decl.startLine && (n.endLine ?? n.startLine) <= end &&
+        (isCppFunctionNode(n) || CPP_CLASS_KINDS.has(n.kind)))
+      .map((n): [number, number] => [n.startLine, n.endLine ?? n.startLine]);
+    memo.set(decl.id, spans);
+  }
+  return spans;
+}
+
+const CPP_CALLERS_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWrittenType | null>>();
+
+/**
+ * The type a data member `name` of the C++ class the calling function
+ * `caller` belongs to has, as written in the class: its own, else one of a
+ * class it derives from, through its base edges (not a base that depends on
+ * the class's template parameters, where a bare name isn't looked up). The
+ * class is read wherever it is declared: rocksdb's `DBImpl` is declared in
+ * db_impl.h, while its methods are defined in db_impl_write.cc,
+ * db_impl_compaction_flush.cc, db_impl_open.cc and more. A gtest
+ * `TEST_F(Fixture, Name)` or `TEST_P` body is a method of a class derived
+ * from `Fixture`. Null when none of them declares it.
+ */
+function cppCallersMember(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  let memo = CPP_CALLERS_MEMBERS.get(context);
+  if (!memo) CPP_CALLERS_MEMBERS.set(context, (memo = new Map()));
+  const key = `${caller.id}\u0000${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const owner = cppMemberOwner(caller, context) ?? cppTestFixture(caller, ref, context);
+  const decls = owner ? cppScopeDeclarations(owner, cppClassDecls(owner, context), caller, context).decls : [];
+  const member = owner ? cppInheritedDataMember(decls, name, context, 0, new Set([owner])) : null;
+  memo.set(key, member);
+  return member;
+}
+
+/** The data member `name` of a class, in one of its declarations `decls` or else in a class it derives from. */
+function cppInheritedDataMember(decls: readonly Node[], name: string, context: ResolutionContext, depth: number, seen: Set<string>): CppWrittenType | null {
+  for (const decl of decls) {
+    const own = cppDataMemberIn(decl, name, context);
+    if (own) return own;
+  }
+  if (depth >= 4 || !context.getSupertypeNodes) return null;
+  for (const decl of decls) {
+    for (const base of context.getSupertypeNodes(decl.id)) {
+      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName) || isCppDependentBase(decl, base, context)) continue;
+      seen.add(base.qualifiedName);
+      const inherited = cppInheritedDataMember([base], name, context, depth + 1, seen);
+      if (inherited) return inherited;
+    }
+  }
   return null;
+}
+
+/**
+ * The fixture class of a gtest `TEST_F(Fixture, Name)` or `TEST_P(Fixture,
+ * Name)` body, which the index holds as a function named `TEST_F`: the body
+ * is a method of a class gtest derives from `Fixture`. Null for any other
+ * function, and for a fixture C++ lookup doesn't find.
+ */
+function cppTestFixture(caller: Node, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (caller.kind !== 'function' || (caller.name !== 'TEST_F' && caller.name !== 'TEST_P')) return null;
+  const lines = context.getFileLines?.(caller.filePath) ?? context.readFile(caller.filePath)?.split(/\r?\n/);
+  const head = lines?.slice(caller.startLine - 1, caller.startLine + 1).join(' ') ?? '';
+  const fixture = /\bTEST_[FP]\s*\(\s*((?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*,/.exec(head)?.[1];
+  if (!fixture) return null;
+  const site = { scope: cppParentScope(caller.qualifiedName), file: caller.filePath, line: caller.startLine, parameters: new Set<string>() };
+  const found = cppClassWritten(fixture.replace(/\s+/g, ''), site, ref, context);
+  return found?.exact && CPP_CLASS_KINDS.has(found.node.kind) ? found.node.qualifiedName : null;
 }
 
 /**
@@ -9253,10 +9413,8 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     if (decl.initializer && isCppCallersDeclaration(at.filePath, decl.initializer.line, at, context)) {
       return cppExpressionType(decl.initializer.text, { ...at, line: decl.initializer.line, column: 0 }, context, depth + 1);
     }
-    if (decl.raw !== undefined && decl.callers) return decl.shadowed ? null : { ...callers, text: decl.raw };
-    // Declared nowhere in the calling method (`versions_` in db_impl_write.cc,
-    // whose class is declared in db_impl.h): a data member of its class.
-    return decl.shadowed || !owner ? null : cppDataMemberType(owner, name[1]!, context);
+    // (A data member of the caller's class has its type as `declared`.)
+    return decl.raw !== undefined && decl.callers && !decl.shadowed ? { ...callers, text: decl.raw } : null;
   }
   // `new Foo(…)`: a pointer to what it constructs.
   const created = /^new\s+((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(?:[({[][\s\S]*)?$/.exec(text);
@@ -9385,7 +9543,9 @@ function isCppTemplateDependentType(type: CppWrittenType, context: ResolutionCon
   if (isCppTemplateParameterType(type)) return true;
   const held = cppStdHeldType(type.text);
   if (held) return isCppTemplateDependentType({ ...type, text: held }, context);
-  return isCppLibraryType(type.text, context) && (type.text.match(/[A-Za-z_]\w*/g) ?? []).some((word) => type.parameters.has(word));
+  // (A trait of one, `std::conditional_t<kIsMutable, …>`, too: it names another type.)
+  return (isCppLibraryType(type.text, context) || cppTypeSegments(type.text)?.[0] === 'std') &&
+    (type.text.match(/[A-Za-z_]\w*/g) ?? []).some((word) => type.parameters.has(word));
 }
 
 /** Where the C or C++ string or character literal opening at `text[start]` closes (the line's end if it doesn't). */
@@ -9487,10 +9647,11 @@ interface CppReceiverDeclaration {
    */
   shadowed?: boolean;
   /**
-   * The receiver's type as written where it is declared, when its own
-   * declaration says `auto` (`raw` is its text): the element type of the
-   * range an `auto` range-for iterates, or the type of an `auto` local's
-   * initializer — the `Iterator*` that `txn->GetIterator(…)` returns.
+   * The receiver's type as written where it is declared, when that is not
+   * in the calling function's own text or says `auto` there (`raw` is its
+   * text): the element type of the range an `auto` range-for iterates, the
+   * type of an `auto` local's initializer — the `Iterator*` that
+   * `txn->GetIterator(…)` returns — or a data member's, in its class.
    */
   declared?: CppWrittenType;
   /**
@@ -9744,8 +9905,9 @@ function matchCppDeclaredTypeCall(
   // own the index doesn't hold: the class it names, by its qualified name.
   const aliasedClass = decl.alias && cppAliasedClass(decl.alias, context);
   if (decl.aliased && !aliasedClass) return undefined;
-  // An `auto` variable's type is looked up where it is written: where its
-  // range's type or its initializer's function is declared.
+  // A type the calling function doesn't write is looked up where it is
+  // written: where an `auto` variable's range or initializer gets it, or in
+  // a data member's class.
   const site = decl.declared ?? cppCallSite(caller, ref, context);
   const found = cppClassWritten(aliasedClass ? `::${aliasedClass}` : decl.raw, site, ref, context);
   if (found === undefined && !aliasedClass && isCppOutsideQualifiedType(decl.raw, site, context)) return null;
@@ -10267,8 +10429,18 @@ function inferCppReceiverType(
   // writes `upb_MiniTableField field = $field_init$;` in the raw string it
   // emits, above calls on its own `upb::FieldDefPtr field` parameter.
   const rawLines = cppRawStringLines(ref.filePath, context);
+  // Past the calling function's first line, C++ looks the name up among the
+  // members of the function's class before anything outside it.
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const memberCaller = caller && caller.filePath === ref.filePath && (caller.kind === 'method' || caller.kind === 'function') ? caller : null;
+  let memberLooked = memberCaller === null;
 
   for (let i = callLineIndex; i >= 0; i--) {
+    if (!memberLooked && memberCaller && i < memberCaller.startLine - 1) {
+      memberLooked = true;
+      const member = cppMemberReceiverType(receiverName, memberCaller, ref, context, found);
+      if (member !== undefined) return member;
+    }
     const text = lines[i];
     if (!text || !receiverPattern.test(text)) continue;
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
@@ -10333,6 +10505,11 @@ function inferCppReceiverType(
       if (cppRebindsReceiver(line, escapedReceiver)) found.shadowed = true;
     }
   }
+  // (A function that starts on the file's first line.)
+  if (!memberLooked && memberCaller) {
+    const member = cppMemberReceiverType(receiverName, memberCaller, ref, context, found);
+    if (member !== undefined) return member;
+  }
 
   const headerCandidates = [
     ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.h'),
@@ -10365,6 +10542,35 @@ function inferCppReceiverType(
   }
 
   return null;
+}
+
+/**
+ * The type of a C++ receiver the calling function doesn't declare, as a data
+ * member of the function's class (cppCallersMember), recorded in `found` as
+ * a declaration of the caller's, where the class writes it. Undefined when
+ * it is no member, or the scan passed a declaration of the name it couldn't
+ * read (`auto mutex_ = Make();`), which is what the name means there.
+ */
+function cppMemberReceiverType(
+  receiverName: string,
+  caller: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  found: CppReceiverDeclaration,
+): string | null | undefined {
+  if (found.shadowed) return undefined;
+  const member = cppCallersMember(receiverName, caller, ref, context);
+  const normalized = member && normalizeCppTypeName(member.text);
+  if (!member || !normalized) return undefined;
+  // A member of a template parameter's type (`TComparator cmp_;`), or of an
+  // alias of one (`using Shard = typename Cache::Shard;`, protobuf's
+  // `using MapFieldBase = std::conditional_t<kIsMutable, …>;`), names no
+  // particular class: the call goes on as before.
+  const followed = cppFollowWrittenAliases(member, ref, context);
+  if (isCppTemplateDependentType(followed ?? member, context) || resolveCppAliasedType(member.text, ref, context) === null) return undefined;
+  noteCppDeclaration(found, member.text, true);
+  found.declared = member;
+  return cppDeclaredType(member.text, normalized, true, ref, context, found);
 }
 
 /**
@@ -10968,6 +11174,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
   CPP_SCOPE_NAMES.delete(context);
+  CPP_DATA_MEMBERS.delete(context);
+  CPP_NESTED_SPANS.delete(context);
+  CPP_CLASS_PAREN_DEPTHS.delete(context);
+  CPP_CALLERS_MEMBERS.delete(context);
   SOLIDITY_SUPERS.delete(context);
   DECLARED_SUPERS.delete(context);
   INHERITED_METHODS.delete(context);
