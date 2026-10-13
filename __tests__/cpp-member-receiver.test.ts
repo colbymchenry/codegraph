@@ -401,8 +401,8 @@ describe('what keeps the call as it was', () => {
 
   it('a parameter of a method the class declares, which is no member', async () => {
     // rocksdb's DB declares `CreateColumnFamilies(const std::vector<…>&
-    // column_families, …)`; DBImpl's `const ColumnFamilySet* const
-    // column_families` is a local the scan cannot read.
+    // column_families, …)`. (The function declares no local of the names:
+    // one the scan reads would decide first.)
     const cg = await indexed({
       ...ROCKSDB,
       'db/db_impl/db_impl.h': ROCKSDB['db/db_impl/db_impl.h'].replace(
@@ -413,8 +413,6 @@ describe('what keeps the call as it was', () => {
         '#include "db/db_impl/db_impl.h"',
         'namespace rocksdb {',
         'int DBImpl::CountColumnFamilies() {',
-        '  const ColumnFamilySet* const column_families = versions_->GetColumnFamilySet();',
-        '  const Statistics* const stats = nullptr;',
         '  if (stats->load()) return 0;',
         '  return column_families->NumberOfColumnFamilies();',
         '}',
