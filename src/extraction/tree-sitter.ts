@@ -1820,6 +1820,18 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * The qualified name of a class, struct or union whose declaration writes
+   * its name in a scope (getClassScope): C++'s out-of-line nested `struct
+   * SkipList<Key, Comparator>::Node` is `leveldb::SkipList::Node`, composed
+   * like an out-of-line method's. Its members are qualified under it
+   * (objectPathOwners). Undefined for any other.
+   */
+  private writtenScopeQualifiedName(node: SyntaxNode, name: string): string | undefined {
+    const scope = this.extractor?.getClassScope?.(node, this.source);
+    return scope ? this.composeReceiverQualifiedName(scope, name) : undefined;
+  }
+
+  /**
    * Build qualified name from node stack
    */
   private buildQualifiedName(name: string): string {
@@ -2140,14 +2152,17 @@ export class TreeSitterExtractor {
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
       ...this.cppBodyEnd(resolvedBody),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!classNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(classNode.id, scoped);
     this.openCppClassScope(classNode, resolvedBody);
 
     // Extract extends/implements
@@ -2356,14 +2371,17 @@ export class TreeSitterExtractor {
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const aggregateNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
       ...this.cppBodyEnd(body),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!aggregateNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(aggregateNode.id, scoped);
     this.openCppClassScope(aggregateNode, body);
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)

@@ -301,6 +301,10 @@ struct Scope {
     row: u32,
     kind: &'static str,
     name: String,
+    /// The qualified name its members are qualified under in place of the
+    /// scopes around it: a class written in a scope (objectPathOwners in
+    /// tree-sitter.ts, written_scope_qualified_name).
+    qualified: Option<String>,
 }
 
 #[derive(Default)]
@@ -464,7 +468,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
     });
     w.nodes_meta.push(NodeMeta { kind: "file", name: base_name.to_string() });
     w.node_ids.push(ids::file_node_id(file_path));
-    w.stack.push(Scope { row: 0, kind: "file", name: base_name.to_string() });
+    w.stack.push(Scope { row: 0, kind: "file", name: base_name.to_string(), qualified: None });
 
     w.visit_node(tree.root_node());
     w.flush_fn_ref_candidates();
@@ -541,7 +545,10 @@ impl<'t> Walker<'t> {
         let qualified = extra.qualified_name.unwrap_or_else(|| {
             let mut parts: Vec<&str> = self.namespace_prefix.iter().map(|s| s.as_str()).collect();
             for s in &self.stack {
-                if s.kind != "file" {
+                if let Some(q) = &s.qualified {
+                    parts.clear();
+                    parts.push(q);
+                } else if s.kind != "file" {
                     parts.push(&s.name);
                 }
             }
@@ -648,6 +655,11 @@ impl<'t> Walker<'t> {
         if let Some(name) = self.unnamed_type_variable_name(node) {
             return name;
         }
+        if self.variant == Variant::Cpp {
+            if let Some(mut parts) = self.cpp_written_class_parts(node) {
+                return parts.pop().unwrap_or_default();
+            }
+        }
         if let Some(name_node) = node.child_by_field_name("declarator") {
             let mut resolved = name_node;
             // Unwrap pointer/reference declarators (`int* f()`, `T& f()`).
@@ -686,6 +698,55 @@ impl<'t> Walker<'t> {
             }
         }
         "<anonymous>".to_string()
+    }
+
+    /// cppWrittenClassParts (languages/c-cpp.ts): the `::` segments of a class,
+    /// struct or union name written with a scope, the scope's template
+    /// arguments dropped (`["SkipList", "Node"]` for `struct SkipList<Key,
+    /// Comparator>::Node`). None for a plain name and for a specialization,
+    /// whose innermost name has template arguments.
+    fn cpp_written_class_parts(&self, node: Node) -> Option<Vec<String>> {
+        if !matches!(node.kind(), "class_specifier" | "struct_specifier" | "union_specifier") {
+            return None;
+        }
+        let written = node.child_by_field_name("name")?;
+        if written.kind() != "qualified_identifier" {
+            return None;
+        }
+        let mut innermost = Some(written);
+        while let Some(n) = innermost.filter(|n| n.kind() == "qualified_identifier") {
+            innermost = n.child_by_field_name("name");
+        }
+        if innermost.map(|n| n.kind()) != Some("type_identifier") {
+            return None;
+        }
+        let parts: Vec<String> = strip_cpp_template_args(self.text(written))
+            .split("::")
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let identifier = |p: &String| {
+            let mut chars = p.chars();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if parts.is_empty() || !parts.iter().all(identifier) {
+            return None;
+        }
+        Some(parts)
+    }
+
+    /// writtenScopeQualifiedName (tree-sitter.ts): a class whose name is
+    /// written in a scope is qualified like an out-of-line method under it.
+    fn written_scope_qualified_name(&self, node: Node, name: &str) -> Option<String> {
+        if self.variant != Variant::Cpp {
+            return None;
+        }
+        let parts = self.cpp_written_class_parts(node)?;
+        if parts.len() < 2 {
+            return None;
+        }
+        Some(self.compose_receiver_qualified_name(&parts[..parts.len() - 1].join("::"), name))
     }
 
     /// unnamedTypeVariableName (languages/c-cpp.ts): an unnamed class, struct,
@@ -1172,7 +1233,7 @@ impl<'t> Walker<'t> {
         // for c/cpp: not in TYPE_ANNOTATION_LANGUAGES, and the decorator node
         // kinds never appear as direct children/preceding siblings in these
         // grammars — `attribute` only occurs under attribute_declaration.)
-        self.stack.push(Scope { row, kind: "function", name });
+        self.stack.push(Scope { row, kind: "function", name, qualified: None });
         if let Some(body) = node.child_by_field_name("body") {
             self.visit_function_body(body);
         }
@@ -1242,7 +1303,7 @@ impl<'t> Walker<'t> {
             }
         }
 
-        self.stack.push(Scope { row, kind: "method", name });
+        self.stack.push(Scope { row, kind: "method", name, qualified: None });
         if let Some(body) = node.child_by_field_name("body") {
             self.visit_function_body(body);
         }
@@ -1260,14 +1321,16 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
+        let scoped = self.written_scope_qualified_name(node, &name);
         let extra = Extra {
             docstring: self.class_like_docstring(node),
             visibility: self.visibility_of(node),
             end: self.brace_body_end(body),
+            qualified_name: scoped.clone(),
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
-        let scope = Scope { row, kind: "class", name };
+        let scope = Scope { row, kind: "class", name, qualified: scoped };
         self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
         self.stack.push(scope);
@@ -1284,14 +1347,16 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
+        let scoped = self.written_scope_qualified_name(node, &name);
         let extra = Extra {
             docstring: self.class_like_docstring(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
             end: self.brace_body_end(body),
+            qualified_name: scoped.clone(),
             ..Extra::default()
         };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
-        let scope = Scope { row, kind, name };
+        let scope = Scope { row, kind, name, qualified: scoped };
         self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
         self.stack.push(scope);
@@ -1314,7 +1379,7 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node("enum", &name, node, extra) else { return };
         self.extract_inheritance(node, row);
-        self.stack.push(Scope { row, kind: "enum", name });
+        self.stack.push(Scope { row, kind: "enum", name, qualified: None });
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enumerator" {
@@ -1375,7 +1440,7 @@ impl<'t> Walker<'t> {
             ) else {
                 return true;
             };
-            self.stack.push(Scope { row, kind, name });
+            self.stack.push(Scope { row, kind, name, qualified: None });
             let type_child = node
                 .child_by_field_name("type")
                 .or_else(|| self.find_child_by_kind(node, "struct_specifier"))
@@ -1402,7 +1467,7 @@ impl<'t> Walker<'t> {
             ) else {
                 return true;
             };
-            self.stack.push(Scope { row, kind: "enum", name });
+            self.stack.push(Scope { row, kind: "enum", name, qualified: None });
             if let Some(inner) = self.find_child_by_kind(node, "enum_specifier") {
                 self.extract_inheritance(inner, row);
                 if let Some(body) = inner.child_by_field_name("body") {

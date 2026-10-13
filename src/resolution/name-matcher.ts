@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
+import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppRawStringLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
@@ -10741,6 +10741,133 @@ function inferCppAutoInitializerType(
 }
 
 /**
+ * A C++ construction — `new log::Writer(…)`, `Writer w(…)`, which the
+ * extractor records by the type's last name — makes the class C++ lookup
+ * finds for the type as written at the ref (cppClassWritten), as a base
+ * class names one (matchCppSupertype): from the scopes around the call
+ * outward, its qualifier followed, an alias to the class it names. leveldb's
+ * db_impl.cc writes `new log::Writer(…)` in `DBImpl` methods, which also
+ * construct `DBImpl::Writer`s, the struct it defines out of line, as `Writer
+ * w(…)`; by its last name alone the two were one.
+ *  - At 0.7 when lookup doesn't place the type and the class is only the one
+ *    of that name the file can see.
+ *  - The enum lookup finds instead of a class: rocksdb's `const ValueType
+ *    types[] = {kTypeValue, …}`.
+ *  - Through an alias the calling function declares itself, which isn't
+ *    indexed, the class it names, if one of the project's.
+ *  - null (no edge) when the type names no particular class: a template
+ *    parameter, a member of a type from outside the project (rocksdb's
+ *    `stl_wrappers::KVMap::value_type`), a function's own alias of one —
+ *    protobuf's `using Map = std::map<…>; … new Map{}` is no
+ *    `google::protobuf::Map`.
+ *  - undefined, for the name strategies to decide as before, when nothing
+ *    the file sees is named so.
+ * The type is read with its template arguments, so `new Outer<int>::Inner(…)`,
+ * which the extractor records by the name before the first `<`, makes an
+ * `Outer::Inner`. Where the file declares several classes or aliases of the
+ * qualified name lookup found, which C++ tells apart and qualified names
+ * don't, the type is the one declared around the construction
+ * (cppNamesakeAround).
+ */
+function matchCppConstruction(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const text = lines?.[ref.line - 1]?.slice(Math.max(0, ref.column));
+  if (!caller || !text) return undefined;
+  // (A declaration's column is where its specifiers start: `const Slice key(…)`.)
+  const specifiers = /^(?:(?:new|const|volatile|static|thread_local|constexpr|constinit|mutable|struct|class|union|typename)\s+)*/.exec(text)![0];
+  const written = cppTypeWrittenAt(text.slice(specifiers.length));
+  if (!written) return undefined;
+  const made = (node: Node, exact = true): ResolvedRef => exact
+    ? { original: ref, targetNodeId: node.id, confidence: 0.9, resolvedBy: 'qualified-name' }
+    : { original: ref, targetNodeId: node.id, confidence: 0.7, resolvedBy: 'exact-match' };
+  if (cppDeclaresLocalAlias(written, ref, context)) {
+    const aliased = resolveCppAliasedType(written, ref, context);
+    const named = aliased && !aliased.pointer ? cppAliasedClass(aliased, context) : undefined;
+    const cls = named ? context.getNodesByQualifiedName(named).find((n) => CPP_CLASS_KINDS.has(n.kind)) : undefined;
+    return cls ? made(cls) : null;
+  }
+  const site = cppCallSite(caller, ref, context);
+  const found = cppClassWritten(written, site, ref, context);
+  if (found === null) {
+    const named = cppEnumWritten(written, site, context);
+    return named ? made(named) : null;
+  }
+  if (!found) return undefined;
+  const namesakes = context.getNodesByQualifiedName(found.node.qualifiedName)
+    .filter((n) => n.filePath === ref.filePath && (CPP_CLASS_KINDS.has(n.kind) || n.kind === 'type_alias'));
+  const type = namesakes.length > 1 ? cppNamesakeAround(namesakes, ref, context) : found.node;
+  return type ? made(type, found.exact) : undefined;
+}
+
+/**
+ * The enum a C++ type written at `site` names, which C++ lookup for a class
+ * passes by: the first scope around the site, innermost first, that declares
+ * one of that name the file can see. (A template parameter of that name is
+ * the parameter, which the resolver's type-parameter gate sees to.)
+ */
+function cppEnumWritten(written: string, site: CppNameSite, context: ResolutionContext): Node | undefined {
+  const global = written.trimStart().startsWith('::');
+  const path = stripCppTemplateArguments(written).replace(/\s+/g, '').replace(/^::/, '');
+  for (const scope of global ? [''] : cppScopesWithin(site.scope)) {
+    const enums = context.getNodesByQualifiedName(scope ? `${scope}::${path}` : path)
+      .filter((n) => n.kind === 'enum' && (n.filePath === site.file || !C_SOURCE_EXT.test(n.filePath)));
+    if (enums.length > 0) return enums.find((n) => n.filePath === site.file) ?? enums[0];
+  }
+  return undefined;
+}
+
+const CPP_HOLDER_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'class', 'struct', 'union']);
+
+/**
+ * Of several classes or aliases the ref's file declares under one qualified
+ * name — the local classes of rocksdb's gtest `TEST_F` bodies, each a
+ * `FakeWF`, or the `Impl`s and `ArgumentTuple`s of googlemock's unnamed
+ * specializations — the one whose holder (the function or class it is
+ * declared in, else the file) holds the ref. Undefined unless exactly one is.
+ */
+function cppNamesakeAround(namesakes: Node[], ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const holders = context.getNodesInFile(ref.filePath).filter((n) => CPP_HOLDER_KINDS.has(n.kind));
+  const around = namesakes.filter((cls) => {
+    let holder: Node | undefined;
+    for (const n of holders) {
+      if (n.id === cls.id || n.startLine > cls.startLine || n.endLine < cls.endLine) continue;
+      if (!holder || n.endLine - n.startLine < holder.endLine - holder.startLine) holder = n;
+    }
+    return !holder || (holder.startLine <= ref.line && ref.line <= holder.endLine);
+  });
+  return around.length === 1 ? around[0] : undefined;
+}
+
+/**
+ * The type name `text` starts with, template arguments and all: `log::Writer`
+ * of `log::Writer(…)`, `Outer<int>::Inner` of `Outer<int>::Inner x(…)`.
+ * Undefined when it starts with none, or a template argument list goes on to
+ * the next line.
+ */
+function cppTypeWrittenAt(text: string): string | undefined {
+  let end = 0;
+  for (let segment = /^(?:::\s*)?[A-Za-z_]\w*/; ; segment = /^\s*::\s*[A-Za-z_]\w*/) {
+    const name = segment.exec(text.slice(end));
+    if (!name) return end > 0 ? text.slice(0, end) : undefined;
+    end += name[0].length;
+    const open = /^\s*</.exec(text.slice(end));
+    if (!open) continue;
+    end += open[0].length;
+    // (`>` inside parentheses compares: `Bits<(N > 8)>`.)
+    for (let angles = 1, parens = 0; angles > 0; end++) {
+      const c = text[end];
+      if (c === undefined) return undefined;
+      if (c === '(') parens++;
+      else if (c === ')') parens--;
+      else if (parens > 0) continue;
+      else if (c === '<') angles++;
+      else if (c === '>') angles--;
+    }
+  }
+}
+
+/**
  * Resolve a C++ chained call whose receiver is itself a call — encoded by the
  * extractor as `<innerCallee>().<method>` (#645). The receiver's type is what
  * the inner call returns; the outer method is then resolved and VALIDATED on it
@@ -15230,6 +15357,13 @@ function matchReferenceInner(
   if (ref.language === 'cpp' || ref.language === 'c') {
     result = nmTimed('cppChain', ref, () => matchCppCallChain(ref, context));
     if (result) return result;
+  }
+
+  // 1b'. A C++ construction — `new log::Writer(…)`, `Writer w(…)` — makes the
+  // class C++ lookup finds for the type as written there, or nothing.
+  if (ref.language === 'cpp' && ref.referenceKind === 'instantiates') {
+    const constructed = nmTimedT('cppConstruct', ref, () => matchCppConstruction(ref, context));
+    if (constructed !== undefined) return constructed;
   }
 
   // 1c. `::`-scoped factory chain — PHP `Cls::for($x)->method()` (#608) or Rust

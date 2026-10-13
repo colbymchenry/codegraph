@@ -315,6 +315,14 @@ export interface LanguageExtractor {
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * The scope a class, struct or union declaration writes its name in, when
+   * it does: C++'s `SkipList` for an out-of-line nested class `struct
+   * SkipList<Key, Comparator>::Node`. The class is qualified under it the way
+   * an out-of-line method is under its receiver, and so are its members.
+   */
+  getClassScope?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
    * Extract a function/method's normalized return type name (bare class name,
    * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
    * by C/C++ so resolution can infer a chained receiver's type from what the
