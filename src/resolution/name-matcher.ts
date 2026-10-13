@@ -1858,6 +1858,186 @@ const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
  */
 const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
 
+/** Per context: a C/C++ type's qualified name → its declarations. */
+const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+/** Per context: a C/C++ file → the line and resolved file of each `#include` it writes. */
+const CPP_INCLUDE_LINES = new WeakMap<ResolutionContext, Map<string, Array<[number, string | null]>>>();
+/** Per context: a C/C++ file → the line spans of its unnamed namespaces. */
+const CPP_UNNAMED_NAMESPACES = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
+
+/**
+ * Whether only another C or C++ translation unit can name `candidate`: a
+ * type or alias a source file declares, a member of a class only source
+ * files declare, or what a source file's unnamed namespace (`namespace { … }`)
+ * declares. rocksdb's test fixture `ColumnFamilyTestBase` is declared in
+ * column_family_test.cc, and other test files' bare `Put(…)` reached its `Put`
+ * by name; inlineskiplist.h's `Node*` reached hash_linklist_rep.cc's own
+ * `Node`. What a source file declares is seen by the file itself, by a
+ * translation unit that includes it (a test that includes the source it
+ * tests), and by a header it includes after the declaration: rocksdb's
+ * version_set.cc includes version_set_sync_and_async.h below its
+ * `FilePicker` classes.
+ */
+function isCppTranslationUnitLocal(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'c' && ref.language !== 'cpp') return false;
+  const seenFrom = (decl: Node, file: string): boolean => !C_SOURCE_EXT.test(decl.filePath) || decl.filePath === file ||
+    cppIncluders(decl.filePath, context).has(file) || cppIncludesAfter(decl.filePath, decl.startLine, file, context);
+  const seen = (decl: Node): boolean => seenFrom(decl, ref.filePath);
+  if (CPP_TYPE_KINDS.has(candidate.kind)) return !seen(candidate);
+  // A member written in its class's declaration is that declaration's; one
+  // defined out of line is the class's, wherever a declaration of it its own
+  // file sees is (through an alias, the class may be declared anywhere). A
+  // scope its file sees no type of may be a namespace: fmt's posix-mock-test.cc
+  // defines `test::close` of posix-mock.h's `namespace test`, and
+  // ostream-test.cc declares a `struct test` of its own.
+  const enclosing = cppEnclosingClassDecl(candidate, context);
+  if (enclosing) return !seen(enclosing);
+  const decls = cppTypeDecls(cppParentScope(candidate.qualifiedName), context)
+    .filter((d) => seenFrom(d, candidate.filePath));
+  if (decls.some((d) => d.kind === 'type_alias')) return false;
+  if (decls.length > 0) return !decls.some(seen);
+  return !seen(candidate) &&
+    cppUnnamedNamespaceSpans(candidate.filePath, context).some(([start, end]) => candidate.startLine >= start && candidate.startLine <= end);
+}
+
+/**
+ * Of the methods a C or C++ type's name gives, those `ref`'s translation
+ * unit can see (isCppTranslationUnitLocal), when there are any. Classes of
+ * one qualified name can be declared apart: rocksdb's db_stress_shared_state.h
+ * and two benchmark `.cc` files each declare a `SharedState`, and a call in
+ * db_stress_common.cc is the header's. (Every candidate for any other ref.)
+ */
+function cppVisibleFirst(methods: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (methods.length < 2 || (ref.language !== 'c' && ref.language !== 'cpp')) return methods;
+  const visible = methods.filter((m) => !isCppTranslationUnitLocal(m, ref, context));
+  return visible.length > 0 ? visible : methods;
+}
+
+/** The declarations of the C or C++ type (or alias) named `qualifiedName`. */
+function cppTypeDecls(qualifiedName: string, context: ResolutionContext): Node[] {
+  if (!qualifiedName) return [];
+  let memo = CPP_TYPE_DECLS.get(context);
+  if (!memo) CPP_TYPE_DECLS.set(context, (memo = new Map()));
+  let decls = memo.get(qualifiedName);
+  if (!decls) {
+    decls = context.getNodesByQualifiedName(qualifiedName)
+      .filter((n) => CPP_TYPE_KINDS.has(n.kind) && (n.language === 'cpp' || n.language === 'c'));
+    memo.set(qualifiedName, decls);
+  }
+  return decls;
+}
+
+/** The innermost C or C++ class, struct or union declaration of its file whose lines hold `member`. */
+function cppEnclosingClassDecl(member: Node, context: ResolutionContext): Node | undefined {
+  let innermost: Node | undefined;
+  for (const cls of cppClassesIn(member.filePath, context)) {
+    if (cls.id === member.id || member.startLine < cls.startLine || member.startLine > (cls.endLine ?? cls.startLine)) continue;
+    if (!innermost || cls.startLine >= innermost.startLine) innermost = cls;
+  }
+  return innermost;
+}
+
+/** Whether the C or C++ file `source` `#include`s `header` below line `line`. */
+function cppIncludesAfter(source: string, line: number, header: string, context: ResolutionContext): boolean {
+  let memo = CPP_INCLUDE_LINES.get(context);
+  if (!memo) CPP_INCLUDE_LINES.set(context, (memo = new Map()));
+  let includes = memo.get(source);
+  if (!includes) {
+    includes = context.getNodesInFile(source)
+      .filter((n) => n.kind === 'import')
+      .map((n): [number, string | null] => [n.startLine, cppIncludedFile(n, context)]);
+    memo.set(source, includes);
+  }
+  return includes.some(([at, file]) => at > line && file === header);
+}
+
+/**
+ * The line spans of the unnamed namespaces (`namespace { … }`) a C or C++
+ * file writes, the outermost of nested ones: what one declares has internal
+ * linkage, so no other translation unit names it. Comments, preprocessor
+ * lines and string, character and raw string literals are skipped.
+ */
+function cppUnnamedNamespaceSpans(file: string, context: ResolutionContext): Array<[number, number]> {
+  let memo = CPP_UNNAMED_NAMESPACES.get(context);
+  if (!memo) CPP_UNNAMED_NAMESPACES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const spans: Array<[number, number]> = [];
+  const text = context.readFile(file) ?? '';
+  if (/\bnamespace\s*\{/.test(text)) {
+    const open: Array<{ line: number; unnamed: boolean }> = [];
+    let line = 1;
+    let lineStart = true;
+    // The code since the last brace or `;`, without comments and literals.
+    let code = '';
+    let i = 0;
+    while (i < text.length) {
+      const c = text[i]!;
+      if (c === '\n') {
+        line++;
+        lineStart = true;
+        code += ' ';
+        i++;
+        continue;
+      }
+      if (lineStart && c === '#') {
+        // A preprocessor line, continued by a trailing backslash (before a CRLF too).
+        let end = i;
+        while (end < text.length && (text[end] !== '\n' || text[end - 1] === '\\' || (text[end - 1] === '\r' && text[end - 2] === '\\'))) {
+          if (text[end] === '\n') line++;
+          end++;
+        }
+        i = end;
+        continue;
+      }
+      if (!/\s/.test(c)) lineStart = false;
+      if (c === '/' && text[i + 1] === '/') {
+        const end = text.indexOf('\n', i);
+        i = end < 0 ? text.length : end;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '*') {
+        const end = text.indexOf('*/', i + 2);
+        const stop = end < 0 ? text.length : end + 2;
+        for (let j = i; j < stop; j++) if (text.charCodeAt(j) === 10) line++;
+        i = stop;
+        continue;
+      }
+      if (c === '"' && /(?:^|[^\w$])(?:u8|[uUL])?R$/.test(text.slice(Math.max(0, i - 4), i))) {
+        // `R"delim( … )delim"`.
+        const paren = text.indexOf('(', i);
+        const end = paren < 0 ? -1 : text.indexOf(`)${text.slice(i + 1, paren)}"`, paren);
+        const stop = end < 0 ? text.length : end + paren - i + 1;
+        for (let j = i; j < stop && j < text.length; j++) if (text.charCodeAt(j) === 10) line++;
+        i = Math.min(stop, text.length);
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        let j = i + 1;
+        while (j < text.length && text[j] !== c && text[j] !== '\n') j += text[j] === '\\' ? 2 : 1;
+        i = j + 1;
+        continue;
+      }
+      if (c === '{') {
+        open.push({ line, unnamed: /(?:^|[^\w$])namespace\s*$/.test(code) });
+        code = '';
+      } else if (c === '}') {
+        const top = open.pop();
+        if (top?.unnamed && !open.some((o) => o.unnamed)) spans.push([top.line, line]);
+        code = '';
+      } else if (c === ';') {
+        code = '';
+      } else {
+        code += c;
+        if (code.length > 200) code = code.slice(-100);
+      }
+      i++;
+    }
+  }
+  memo.set(file, spans);
+  return spans;
+}
+
 /**
  * Whether a C/C++ function definition carries the `static` storage class —
  * read from its first source line(s), since the extractor records no storage
@@ -2761,7 +2941,9 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
  *   includes it and stays visible. On a 2,109-file betaflight tree 145
  *   cross-file calls resolved onto a `static` in another `.c` (#1730) —
  *   `usbd_get_descriptor` onto the `static get_device_descriptor` of
- *   whichever USB class file ranked first.
+ *   whichever USB class file ranked first. So is what a source file's
+ *   unnamed namespace declares, and a type only source files declare, with
+ *   its members (isCppTranslationUnitLocal).
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -2826,11 +3008,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
       (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
-    return (
-      candidate.kind !== 'function' ||
-      !C_SOURCE_EXT.test(candidate.filePath) ||
-      !isStaticCFunction(candidate, context)
-    );
+    if (candidate.kind === 'function' && C_SOURCE_EXT.test(candidate.filePath) && isStaticCFunction(candidate, context)) return false;
+    return !isCppTranslationUnitLocal(candidate, ref, context);
   }
   if (lang === 'go') {
     // By the name's first letter, not the extractor's flag: the flag is unset
@@ -8851,7 +9030,7 @@ export function resolveMethodOnType(
   // in ANOTHER file (#314) — is unaffected: that block returns early whenever
   // an import FQN pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(matches, ref.filePath);
+  const ordered = preferCallSiteFile(cppVisibleFirst(matches, ref, context), ref.filePath);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -10004,7 +10183,7 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
   const own = named.filter((n) => n.qualifiedName === want);
-  if (own.length > 0) return preferCallSiteFile(own, ref.filePath)[0]!;
+  if (own.length > 0) return preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath)[0]!;
   seen.add(cls.qualifiedName);
   if (depth >= 4 || !context.getSupertypeNodes) return null;
   for (const decl of context.getNodesByQualifiedName(cls.qualifiedName)) {
@@ -11141,6 +11320,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
+  CPP_TYPE_DECLS.delete(context);
+  CPP_INCLUDE_LINES.delete(context);
+  CPP_UNNAMED_NAMESPACES.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_CRATES.delete(context);
