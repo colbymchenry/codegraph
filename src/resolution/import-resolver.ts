@@ -751,12 +751,12 @@ function resolveAliasedImport(
   }
 
   // 1.5 Workspace packages (`@scope/ui/widgets` → `packages/ui/widgets`).
-  //     Resolves a monorepo member import to the member's directory; the
-  //     extension/index permutations below then find its barrel (#629).
+  //     Resolves a monorepo member import to the entry its package.json
+  //     declares (#2502), else to the member's directory, where the
+  //     extension/index permutations find its barrel (#629).
   const workspaces = context.getWorkspacePackages?.();
   if (workspaces) {
-    const base = resolveWorkspaceImport(importPath, workspaces);
-    if (base) {
+    for (const base of resolveWorkspaceImport(importPath, workspaces) ?? []) {
       const hit = tryWithExt(base);
       if (hit) return hit;
     }
