@@ -3189,6 +3189,48 @@ export class QueryBuilder {
       }));
   }
 
+  /**
+   * The module edges (`imports` edges into a file node) into the files an
+   * import of `dir/name` can find instead of a file added there: `dir/name.*`
+   * under another extension, and the folder's own entry, `dir/name/index.*`
+   * or `dir/name/__init__.py`. With the source file and language a
+   * resurrection needs.
+   */
+  getModuleImportsNamed(
+    dir: string,
+    name: string
+  ): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const base = dir ? `${dir}/${name}` : name;
+    // `x.` up to `x/` and `x/index.` up to `x/index/` ('/' is the byte after '.').
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file'
+            AND ((tgt.file_path >= ? AND tgt.file_path < ?) OR (tgt.file_path >= ? AND tgt.file_path < ?) OR tgt.file_path = ?)`
+      )
+      .all(`${base}.`, `${base}/`, `${base}/index.`, `${base}/index/`, `${base}/__init__.py`) as Array<
+        EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
+      >;
+    return rows
+      // Not a deeper path that only shares the prefix (`dir/name.d/x.ts`).
+      .filter((row) => {
+        const file = row.target_file_path;
+        if (file === `${base}/__init__.py`) return true;
+        const index = `${base}/index.`;
+        return !(file.startsWith(index) ? file.slice(index.length) : file.slice(base.length + 1)).includes('/');
+      })
+      .map((row) => ({
+        ...rowToEdge(row),
+        edgeId: row.id,
+        targetFilePath: row.target_file_path,
+        sourceFilePath: row.source_file_path,
+        sourceLanguage: row.source_language,
+      }));
+  }
+
   /** The files with a resolution edge into one of `targetIds`. */
   getFilesWithEdgesInto(targetIds: string[]): string[] {
     const files = new Set<string>();
@@ -4042,26 +4084,40 @@ export class QueryBuilder {
   /**
    * Failed `imports` refs a sync should retry once files appear. An import
    * names a file, a folder or a namespace, which the symbol lookup above
-   * cannot match, so it is found two ways:
+   * cannot match, so it is found three ways:
    *  - by `pathKeys` (`importPathKeys` of each added file), as its tail or its
    *    whole name: `package:app/b.dart` waits for a file named `b.dart`, a
    *    bare `#include "b.h"` or `require 'db.php'` is the file's whole name;
    *  - by `names` (the changed files' namespaces and modules), as its whole
    *    name when its tail is something else: a C# `using Foo.Bar` waits for
    *    the namespace node `Foo.Bar`. An import whose tail is the name is the
-   *    symbol lookup's, under that lookup's ceiling.
-   * Same per-name ceiling as {@link getRetryableFailedReferences}, counted
-   * per key.
+   *    symbol lookup's, under that lookup's ceiling;
+   *  - by `resolvedModules`, module specifiers that now resolve to an added
+   *    file, as its whole name: `@excalidraw/common`, which a `tsconfig` path
+   *    maps to `packages/common/src/index.ts`, waits under the tail `common`,
+   *    which the file's own keys (`src`, `index`) never give.
+   * The other lookups share the per-name ceiling of
+   * {@link getRetryableFailedReferences}, counted per key; this one has the
+   * module ceiling, since a specifier that resolves to the file is no noise.
    */
-  getRetryableFailedImports(pathKeys: string[], names: string[] = [], perNameCeiling: number = 500): UnresolvedReference[] {
+  getRetryableFailedImports(
+    pathKeys: string[],
+    names: string[] = [],
+    perNameCeiling: number = 500,
+    resolvedModules: string[] = [],
+    perModuleCeiling: number = 5000,
+  ): UnresolvedReference[] {
     const failedImports = "status = 'failed' AND reference_kind = 'imports'";
     const lookups = [
-      { keys: pathKeys, column: 'name_tail', where: failedImports },
-      { keys: pathKeys, column: 'reference_name', where: failedImports },
-      { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name` },
+      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling },
+      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling },
+      { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name`, ceiling: perNameCeiling },
+      // A module specifier that now resolves to an added file: no noise, so
+      // the module ceiling, as for a module key.
+      { keys: resolvedModules, column: 'reference_name', where: failedImports, ceiling: perModuleCeiling },
     ];
     const rows = new Map<number, UnresolvedRefRow>();
-    for (const { keys, column, where } of lookups) {
+    for (const { keys, column, where, ceiling } of lookups) {
       const unique = [...new Set(keys)].filter((key) => key.length > 0);
       // Pass 1: per-key counts, chunked under the SQLite parameter limit.
       const retryKeys: string[] = [];
@@ -4072,7 +4128,7 @@ export class QueryBuilder {
           .prepare(`SELECT ${column} AS key, COUNT(*) AS count FROM unresolved_refs WHERE ${where} AND ${column} IN (${placeholders}) GROUP BY ${column}`)
           .all(...chunk) as Array<{ key: string; count: number }>;
         for (const row of counts) {
-          if (row.count <= perNameCeiling) retryKeys.push(row.key);
+          if (row.count <= ceiling) retryKeys.push(row.key);
         }
       }
       // Pass 2: load the surviving rows; a row two lookups find is kept once.
@@ -4097,6 +4153,49 @@ export class QueryBuilder {
       language: row.language as Language,
       rowId: row.id,
     }));
+  }
+
+  /**
+   * The scoped package specifiers (`@excalidraw/common`) of failed imports,
+   * each with one file that wrote it — what a `tsconfig` path or a workspace
+   * package can map to a project file that a sync adds.
+   */
+  getFailedScopedImports(): Array<{ name: string; filePath: string; language: Language }> {
+    return (this.db
+      .prepare(
+        `SELECT reference_name AS name, MIN(file_path) AS file_path, language
+           FROM unresolved_refs
+          WHERE status = 'failed' AND reference_kind = 'imports'
+            AND reference_name GLOB '@?*/?*' AND reference_name NOT GLOB '@*/*/*'
+          GROUP BY reference_name`
+      )
+      .all() as Array<{ name: string; file_path: string; language: Language }>)
+      .map((row) => ({ name: row.name, filePath: row.file_path, language: row.language }));
+  }
+
+  /**
+   * Failed imports of the folder the importing file is in or under (`.`,
+   * `..`). Their tail is empty, since they name a folder only through where
+   * they are written, so no added file's keys find them.
+   */
+  getFailedFolderImports(): UnresolvedReference[] {
+    return (this.db
+      .prepare(
+        `SELECT * FROM unresolved_refs
+          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN ('.', './', '..', '../')`
+      )
+      .all() as UnresolvedRefRow[])
+      .map((row) => ({
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+        filePath: row.file_path,
+        language: row.language as Language,
+        rowId: row.id,
+      }));
   }
 
   /**

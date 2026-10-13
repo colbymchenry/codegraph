@@ -1717,25 +1717,26 @@ export function resolvePhpImportedStaticCall(
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
-const JS_MODULE_LANGUAGES: ReadonlySet<string> = new Set(['javascript', 'jsx', 'typescript', 'tsx', 'arkts']);
-
 /**
  * A module specifier written as a path — relative (`./x`, `../x`), rooted, or
- * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — rather than an
- * imported binding's name or a bare package (`react`, `lodash`).
+ * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — or a scoped
+ * package (`@excalidraw/common`), which no binding can be named and which a
+ * `tsconfig` path or a workspace member can map to a project file; rather
+ * than an imported binding's name or a bare package (`react`, `lodash`).
  */
 function isJsPathSpecifier(name: string): boolean {
   return name.startsWith('./') || name.startsWith('../') || name === '.' || name === '..' ||
-    (name.includes('/') && !/\s/.test(name) && !/^@[\w.-]+\/[\w.-]+$/.test(name));
+    (name.includes('/') && !/\s/.test(name));
 }
 
 /**
- * A JS/TS `imports` reference that names a module by path. It names a FILE, not
- * a symbol, so it skips the resolver's name-exists pre-filter — a CommonJS
- * `require('./x')` has no import node of that name to pass it.
+ * A JS/TS `imports` reference that names a module by path — from a script, or
+ * from a Vue, Svelte or Astro component's. It names a FILE, not a symbol, so
+ * it skips the resolver's name-exists pre-filter — a CommonJS `require('./x')`
+ * has no import node of that name to pass it.
  */
 export function isJsPathImportRef(ref: UnresolvedRef): boolean {
-  return ref.referenceKind === 'imports' && JS_MODULE_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
+  return ref.referenceKind === 'imports' && ESM_IMPORT_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
 }
 
 /** PHP reference kinds whose name is a class name, written as in the source. */
@@ -2732,7 +2733,7 @@ function findGoPackageMember(
 /** Recursive depth cap for re-export chain following. Real codebases
  *  rarely chain barrels more than 2–3 deep; 8 is a generous safety
  *  net that still bounds worst-case work. */
-const REEXPORT_MAX_DEPTH = 8;
+export const REEXPORT_MAX_DEPTH = 8;
 
 /**
  * Find an exported symbol in `filePath`, following `export { x } from

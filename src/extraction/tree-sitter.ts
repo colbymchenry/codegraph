@@ -564,6 +564,8 @@ export class TreeSitterExtractor {
   private fileScopeValueCounts = new Map<string, number>(); // file-scope nodes per name (conditional-def detection)
   private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
   private errors: ExtractionError[] = [];
+  // Import nodes made for `export … from` statements: no symbols of the file's own.
+  private reExportImports = 0;
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
@@ -733,7 +735,9 @@ export class TreeSitterExtractor {
       this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
 
       // hasError is routine for several grammars; warn only when no symbols survived.
-      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
+      // (A re-export's import of its module is none: a barrel whose other lines
+      // failed to parse has lost what it passes on.)
+      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length - this.reExportImports;
       if (this.tree?.rootNode.hasError && symbolCount === 0) {
         this.errors.push({
           message:
@@ -1577,13 +1581,16 @@ export class TreeSitterExtractor {
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
     }
-    // Re-export from another module — `export { X } from './y'` (TS/JS). A
-    // re-export is a dependency on the source module just like an import, but
-    // the export_statement is otherwise only descended into (no declaration to
-    // extract), so a barrel that ONLY re-exports produced zero edges and showed
-    // 0 dependents. Link each re-exported name to its definition. Children are
-    // still visited (a non-re-export `export const X = …` has no `source` and
-    // falls through to its normal declaration extraction).
+    // Re-export from another module — `export { X } from './y'`, `export * from
+    // './y'` (TS/JS). A re-export is a dependency on the source module just like
+    // an import, but the export_statement is otherwise only descended into (no
+    // declaration to extract), so a barrel that ONLY re-exports produced zero
+    // edges and showed 0 dependents. It imports the module as `import … from`
+    // does — an import node and a reference to the module, which links the
+    // barrel to the file it names (so a barrel of barrels can be followed) —
+    // and links each re-exported name to its definition. Children are still
+    // visited (a non-re-export `export const X = …` has no `source` and falls
+    // through to its normal declaration extraction).
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
@@ -1591,6 +1598,9 @@ export class TreeSitterExtractor {
        this.language === 'arkts') &&
       getChildByField(node, 'source')
     ) {
+      const before = this.nodes.length;
+      this.extractImport(node);
+      this.reExportImports += this.nodes.length - before;
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       if (parentId) this.emitReExportRefs(node, parentId);
     }

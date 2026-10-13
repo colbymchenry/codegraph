@@ -721,7 +721,10 @@ impl<'t> Walker<'t> {
         } else if kind == "import_statement" {
             self.extract_import(node);
         } else if kind == "export_statement" && node.child_by_field_name("source").is_some() {
-            // Re-export: `export { X } from './y'`.
+            // Re-export: `export { X } from './y'`, `export * from './y'`. It
+            // imports the module as `import … from` does (an import node and a
+            // reference to the module), then links each re-exported name.
+            self.extract_import(node);
             self.emit_re_export_refs(node);
         } else if kind == "export_statement" && self.looks_like_vue_store_file() {
             // Vuex MODULE default export (`export default { actions: {…} }`).
