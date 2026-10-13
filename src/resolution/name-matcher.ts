@@ -8922,8 +8922,15 @@ const CPP_DECLARATOR_CV = String.raw`\b(?:const|volatile|__restrict__|__restrict
  * PROTOBUF_NULLABLE arena`, xxhash's `XXH_RESTRICT`.
  */
 const CPP_DECLARATOR_ANNOTATION = String.raw`\b(?:absl_nonnull|absl_nullable|absl_nullability_unknown|_Nonnull|_Nullable|_Null_unspecified|[A-Z][A-Z0-9]*_[A-Z0-9_]*)\b`;
+/**
+ * A function wrapper's type, whose template argument is a function type:
+ * rocksdb's `std::function<Iterator*()> create_iterator`.
+ */
+const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function|move_only_function|copyable_function)|absl\s*::\s*(?:FunctionRef|AnyInvocable))\s*<[^;={}]*>`;
 /** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
-const CPP_DECLARATOR_TYPE = String.raw`[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+/** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
+const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
 /** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
 const CPP_TRAILING_ANNOTATION = String.raw`\b[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*\([^()]*\)`;
 
@@ -9062,6 +9069,10 @@ const CPP_LIBRARY_SEQUENCES: ReadonlySet<string> = new Set([
 ]);
 /** Widely used project containers of the same kind: protobuf's repeated fields, rocksdb's `autovector`. */
 const CPP_PROJECT_SEQUENCES: ReadonlySet<string> = new Set(['RepeatedField', 'RepeatedPtrField', 'autovector']);
+/** The standard library's and abseil's maps, whose elements are `std::pair`s of a key and a value. */
+const CPP_LIBRARY_MAPS: ReadonlySet<string> = new Set([
+  'map', 'multimap', 'unordered_map', 'unordered_multimap', 'flat_hash_map', 'node_hash_map', 'btree_map', 'btree_multimap',
+]);
 
 /** Clang's and abseil's nullability annotations: `const FieldDescriptor* absl_nonnull`. */
 const CPP_NULLABILITY = /\b(?:absl_nonnull|absl_nullable|absl_nullability_unknown|_Nonnull|_Nullable|_Null_unspecified)\b/g;
@@ -9231,18 +9242,32 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
       if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
-      const code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
-      const m = code ? matchCppDeclarator(code, declarator) : null;
+      let code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
+      // The line the declaration's code starts on: the one above, for a type
+      // written there and nothing else (rocksdb's
+      // `std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>`
+      // above `cfh_iter_pairs_;`), so a default member initializer continued
+      // on the next line (`bool ready_ = flag_ &&` above `it_;`) isn't one.
+      let from = l;
+      let m = code ? matchCppDeclarator(code, declarator) : null;
+      if (!m && code && l > decl.startLine) {
+        const above = cppCodeOf(cppLiteralsBlanked(lines[l - 2]!, l - 1, rawLines));
+        if (above && CPP_TYPE_LINE.test(above)) {
+          code = `${above} ${code}`;
+          from = l - 1;
+          m = matchCppDeclarator(code, declarator);
+        }
+      }
       if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
-      let depth = depths[l - decl.startLine]!;
+      let depth = depths[from - decl.startLine]!;
       if (depth < 0) continue;
-      for (const c of code!.slice(l === decl.startLine ? decl.startColumn : 0, m.index)) {
+      for (const c of code!.slice(from === decl.startLine ? decl.startColumn : 0, m.index)) {
         if (c === '(') depth++;
         else if (c === ')') depth--;
       }
       const type = depth <= 0 ? normalizeCppTypeName(m[1]!) : null;
       if (type && type !== 'auto') {
-        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: l, parameters: cppTemplateParameters(decl, context) };
+        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: from, parameters: cppTemplateParameters(decl, context) };
         break;
       }
     }
@@ -9412,6 +9437,11 @@ function cppRangeElementOf(type: CppWrittenType, at: UnresolvedRef, context: Res
     const element = cppTemplateArguments(range.text)?.[0];
     return element ? { ...range, text: cppWithoutNullability(element) } : null;
   }
+  // A map's elements pair its key with its value.
+  if (CPP_LIBRARY_MAPS.has(last) && (segments[0] === 'std' || segments[0] === 'absl')) {
+    const [key, value] = cppTemplateArguments(range.text) ?? [];
+    return key && value ? { ...range, text: `std::pair<const ${cppWithoutNullability(key)}, ${cppWithoutNullability(value)}>` } : null;
+  }
   const cls = cppWrittenClass(range, at, context);
   const begin = cls ? cppReturnTypeOf(cppMethodsOf(cls, 'begin', at, context), context) : null;
   return begin ? cppIteratorElement(begin, at, context, hops) : null;
@@ -9500,6 +9530,12 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   if (made) return { ...callers, text: `std::${made[1]}_ptr<${made[2]!.trim()}>` };
   // `std::unique_ptr<Iterator>(…)`: the smart pointer or optional it makes.
   if (cppStdHeldType(callee)) return { ...callers, text: callee };
+  // `create_iterator()` on a `std::function<Iterator*()> create_iterator`: what its function type returns.
+  if (/^[A-Za-z_]\w*$/.test(callee)) {
+    const wrapper = cppExpressionType(callee, at, context, depth + 1);
+    const returned = wrapper && cppWrapperReturnType(wrapper);
+    if (returned) return returned;
+  }
   // `recv.method(…)`, `recv->method(…)`: the method of the receiver's class.
   const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(callee);
   if (member) {
@@ -10566,6 +10602,14 @@ function inferCppReceiverType(
           return cppDeclaredType(element.text, elementType, true, ref, context, found);
         }
       }
+      // `for (auto& [cfh, iter] : cfh_iter_pairs_)`, `auto [status, iter] = Open();`.
+      const bound = !found.shadowed ? cppStructuredBindingType(line, lines, i, receiverName, callLineIndex, ref, context, rawLines) : null;
+      const boundType = bound && normalizeCppTypeName(bound.text);
+      if (bound && boundType && boundType !== 'auto') {
+        noteCppDeclaration(found, bound.text, true);
+        found.declared = bound;
+        return cppDeclaredType(bound.text, boundType, true, ref, context, found);
+      }
       if (cppRebindsReceiver(line, escapedReceiver)) found.shadowed = true;
     }
   }
@@ -10761,14 +10805,101 @@ function cppAutoInitializerStatement(
 ): string | null {
   const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const start = new RegExp(`\\b${escaped}\\b\\s*=(?!=)`).exec(line);
-  if (!start) return null;
-  let text = line.slice(start.index + start[0].length);
+  return start ? cppStatementFrom(line.slice(start.index + start[0].length), lines, index, rawLines) : null;
+}
+
+/**
+ * The C++ statement that `text`, the rest of `lines[index]`, begins, read on
+ * to the `;` that ends it. Null when no `;` ends it within a few lines.
+ */
+function cppStatementFrom(
+  text: string,
+  lines: readonly string[],
+  index: number,
+  rawLines: ReturnType<typeof cppRawStringLines>,
+): string | null {
   for (let next = index + 1; ; next++) {
     const end = cppStatementEnd(text);
     if (end >= 0) return text.slice(0, end).trim() || null;
     if (next >= lines.length || next > index + 4) return null;
     text += ` ${cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? ''}`;
   }
+}
+
+/** A structured binding's names: `[cfh, iter]` in `for (auto& [cfh, iter] : …)` or `const auto [status, iter] = …;`. */
+const CPP_STRUCTURED_BINDING = /\bauto\s*&{0,2}\s*\[([^\]]*)\]/g;
+
+/**
+ * The type the structured binding on line `index` (`line`, its code) gives
+ * `receiverName`, as written: the element at the name's place of the pair
+ * or tuple bound. That is an element of the range a range-for over the
+ * binding iterates, when the call is in the loop's body — rocksdb's `for
+ * (auto& [cfh, iter] : cfh_iter_pairs_)` over a
+ * `std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>`,
+ * or a map's key and value — or the initializer of a declaration the
+ * calling function makes (`auto [status, iter] = Open();`). Null when that
+ * can't be read.
+ */
+function cppStructuredBindingType(
+  line: string,
+  lines: readonly string[],
+  index: number,
+  receiverName: string,
+  callLineIndex: number,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  rawLines: ReturnType<typeof cppRawStringLines>,
+): CppWrittenType | null {
+  if (!line.includes('[')) return null;
+  for (const m of line.matchAll(CPP_STRUCTURED_BINDING)) {
+    const place = m[1]!.split(',').map((name) => name.trim()).indexOf(receiverName);
+    if (place < 0) continue;
+    const end = m.index! + m[0].length;
+    const loop = /\bfor\s*\(\s*(?:(?:const|volatile)\s+)*$/.exec(line.slice(0, m.index!));
+    const colon = /^\s*:(?!:)/.exec(line.slice(end));
+    let value: CppWrittenType | null = null;
+    if (loop && colon) {
+      if (!cppForBodyEncloses(lines, index, line.indexOf('(', loop.index), callLineIndex, ref.column)) return null;
+      value = cppAutoLoopElement(lines, index, { colon: end + colon[0].length }, ref, context);
+    } else {
+      const assign = /^\s*=(?!=)/.exec(line.slice(end));
+      if (!assign || !isCppCallersDeclaration(ref.filePath, index + 1, ref, context)) return null;
+      const init = cppStatementFrom(line.slice(end + assign[0].length), lines, index, rawLines);
+      value = init ? cppAutoLocalType(init, index + 1, m[0], ref, context) : null;
+    }
+    return (value && cppBindingElements(value, ref, context)?.[place]) ?? null;
+  }
+  return null;
+}
+
+/**
+ * What calling a function wrapper of the written type `type` returns, as
+ * written: what the function type that is its template argument returns
+ * (`Iterator*` for `std::function<Iterator*()>`). Only a wrapper's
+ * declaration is read with one (CPP_FUNCTION_WRAPPER_TYPE). Null when its
+ * template argument is no function type.
+ */
+function cppWrapperReturnType(type: CppWrittenType): CppWrittenType | null {
+  const signature = cppTemplateArguments(type.text)?.[0] ?? '';
+  let depth = 0;
+  for (let i = 0; i < signature.length; i++) {
+    const c = signature[i]!;
+    if (c === '<') depth++;
+    else if (c === '>') depth--;
+    else if (c === '(' && depth === 0) {
+      const returned = signature.slice(0, i).trim();
+      return returned ? { ...type, text: returned } : null;
+    }
+  }
+  return null;
+}
+
+/** What a structured binding of a value of the type `type` names, in order: a `std::pair`'s or `std::tuple`'s elements. */
+function cppBindingElements(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType[] | null {
+  const followed = cppFollowWrittenAliases(type, at, context);
+  const segments = followed && cppTypeSegments(followed.text);
+  if (!followed || segments?.length !== 2 || segments[0] !== 'std' || (segments[1] !== 'pair' && segments[1] !== 'tuple')) return null;
+  return cppTemplateArguments(followed.text)?.map((text) => ({ ...followed, text: cppWithoutNullability(text) })) ?? null;
 }
 
 /** Where the statement that `text` begins ends: its first `;` outside brackets, or -1. */
