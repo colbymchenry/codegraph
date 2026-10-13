@@ -70,6 +70,8 @@ import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegmen
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 
+const MEMO_WARM_DELAY_MS = 15_000;
+
 // Re-export types for consumers
 export * from './types';
 // Storage building blocks for embedded/SDK consumers that drive the graph
@@ -163,6 +165,7 @@ export class CodeGraph {
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
+  private memoWarmTimer: ReturnType<typeof setTimeout> | undefined;
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
@@ -495,6 +498,7 @@ export class CodeGraph {
    */
   close(): void {
     this.unwatch();
+    if (this.memoWarmTimer) clearTimeout(this.memoWarmTimer);
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
@@ -803,6 +807,7 @@ export class CodeGraph {
             this.db.getDb().pragma('journal_mode = WAL');
           } catch { /* connection may be closing */ }
         }
+        this.markGraphChanged(true);
         this.fileLock.release();
       }
     });
@@ -821,8 +826,9 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        return await this.orchestrator.indexFiles(filePaths);
       } finally {
+        this.markGraphChanged(false);
         this.fileLock.release();
       }
     });
@@ -902,6 +908,9 @@ export class CodeGraph {
         );
         walValve.start();
       }
+      // A run that ends without reaching the no-change branch (including a
+      // throw after partial writes) is treated as having changed the graph.
+      let graphUnchanged = false;
       try {
         // Captured BEFORE the sync runs: the sync's own incremental writes
         // populate vocab rows for the files it touches, so an end-of-sync
@@ -1262,6 +1271,8 @@ export class CodeGraph {
         // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
           await this.db.runMaintenance();
+        } else {
+          graphUnchanged = true;
         }
 
         // Heal the segment vocabulary on indexes built before the table
@@ -1298,9 +1309,35 @@ export class CodeGraph {
         if (deferWal) {
           try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
         }
+        // An index that predates graph_epoch gets its first epoch from any sync.
+        if (!graphUnchanged || !this.queries.hasGraphEpoch()) this.markGraphChanged(false);
         this.fileLock.release();
       }
     });
+  }
+
+  /**
+   * Invalidate persisted query memos after the graph changed, then recompute
+   * them so the prompt hook (a fresh process per prompt) reads a hit. A bulk
+   * index warms inline; other writers defer to a quiet period so the
+   * multi-second aggregate never lands on every edit.
+   */
+  private markGraphChanged(warmNow: boolean): void {
+    try {
+      this.queries.bumpGraphEpoch();
+    } catch { /* memo is advisory — never fail a write over it */ return; }
+    // A pending deferred warm is superseded by this bump (and by an inline warm).
+    if (this.memoWarmTimer) clearTimeout(this.memoWarmTimer);
+    this.memoWarmTimer = undefined;
+    if (warmNow) {
+      try { this.queries.warmPersistedMemo(); } catch { /* advisory */ }
+      return;
+    }
+    this.memoWarmTimer = setTimeout(() => {
+      this.memoWarmTimer = undefined;
+      try { this.queries.warmPersistedMemo(); } catch { /* closed or busy: next reader recomputes */ }
+    }, MEMO_WARM_DELAY_MS);
+    this.memoWarmTimer.unref();
   }
 
   /**
@@ -1555,7 +1592,11 @@ export class CodeGraph {
   resolveReferences(onProgress?: (current: number, total: number) => void): ResolutionResult {
     // Get all unresolved references from the database
     const unresolvedRefs = this.queries.getUnresolvedReferences();
-    return this.resolver.resolveAndPersist(unresolvedRefs, onProgress);
+    try {
+      return this.resolver.resolveAndPersist(unresolvedRefs, onProgress);
+    } finally {
+      this.markGraphChanged(false);
+    }
   }
 
   /**
@@ -1590,7 +1631,7 @@ export class CodeGraph {
         end: () => this.db.endBulkRefLoad(),
       },
       backpressure,
-    }, synthesize);
+    }, synthesize).finally(() => this.markGraphChanged(false));
   }
 
   /**
