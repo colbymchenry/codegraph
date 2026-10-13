@@ -9996,15 +9996,28 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
 }
 
 /**
- * C++ class `cls`'s method `name`: its own, else the nearest one of a class
+ * C++ class `cls`'s method `name`: its own — of its overloads, the one the
+ * call's arguments fit (cppOverloadFor) — else the nearest one of a class
  * it derives from, through the base edges every declaration of `cls` has.
+ * When other classes share `cls`'s qualified name, its own are the ones
+ * defined where it is: leveldb's db_bench.cc and db_bench_sqlite3.cc each
+ * declare a `RandomGenerator`, with a `Generate` that takes a `size_t` and
+ * an `int`. (A chained call `inner(…).name(…)` keeps the first: the
+ * arguments at its position are the inner call's.)
  */
 function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
   const own = named.filter((n) => n.qualifiedName === want);
-  if (own.length > 0) return preferCallSiteFile(own, ref.filePath)[0]!;
+  if (own.length > 0) {
+    const ordered = preferCallSiteFile(own, ref.filePath);
+    if (ref.referenceName.includes('().')) return ordered[0]!;
+    const defined = cppClassDecls(cls.qualifiedName, context).length > 1
+      ? ordered.filter((n) => n.filePath === cls.filePath || cppIncluders(cls.filePath, context).has(n.filePath))
+      : ordered;
+    return cppOverloadFor(defined.length > 0 ? defined : ordered, name, ref, context);
+  }
   seen.add(cls.qualifiedName);
   if (depth >= 4 || !context.getSupertypeNodes) return null;
   for (const decl of context.getNodesByQualifiedName(cls.qualifiedName)) {
@@ -10248,21 +10261,158 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
   return null;
 }
 
-/** Of one class's overloads of `name` (in preference order), the one the call's arguments fit best. */
+/**
+ * Of one class's overloads of `name` (in preference order), the one the
+ * call's arguments fit best: by their count and string literals
+ * (cppOverloadFit), then, among overloads those fit alike, by the types the
+ * arguments have where the call reads them (cppArgumentTypeFit). rocksdb's
+ * `Insert(ch)` on a `char ch` is `Insert(char key, …)`, not `Insert(const
+ * std::string& key, …)`.
+ */
 function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
   if (overloads.length === 1) return overloads[0]!;
   const args = cppCallArguments(ref, name, context);
   if (!args) return overloads[0]!;
-  let best = overloads[0]!;
-  let bestFit = cppOverloadFit(best, name, args, context);
-  for (const n of overloads.slice(1)) {
-    const fit = cppOverloadFit(n, name, args, context);
+  const fits = overloads.map((n) => cppOverloadFit(n, name, args, context));
+  const top = Math.max(...fits);
+  const tied = overloads.filter((_, i) => fits[i] === top);
+  if (tied.length === 1 || args.length === 0) return tied[0]!;
+  const types = args.map((arg) => cppArgumentType(arg, ref, context));
+  if (types.every((t) => t === null)) return tied[0]!;
+  let best = tied[0]!;
+  let bestFit = cppArgumentTypeFit(best, name, types, context);
+  for (const n of tied.slice(1)) {
+    const fit = cppArgumentTypeFit(n, name, types, context);
     if (fit > bestFit) {
       best = n;
       bestFit = fit;
     }
   }
   return best;
+}
+
+/** What a C++ call's argument is: a literal's kind, or the type a name or expression has as written. */
+type CppArgumentType = { kind: 'char' | 'number' | 'zero' | 'bool' | 'null' } | { kind: 'type'; text: string };
+
+/**
+ * What the argument `arg` of the call at `ref` is, where that can be read: a
+ * character, number, `true`/`false` or `nullptr` literal, or the written
+ * type of a name the calling function declares, of `&name`, of `name[i]`
+ * (rocksdb's `TryLock(column_family[i], keys[i], …)` on a
+ * `std::vector<Slice>`), or of an expression (cppExpressionType). Null
+ * otherwise. (String literals are cppOverloadFit's.)
+ */
+function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
+  const text = arg.trim();
+  if (/^(?:u8|u|U|L)?'(?:[^'\\]|\\.)+'$/.test(text)) return { kind: 'char' };
+  if (text === 'true' || text === 'false') return { kind: 'bool' };
+  if (text === 'nullptr' || text === 'NULL') return { kind: 'null' };
+  if (/^0+[uUlL]*$/.test(text)) return { kind: 'zero' };
+  if (/^[-+]?(?:0[xX][\da-fA-F']+|\d[\d']*(?:\.\d*)?(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)[uUlLfFzZ]*$/.test(text)) return { kind: 'number' };
+  const address = /^&\s*([A-Za-z_]\w*)$/.exec(text);
+  const name = address?.[1] ?? (/^[A-Za-z_]\w*$/.test(text) ? text : null);
+  if (name) {
+    const decl: CppReceiverDeclaration = {};
+    inferCppReceiverType(name, ref, context, 0, decl);
+    const written = decl.declared?.text ?? decl.raw;
+    if (!written || !decl.callers || decl.shadowed) return null;
+    return { kind: 'type', text: address ? `${written}*` : written };
+  }
+  // `keys[i]`: an element of the container, or what the pointer points at, a name the calling function declares is.
+  const subscript = /^([A-Za-z_]\w*)\s*\[[^[\]]*\]$/.exec(text);
+  if (subscript) {
+    const container = cppExpressionType(subscript[1]!, ref, context, 0);
+    const followed = container && cppFollowWrittenAliases(container, ref, context);
+    const element = followed && (isCppPointerType(followed.text) ? cppPointee(followed) : cppRangeElementOf(followed, ref, context));
+    return element ? { kind: 'type', text: element.text } : null;
+  }
+  const typed = /^(?:u8|u|U|L)?R?["']/.test(text) ? null : cppExpressionType(text, ref, context, 0);
+  return typed ? { kind: 'type', text: typed.text } : null;
+}
+
+/** What a C++ type is, for an argument to fit a parameter of it. */
+type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'class';
+
+const CPP_CHAR_TYPES: ReadonlySet<string> = new Set(['char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t']);
+const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
+  'int', 'unsigned', 'signed', 'short', 'long', 'float', 'double', 'size_t', 'ssize_t', 'ptrdiff_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t', 'intptr_t', 'uintptr_t',
+]);
+const CPP_STRING_TYPES: ReadonlySet<string> = new Set(['string', 'wstring', 'string_view', 'wstring_view', 'basic_string', 'basic_string_view']);
+
+/** The category of the written C++ type `type`: a pointer's, a string's, a character's, a number's, a class's. */
+function cppTypeCategory(type: string): CppTypeCategory {
+  const flat = stripCppTemplateArguments(type).replace(/\b(?:const|volatile|struct|class|typename|enum)\b/g, ' ').replace(/&+/g, ' ').trim();
+  const words = flat.replace(/\*/g, ' ').trim().split(/\s+/);
+  const last = cppLastSegment(words[words.length - 1] ?? '');
+  if (flat.includes('*')) return CPP_CHAR_TYPES.has(last) && (flat.match(/\*/g) ?? []).length === 1 ? 'cstring' : 'pointer';
+  if (last === 'bool') return 'bool';
+  if (CPP_CHAR_TYPES.has(last) && words.every((w) => CPP_CHAR_TYPES.has(w) || w === 'signed' || w === 'unsigned')) return 'char';
+  if (CPP_NUMBER_TYPES.has(last) || words.every((w) => CPP_NUMBER_TYPES.has(w))) return 'number';
+  return CPP_STRING_TYPES.has(last) ? 'string' : 'class';
+}
+
+/**
+ * How well the read argument types `types` fit the parameters of the
+ * overload `n`: the same type, or a character to a character, scores; a
+ * character, number or pointer to a string, or a string or pointer to a
+ * number, counts against. Classes of other names score nothing: a conversion
+ * may join them.
+ */
+function cppArgumentTypeFit(n: Node, name: string, types: Array<CppArgumentType | null>, context: ResolutionContext): number {
+  const list = cppOverloadParameters(n, name, context);
+  if (list === null) return 0;
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
+  let score = 0;
+  for (let i = 0; i < types.length && i < params.length; i++) {
+    const arg = types[i];
+    const param = cppParameterType(params[i]!);
+    if (!arg || param.includes('...')) continue;
+    const category = cppTypeCategory(param);
+    score += arg.kind === 'type' ? cppWrittenTypeFit(arg.text, param, category) : CPP_LITERAL_FIT[arg.kind][category];
+  }
+  return score;
+}
+
+/** How a literal fits a parameter of each category. */
+const CPP_LITERAL_FIT: Record<'char' | 'number' | 'zero' | 'bool' | 'null', Record<CppTypeCategory, number>> = {
+  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, string: -3, class: 0 },
+  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  null: { pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
+};
+
+/** How an argument written as type `arg` fits a parameter of type `param` (of category `category`). */
+function cppWrittenTypeFit(arg: string, param: string, category: CppTypeCategory): number {
+  const argCategory = cppTypeCategory(arg);
+  const pointer = (c: CppTypeCategory): boolean => c === 'pointer' || c === 'cstring';
+  if (normalizeCppTypeName(arg) === normalizeCppTypeName(param) && pointer(argCategory) === pointer(category)) return 3;
+  if (argCategory === category && argCategory !== 'class') return 2;
+  const textual = (c: CppTypeCategory): boolean => c === 'string' || c === 'cstring';
+  if ((argCategory === 'char' || argCategory === 'number' || argCategory === 'pointer') && category === 'string') return -3;
+  if ((textual(argCategory) || argCategory === 'pointer') && (category === 'char' || category === 'number')) return -3;
+  if ((argCategory === 'char' || argCategory === 'number') && (category === 'pointer' || category === 'cstring')) return -3;
+  return 0;
+}
+
+/** A C++ parameter declaration's type: without its default argument and its name. */
+function cppParameterType(param: string): string {
+  let text = param;
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '<' || c === '(' || c === '[') depth++;
+    else if (c === '>' || c === ')' || c === ']') depth--;
+    else if (c === '=' && depth === 0) {
+      text = text.slice(0, i);
+      break;
+    }
+  }
+  text = text.trim();
+  // The name, when a type comes before it.
+  const named = /^(.*[\w>*&\s])\b[A-Za-z_]\w*\s*(?:\[[^\]]*\])?$/.exec(text);
+  return named && /[A-Za-z_]/.test(named[1]!) && !/^(?:const|volatile|unsigned|signed|struct|class|enum)\s*$/.test(named[1]!.trim()) ? named[1]!.trim() : text;
 }
 
 const CPP_MEMBER_MACRO_ARGS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -11171,6 +11321,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
+  CPP_OVERLOAD_PARAMETERS.delete(context);
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
   CPP_SCOPE_NAMES.delete(context);
@@ -15455,17 +15606,89 @@ function cppParenListAfter(file: string, line: number, column: number, name: str
   return null;
 }
 
+/** C++ text with each comment blanked to a space; string and character literals are kept. */
+function cppWithoutComments(text: string): string {
+  if (!text.includes('/')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c && text[j] !== '\n') j += text[j] === '\\' ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i);
+      i = end < 0 ? text.length : end - 1;
+      out += ' ';
+    } else if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end < 0 ? text.length : end + 1;
+      out += ' ';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
   const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
-  return list === null ? null : splitCppTopLevel(list);
+  return list === null ? null : splitCppTopLevel(cppWithoutComments(list));
+}
+
+/** Per context: a C++ method's id → the parameter list its defaults are read from (cppOverloadParameters). */
+const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The parameter list of the C++ overload `n`, its `( … )`, as it gives the
+ * parameters' defaults: for a method defined outside its class, the list
+ * the method's declaration in the class writes. protobuf defines `template
+ * <typename Desc> void Printer::Annotate(…, const Desc* descriptor,
+ * absl::optional<Semantic> semantic)` below the class, whose declaration
+ * gave `semantic` its `= absl::nullopt`. Its own list when the class
+ * declares the method with the same parameter types and no default, or
+ * not at all.
+ */
+function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
+  const own = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  if (own === null || n.kind !== 'method') return own;
+  let memo = CPP_OVERLOAD_PARAMETERS.get(context);
+  if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  let found = own;
+  const classes = cppClassDecls(cppParentScope(n.qualifiedName), context);
+  if (!classes.some((c) => c.filePath === n.filePath && rangeWithin(n, c))) {
+    const types = (list: string): string[] => splitCppTopLevel(cppWithoutComments(list))
+      .filter((p) => p !== 'void')
+      .map((p) => normalizeCppTypeName(cppParameterType(p)) ?? p);
+    const want = types(own);
+    const word = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*\\(`);
+    search: for (const cls of classes) {
+      const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+      for (let line = cls.startLine; line <= Math.min(lines.length, cls.endLine ?? cls.startLine); line++) {
+        if (!word.test(lines[line - 1]!)) continue;
+        const list = cppParenListAfter(cls.filePath, line, 0, name, context);
+        if (list === null || !list.includes('=')) continue;
+        const have = types(list);
+        if (have.length === want.length && have.every((t, i) => t === want[i])) {
+          found = list;
+          break search;
+        }
+      }
+    }
+  }
+  memo.set(n.id, found);
+  return found;
 }
 
 /** How well a call's arguments fit an overload's parameters: arity, and a string literal's first slot. */
 function cppOverloadFit(n: Node, name: string, args: string[], context: ResolutionContext): number {
   if (n.kind !== 'function' && n.kind !== 'method') return -1;
-  const list = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  const list = cppOverloadParameters(n, name, context);
   if (list === null) return 0;
-  const params = splitCppTopLevel(list).filter((p) => p !== 'void');
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
   // A pack is `T&&... args`, not the `...` inside `format_string<T...>`.
   const isPack = (p: string): boolean => {
     let flat = p;
@@ -15479,14 +15702,21 @@ function cppOverloadFit(n: Node, name: string, args: string[], context: Resoluti
   // Each string literal against its parameter: a string type by name over a
   // template parameter that might be one (`const S&`), and a narrow literal
   // never a wide parameter (`fmt::join(v, ", ")` is not xchar.h's `wstring_view`).
+  // A literal, raw ones too (protobuf's `p->Emit({…}, R"cc(…)cc")`), is a
+  // `const char*`: no pointer to anything else (rocksdb's `std::string*
+  // value`), number or character takes it, which counts for more than a
+  // class of another name, one that may convert from it (`const Slice& key`)
+  // or may not (fmt's `text_style`).
   for (let i = 0; i < args.length && i < params.length; i++) {
     const arg = args[i]!;
     const param = params[i]!;
     if (isPack(param)) break;
-    if (!/^(?:u8|u|U|L)?"|^FMT_STRING\s*\(/.test(arg)) continue;
-    const wideArg = /^L"/.test(arg);
+    if (!/^(?:u8|u|U|L)?R?"|^FMT_STRING\s*\(/.test(arg)) continue;
+    const wideArg = /^LR?"/.test(arg);
     const wideParam = /\bw(?:string|char_t|format|string_view)|wchar_t/.test(param);
+    const category = cppTypeCategory(cppParameterType(param));
     if (wideArg !== wideParam && /string|char|Char|format/.test(param)) score -= 2;
+    else if (category === 'pointer' || category === 'number' || category === 'bool' || category === 'char') score -= 3;
     else score += /string|char|Char|\bstr\b/.test(param) ? 3 : /^(?:const\s+)?[A-Z]\w{0,2}\s*[&*]{0,2}\s*\w*$/.test(param) ? 1 : -2;
   }
   return score;
