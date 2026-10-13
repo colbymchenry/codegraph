@@ -8913,16 +8913,80 @@ function normalizeCppTypeName(typeName: string): string | null {
   return last;
 }
 
+/** cv-qualifiers and `__restrict`, before or after a declarator's `*` or `&`: `Iterator* const iter`, `Slice const& key`. */
+const CPP_DECLARATOR_CV = String.raw`\b(?:const|volatile|__restrict__|__restrict)\b`;
+/**
+ * What a pointer or reference declarator may carry after its `*` or `&`:
+ * clang's and abseil's nullability annotations (CPP_NULLABILITY), and the
+ * ALL-CAPS macros c-cpp.ts blanks for the parser — protobuf's `Arena*
+ * PROTOBUF_NULLABLE arena`, xxhash's `XXH_RESTRICT`.
+ */
+const CPP_DECLARATOR_ANNOTATION = String.raw`\b(?:absl_nonnull|absl_nullable|absl_nullability_unknown|_Nonnull|_Nullable|_Null_unspecified|[A-Z][A-Z0-9]*_[A-Z0-9_]*)\b`;
+/** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
+const CPP_DECLARATOR_TYPE = String.raw`[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+/** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
+const CPP_TRAILING_ANNOTATION = String.raw`\b[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*\([^()]*\)`;
+
 // Declarator regex: matches `Type receiver`, `Type* receiver`, `Type *receiver`,
 // `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
 // (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
 // terminator rules out uses like `return receiver->m()` where the preceding
 // token is a keyword, not a type. A range-based for's `Type receiver :` is read
-// by cppRangeForDeclaration instead.
+// by cppRangeForDeclaration instead. Qualifiers and annotations around the
+// name are read past, and matchCppDeclarator drops the annotations from the
+// type.
 function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   return new RegExp(
-    `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
+    `(${CPP_DECLARATOR_TYPE})\\s*\\b${escapedReceiver}\\b(?:\\s*${CPP_TRAILING_ANNOTATION})*\\s*(?=[;=,)\\[{(]|$)`,
   );
+}
+
+/** buildDeclaratorRegex's `regex` run on the code `line`, with its type as cppDeclaratorType gives it. */
+function matchCppDeclarator(line: string, regex: RegExp): RegExpExecArray | null {
+  const m = regex.exec(line);
+  if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
+  return m;
+}
+
+const CPP_DECLARATOR_ANNOTATION_WORD = new RegExp(`^${CPP_DECLARATOR_ANNOTATION}$`);
+const CPP_WORD_AT = /[A-Za-z_]\w*/y;
+
+/**
+ * A type the declarator regex read, without the annotations it reads past
+ * after a `*` or `&`, outside template arguments: `Arena*
+ * PROTOBUF_NULLABLE` → `Arena*`. Taken as part of the type, one read as its
+ * name, of a class no project has. An ALL-CAPS word stands for an annotation
+ * only there, so a type's own name stays (`OS_HANDLE* const h`), and so do
+ * its cv-qualifiers, which what reads a type reads past. A type with nothing
+ * to drop comes back as it is.
+ */
+function cppDeclaratorType(text: string): string {
+  let out = '';
+  let depth = 0;
+  let afterPointer = false;
+  let dropped = false;
+  for (let i = 0; i < text.length; ) {
+    CPP_WORD_AT.lastIndex = i;
+    const word = depth === 0 && !/[\w:]/.test(text[i - 1] ?? ' ') ? CPP_WORD_AT.exec(text)?.[0] : undefined;
+    if (word) {
+      if (afterPointer && CPP_DECLARATOR_ANNOTATION_WORD.test(word)) {
+        dropped = true;
+      } else {
+        out += word;
+        afterPointer = false;
+      }
+      i += word.length;
+      continue;
+    }
+    const c = text[i]!;
+    if (c === '<') depth++;
+    else if (c === '>') depth--;
+    else if (depth === 0 && (c === '*' || c === '&')) afterPointer = true;
+    else if (depth === 0 && !/\s/.test(c)) afterPointer = false;
+    out += c;
+    i++;
+  }
+  return dropped ? out.replace(/\s+/g, ' ').trim() : text;
 }
 
 // A range-based for's declaration, `for (const Foo& name :`, up to the single
@@ -8930,7 +8994,7 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
 // global-scope `::` — is never an initializer, a call or a member access.
 const CPP_RANGE_FOR_DECLARATION = /\bfor\s*\(([^;=(){}?."']*?)\b([A-Za-z_]\w*)\s*:(?!:)/g;
 // The type a declaration ends with, read as the declarator regex reads it.
-const CPP_DECLARED_TYPE_TAIL = /([A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*[*&]+)?)\s*$/;
+const CPP_DECLARED_TYPE_TAIL = new RegExp(String.raw`(${CPP_DECLARATOR_TYPE})\s*$`);
 
 /**
  * The type the range-based for on `line` (comments blanked) declares
@@ -8944,7 +9008,7 @@ function cppRangeForDeclaration(line: string, receiverName: string): { type: str
   for (const m of line.matchAll(CPP_RANGE_FOR_DECLARATION)) {
     if (m[2] !== receiverName) continue;
     const tail = m[1]!.match(CPP_DECLARED_TYPE_TAIL);
-    return tail ? { type: tail[1]!, paren: m.index! + m[0].indexOf('('), colon: m.index! + m[0].length } : null;
+    return tail ? { type: cppDeclaratorType(tail[1]!), paren: m.index! + m[0].indexOf('('), colon: m.index! + m[0].length } : null;
   }
   return null;
 }
@@ -9168,7 +9232,7 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     for (let l = decl.startLine; l <= end; l++) {
       if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
       const code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
-      const m = code ? declarator.exec(code) : null;
+      const m = code ? matchCppDeclarator(code, declarator) : null;
       if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
       let depth = depths[l - decl.startLine]!;
       if (depth < 0) continue;
@@ -10446,7 +10510,7 @@ function inferCppReceiverType(
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
     if (!line || !receiverPattern.test(line)) continue;
 
-    const declaratorMatch = line.match(declaratorRegex);
+    const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized === 'auto') {
@@ -10530,7 +10594,7 @@ function inferCppReceiverType(
       if (!receiverPattern.test(text)) continue;
       const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, headerRawLines));
       if (!line) continue;
-      const declaratorMatch = line.match(declaratorRegex);
+      const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized && normalized !== 'auto') {
