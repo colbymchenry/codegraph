@@ -1858,6 +1858,186 @@ const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
  */
 const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
 
+/** Per context: a C/C++ type's qualified name → its declarations. */
+const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+/** Per context: a C/C++ file → the line and resolved file of each `#include` it writes. */
+const CPP_INCLUDE_LINES = new WeakMap<ResolutionContext, Map<string, Array<[number, string | null]>>>();
+/** Per context: a C/C++ file → the line spans of its unnamed namespaces. */
+const CPP_UNNAMED_NAMESPACES = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
+
+/**
+ * Whether only another C or C++ translation unit can name `candidate`: a
+ * type or alias a source file declares, a member of a class only source
+ * files declare, or what a source file's unnamed namespace (`namespace { … }`)
+ * declares. rocksdb's test fixture `ColumnFamilyTestBase` is declared in
+ * column_family_test.cc, and other test files' bare `Put(…)` reached its `Put`
+ * by name; inlineskiplist.h's `Node*` reached hash_linklist_rep.cc's own
+ * `Node`. What a source file declares is seen by the file itself, by a
+ * translation unit that includes it (a test that includes the source it
+ * tests), and by a header it includes after the declaration: rocksdb's
+ * version_set.cc includes version_set_sync_and_async.h below its
+ * `FilePicker` classes.
+ */
+function isCppTranslationUnitLocal(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'c' && ref.language !== 'cpp') return false;
+  const seenFrom = (decl: Node, file: string): boolean => !C_SOURCE_EXT.test(decl.filePath) || decl.filePath === file ||
+    cppIncluders(decl.filePath, context).has(file) || cppIncludesAfter(decl.filePath, decl.startLine, file, context);
+  const seen = (decl: Node): boolean => seenFrom(decl, ref.filePath);
+  if (CPP_TYPE_KINDS.has(candidate.kind)) return !seen(candidate);
+  // A member written in its class's declaration is that declaration's; one
+  // defined out of line is the class's, wherever a declaration of it its own
+  // file sees is (through an alias, the class may be declared anywhere). A
+  // scope its file sees no type of may be a namespace: fmt's posix-mock-test.cc
+  // defines `test::close` of posix-mock.h's `namespace test`, and
+  // ostream-test.cc declares a `struct test` of its own.
+  const enclosing = cppEnclosingClassDecl(candidate, context);
+  if (enclosing) return !seen(enclosing);
+  const decls = cppTypeDecls(cppParentScope(candidate.qualifiedName), context)
+    .filter((d) => seenFrom(d, candidate.filePath));
+  if (decls.some((d) => d.kind === 'type_alias')) return false;
+  if (decls.length > 0) return !decls.some(seen);
+  return !seen(candidate) &&
+    cppUnnamedNamespaceSpans(candidate.filePath, context).some(([start, end]) => candidate.startLine >= start && candidate.startLine <= end);
+}
+
+/**
+ * Of the methods a C or C++ type's name gives, those `ref`'s translation
+ * unit can see (isCppTranslationUnitLocal), when there are any. Classes of
+ * one qualified name can be declared apart: rocksdb's db_stress_shared_state.h
+ * and two benchmark `.cc` files each declare a `SharedState`, and a call in
+ * db_stress_common.cc is the header's. (Every candidate for any other ref.)
+ */
+function cppVisibleFirst(methods: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (methods.length < 2 || (ref.language !== 'c' && ref.language !== 'cpp')) return methods;
+  const visible = methods.filter((m) => !isCppTranslationUnitLocal(m, ref, context));
+  return visible.length > 0 ? visible : methods;
+}
+
+/** The declarations of the C or C++ type (or alias) named `qualifiedName`. */
+function cppTypeDecls(qualifiedName: string, context: ResolutionContext): Node[] {
+  if (!qualifiedName) return [];
+  let memo = CPP_TYPE_DECLS.get(context);
+  if (!memo) CPP_TYPE_DECLS.set(context, (memo = new Map()));
+  let decls = memo.get(qualifiedName);
+  if (!decls) {
+    decls = context.getNodesByQualifiedName(qualifiedName)
+      .filter((n) => CPP_TYPE_KINDS.has(n.kind) && (n.language === 'cpp' || n.language === 'c'));
+    memo.set(qualifiedName, decls);
+  }
+  return decls;
+}
+
+/** The innermost C or C++ class, struct or union declaration of its file whose lines hold `member`. */
+function cppEnclosingClassDecl(member: Node, context: ResolutionContext): Node | undefined {
+  let innermost: Node | undefined;
+  for (const cls of cppClassesIn(member.filePath, context)) {
+    if (cls.id === member.id || member.startLine < cls.startLine || member.startLine > (cls.endLine ?? cls.startLine)) continue;
+    if (!innermost || cls.startLine >= innermost.startLine) innermost = cls;
+  }
+  return innermost;
+}
+
+/** Whether the C or C++ file `source` `#include`s `header` below line `line`. */
+function cppIncludesAfter(source: string, line: number, header: string, context: ResolutionContext): boolean {
+  let memo = CPP_INCLUDE_LINES.get(context);
+  if (!memo) CPP_INCLUDE_LINES.set(context, (memo = new Map()));
+  let includes = memo.get(source);
+  if (!includes) {
+    includes = context.getNodesInFile(source)
+      .filter((n) => n.kind === 'import')
+      .map((n): [number, string | null] => [n.startLine, cppIncludedFile(n, context)]);
+    memo.set(source, includes);
+  }
+  return includes.some(([at, file]) => at > line && file === header);
+}
+
+/**
+ * The line spans of the unnamed namespaces (`namespace { … }`) a C or C++
+ * file writes, the outermost of nested ones: what one declares has internal
+ * linkage, so no other translation unit names it. Comments, preprocessor
+ * lines and string, character and raw string literals are skipped.
+ */
+function cppUnnamedNamespaceSpans(file: string, context: ResolutionContext): Array<[number, number]> {
+  let memo = CPP_UNNAMED_NAMESPACES.get(context);
+  if (!memo) CPP_UNNAMED_NAMESPACES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const spans: Array<[number, number]> = [];
+  const text = context.readFile(file) ?? '';
+  if (/\bnamespace\s*\{/.test(text)) {
+    const open: Array<{ line: number; unnamed: boolean }> = [];
+    let line = 1;
+    let lineStart = true;
+    // The code since the last brace or `;`, without comments and literals.
+    let code = '';
+    let i = 0;
+    while (i < text.length) {
+      const c = text[i]!;
+      if (c === '\n') {
+        line++;
+        lineStart = true;
+        code += ' ';
+        i++;
+        continue;
+      }
+      if (lineStart && c === '#') {
+        // A preprocessor line, continued by a trailing backslash (before a CRLF too).
+        let end = i;
+        while (end < text.length && (text[end] !== '\n' || text[end - 1] === '\\' || (text[end - 1] === '\r' && text[end - 2] === '\\'))) {
+          if (text[end] === '\n') line++;
+          end++;
+        }
+        i = end;
+        continue;
+      }
+      if (!/\s/.test(c)) lineStart = false;
+      if (c === '/' && text[i + 1] === '/') {
+        const end = text.indexOf('\n', i);
+        i = end < 0 ? text.length : end;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '*') {
+        const end = text.indexOf('*/', i + 2);
+        const stop = end < 0 ? text.length : end + 2;
+        for (let j = i; j < stop; j++) if (text.charCodeAt(j) === 10) line++;
+        i = stop;
+        continue;
+      }
+      if (c === '"' && /(?:^|[^\w$])(?:u8|[uUL])?R$/.test(text.slice(Math.max(0, i - 4), i))) {
+        // `R"delim( … )delim"`.
+        const paren = text.indexOf('(', i);
+        const end = paren < 0 ? -1 : text.indexOf(`)${text.slice(i + 1, paren)}"`, paren);
+        const stop = end < 0 ? text.length : end + paren - i + 1;
+        for (let j = i; j < stop && j < text.length; j++) if (text.charCodeAt(j) === 10) line++;
+        i = Math.min(stop, text.length);
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        let j = i + 1;
+        while (j < text.length && text[j] !== c && text[j] !== '\n') j += text[j] === '\\' ? 2 : 1;
+        i = j + 1;
+        continue;
+      }
+      if (c === '{') {
+        open.push({ line, unnamed: /(?:^|[^\w$])namespace\s*$/.test(code) });
+        code = '';
+      } else if (c === '}') {
+        const top = open.pop();
+        if (top?.unnamed && !open.some((o) => o.unnamed)) spans.push([top.line, line]);
+        code = '';
+      } else if (c === ';') {
+        code = '';
+      } else {
+        code += c;
+        if (code.length > 200) code = code.slice(-100);
+      }
+      i++;
+    }
+  }
+  memo.set(file, spans);
+  return spans;
+}
+
 /**
  * Whether a C/C++ function definition carries the `static` storage class —
  * read from its first source line(s), since the extractor records no storage
@@ -2761,7 +2941,9 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
  *   includes it and stays visible. On a 2,109-file betaflight tree 145
  *   cross-file calls resolved onto a `static` in another `.c` (#1730) —
  *   `usbd_get_descriptor` onto the `static get_device_descriptor` of
- *   whichever USB class file ranked first.
+ *   whichever USB class file ranked first. So is what a source file's
+ *   unnamed namespace declares, and a type only source files declare, with
+ *   its members (isCppTranslationUnitLocal).
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -2826,11 +3008,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
       (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
-    return (
-      candidate.kind !== 'function' ||
-      !C_SOURCE_EXT.test(candidate.filePath) ||
-      !isStaticCFunction(candidate, context)
-    );
+    if (candidate.kind === 'function' && C_SOURCE_EXT.test(candidate.filePath) && isStaticCFunction(candidate, context)) return false;
+    return !isCppTranslationUnitLocal(candidate, ref, context);
   }
   if (lang === 'go') {
     // By the name's first letter, not the extractor's flag: the flag is unset
@@ -8851,7 +9030,7 @@ export function resolveMethodOnType(
   // in ANOTHER file (#314) — is unaffected: that block returns early whenever
   // an import FQN pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(matches, ref.filePath);
+  const ordered = preferCallSiteFile(cppVisibleFirst(matches, ref, context), ref.filePath);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -8913,16 +9092,87 @@ function normalizeCppTypeName(typeName: string): string | null {
   return last;
 }
 
+/** cv-qualifiers and `__restrict`, before or after a declarator's `*` or `&`: `Iterator* const iter`, `Slice const& key`. */
+const CPP_DECLARATOR_CV = String.raw`\b(?:const|volatile|__restrict__|__restrict)\b`;
+/**
+ * What a pointer or reference declarator may carry after its `*` or `&`:
+ * clang's and abseil's nullability annotations (CPP_NULLABILITY), and the
+ * ALL-CAPS macros c-cpp.ts blanks for the parser — protobuf's `Arena*
+ * PROTOBUF_NULLABLE arena`, xxhash's `XXH_RESTRICT`.
+ */
+const CPP_DECLARATOR_ANNOTATION = String.raw`\b(?:absl_nonnull|absl_nullable|absl_nullability_unknown|_Nonnull|_Nullable|_Null_unspecified|[A-Z][A-Z0-9]*_[A-Z0-9_]*)\b`;
+/**
+ * A function wrapper's type, whose template argument is a function type:
+ * rocksdb's `std::function<Iterator*()> create_iterator`.
+ */
+const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function|move_only_function|copyable_function)|absl\s*::\s*(?:FunctionRef|AnyInvocable))\s*<[^;={}]*>`;
+/** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+/** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
+const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
+/** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
+const CPP_TRAILING_ANNOTATION = String.raw`\b[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*\([^()]*\)`;
+
 // Declarator regex: matches `Type receiver`, `Type* receiver`, `Type *receiver`,
 // `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
 // (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
 // terminator rules out uses like `return receiver->m()` where the preceding
 // token is a keyword, not a type. A range-based for's `Type receiver :` is read
-// by cppRangeForDeclaration instead.
+// by cppRangeForDeclaration instead. Qualifiers and annotations around the
+// name are read past, and matchCppDeclarator drops the annotations from the
+// type.
 function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   return new RegExp(
-    `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
+    `(${CPP_DECLARATOR_TYPE})\\s*\\b${escapedReceiver}\\b(?:\\s*${CPP_TRAILING_ANNOTATION})*\\s*(?=[;=,)\\[{(]|$)`,
   );
+}
+
+/** buildDeclaratorRegex's `regex` run on the code `line`, with its type as cppDeclaratorType gives it. */
+function matchCppDeclarator(line: string, regex: RegExp): RegExpExecArray | null {
+  const m = regex.exec(line);
+  if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
+  return m;
+}
+
+const CPP_DECLARATOR_ANNOTATION_WORD = new RegExp(`^${CPP_DECLARATOR_ANNOTATION}$`);
+const CPP_WORD_AT = /[A-Za-z_]\w*/y;
+
+/**
+ * A type the declarator regex read, without the annotations it reads past
+ * after a `*` or `&`, outside template arguments: `Arena*
+ * PROTOBUF_NULLABLE` → `Arena*`. Taken as part of the type, one read as its
+ * name, of a class no project has. An ALL-CAPS word stands for an annotation
+ * only there, so a type's own name stays (`OS_HANDLE* const h`), and so do
+ * its cv-qualifiers, which what reads a type reads past. A type with nothing
+ * to drop comes back as it is.
+ */
+function cppDeclaratorType(text: string): string {
+  let out = '';
+  let depth = 0;
+  let afterPointer = false;
+  let dropped = false;
+  for (let i = 0; i < text.length; ) {
+    CPP_WORD_AT.lastIndex = i;
+    const word = depth === 0 && !/[\w:]/.test(text[i - 1] ?? ' ') ? CPP_WORD_AT.exec(text)?.[0] : undefined;
+    if (word) {
+      if (afterPointer && CPP_DECLARATOR_ANNOTATION_WORD.test(word)) {
+        dropped = true;
+      } else {
+        out += word;
+        afterPointer = false;
+      }
+      i += word.length;
+      continue;
+    }
+    const c = text[i]!;
+    if (c === '<') depth++;
+    else if (c === '>') depth--;
+    else if (depth === 0 && (c === '*' || c === '&')) afterPointer = true;
+    else if (depth === 0 && !/\s/.test(c)) afterPointer = false;
+    out += c;
+    i++;
+  }
+  return dropped ? out.replace(/\s+/g, ' ').trim() : text;
 }
 
 // A range-based for's declaration, `for (const Foo& name :`, up to the single
@@ -8930,7 +9180,7 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
 // global-scope `::` — is never an initializer, a call or a member access.
 const CPP_RANGE_FOR_DECLARATION = /\bfor\s*\(([^;=(){}?."']*?)\b([A-Za-z_]\w*)\s*:(?!:)/g;
 // The type a declaration ends with, read as the declarator regex reads it.
-const CPP_DECLARED_TYPE_TAIL = /([A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?(?:\s*[*&]+)?)\s*$/;
+const CPP_DECLARED_TYPE_TAIL = new RegExp(String.raw`(${CPP_DECLARATOR_TYPE})\s*$`);
 
 /**
  * The type the range-based for on `line` (comments blanked) declares
@@ -8944,7 +9194,7 @@ function cppRangeForDeclaration(line: string, receiverName: string): { type: str
   for (const m of line.matchAll(CPP_RANGE_FOR_DECLARATION)) {
     if (m[2] !== receiverName) continue;
     const tail = m[1]!.match(CPP_DECLARED_TYPE_TAIL);
-    return tail ? { type: tail[1]!, paren: m.index! + m[0].indexOf('('), colon: m.index! + m[0].length } : null;
+    return tail ? { type: cppDeclaratorType(tail[1]!), paren: m.index! + m[0].indexOf('('), colon: m.index! + m[0].length } : null;
   }
   return null;
 }
@@ -8998,6 +9248,10 @@ const CPP_LIBRARY_SEQUENCES: ReadonlySet<string> = new Set([
 ]);
 /** Widely used project containers of the same kind: protobuf's repeated fields, rocksdb's `autovector`. */
 const CPP_PROJECT_SEQUENCES: ReadonlySet<string> = new Set(['RepeatedField', 'RepeatedPtrField', 'autovector']);
+/** The standard library's and abseil's maps, whose elements are `std::pair`s of a key and a value. */
+const CPP_LIBRARY_MAPS: ReadonlySet<string> = new Set([
+  'map', 'multimap', 'unordered_map', 'unordered_multimap', 'flat_hash_map', 'node_hash_map', 'btree_map', 'btree_multimap',
+]);
 
 /** Clang's and abseil's nullability annotations: `const FieldDescriptor* absl_nonnull`. */
 const CPP_NULLABILITY = /\b(?:absl_nonnull|absl_nullable|absl_nullability_unknown|_Nonnull|_Nullable|_Null_unspecified)\b/g;
@@ -9167,18 +9421,32 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
       if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
-      const code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
-      const m = code ? declarator.exec(code) : null;
+      let code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
+      // The line the declaration's code starts on: the one above, for a type
+      // written there and nothing else (rocksdb's
+      // `std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>`
+      // above `cfh_iter_pairs_;`), so a default member initializer continued
+      // on the next line (`bool ready_ = flag_ &&` above `it_;`) isn't one.
+      let from = l;
+      let m = code ? matchCppDeclarator(code, declarator) : null;
+      if (!m && code && l > decl.startLine) {
+        const above = cppCodeOf(cppLiteralsBlanked(lines[l - 2]!, l - 1, rawLines));
+        if (above && CPP_TYPE_LINE.test(above)) {
+          code = `${above} ${code}`;
+          from = l - 1;
+          m = matchCppDeclarator(code, declarator);
+        }
+      }
       if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
-      let depth = depths[l - decl.startLine]!;
+      let depth = depths[from - decl.startLine]!;
       if (depth < 0) continue;
-      for (const c of code!.slice(l === decl.startLine ? decl.startColumn : 0, m.index)) {
+      for (const c of code!.slice(from === decl.startLine ? decl.startColumn : 0, m.index)) {
         if (c === '(') depth++;
         else if (c === ')') depth--;
       }
       const type = depth <= 0 ? normalizeCppTypeName(m[1]!) : null;
       if (type && type !== 'auto') {
-        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: l, parameters: cppTemplateParameters(decl, context) };
+        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: from, parameters: cppTemplateParameters(decl, context) };
         break;
       }
     }
@@ -9285,7 +9553,8 @@ function cppInheritedDataMember(decls: readonly Node[], name: string, context: R
   if (depth >= 4 || !context.getSupertypeNodes) return null;
   for (const decl of decls) {
     for (const base of context.getSupertypeNodes(decl.id)) {
-      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName) || isCppDependentBase(decl, base, context)) continue;
+      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName)) continue;
+      if (isCppDependentBase(decl, base, context) && !cppUsingDeclares(decl, base, name, context)) continue;
       seen.add(base.qualifiedName);
       const inherited = cppInheritedDataMember([base], name, context, depth + 1, seen);
       if (inherited) return inherited;
@@ -9313,7 +9582,7 @@ function cppTestFixture(caller: Node, ref: UnresolvedRef, context: ResolutionCon
 
 /**
  * The type `*x` has when `x` has the type `type`: what a pointer points at,
- * or what a standard smart pointer or optional holds. Null for any other type.
+ * or what a smart pointer, an optional or an `absl::StatusOr` holds (cppHeldType). Null for any other type.
  */
 function cppPointee(type: CppWrittenType): CppWrittenType | null {
   const text = type.text.replace(/&+\s*$/, '').trim();
@@ -9324,7 +9593,7 @@ function cppPointee(type: CppWrittenType): CppWrittenType | null {
     else if (ch === '<') depth--;
     else if (ch === '*' && depth === 0) return { ...type, text: text.slice(0, i).trim() };
   }
-  const held = cppStdHeldType(text);
+  const held = cppHeldType(text);
   return held ? { ...type, text: held } : null;
 }
 
@@ -9347,6 +9616,11 @@ function cppRangeElementOf(type: CppWrittenType, at: UnresolvedRef, context: Res
     if (CPP_LIBRARY_SEQUENCES.has(last) && segments[0] !== 'std' && segments[0] !== 'absl' && cppTypesNamed(last, context).length > 0) return null;
     const element = cppTemplateArguments(range.text)?.[0];
     return element ? { ...range, text: cppWithoutNullability(element) } : null;
+  }
+  // A map's elements pair its key with its value.
+  if (CPP_LIBRARY_MAPS.has(last) && (segments[0] === 'std' || segments[0] === 'absl')) {
+    const [key, value] = cppTemplateArguments(range.text) ?? [];
+    return key && value ? { ...range, text: `std::pair<const ${cppWithoutNullability(key)}, ${cppWithoutNullability(value)}>` } : null;
   }
   const cls = cppWrittenClass(range, at, context);
   const begin = cls ? cppReturnTypeOf(cppMethodsOf(cls, 'begin', at, context), context) : null;
@@ -9402,8 +9676,11 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   if (!caller) return null;
   // What the calling function writes is looked up from inside it.
   const callers = { scope: caller.qualifiedName, file: at.filePath, line: at.line, parameters: cppTemplateParameters(caller, context) };
-  const owner = cppMemberOwner(caller, context);
-  if (text === 'this') return owner ? { ...callers, text: `${owner}*` } : null;
+  if (text === 'this') {
+    // (A gtest `TEST_F` body's object is of a class derived from its fixture.)
+    const owner = cppMemberOwner(caller, context) ?? cppTestFixture(caller, at, context);
+    return owner ? { ...callers, text: `${owner}*` } : null;
+  }
   const name = /^(?:this\s*->\s*)?([A-Za-z_]\w*)$/.exec(text);
   if (name) {
     const decl: CppReceiverDeclaration = {};
@@ -9434,8 +9711,14 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   // `std::make_unique<Foo>(…)`: the smart pointer it makes.
   const made = /^(?:::\s*)?(?:std|absl)\s*::\s*make_(unique|shared)\s*<([\s\S]+)>$/.exec(callee);
   if (made) return { ...callers, text: `std::${made[1]}_ptr<${made[2]!.trim()}>` };
-  // `std::unique_ptr<Iterator>(…)`: the smart pointer or optional it makes.
-  if (cppStdHeldType(callee)) return { ...callers, text: callee };
+  // `std::unique_ptr<Iterator>(…)`: the holder it makes (cppHeldType).
+  if (cppHeldType(callee)) return { ...callers, text: callee };
+  // `create_iterator()` on a `std::function<Iterator*()> create_iterator`: what its function type returns.
+  if (/^[A-Za-z_]\w*$/.test(callee)) {
+    const wrapper = cppExpressionType(callee, at, context, depth + 1);
+    const returned = wrapper && cppWrapperReturnType(wrapper);
+    if (returned) return returned;
+  }
   // `recv.method(…)`, `recv->method(…)`: the method of the receiver's class.
   const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(callee);
   if (member) {
@@ -9445,10 +9728,14 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   }
   if (!/^(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*(?:\s*<[\s\S]*>)?$/.test(callee)) return null;
   const spelled = stripCppTemplateArguments(callee).replace(/\s+/g, '');
-  // `NewIterator(…)` in a method: its class's own or inherited method first.
-  const ownClass = owner && !spelled.includes('::') ? cppClassDecls(owner, context)[0] : undefined;
-  const own = ownClass ? cppMethodsOf(ownClass, spelled, at, context) : [];
-  if (own.length > 0) return cppReturnTypeOf(own, context);
+  // `NewIterator(…)` in a method, or in a gtest body: what the method of its
+  // class, or of a class it derives from, returns (cppImplicitThisMethod),
+  // before anything outside. It is looked up as on `this`: in a template, a
+  // bare call into a base that depends on its parameters compiles only
+  // through a using-declaration, like protobuf's `using
+  // RepeatedFieldWrapper<T>::MutableRepeatedField;`.
+  const own = spelled.includes('::') ? undefined : cppImplicitThisMethod(spelled, 'this', caller, at, context);
+  if (own) return cppReturnTypeOf([own], context);
   // `f(…)`, `ns::f(…)`, `Class::f(…)`: looked up from the caller outwards.
   for (const scope of cppScopesWithin(cppParentScope(caller.qualifiedName))) {
     const fns = context.getNodesByQualifiedName(scope ? `${scope}::${spelled}` : spelled).filter(isCppFunctionNode);
@@ -9541,7 +9828,7 @@ function cppAutoLocalType(
 function isCppTemplateDependentType(type: CppWrittenType, context: ResolutionContext): boolean {
   if (type.parameters.size === 0) return false;
   if (isCppTemplateParameterType(type)) return true;
-  const held = cppStdHeldType(type.text);
+  const held = cppHeldType(type.text);
   if (held) return isCppTemplateDependentType({ ...type, text: held }, context);
   // (A trait of one, `std::conditional_t<kIsMutable, …>`, too: it names another type.)
   return (isCppLibraryType(type.text, context) || cppTypeSegments(type.text)?.[0] === 'std') &&
@@ -9792,19 +10079,31 @@ function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   return !declared.some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
 }
 
-/** Standard-library types whose `->` reaches the value they hold. */
-const CPP_STD_HOLDERS: ReadonlySet<string> = new Set(['unique_ptr', 'shared_ptr', 'optional']);
+/** Library types whose `->` reaches the value they hold. */
+const CPP_HOLDERS: ReadonlySet<string> = new Set(['std::unique_ptr', 'std::shared_ptr', 'std::optional', 'absl::optional', 'absl::StatusOr', 'absl::NoDestructor']);
 
-/** The type a standard smart pointer or optional written as `raw` holds (`Iterator` for `std::unique_ptr<Iterator>`), or null. */
-function cppStdHeldType(raw: string): string | null {
+/**
+ * The type a standard smart pointer, an optional, an `absl::StatusOr` or an
+ * `absl::NoDestructor` written as `raw` holds (`Iterator` for
+ * `std::unique_ptr<Iterator>`), or null.
+ */
+function cppHeldType(raw: string): string | null {
   const holder = cppTypeSegments(raw);
-  if (holder?.length !== 2 || holder[0] !== 'std' || !CPP_STD_HOLDERS.has(holder[1]!)) return null;
+  if (holder?.length !== 2 || !CPP_HOLDERS.has(holder.join('::'))) return null;
   return cppTemplateArguments(raw)?.[0] ?? null;
 }
 
+/** Whether the holder `raw` names (cppHeldType) is the library's: no type of the project's has its name. */
+function isCppLibraryHolder(raw: string, context: ResolutionContext): boolean {
+  const spelled = cppTypeSegments(raw)!.join('::');
+  return !cppTypesNamed(cppLastSegment(spelled), context).some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
+}
+
 /**
- * A `->` call on a C++ receiver declared as a standard smart pointer or
- * optional (`std::unique_ptr<Iterator> iter; iter->Valid()`) calls a member of
+ * A `->` call on a C++ receiver declared as a standard smart pointer, an
+ * optional or an `absl::StatusOr` (`std::unique_ptr<Iterator> iter;
+ * iter->Valid()`, protobuf's `absl::StatusOr<FeatureResolver> resolver;
+ * resolver->MergeFeatures(…)`) calls a member of
  * the type it holds. That type is looked up as C++ looks it up where the call
  * is written (cpp-supertypes.ts): the scopes around the call, the file's
  * `using`s, and aliases followed. Looking it up by its last name instead
@@ -9822,8 +10121,8 @@ function cppStdHeldType(raw: string): string | null {
  *    doesn't name): the call goes on as before.
  */
 function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const held = cppStdHeldType(raw);
-  if (!held || !isCppLibraryType(raw, context)) return undefined;
+  const held = cppHeldType(raw);
+  if (!held || !isCppLibraryHolder(raw, context)) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
   if (!caller || isCppPointerType(held)) return undefined;
   if (isCppLibraryType(held, context)) return null;
@@ -9918,6 +10217,24 @@ function matchCppDeclaredTypeCall(
 }
 
 /**
+ * Is a C++ `->` call on `receiver` made on a value — not a pointer — of a
+ * type from outside the project that nothing the file sees declares
+ * (isCppOutsideQualifiedType)? Its `operator->` hands the call to a type the
+ * declared one only wraps (`absl::StatusOr<Any>`'s `Any`), so the declared
+ * type's last name names no class the method is in. (A smart pointer, an
+ * optional or an `absl::StatusOr` holding one of the project's classes is
+ * matchCppHeldTypeCall's.)
+ */
+function isCppArrowThroughOutsideType(receiver: string, decl: CppReceiverDeclaration, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!decl.callers || decl.shadowed || !decl.raw || decl.pointer || decl.aliased) return false;
+  if (cppMemberOperator(receiver, ref, context) !== '->' || isCppLibraryType(decl.raw, context)) return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return false;
+  const site = decl.declared ?? cppCallSite(caller, ref, context);
+  return cppClassWritten(decl.raw, site, ref, context) === undefined && isCppOutsideQualifiedType(decl.raw, site, context);
+}
+
+/**
  * Is the C++ type `raw`, which nothing the file sees declares, written under
  * a namespace the project declares no type in — `absl::Status`,
  * `grpc::ServerContext` — so that it is from outside the project? Not when
@@ -9996,15 +10313,28 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
 }
 
 /**
- * C++ class `cls`'s method `name`: its own, else the nearest one of a class
+ * C++ class `cls`'s method `name`: its own — of its overloads, the one the
+ * call's arguments fit (cppOverloadFor) — else the nearest one of a class
  * it derives from, through the base edges every declaration of `cls` has.
+ * When other classes share `cls`'s qualified name, its own are the ones
+ * defined where it is: leveldb's db_bench.cc and db_bench_sqlite3.cc each
+ * declare a `RandomGenerator`, with a `Generate` that takes a `size_t` and
+ * an `int`. (A chained call `inner(…).name(…)` keeps the first: the
+ * arguments at its position are the inner call's.)
  */
 function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
   const own = named.filter((n) => n.qualifiedName === want);
-  if (own.length > 0) return preferCallSiteFile(own, ref.filePath)[0]!;
+  if (own.length > 0) {
+    const ordered = preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath);
+    if (ref.referenceName.includes('().')) return ordered[0]!;
+    const defined = cppClassDecls(cls.qualifiedName, context).length > 1
+      ? ordered.filter((n) => n.filePath === cls.filePath || cppIncluders(cls.filePath, context).has(n.filePath))
+      : ordered;
+    return cppOverloadFor(defined.length > 0 ? defined : ordered, name, ref, context);
+  }
   seen.add(cls.qualifiedName);
   if (depth >= 4 || !context.getSupertypeNodes) return null;
   for (const decl of context.getNodesByQualifiedName(cls.qualifiedName)) {
@@ -10048,16 +10378,33 @@ function matchCppImplicitThisCall(ref: UnresolvedRef, context: ResolutionContext
   const receiver = cppImplicitReceiver(ref, context);
   if (receiver === null) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
-  const owner = caller ? cppMemberOwner(caller, context) : null;
-  if (!caller || owner === null) return undefined;
+  if (!caller) return undefined;
+  const found = cppImplicitThisMethod(name, receiver, caller, ref, context);
+  // (A recursive call names the function itself, which no local shadows.)
+  if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
+  return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'instance-method' };
+}
+
+/**
+ * The method a C++ call of `name` written with no receiver, or on `this`,
+ * reaches from `caller` by C++ lookup (matchCppImplicitThisCall): of the
+ * caller's class, a class it derives from, or one it is nested in. A gtest
+ * `TEST_F(Fixture, …)` or `TEST_P` body is a method of a class gtest derives
+ * from `Fixture`, so the fixture's methods are its own: rocksdb's tests call
+ * `DBTestBase`'s `Put(…)` and `NewIterator(…)` bare. Undefined when the
+ * caller is no member function, or no class on the way has a method of that
+ * name in the index. (Whether a local of the caller's shadows it is the
+ * caller's to ask.)
+ */
+function cppImplicitThisMethod(name: string, receiver: 'bare' | 'this', caller: Node, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const owner = cppMemberOwner(caller, context) ?? cppTestFixture(caller, ref, context);
+  if (owner === null) return undefined;
   let found: Node | null | undefined = null;
   for (const scope of cppEnclosingClasses(owner, caller, context)) {
     found = cppScopeMethod(scope, name, receiver, ref, context);
     if (found !== null || receiver === 'this') break;
   }
-  // (A recursive call names the function itself, which no local shadows.)
-  if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
-  return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return found ?? undefined;
 }
 
 /** `this->` / `(*this).` before a member's name, with a `template` keyword after it. */
@@ -10234,7 +10581,7 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
   for (const decl of scope.decls) {
     for (const base of context.getSupertypeNodes(decl.id)) {
       if (!CPP_CLASS_KINDS.has(base.kind)) continue;
-      if (receiver === 'bare' && isCppDependentBase(decl, base, context)) continue;
+      if (receiver === 'bare' && isCppDependentBase(decl, base, context) && !cppUsingDeclares(decl, base, name, context)) continue;
       const inherited = cppMethodOf(base, name, ref, context, 1, new Set([scope.qualifiedName]));
       if (!inherited) continue;
       // Its class's other overloads, which the arguments may fit better
@@ -10248,21 +10595,158 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
   return null;
 }
 
-/** Of one class's overloads of `name` (in preference order), the one the call's arguments fit best. */
+/**
+ * Of one class's overloads of `name` (in preference order), the one the
+ * call's arguments fit best: by their count and string literals
+ * (cppOverloadFit), then, among overloads those fit alike, by the types the
+ * arguments have where the call reads them (cppArgumentTypeFit). rocksdb's
+ * `Insert(ch)` on a `char ch` is `Insert(char key, …)`, not `Insert(const
+ * std::string& key, …)`.
+ */
 function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
   if (overloads.length === 1) return overloads[0]!;
   const args = cppCallArguments(ref, name, context);
   if (!args) return overloads[0]!;
-  let best = overloads[0]!;
-  let bestFit = cppOverloadFit(best, name, args, context);
-  for (const n of overloads.slice(1)) {
-    const fit = cppOverloadFit(n, name, args, context);
+  const fits = overloads.map((n) => cppOverloadFit(n, name, args, context));
+  const top = Math.max(...fits);
+  const tied = overloads.filter((_, i) => fits[i] === top);
+  if (tied.length === 1 || args.length === 0) return tied[0]!;
+  const types = args.map((arg) => cppArgumentType(arg, ref, context));
+  if (types.every((t) => t === null)) return tied[0]!;
+  let best = tied[0]!;
+  let bestFit = cppArgumentTypeFit(best, name, types, context);
+  for (const n of tied.slice(1)) {
+    const fit = cppArgumentTypeFit(n, name, types, context);
     if (fit > bestFit) {
       best = n;
       bestFit = fit;
     }
   }
   return best;
+}
+
+/** What a C++ call's argument is: a literal's kind, or the type a name or expression has as written. */
+type CppArgumentType = { kind: 'char' | 'number' | 'zero' | 'bool' | 'null' } | { kind: 'type'; text: string };
+
+/**
+ * What the argument `arg` of the call at `ref` is, where that can be read: a
+ * character, number, `true`/`false` or `nullptr` literal, or the written
+ * type of a name the calling function declares, of `&name`, of `name[i]`
+ * (rocksdb's `TryLock(column_family[i], keys[i], …)` on a
+ * `std::vector<Slice>`), or of an expression (cppExpressionType). Null
+ * otherwise. (String literals are cppOverloadFit's.)
+ */
+function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
+  const text = arg.trim();
+  if (/^(?:u8|u|U|L)?'(?:[^'\\]|\\.)+'$/.test(text)) return { kind: 'char' };
+  if (text === 'true' || text === 'false') return { kind: 'bool' };
+  if (text === 'nullptr' || text === 'NULL') return { kind: 'null' };
+  if (/^0+[uUlL]*$/.test(text)) return { kind: 'zero' };
+  if (/^[-+]?(?:0[xX][\da-fA-F']+|\d[\d']*(?:\.\d*)?(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)[uUlLfFzZ]*$/.test(text)) return { kind: 'number' };
+  const address = /^&\s*([A-Za-z_]\w*)$/.exec(text);
+  const name = address?.[1] ?? (/^[A-Za-z_]\w*$/.test(text) ? text : null);
+  if (name) {
+    const decl: CppReceiverDeclaration = {};
+    inferCppReceiverType(name, ref, context, 0, decl);
+    const written = decl.declared?.text ?? decl.raw;
+    if (!written || !decl.callers || decl.shadowed) return null;
+    return { kind: 'type', text: address ? `${written}*` : written };
+  }
+  // `keys[i]`: an element of the container, or what the pointer points at, a name the calling function declares is.
+  const subscript = /^([A-Za-z_]\w*)\s*\[[^[\]]*\]$/.exec(text);
+  if (subscript) {
+    const container = cppExpressionType(subscript[1]!, ref, context, 0);
+    const followed = container && cppFollowWrittenAliases(container, ref, context);
+    const element = followed && (isCppPointerType(followed.text) ? cppPointee(followed) : cppRangeElementOf(followed, ref, context));
+    return element ? { kind: 'type', text: element.text } : null;
+  }
+  const typed = /^(?:u8|u|U|L)?R?["']/.test(text) ? null : cppExpressionType(text, ref, context, 0);
+  return typed ? { kind: 'type', text: typed.text } : null;
+}
+
+/** What a C++ type is, for an argument to fit a parameter of it. */
+type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'class';
+
+const CPP_CHAR_TYPES: ReadonlySet<string> = new Set(['char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t']);
+const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
+  'int', 'unsigned', 'signed', 'short', 'long', 'float', 'double', 'size_t', 'ssize_t', 'ptrdiff_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t', 'intptr_t', 'uintptr_t',
+]);
+const CPP_STRING_TYPES: ReadonlySet<string> = new Set(['string', 'wstring', 'string_view', 'wstring_view', 'basic_string', 'basic_string_view']);
+
+/** The category of the written C++ type `type`: a pointer's, a string's, a character's, a number's, a class's. */
+function cppTypeCategory(type: string): CppTypeCategory {
+  const flat = stripCppTemplateArguments(type).replace(/\b(?:const|volatile|struct|class|typename|enum)\b/g, ' ').replace(/&+/g, ' ').trim();
+  const words = flat.replace(/\*/g, ' ').trim().split(/\s+/);
+  const last = cppLastSegment(words[words.length - 1] ?? '');
+  if (flat.includes('*')) return CPP_CHAR_TYPES.has(last) && (flat.match(/\*/g) ?? []).length === 1 ? 'cstring' : 'pointer';
+  if (last === 'bool') return 'bool';
+  if (CPP_CHAR_TYPES.has(last) && words.every((w) => CPP_CHAR_TYPES.has(w) || w === 'signed' || w === 'unsigned')) return 'char';
+  if (CPP_NUMBER_TYPES.has(last) || words.every((w) => CPP_NUMBER_TYPES.has(w))) return 'number';
+  return CPP_STRING_TYPES.has(last) ? 'string' : 'class';
+}
+
+/**
+ * How well the read argument types `types` fit the parameters of the
+ * overload `n`: the same type, or a character to a character, scores; a
+ * character, number or pointer to a string, or a string or pointer to a
+ * number, counts against. Classes of other names score nothing: a conversion
+ * may join them.
+ */
+function cppArgumentTypeFit(n: Node, name: string, types: Array<CppArgumentType | null>, context: ResolutionContext): number {
+  const list = cppOverloadParameters(n, name, context);
+  if (list === null) return 0;
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
+  let score = 0;
+  for (let i = 0; i < types.length && i < params.length; i++) {
+    const arg = types[i];
+    const param = cppParameterType(params[i]!);
+    if (!arg || param.includes('...')) continue;
+    const category = cppTypeCategory(param);
+    score += arg.kind === 'type' ? cppWrittenTypeFit(arg.text, param, category) : CPP_LITERAL_FIT[arg.kind][category];
+  }
+  return score;
+}
+
+/** How a literal fits a parameter of each category. */
+const CPP_LITERAL_FIT: Record<'char' | 'number' | 'zero' | 'bool' | 'null', Record<CppTypeCategory, number>> = {
+  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, string: -3, class: 0 },
+  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
+  null: { pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
+};
+
+/** How an argument written as type `arg` fits a parameter of type `param` (of category `category`). */
+function cppWrittenTypeFit(arg: string, param: string, category: CppTypeCategory): number {
+  const argCategory = cppTypeCategory(arg);
+  const pointer = (c: CppTypeCategory): boolean => c === 'pointer' || c === 'cstring';
+  if (normalizeCppTypeName(arg) === normalizeCppTypeName(param) && pointer(argCategory) === pointer(category)) return 3;
+  if (argCategory === category && argCategory !== 'class') return 2;
+  const textual = (c: CppTypeCategory): boolean => c === 'string' || c === 'cstring';
+  if ((argCategory === 'char' || argCategory === 'number' || argCategory === 'pointer') && category === 'string') return -3;
+  if ((textual(argCategory) || argCategory === 'pointer') && (category === 'char' || category === 'number')) return -3;
+  if ((argCategory === 'char' || argCategory === 'number') && (category === 'pointer' || category === 'cstring')) return -3;
+  return 0;
+}
+
+/** A C++ parameter declaration's type: without its default argument and its name. */
+function cppParameterType(param: string): string {
+  let text = param;
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '<' || c === '(' || c === '[') depth++;
+    else if (c === '>' || c === ')' || c === ']') depth--;
+    else if (c === '=' && depth === 0) {
+      text = text.slice(0, i);
+      break;
+    }
+  }
+  text = text.trim();
+  // The name, when a type comes before it.
+  const named = /^(.*[\w>*&\s])\b[A-Za-z_]\w*\s*(?:\[[^\]]*\])?$/.exec(text);
+  return named && /[A-Za-z_]/.test(named[1]!) && !/^(?:const|volatile|unsigned|signed|struct|class|enum)\s*$/.test(named[1]!.trim()) ? named[1]!.trim() : text;
 }
 
 const CPP_MEMBER_MACRO_ARGS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -10322,10 +10806,37 @@ function cppBaseSpecifiers(decl: Node, context: ResolutionContext): string[] {
   return specs;
 }
 
+/** Per context: a C++ class declaration's id → the `using Base::name;` declarations its body writes, as [base, name]. */
+const CPP_USING_MEMBERS = new WeakMap<ResolutionContext, Map<string, Array<[string, string]>>>();
+
+/**
+ * Whether the C++ class declaration `decl` brings `name` in from its base
+ * `base` with a using-declaration: rocksdb's `FullTypedCacheHelperFns`
+ * writes `using BasicTypedCacheHelperFns<TValue>::DownCastValue;`, and a bare
+ * `DownCastValue(v)` in it then finds the base's, though the base depends on
+ * the class's template parameters (isCppDependentBase).
+ */
+function cppUsingDeclares(decl: Node, base: Node, name: string, context: ResolutionContext): boolean {
+  let memo = CPP_USING_MEMBERS.get(context);
+  if (!memo) CPP_USING_MEMBERS.set(context, (memo = new Map()));
+  let usings = memo.get(decl.id);
+  if (!usings) {
+    usings = [];
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine).map((l) => cppCodeOf(l) ?? '').join('\n');
+    for (const m of body.matchAll(/\busing\s+(?!namespace\b)((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}]*>)?)\s*::\s*([A-Za-z_]\w*)\s*;/g)) {
+      usings.push([cppLastSegment(stripCppTemplateArguments(m[1]!).trim()), m[2]!]);
+    }
+    memo.set(decl.id, usings);
+  }
+  return usings.some(([of, member]) => of === base.name && member === name);
+}
+
 /**
  * Whether `base`, a base of the C++ class declaration `decl`, depends on the
  * template parameters of `decl` or a class around it: `template <class T>
- * class Foo : public Base<T>`. A bare name is not looked up in such a base.
+ * class Foo : public Base<T>`. A bare name is not looked up in such a base,
+ * unless the class brings it in with a using-declaration (cppUsingDeclares).
  */
 function isCppDependentBase(decl: Node, base: Node, context: ResolutionContext): boolean {
   const parameters = cppTemplateParameters(decl, context);
@@ -10446,7 +10957,7 @@ function inferCppReceiverType(
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
     if (!line || !receiverPattern.test(line)) continue;
 
-    const declaratorMatch = line.match(declaratorRegex);
+    const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized === 'auto') {
@@ -10502,6 +11013,14 @@ function inferCppReceiverType(
           return cppDeclaredType(element.text, elementType, true, ref, context, found);
         }
       }
+      // `for (auto& [cfh, iter] : cfh_iter_pairs_)`, `auto [status, iter] = Open();`.
+      const bound = !found.shadowed ? cppStructuredBindingType(line, lines, i, receiverName, callLineIndex, ref, context, rawLines) : null;
+      const boundType = bound && normalizeCppTypeName(bound.text);
+      if (bound && boundType && boundType !== 'auto') {
+        noteCppDeclaration(found, bound.text, true);
+        found.declared = bound;
+        return cppDeclaredType(bound.text, boundType, true, ref, context, found);
+      }
       if (cppRebindsReceiver(line, escapedReceiver)) found.shadowed = true;
     }
   }
@@ -10530,7 +11049,7 @@ function inferCppReceiverType(
       if (!receiverPattern.test(text)) continue;
       const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, headerRawLines));
       if (!line) continue;
-      const declaratorMatch = line.match(declaratorRegex);
+      const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized && normalized !== 'auto') {
@@ -10697,14 +11216,101 @@ function cppAutoInitializerStatement(
 ): string | null {
   const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const start = new RegExp(`\\b${escaped}\\b\\s*=(?!=)`).exec(line);
-  if (!start) return null;
-  let text = line.slice(start.index + start[0].length);
+  return start ? cppStatementFrom(line.slice(start.index + start[0].length), lines, index, rawLines) : null;
+}
+
+/**
+ * The C++ statement that `text`, the rest of `lines[index]`, begins, read on
+ * to the `;` that ends it. Null when no `;` ends it within a few lines.
+ */
+function cppStatementFrom(
+  text: string,
+  lines: readonly string[],
+  index: number,
+  rawLines: ReturnType<typeof cppRawStringLines>,
+): string | null {
   for (let next = index + 1; ; next++) {
     const end = cppStatementEnd(text);
     if (end >= 0) return text.slice(0, end).trim() || null;
     if (next >= lines.length || next > index + 4) return null;
     text += ` ${cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? ''}`;
   }
+}
+
+/** A structured binding's names: `[cfh, iter]` in `for (auto& [cfh, iter] : …)` or `const auto [status, iter] = …;`. */
+const CPP_STRUCTURED_BINDING = /\bauto\s*&{0,2}\s*\[([^\]]*)\]/g;
+
+/**
+ * The type the structured binding on line `index` (`line`, its code) gives
+ * `receiverName`, as written: the element at the name's place of the pair
+ * or tuple bound. That is an element of the range a range-for over the
+ * binding iterates, when the call is in the loop's body — rocksdb's `for
+ * (auto& [cfh, iter] : cfh_iter_pairs_)` over a
+ * `std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>`,
+ * or a map's key and value — or the initializer of a declaration the
+ * calling function makes (`auto [status, iter] = Open();`). Null when that
+ * can't be read.
+ */
+function cppStructuredBindingType(
+  line: string,
+  lines: readonly string[],
+  index: number,
+  receiverName: string,
+  callLineIndex: number,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  rawLines: ReturnType<typeof cppRawStringLines>,
+): CppWrittenType | null {
+  if (!line.includes('[')) return null;
+  for (const m of line.matchAll(CPP_STRUCTURED_BINDING)) {
+    const place = m[1]!.split(',').map((name) => name.trim()).indexOf(receiverName);
+    if (place < 0) continue;
+    const end = m.index! + m[0].length;
+    const loop = /\bfor\s*\(\s*(?:(?:const|volatile)\s+)*$/.exec(line.slice(0, m.index!));
+    const colon = /^\s*:(?!:)/.exec(line.slice(end));
+    let value: CppWrittenType | null = null;
+    if (loop && colon) {
+      if (!cppForBodyEncloses(lines, index, line.indexOf('(', loop.index), callLineIndex, ref.column)) return null;
+      value = cppAutoLoopElement(lines, index, { colon: end + colon[0].length }, ref, context);
+    } else {
+      const assign = /^\s*=(?!=)/.exec(line.slice(end));
+      if (!assign || !isCppCallersDeclaration(ref.filePath, index + 1, ref, context)) return null;
+      const init = cppStatementFrom(line.slice(end + assign[0].length), lines, index, rawLines);
+      value = init ? cppAutoLocalType(init, index + 1, m[0], ref, context) : null;
+    }
+    return (value && cppBindingElements(value, ref, context)?.[place]) ?? null;
+  }
+  return null;
+}
+
+/**
+ * What calling a function wrapper of the written type `type` returns, as
+ * written: what the function type that is its template argument returns
+ * (`Iterator*` for `std::function<Iterator*()>`). Only a wrapper's
+ * declaration is read with one (CPP_FUNCTION_WRAPPER_TYPE). Null when its
+ * template argument is no function type.
+ */
+function cppWrapperReturnType(type: CppWrittenType): CppWrittenType | null {
+  const signature = cppTemplateArguments(type.text)?.[0] ?? '';
+  let depth = 0;
+  for (let i = 0; i < signature.length; i++) {
+    const c = signature[i]!;
+    if (c === '<') depth++;
+    else if (c === '>') depth--;
+    else if (c === '(' && depth === 0) {
+      const returned = signature.slice(0, i).trim();
+      return returned ? { ...type, text: returned } : null;
+    }
+  }
+  return null;
+}
+
+/** What a structured binding of a value of the type `type` names, in order: a `std::pair`'s or `std::tuple`'s elements. */
+function cppBindingElements(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType[] | null {
+  const followed = cppFollowWrittenAliases(type, at, context);
+  const segments = followed && cppTypeSegments(followed.text);
+  if (!followed || segments?.length !== 2 || segments[0] !== 'std' || (segments[1] !== 'pair' && segments[1] !== 'tuple')) return null;
+  return cppTemplateArguments(followed.text)?.map((text) => ({ ...followed, text: cppWithoutNullability(text) })) ?? null;
 }
 
 /** Where the statement that `text` begins ends: its first `;` outside brackets, or -1. */
@@ -11268,6 +11874,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
+  CPP_TYPE_DECLS.delete(context);
+  CPP_INCLUDE_LINES.delete(context);
+  CPP_UNNAMED_NAMESPACES.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_CRATES.delete(context);
@@ -11297,7 +11906,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   clearCppRawStringMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
+  CPP_USING_MEMBERS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
+  CPP_OVERLOAD_PARAMETERS.delete(context);
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
   CPP_SCOPE_NAMES.delete(context);
@@ -12487,6 +13098,11 @@ export function matchMethodCall(
       const declared = nmTimedT('mc-cppdecl', ref, () =>
         matchCppDeclaredTypeCall(objectOrClass!, methodName!, cppDecl, ref, context));
       if (declared !== undefined) return declared;
+      // `->` on a value of a type from outside the project reaches what its
+      // `operator->` returns, which the type's last name doesn't name:
+      // protobuf's `absl::StatusOr<Any> m; m->value()` is no member of the
+      // project's own `hpb::StatusOr`. The name strategies decide.
+      if (inferredType && isCppArrowThroughOutsideType(objectOrClass!, cppDecl, ref, context)) inferredType = null;
     }
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
@@ -12598,8 +13214,9 @@ export function matchMethodCall(
       // followed.
       if (isUndeclaredTypeName(cppDecl.written!, ref, context)) return null;
     }
-    // A `->` call on a standard smart pointer or optional the calling
-    // function or its class declares is a call on the type it holds:
+    // A `->` call on a smart pointer, an optional or an `absl::StatusOr`
+    // (cppHeldType) the calling function or its class declares is a call on
+    // the type it holds:
     // rocksdb's `std::unique_ptr<Iterator> iter; iter->Valid()` reached
     // `ArenaWrappedDBIter::Valid` by the method's name.
     if (ref.language === 'cpp' && cppDecl.callers && !cppDecl.aliased && !cppDecl.shadowed && !cppDecl.pointer &&
@@ -15589,17 +16206,89 @@ function cppParenListAfter(file: string, line: number, column: number, name: str
   return null;
 }
 
+/** C++ text with each comment blanked to a space; string and character literals are kept. */
+function cppWithoutComments(text: string): string {
+  if (!text.includes('/')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c && text[j] !== '\n') j += text[j] === '\\' ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i);
+      i = end < 0 ? text.length : end - 1;
+      out += ' ';
+    } else if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end < 0 ? text.length : end + 1;
+      out += ' ';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
   const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
-  return list === null ? null : splitCppTopLevel(list);
+  return list === null ? null : splitCppTopLevel(cppWithoutComments(list));
+}
+
+/** Per context: a C++ method's id → the parameter list its defaults are read from (cppOverloadParameters). */
+const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The parameter list of the C++ overload `n`, its `( … )`, as it gives the
+ * parameters' defaults: for a method defined outside its class, the list
+ * the method's declaration in the class writes. protobuf defines `template
+ * <typename Desc> void Printer::Annotate(…, const Desc* descriptor,
+ * absl::optional<Semantic> semantic)` below the class, whose declaration
+ * gave `semantic` its `= absl::nullopt`. Its own list when the class
+ * declares the method with the same parameter types and no default, or
+ * not at all.
+ */
+function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
+  const own = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  if (own === null || n.kind !== 'method') return own;
+  let memo = CPP_OVERLOAD_PARAMETERS.get(context);
+  if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  let found = own;
+  const classes = cppClassDecls(cppParentScope(n.qualifiedName), context);
+  if (!classes.some((c) => c.filePath === n.filePath && rangeWithin(n, c))) {
+    const types = (list: string): string[] => splitCppTopLevel(cppWithoutComments(list))
+      .filter((p) => p !== 'void')
+      .map((p) => normalizeCppTypeName(cppParameterType(p)) ?? p);
+    const want = types(own);
+    const word = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*\\(`);
+    search: for (const cls of classes) {
+      const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+      for (let line = cls.startLine; line <= Math.min(lines.length, cls.endLine ?? cls.startLine); line++) {
+        if (!word.test(lines[line - 1]!)) continue;
+        const list = cppParenListAfter(cls.filePath, line, 0, name, context);
+        if (list === null || !list.includes('=')) continue;
+        const have = types(list);
+        if (have.length === want.length && have.every((t, i) => t === want[i])) {
+          found = list;
+          break search;
+        }
+      }
+    }
+  }
+  memo.set(n.id, found);
+  return found;
 }
 
 /** How well a call's arguments fit an overload's parameters: arity, and a string literal's first slot. */
 function cppOverloadFit(n: Node, name: string, args: string[], context: ResolutionContext): number {
   if (n.kind !== 'function' && n.kind !== 'method') return -1;
-  const list = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  const list = cppOverloadParameters(n, name, context);
   if (list === null) return 0;
-  const params = splitCppTopLevel(list).filter((p) => p !== 'void');
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
   // A pack is `T&&... args`, not the `...` inside `format_string<T...>`.
   const isPack = (p: string): boolean => {
     let flat = p;
@@ -15613,14 +16302,21 @@ function cppOverloadFit(n: Node, name: string, args: string[], context: Resoluti
   // Each string literal against its parameter: a string type by name over a
   // template parameter that might be one (`const S&`), and a narrow literal
   // never a wide parameter (`fmt::join(v, ", ")` is not xchar.h's `wstring_view`).
+  // A literal, raw ones too (protobuf's `p->Emit({…}, R"cc(…)cc")`), is a
+  // `const char*`: no pointer to anything else (rocksdb's `std::string*
+  // value`), number or character takes it, which counts for more than a
+  // class of another name, one that may convert from it (`const Slice& key`)
+  // or may not (fmt's `text_style`).
   for (let i = 0; i < args.length && i < params.length; i++) {
     const arg = args[i]!;
     const param = params[i]!;
     if (isPack(param)) break;
-    if (!/^(?:u8|u|U|L)?"|^FMT_STRING\s*\(/.test(arg)) continue;
-    const wideArg = /^L"/.test(arg);
+    if (!/^(?:u8|u|U|L)?R?"|^FMT_STRING\s*\(/.test(arg)) continue;
+    const wideArg = /^LR?"/.test(arg);
     const wideParam = /\bw(?:string|char_t|format|string_view)|wchar_t/.test(param);
+    const category = cppTypeCategory(cppParameterType(param));
     if (wideArg !== wideParam && /string|char|Char|format/.test(param)) score -= 2;
+    else if (category === 'pointer' || category === 'number' || category === 'bool' || category === 'char') score -= 3;
     else score += /string|char|Char|\bstr\b/.test(param) ? 3 : /^(?:const\s+)?[A-Z]\w{0,2}\s*[&*]{0,2}\s*\w*$/.test(param) ? 1 : -2;
   }
   return score;
