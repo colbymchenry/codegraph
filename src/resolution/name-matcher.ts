@@ -9402,8 +9402,11 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   if (!caller) return null;
   // What the calling function writes is looked up from inside it.
   const callers = { scope: caller.qualifiedName, file: at.filePath, line: at.line, parameters: cppTemplateParameters(caller, context) };
-  const owner = cppMemberOwner(caller, context);
-  if (text === 'this') return owner ? { ...callers, text: `${owner}*` } : null;
+  if (text === 'this') {
+    // (A gtest `TEST_F` body's object is of a class derived from its fixture.)
+    const owner = cppMemberOwner(caller, context) ?? cppTestFixture(caller, at, context);
+    return owner ? { ...callers, text: `${owner}*` } : null;
+  }
   const name = /^(?:this\s*->\s*)?([A-Za-z_]\w*)$/.exec(text);
   if (name) {
     const decl: CppReceiverDeclaration = {};
@@ -9445,10 +9448,14 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   }
   if (!/^(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*(?:\s*<[\s\S]*>)?$/.test(callee)) return null;
   const spelled = stripCppTemplateArguments(callee).replace(/\s+/g, '');
-  // `NewIterator(…)` in a method: its class's own or inherited method first.
-  const ownClass = owner && !spelled.includes('::') ? cppClassDecls(owner, context)[0] : undefined;
-  const own = ownClass ? cppMethodsOf(ownClass, spelled, at, context) : [];
-  if (own.length > 0) return cppReturnTypeOf(own, context);
+  // `NewIterator(…)` in a method, or in a gtest body: what the method of its
+  // class, or of a class it derives from, returns (cppImplicitThisMethod),
+  // before anything outside. It is looked up as on `this`: in a template, a
+  // bare call into a base that depends on its parameters compiles only
+  // through a using-declaration, like protobuf's `using
+  // RepeatedFieldWrapper<T>::MutableRepeatedField;`.
+  const own = spelled.includes('::') ? undefined : cppImplicitThisMethod(spelled, 'this', caller, at, context);
+  if (own) return cppReturnTypeOf([own], context);
   // `f(…)`, `ns::f(…)`, `Class::f(…)`: looked up from the caller outwards.
   for (const scope of cppScopesWithin(cppParentScope(caller.qualifiedName))) {
     const fns = context.getNodesByQualifiedName(scope ? `${scope}::${spelled}` : spelled).filter(isCppFunctionNode);
@@ -9918,6 +9925,23 @@ function matchCppDeclaredTypeCall(
 }
 
 /**
+ * Is a C++ `->` call on `receiver` made on a value — not a pointer — of a
+ * type from outside the project that nothing the file sees declares
+ * (isCppOutsideQualifiedType)? Its `operator->` hands the call to a type the
+ * declared one only wraps (`absl::StatusOr<Any>`'s `Any`), so the declared
+ * type's last name names no class the method is in. (A standard smart
+ * pointer or optional is matchCppHeldTypeCall's.)
+ */
+function isCppArrowThroughOutsideType(receiver: string, decl: CppReceiverDeclaration, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!decl.callers || decl.shadowed || !decl.raw || decl.pointer || decl.aliased) return false;
+  if (cppMemberOperator(receiver, ref, context) !== '->' || isCppLibraryType(decl.raw, context)) return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return false;
+  const site = decl.declared ?? cppCallSite(caller, ref, context);
+  return cppClassWritten(decl.raw, site, ref, context) === undefined && isCppOutsideQualifiedType(decl.raw, site, context);
+}
+
+/**
  * Is the C++ type `raw`, which nothing the file sees declares, written under
  * a namespace the project declares no type in — `absl::Status`,
  * `grpc::ServerContext` — so that it is from outside the project? Not when
@@ -10048,16 +10072,33 @@ function matchCppImplicitThisCall(ref: UnresolvedRef, context: ResolutionContext
   const receiver = cppImplicitReceiver(ref, context);
   if (receiver === null) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
-  const owner = caller ? cppMemberOwner(caller, context) : null;
-  if (!caller || owner === null) return undefined;
+  if (!caller) return undefined;
+  const found = cppImplicitThisMethod(name, receiver, caller, ref, context);
+  // (A recursive call names the function itself, which no local shadows.)
+  if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
+  return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'instance-method' };
+}
+
+/**
+ * The method a C++ call of `name` written with no receiver, or on `this`,
+ * reaches from `caller` by C++ lookup (matchCppImplicitThisCall): of the
+ * caller's class, a class it derives from, or one it is nested in. A gtest
+ * `TEST_F(Fixture, …)` or `TEST_P` body is a method of a class gtest derives
+ * from `Fixture`, so the fixture's methods are its own: rocksdb's tests call
+ * `DBTestBase`'s `Put(…)` and `NewIterator(…)` bare. Undefined when the
+ * caller is no member function, or no class on the way has a method of that
+ * name in the index. (Whether a local of the caller's shadows it is the
+ * caller's to ask.)
+ */
+function cppImplicitThisMethod(name: string, receiver: 'bare' | 'this', caller: Node, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const owner = cppMemberOwner(caller, context) ?? cppTestFixture(caller, ref, context);
+  if (owner === null) return undefined;
   let found: Node | null | undefined = null;
   for (const scope of cppEnclosingClasses(owner, caller, context)) {
     found = cppScopeMethod(scope, name, receiver, ref, context);
     if (found !== null || receiver === 'this') break;
   }
-  // (A recursive call names the function itself, which no local shadows.)
-  if (!found || (receiver === 'bare' && name !== caller.name && isCppLocalName(name, caller, ref, context))) return undefined;
-  return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return found ?? undefined;
 }
 
 /** `this->` / `(*this).` before a member's name, with a `template` keyword after it. */
@@ -12360,6 +12401,11 @@ export function matchMethodCall(
       const declared = nmTimedT('mc-cppdecl', ref, () =>
         matchCppDeclaredTypeCall(objectOrClass!, methodName!, cppDecl, ref, context));
       if (declared !== undefined) return declared;
+      // `->` on a value of a type from outside the project reaches what its
+      // `operator->` returns, which the type's last name doesn't name:
+      // protobuf's `absl::StatusOr<Any> m; m->value()` is no member of the
+      // project's own `hpb::StatusOr`. The name strategies decide.
+      if (inferredType && isCppArrowThroughOutsideType(objectOrClass!, cppDecl, ref, context)) inferredType = null;
     }
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
