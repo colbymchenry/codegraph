@@ -9285,7 +9285,8 @@ function cppInheritedDataMember(decls: readonly Node[], name: string, context: R
   if (depth >= 4 || !context.getSupertypeNodes) return null;
   for (const decl of decls) {
     for (const base of context.getSupertypeNodes(decl.id)) {
-      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName) || isCppDependentBase(decl, base, context)) continue;
+      if (!CPP_CLASS_KINDS.has(base.kind) || seen.has(base.qualifiedName)) continue;
+      if (isCppDependentBase(decl, base, context) && !cppUsingDeclares(decl, base, name, context)) continue;
       seen.add(base.qualifiedName);
       const inherited = cppInheritedDataMember([base], name, context, depth + 1, seen);
       if (inherited) return inherited;
@@ -9313,7 +9314,7 @@ function cppTestFixture(caller: Node, ref: UnresolvedRef, context: ResolutionCon
 
 /**
  * The type `*x` has when `x` has the type `type`: what a pointer points at,
- * or what a standard smart pointer or optional holds. Null for any other type.
+ * or what a smart pointer, an optional or an `absl::StatusOr` holds (cppHeldType). Null for any other type.
  */
 function cppPointee(type: CppWrittenType): CppWrittenType | null {
   const text = type.text.replace(/&+\s*$/, '').trim();
@@ -9324,7 +9325,7 @@ function cppPointee(type: CppWrittenType): CppWrittenType | null {
     else if (ch === '<') depth--;
     else if (ch === '*' && depth === 0) return { ...type, text: text.slice(0, i).trim() };
   }
-  const held = cppStdHeldType(text);
+  const held = cppHeldType(text);
   return held ? { ...type, text: held } : null;
 }
 
@@ -9437,8 +9438,8 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   // `std::make_unique<Foo>(…)`: the smart pointer it makes.
   const made = /^(?:::\s*)?(?:std|absl)\s*::\s*make_(unique|shared)\s*<([\s\S]+)>$/.exec(callee);
   if (made) return { ...callers, text: `std::${made[1]}_ptr<${made[2]!.trim()}>` };
-  // `std::unique_ptr<Iterator>(…)`: the smart pointer or optional it makes.
-  if (cppStdHeldType(callee)) return { ...callers, text: callee };
+  // `std::unique_ptr<Iterator>(…)`: the holder it makes (cppHeldType).
+  if (cppHeldType(callee)) return { ...callers, text: callee };
   // `recv.method(…)`, `recv->method(…)`: the method of the receiver's class.
   const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(callee);
   if (member) {
@@ -9548,7 +9549,7 @@ function cppAutoLocalType(
 function isCppTemplateDependentType(type: CppWrittenType, context: ResolutionContext): boolean {
   if (type.parameters.size === 0) return false;
   if (isCppTemplateParameterType(type)) return true;
-  const held = cppStdHeldType(type.text);
+  const held = cppHeldType(type.text);
   if (held) return isCppTemplateDependentType({ ...type, text: held }, context);
   // (A trait of one, `std::conditional_t<kIsMutable, …>`, too: it names another type.)
   return (isCppLibraryType(type.text, context) || cppTypeSegments(type.text)?.[0] === 'std') &&
@@ -9799,19 +9800,31 @@ function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   return !declared.some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
 }
 
-/** Standard-library types whose `->` reaches the value they hold. */
-const CPP_STD_HOLDERS: ReadonlySet<string> = new Set(['unique_ptr', 'shared_ptr', 'optional']);
+/** Library types whose `->` reaches the value they hold. */
+const CPP_HOLDERS: ReadonlySet<string> = new Set(['std::unique_ptr', 'std::shared_ptr', 'std::optional', 'absl::optional', 'absl::StatusOr', 'absl::NoDestructor']);
 
-/** The type a standard smart pointer or optional written as `raw` holds (`Iterator` for `std::unique_ptr<Iterator>`), or null. */
-function cppStdHeldType(raw: string): string | null {
+/**
+ * The type a standard smart pointer, an optional, an `absl::StatusOr` or an
+ * `absl::NoDestructor` written as `raw` holds (`Iterator` for
+ * `std::unique_ptr<Iterator>`), or null.
+ */
+function cppHeldType(raw: string): string | null {
   const holder = cppTypeSegments(raw);
-  if (holder?.length !== 2 || holder[0] !== 'std' || !CPP_STD_HOLDERS.has(holder[1]!)) return null;
+  if (holder?.length !== 2 || !CPP_HOLDERS.has(holder.join('::'))) return null;
   return cppTemplateArguments(raw)?.[0] ?? null;
 }
 
+/** Whether the holder `raw` names (cppHeldType) is the library's: no type of the project's has its name. */
+function isCppLibraryHolder(raw: string, context: ResolutionContext): boolean {
+  const spelled = cppTypeSegments(raw)!.join('::');
+  return !cppTypesNamed(cppLastSegment(spelled), context).some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
+}
+
 /**
- * A `->` call on a C++ receiver declared as a standard smart pointer or
- * optional (`std::unique_ptr<Iterator> iter; iter->Valid()`) calls a member of
+ * A `->` call on a C++ receiver declared as a standard smart pointer, an
+ * optional or an `absl::StatusOr` (`std::unique_ptr<Iterator> iter;
+ * iter->Valid()`, protobuf's `absl::StatusOr<FeatureResolver> resolver;
+ * resolver->MergeFeatures(…)`) calls a member of
  * the type it holds. That type is looked up as C++ looks it up where the call
  * is written (cpp-supertypes.ts): the scopes around the call, the file's
  * `using`s, and aliases followed. Looking it up by its last name instead
@@ -9829,8 +9842,8 @@ function cppStdHeldType(raw: string): string | null {
  *    doesn't name): the call goes on as before.
  */
 function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const held = cppStdHeldType(raw);
-  if (!held || !isCppLibraryType(raw, context)) return undefined;
+  const held = cppHeldType(raw);
+  if (!held || !isCppLibraryHolder(raw, context)) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
   if (!caller || isCppPointerType(held)) return undefined;
   if (isCppLibraryType(held, context)) return null;
@@ -9929,8 +9942,9 @@ function matchCppDeclaredTypeCall(
  * type from outside the project that nothing the file sees declares
  * (isCppOutsideQualifiedType)? Its `operator->` hands the call to a type the
  * declared one only wraps (`absl::StatusOr<Any>`'s `Any`), so the declared
- * type's last name names no class the method is in. (A standard smart
- * pointer or optional is matchCppHeldTypeCall's.)
+ * type's last name names no class the method is in. (A smart pointer, an
+ * optional or an `absl::StatusOr` holding one of the project's classes is
+ * matchCppHeldTypeCall's.)
  */
 function isCppArrowThroughOutsideType(receiver: string, decl: CppReceiverDeclaration, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (!decl.callers || decl.shadowed || !decl.raw || decl.pointer || decl.aliased) return false;
@@ -10275,7 +10289,7 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
   for (const decl of scope.decls) {
     for (const base of context.getSupertypeNodes(decl.id)) {
       if (!CPP_CLASS_KINDS.has(base.kind)) continue;
-      if (receiver === 'bare' && isCppDependentBase(decl, base, context)) continue;
+      if (receiver === 'bare' && isCppDependentBase(decl, base, context) && !cppUsingDeclares(decl, base, name, context)) continue;
       const inherited = cppMethodOf(base, name, ref, context, 1, new Set([scope.qualifiedName]));
       if (!inherited) continue;
       // Its class's other overloads, which the arguments may fit better
@@ -10363,10 +10377,37 @@ function cppBaseSpecifiers(decl: Node, context: ResolutionContext): string[] {
   return specs;
 }
 
+/** Per context: a C++ class declaration's id → the `using Base::name;` declarations its body writes, as [base, name]. */
+const CPP_USING_MEMBERS = new WeakMap<ResolutionContext, Map<string, Array<[string, string]>>>();
+
+/**
+ * Whether the C++ class declaration `decl` brings `name` in from its base
+ * `base` with a using-declaration: rocksdb's `FullTypedCacheHelperFns`
+ * writes `using BasicTypedCacheHelperFns<TValue>::DownCastValue;`, and a bare
+ * `DownCastValue(v)` in it then finds the base's, though the base depends on
+ * the class's template parameters (isCppDependentBase).
+ */
+function cppUsingDeclares(decl: Node, base: Node, name: string, context: ResolutionContext): boolean {
+  let memo = CPP_USING_MEMBERS.get(context);
+  if (!memo) CPP_USING_MEMBERS.set(context, (memo = new Map()));
+  let usings = memo.get(decl.id);
+  if (!usings) {
+    usings = [];
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine).map((l) => cppCodeOf(l) ?? '').join('\n');
+    for (const m of body.matchAll(/\busing\s+(?!namespace\b)((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}]*>)?)\s*::\s*([A-Za-z_]\w*)\s*;/g)) {
+      usings.push([cppLastSegment(stripCppTemplateArguments(m[1]!).trim()), m[2]!]);
+    }
+    memo.set(decl.id, usings);
+  }
+  return usings.some(([of, member]) => of === base.name && member === name);
+}
+
 /**
  * Whether `base`, a base of the C++ class declaration `decl`, depends on the
  * template parameters of `decl` or a class around it: `template <class T>
- * class Foo : public Base<T>`. A bare name is not looked up in such a base.
+ * class Foo : public Base<T>`. A bare name is not looked up in such a base,
+ * unless the class brings it in with a using-declaration (cppUsingDeclares).
  */
 function isCppDependentBase(decl: Node, base: Node, context: ResolutionContext): boolean {
   const parameters = cppTemplateParameters(decl, context);
@@ -11211,6 +11252,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   clearCppRawStringMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_BASE_SPECS.delete(context);
+  CPP_USING_MEMBERS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
@@ -12517,8 +12559,9 @@ export function matchMethodCall(
       // followed.
       if (isUndeclaredTypeName(cppDecl.written!, ref, context)) return null;
     }
-    // A `->` call on a standard smart pointer or optional the calling
-    // function or its class declares is a call on the type it holds:
+    // A `->` call on a smart pointer, an optional or an `absl::StatusOr`
+    // (cppHeldType) the calling function or its class declares is a call on
+    // the type it holds:
     // rocksdb's `std::unique_ptr<Iterator> iter; iter->Valid()` reached
     // `ArenaWrappedDBIter::Valid` by the method's name.
     if (ref.language === 'cpp' && cppDecl.callers && !cppDecl.aliased && !cppDecl.shadowed && !cppDecl.pointer &&
