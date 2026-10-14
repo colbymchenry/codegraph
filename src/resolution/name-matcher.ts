@@ -8144,6 +8144,22 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
+ * Is `n` the method `name` of the class `cls` a receiver is taken to name
+ * (the class-name and capitalized-receiver strategies of matchMethodCall)?
+ * In C and C++, only one of exactly that class: protobuf's `arena.get()`
+ * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
+ * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
+ * other languages, any method of the name whose qualified name has the
+ * class's name in it, as before.
+ */
+function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
+  if (n.kind !== 'method' || n.name !== name) return false;
+  return cls.language === 'c' || cls.language === 'cpp'
+    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
+    : n.qualifiedName.includes(cls.name);
+}
+
+/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -10132,13 +10148,21 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
 
-/** Where a type the calling function writes is looked up from: the function itself, so a class local to it is found first. */
+/**
+ * Where a type the calling function writes is looked up from: the function
+ * itself, so a class local to it is found first, then — in a gtest `TEST_F`
+ * or `TEST_P` body — the test's fixture (cppTestFixture) and its bases, as
+ * for the member function of a class derived from it that the body is:
+ * rocksdb's `new TestUserDefinedIndexFactory()` is the fixture base's own.
+ */
 function cppCallSite(caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppNameSite {
+  const fixture = cppTestFixture(caller, ref, context);
   return {
     scope: caller.kind === 'file' ? '' : caller.qualifiedName,
     file: ref.filePath,
     line: ref.line,
     parameters: cppTemplateParameters(caller, context),
+    ...(fixture ? { classScope: fixture } : {}),
   };
 }
 
@@ -10302,10 +10326,12 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
  * call's arguments fit (cppOverloadFor) — else the nearest one of a class
  * it derives from, through the base edges every declaration of `cls` has.
  * When other classes share `cls`'s qualified name, its own are the ones
- * defined where it is: leveldb's db_bench.cc and db_bench_sqlite3.cc each
- * declare a `RandomGenerator`, with a `Generate` that takes a `size_t` and
- * an `int`. (A chained call `inner(…).name(…)` keeps the first: the
- * arguments at its position are the inner call's.)
+ * defined in its body, else where it is: the local classes of gtest bodies
+ * in one namespace are each `ns::TEST_F::Listener`, and leveldb's
+ * db_bench.cc and db_bench_sqlite3.cc each declare a `RandomGenerator`, with
+ * a `Generate` that takes a `size_t` and an `int`. (A chained call
+ * `inner(…).name(…)` keeps the first: the arguments at its position are the
+ * inner call's.)
  */
 function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
@@ -10315,7 +10341,11 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   if (own.length > 0) {
     const ordered = preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath);
     if (ref.referenceName.includes('().')) return ordered[0]!;
-    const defined = cppClassDecls(cls.qualifiedName, context).length > 1
+    const namesakes = cppClassDecls(cls.qualifiedName, context).length > 1;
+    const inBody = namesakes
+      ? ordered.filter((n) => n.filePath === cls.filePath && n.startLine >= cls.startLine && n.endLine <= cls.endLine)
+      : [];
+    const defined = inBody.length > 0 ? inBody : namesakes
       ? ordered.filter((n) => n.filePath === cls.filePath || cppIncluders(cls.filePath, context).has(n.filePath))
       : ordered;
     return cppOverloadFor(defined.length > 0 ? defined : ordered, name, ref, context);
@@ -11383,7 +11413,7 @@ function matchCppConstruction(ref: UnresolvedRef, context: ResolutionContext): R
     : { original: ref, targetNodeId: node.id, confidence: 0.7, resolvedBy: 'exact-match' };
   if (cppDeclaresLocalAlias(written, ref, context)) {
     const aliased = resolveCppAliasedType(written, ref, context);
-    const named = aliased && !aliased.pointer ? cppAliasedClass(aliased, context) : undefined;
+    const named = aliased && !aliased.pointer ? cppAliasedClass(aliased, context, ref) : undefined;
     const cls = named ? context.getNodesByQualifiedName(named).find((n) => CPP_CLASS_KINDS.has(n.kind)) : undefined;
     return cls ? made(cls) : null;
   }
@@ -13342,13 +13372,18 @@ export function matchMethodCall(
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
+      // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
+      // own, else one a base declares (cppMethodOf), never one of a class
+      // nested in it, like `Outer::Inner::Count` beside an inherited `Base::Count`.
+      if (classNode.language === 'cpp') {
+        const method = cppMethodOf(classNode, methodName!, ref, context);
+        if (!method) continue;
+        const own = method.qualifiedName === `${classNode.qualifiedName}::${methodName}`;
+        return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
+      }
+
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          n.qualifiedName.includes(classNode.name)
-      );
+      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
       if (methodNode) {
         return {
@@ -13429,12 +13464,7 @@ export function matchMethodCall(
         if (classNode.language !== ref.language) continue;
 
         const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
-        );
+        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
         if (methodNode) {
           return {
