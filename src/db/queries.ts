@@ -18,15 +18,15 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail } from './reference-tail';
 
 /**
- * Files that should not be candidates for "dominant file" detection: test/spec
- * files and tool-generated files. Generated files (`*.pb.go`, `*.pulsar.go`,
+ * Files that should not be candidates for "dominant file" detection: tests,
+ * examples and tool-generated files. Generated files (`*.pb.go`, `*.pulsar.go`,
  * mock outputs, …) often have huge in-file edge counts that dwarf the real
  * source — etcd's `rpc.pb.go` has 4× the in-file edges of `server.go`.
  *
@@ -37,21 +37,10 @@ import { isModuleKey, referenceNameTail } from './reference-tail';
  */
 function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): boolean {
   if (generated?.has(filePath)) return true;
-  const lp = filePath.toLowerCase();
-  return (
-    /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
-    /_test\.go$/.test(lp) ||
-    /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
-    /_test\.py$/.test(lp) ||
-    /_spec\.rb$/.test(lp) ||
-    /_test\.rb$/.test(lp) ||
-    /\.(test|spec)\.[jt]sx?$/.test(lp) ||
-    /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
-    /(tests?|spec)\.cs$/.test(lp) ||
-    /tests?\.swift$/.test(lp) ||
-    /_test\.dart$/.test(lp) ||
-    isGeneratedFile(filePath)
-  );
+  // Tests, examples, fixtures and benchmarks by the engine's own reading —
+  // LLVM's `unittests/`, Google's `foo_unittest.cc`, a C++ `FooTest.cpp` —
+  // plus the singular `__test__/` some projects use.
+  return isTestFile(filePath) || /(?:^|\/)__test__\//i.test(filePath) || isGeneratedFile(filePath);
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
