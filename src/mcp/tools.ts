@@ -4659,25 +4659,18 @@ export class ToolHandler {
     // Test/spec/icon/i18n file detector — used by the pre-floor hard filter, the
     // rank penalty, and the comparator deprioritization.
     //
-    // The directory pattern is anchored at `^` as well as `/`: a repo-ROOT
-    // `test/` or `spec/` directory (express, cobra, and most of npm/Go) produced
-    // paths like `test/express.raw.js`, which the old leading-`/` form could
-    // never match — so express's routing question spent 59% of its envelope on
-    // three test files while `lib/router/index.js` never rendered.
+    // Tests are the engine's own reading (`isTestFile`), the one the gather
+    // above already dampened them by: every ecosystem's test names and folders —
+    // a repo-ROOT `test/` (express's routing question once spent 59% of its
+    // envelope on three test files), LLVM's `unittests/`, Google's
+    // `foo_unittest.cc`, a C++ `FooTest.cpp`, `testing/`, `e2e/` — and the
+    // examples, samples, fixtures and benchmarks around a project. A list of
+    // its own here missed every one of those it hadn't been taught.
     const isLowValue = (p: string) => {
       const lp = p.toLowerCase();
       return (
-        /(?:^|\/)(tests?|__tests?__|specs?)\//.test(lp) ||
-        /_test\.go$/.test(lp) ||
-        /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
-        /_test\.py$/.test(lp) ||
-        /_spec\.rb$/.test(lp) ||
-        /_test\.rb$/.test(lp) ||
-        /\.(test|spec)\.[jt]sx?$/.test(lp) ||
-        /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
-        /(tests?|spec)\.cs$/.test(lp) ||
-        /tests?\.swift$/.test(lp) ||
-        /_test\.dart$/.test(lp) ||
+        isTestFile(p) ||
+        /(?:^|\/)__test__\//.test(lp) ||
         /\bicons?\b/.test(lp) ||
         /\bi18n\b/.test(lp)
       );

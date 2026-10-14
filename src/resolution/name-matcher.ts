@@ -16,7 +16,7 @@ import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNamespaceAliases } from './cpp-namespaces';
-import { clearCppRawStringMemos, cppLiteralsBlanked, cppRawStringLines } from './cpp-raw-strings';
+import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
@@ -8144,6 +8144,22 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
+ * Is `n` the method `name` of the class `cls` a receiver is taken to name
+ * (the class-name and capitalized-receiver strategies of matchMethodCall)?
+ * In C and C++, only one of exactly that class: protobuf's `arena.get()`
+ * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
+ * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
+ * other languages, any method of the name whose qualified name has the
+ * class's name in it, as before.
+ */
+function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
+  if (n.kind !== 'method' || n.name !== name) return false;
+  return cls.language === 'c' || cls.language === 'cpp'
+    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
+    : n.qualifiedName.includes(cls.name);
+}
+
+/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -9064,6 +9080,63 @@ function cppTypeBeganAbove(typeName: string): boolean {
 }
 
 /**
+ * Does `line` end a declaration of the receiver begun on an earlier line, a
+ * templated type whose `>`s outnumber its `<`s before the name: rocksdb's
+ * `std::unique_ptr<BlobContents>>>& blob_reqs` under `autovector<std::pair<
+ * BlobReadRequest*,`? The declarator reads no type there, since its template
+ * arguments pair their brackets. (`this->blob_reqs` and `in >> blob_reqs`
+ * declare nothing.)
+ */
+function cppEndsDeclarationBegunAbove(line: string, escapedReceiver: string): boolean {
+  const end = new RegExp(String.raw`(?:^|[^\w:])([A-Za-z_][\w:]*\s*<[^;=(){}]+>)(?:\s*(?:const\b|volatile\b|[*&]+))*\s*${escapedReceiver}\b`).exec(line);
+  return end !== null && cppTypeBeganAbove(end[1]!);
+}
+
+/**
+ * The type a declaration of the receiver on the code `line` (lines[index])
+ * declares when its type is written on lines above, read with them:
+ * - the end of a type begun above, its text before the name closing a `<`
+ *   an earlier line opened — protobuf's `const
+ *   google::protobuf::internal::ExtensionIdentifier<` above `FeatureSet,
+ *   TypeTraitsT, field_type, is_packed>& extension) const {`. Lines are
+ *   joined, up to six, until the brackets pair;
+ * - a type alone on the line above, the name starting this one — rocksdb's
+ *   `std::unordered_map<std::string, std::shared_ptr<const TableProperties>>`
+ *   above `props;`, as cppDataMemberIn reads a member.
+ * Null when the line needs no line above, or the lines read together declare
+ * no type there.
+ */
+function cppDeclarationBegunAbove(
+  lines: readonly string[],
+  index: number,
+  line: string,
+  receiverPattern: RegExp,
+  declaratorRegex: RegExp,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
+): string | null {
+  const at = line.search(receiverPattern);
+  if (at < 0 || index === 0) return null;
+  const codeAt = (j: number): string => cppCodeOf(cppLiteralsBlanked(lines[j]!, j + 1, rawLines)) ?? '';
+  const head = line.slice(0, at);
+  if (/^\s*[*&]*\s*$/.test(head)) {
+    const above = codeAt(index - 1);
+    return CPP_TYPE_LINE.test(above) ? matchCppDeclarator(`${above} ${line}`, declaratorRegex)?.[1] ?? null : null;
+  }
+  // (Only such a line can need the lines above: every other line naming the
+  // receiver is spared joining them.)
+  if (!cppTypeBeganAbove(head)) return null;
+  let text = line;
+  let before = head;
+  for (let j = index - 1; j >= Math.max(0, index - 6); j--) {
+    const above = codeAt(j);
+    text = `${above} ${text}`;
+    before = `${above} ${before}`;
+    if (!cppTypeBeganAbove(before)) return matchCppDeclarator(text, declaratorRegex)?.[1] ?? null;
+  }
+  return null;
+}
+
+/**
  * The last name of a declared C++ type: `const std::vector<std::pair<int,
  * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
  * names no type.
@@ -9106,8 +9179,16 @@ const CPP_DECLARATOR_ANNOTATION = String.raw`\b(?:absl_nonnull|absl_nullable|abs
  * rocksdb's `std::function<Iterator*()> create_iterator`.
  */
 const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function|move_only_function|copyable_function)|absl\s*::\s*(?:FunctionRef|AnyInvocable))\s*<[^;={}]*>`;
+/**
+ * A template argument list, nested up to three deep: `<std::string,
+ * std::vector<std::pair<int, int>>>`. Its `<`s and `>`s pair up, so on a line
+ * declaring `const std::vector<A*>& a, const std::vector<B>& b` the list
+ * read for `b` is `<B>`: matching any run up to a `>` read `a`'s parameter
+ * into `b`'s type.
+ */
+const CPP_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>`;
 /** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
-const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS})?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
 /** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
 const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
 /** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
@@ -9316,6 +9397,61 @@ function cppWrittenReturnType(fn: Node, context: ResolutionContext): string | nu
   return written;
 }
 
+/**
+ * The names of the template parameters a C++ function template's own
+ * `template <…>` header declares, in order, without their defaults:
+ * `['Type']` for protobuf's `template <typename Type> const Type& GetRaw(…)`.
+ * A template's node starts at its declaration, so the header is the code
+ * right before it. Empty for a function that is no template.
+ */
+function cppOwnTemplateParameters(fn: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/);
+  if (!lines) return [];
+  const at = lines[fn.startLine - 1] ?? '';
+  const before = [...lines.slice(Math.max(0, fn.startLine - 4), fn.startLine - 1), at.slice(0, fn.startColumn)]
+    .map((line) => cppCodeOf(line) ?? '').join(' ').trimEnd();
+  let depth = 0;
+  for (let i = before.endsWith('>') ? before.length - 1 : -1; i >= 0; i--) {
+    if (before[i] === '>') depth++;
+    else if (before[i] === '<' && --depth === 0) {
+      if (!/\btemplate\s*$/.test(before.slice(0, i))) return [];
+      return splitCppTopLevel(before.slice(i + 1, -1)).map((p) => /([A-Za-z_]\w*)$/.exec(p.split('=')[0]!.trim())?.[1] ?? '');
+    }
+  }
+  return [];
+}
+
+/**
+ * What a call of the C++ member template whose overloads are `methods`, with
+ * the explicit template arguments `args` (`<…>` as written), returns when
+ * every overload is declared to return the same one of its own template
+ * parameters, perhaps const, a pointer or a reference: that argument, so
+ * qualified, as written at the call (`site`). protobuf's `template <typename
+ * Type> const Type& GetRaw(…)` called as `reflection->GetRaw<RepeatedPtrField<
+ * std::string>>(…)` returns a `const RepeatedPtrField<std::string>&`, and
+ * rocksdb's `T* GetOptions()` called as `GetOptions<BlockBasedTableOptions>()`
+ * a `BlockBasedTableOptions*`. Undefined otherwise: then the return type is
+ * read as written.
+ */
+function cppMemberTemplateReturn(
+  methods: readonly Node[],
+  args: string,
+  site: Omit<CppWrittenType, 'text'>,
+  context: ResolutionContext,
+): CppWrittenType | undefined {
+  let slot: { index: number; written: string; param: string } | undefined;
+  for (const fn of methods) {
+    const written = cppWrittenReturnType(fn, context);
+    if (!written) continue;
+    const param = written.replace(/\b(?:const|volatile)\b|[*&]/g, ' ').trim();
+    const index = param ? cppOwnTemplateParameters(fn, context).indexOf(param) : -1;
+    if (index < 0 || (slot && slot.index !== index)) return undefined;
+    slot ??= { index, written, param };
+  }
+  const arg = slot && splitCppTopLevel(args.slice(1, -1))[slot.index];
+  return slot && arg ? { ...site, text: slot.written.replace(new RegExp(`\\b${slot.param}\\b`), arg) } : undefined;
+}
+
 /** What one of `fns` (overloads, a declaration and its definition) returns, as written where it is declared. */
 function cppReturnTypeOf(fns: readonly Node[], context: ResolutionContext): CppWrittenType | null {
   for (const fn of fns) {
@@ -9417,7 +9553,7 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     const declarator = buildDeclaratorRegex(escaped);
     const end = Math.min(decl.endLine ?? decl.startLine, lines.length);
     const nested = cppNestedSpans(decl, end, context);
-    const rawLines = cppRawStringLines(decl.filePath, context);
+    const rawLines = cppNonCodeLines(decl.filePath, context);
     const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
       if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
@@ -9439,7 +9575,6 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
       }
       if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
       let depth = depths[from - decl.startLine]!;
-      if (depth < 0) continue;
       for (const c of code!.slice(from === decl.startLine ? decl.startColumn : 0, m.index)) {
         if (c === '(') depth++;
         else if (c === ')') depth--;
@@ -9457,16 +9592,15 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
 
 /**
  * How many parentheses are open where each line of the C++ class
- * declaration `decl`, which ends on line `end`, begins, or -1 for one that
- * begins inside a block comment. Comments are followed across lines, not
- * guessed as cppCodeOf does: it takes a code line that starts with a
- * dereference, `*first_key, scratch);`, for one.
+ * declaration `decl`, which ends on line `end`, begins. Its block comments
+ * and literals are blanked first (cppNonCodeLines): a parenthesis in one
+ * opens nothing.
  */
 function cppClassParenDepths(
   decl: Node,
   lines: readonly string[],
   end: number,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
   context: ResolutionContext,
 ): number[] {
   let memo = CPP_CLASS_PAREN_DEPTHS.get(context);
@@ -9475,27 +9609,14 @@ function cppClassParenDepths(
   if (!depths) {
     depths = [];
     let depth = 0;
-    let comment = false;
     for (let l = decl.startLine; l <= end; l++) {
-      depths.push(comment ? -1 : depth);
+      depths.push(depth);
       const text = cppLiteralsBlanked(lines[l - 1] ?? '', l, rawLines);
       for (let i = l === decl.startLine ? decl.startColumn : 0; i < text.length; i++) {
         const c = text[i]!;
-        if (comment) {
-          if (c === '*' && text[i + 1] === '/') {
-            comment = false;
-            i++;
-          }
-        } else if (c === '/' && text[i + 1] === '/') {
-          break;
-        } else if (c === '/' && text[i + 1] === '*') {
-          comment = true;
-          i++;
-        } else if (c === '(') {
-          depth++;
-        } else if (c === ')' && depth > 0) {
-          depth--;
-        }
+        if (c === '/' && text[i + 1] === '/') break;
+        else if (c === '(') depth++;
+        else if (c === ')' && depth > 0) depth--;
       }
     }
     memo.set(decl.id, depths);
@@ -9719,12 +9840,17 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     const returned = wrapper && cppWrapperReturnType(wrapper);
     if (returned) return returned;
   }
-  // `recv.method(…)`, `recv->method(…)`: the method of the receiver's class.
-  const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(callee);
+  // `recv.method(…)`, `recv->method(…)`, `recv->method<T>(…)`: the method of the receiver's class.
+  const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)\s*(<[\s\S]*>)?$/.exec(callee);
   if (member) {
     const object = cppMemberObject(member[1]!, member[2]!, at, context, depth);
     const cls = object && cppWrittenClass(object, at, context);
-    return cls ? cppReturnTypeOf(cppMethodsOf(cls, member[3]!, at, context), context) : null;
+    if (!cls) return null;
+    const methods = cppMethodsOf(cls, member[3]!, at, context);
+    if (!member[4]) return cppReturnTypeOf(methods, context);
+    // Explicit template arguments call a template, never an overload that is none.
+    const templates = methods.filter((fn) => cppOwnTemplateParameters(fn, context).length > 0);
+    return cppMemberTemplateReturn(templates, member[4], callers, context) ?? cppReturnTypeOf(templates, context);
   }
   if (!/^(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*(?:\s*<[\s\S]*>)?$/.test(callee)) return null;
   const spelled = stripCppTemplateArguments(callee).replace(/\s+/g, '');
@@ -10147,13 +10273,21 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
 
-/** Where a type the calling function writes is looked up from: the function itself, so a class local to it is found first. */
+/**
+ * Where a type the calling function writes is looked up from: the function
+ * itself, so a class local to it is found first, then — in a gtest `TEST_F`
+ * or `TEST_P` body — the test's fixture (cppTestFixture) and its bases, as
+ * for the member function of a class derived from it that the body is:
+ * rocksdb's `new TestUserDefinedIndexFactory()` is the fixture base's own.
+ */
 function cppCallSite(caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppNameSite {
+  const fixture = cppTestFixture(caller, ref, context);
   return {
     scope: caller.kind === 'file' ? '' : caller.qualifiedName,
     file: ref.filePath,
     line: ref.line,
     parameters: cppTemplateParameters(caller, context),
+    ...(fixture ? { classScope: fixture } : {}),
   };
 }
 
@@ -10317,10 +10451,12 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
  * call's arguments fit (cppOverloadFor) — else the nearest one of a class
  * it derives from, through the base edges every declaration of `cls` has.
  * When other classes share `cls`'s qualified name, its own are the ones
- * defined where it is: leveldb's db_bench.cc and db_bench_sqlite3.cc each
- * declare a `RandomGenerator`, with a `Generate` that takes a `size_t` and
- * an `int`. (A chained call `inner(…).name(…)` keeps the first: the
- * arguments at its position are the inner call's.)
+ * defined in its body, else where it is: the local classes of gtest bodies
+ * in one namespace are each `ns::TEST_F::Listener`, and leveldb's
+ * db_bench.cc and db_bench_sqlite3.cc each declare a `RandomGenerator`, with
+ * a `Generate` that takes a `size_t` and an `int`. (A chained call
+ * `inner(…).name(…)` keeps the first: the arguments at its position are the
+ * inner call's.)
  */
 function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
@@ -10330,7 +10466,11 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   if (own.length > 0) {
     const ordered = preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath);
     if (ref.referenceName.includes('().')) return ordered[0]!;
-    const defined = cppClassDecls(cls.qualifiedName, context).length > 1
+    const namesakes = cppClassDecls(cls.qualifiedName, context).length > 1;
+    const inBody = namesakes
+      ? ordered.filter((n) => n.filePath === cls.filePath && n.startLine >= cls.startLine && n.endLine <= cls.endLine)
+      : [];
+    const defined = inBody.length > 0 ? inBody : namesakes
       ? ordered.filter((n) => n.filePath === cls.filePath || cppIncluders(cls.filePath, context).has(n.filePath))
       : ordered;
     return cppOverloadFor(defined.length > 0 ? defined : ordered, name, ref, context);
@@ -10601,9 +10741,13 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
  * (cppOverloadFit), then, among overloads those fit alike, by the types the
  * arguments have where the call reads them (cppArgumentTypeFit). rocksdb's
  * `Insert(ch)` on a `char ch` is `Insert(char key, …)`, not `Insert(const
- * std::string& key, …)`.
+ * std::string& key, …)`. A deleted overload (`void reset(T*) = delete;`) is
+ * none a call that compiles reaches, so it is only taken when every one is.
  */
-function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
+function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
+  if (candidates.length === 1) return candidates[0]!;
+  const callable = candidates.filter((n) => !isCppDeletedFunction(n, name, context));
+  const overloads = callable.length > 0 ? callable : candidates;
   if (overloads.length === 1) return overloads[0]!;
   const args = cppCallArguments(ref, name, context);
   if (!args) return overloads[0]!;
@@ -10623,6 +10767,27 @@ function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, con
     }
   }
   return best;
+}
+
+const CPP_DELETED_FUNCTIONS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether the C++ function or method `n`, named `name`, is declared deleted:
+ * from its name to the declaration's `;` or body, it says `= delete`
+ * (protobuf's `void reset(T* PROTOBUF_NULLABLE) = delete;`).
+ */
+function isCppDeletedFunction(n: Node, name: string, context: ResolutionContext): boolean {
+  let memo = CPP_DELETED_FUNCTIONS.get(context);
+  if (!memo) CPP_DELETED_FUNCTIONS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(n.startLine - 1, Math.min(lines.length, n.startLine + 11)).join('\n');
+  const at = text.search(new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`));
+  const declaration = at < 0 ? '' : text.slice(at).split(/[;{]/)[0]!;
+  const deleted = /=\s*delete\b/.test(declaration);
+  memo.set(n.id, deleted);
+  return deleted;
 }
 
 /** What a C++ call's argument is: a literal's kind, or the type a name or expression has as written. */
@@ -10665,7 +10830,7 @@ function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCon
 }
 
 /** What a C++ type is, for an argument to fit a parameter of it. */
-type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'class';
+type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'null' | 'class';
 
 const CPP_CHAR_TYPES: ReadonlySet<string> = new Set(['char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t']);
 const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
@@ -10674,12 +10839,16 @@ const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
 ]);
 const CPP_STRING_TYPES: ReadonlySet<string> = new Set(['string', 'wstring', 'string_view', 'wstring_view', 'basic_string', 'basic_string_view']);
 
-/** The category of the written C++ type `type`: a pointer's, a string's, a character's, a number's, a class's. */
+/**
+ * The category of the written C++ type `type`: a pointer's, a string's, a
+ * character's, a number's, `std::nullptr_t`'s, a class's.
+ */
 function cppTypeCategory(type: string): CppTypeCategory {
   const flat = stripCppTemplateArguments(type).replace(/\b(?:const|volatile|struct|class|typename|enum)\b/g, ' ').replace(/&+/g, ' ').trim();
   const words = flat.replace(/\*/g, ' ').trim().split(/\s+/);
   const last = cppLastSegment(words[words.length - 1] ?? '');
   if (flat.includes('*')) return CPP_CHAR_TYPES.has(last) && (flat.match(/\*/g) ?? []).length === 1 ? 'cstring' : 'pointer';
+  if (last === 'nullptr_t') return 'null';
   if (last === 'bool') return 'bool';
   if (CPP_CHAR_TYPES.has(last) && words.every((w) => CPP_CHAR_TYPES.has(w) || w === 'signed' || w === 'unsigned')) return 'char';
   if (CPP_NUMBER_TYPES.has(last) || words.every((w) => CPP_NUMBER_TYPES.has(w))) return 'number';
@@ -10708,13 +10877,17 @@ function cppArgumentTypeFit(n: Node, name: string, types: Array<CppArgumentType 
   return score;
 }
 
-/** How a literal fits a parameter of each category. */
+/**
+ * How a literal fits a parameter of each category. `nullptr` is a
+ * `std::nullptr_t` exactly, and a pointer only by conversion: protobuf's
+ * `ptr.reset(nullptr)` is `reset(std::nullptr_t)`, not `reset(T*)`.
+ */
 const CPP_LITERAL_FIT: Record<'char' | 'number' | 'zero' | 'bool' | 'null', Record<CppTypeCategory, number>> = {
-  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, string: -3, class: 0 },
-  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  null: { pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
+  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, null: 1, string: -3, class: 0 },
+  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  null: { null: 4, pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
 };
 
 /** How an argument written as type `arg` fits a parameter of type `param` (of category `category`). */
@@ -10764,9 +10937,11 @@ function cppMemberMacroArguments(decl: Node, context: ResolutionContext): string
   if (hit) return hit;
   const words: string[] = [];
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const nonCode = cppNonCodeLines(decl.filePath, context);
   let depth = 0;
   for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.endLine); i++) {
-    const code = cppCodeOf(i === decl.startLine - 1 ? lines[i]!.slice(decl.startColumn) : lines[i]!) ?? '';
+    const blanked = cppLiteralsBlanked(lines[i]!, i + 1, nonCode);
+    const code = cppCodeOf(i === decl.startLine - 1 ? blanked.slice(decl.startColumn) : blanked) ?? '';
     const call = depth === 1 ? /^\s*[A-Z][A-Z0-9_]*\s*\(([^;{}]*)\)\s*;?\s*$/.exec(code) : null;
     if (call) words.push(...call[1]!.split(/\W+/).filter((w) => w.length >= 3));
     for (const c of code) {
@@ -10792,7 +10967,8 @@ function cppBaseSpecifiers(decl: Node, context: ResolutionContext): string[] {
   if (hit) return hit;
   const specs: string[] = [];
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
-  const head = lines?.slice(decl.startLine - 1, decl.startLine + 11) ?? [];
+  const nonCode = cppNonCodeLines(decl.filePath, context);
+  const head = (lines?.slice(decl.startLine - 1, decl.startLine + 11) ?? []).map((l, k) => cppLiteralsBlanked(l, decl.startLine + k, nonCode));
   if (head.length > 0) {
     head[0] = head[0]!.slice(decl.startColumn);
     const text = head.map((l) => cppCodeOf(l) ?? '').join('\n');
@@ -10823,7 +10999,9 @@ function cppUsingDeclares(decl: Node, base: Node, name: string, context: Resolut
   if (!usings) {
     usings = [];
     const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
-    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine).map((l) => cppCodeOf(l) ?? '').join('\n');
+    const nonCode = cppNonCodeLines(decl.filePath, context);
+    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine)
+      .map((l, k) => cppCodeOf(cppLiteralsBlanked(l, decl.startLine + k, nonCode)) ?? '').join('\n');
     for (const m of body.matchAll(/\busing\s+(?!namespace\b)((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}]*>)?)\s*::\s*([A-Za-z_]\w*)\s*;/g)) {
       usings.push([cppLastSegment(stripCppTemplateArguments(m[1]!).trim()), m[2]!]);
     }
@@ -10859,9 +11037,10 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const word = new RegExp(`\\b${escaped}\\b`);
   const declarator = buildDeclaratorRegex(escaped);
+  const nonCode = cppNonCodeLines(caller.filePath, context);
   for (let i = Math.max(0, caller.startLine - 1); i < Math.min(lines.length, ref.line); i++) {
     if (!word.test(lines[i]!)) continue;
-    const code = cppCodeOf(lines[i]!);
+    const code = cppCodeOf(cppLiteralsBlanked(lines[i]!, i + 1, nonCode));
     if (!code || !word.test(code)) continue;
     if (cppRebindsReceiver(code, escaped)) return true;
     // `std::function<void()> done;` reads as a declaration once its template arguments are gone.
@@ -10875,13 +11054,16 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
 }
 
 /**
- * A C++ source line as code, for reading declarations: null for a line of a
- * comment (`// …`, ` * …`), else the line with its comments blanked, columns
- * kept. Receiver inference read leveldb's `// … non-null imm_` as a
- * declaration of `imm_` with the type `null`.
+ * A C++ source line as code, for reading declarations: null for a `// …`
+ * line, else the line with its comments blanked, columns kept. Receiver
+ * inference read leveldb's `// … non-null imm_` as a declaration of `imm_`
+ * with the type `null`. A line inside a block comment is blank by the time
+ * it gets here (cppLiteralsBlanked, from cppNonCodeLines): a line starting
+ * with `*` is not one by that alone, as `*widget_;` continuing a declaration
+ * is not.
  */
 function cppCodeOf(line: string): string | null {
-  if (/^\s*(?:\/\/|\*)/.test(line)) return null;
+  if (/^\s*\/\//.test(line)) return null;
   let code = line.replace(/\/\*.*?\*\//g, (c) => ' '.repeat(c.length));
   // A block comment opening here runs past the line.
   const open = code.indexOf('/*');
@@ -10939,7 +11121,7 @@ function inferCppReceiverType(
   // A declaration in a string literal is text: protobuf's upb generator
   // writes `upb_MiniTableField field = $field_init$;` in the raw string it
   // emits, above calls on its own `upb::FieldDefPtr field` parameter.
-  const rawLines = cppRawStringLines(ref.filePath, context);
+  const rawLines = cppNonCodeLines(ref.filePath, context);
   // Past the calling function's first line, C++ looks the name up among the
   // members of the function's class before anything outside it.
   const caller = context.getNodeById?.(ref.fromNodeId);
@@ -11013,6 +11195,17 @@ function inferCppReceiverType(
           return cppDeclaredType(element.text, elementType, true, ref, context, found);
         }
       }
+      // A declaration begun on an earlier line, read with the lines it began on.
+      const begun = cppDeclarationBegunAbove(lines, i, line, receiverPattern, declaratorRegex, rawLines);
+      const begunType = begun && normalizeCppTypeName(begun);
+      if (begun && begunType && begunType !== 'auto') {
+        const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
+        noteCppDeclaration(found, begun, inCallerScope);
+        return cppDeclaredType(begun, begunType, inCallerScope, ref, context, found);
+      }
+      // One those lines don't make readable is still maybe the receiver's:
+      // one found further up may be another variable.
+      if (cppEndsDeclarationBegunAbove(line, escapedReceiver)) found.shadowed = true;
       // `for (auto& [cfh, iter] : cfh_iter_pairs_)`, `auto [status, iter] = Open();`.
       const bound = !found.shadowed ? cppStructuredBindingType(line, lines, i, receiverName, callLineIndex, ref, context, rawLines) : null;
       const boundType = bound && normalizeCppTypeName(bound.text);
@@ -11042,7 +11235,7 @@ function inferCppReceiverType(
       ? context.getFileLines(headerPath)
       : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
     if (!headerLines) continue;
-    const headerRawLines = cppRawStringLines(headerPath, context);
+    const headerRawLines = cppNonCodeLines(headerPath, context);
 
     for (let i = 0; i < headerLines.length; i++) {
       const text = headerLines[i]!;
@@ -11212,7 +11405,7 @@ function cppAutoInitializerStatement(
   lines: readonly string[],
   index: number,
   receiverName: string,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
   const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const start = new RegExp(`\\b${escaped}\\b\\s*=(?!=)`).exec(line);
@@ -11221,19 +11414,23 @@ function cppAutoInitializerStatement(
 
 /**
  * The C++ statement that `text`, the rest of `lines[index]`, begins, read on
- * to the `;` that ends it. Null when no `;` ends it within a few lines.
+ * to the `;` that ends it. Null when no `;` ends it within a few lines. A
+ * macro body's lines end in `\`, which splices them: protobuf's `const auto&
+ * rep = \` goes on with `reflection->GetRaw<…>(message, field); \`.
  */
 function cppStatementFrom(
   text: string,
   lines: readonly string[],
   index: number,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
+  const spliced = (code: string): string => code.replace(/\\\s*$/, ' ');
+  text = spliced(text);
   for (let next = index + 1; ; next++) {
     const end = cppStatementEnd(text);
     if (end >= 0) return text.slice(0, end).trim() || null;
     if (next >= lines.length || next > index + 4) return null;
-    text += ` ${cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? ''}`;
+    text += ` ${spliced(cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? '')}`;
   }
 }
 
@@ -11259,7 +11456,7 @@ function cppStructuredBindingType(
   callLineIndex: number,
   ref: UnresolvedRef,
   context: ResolutionContext,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): CppWrittenType | null {
   if (!line.includes('[')) return null;
   for (const m of line.matchAll(CPP_STRUCTURED_BINDING)) {
@@ -11389,7 +11586,7 @@ function matchCppConstruction(ref: UnresolvedRef, context: ResolutionContext): R
     : { original: ref, targetNodeId: node.id, confidence: 0.7, resolvedBy: 'exact-match' };
   if (cppDeclaresLocalAlias(written, ref, context)) {
     const aliased = resolveCppAliasedType(written, ref, context);
-    const named = aliased && !aliased.pointer ? cppAliasedClass(aliased, context) : undefined;
+    const named = aliased && !aliased.pointer ? cppAliasedClass(aliased, context, ref) : undefined;
     const cls = named ? context.getNodesByQualifiedName(named).find((n) => CPP_CLASS_KINDS.has(n.kind)) : undefined;
     return cls ? made(cls) : null;
   }
@@ -11909,6 +12106,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_USING_MEMBERS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
   CPP_OVERLOAD_PARAMETERS.delete(context);
+  CPP_DELETED_FUNCTIONS.delete(context);
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
   CPP_SCOPE_NAMES.delete(context);
@@ -13348,13 +13546,18 @@ export function matchMethodCall(
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
+      // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
+      // own, else one a base declares (cppMethodOf), never one of a class
+      // nested in it, like `Outer::Inner::Count` beside an inherited `Base::Count`.
+      if (classNode.language === 'cpp') {
+        const method = cppMethodOf(classNode, methodName!, ref, context);
+        if (!method) continue;
+        const own = method.qualifiedName === `${classNode.qualifiedName}::${methodName}`;
+        return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
+      }
+
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          n.qualifiedName.includes(classNode.name)
-      );
+      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
       if (methodNode) {
         return {
@@ -13435,12 +13638,7 @@ export function matchMethodCall(
         if (classNode.language !== ref.language) continue;
 
         const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
-        );
+        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
         if (methodNode) {
           return {
@@ -16172,6 +16370,8 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
 function splitCppTopLevel(text: string): string[] {
   const out: string[] = [];
   let depth = 0;
+  // Where each template argument list open around the current character closes.
+  const closes: number[] = [];
   let cur = '';
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!;
@@ -16182,13 +16382,44 @@ function splitCppTopLevel(text: string): string[] {
       i = j;
       continue;
     }
-    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth++;
-    else if (ch === ')' || ch === ']' || ch === '}' || (ch === '>' && text[i - 1] !== '-')) depth = Math.max(0, depth - 1);
-    if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    else if (ch === '<') {
+      const end = cppTemplateArgumentsEnd(text, i);
+      if (end > i) closes.push(end);
+    } else if (ch === '>' && closes[closes.length - 1] === i) closes.pop();
+    if (ch === ',' && depth === 0 && closes.length === 0) { out.push(cur.trim()); cur = ''; continue; }
     cur += ch;
   }
   if (cur.trim()) out.push(cur.trim());
   return out;
+}
+
+/**
+ * Where the template argument list the `<` at `at` opens closes: the index
+ * of its `>`, or -1 when the `<` compares or shifts. A template's `<` is
+ * written right after a name, and its `>` comes before the bracket around it
+ * closes: protobuf's `{"declare", has_bit_word_index < 0 ? … : ""}` was read
+ * as one argument, the `<` holding the rest open.
+ */
+function cppTemplateArgumentsEnd(text: string, at: number): number {
+  if (!/\w/.test(text[at - 1] ?? '') || text[at + 1] === '<' || text[at + 1] === '=') return -1;
+  let angles = 0;
+  let others = 0;
+  for (let i = at; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== ch) j += text[j] === '\\' ? 2 : 1;
+      i = j;
+    } else if (ch === '(' || ch === '[' || ch === '{') others++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (--others < 0) return -1;
+    } else if (others > 0) continue;
+    else if (ch === '<') angles++;
+    else if (ch === '>' && text[i - 1] !== '-' && --angles === 0) return i;
+  }
+  return -1;
 }
 
 /** The balanced `( … )` after `name` from `line`/`column` of `file` (up to a dozen lines), or null. */
