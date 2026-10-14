@@ -8144,6 +8144,22 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
+ * Is `n` the method `name` of the class `cls` a receiver is taken to name
+ * (the class-name and capitalized-receiver strategies of matchMethodCall)?
+ * In C and C++, only one of exactly that class: protobuf's `arena.get()`
+ * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
+ * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
+ * other languages, any method of the name whose qualified name has the
+ * class's name in it, as before.
+ */
+function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
+  if (n.kind !== 'method' || n.name !== name) return false;
+  return cls.language === 'c' || cls.language === 'cpp'
+    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
+    : n.qualifiedName.includes(cls.name);
+}
+
+/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -13348,13 +13364,18 @@ export function matchMethodCall(
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
 
+      // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
+      // own, else one a base declares (cppMethodOf), never one of a class
+      // nested in it, like `Outer::Inner::Count` beside an inherited `Base::Count`.
+      if (classNode.language === 'cpp') {
+        const method = cppMethodOf(classNode, methodName!, ref, context);
+        if (!method) continue;
+        const own = method.qualifiedName === `${classNode.qualifiedName}::${methodName}`;
+        return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
+      }
+
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          n.qualifiedName.includes(classNode.name)
-      );
+      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
       if (methodNode) {
         return {
@@ -13435,12 +13456,7 @@ export function matchMethodCall(
         if (classNode.language !== ref.language) continue;
 
         const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
-        );
+        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
 
         if (methodNode) {
           return {
