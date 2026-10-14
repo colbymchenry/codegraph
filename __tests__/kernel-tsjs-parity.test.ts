@@ -353,7 +353,8 @@ const lowerCase = styled.div<Props>\`color: red;\`;
 
   it('torture fixture (java): Lombok, anonymous classes, method refs, chains', () => {
     const file = path.join(FIXTURE_DIR, 'Torture.java');
-    assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
+    const result = assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
+    expect(result.nodes.find(n => n.name === 'DEFAULT_PRIORITY')).toMatchObject({ kind: 'constant', isStatic: true });
   });
 
   it('torture fixture (python): decorators, self fn-refs, imports, shadowing', () => {
