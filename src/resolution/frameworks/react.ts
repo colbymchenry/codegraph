@@ -484,8 +484,9 @@ const MAX_REEXPORT_HOPS = 4;
  * Page`, `export function Component`, `export { Page as Component }` — or one
  * it forwards from the module that declares it, as a barrel `index.ts` does:
  * `export { default } from './page'`, `export { Page as Component } from
- * './page'`, or `export * from './page'`, which forwards every name but the
- * default. As in JavaScript, a name the file exports itself hides one an
+ * './page'`, `export * from './page'`, which forwards every name but the
+ * default, or an import it exports again, `import { Page } from './page';
+ * export { Page }`. As in JavaScript, a name the file exports itself hides one an
  * `export *` would forward, and a name two `export *` modules both forward is
  * exported by neither. `reads` collects every file the lookup reads.
  */
@@ -498,15 +499,26 @@ function exportedComponent(
 ): string | null {
   if (visited.has(file) || visited.size > MAX_REEXPORT_HOPS) return null;
   reads?.add(file);
-  const local = ownExport(stripCommentsForRegex(context.readFile(file) ?? '', 'typescript'), name);
-  if (local) return context.getNodesInFile(file).find((n) => n.name === local && EXPORTED_COMPONENT_KINDS.has(n.kind))?.id ?? null;
   const language = scriptLanguage(file);
-  const reExports = context.getReExports?.(file, language) ?? [];
   const through = new Set(visited).add(file);
   const forwarded = (source: string, exported: string): string | null => {
     const target = resolveImportPath(source, file, language, context);
     return target ? exportedComponent(target, exported, context, through, reads) : null;
   };
+  const code = stripCommentsForRegex(context.readFile(file) ?? '', 'typescript');
+  const local = ownExport(code, name);
+  if (local) {
+    const declared = context.getNodesInFile(file).find((n) => n.name === local && EXPORTED_COMPONENT_KINDS.has(n.kind));
+    if (declared) return declared.id;
+    // A name the module imports and exports again — `import { Page } from
+    // './page'; export { Page }`, `import Page from './Page'; export default
+    // Page` — is the page that import names. `export default withAuth(Page)`
+    // hands over no binding of its own.
+    if (name === 'default' && !exportsBinding(code, local)) return null;
+    const imported = context.getImportMappings(file, language).find((m) => m.localName === local);
+    return imported && !imported.isNamespace ? forwarded(imported.source, imported.isDefault ? 'default' : imported.exportedName) : null;
+  }
+  const reExports = context.getReExports?.(file, language) ?? [];
   for (const re of reExports) {
     if (re.kind === 'named' && re.exportedName === name) return forwarded(re.source, re.originalName);
   }
@@ -534,6 +546,12 @@ function ownExport(source: string, name: string): string | null {
     return name;
   }
   return extractLocalExportAliases(source).find((a) => a.exportedName === name)?.localName ?? null;
+}
+
+/** True when the module's default export is the binding `local` itself: `export default Page;`, `export { Page as default }`. */
+function exportsBinding(source: string, local: string): boolean {
+  return new RegExp(String.raw`(?:^|;)\s*export\s+default\s+${local.replace(/\$/g, '\\$')}\s*(?:;|$)`, 'm').test(source) ||
+    extractLocalExportAliases(source).some((a) => a.exportedName === 'default' && a.localName === local);
 }
 
 /**
