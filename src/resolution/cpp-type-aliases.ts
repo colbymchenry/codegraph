@@ -81,12 +81,16 @@ function cppTypeName(raw: string): TypeName | null {
   const parts: string[] = [];
   const templated: boolean[] = [];
   let depth = 0;
+  let parens = 0;
   let part = '';
   let args = false;
   const text = raw.replace(/\b(?:const|volatile|mutable|typename|template|class|struct|union|enum)\b/g, ' ').replace(/[&*]+/g, ' ');
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
-    if (c === '<') {
+    // (In template arguments, a `<` or `>` in parentheses compares: `Bits<(N > 8)>`.)
+    if (depth > 0 && (c === '(' || c === ')')) parens = Math.max(0, parens + (c === '(' ? 1 : -1));
+    else if (parens > 0) continue;
+    else if (c === '<') {
       depth++;
       args = true;
     } else if (c === '>') depth = Math.max(0, depth - 1);
@@ -252,6 +256,17 @@ function localAliasLines(caller: Node, lines: readonly string[], context: Resolu
     memo.set(caller.id, found);
   }
   return found;
+}
+
+/**
+ * Does the function making `ref` declare, before it, an alias of the name a
+ * written type starts with — `using Map = std::map<…>;` for `Map`? Such an
+ * alias isn't indexed, so a lookup goes past it; resolveCppAliasedType reads it.
+ */
+export function cppDeclaresLocalAlias(written: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = cppTypeName(written);
+  return !!name && !written.trimStart().startsWith('::') &&
+    localAliasedType(name.names[0]!, context.getNodeById?.(ref.fromNodeId), ref, context) !== undefined;
 }
 
 /**

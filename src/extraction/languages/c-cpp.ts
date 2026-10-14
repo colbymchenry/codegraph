@@ -192,6 +192,31 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
   return name;
 }
 
+const CPP_CLASS_SPECIFIERS: ReadonlySet<string> = new Set(['class_specifier', 'struct_specifier', 'union_specifier']);
+
+/**
+ * The `::` segments of a C++ class, struct or union name written with a
+ * scope, the scope's template arguments dropped: `['SkipList', 'Node']` for
+ * an out-of-line nested class `struct SkipList<Key, Comparator>::Node`. Such
+ * a class was indexed `<anonymous>`, so its members were no class's.
+ * Undefined for a plain name, and for a specialization (`class
+ * FunctionMocker<R(Args...)>`, `struct fmt::formatter<Foo>`): named after its
+ * template, it would stand in for the template and every other
+ * specialization of it (fmt's `formatter<weekday, Char> : formatter<std::tm,
+ * Char>` extended `formatter<day, Char>`). Mirrored in the kernel
+ * (ccpp/mod.rs).
+ */
+function cppWrittenClassParts(node: SyntaxNode, source: string): string[] | undefined {
+  if (!CPP_CLASS_SPECIFIERS.has(node.type)) return undefined;
+  const written = getChildByField(node, 'name');
+  if (written?.type !== 'qualified_identifier') return undefined;
+  let innermost: SyntaxNode | null = written;
+  while (innermost?.type === 'qualified_identifier') innermost = getChildByField(innermost, 'name');
+  if (innermost?.type !== 'type_identifier') return undefined;
+  const parts = stripCppTemplateArgs(getNodeText(written, source)).split('::').map((p) => p.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every((p) => /^[A-Za-z_]\w*$/.test(p)) ? parts : undefined;
+}
+
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
   const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
@@ -2400,9 +2425,10 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   resolveName: (node, source) =>
-    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1),
   getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
+  getClassScope: (node, source) => cppWrittenClassParts(node, source)?.slice(0, -1).join('::') || undefined,
   getReturnType: extractCppReturnType,
   // Constructors (definitions and class-body declarations) carry their
   // parameter list as the signature; a trailing semicolon marks a prototype, so a local `T obj(args)` can be matched
