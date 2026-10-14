@@ -9397,6 +9397,61 @@ function cppWrittenReturnType(fn: Node, context: ResolutionContext): string | nu
   return written;
 }
 
+/**
+ * The names of the template parameters a C++ function template's own
+ * `template <…>` header declares, in order, without their defaults:
+ * `['Type']` for protobuf's `template <typename Type> const Type& GetRaw(…)`.
+ * A template's node starts at its declaration, so the header is the code
+ * right before it. Empty for a function that is no template.
+ */
+function cppOwnTemplateParameters(fn: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/);
+  if (!lines) return [];
+  const at = lines[fn.startLine - 1] ?? '';
+  const before = [...lines.slice(Math.max(0, fn.startLine - 4), fn.startLine - 1), at.slice(0, fn.startColumn)]
+    .map((line) => cppCodeOf(line) ?? '').join(' ').trimEnd();
+  let depth = 0;
+  for (let i = before.endsWith('>') ? before.length - 1 : -1; i >= 0; i--) {
+    if (before[i] === '>') depth++;
+    else if (before[i] === '<' && --depth === 0) {
+      if (!/\btemplate\s*$/.test(before.slice(0, i))) return [];
+      return splitCppTopLevel(before.slice(i + 1, -1)).map((p) => /([A-Za-z_]\w*)$/.exec(p.split('=')[0]!.trim())?.[1] ?? '');
+    }
+  }
+  return [];
+}
+
+/**
+ * What a call of the C++ member template whose overloads are `methods`, with
+ * the explicit template arguments `args` (`<…>` as written), returns when
+ * every overload is declared to return the same one of its own template
+ * parameters, perhaps const, a pointer or a reference: that argument, so
+ * qualified, as written at the call (`site`). protobuf's `template <typename
+ * Type> const Type& GetRaw(…)` called as `reflection->GetRaw<RepeatedPtrField<
+ * std::string>>(…)` returns a `const RepeatedPtrField<std::string>&`, and
+ * rocksdb's `T* GetOptions()` called as `GetOptions<BlockBasedTableOptions>()`
+ * a `BlockBasedTableOptions*`. Undefined otherwise: then the return type is
+ * read as written.
+ */
+function cppMemberTemplateReturn(
+  methods: readonly Node[],
+  args: string,
+  site: Omit<CppWrittenType, 'text'>,
+  context: ResolutionContext,
+): CppWrittenType | undefined {
+  let slot: { index: number; written: string; param: string } | undefined;
+  for (const fn of methods) {
+    const written = cppWrittenReturnType(fn, context);
+    if (!written) continue;
+    const param = written.replace(/\b(?:const|volatile)\b|[*&]/g, ' ').trim();
+    const index = param ? cppOwnTemplateParameters(fn, context).indexOf(param) : -1;
+    if (index < 0 || (slot && slot.index !== index)) return undefined;
+    slot ??= { index, written, param };
+  }
+  const arg = slot && splitCppTopLevel(args.slice(1, -1))[slot.index];
+  return slot && arg ? { ...site, text: slot.written.replace(new RegExp(`\\b${slot.param}\\b`), arg) } : undefined;
+}
+
 /** What one of `fns` (overloads, a declaration and its definition) returns, as written where it is declared. */
 function cppReturnTypeOf(fns: readonly Node[], context: ResolutionContext): CppWrittenType | null {
   for (const fn of fns) {
@@ -9785,12 +9840,17 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     const returned = wrapper && cppWrapperReturnType(wrapper);
     if (returned) return returned;
   }
-  // `recv.method(…)`, `recv->method(…)`: the method of the receiver's class.
-  const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(callee);
+  // `recv.method(…)`, `recv->method(…)`, `recv->method<T>(…)`: the method of the receiver's class.
+  const member = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)\s*(<[\s\S]*>)?$/.exec(callee);
   if (member) {
     const object = cppMemberObject(member[1]!, member[2]!, at, context, depth);
     const cls = object && cppWrittenClass(object, at, context);
-    return cls ? cppReturnTypeOf(cppMethodsOf(cls, member[3]!, at, context), context) : null;
+    if (!cls) return null;
+    const methods = cppMethodsOf(cls, member[3]!, at, context);
+    if (!member[4]) return cppReturnTypeOf(methods, context);
+    // Explicit template arguments call a template, never an overload that is none.
+    const templates = methods.filter((fn) => cppOwnTemplateParameters(fn, context).length > 0);
+    return cppMemberTemplateReturn(templates, member[4], callers, context) ?? cppReturnTypeOf(templates, context);
   }
   if (!/^(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*(?:\s*<[\s\S]*>)?$/.test(callee)) return null;
   const spelled = stripCppTemplateArguments(callee).replace(/\s+/g, '');
@@ -11354,7 +11414,9 @@ function cppAutoInitializerStatement(
 
 /**
  * The C++ statement that `text`, the rest of `lines[index]`, begins, read on
- * to the `;` that ends it. Null when no `;` ends it within a few lines.
+ * to the `;` that ends it. Null when no `;` ends it within a few lines. A
+ * macro body's lines end in `\`, which splices them: protobuf's `const auto&
+ * rep = \` goes on with `reflection->GetRaw<…>(message, field); \`.
  */
 function cppStatementFrom(
   text: string,
@@ -11362,11 +11424,13 @@ function cppStatementFrom(
   index: number,
   rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
+  const spliced = (code: string): string => code.replace(/\\\s*$/, ' ');
+  text = spliced(text);
   for (let next = index + 1; ; next++) {
     const end = cppStatementEnd(text);
     if (end >= 0) return text.slice(0, end).trim() || null;
     if (next >= lines.length || next > index + 4) return null;
-    text += ` ${cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? ''}`;
+    text += ` ${spliced(cppCodeOf(cppLiteralsBlanked(lines[next]!, next + 1, rawLines)) ?? '')}`;
   }
 }
 
