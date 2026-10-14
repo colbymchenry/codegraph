@@ -796,3 +796,209 @@ export function ProfileForm({ user }: { user: User }) {
     expect(referenced).toEqual(['web/src/forms/profile-form.tsx']);
   });
 });
+
+/**
+ * A tag imported from a module of the project renders what that module exports
+ * under the imported name, read the way a lazy route's module is: through an
+ * `index` or a barrel that hands it on, and past a wrapper call around it. The
+ * name only broke ties among the candidates in the module the import resolves
+ * to, so an `index` that forwards its default export declared none of them,
+ * and the name picked among the rest: outline's `<Sidebar>` rendered
+ * `Aside.tsx`'s styled `Sidebar`, not the `AppSidebar` its index forwards.
+ */
+describe('JSX child: a tag imported from a module of the project', () => {
+  let dir: string;
+  let cg: any;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsx-project-import-'));
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react":"^18.0.0","mobx-react":"^9.0.0"}}');
+  });
+
+  afterEach(() => {
+    cg?.close?.();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (rel: string, body: string) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+  };
+
+  async function index(): Promise<void> {
+    cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+  }
+
+  /** `name file:line` of each node a jsx-render edge out of `parent` points at. */
+  const renders = (parent: string): string[] =>
+    cg.db.db
+      .prepare(
+        `SELECT t.name || ' ' || t.file_path || ':' || t.start_line AS r FROM edges e
+           JOIN nodes s ON s.id = e.source
+           JOIN nodes t ON t.id = e.target
+          WHERE s.name = ? AND json_extract(e.metadata, '$.synthesizedBy') = 'jsx-render'
+          ORDER BY r`
+      )
+      .all(parent)
+      .map((row: any) => row.r);
+
+  it('follows an index that forwards another module’s default export', async () => {
+    // outline: `Sidebar/index.ts` is `import Sidebar from "./App"; export
+    // default Sidebar;`, and `App.tsx` exports `observer(AppSidebar)`.
+    write('app/components/Sidebar/Aside.tsx', 'export function Sidebar() {\n  return <aside />;\n}\n');
+    write(
+      'app/components/Sidebar/App.tsx',
+      "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n"
+    );
+    write('app/components/Sidebar/index.ts', "import Sidebar from './App';\n\nexport default Sidebar;\n");
+    write(
+      'app/components/AuthenticatedLayout.tsx',
+      "import Sidebar from './Sidebar';\n\nexport function AuthenticatedLayout() {\n  return <main><Sidebar /></main>;\n}\n"
+    );
+    await index();
+    expect(renders('AuthenticatedLayout')).toEqual(['AppSidebar app/components/Sidebar/App.tsx:3']);
+  });
+
+  it('follows an index that exports an import again, through `React.memo(X, areEqual)`', async () => {
+    // excalidraw: `canvases/index.tsx` is `import StaticCanvas from
+    // "./StaticCanvas"; export { StaticCanvas };`.
+    write('a-decoy/StaticCanvas.tsx', 'export function StaticCanvas() {\n  return <canvas id="decoy" />;\n}\n');
+    write(
+      'components/canvases/StaticCanvas.tsx',
+      "import React from 'react';\n\nconst StaticCanvas = () => {\n  return <canvas />;\n};\n\nconst areEqual = () => true;\n\nexport default React.memo(StaticCanvas, areEqual);\n"
+    );
+    write('components/canvases/index.tsx', "import StaticCanvas from './StaticCanvas';\n\nexport { StaticCanvas };\n");
+    write(
+      'components/App.tsx',
+      "import { StaticCanvas } from './canvases';\n\nexport function App() {\n  return <div><StaticCanvas /></div>;\n}\n"
+    );
+    await index();
+    expect(renders('App')).toEqual(['StaticCanvas components/canvases/StaticCanvas.tsx:3']);
+  });
+
+  it('renders a default export imported under another name, not the module’s other component', async () => {
+    // outline's `Button.tsx` exports a styled `Inner` beside `export default
+    // React.forwardRef<…>(Button)`.
+    write(
+      'components/Button.tsx',
+      `import React from 'react';
+
+export const Inner = React.forwardRef<HTMLSpanElement, object>((props, ref) => <span ref={ref} {...props} />);
+
+function Button(props: object, ref: React.Ref<HTMLButtonElement>) {
+  return <button ref={ref}><Inner /></button>;
+}
+
+export default React.forwardRef<HTMLButtonElement, object>(Button);
+`
+    );
+    write(
+      'components/Toolbar.tsx',
+      "import ToolbarButton from './Button';\n\nexport function Toolbar() {\n  return <div><ToolbarButton /></div>;\n}\n"
+    );
+    await index();
+    expect(renders('Toolbar')).toEqual(['Button components/Button.tsx:5']);
+  });
+
+  it('renders its own app’s component through a barrel when every app has one of that name', async () => {
+    // bulletproof-react: each app imports `Button` from its own
+    // `@/components/ui/button`, a barrel of `export * from './button'`.
+    for (const app of ['nextjs-app', 'react-vite']) {
+      write(`apps/${app}/tsconfig.json`, JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+      write(`apps/${app}/src/components/ui/button/button.tsx`, 'export function Button() {\n  return <button />;\n}\n');
+      write(`apps/${app}/src/components/ui/button/index.ts`, "export * from './button';\n");
+    }
+    write(
+      'apps/react-vite/src/features/auth/login-form.tsx',
+      "import { Button } from '@/components/ui/button';\n\nexport function LoginForm() {\n  return <form><Button /></form>;\n}\n"
+    );
+    await index();
+    expect(renders('LoginForm')).toEqual(['Button apps/react-vite/src/components/ui/button/button.tsx:1']);
+  });
+
+  it('renders the component a memoized export wraps, not the wrapper', async () => {
+    // mastodon's `blurhash.tsx`: `const MemoizedBlurhash = memo(Blurhash);
+    // export { MemoizedBlurhash as Blurhash };`. The wrapper's node has no body
+    // to render from; `Blurhash`'s has the markup.
+    write(
+      'app/javascript/mastodon/components/blurhash.tsx',
+      "import { memo } from 'react';\n\nfunction Blurhash({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(Blurhash);\n\nexport { MemoizedBlurhash as Blurhash };\n"
+    );
+    write(
+      'app/javascript/mastodon/components/media_item.tsx',
+      "import { Blurhash } from './blurhash';\n\nexport function MediaItem() {\n  return <div><Blurhash hash=\"x\" /></div>;\n}\n"
+    );
+    await index();
+    expect(renders('MediaItem')).toEqual(['Blurhash app/javascript/mastodon/components/blurhash.tsx:3']);
+  });
+
+  it('follows a value an index holds another module’s component in', async () => {
+    // outline's `Avatar/index.ts`: `const Avatar = AvatarWithHoverCard; export
+    // { Avatar }`. The value has no body; the hover card renders the avatar.
+    write(
+      'app/components/Avatar/Avatar.tsx',
+      "import { observer } from 'mobx-react';\n\nfunction Avatar() {\n  return <img />;\n}\n\nexport default observer(Avatar);\n"
+    );
+    write(
+      'app/components/Avatar/AvatarWithHoverCard.tsx',
+      "import { observer } from 'mobx-react';\nimport Avatar from './Avatar';\n\nfunction AvatarWithHoverCard() {\n  return <div><Avatar /></div>;\n}\n\nexport default observer(AvatarWithHoverCard);\n"
+    );
+    write(
+      'app/components/Avatar/index.ts',
+      "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n"
+    );
+    write(
+      'app/components/CommentForm.tsx',
+      "import { Avatar } from '~/components/Avatar';\n\nexport function CommentForm() {\n  return <form><Avatar /></form>;\n}\n"
+    );
+    write('tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '~/*': ['./app/*'] } } }));
+    await index();
+    expect(renders('CommentForm')).toEqual(['AvatarWithHoverCard app/components/Avatar/AvatarWithHoverCard.tsx:4']);
+    expect(renders('AvatarWithHoverCard')).toEqual(['Avatar app/components/Avatar/Avatar.tsx:3']);
+  });
+
+  it('keeps a `let` the module exports, which may hold another component by then', async () => {
+    write('components/Primary.tsx', 'export function Primary() {\n  return <b />;\n}\n');
+    write('components/Secondary.tsx', 'export function Secondary() {\n  return <i />;\n}\n');
+    write(
+      'components/Button.ts',
+      "import { Primary } from './Primary';\nimport { Secondary } from './Secondary';\n\nlet Button = Primary;\nif (globalThis.compact) Button = Secondary;\n\nexport { Button };\n"
+    );
+    write(
+      'components/Toolbar.tsx',
+      "import { Button } from './Button';\n\nexport function Toolbar() {\n  return <div><Button /></div>;\n}\n"
+    );
+    await index();
+    expect(renders('Toolbar')).toEqual(['Button components/Button.ts:4']);
+  });
+
+  it('renders no namesake elsewhere for a module whose default export has no name', async () => {
+    // outline's email `Footer.tsx`: `export const Link = …` above `export
+    // default ({ … }) => …`. The default export is no node, and neither the
+    // module's `Link` nor the app's own `Footer` is it.
+    write('app/components/Footer.tsx', 'export function Footer() {\n  return <div className="app-footer" />;\n}\n');
+    write(
+      'emails/components/Footer.tsx',
+      "export const Link = ({ href }: { href: string }) => <a href={href} />;\n\nexport default ({ url }: { url: string }) => (\n  <footer><Link href={url} /></footer>\n);\n"
+    );
+    write(
+      'emails/Welcome.tsx',
+      "import Footer from './components/Footer';\n\nexport function Welcome() {\n  return <div><Footer url=\"/\" /></div>;\n}\n"
+    );
+    await index();
+    expect(renders('Welcome')).toEqual([]);
+  });
+
+  it('still renders the module’s own namesake when its export can’t be read (CommonJS)', async () => {
+    write('a-decoy/Card.jsx', 'export function Card() {\n  return <div id="decoy" />;\n}\n');
+    write('components/Card.js', "const React = require('react');\n\nfunction Card() {\n  return React.createElement('div');\n}\n\nmodule.exports = Card;\n");
+    write(
+      'components/Deck.jsx',
+      "import Card from './Card';\n\nexport function Deck() {\n  return <section><Card /></section>;\n}\n"
+    );
+    await index();
+    expect(renders('Deck')).toEqual(['Card components/Card.js:3']);
+  });
+});

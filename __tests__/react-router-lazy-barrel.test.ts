@@ -36,6 +36,7 @@ export const router = createBrowserRouter([
   { path: '/fleet', lazy: () => import('@/fleet/home_page') },
   { path: '/login', lazy: () => import('@/auth/login_page') },
   { path: '/graph', lazy: () => import('@/chronicle/graph_view') },
+  { path: '/media', lazy: () => import('@/media/media_page') },
   { path: '/settings', element: <Settings /> },
   { path: '/redirect', lazy: () => import('@/core/redirection_loader') },
   { path: '/clash', lazy: () => import('@/clash') },
@@ -89,6 +90,17 @@ export const Component = BuilderListPage;
 }
 
 export { GraphView as Component };
+`,
+    // A memoized export, whose wrapper has no body of its own to render from.
+    'src/media/media_page.tsx': `import { memo } from 'react';
+
+function MediaPage() {
+  return null;
+}
+
+const MemoizedMediaPage = memo(MediaPage);
+
+export { MemoizedMediaPage as Component };
 `,
     // `React.lazy` reads the default export, through a barrel too.
     'src/settings/index.ts': `export { default } from './settings_page';
@@ -159,7 +171,8 @@ describe('a lazy route module that is a barrel', () => {
   });
 
   it('follows a barrel that forwards another barrel', () => {
-    expect(renders('/builders')).toEqual(['Component@src/builds/pages/builder_list_page/builder_list_page.tsx']);
+    // `export const Component = BuilderListPage` holds the page: the route renders it.
+    expect(renders('/builders')).toEqual(['BuilderListPage@src/builds/pages/builder_list_page/builder_list_page.tsx']);
   });
 
   it('renders inside the layout a barrel forwards', () => {
@@ -173,6 +186,11 @@ describe('a lazy route module that is a barrel', () => {
 
   it('reads an export clause in the module itself', () => {
     expect(renders('/graph')).toEqual(['GraphView@src/chronicle/graph_view.tsx']);
+  });
+
+  it('renders the component a memoized export wraps, not the wrapper', () => {
+    // mastodon's `blurhash.tsx` exports `memo(Blurhash)` this way.
+    expect(renders('/media')).toEqual(['MediaPage@src/media/media_page.tsx']);
   });
 
   it('follows the barrel a React.lazy value loads', () => {

@@ -40,7 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
-import { declaredComponent, lazyValueModules } from './frameworks/react';
+import { declaredComponent, exportedComponent, lazyValueModules } from './frameworks/react';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1707,6 +1707,9 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+/** A file whose tags the JSX pass reads: a script, or a single-file component's. */
+const JSX_INPUT_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
+
 /**
  * Whether a JSX tag can render `node` (`jsxChild`): a script's component,
  * function or class named with a tag's capital, or any component, which a
@@ -1754,6 +1757,49 @@ function importedFromPackage(ctx: ResolutionContext, name: string, file: string)
 }
 
 /**
+ * The module of the project `file` imports `name` from, and the export the
+ * import names: `default` for a default import, else the imported name.
+ * Undefined when the file imports no such name from a module the index holds:
+ * a package's (`importedFromPackage`), or a path only the app's build resolves.
+ */
+function projectImport(ctx: ResolutionContext, name: string, file: string): { module: string; exported: string } | undefined {
+  const language = languageForJsxFile(file);
+  const binding = ctx.getImportMappings(file, language).find((m) => m.localName === name);
+  if (!binding || binding.isNamespace) return undefined;
+  const module = binding.resolvedPath ?? resolveImportPath(binding.source, file, language, ctx);
+  if (!module || !ctx.getNodesInFile(module).some((n) => n.kind === 'file')) return undefined;
+  return { module, exported: binding.isDefault || binding.exportedName === 'default' ? 'default' : binding.exportedName };
+}
+
+/**
+ * The files a JSX file's project-imported tags are read through: each tag's
+ * module, the index or barrel that hands its component on, and the module
+ * that declares it (`exportedComponent`'s reads). A sync that edits one of
+ * them — `index.ts` forwarding another module, a default export rewired —
+ * redraws the tag. `memo` holds each module and export's reads for one run.
+ */
+function importedTagModules(ctx: ResolutionContext, file: string, content: string, memo: Map<string, Set<string>>): Set<string> {
+  const out = new Set<string>();
+  JSX_TAG_RE.lastIndex = 0;
+  const names = new Set<string>();
+  for (let m = JSX_TAG_RE.exec(content); m; m = JSX_TAG_RE.exec(content)) names.add(m[1]!);
+  for (const name of names) {
+    const imported = projectImport(ctx, name, file);
+    if (!imported) continue;
+    const key = `${imported.module}\0${imported.exported}`;
+    let reads = memo.get(key);
+    if (!reads) {
+      reads = new Set<string>();
+      exportedComponent(imported.module, imported.exported, ctx, new Set(), reads);
+      memo.set(key, reads);
+    }
+    for (const read of reads) out.add(read);
+  }
+  out.delete(file);
+  return out;
+}
+
+/**
  * The component a JSX tag names, among every node that shares the name.
  *
  * A tag is written in one file, and that file already says which `FrameCard` it
@@ -1770,9 +1816,19 @@ function importedFromPackage(ctx: ResolutionContext, name: string, file: string)
  * shape, and the one an import can never disambiguate. Then a name the file
  * imports from a package: that package's component, which is no node here, so
  * nothing. On SigNoz, antd's `<Button>` rendered the one project `Button` there
- * was, a styled link in a 404 page's styles. Then the file the name is
- * imported from. Then the language, which only decides a tie: a `.tsx` tag
- * naming both a TS component and a same-named Swift class means the TS one.
+ * was, a styled link in a 404 page's styles. Then a name it imports from a
+ * module of the project: the component that module exports under it, read the
+ * way a lazy route's module is (`exportedComponent`), through an `index` or a
+ * barrel that hands it on and past a wrapper call. outline's
+ * `Sidebar/index.ts` is `import Sidebar from "./App"; export default
+ * Sidebar`, and `./App` exports `observer(AppSidebar)`; the index declares
+ * nothing, so `<Sidebar>` took the styled `Sidebar` of `Aside.tsx` by name.
+ * When the module exports nothing the graph holds as a component under the
+ * name — `export default () => …`, a type — no namesake elsewhere is it either,
+ * though one the module itself declares still is (a CommonJS `module.exports =
+ * Card`). Then the file the name is imported from. Then the language, which
+ * only decides a tie: a `.tsx` tag naming both a TS component and a
+ * same-named Swift class means the TS one.
  *
  * A value the file declares under the name comes first of all: `const Chart =
  * lazy(() => import('./Chart'))` renders the component that module exports,
@@ -1787,7 +1843,8 @@ function jsxChild(
   name: string,
   file: string,
   importsOf: () => Map<string, string>,
-  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>,
+  exportOf: (module: string, exported: string) => Node | null
 ): Node | undefined {
   const own = ownValueOf(name);
   if (own) return own.component ?? own.declaration;
@@ -1795,6 +1852,14 @@ function jsxChild(
   const local = candidates.find((n) => n.filePath === file);
   if (local) return local;
   if (importedFromPackage(ctx, name, file)) return undefined;
+  const imported = projectImport(ctx, name, file);
+  if (imported) {
+    const exported = exportOf(imported.module, imported.exported);
+    if (exported) return exported;
+    const inModule = candidates.find((n) => n.filePath === imported.module);
+    if (inModule) return inModule;
+    if (candidates.length > 0) return undefined;
+  }
   if (candidates.length === 0) {
     // A name nothing declares is the file's DEFAULT import of a module's one
     // component under another name: segmented-control renders
@@ -1881,6 +1946,19 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
+  // Once per module and export for the whole pass: what a tag imported from
+  // the project renders. The lookup reads and comment-strips the module.
+  const exports = new Map<string, Node | null>();
+  const exportOf = (module: string, exported: string): Node | null => {
+    const key = `${module}\0${exported}`;
+    let node = exports.get(key);
+    if (node === undefined) {
+      const id = exportedComponent(module, exported, ctx);
+      node = id ? ctx.getNodeById?.(id) ?? null : null;
+      exports.set(key, node);
+    }
+    return node;
+  };
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
     if ((++scannedFiles & 15) === 0) await onYield();
@@ -1939,7 +2017,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
         if (!line) continue;
-        let child = jsxChild(ctx, name, file, importsOf, ownValueOf);
+        let child = jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
         // A name the parent binds itself by its first tag is that local.
         if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
           child = declaredInside(ctx, name, parent, child);
@@ -4681,14 +4759,19 @@ export async function synthesizeCallbackEdges(
   // depends only on the files, so with a pool the main thread reads them while
   // the workers run the passes instead of after. A module a file's own lazy
   // value loads feeds the JSX that names the value, even with no markup of its
-  // own: a page given its default export, or a barrel rewired, redraws it.
+  // own: a page given its default export, or a barrel rewired, redraws it. So
+  // does every file a tag imported from the project is read through.
   const collectInputs = async (): Promise<string[]> => {
     const found = new Set<string>();
+    const tagModules = new Map<string, Set<string>>();
     for (const file of ctx.getAllFiles()) {
       const content = ctx.readFile(file);
       if (content !== null && hasSynthesisPattern(file, content)) {
         found.add(file);
         if (/\bimport\s*\(/.test(content)) for (const read of lazyValueModules(file, ctx)) found.add(read);
+        if (JSX_INPUT_FILE.test(file) && (content.includes('</') || content.includes('/>'))) {
+          for (const read of importedTagModules(ctx, file, content, tagModules)) found.add(read);
+        }
       }
       await yieldToLoop();
     }
