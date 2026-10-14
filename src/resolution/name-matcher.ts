@@ -16,7 +16,7 @@ import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNamespaceAliases } from './cpp-namespaces';
-import { clearCppRawStringMemos, cppLiteralsBlanked, cppRawStringLines } from './cpp-raw-strings';
+import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
 import { isTestPath } from '../search/query-utils';
@@ -9417,7 +9417,7 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     const declarator = buildDeclaratorRegex(escaped);
     const end = Math.min(decl.endLine ?? decl.startLine, lines.length);
     const nested = cppNestedSpans(decl, end, context);
-    const rawLines = cppRawStringLines(decl.filePath, context);
+    const rawLines = cppNonCodeLines(decl.filePath, context);
     const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
       if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
@@ -9439,7 +9439,6 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
       }
       if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
       let depth = depths[from - decl.startLine]!;
-      if (depth < 0) continue;
       for (const c of code!.slice(from === decl.startLine ? decl.startColumn : 0, m.index)) {
         if (c === '(') depth++;
         else if (c === ')') depth--;
@@ -9457,16 +9456,15 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
 
 /**
  * How many parentheses are open where each line of the C++ class
- * declaration `decl`, which ends on line `end`, begins, or -1 for one that
- * begins inside a block comment. Comments are followed across lines, not
- * guessed as cppCodeOf does: it takes a code line that starts with a
- * dereference, `*first_key, scratch);`, for one.
+ * declaration `decl`, which ends on line `end`, begins. Its block comments
+ * and literals are blanked first (cppNonCodeLines): a parenthesis in one
+ * opens nothing.
  */
 function cppClassParenDepths(
   decl: Node,
   lines: readonly string[],
   end: number,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
   context: ResolutionContext,
 ): number[] {
   let memo = CPP_CLASS_PAREN_DEPTHS.get(context);
@@ -9475,27 +9473,14 @@ function cppClassParenDepths(
   if (!depths) {
     depths = [];
     let depth = 0;
-    let comment = false;
     for (let l = decl.startLine; l <= end; l++) {
-      depths.push(comment ? -1 : depth);
+      depths.push(depth);
       const text = cppLiteralsBlanked(lines[l - 1] ?? '', l, rawLines);
       for (let i = l === decl.startLine ? decl.startColumn : 0; i < text.length; i++) {
         const c = text[i]!;
-        if (comment) {
-          if (c === '*' && text[i + 1] === '/') {
-            comment = false;
-            i++;
-          }
-        } else if (c === '/' && text[i + 1] === '/') {
-          break;
-        } else if (c === '/' && text[i + 1] === '*') {
-          comment = true;
-          i++;
-        } else if (c === '(') {
-          depth++;
-        } else if (c === ')' && depth > 0) {
-          depth--;
-        }
+        if (c === '/' && text[i + 1] === '/') break;
+        else if (c === '(') depth++;
+        else if (c === ')' && depth > 0) depth--;
       }
     }
     memo.set(decl.id, depths);
@@ -10764,9 +10749,11 @@ function cppMemberMacroArguments(decl: Node, context: ResolutionContext): string
   if (hit) return hit;
   const words: string[] = [];
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const nonCode = cppNonCodeLines(decl.filePath, context);
   let depth = 0;
   for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.endLine); i++) {
-    const code = cppCodeOf(i === decl.startLine - 1 ? lines[i]!.slice(decl.startColumn) : lines[i]!) ?? '';
+    const blanked = cppLiteralsBlanked(lines[i]!, i + 1, nonCode);
+    const code = cppCodeOf(i === decl.startLine - 1 ? blanked.slice(decl.startColumn) : blanked) ?? '';
     const call = depth === 1 ? /^\s*[A-Z][A-Z0-9_]*\s*\(([^;{}]*)\)\s*;?\s*$/.exec(code) : null;
     if (call) words.push(...call[1]!.split(/\W+/).filter((w) => w.length >= 3));
     for (const c of code) {
@@ -10792,7 +10779,8 @@ function cppBaseSpecifiers(decl: Node, context: ResolutionContext): string[] {
   if (hit) return hit;
   const specs: string[] = [];
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
-  const head = lines?.slice(decl.startLine - 1, decl.startLine + 11) ?? [];
+  const nonCode = cppNonCodeLines(decl.filePath, context);
+  const head = (lines?.slice(decl.startLine - 1, decl.startLine + 11) ?? []).map((l, k) => cppLiteralsBlanked(l, decl.startLine + k, nonCode));
   if (head.length > 0) {
     head[0] = head[0]!.slice(decl.startColumn);
     const text = head.map((l) => cppCodeOf(l) ?? '').join('\n');
@@ -10823,7 +10811,9 @@ function cppUsingDeclares(decl: Node, base: Node, name: string, context: Resolut
   if (!usings) {
     usings = [];
     const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
-    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine).map((l) => cppCodeOf(l) ?? '').join('\n');
+    const nonCode = cppNonCodeLines(decl.filePath, context);
+    const body = lines.slice(decl.startLine - 1, decl.endLine ?? decl.startLine)
+      .map((l, k) => cppCodeOf(cppLiteralsBlanked(l, decl.startLine + k, nonCode)) ?? '').join('\n');
     for (const m of body.matchAll(/\busing\s+(?!namespace\b)((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}]*>)?)\s*::\s*([A-Za-z_]\w*)\s*;/g)) {
       usings.push([cppLastSegment(stripCppTemplateArguments(m[1]!).trim()), m[2]!]);
     }
@@ -10859,9 +10849,10 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const word = new RegExp(`\\b${escaped}\\b`);
   const declarator = buildDeclaratorRegex(escaped);
+  const nonCode = cppNonCodeLines(caller.filePath, context);
   for (let i = Math.max(0, caller.startLine - 1); i < Math.min(lines.length, ref.line); i++) {
     if (!word.test(lines[i]!)) continue;
-    const code = cppCodeOf(lines[i]!);
+    const code = cppCodeOf(cppLiteralsBlanked(lines[i]!, i + 1, nonCode));
     if (!code || !word.test(code)) continue;
     if (cppRebindsReceiver(code, escaped)) return true;
     // `std::function<void()> done;` reads as a declaration once its template arguments are gone.
@@ -10875,13 +10866,16 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
 }
 
 /**
- * A C++ source line as code, for reading declarations: null for a line of a
- * comment (`// …`, ` * …`), else the line with its comments blanked, columns
- * kept. Receiver inference read leveldb's `// … non-null imm_` as a
- * declaration of `imm_` with the type `null`.
+ * A C++ source line as code, for reading declarations: null for a `// …`
+ * line, else the line with its comments blanked, columns kept. Receiver
+ * inference read leveldb's `// … non-null imm_` as a declaration of `imm_`
+ * with the type `null`. A line inside a block comment is blank by the time
+ * it gets here (cppLiteralsBlanked, from cppNonCodeLines): a line starting
+ * with `*` is not one by that alone, as `*widget_;` continuing a declaration
+ * is not.
  */
 function cppCodeOf(line: string): string | null {
-  if (/^\s*(?:\/\/|\*)/.test(line)) return null;
+  if (/^\s*\/\//.test(line)) return null;
   let code = line.replace(/\/\*.*?\*\//g, (c) => ' '.repeat(c.length));
   // A block comment opening here runs past the line.
   const open = code.indexOf('/*');
@@ -10939,7 +10933,7 @@ function inferCppReceiverType(
   // A declaration in a string literal is text: protobuf's upb generator
   // writes `upb_MiniTableField field = $field_init$;` in the raw string it
   // emits, above calls on its own `upb::FieldDefPtr field` parameter.
-  const rawLines = cppRawStringLines(ref.filePath, context);
+  const rawLines = cppNonCodeLines(ref.filePath, context);
   // Past the calling function's first line, C++ looks the name up among the
   // members of the function's class before anything outside it.
   const caller = context.getNodeById?.(ref.fromNodeId);
@@ -11042,7 +11036,7 @@ function inferCppReceiverType(
       ? context.getFileLines(headerPath)
       : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
     if (!headerLines) continue;
-    const headerRawLines = cppRawStringLines(headerPath, context);
+    const headerRawLines = cppNonCodeLines(headerPath, context);
 
     for (let i = 0; i < headerLines.length; i++) {
       const text = headerLines[i]!;
@@ -11212,7 +11206,7 @@ function cppAutoInitializerStatement(
   lines: readonly string[],
   index: number,
   receiverName: string,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
   const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const start = new RegExp(`\\b${escaped}\\b\\s*=(?!=)`).exec(line);
@@ -11227,7 +11221,7 @@ function cppStatementFrom(
   text: string,
   lines: readonly string[],
   index: number,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
   for (let next = index + 1; ; next++) {
     const end = cppStatementEnd(text);
@@ -11259,7 +11253,7 @@ function cppStructuredBindingType(
   callLineIndex: number,
   ref: UnresolvedRef,
   context: ResolutionContext,
-  rawLines: ReturnType<typeof cppRawStringLines>,
+  rawLines: ReturnType<typeof cppNonCodeLines>,
 ): CppWrittenType | null {
   if (!line.includes('[')) return null;
   for (const m of line.matchAll(CPP_STRUCTURED_BINDING)) {
