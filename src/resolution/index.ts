@@ -28,6 +28,8 @@ import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
+import { clearPascalReferenceMemos, matchPascalReference } from './pascal-references';
+import { matchNestedRoutine } from './pascal-nested';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
@@ -570,6 +572,7 @@ export class ReferenceResolver {
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);
       clearVbnetReceiverMemos(this.context);
+      clearPascalReferenceMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
       clearCppTypeAliasMemos(this.context);
@@ -1261,6 +1264,10 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    const nested = matchNestedRoutine(ref, this.context);
+    if (nested !== undefined) return nested;
+    const pascal = matchPascalReference(ref, this.context);
+    if (pascal !== undefined) return pascal;
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);

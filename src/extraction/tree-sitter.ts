@@ -31,6 +31,7 @@ import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
+import { DelphiPackageExtractor } from './delphi-package-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
@@ -597,6 +598,7 @@ export class TreeSitterExtractor {
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  private pascalNestedNames: Set<string>[] = [];
   // Function-as-value capture (#756): per-language spec + candidates collected
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
   // (see flushFnRefCandidates).
@@ -8087,6 +8089,7 @@ export class TreeSitterExtractor {
     if (!parentId && !fullName.includes('.')) {
       const fnNode = this.createNode('function', fullName, declProc, {
         signature: this.extractor?.getSignature?.(declProc, this.source),
+        returnType: this.extractor?.getReturnType?.(declProc, this.source),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
       if (fnNode) {
@@ -8099,151 +8102,134 @@ export class TreeSitterExtractor {
     if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
-    // Visit the block for calls
-    const block = node.namedChildren.find(
-      (c: SyntaxNode) => c.type === 'block'
-    );
-    if (block) {
-      this.nodeStack.push(parentId);
-      this.visitPascalBlock(block);
+    const routine = this.nodes.find(n => n.id === parentId);
+    const nestable = routine?.kind === (fullName.includes('.') ? 'method' : 'function');
+    this.extractPascalRoutineBody(node, parentId, nestable ? routine!.qualifiedName : null, new Set());
+  }
+
+  /**
+   * Nested routines get their own function node, qualified under the routine
+   * that declares them, and own the calls in their bodies. The names visible
+   * in a body gate which bare identifiers are recorded as calls: the resolver
+   * decides lexically which nested routine, if any, such a name denotes.
+   */
+  private extractPascalRoutineBody(
+    defProc: SyntaxNode,
+    routineId: string,
+    qualifiedName: string | null,
+    outerNames: ReadonlySet<string>
+  ): void {
+    const names = new Set(outerNames);
+    const nested: Array<{ node: SyntaxNode; id: string; qualifiedName: string }> = [];
+    if (qualifiedName) {
+      this.nodeStack.push(routineId);
+      for (const child of defProc.namedChildren) {
+        if (child.type !== 'defProc') continue;
+        const declProc = child.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+        const nameNode = declProc && getChildByField(declProc, 'name');
+        if (!declProc || nameNode?.type !== 'identifier') continue;
+        const name = getNodeText(nameNode, this.source).trim();
+        const fnNode = this.createNode('function', name, child, {
+          qualifiedName: `${qualifiedName}::${name}`,
+          signature: this.extractor?.getSignature?.(declProc, this.source),
+          returnType: this.extractor?.getReturnType?.(declProc, this.source),
+        });
+        if (!fnNode) continue;
+        names.add(name.toLowerCase());
+        nested.push({ node: child, id: fnNode.id, qualifiedName: fnNode.qualifiedName });
+      }
       this.nodeStack.pop();
     }
+    const block = defProc.namedChildren.find((c: SyntaxNode) => c.type === 'block');
+    if (block) {
+      this.pascalNestedNames.push(names);
+      this.nodeStack.push(routineId);
+      this.visitPascalBlock(block);
+      this.nodeStack.pop();
+      this.pascalNestedNames.pop();
+    }
+    for (const child of nested) this.extractPascalRoutineBody(child.node, child.id, child.qualifiedName, names);
   }
 
-  /**
-   * Extract function calls from a Pascal expression
-   */
+  private pascalCalleeName(node: SyntaxNode): string {
+    if (node.type === 'identifier') return getNodeText(node, this.source);
+    if (node.type === 'exprCall') {
+      const callee = node.namedChild(0);
+      const name = callee ? this.pascalCalleeName(callee) : '';
+      return name ? `${name}()` : '';
+    }
+    if (node.type === 'exprParens') {
+      const inner = node.namedChild(0);
+      return inner ? this.pascalCalleeName(inner) : '';
+    }
+    if (node.type === 'exprBinary' && getChildByField(node, 'operator')?.type === 'kAs') {
+      const type = getChildByField(node, 'rhs');
+      return type ? this.pascalCalleeName(type) : '';
+    }
+    if (node.type === 'exprSubscript') {
+      const entity = getChildByField(node, 'entity');
+      const name = entity ? this.pascalCalleeName(entity) : '';
+      return name ? `${name}[]` : '';
+    }
+    if (node.type !== 'exprDot') return '';
+    const receiver = getChildByField(node, 'lhs');
+    const member = getChildByField(node, 'rhs');
+    const name = receiver ? this.pascalCalleeName(receiver) : '';
+    return name && member?.type === 'identifier'
+      ? `${name}.${getNodeText(member, this.source)}`
+      : '';
+  }
+
+  private extractPascalReceiver(node: SyntaxNode): void {
+    const receiver = getChildByField(node, 'lhs');
+    if (receiver?.type === 'exprCall') this.extractPascalCall(receiver);
+    else if (receiver?.type === 'exprDot') this.extractPascalParenlessCall(receiver);
+    else if (receiver?.type === 'identifier') {
+      const callerId = this.nodeStack[this.nodeStack.length - 1];
+      if (callerId) this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: `Self.${getNodeText(receiver, this.source)}`,
+        referenceKind: 'calls',
+        line: receiver.startPosition.row + 1,
+        column: receiver.startPosition.column,
+      });
+    }
+    else if (receiver) this.visitPascalBlock(receiver);
+  }
+
   private extractPascalCall(node: SyntaxNode): void {
-    if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
-    if (!callerId) return;
-
-    // Get the callee name — first child is typically the identifier or exprDot
-    const firstChild = node.namedChild(0);
-    if (!firstChild) return;
-
-    let calleeName = '';
-    if (firstChild.type === 'exprDot') {
-      // Chained static-factory call: `TFoo.GetInstance().DoIt()` — the exprDot's
-      // receiver is itself an `exprCall`, so the bare identifier list would
-      // collapse to just `DoIt` and mis-resolve to a same-named method on an
-      // unrelated class. Encode `TFoo.GetInstance().DoIt` so resolution infers
-      // DoIt's class from what `TFoo.GetInstance` RETURNS (#645/#608). Only a
-      // capitalized class-factory chain; a unary outer method.
-      const innerCall = firstChild.namedChildren.find((c: SyntaxNode) => c.type === 'exprCall');
-      const outerId = firstChild.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop();
-      const method = outerId ? getNodeText(outerId, this.source) : '';
-      if (innerCall && method && /^\w+$/.test(method)) {
-        const innerFirst = innerCall.namedChild(0);
-        let innerCallee = '';
-        if (innerFirst?.type === 'exprDot') {
-          innerCallee = innerFirst.namedChildren
-            .filter((c: SyntaxNode) => c.type === 'identifier')
-            .map((id: SyntaxNode) => getNodeText(id, this.source))
-            .join('.');
-        } else if (innerFirst?.type === 'identifier') {
-          innerCallee = getNodeText(innerFirst, this.source);
-        }
-        // Gate on the Delphi type-naming convention — `TFoo` classes / `IFoo`
-        // interfaces — so a class-factory chain re-encodes but a capitalized
-        // VARIABLE/parameter chain (Pascal capitalizes locals too: `Curve.X().Y()`,
-        // `Self.X().Y()`) stays bare and keeps its existing bare-name resolution.
-        calleeName = innerCallee && /^[TI][A-Z]/.test(innerCallee)
-          ? `${innerCallee}().${method}`
-          : method;
-      } else {
-        // Qualified call: Obj.Method(...)
-        const identifiers = firstChild.namedChildren.filter(
-          (c: SyntaxNode) => c.type === 'identifier'
-        );
-        if (identifiers.length > 0) {
-          calleeName = identifiers.map((id: SyntaxNode) => getNodeText(id, this.source)).join('.');
-        }
-      }
-    } else if (firstChild.type === 'identifier') {
-      calleeName = getNodeText(firstChild, this.source);
-    }
-
-    if (calleeName) {
+    const callee = node.namedChild(0);
+    if (!callerId || !callee) return;
+    const name = this.pascalCalleeName(callee);
+    if (name) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
-        referenceName: calleeName,
+        referenceName: name,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
     }
-
-    // Also visit arguments for nested calls
-    const args = node.namedChildren.find(
-      (c: SyntaxNode) => c.type === 'exprArgs'
-    );
-    if (args) {
-      this.visitPascalBlock(args);
-    }
+    if (callee.type === 'exprDot') this.extractPascalReceiver(callee);
+    const args = node.namedChildren.find((child: SyntaxNode) => child.type === 'exprArgs');
+    if (args) this.visitPascalBlock(args);
   }
 
-  /**
-   * Extract a PAREN-LESS Pascal method/procedure call (`Obj.Method;`,
-   * `TFoo.GetInstance.DoIt;`). Pascal lets a no-arg method drop its parens, so it
-   * parses as a bare `exprDot` (not an `exprCall`). A bare `exprDot` is
-   * syntactically identical to a field/property access, so this is only ever
-   * called for a STATEMENT-level exprDot (caller-gated): a bare `Obj.Field;`
-   * statement is a no-op, so a statement-level dot expression is a call. (An
-   * exprDot in assignment LHS/RHS or a condition is left alone — there it really
-   * can be a field/property read.)
-   */
   private extractPascalParenlessCall(node: SyntaxNode): void {
-    if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
-
-    const receiver = node.namedChild(0);
-    const outerId = node.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop();
-    const method = outerId ? getNodeText(outerId, this.source) : '';
-    if (!method) return;
-
-    let calleeName = '';
-    // Chained: the receiver is itself a call — a paren-less `TFoo.GetInstance` (an
-    // inner exprDot) or a paren'd `TFoo.GetInstance()` (an exprCall). Encode the
-    // chain `TFoo.GetInstance().DoIt` so resolution infers DoIt's class from what
-    // the factory RETURNS (#645/#608), gated on the Delphi `TFoo`/`IFoo` type
-    // convention; a capitalized VARIABLE chain stays a bare method name.
-    if ((receiver?.type === 'exprDot' || receiver?.type === 'exprCall') && /^\w+$/.test(method)) {
-      const innerCalleeNode = receiver.type === 'exprCall' ? receiver.namedChild(0) : receiver;
-      const innerCallee = !innerCalleeNode
-        ? ''
-        : innerCalleeNode.type === 'identifier'
-          ? getNodeText(innerCalleeNode, this.source)
-          : innerCalleeNode.namedChildren
-              .filter((c: SyntaxNode) => c.type === 'identifier')
-              .map((id: SyntaxNode) => getNodeText(id, this.source))
-              .join('.');
-      if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) {
-        calleeName = `${innerCallee}().${method}`;
-        // The T/I-prefixed inner is itself a real call — record it too.
-        if (receiver.type === 'exprCall') this.extractPascalCall(receiver);
-        else this.extractPascalParenlessCall(receiver);
-      } else {
-        calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
-      }
-    } else {
-      // Simple: `Obj.Method` → the dotted name (resolves via the receiver / bare name).
-      calleeName = node.namedChildren
-        .filter((c: SyntaxNode) => c.type === 'identifier')
-        .map((id: SyntaxNode) => getNodeText(id, this.source))
-        .join('.');
-    }
-
-    if (calleeName) {
+    const name = this.pascalCalleeName(node);
+    if (name) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
-        referenceName: calleeName,
+        referenceName: name,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
     }
+    this.extractPascalReceiver(node);
   }
 
   /**
@@ -8264,19 +8250,21 @@ export class TreeSitterExtractor {
         const args = child.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
         if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
       } else if (child.type === 'exprDot') {
-        // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
-        // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
-        // expression) a bare exprDot is ambiguous with a field/property access,
-        // so there we only descend for paren'd inner calls.
-        if (node.type === 'statement') {
-          this.extractPascalParenlessCall(child);
-        } else {
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild?.type === 'exprCall') {
-              this.extractPascalCall(grandchild);
-            }
-          }
+        this.extractPascalParenlessCall(child);
+      } else if (child.type === 'identifier') {
+        const callerId = this.nodeStack[this.nodeStack.length - 1];
+        const visible = this.pascalNestedNames[this.pascalNestedNames.length - 1];
+        const isTarget = (node.type === 'assignment' && getChildByField(node, 'lhs')?.id === child.id) ||
+          (node.type === 'exprUnary' && getNodeText(node, this.source).trimStart().startsWith('@'));
+        const name = getNodeText(child, this.source);
+        if (callerId && !isTarget && visible?.has(name.toLowerCase())) {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: name,
+            referenceKind: 'calls',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
         }
       } else {
         this.visitPascalBlock(child);
@@ -8352,6 +8340,8 @@ export function extractFromSource(
     // Use custom extractor for DFM/FMX form files
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
+  } else if (detectedLanguage === 'pascal' && fileExtension === '.dpk') {
+    result = new DelphiPackageExtractor(filePath, source).extract();
   } else {
     // Native-kernel route (docs/design/rust-kernel-migration-plan.md): gated
     // per language, null when not routed/available or on a kernel error —

@@ -151,6 +151,11 @@ function isRouted(language: Language): boolean {
     .includes(language);
 }
 
+/** `.dpk` sources have a dedicated extractor; the kernel's Pascal grammar has no `package`. */
+function isDelphiPackage(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith('.dpk');
+}
+
 /** True when `language` would be extracted by the kernel right now. */
 export function kernelRoutes(language: Language): boolean {
   return isRouted(language) && kernelSupports(language);
@@ -210,7 +215,7 @@ export function tryKernelExtractRaw(
   source: string,
   language: Language
 ): KernelRawResult | null {
-  if (!kernelRoutes(language) || POST_PASSES[language]) return null;
+  if (!kernelRoutes(language) || isDelphiPackage(filePath) || POST_PASSES[language]) return null;
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
@@ -287,7 +292,7 @@ export function tryKernelExtract(
   source: string,
   language: Language
 ): ExtractionResult | null {
-  if (!kernelRoutes(language)) return null;
+  if (!kernelRoutes(language) || isDelphiPackage(filePath)) return null;
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
