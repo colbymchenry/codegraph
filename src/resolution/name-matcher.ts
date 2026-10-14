@@ -9064,6 +9064,19 @@ function cppTypeBeganAbove(typeName: string): boolean {
 }
 
 /**
+ * Does `line` end a declaration of the receiver begun on an earlier line, a
+ * templated type whose `>`s outnumber its `<`s before the name: rocksdb's
+ * `std::unique_ptr<BlobContents>>>& blob_reqs` under `autovector<std::pair<
+ * BlobReadRequest*,`? The declarator reads no type there, since its template
+ * arguments pair their brackets. (`this->blob_reqs` and `in >> blob_reqs`
+ * declare nothing.)
+ */
+function cppEndsDeclarationBegunAbove(line: string, escapedReceiver: string): boolean {
+  const end = new RegExp(String.raw`(?:^|[^\w:])([A-Za-z_][\w:]*\s*<[^;=(){}]+>)(?:\s*(?:const\b|volatile\b|[*&]+))*\s*${escapedReceiver}\b`).exec(line);
+  return end !== null && cppTypeBeganAbove(end[1]!);
+}
+
+/**
  * The last name of a declared C++ type: `const std::vector<std::pair<int,
  * Foo>>&` → `vector`, `ns::Table<int, Box<int>>` → `Table`. Null when the text
  * names no type.
@@ -9106,8 +9119,16 @@ const CPP_DECLARATOR_ANNOTATION = String.raw`\b(?:absl_nonnull|absl_nullable|abs
  * rocksdb's `std::function<Iterator*()> create_iterator`.
  */
 const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function|move_only_function|copyable_function)|absl\s*::\s*(?:FunctionRef|AnyInvocable))\s*<[^;={}]*>`;
+/**
+ * A template argument list, nested up to three deep: `<std::string,
+ * std::vector<std::pair<int, int>>>`. Its `<`s and `>`s pair up, so on a line
+ * declaring `const std::vector<A*>& a, const std::vector<B>& b` the list
+ * read for `b` is `<B>`: matching any run up to a `>` read `a`'s parameter
+ * into `b`'s type.
+ */
+const CPP_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>`;
 /** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
-const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*<[^;=(){}]+>)?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS})?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
 /** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
 const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
 /** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
@@ -11013,6 +11034,9 @@ function inferCppReceiverType(
           return cppDeclaredType(element.text, elementType, true, ref, context, found);
         }
       }
+      // The end of a declaration begun on an earlier line, maybe the
+      // receiver's: one found further up may be another variable.
+      if (cppEndsDeclarationBegunAbove(line, escapedReceiver)) found.shadowed = true;
       // `for (auto& [cfh, iter] : cfh_iter_pairs_)`, `auto [status, iter] = Open();`.
       const bound = !found.shadowed ? cppStructuredBindingType(line, lines, i, receiverName, callLineIndex, ref, context, rawLines) : null;
       const boundType = bound && normalizeCppTypeName(bound.text);
@@ -16172,6 +16196,8 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
 function splitCppTopLevel(text: string): string[] {
   const out: string[] = [];
   let depth = 0;
+  // Where each template argument list open around the current character closes.
+  const closes: number[] = [];
   let cur = '';
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!;
@@ -16182,13 +16208,44 @@ function splitCppTopLevel(text: string): string[] {
       i = j;
       continue;
     }
-    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth++;
-    else if (ch === ')' || ch === ']' || ch === '}' || (ch === '>' && text[i - 1] !== '-')) depth = Math.max(0, depth - 1);
-    if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    else if (ch === '<') {
+      const end = cppTemplateArgumentsEnd(text, i);
+      if (end > i) closes.push(end);
+    } else if (ch === '>' && closes[closes.length - 1] === i) closes.pop();
+    if (ch === ',' && depth === 0 && closes.length === 0) { out.push(cur.trim()); cur = ''; continue; }
     cur += ch;
   }
   if (cur.trim()) out.push(cur.trim());
   return out;
+}
+
+/**
+ * Where the template argument list the `<` at `at` opens closes: the index
+ * of its `>`, or -1 when the `<` compares or shifts. A template's `<` is
+ * written right after a name, and its `>` comes before the bracket around it
+ * closes: protobuf's `{"declare", has_bit_word_index < 0 ? … : ""}` was read
+ * as one argument, the `<` holding the rest open.
+ */
+function cppTemplateArgumentsEnd(text: string, at: number): number {
+  if (!/\w/.test(text[at - 1] ?? '') || text[at + 1] === '<' || text[at + 1] === '=') return -1;
+  let angles = 0;
+  let others = 0;
+  for (let i = at; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== ch) j += text[j] === '\\' ? 2 : 1;
+      i = j;
+    } else if (ch === '(' || ch === '[' || ch === '{') others++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (--others < 0) return -1;
+    } else if (others > 0) continue;
+    else if (ch === '<') angles++;
+    else if (ch === '>' && text[i - 1] !== '-' && --angles === 0) return i;
+  }
+  return -1;
 }
 
 /** The balanced `( … )` after `name` from `line`/`column` of `file` (up to a dozen lines), or null. */
