@@ -18,15 +18,15 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
-import { referenceNameTail } from './reference-tail';
+import { isModuleKey, referenceNameTail } from './reference-tail';
 
 /**
- * Files that should not be candidates for "dominant file" detection: test/spec
- * files and tool-generated files. Generated files (`*.pb.go`, `*.pulsar.go`,
+ * Files that should not be candidates for "dominant file" detection: tests,
+ * examples and tool-generated files. Generated files (`*.pb.go`, `*.pulsar.go`,
  * mock outputs, …) often have huge in-file edge counts that dwarf the real
  * source — etcd's `rpc.pb.go` has 4× the in-file edges of `server.go`.
  *
@@ -37,21 +37,10 @@ import { referenceNameTail } from './reference-tail';
  */
 function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): boolean {
   if (generated?.has(filePath)) return true;
-  const lp = filePath.toLowerCase();
-  return (
-    /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
-    /_test\.go$/.test(lp) ||
-    /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
-    /_test\.py$/.test(lp) ||
-    /_spec\.rb$/.test(lp) ||
-    /_test\.rb$/.test(lp) ||
-    /\.(test|spec)\.[jt]sx?$/.test(lp) ||
-    /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
-    /(tests?|spec)\.cs$/.test(lp) ||
-    /tests?\.swift$/.test(lp) ||
-    /_test\.dart$/.test(lp) ||
-    isGeneratedFile(filePath)
-  );
+  // Tests, examples, fixtures and benchmarks by the engine's own reading —
+  // LLVM's `unittests/`, Google's `foo_unittest.cc`, a C++ `FooTest.cpp` —
+  // plus the singular `__test__/` some projects use.
+  return isTestFile(filePath) || /(?:^|\/)__test__\//i.test(filePath) || isGeneratedFile(filePath);
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
@@ -72,6 +61,16 @@ const SQLITE_PARAM_CHUNK_SIZE = 500;
 const IS_INTERFACE_MEMBER = (alias: string): string => `EXISTS (
   SELECT 1 FROM edges ce JOIN nodes owner ON owner.id = ce.source
    WHERE ce.target = ${alias}.id AND ce.kind = 'contains' AND owner.kind = 'interface'
+)`;
+
+/**
+ * A SQL predicate: is the reference name in `column` written through one of
+ * the names in the JSON array bound to the next two parameters, as the name
+ * itself or as a member read through it (`Order.objects` through `Order`)?
+ */
+const THROUGH_NAMES = (column: string): string => `(
+  ${column} IN (SELECT value FROM json_each(?))
+  OR (instr(${column}, '.') > 1 AND substr(${column}, 1, instr(${column}, '.') - 1) IN (SELECT value FROM json_each(?)))
 )`;
 
 /**
@@ -3086,6 +3085,176 @@ export class QueryBuilder {
     }));
   }
 
+  /**
+   * Resolution edges out of the nodes of `filePath` whose reference was
+   * written through one of `names` (see {@link THROUGH_NAMES}), with the source
+   * file and language a resurrection needs and the file of each target.
+   * Synthesized (`provenance='heuristic'`) and `contains` edges are left out.
+   */
+  getResolutionEdgesThrough(
+    filePath: string,
+    names: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM (
+           SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path,
+                  CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.refName') END AS ref_name
+             FROM nodes src
+             JOIN edges e ON e.source = src.id
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE src.file_path = ?
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+         ) WHERE ${THROUGH_NAMES('ref_name')}`
+      )
+      .all(filePath, JSON.stringify(names), JSON.stringify(names)) as Array<
+        EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }
+      >;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+      targetFilePath: row.target_file_path,
+    }));
+  }
+
+  /**
+   * The row ids of the failed references of `filePath` that import one of
+   * `modules` or are written through one of `names` (see {@link THROUGH_NAMES}).
+   */
+  getFailedReferencesThrough(filePath: string, modules: readonly string[], names: readonly string[]): number[] {
+    return (this.db
+      .prepare(
+        `SELECT id FROM unresolved_refs
+          WHERE file_path = ? AND status = 'failed'
+            AND ((reference_kind = 'imports' AND reference_name IN (SELECT value FROM json_each(?)))
+                 OR ${THROUGH_NAMES('reference_name')})`
+      )
+      .all(filePath, JSON.stringify(modules), JSON.stringify(names), JSON.stringify(names)) as Array<{ id: number }>)
+      .map((row) => row.id);
+  }
+
+  /** The targets, in other files, of the non-synthesized `imports` edges out of the nodes of `filePath`. */
+  getImportTargetsFromFile(filePath: string): string[] {
+    return (this.db
+      .prepare(
+        `SELECT DISTINCT e.target AS target
+           FROM nodes src
+           JOIN edges e ON e.source = src.id
+           JOIN nodes tgt ON tgt.id = e.target
+          WHERE src.file_path = ?
+            AND e.kind = 'imports'
+            AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+            AND tgt.file_path != ?`
+      )
+      .all(filePath, filePath) as Array<{ target: string }>)
+      .map((row) => row.target);
+  }
+
+  /**
+   * The `imports` edges into the node `targetId` from files other than
+   * `exceptFile`: each importing file, its language, and the module specifier
+   * it wrote (the edge's `refName`; null when it carries none).
+   */
+  getImportsInto(
+    targetId: string,
+    exceptFile: string
+  ): Array<{ filePath: string; language: Language; refName: string | null }> {
+    return (this.db
+      .prepare(
+        `SELECT src.file_path AS file_path, src.language AS language,
+                CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.refName') END AS ref_name
+           FROM edges e
+           JOIN nodes src ON src.id = e.source
+          WHERE e.target = ? AND e.kind = 'imports' AND src.file_path != ?`
+      )
+      .all(targetId, exceptFile) as Array<{ file_path: string; language: Language; ref_name: unknown }>)
+      .map((row) => ({
+        filePath: row.file_path,
+        language: row.language,
+        refName: typeof row.ref_name === 'string' ? row.ref_name : null,
+      }));
+  }
+
+  /**
+   * The module edges (`imports` edges into a file node) into the files an
+   * import of `dir/name` can find instead of a file added there: `dir/name.*`
+   * under another extension, and the folder's own entry, `dir/name/index.*`
+   * or `dir/name/__init__.py`. With the source file and language a
+   * resurrection needs.
+   */
+  getModuleImportsNamed(
+    dir: string,
+    name: string
+  ): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const base = dir ? `${dir}/${name}` : name;
+    // `x.` up to `x/` and `x/index.` up to `x/index/` ('/' is the byte after '.').
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file'
+            AND ((tgt.file_path >= ? AND tgt.file_path < ?) OR (tgt.file_path >= ? AND tgt.file_path < ?) OR tgt.file_path = ?)`
+      )
+      .all(`${base}.`, `${base}/`, `${base}/index.`, `${base}/index/`, `${base}/__init__.py`) as Array<
+        EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
+      >;
+    return rows
+      // Not a deeper path that only shares the prefix (`dir/name.d/x.ts`).
+      .filter((row) => {
+        const file = row.target_file_path;
+        if (file === `${base}/__init__.py`) return true;
+        const index = `${base}/index.`;
+        return !(file.startsWith(index) ? file.slice(index.length) : file.slice(base.length + 1)).includes('/');
+      })
+      .map((row) => ({
+        ...rowToEdge(row),
+        edgeId: row.id,
+        targetFilePath: row.target_file_path,
+        sourceFilePath: row.source_file_path,
+        sourceLanguage: row.source_language,
+      }));
+  }
+
+  /** The files with a resolution edge into one of `targetIds`. */
+  getFilesWithEdgesInto(targetIds: string[]): string[] {
+    const files = new Set<string>();
+    for (let i = 0; i < targetIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = targetIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT src.file_path AS file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+            WHERE e.target IN (${placeholders})
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')`
+        )
+        .all(...chunk) as Array<{ file_path: string }>;
+      for (const row of rows) files.add(row.file_path);
+    }
+    return [...files];
+  }
+
+  /** The import nodes named one of `names` (an import node is named by the module path it imports). */
+  getImportNodesByNames(names: string[]): Array<{ filePath: string; name: string; language: Language }> {
+    const out: Array<{ filePath: string; name: string; language: Language }> = [];
+    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT file_path, name, language FROM nodes WHERE name IN (${placeholders}) AND kind = 'import'`)
+        .all(...chunk) as Array<{ file_path: string; name: string; language: Language }>;
+      for (const row of rows) out.push({ filePath: row.file_path, name: row.name, language: row.language });
+    }
+    return out;
+  }
+
   // ===========================================================================
   // File Operations
   // ===========================================================================
@@ -3841,8 +4010,14 @@ export class QueryBuilder {
    * reference still waits for its own name too, looked up by its whole name:
    * a fresh index links a binding whose module never resolves it by that
    * name alone, to whichever declaration carries it.
+   *
+   * A module key has a ceiling of its own, `perModuleCeiling`. What waits
+   * under it imports a module of that name, so a large population is not
+   * noise: it is every importer of a package whose `__init__.py` was missing
+   * (`from fastapi import FastAPI` across a whole test suite), which the file
+   * that just appeared resolves at once. The ceiling only bounds the work.
    */
-  getRetryableFailedReferences(names: string[], perNameCeiling: number = 500): UnresolvedReference[] {
+  getRetryableFailedReferences(names: string[], perNameCeiling: number = 500, perModuleCeiling: number = 5000): UnresolvedReference[] {
     if (names.length === 0) return [];
 
     const lookups = [
@@ -3863,7 +4038,8 @@ export class QueryBuilder {
           .prepare(`SELECT ${column} AS key, COUNT(*) AS count FROM unresolved_refs WHERE ${where} AND ${column} IN (${placeholders}) GROUP BY ${column}`)
           .all(...chunk) as Array<{ key: string; count: number }>;
         for (const row of counts) {
-          if (row.count <= perNameCeiling) retryKeys.push(row.key);
+          const ceiling = column === 'name_tail' && isModuleKey(row.key) ? perModuleCeiling : perNameCeiling;
+          if (row.count <= ceiling) retryKeys.push(row.key);
         }
       }
 
@@ -3897,26 +4073,40 @@ export class QueryBuilder {
   /**
    * Failed `imports` refs a sync should retry once files appear. An import
    * names a file, a folder or a namespace, which the symbol lookup above
-   * cannot match, so it is found two ways:
+   * cannot match, so it is found three ways:
    *  - by `pathKeys` (`importPathKeys` of each added file), as its tail or its
    *    whole name: `package:app/b.dart` waits for a file named `b.dart`, a
    *    bare `#include "b.h"` or `require 'db.php'` is the file's whole name;
    *  - by `names` (the changed files' namespaces and modules), as its whole
    *    name when its tail is something else: a C# `using Foo.Bar` waits for
    *    the namespace node `Foo.Bar`. An import whose tail is the name is the
-   *    symbol lookup's, under that lookup's ceiling.
-   * Same per-name ceiling as {@link getRetryableFailedReferences}, counted
-   * per key.
+   *    symbol lookup's, under that lookup's ceiling;
+   *  - by `resolvedModules`, module specifiers that now resolve to an added
+   *    file, as its whole name: `@excalidraw/common`, which a `tsconfig` path
+   *    maps to `packages/common/src/index.ts`, waits under the tail `common`,
+   *    which the file's own keys (`src`, `index`) never give.
+   * The other lookups share the per-name ceiling of
+   * {@link getRetryableFailedReferences}, counted per key; this one has the
+   * module ceiling, since a specifier that resolves to the file is no noise.
    */
-  getRetryableFailedImports(pathKeys: string[], names: string[] = [], perNameCeiling: number = 500): UnresolvedReference[] {
+  getRetryableFailedImports(
+    pathKeys: string[],
+    names: string[] = [],
+    perNameCeiling: number = 500,
+    resolvedModules: string[] = [],
+    perModuleCeiling: number = 5000,
+  ): UnresolvedReference[] {
     const failedImports = "status = 'failed' AND reference_kind = 'imports'";
     const lookups = [
-      { keys: pathKeys, column: 'name_tail', where: failedImports },
-      { keys: pathKeys, column: 'reference_name', where: failedImports },
-      { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name` },
+      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling },
+      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling },
+      { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name`, ceiling: perNameCeiling },
+      // A module specifier that now resolves to an added file: no noise, so
+      // the module ceiling, as for a module key.
+      { keys: resolvedModules, column: 'reference_name', where: failedImports, ceiling: perModuleCeiling },
     ];
     const rows = new Map<number, UnresolvedRefRow>();
-    for (const { keys, column, where } of lookups) {
+    for (const { keys, column, where, ceiling } of lookups) {
       const unique = [...new Set(keys)].filter((key) => key.length > 0);
       // Pass 1: per-key counts, chunked under the SQLite parameter limit.
       const retryKeys: string[] = [];
@@ -3927,7 +4117,7 @@ export class QueryBuilder {
           .prepare(`SELECT ${column} AS key, COUNT(*) AS count FROM unresolved_refs WHERE ${where} AND ${column} IN (${placeholders}) GROUP BY ${column}`)
           .all(...chunk) as Array<{ key: string; count: number }>;
         for (const row of counts) {
-          if (row.count <= perNameCeiling) retryKeys.push(row.key);
+          if (row.count <= ceiling) retryKeys.push(row.key);
         }
       }
       // Pass 2: load the surviving rows; a row two lookups find is kept once.
@@ -3952,6 +4142,49 @@ export class QueryBuilder {
       language: row.language as Language,
       rowId: row.id,
     }));
+  }
+
+  /**
+   * The scoped package specifiers (`@excalidraw/common`) of failed imports,
+   * each with one file that wrote it — what a `tsconfig` path or a workspace
+   * package can map to a project file that a sync adds.
+   */
+  getFailedScopedImports(): Array<{ name: string; filePath: string; language: Language }> {
+    return (this.db
+      .prepare(
+        `SELECT reference_name AS name, MIN(file_path) AS file_path, language
+           FROM unresolved_refs
+          WHERE status = 'failed' AND reference_kind = 'imports'
+            AND reference_name GLOB '@?*/?*' AND reference_name NOT GLOB '@*/*/*'
+          GROUP BY reference_name`
+      )
+      .all() as Array<{ name: string; file_path: string; language: Language }>)
+      .map((row) => ({ name: row.name, filePath: row.file_path, language: row.language }));
+  }
+
+  /**
+   * Failed imports of the folder the importing file is in or under (`.`,
+   * `..`). Their tail is empty, since they name a folder only through where
+   * they are written, so no added file's keys find them.
+   */
+  getFailedFolderImports(): UnresolvedReference[] {
+    return (this.db
+      .prepare(
+        `SELECT * FROM unresolved_refs
+          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN ('.', './', '..', '../')`
+      )
+      .all() as UnresolvedRefRow[])
+      .map((row) => ({
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+        filePath: row.file_path,
+        language: row.language as Language,
+        rowId: row.id,
+      }));
   }
 
   /**
@@ -4000,6 +4233,18 @@ export class QueryBuilder {
   }
 
   /**
+   * The keys failed references wait for a module under (`module:pages`), each
+   * once. Reads only the failed rows parked under such keys: a range of
+   * idx_unresolved_failed_tail, or the whole of
+   * idx_unresolved_failed_module_name.
+   */
+  getFailedModuleKeys(): string[] {
+    return (this.db
+      .prepare(`SELECT DISTINCT name_tail AS key FROM unresolved_refs WHERE status = 'failed' AND name_tail GLOB 'module:*'`)
+      .all() as Array<{ key: string }>).map((row) => row.key);
+  }
+
+  /**
    * Put failed refs back in the pending set, for the next resolution pass —
    * the sync's orphan sweep — to try again. Returns the number re-opened.
    */
@@ -4016,6 +4261,11 @@ export class QueryBuilder {
       }
     })();
     return changed;
+  }
+
+  /** The highest edge id so far: edges inserted later have higher ids (AUTOINCREMENT). */
+  getMaxEdgeId(): number {
+    return (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM edges').get() as { id: number }).id;
   }
 
   /**
@@ -4041,15 +4291,24 @@ export class QueryBuilder {
    * population the name is generic (`get`, `clear`, …), one definition changing
    * won't flip most of them, and rebinding an arbitrary subset is both wasted
    * work and incoherent coverage.
+   *
+   * With `countedUpToEdgeId`, only edges up to that id count toward the
+   * ceiling: the ones a sync's failed-ref retry made just now were resolved
+   * against the graph this sync built, and relinking every `from django.urls
+   * import path` must not push `path` over the ceiling and leave the edges the
+   * new definitions moved unrebound. They are still returned under a name
+   * that stays below it.
    */
   getResolutionEdgesByTargetName(
     names: string[],
-    perNameCeiling: number = 500
+    perNameCeiling: number = 500,
+    countedUpToEdgeId?: number
   ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
     if (names.length === 0) return [];
 
     // Pass 1: per-name edge counts, chunked under the SQLite parameter limit.
     const keep: string[] = [];
+    const counted = countedUpToEdgeId === undefined ? '' : 'AND e.id <= ?';
     for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
@@ -4060,9 +4319,10 @@ export class QueryBuilder {
              JOIN nodes tgt ON tgt.id = e.target
             WHERE tgt.name IN (${placeholders})
               AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+              ${counted}
             GROUP BY tgt.name`
         )
-        .all(...chunk) as Array<{ name: string; count: number }>;
+        .all(...chunk, ...(countedUpToEdgeId === undefined ? [] : [countedUpToEdgeId])) as Array<{ name: string; count: number }>;
       for (const row of counts) {
         if (row.count <= perNameCeiling) keep.push(row.name);
       }
@@ -4095,6 +4355,46 @@ export class QueryBuilder {
       }
     }
     return out;
+  }
+
+  /**
+   * The resolution edges out of route nodes that a change to `filePaths` can
+   * move: from a route in another file, to a node of one of `filePaths`, or to
+   * a value declared beside the route — what a route rendering
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to while that
+   * module is missing. Returned with the route's file and language, which a
+   * resurrection needs, in the order they were written, so references put
+   * back resolve in that order again. Synthesized edges carry no reference to
+   * resurrect and are left out.
+   */
+  getRouteEdgesMovedBy(filePaths: readonly string[]): Array<Edge & {
+    edgeId: number;
+    sourceFilePath: string;
+    sourceLanguage: Language;
+  }> {
+    if (filePaths.length === 0) return [];
+    const files = JSON.stringify(filePaths);
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes src
+           JOIN edges e ON e.source = src.id
+           JOIN nodes tgt ON tgt.id = e.target
+          WHERE src.kind = 'route'
+            AND e.kind != 'contains'
+            AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+            AND src.file_path NOT IN (SELECT value FROM json_each(?))
+            AND (tgt.file_path IN (SELECT value FROM json_each(?))
+              OR (tgt.file_path = src.file_path AND tgt.kind IN ('constant', 'variable')))
+          ORDER BY e.id`
+      )
+      .all(files, files) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
   }
 
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */

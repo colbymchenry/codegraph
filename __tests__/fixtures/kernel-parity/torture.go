@@ -6,7 +6,7 @@ import (
 	pkga "example.com/other/pkga"
 )
 
-const MAX_ITEMS = 128
+const MAX_ITEMS = 128 // the line's own comment, not DefaultRegistry's doc
 
 var DefaultRegistry = NewRegistry()
 
@@ -14,6 +14,7 @@ var handlerTable = map[string]func(int){
 	"recv": TargetCb,
 }
 
+// Widget is documented above its own type declaration.
 type Widget struct {
 	*Base
 	Queryable
@@ -27,6 +28,13 @@ type Widget struct {
 type Stack[T any] struct {
 	items []T
 }
+
+// Units of time: the group's comment, no member's doc.
+type (
+	Seconds int
+	// Minutes is documented inside its group.
+	Minutes int
+)
 
 type Core interface {
 	Reader

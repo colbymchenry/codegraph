@@ -73,6 +73,11 @@ const MODULE_REFERENCE = /^(?:layout:)?(?:lazy-import:(.+)|import:(.+)#[^#]+)$/;
 /** What a module reference's tail starts with. No symbol's name does, so a lookup by symbol names never finds one. */
 const MODULE_KEY = 'module:';
 
+/** Whether a tail or lookup key waits for a module (`module:Team`) rather than for a name. */
+export function isModuleKey(key: string): boolean {
+  return key.startsWith(MODULE_KEY);
+}
+
 /**
  * The tail of a reference that waits for a module rather than for a name: the
  * module path's stem behind 'module:' — `./pages/Team` → 'module:Team',
@@ -127,5 +132,12 @@ export function importPathKeys(filePath: string): string[] {
  * name (`importBindingTail`), which is parked under the same keys.
  */
 export function moduleReferenceKeys(filePath: string): string[] {
-  return importPathKeys(filePath).map((key) => MODULE_KEY + key);
+  const keys = importPathKeys(filePath);
+  // A Python package's `__init__.py` is a submodule of the package above it,
+  // as a module file beside it is through its folder: `app/pkg/sub/__init__.py`
+  // is what `from app.pkg import sub as s`, parked as 'module:pkg', imports.
+  const parts = filePath.split('/');
+  const above = parts.length >= 3 && parts[parts.length - 1] === '__init__.py' ? parts[parts.length - 3]! : '';
+  if (above && !keys.includes(above)) keys.push(above);
+  return keys.map((key) => MODULE_KEY + key);
 }

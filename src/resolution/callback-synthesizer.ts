@@ -40,6 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
+import { declaredComponent, lazyValueModules } from './frameworks/react';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -51,7 +52,11 @@ const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
-const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
+// A tag's name ends at whitespace, `/` or `>`, or at the `<` of the type
+// arguments a generic component's tag passes: `<PaginatedList<Document>
+// items={…} />` renders PaginatedList. The lookahead leaves that `<` to open
+// the next match, which `opensTag` reads as a type argument, not a tag.
+const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)(?=[\s/><])/g;
 const MAX_JSX_CHILDREN = 30;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
@@ -1702,6 +1707,18 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+/**
+ * Whether a JSX tag can render `node` (`jsxChild`): a script's component,
+ * function or class named with a tag's capital, or any component, which a
+ * default import names under a name of its own. A tag in a file a sync never
+ * touched may name one the sync adds, so adding one redraws the JSX edges.
+ * (A `.vue` or `.svelte` file redraws them on any change.)
+ */
+export function isJsxChildCandidate(node: Pick<Node, 'kind' | 'name' | 'language'>): boolean {
+  return JSX_CHILD_KINDS.has(node.kind) && JS_FAMILY.includes(node.language) &&
+    (node.kind === 'component' || /^[A-Z]/.test(node.name));
+}
+
 function languageForJsxFile(file: string): Language {
   if (file.endsWith('.tsx')) return 'tsx';
   if (/\.[cm]?ts$/.test(file)) return 'typescript';
@@ -1724,6 +1741,19 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
 }
 
 /**
+ * Does `file` import `name` from a package outside the repository (`import {
+ * Button } from 'antd'`)? A package means one the file's package.json, or an
+ * enclosing one, declares, under a specifier no project file answers. That is
+ * the test the name matcher applies to calls and values. What such a name
+ * renders is the package's, never a project symbol that shares the name.
+ */
+function importedFromPackage(ctx: ResolutionContext, name: string, file: string): boolean {
+  const language = languageForJsxFile(file);
+  const binding = ctx.getImportMappings(file, language).find((m) => m.localName === name);
+  return !!binding && ctx.isOutOfRepoImport?.(binding.source, file, language) === true;
+}
+
+/**
  * The component a JSX tag names, among every node that shares the name.
  *
  * A tag is written in one file, and that file already says which `FrameCard` it
@@ -1737,17 +1767,34 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
  * another sheet.
  *
  * Same file first — a small component declared beside its use is the commonest
- * shape, and the one an import can never disambiguate. Then the file the name
- * is imported from. Then the language, which only decides a tie: a `.tsx` tag
+ * shape, and the one an import can never disambiguate. Then a name the file
+ * imports from a package: that package's component, which is no node here, so
+ * nothing. On SigNoz, antd's `<Button>` rendered the one project `Button` there
+ * was, a styled link in a 404 page's styles. Then the file the name is
+ * imported from. Then the language, which only decides a tie: a `.tsx` tag
  * naming both a TS component and a same-named Swift class means the TS one.
+ *
+ * A value the file declares under the name comes first of all: `const Chart =
+ * lazy(() => import('./Chart'))` renders the component that module exports,
+ * `observer(function Settings() {…})` the function it wraps, and anything
+ * else the declaration itself (`declaredComponent`). Kind alone left it out —
+ * a value is no component node — so a lone function of that name anywhere
+ * won: mantis's vite app rendered the `RegisterPage` of the repository's
+ * Next.js app.
  */
 function jsxChild(
   ctx: ResolutionContext,
   name: string,
   file: string,
-  importsOf: () => Map<string, string>
+  importsOf: () => Map<string, string>,
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>
 ): Node | undefined {
+  const own = ownValueOf(name);
+  if (own) return own.component ?? own.declaration;
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  const local = candidates.find((n) => n.filePath === file);
+  if (local) return local;
+  if (importedFromPackage(ctx, name, file)) return undefined;
   if (candidates.length === 0) {
     // A name nothing declares is the file's DEFAULT import of a module's one
     // component under another name: segmented-control renders
@@ -1763,8 +1810,6 @@ function jsxChild(
     return components.length === 1 ? components[0] : undefined;
   }
   if (candidates.length === 1) return candidates[0];
-  const local = candidates.find((n) => n.filePath === file);
-  if (local) return local;
   const from = importsOf().get(name);
   if (from) {
     const imported = candidates.find((n) => n.filePath === from);
@@ -1823,7 +1868,8 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
  * a tag, not only in a type argument or parameter list (`useState<User>()`,
  * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
  * read its `Document` model class as a child), and the name must resolve to a
- * component/function/class node. A name the parent binds itself by its first
+ * component/function/class node, or to a value the file declares itself (see
+ * `jsxChild`). A name the parent binds itself by its first
  * tag — a parameter, or a `const` like outline's `const Content = variant ===
  * "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent` — is that
  * local, and renders only a component declared inside the parent
@@ -1851,6 +1897,12 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    // Once per file and name: the value the file declares under it, if any.
+    const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
+    const ownValueOf = (name: string) => {
+      if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
+      return ownValues.get(name);
+    };
     // A function renders the tags its own lines hold, so functions that span
     // the same lines share them: every function of a minified bundle spans
     // its one line, and reading that line again per function took 9 to 25 s
@@ -1887,7 +1939,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
         if (!line) continue;
-        let child = jsxChild(ctx, name, file, importsOf);
+        let child = jsxChild(ctx, name, file, importsOf, ownValueOf);
         // A name the parent binds itself by its first tag is that local.
         if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
           child = declaredInside(ctx, name, parent, child);
@@ -1976,17 +2028,22 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
       added++;
     };
     // Prefer a target in THIS SFC (handlers live in the same file's script) —
-    // avoids cross-file mis-match when a name repeats across a monorepo.
-    const resolve = (name: string, kinds: Set<string>): Node | undefined => {
+    // avoids cross-file mis-match when a name repeats across a monorepo. A name
+    // the SFC imports from a package (`import { NButton } from 'naive-ui'`) is
+    // the package's: no other project symbol, nor a Nuxt auto-imported
+    // component (`fallback`), is what it renders or calls.
+    const resolve = (name: string, kinds: Set<string>, fallback?: Node): Node | undefined => {
       const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind));
-      return matches.find((n) => n.filePath === file) ?? matches[0];
+      const local = matches.find((n) => n.filePath === file);
+      if (local || importedFromPackage(ctx, name, file)) return local;
+      return matches[0] ?? fallback;
     };
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
     while ((m = VUE_KEBAB_RE.exec(tpl))) {
       const tag = kebabToPascal(m[1]!);
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: m[1] });
     }
     // PascalCase component tags. Try a direct name match first (flat components
     // and explicit registrations), then the Nuxt dir-prefixed auto-import name
@@ -1994,7 +2051,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     VUE_PASCAL_RE.lastIndex = 0;
     while ((m = VUE_PASCAL_RE.exec(tpl))) {
       const tag = m[1]!;
-      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+      addEdge(resolve(tag, COMPONENT_KINDS, nuxtComponents.get(tag)), { synthesizedBy: 'jsx-render', via: tag });
     }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
@@ -4622,15 +4679,20 @@ export async function synthesizeCallbackEdges(
   // Files whose text could feed a pass (inputs that produce NO edges included,
   // e.g. an over-cap channel: deleting one may make the full pass viable). It
   // depends only on the files, so with a pool the main thread reads them while
-  // the workers run the passes instead of after.
+  // the workers run the passes instead of after. A module a file's own lazy
+  // value loads feeds the JSX that names the value, even with no markup of its
+  // own: a page given its default export, or a barrel rewired, redraws it.
   const collectInputs = async (): Promise<string[]> => {
-    const found: string[] = [];
+    const found = new Set<string>();
     for (const file of ctx.getAllFiles()) {
       const content = ctx.readFile(file);
-      if (content !== null && hasSynthesisPattern(file, content)) found.push(file);
+      if (content !== null && hasSynthesisPattern(file, content)) {
+        found.add(file);
+        if (/\bimport\s*\(/.test(content)) for (const read of lazyValueModules(file, ctx)) found.add(read);
+      }
       await yieldToLoop();
     }
-    return found;
+    return [...found];
   };
   let inputs: string[] | null = null;
 
