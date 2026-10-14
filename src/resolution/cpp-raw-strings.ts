@@ -10,11 +10,13 @@
  * found by reading the file once, as the compiler does: comments, ordinary
  * string and character literals, and raw strings with their delimiters.
  * An ordinary string can't span lines, so its contents are blanked on the
- * line being read.
+ * line being read. Block comments are found in the same pass and blanked
+ * too: a line inside one is no code whatever it starts with, and a line
+ * outside one is code even when it starts with `*` (`*out = value;`).
  */
 import type { ResolutionContext } from './types';
 
-/** Column ranges, `[start, end)`, a raw string literal takes on a line (its quotes and delimiters included). */
+/** Column ranges, `[start, end)`, a raw string literal or a block comment takes on a line (its quotes, delimiters and comment markers included). */
 type Ranges = Array<[number, number]>;
 
 const RAW_STRING_LINES = new WeakMap<ResolutionContext, Map<string, Map<number, Ranges>>>();
@@ -27,17 +29,17 @@ export function clearCppRawStringMemos(context: ResolutionContext): void {
 const isWordChar = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9_$]/.test(c);
 
 /**
- * The 1-based lines of a C or C++ file that raw string literals cover, each
- * with the columns they take. Empty for a file with none.
+ * The 1-based lines of a C or C++ file that raw string literals or block
+ * comments cover, each with the columns they take. Empty for a file with none.
  */
-export function cppRawStringLines(file: string, context: ResolutionContext): Map<number, Ranges> {
+export function cppNonCodeLines(file: string, context: ResolutionContext): Map<number, Ranges> {
   let memo = RAW_STRING_LINES.get(context);
   if (!memo) RAW_STRING_LINES.set(context, (memo = new Map()));
   const hit = memo.get(file);
   if (hit) return hit;
   const lines = new Map<number, Ranges>();
   const text = context.readFile(file);
-  if (text && text.includes('R"')) {
+  if (text && (text.includes('R"') || text.includes('/*'))) {
     let line = 1;
     let column = 0;
     const n = text.length;
@@ -74,7 +76,9 @@ export function cppRawStringLines(file: string, context: ResolutionContext): Map
         advance(end < 0 ? n : end);
       } else if (c === '/' && next === '*') {
         const end = text.indexOf('*/', i + 2);
-        advance(end < 0 ? n : end + 2);
+        const to = end < 0 ? n : end + 2;
+        mark(i, line, column, to);
+        advance(to);
       } else if (c === '"') {
         // `R"`, `u8R"`, `uR"`, `UR"`, `LR"`, not part of a longer name.
         const prefix = /(?:u8|[uUL])?R$/.exec(text.slice(Math.max(0, i - 3), i));
