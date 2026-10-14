@@ -40,6 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
+import { declaredComponent, lazyValueModules } from './frameworks/react';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1772,13 +1773,24 @@ function importedFromPackage(ctx: ResolutionContext, name: string, file: string)
  * was, a styled link in a 404 page's styles. Then the file the name is
  * imported from. Then the language, which only decides a tie: a `.tsx` tag
  * naming both a TS component and a same-named Swift class means the TS one.
+ *
+ * A value the file declares under the name comes first of all: `const Chart =
+ * lazy(() => import('./Chart'))` renders the component that module exports,
+ * `observer(function Settings() {…})` the function it wraps, and anything
+ * else the declaration itself (`declaredComponent`). Kind alone left it out —
+ * a value is no component node — so a lone function of that name anywhere
+ * won: mantis's vite app rendered the `RegisterPage` of the repository's
+ * Next.js app.
  */
 function jsxChild(
   ctx: ResolutionContext,
   name: string,
   file: string,
-  importsOf: () => Map<string, string>
+  importsOf: () => Map<string, string>,
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>
 ): Node | undefined {
+  const own = ownValueOf(name);
+  if (own) return own.component ?? own.declaration;
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
   const local = candidates.find((n) => n.filePath === file);
   if (local) return local;
@@ -1856,7 +1868,8 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
  * a tag, not only in a type argument or parameter list (`useState<User>()`,
  * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
  * read its `Document` model class as a child), and the name must resolve to a
- * component/function/class node. A name the parent binds itself by its first
+ * component/function/class node, or to a value the file declares itself (see
+ * `jsxChild`). A name the parent binds itself by its first
  * tag — a parameter, or a `const` like outline's `const Content = variant ===
  * "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent` — is that
  * local, and renders only a component declared inside the parent
@@ -1884,6 +1897,12 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    // Once per file and name: the value the file declares under it, if any.
+    const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
+    const ownValueOf = (name: string) => {
+      if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
+      return ownValues.get(name);
+    };
     // A function renders the tags its own lines hold, so functions that span
     // the same lines share them: every function of a minified bundle spans
     // its one line, and reading that line again per function took 9 to 25 s
@@ -1920,7 +1939,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
         if (!line) continue;
-        let child = jsxChild(ctx, name, file, importsOf);
+        let child = jsxChild(ctx, name, file, importsOf, ownValueOf);
         // A name the parent binds itself by its first tag is that local.
         if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
           child = declaredInside(ctx, name, parent, child);
@@ -4660,15 +4679,20 @@ export async function synthesizeCallbackEdges(
   // Files whose text could feed a pass (inputs that produce NO edges included,
   // e.g. an over-cap channel: deleting one may make the full pass viable). It
   // depends only on the files, so with a pool the main thread reads them while
-  // the workers run the passes instead of after.
+  // the workers run the passes instead of after. A module a file's own lazy
+  // value loads feeds the JSX that names the value, even with no markup of its
+  // own: a page given its default export, or a barrel rewired, redraws it.
   const collectInputs = async (): Promise<string[]> => {
-    const found: string[] = [];
+    const found = new Set<string>();
     for (const file of ctx.getAllFiles()) {
       const content = ctx.readFile(file);
-      if (content !== null && hasSynthesisPattern(file, content)) found.push(file);
+      if (content !== null && hasSynthesisPattern(file, content)) {
+        found.add(file);
+        if (/\bimport\s*\(/.test(content)) for (const read of lazyValueModules(file, ctx)) found.add(read);
+      }
       await yieldToLoop();
     }
-    return found;
+    return [...found];
   };
   let inputs: string[] | null = null;
 
