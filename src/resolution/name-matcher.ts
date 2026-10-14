@@ -10681,9 +10681,13 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
  * (cppOverloadFit), then, among overloads those fit alike, by the types the
  * arguments have where the call reads them (cppArgumentTypeFit). rocksdb's
  * `Insert(ch)` on a `char ch` is `Insert(char key, …)`, not `Insert(const
- * std::string& key, …)`.
+ * std::string& key, …)`. A deleted overload (`void reset(T*) = delete;`) is
+ * none a call that compiles reaches, so it is only taken when every one is.
  */
-function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
+function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node {
+  if (candidates.length === 1) return candidates[0]!;
+  const callable = candidates.filter((n) => !isCppDeletedFunction(n, name, context));
+  const overloads = callable.length > 0 ? callable : candidates;
   if (overloads.length === 1) return overloads[0]!;
   const args = cppCallArguments(ref, name, context);
   if (!args) return overloads[0]!;
@@ -10703,6 +10707,27 @@ function cppOverloadFor(overloads: Node[], name: string, ref: UnresolvedRef, con
     }
   }
   return best;
+}
+
+const CPP_DELETED_FUNCTIONS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether the C++ function or method `n`, named `name`, is declared deleted:
+ * from its name to the declaration's `;` or body, it says `= delete`
+ * (protobuf's `void reset(T* PROTOBUF_NULLABLE) = delete;`).
+ */
+function isCppDeletedFunction(n: Node, name: string, context: ResolutionContext): boolean {
+  let memo = CPP_DELETED_FUNCTIONS.get(context);
+  if (!memo) CPP_DELETED_FUNCTIONS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(n.startLine - 1, Math.min(lines.length, n.startLine + 11)).join('\n');
+  const at = text.search(new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`));
+  const declaration = at < 0 ? '' : text.slice(at).split(/[;{]/)[0]!;
+  const deleted = /=\s*delete\b/.test(declaration);
+  memo.set(n.id, deleted);
+  return deleted;
 }
 
 /** What a C++ call's argument is: a literal's kind, or the type a name or expression has as written. */
@@ -10745,7 +10770,7 @@ function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCon
 }
 
 /** What a C++ type is, for an argument to fit a parameter of it. */
-type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'class';
+type CppTypeCategory = 'string' | 'cstring' | 'char' | 'number' | 'bool' | 'pointer' | 'null' | 'class';
 
 const CPP_CHAR_TYPES: ReadonlySet<string> = new Set(['char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t']);
 const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
@@ -10754,12 +10779,16 @@ const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
 ]);
 const CPP_STRING_TYPES: ReadonlySet<string> = new Set(['string', 'wstring', 'string_view', 'wstring_view', 'basic_string', 'basic_string_view']);
 
-/** The category of the written C++ type `type`: a pointer's, a string's, a character's, a number's, a class's. */
+/**
+ * The category of the written C++ type `type`: a pointer's, a string's, a
+ * character's, a number's, `std::nullptr_t`'s, a class's.
+ */
 function cppTypeCategory(type: string): CppTypeCategory {
   const flat = stripCppTemplateArguments(type).replace(/\b(?:const|volatile|struct|class|typename|enum)\b/g, ' ').replace(/&+/g, ' ').trim();
   const words = flat.replace(/\*/g, ' ').trim().split(/\s+/);
   const last = cppLastSegment(words[words.length - 1] ?? '');
   if (flat.includes('*')) return CPP_CHAR_TYPES.has(last) && (flat.match(/\*/g) ?? []).length === 1 ? 'cstring' : 'pointer';
+  if (last === 'nullptr_t') return 'null';
   if (last === 'bool') return 'bool';
   if (CPP_CHAR_TYPES.has(last) && words.every((w) => CPP_CHAR_TYPES.has(w) || w === 'signed' || w === 'unsigned')) return 'char';
   if (CPP_NUMBER_TYPES.has(last) || words.every((w) => CPP_NUMBER_TYPES.has(w))) return 'number';
@@ -10788,13 +10817,17 @@ function cppArgumentTypeFit(n: Node, name: string, types: Array<CppArgumentType 
   return score;
 }
 
-/** How a literal fits a parameter of each category. */
+/**
+ * How a literal fits a parameter of each category. `nullptr` is a
+ * `std::nullptr_t` exactly, and a pointer only by conversion: protobuf's
+ * `ptr.reset(nullptr)` is `reset(std::nullptr_t)`, not `reset(T*)`.
+ */
 const CPP_LITERAL_FIT: Record<'char' | 'number' | 'zero' | 'bool' | 'null', Record<CppTypeCategory, number>> = {
-  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, string: -3, class: 0 },
-  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, class: 0 },
-  null: { pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
+  char: { char: 3, number: 1, bool: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  number: { number: 2, char: 1, bool: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  zero: { number: 2, char: 1, bool: 0, pointer: 1, cstring: 1, null: 1, string: -3, class: 0 },
+  bool: { bool: 3, number: 1, char: 0, string: -3, cstring: -3, pointer: -3, null: -3, class: 0 },
+  null: { null: 4, pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
 };
 
 /** How an argument written as type `arg` fits a parameter of type `param` (of category `category`). */
@@ -12009,6 +12042,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_USING_MEMBERS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
   CPP_OVERLOAD_PARAMETERS.delete(context);
+  CPP_DELETED_FUNCTIONS.delete(context);
   CPP_LOOP_ELEMENTS.delete(context);
   CPP_AUTO_LOCALS.delete(context);
   CPP_SCOPE_NAMES.delete(context);
