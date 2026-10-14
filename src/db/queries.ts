@@ -4233,6 +4233,18 @@ export class QueryBuilder {
   }
 
   /**
+   * The keys failed references wait for a module under (`module:pages`), each
+   * once. Reads only the failed rows parked under such keys: a range of
+   * idx_unresolved_failed_tail, or the whole of
+   * idx_unresolved_failed_module_name.
+   */
+  getFailedModuleKeys(): string[] {
+    return (this.db
+      .prepare(`SELECT DISTINCT name_tail AS key FROM unresolved_refs WHERE status = 'failed' AND name_tail GLOB 'module:*'`)
+      .all() as Array<{ key: string }>).map((row) => row.key);
+  }
+
+  /**
    * Put failed refs back in the pending set, for the next resolution pass —
    * the sync's orphan sweep — to try again. Returns the number re-opened.
    */

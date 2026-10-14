@@ -9,7 +9,7 @@ import { Language, Node } from '../../types';
 import { FrameworkExtractionResult, FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
-import { extractLocalExportAliases } from '../alias-binding';
+import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
 import { makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
@@ -550,8 +550,7 @@ function ownExport(source: string, name: string): string | null {
 
 /** True when the module's default export is the binding `local` itself: `export default Page;`, `export { Page as default }`. */
 function exportsBinding(source: string, local: string): boolean {
-  return new RegExp(String.raw`(?:^|;)\s*export\s+default\s+${local.replace(/\$/g, '\\$')}\s*(?:;|$)`, 'm').test(source) ||
-    extractLocalExportAliases(source).some((a) => a.exportedName === 'default' && a.localName === local);
+  return defaultExportBinding(source) === local;
 }
 
 /**

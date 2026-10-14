@@ -24,6 +24,8 @@ import type { Edge, Language, UnresolvedReference } from '../types';
 import type { ImportMapping, ReExport } from './types';
 import { extractImportMappings, extractReExports, pythonModulePath, REEXPORT_MAX_DEPTH } from './import-resolver';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
+import { defaultExportBinding, extractLocalExportAliases } from './alias-binding';
+import { moduleReferenceKeys } from '../db/reference-tail';
 
 /**
  * Languages whose import bindings name what their references are written as:
@@ -41,6 +43,9 @@ const BINDING_LANGUAGES = new Set<Language>([
  * ES-module `export … from`.
  */
 const reExportDepth = (language: Language): number => (language === 'python' ? 3 : REEXPORT_MAX_DEPTH);
+
+/** An export clause, a default export, or CommonJS exports: a module that can hand over a binding it imports. */
+const EXPORTS_A_BINDING = /\bexport\s*\{|\bexport\s+default\s|\bexports\b/;
 
 /** A Python star import, read the way the resolver reads one. */
 const PYTHON_STAR_IMPORT = /^\s*from\s+([\w.]+)\s+import\s+\*/gm;
@@ -75,10 +80,16 @@ export interface ImportReader {
   reExports(file: string, language: Language): ReExport[];
   /** The modules a Python file star-imports, which have no import mapping. */
   starImports(file: string, language: Language): string[];
+  /**
+   * The bindings an ES module's own exports hand over as they are: each local
+   * an export clause names (`export { Page }`), and its default export when
+   * that is a binding (`export default Page;`).
+   */
+  exportedBindings(file: string, language: Language): ReadonlySet<string>;
 }
 
 export function createImportReader(rootDir: string): ImportReader {
-  const memo = new Map<string, { mappings: ImportMapping[]; reExports: ReExport[]; starImports: string[] }>();
+  const memo = new Map<string, { content: string; mappings: ImportMapping[]; reExports: ReExport[]; starImports: string[]; exported?: ReadonlySet<string> }>();
   const read = (file: string, language: Language) => {
     let entry = memo.get(file);
     if (!entry) {
@@ -89,6 +100,7 @@ export function createImportReader(rootDir: string): ImportReader {
         // Gone or unreadable: it imports nothing.
       }
       entry = {
+        content,
         mappings: content ? extractImportMappings(file, content, language) : [],
         reExports: content ? extractReExports(content, language) : [],
         starImports: language === 'python' ? [...content.matchAll(PYTHON_STAR_IMPORT)].map((m) => m[1]!) : [],
@@ -101,6 +113,21 @@ export function createImportReader(rootDir: string): ImportReader {
     mappings: (file, language) => read(file, language).mappings,
     reExports: (file, language) => read(file, language).reExports,
     starImports: (file, language) => read(file, language).starImports,
+    exportedBindings: (file, language) => {
+      const entry = read(file, language);
+      if (!entry.exported) {
+        // Most importers export nothing they import; a commented-out clause
+        // read as one only costs a key lookup.
+        const exported = new Set<string>();
+        if (EXPORTS_A_BINDING.test(entry.content)) {
+          for (const alias of extractLocalExportAliases(entry.content)) exported.add(alias.localName);
+          const binding = defaultExportBinding(entry.content);
+          if (binding) exported.add(binding);
+        }
+        entry.exported = exported;
+      }
+      return entry.exported;
+    },
   };
 }
 
@@ -150,6 +177,66 @@ export function reopenReferencesThroughAddedFiles(
   const failed = [...bindings].flatMap(([file, { modules, names }]) => queries.getFailedReferencesThrough(file, modules, names));
   return reopenModuleEdges(queries, outranked) +
     reopenEdges(queries, bindings, (e) => e.edgeId <= resolvedUpToEdgeId) + queries.reopenFailedReferences(failed);
+}
+
+/** The languages a barrel a lazy route reads through is written in: the ES-module family. */
+const BARREL_LANGUAGES = new Set<Language>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Re-open, for the sync's sweep, the failed references that wait for a module
+ * through a barrel when a file below the barrel appears or gains a
+ * definition. React Router's `import:@/pages#HomePage` waits under the key of
+ * the module it names, `module:pages`. When `pages/index.ts` passes on
+ * `pages/Home/index.tsx`, that file is what the reference waits for, but its
+ * own keys name its folder and stem (`module:Home`), never the barrel's.
+ *
+ * The barrels are the modules that pass one of `files` on, through `export …
+ * from` or an import they export again (`import { HomePage } from './Home';
+ * export { HomePage }`), followed up as deep as the resolver chases a name.
+ * Only keys a failed reference waits under are looked up, so a sync with none
+ * reads nothing. Call after the failed-ref retry: an added file's importers
+ * reach it through the import edges that retry made. Returns the number
+ * re-opened.
+ */
+export function reopenReferencesThroughBarrels(
+  queries: QueryBuilder,
+  reader: ImportReader,
+  files: ReadonlyArray<{ path: string; language: Language }>,
+): number {
+  let level = files.filter((file) => BARREL_LANGUAGES.has(file.language));
+  if (level.length === 0) return 0;
+  const waiting = new Set(queries.getFailedModuleKeys());
+  if (waiting.size === 0) return 0;
+  const keys = new Set<string>();
+  const seen = new Set(level.map((file) => file.path));
+  for (let depth = 1; level.length > 0 && depth <= REEXPORT_MAX_DEPTH; depth++) {
+    const next: Array<{ path: string; language: Language }> = [];
+    for (const module of level) {
+      for (const i of queries.getImportsInto(`file:${module.path}`, module.path)) {
+        if (i.refName === null || seen.has(i.filePath) || !BARREL_LANGUAGES.has(i.language)) continue;
+        if (!passesOn(i.filePath, i.language, i.refName, reader)) continue;
+        seen.add(i.filePath);
+        for (const key of moduleReferenceKeys(i.filePath)) if (waiting.has(key)) keys.add(key);
+        next.push({ path: i.filePath, language: i.language });
+      }
+    }
+    level = next;
+  }
+  if (keys.size === 0) return 0;
+  const parked = queries.getRetryableFailedReferences([...keys]).flatMap((ref) => (ref.rowId === undefined ? [] : [ref.rowId]));
+  return queries.reopenFailedReferences(parked);
+}
+
+/**
+ * Whether `importer` passes on what it imports from `source`: an `export …
+ * from` of it, or a binding it imports from it and exports again — the forms
+ * a lazy route's lookup follows through a barrel (`exportedComponent`).
+ */
+function passesOn(importer: string, language: Language, source: string, reader: ImportReader): boolean {
+  if (reader.reExports(importer, language).some((rex) => rex.source === source)) return true;
+  const exported = reader.exportedBindings(importer, language);
+  return exported.size > 0 &&
+    reader.mappings(importer, language).some((m) => m.source === source && !m.isNamespace && exported.has(m.localName));
 }
 
 /** An import's module edge into a file that an added file now outranks. */
