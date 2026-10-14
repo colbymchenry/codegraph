@@ -75,6 +75,42 @@ function isCFamily(n: Node): boolean {
   return n.language === 'cpp' || n.language === 'c';
 }
 
+/**
+ * The declarations code at `site` can see (visibleFrom), where a class local
+ * to a function counts only in that function's lines: the index names it
+ * after the function, and every gtest `TEST_F` body in a namespace is
+ * `ns::TEST_F`, so one body's local `Listener` passed for any other's — in
+ * the body itself, and in the methods of a local class of its own.
+ */
+function seenFrom(site: CppNameSite, context: ResolutionContext): (n: Node) => boolean {
+  const visible = visibleFrom(site.file);
+  return (n) => {
+    if (!visible(n)) return false;
+    const fn = cppFunctionAround(n, context);
+    return !fn || (fn.filePath === site.file && site.line >= fn.startLine && site.line <= fn.endLine);
+  };
+}
+
+const LOCAL_TO = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/**
+ * The function a C or C++ class is local to: the one of the scope its
+ * qualified name is in whose lines hold it. Null for a class of a namespace
+ * or of another class.
+ */
+function cppFunctionAround(cls: Node, context: ResolutionContext): Node | null {
+  let memo = LOCAL_TO.get(context);
+  if (!memo) LOCAL_TO.set(context, (memo = new Map()));
+  const hit = memo.get(cls.id);
+  if (hit !== undefined) return hit;
+  const scope = cppParentScope(cls.qualifiedName);
+  const fn = (scope ? context.getNodesByQualifiedName(scope) : []).find((f) =>
+    (f.kind === 'function' || f.kind === 'method') && f.filePath === cls.filePath &&
+    f.startLine <= cls.startLine && f.endLine >= cls.startLine) ?? null;
+  memo.set(cls.id, fn);
+  return fn;
+}
+
 /** The declarations code in `file` can see: a header's, and the file's own. */
 function visibleFrom(file: string): (n: Node) => boolean {
   return (n) => n.filePath === file || !SOURCE_FILE.test(n.filePath);
@@ -110,6 +146,13 @@ export interface CppNameSite {
   parameters: ReadonlySet<string>;
   /** A class the name cannot be: the deriving class, in its own base clause. */
   self?: Node;
+  /**
+   * A class looked in right after `scope` itself, its bases included: a gtest
+   * `TEST_F` body is a member function of a class derived from its fixture,
+   * so the fixture's nested types are what its unqualified names find
+   * before the enclosing namespaces'.
+   */
+  classScope?: string;
 }
 
 /** The class a C or C++ type name names. */
@@ -133,8 +176,9 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const global = written.startsWith('::');
   if (!global && site.parameters.has(segments[0]!)) return null;
 
-  const visible = visibleFrom(site.file);
+  const visible = seenFrom(site, context);
   const scopes = cppScopesWithin(site.scope);
+  if (site.classScope) scopes.splice(1, 0, site.classScope);
   const resolved = (node: Node): CppWrittenClass => ({ node, exact: true });
 
   // The scopes around the name short of the global one, or only the global one for `::Base`.
@@ -234,7 +278,7 @@ function classNode(named: CppNamedClass, site: CppNameSite, context: ResolutionC
     .filter((n) => isCFamily(n) && CLASS_KINDS.has(n.kind) && n.id !== site.self?.id);
   // A lookup that ended on the class itself (its namespace lost) found nothing.
   if (classes.length === 0) return undefined;
-  const visible = classes.filter(visibleFrom(site.file));
+  const visible = classes.filter(seenFrom(site, context));
   return pick(visible.length > 0 ? visible : classes, site.file);
 }
 
@@ -288,9 +332,10 @@ interface CppUsing {
 
 const USINGS = new WeakMap<ResolutionContext, Map<string, CppUsing[]>>();
 
-/** Drop the per-file `using` memo (see ReferenceResolver.clearCaches). */
+/** Drop the per-file `using` memo and the local-class memo (see ReferenceResolver.clearCaches). */
 export function clearCppSupertypeMemos(context: ResolutionContext): void {
   USINGS.delete(context);
+  LOCAL_TO.delete(context);
 }
 
 const PATH = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*`;

@@ -10147,13 +10147,21 @@ function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRe
 
 const CPP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
 
-/** Where a type the calling function writes is looked up from: the function itself, so a class local to it is found first. */
+/**
+ * Where a type the calling function writes is looked up from: the function
+ * itself, so a class local to it is found first, then — in a gtest `TEST_F`
+ * or `TEST_P` body — the test's fixture (cppTestFixture) and its bases, as
+ * for the member function of a class derived from it that the body is:
+ * rocksdb's `new TestUserDefinedIndexFactory()` is the fixture base's own.
+ */
 function cppCallSite(caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppNameSite {
+  const fixture = cppTestFixture(caller, ref, context);
   return {
     scope: caller.kind === 'file' ? '' : caller.qualifiedName,
     file: ref.filePath,
     line: ref.line,
     parameters: cppTemplateParameters(caller, context),
+    ...(fixture ? { classScope: fixture } : {}),
   };
 }
 
@@ -10317,10 +10325,12 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
  * call's arguments fit (cppOverloadFor) — else the nearest one of a class
  * it derives from, through the base edges every declaration of `cls` has.
  * When other classes share `cls`'s qualified name, its own are the ones
- * defined where it is: leveldb's db_bench.cc and db_bench_sqlite3.cc each
- * declare a `RandomGenerator`, with a `Generate` that takes a `size_t` and
- * an `int`. (A chained call `inner(…).name(…)` keeps the first: the
- * arguments at its position are the inner call's.)
+ * defined in its body, else where it is: the local classes of gtest bodies
+ * in one namespace are each `ns::TEST_F::Listener`, and leveldb's
+ * db_bench.cc and db_bench_sqlite3.cc each declare a `RandomGenerator`, with
+ * a `Generate` that takes a `size_t` and an `int`. (A chained call
+ * `inner(…).name(…)` keeps the first: the arguments at its position are the
+ * inner call's.)
  */
 function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
@@ -10330,7 +10340,11 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   if (own.length > 0) {
     const ordered = preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath);
     if (ref.referenceName.includes('().')) return ordered[0]!;
-    const defined = cppClassDecls(cls.qualifiedName, context).length > 1
+    const namesakes = cppClassDecls(cls.qualifiedName, context).length > 1;
+    const inBody = namesakes
+      ? ordered.filter((n) => n.filePath === cls.filePath && n.startLine >= cls.startLine && n.endLine <= cls.endLine)
+      : [];
+    const defined = inBody.length > 0 ? inBody : namesakes
       ? ordered.filter((n) => n.filePath === cls.filePath || cppIncluders(cls.filePath, context).has(n.filePath))
       : ordered;
     return cppOverloadFor(defined.length > 0 ? defined : ordered, name, ref, context);
