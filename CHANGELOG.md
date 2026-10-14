@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- QML, the declarative language used with the Qt framework, is now indexed, including component structure, module imports and flows from QML handlers into C++ through Qt signals, slots, invokable methods and properties.
+- Qt macros in C++ files no longer disturb the parser: source positions stay exact, comments and string literals are untouched, and QML objects, bindings and multi-line functions keep their place in the component hierarchy with their full bodies.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.

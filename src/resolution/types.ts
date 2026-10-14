@@ -332,7 +332,7 @@ export interface FrameworkResolver {
    * ref reach `resolve()` instead of being dropped for having no name match.
    * Asked only about references written in the languages `resolve()` sees.
    */
-  claimsReference?(name: string): boolean;
+  claimsReference?(name: string, ref?: UnresolvedRef): boolean;
   /**
    * Extract framework-specific nodes and references from a file.
    *
