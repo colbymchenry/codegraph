@@ -63,8 +63,12 @@ describe('dominant file query plan (#2571)', () => {
       if (/COUNT\(\*\) AS edge_count/.test(text)) sql = text;
       return prepare(text);
     };
-    const dominant = queries.getDominantFile();
-    queries.db.prepare = prepare;
+    let dominant;
+    try {
+      dominant = queries.getDominantFile();
+    } finally {
+      queries.db.prepare = prepare;
+    }
 
     expect(dominant?.filePath).toBe('core.ts');
     expect(sql).toBeDefined();
