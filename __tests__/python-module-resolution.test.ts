@@ -321,6 +321,27 @@ def fetch():
     expect(targets('client.py', 'app/client.py', 'imports')).toEqual([]);
   });
 
+  // #2566: `from scipy import stats` bound `stats` by exact name to a
+  // top-level `stats` in another project file, and when that file imports
+  // this one, a cycle that does not exist. The stdlib form (`from os import
+  // path`) did the same. A module import (`import scipy.stats as stats`) never did.
+  it.each([
+    ['a third-party module, against a variable', 'from scipy import stats', 'stats', 'stats = summary([1, 2, 3])\n'],
+    ['a third-party module, against a function', 'from scipy import stats', 'stats', 'def stats():\n    return 1\n'],
+    ['a stdlib module, against a variable', 'from os import path', 'path', 'path = summary([1])\n'],
+    ['a third-party module under an alias, against a variable', 'from scipy import stats as st', 'st', 'st = summary([1])\n'],
+  ])('never binds a name imported from %s to a same-named project symbol (#2566)', async (_label, importLine, name, decl) => {
+    write({
+      'analysis.py': `${importLine}\n\n\ndef summary(values):\n    return ${name}.describe(values)\n`,
+      'report.py': `from analysis import summary\n\n${decl}`,
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+
+    expect(targets('analysis.py', 'analysis.py', 'imports')).toEqual([]);
+    expect(targets('report.py', 'report.py', 'imports')).toEqual(['summary@analysis.py']);
+    expect(cg.findCircularDependencies()).toEqual([]);
+  });
+
   it('still binds a name imported from a package the project provides at a root', async () => {
     write({
       'requests/__init__.py': 'def get(u):\n    return u\n',
