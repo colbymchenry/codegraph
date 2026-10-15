@@ -9756,13 +9756,21 @@ function cppRangeElementOf(type: CppWrittenType, at: UnresolvedRef, context: Res
   return begin ? cppIteratorElement(begin, at, context, hops) : null;
 }
 
+/** A container's iterator type, `std::vector<Foo*>::const_iterator`, with the container. */
+const CPP_ITERATOR_OF = /^(.*>)\s*::\s*(?:const_)?(?:reverse_)?iterator\s*$/;
+
+/** A written type without `typename`, `const` and `&`, which name no part of it. */
+function cppWithoutTypeKeywords(text: string): string {
+  return text.replace(/\b(?:typename|const)\b|&/g, ' ').trim();
+}
+
 /** What dereferencing an iterator of the type `type` gives, as written. */
 function cppIteratorElement(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext, hops: number): CppWrittenType | null {
   const iterator = cppFollowWrittenAliases(type, at, context);
   if (!iterator) return null;
   if (isCppPointerType(iterator.text)) return cppPointee(iterator);
   // `std::vector<Foo*>::const_iterator`: the container's element.
-  const nested = /^(.*>)\s*::\s*(?:const_)?(?:reverse_)?iterator\s*$/.exec(iterator.text.replace(/\b(?:typename|const)\b|&/g, ' ').trim());
+  const nested = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(iterator.text));
   if (nested) return cppRangeElementOf({ ...iterator, text: nested[1]! }, at, context, hops + 1);
   const cls = cppWrittenClass(iterator, at, context);
   const star = cls ? cppReturnTypeOf(cppMethodsOf(cls, 'operator*', at, context), context) : null;
@@ -10248,6 +10256,26 @@ function cppHeldType(raw: string): string | null {
   return cppTemplateArguments(raw)?.[0] ?? null;
 }
 
+/**
+ * What `->` on a C++ value of the type `raw`, written at `site`, reaches, as
+ * written: the type a library holder holds (cppHeldType), or the element of
+ * the container whose iterator it is — `Slice` for
+ * `std::deque<Slice>::const_iterator`, protobuf's `SourceCodeInfo_Location`
+ * for `RepeatedPtrField<SourceCodeInfo_Location>::iterator`, read from the
+ * container's template arguments before the `iterator` alias would lose them
+ * (cppRangeElementOf). Null for any other type, and for an element a class
+ * template's own `begin()` or `operator*` writes with its template parameter
+ * (googletest's `ParamGenerator<T>::iterator`), which the specialization
+ * decides.
+ */
+function cppArrowTarget(raw: string, site: CppNameSite, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  const held = cppHeldType(raw);
+  if (held) return isCppLibraryHolder(raw, context) ? { ...site, text: held } : null;
+  const container = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(raw))?.[1];
+  const element = container ? cppRangeElementOf({ ...site, text: container }, ref, context, 1) : null;
+  return element && (element.scope === site.scope || !isCppTemplateParameterType(element)) ? element : null;
+}
+
 /** Whether the holder `raw` names (cppHeldType) is the library's: no type of the project's has its name. */
 function isCppLibraryHolder(raw: string, context: ResolutionContext): boolean {
   const spelled = cppTypeSegments(raw)!.join('::');
@@ -10258,10 +10286,11 @@ function isCppLibraryHolder(raw: string, context: ResolutionContext): boolean {
  * A `->` call on a C++ receiver declared as a standard smart pointer, an
  * optional or an `absl::StatusOr` (`std::unique_ptr<Iterator> iter;
  * iter->Valid()`, protobuf's `absl::StatusOr<FeatureResolver> resolver;
- * resolver->MergeFeatures(…)`) calls a member of
- * the type it holds. That type is looked up as C++ looks it up where the call
- * is written (cpp-supertypes.ts): the scopes around the call, the file's
- * `using`s, and aliases followed. Looking it up by its last name instead
+ * resolver->MergeFeatures(…)`), or as a container's iterator
+ * (`std::deque<Slice>::const_iterator it; it->data()`), calls a member of
+ * the type it holds or points at (cppArrowTarget). That type is looked up
+ * as C++ looks it up where the call is written (cpp-supertypes.ts): the
+ * scopes around the call, the file's `using`s, and aliases followed. Looking it up by its last name instead
  * finds namesakes: 21 other classes in rocksdb are named `Iterator`, nested
  * ones like `MemTableRep::Iterator`, while the `Iterator` the call means
  * inherits `Valid` from `IteratorBase`.
@@ -10271,18 +10300,19 @@ function isCppLibraryHolder(raw: string, context: ResolutionContext): boolean {
  *    alias of one, or a class that surely lacks the method (cppLacksMethod:
  *    not when a class template's specialization or a base the index doesn't
  *    link may declare it).
- *  - undefined when `raw` declares no such holder, or the type it holds is
- *    none the project declares (a generated message, a class the index
- *    doesn't name): the call goes on as before.
+ *  - undefined when `raw` declares no such holder or iterator, or the type
+ *    it holds is none the project declares (a generated message, a class the
+ *    index doesn't name): the call goes on as before.
  */
 function matchCppHeldTypeCall(raw: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const held = cppHeldType(raw);
-  if (!held || !isCppLibraryHolder(raw, context)) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
-  if (!caller || isCppPointerType(held)) return undefined;
+  if (!caller) return undefined;
+  const target = cppArrowTarget(raw, cppCallSite(caller, ref, context), ref, context);
+  if (!target || isCppPointerType(target.text)) return undefined;
+  const held = target.text;
   if (isCppLibraryType(held, context)) return null;
   // A template parameter's type (`std::unique_ptr<T>`, `typename T::Iter`) names no particular class: null.
-  const found = cppClassWritten(held, cppCallSite(caller, ref, context), ref, context);
+  const found = cppClassWritten(held, target, ref, context);
   if (found === undefined) return undefined;
   if (found === null) return null;
   if (!CPP_CLASS_KINDS.has(found.node.kind)) {
@@ -13523,11 +13553,13 @@ export function matchMethodCall(
       if (isUndeclaredTypeName(cppDecl.written!, ref, context)) return null;
     }
     // A `->` call on a smart pointer, an optional or an `absl::StatusOr`
-    // (cppHeldType) the calling function or its class declares is a call on
-    // the type it holds:
+    // (cppHeldType), or on a container's iterator, the calling function or
+    // its class declares is a call on the type it holds or points at:
     // rocksdb's `std::unique_ptr<Iterator> iter; iter->Valid()` reached
-    // `ArenaWrappedDBIter::Valid` by the method's name.
-    if (ref.language === 'cpp' && cppDecl.callers && !cppDecl.aliased && !cppDecl.shadowed && !cppDecl.pointer &&
+    // `ArenaWrappedDBIter::Valid` by the method's name. (The iterator a
+    // container's own alias names counts too: protobuf's
+    // `RepeatedPtrField<SourceCodeInfo_Location>::iterator`.)
+    if (ref.language === 'cpp' && cppDecl.callers && !cppDecl.shadowed && !cppDecl.pointer &&
         cppMemberOperator(objectOrClass!, ref, context) === '->') {
       const held = nmTimedT('mc-cppheld', ref, () => matchCppHeldTypeCall(cppDecl.raw!, methodName!, ref, context));
       if (held !== undefined) return held;
