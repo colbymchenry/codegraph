@@ -14228,10 +14228,17 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  */
 export function isPythonFromImportModule(ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.language !== 'python' || ref.referenceKind !== 'imports') return false;
-  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n'))?.[ref.line - 1];
-  if (line === undefined) return false;
-  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`^from\\s+${name}\\s+import\\b`).test(line.slice(ref.column));
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  if (line === undefined || !line.startsWith('from', ref.column)) return false;
+  // `from app \` continues the statement on the next line.
+  let text = line.slice(ref.column + 4);
+  for (let next = ref.line; /\\\s*$/.test(text) && next < ref.line + 3; next++) {
+    text = text.replace(/\\\s*$/, ' ') + (lines![next] ?? '');
+  }
+  const name = text.trimStart();
+  return name.length < text.length && name.startsWith(ref.referenceName) &&
+    /^\s+import\b/.test(name.slice(ref.referenceName.length));
 }
 
 /**

@@ -1,8 +1,8 @@
 /**
  * The module of a Python `from X import y` names a module or package, never a
- * symbol: `from app import email` must not link the importing file to a
- * project variable that happens to be named `app` (#2584). The imported names
- * keep their edges.
+ * symbol: `from app import email` links the package `app/__init__.py`, not a
+ * project variable that happens to be named `app` (#2584), and `from settings
+ * import *` keeps its edge to `settings.py`. The imported names keep theirs.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -44,7 +44,7 @@ const PKG = {
   'app/email.py': 'def send():\n    return 1\n',
 };
 
-describe('the module of a Python from-import is never a symbol (#2584)', () => {
+describe('the module of a Python from-import links its file or package, never a symbol (#2584)', () => {
   it.each([
     ['in the package', { 'app/main.py': 'app = object()\n' }],
     ['at the project root', { 'server.py': 'app = object()\n' }],
@@ -55,14 +55,26 @@ describe('the module of a Python from-import is never a symbol (#2584)', () => {
     );
     expect(out.filter((e) => e.startsWith('variable:'))).toEqual([]);
     expect(out).toContain('file:email.py@app/email.py');
+    expect(out).toContain('file:__init__.py@app/__init__.py');
   });
 
-  it('does not link a variable for an indented from-import', async () => {
-    const out = await importEdges(
-      { ...PKG, 'app/main.py': 'app = object()\n', 'tests/test_email.py': 'def test_send():\n    from app import email\n    email.send()\n' },
-      'tests/test_email.py'
-    );
+  it.each([
+    ['split after the module', 'from app \\\n    import email\n'],
+    ['split after from', 'from \\\n    app import email\n'],
+    ['under if TYPE_CHECKING', 'from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from app import email\n'],
+  ])('links a from-import %s to the package', async (_label, code) => {
+    const out = await importEdges({ ...PKG, 'app/main.py': 'app = object()\n', 'tests/test_email.py': code }, 'tests/test_email.py');
     expect(out.filter((e) => e.startsWith('variable:'))).toEqual([]);
+    expect(out).toContain('file:__init__.py@app/__init__.py');
+  });
+
+  it.each([
+    ['a module', { 'settings.py': 'settings = dict()\n' }, 'from settings import *\n', 'file:settings.py@settings.py'],
+    ['a package', { 'app/__init__.py': 'app = object()\n' }, 'from app import *\n', 'file:__init__.py@app/__init__.py'],
+    ['a dotted module', { 'app/__init__.py': '', 'app/models.py': 'models = 1\n' }, 'from app.models import *\n', 'file:models.py@app/models.py'],
+  ])('links a star import to %s', async (_label, files, code, expected) => {
+    const out = await importEdges({ ...files, 'use.py': code }, 'use.py');
+    expect(out).toEqual([expected]);
   });
 
   it('keeps an imported name that is a variable', async () => {
