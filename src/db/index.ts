@@ -748,6 +748,16 @@ export class DatabaseConnection {
    *     tables whose row counts changed materially since the last
    *     ANALYZE. Without it, the query planner has no statistics on the
    *     freshly-bulk-loaded tables and can pick suboptimal indexes.
+   *     After a FULL index (`fullAnalyze`) it is a full `ANALYZE` instead:
+   *     the statistics `optimize` gathers under `analysis_limit` come from
+   *     the first rows of each index, and on a repository with one
+   *     generated file of thousands of symbols (an Android `R.java`, a
+   *     bundled `.d.ts`) that sample misses the big file. The planner
+   *     then takes every file for a few symbols, and the dominant-file query
+   *     behind every explore is planned as a scan of each file's symbols
+   *     per symbol — ~100 s per explore on a 280k-node index, 1.5 s with
+   *     exact statistics (#2571). A full ANALYZE of a 1 GB index is under
+   *     a second, once, at the end of a run that took minutes.
    *
    *   - `PRAGMA wal_checkpoint(PASSIVE)` — fold pending WAL pages back
    *     into the main database file so the WAL file doesn't grow
@@ -769,17 +779,20 @@ export class DatabaseConnection {
    * and SKIPS the checkpoint (the final close() checkpoints after the
    * CLI has already disarmed its watchdog).
    */
-  async runMaintenance(): Promise<void> {
+  async runMaintenance(options: { fullAnalyze?: boolean } = {}): Promise<void> {
+    const analyze = options.fullAnalyze
+      ? ['PRAGMA analysis_limit=0', 'ANALYZE']
+      : ['PRAGMA analysis_limit=1000', 'PRAGMA optimize'];
     // In-memory / test databases: nothing worth a worker round-trip.
     if (!this.dbPath || this.dbPath === ':memory:') {
-      try { this.db.exec('PRAGMA optimize'); } catch { /* ignore */ }
+      for (const p of analyze) { try { this.db.exec(p); } catch { /* ignore */ } }
       try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* ignore */ }
       return;
     }
     await this.runPragmasOffThread(
-      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'],
+      [...analyze, 'PRAGMA wal_checkpoint(PASSIVE)'],
       // Worker threads unavailable — bounded in-line fallback, no checkpoint.
-      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']
+      analyze
     );
   }
 
