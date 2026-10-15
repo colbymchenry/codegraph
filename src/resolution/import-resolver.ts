@@ -22,7 +22,6 @@ import {
   localReceiverTypePatterns,
   normalizeInferredTypeName,
   goRefQualifier,
-  isPythonFromImportModule,
 } from './name-matcher';
 
 /**
@@ -2452,12 +2451,11 @@ function resolvePythonAbsoluteModule(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  // Only a DOTTED `import a.b.c` ref carries its full module path, or the
-  // module of a `from app import …`, which is the path as written (#2584). A
-  // bare leaf (`from app.api.routes import authentication`) is ambiguous on its
-  // own — three `authentication.py` files may exist — so leave it to
-  // resolveModuleImportToFile, which uses the import's source to build the path.
-  if (!ref.referenceName.includes('.') && !isPythonFromImportModule(ref, context)) return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
+  // (`from app.api.routes import authentication`) is ambiguous on its own — three
+  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
+  // which uses the import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.')) return null;
   const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
