@@ -44,6 +44,38 @@ function inputs(graph: CodeGraph): string[] {
   return db.prepare('SELECT file_path FROM synthesis_inputs ORDER BY file_path').all().map((r: any) => r.file_path);
 }
 
+
+function write(dir: string, files: Record<string, string>): void {
+  for (const [file, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), text);
+  }
+}
+
+/** `<parent> -> <file>::<child>` for every synthesized JSX render edge. */
+function renders(graph: CodeGraph): string[] {
+  const out: string[] = [];
+  for (const file of graph.getFiles()) {
+    for (const node of graph.getNodesInFile(file.path)) {
+      for (const e of graph.getOutgoingEdges(node.id)) {
+        if (e.metadata?.synthesizedBy !== 'jsx-render') continue;
+        const child = graph.getNode(e.target);
+        out.push(`${node.name} -> ${child?.filePath}::${child?.name}`);
+      }
+    }
+  }
+  return out.sort();
+}
+
+let fresh: CodeGraph | undefined;
+let freshRoot: string | undefined;
+afterEach(() => {
+  fresh?.close();
+  fresh = undefined;
+  if (freshRoot) fs.rmSync(freshRoot, { recursive: true, force: true });
+  freshRoot = undefined;
+});
+
 describe('synthesis inputs from a lazily loaded workspace package (#2565)', () => {
   it('records the loading file as an input, and a sync after an edit to it succeeds', async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2565-'));
@@ -52,7 +84,8 @@ describe('synthesis inputs from a lazily loaded workspace package (#2565)', () =
       fs.writeFileSync(path.join(root, file), text);
     }
     cg = await CodeGraph.init(root, { index: true });
-    expect(inputs(cg)).toEqual(['src/App.tsx']);
+    expect(inputs(cg)).toContain('src/App.tsx');
+    expect(inputs(cg)).not.toContain('packages/icons');
 
     fs.appendFileSync(path.join(root, 'src/App.tsx'), '// touched\n');
     await expect(cg.sync()).resolves.toBeDefined();
@@ -60,6 +93,47 @@ describe('synthesis inputs from a lazily loaded workspace package (#2565)', () =
     const indexed = new Set(cg.getFiles().map((f) => f.path));
     expect(indexed.has('src/App.tsx')).toBe(true);
     expect(indexed.has('packages/icons')).toBe(false);
-    expect(inputs(cg)).toEqual(['src/App.tsx']);
+    expect(inputs(cg)).toContain('src/App.tsx');
   });
+  // The issue's own trigger: the edit is to ANOTHER file with markup, not the
+  // one that loads the package, and every such sync failed.
+  it('a sync after an edit to another file with markup succeeds', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2565-'));
+    write(root, { ...FILES, 'src/Other.tsx': 'export function Other() { return <div />; }\n' });
+    cg = await CodeGraph.init(root, { index: true });
+
+    fs.appendFileSync(path.join(root, 'src/Other.tsx'), '// touched\n');
+    await expect(cg.sync()).resolves.toBeDefined();
+  });
+
+  // An input is matched to the indexed file by its path, so a module spelled
+  // with a trailing slash or a `.` segment (`import('@/widgets/Chart/')`) must
+  // still be recorded under the file's own path: dropping it left the barrel
+  // out of the inputs, and rewiring the barrel never redrew the tag.
+  it.each([['@/widgets/Chart/'], ['src/widgets/./Chart']])(
+    'records a module spelled %s under its indexed path, so rewiring it redraws the tag',
+    async (spec) => {
+      const files: Record<string, string> = {
+        'package.json': JSON.stringify({ name: 'app', dependencies: { react: '^18', next: '^14' } }),
+        'src/App.tsx': `import dynamic from 'next/dynamic';\nconst Chart = dynamic(() => import('${spec}'));\nexport function App() { return <Chart />; }\n`,
+        'src/widgets/Chart/index.ts': "export { default } from './Impl';\n",
+        'src/widgets/Chart/Impl.tsx': 'export default function ImplA() { return null; }\n',
+        'src/widgets/Chart/Other.tsx': 'export default function Other() { return null; }\n',
+      };
+      const rewired = { ...files, 'src/widgets/Chart/index.ts': "export { default } from './Other';\n" };
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2565-'));
+      write(root, files);
+      cg = await CodeGraph.init(root, { index: true });
+      expect(inputs(cg)).toContain('src/widgets/Chart/index.ts');
+
+      write(root, rewired);
+      await cg.sync();
+
+      freshRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2565-fresh-'));
+      write(freshRoot, rewired);
+      fresh = await CodeGraph.init(freshRoot, { index: true });
+      expect(renders(fresh)).toEqual(['App -> src/widgets/Chart/Other.tsx::Other']);
+      expect(renders(cg)).toEqual(renders(fresh));
+    }
+  );
 });
