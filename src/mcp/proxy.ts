@@ -292,7 +292,38 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     } catch { /* unparseable — nothing we could re-serve anyway */ }
   };
 
+  // Debug trace (local fork only): CODEGRAPH_MCP_TRACE=<file> appends one line
+  // per message crossing the host<->proxy boundary, so a run can show whether
+  // the host ever sent a tools/call at all, and with what arguments.
+  const traceFile = process.env.CODEGRAPH_MCP_TRACE;
+  const trace = (dir: 'in' | 'out', obj: JsonRpc | string): void => {
+    if (!traceFile) return;
+    try {
+      let msg: JsonRpc | null = null;
+      if (typeof obj === 'string') { try { msg = JSON.parse(obj) as JsonRpc; } catch { msg = null; } } else { msg = obj; }
+      const raw = typeof obj === 'string' ? obj : JSON.stringify(obj);
+      let summary: string;
+      if (msg && msg.method === 'tools/call') {
+        const p = (msg.params || {}) as { name?: string; arguments?: Record<string, unknown> };
+        summary = `tools/call ${p.name ?? '?'} args=${JSON.stringify(p.arguments ?? {}).slice(0, 400)}`;
+      } else if (msg && msg.method) {
+        summary = `${msg.method}`;
+      } else if (msg && 'result' in msg) {
+        const r = msg.result as { isError?: boolean; tools?: unknown[]; instructions?: string } | undefined;
+        summary = `result id=${String(msg.id)} bytes=${raw.length}` +
+          (r && Array.isArray(r.tools) ? ` tools=${r.tools.length}` : '') +
+          (r && typeof r.instructions === 'string' ? ` instructions=${r.instructions.length}ch` : '') +
+          (r && r.isError ? ' isError' : '');
+      } else if (msg && 'error' in msg) {
+        summary = `error id=${String(msg.id)} ${JSON.stringify((msg as { error?: unknown }).error).slice(0, 200)}`;
+      } else {
+        summary = raw.slice(0, 120);
+      }
+      fs.appendFileSync(traceFile, `${new Date().toISOString()} pid=${process.pid} cwd=${process.cwd()} ${dir === 'in' ? 'host->proxy' : 'proxy->host'} ${summary}\n`);
+    } catch { /* tracing never breaks the server */ }
+  };
   const writeClient = (obj: JsonRpc | string): void => {
+    trace('out', obj);
     try { process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n'); } catch { /* host gone */ }
   };
   const shutdown = (): void => {
@@ -395,6 +426,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       const line = stdinBuf.slice(0, idx).trim();
       stdinBuf = stdinBuf.slice(idx + 1);
       if (!line) continue;
+      trace('in', line);
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
