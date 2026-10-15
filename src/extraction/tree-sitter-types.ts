@@ -257,6 +257,16 @@ export interface LanguageExtractor {
   visitNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
 
   /**
+   * Consult `visitNode` in `visitFunctionBody` too, before the generic
+   * callTypes dispatch. The body walker normally bypasses the visitor hook,
+   * so a `callTypes` node the hook claims at statement level (e.g. Tcl's
+   * `source`/builtin commands) would still mint a call edge when it appears
+   * inside a function body. Opt-in per language; unset keeps the legacy
+   * behavior for every existing extractor.
+   */
+  bodyWalkerUsesVisitNode?: boolean;
+
+  /**
    * Synthesize members that exist at compile time but not in the source AST,
    * called at the end of class extraction with the class still on the scope
    * stack (so `ctx.createNode` attaches containment + qualified names) and the
