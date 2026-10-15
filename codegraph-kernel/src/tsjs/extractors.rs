@@ -1401,15 +1401,7 @@ impl<'t> Walker<'t> {
         let func = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0))
-            // `await f<T>(x)` parses with `await f` as the callee; the call is
-            // to `f` (#2586). Mirrors TreeSitterExtractor.extractCall.
-            .map(|f| {
-                if self.variant.is_ts() && f.kind() == "await_expression" {
-                    f.named_child(0).unwrap_or(f)
-                } else {
-                    f
-                }
-            });
+            .map(|f| self.peel_await_callee(f));
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1509,8 +1501,24 @@ impl<'t> Walker<'t> {
 
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
+    /// `await f<T>(x)` parses with `await f` as the callee; the call is to
+    /// `f` (#2586). Peels every `await`, skipping a comment written after one.
+    /// TS-family only. Mirrors peelTsAwaitCallee.
+    fn peel_await_callee(&self, node: Node<'t>) -> Node<'t> {
+        if !self.variant.is_ts() {
+            return node;
+        }
+        let mut cur = node;
+        while cur.kind() == "await_expression" {
+            let mut walker = cur.walk();
+            let Some(inner) = cur.named_children(&mut walker).find(|c| c.kind() != "comment") else { break };
+            cur = inner;
+        }
+        cur
+    }
+
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
-        let inner = call.child_by_field_name("function")?;
+        let inner = self.peel_await_callee(call.child_by_field_name("function")?);
         Self::plain_member_name(self.text(inner))
     }
 

@@ -131,12 +131,16 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
       'export async function a() { return await fetchApi<User>("/me"); }',
       'export async function b() { return await api.fetchApi<User>("/me"); }',
       'export async function c() { return (await load())(); }',
+      'export async function d() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function e() { return await api.get<User>("/me").then(r => r); }',
+      'export async function f() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function g() { return await await fetchApi<User>("/me"); }',
       '',
     ].join('\n');
     const result = assertParity(`awaited.${ext}`, source, language);
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi']));
-    expect(calls.some((n) => n.startsWith('await'))).toBe(false);
+    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi', 'fetchApi().json', 'api.get().then']));
+    expect(calls.some((n) => /^await|^\/\*/.test(n))).toBe(false);
   });
 
   it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {

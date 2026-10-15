@@ -787,6 +787,32 @@ function main() {
     expect(byFn('viaThis')).toEqual(['load']);
     expect(calls.some((c) => c.referenceName.startsWith('await'))).toBe(false);
   });
+
+  it.each([['user.ts'], ['user.tsx'], ['user.ets']])('an awaited generic call peels every await and skips comments: %s (#2586)', (file) => {
+    const code = [
+      'export async function chainedParen() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function chainedThen() { return await api.get<User>("/me").then(r => r); }',
+      'export async function commented() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function lineCommented() { return await // typed\n fetchApi<User>("/me"); }',
+      'export async function doubled() { return await await fetchApi<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName).sort();
+    };
+    expect(byFn('commented')).toEqual(['fetchApi']);
+    expect(byFn('lineCommented')).toEqual(['fetchApi']);
+    expect(byFn('doubled')).toEqual(['fetchApi']);
+    expect(calls.some((c) => /^await|^\/[*/]/.test(c.referenceName))).toBe(false);
+    // ArkTS keeps its own chain encoding; TS/TSX name the inner callee.
+    if (file !== 'user.ets') {
+      expect(byFn('chainedParen')).toEqual(['fetchApi', 'fetchApi().json']);
+      expect(byFn('chainedThen')).toEqual(['api.get', 'api.get().then']);
+    }
+  });
 });
 
 describe('Arrow Function Export Extraction', () => {
