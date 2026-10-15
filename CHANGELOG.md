@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_explore` answers sooner from a long-running MCP server or agent session. Each call used to recount the whole graph, reload every symbol name for typo-tolerant search, and look for a `codegraph.json` once per candidate it ranked; the first two are now kept until the index changes, and the config check is cheap when there is no config file. Answers are unchanged.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
