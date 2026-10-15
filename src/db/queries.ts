@@ -2112,7 +2112,10 @@ export class QueryBuilder {
   replaceSynthesisInputs(files: string[]): void {
     this.db.transaction(() => {
       this.db.exec('DELETE FROM synthesis_inputs');
-      const insert = this.db.prepare('INSERT INTO synthesis_inputs(file_path) VALUES (?)');
+      // Indexed files only, as SynthesisStage.publish keeps them (#2565).
+      const insert = this.db.prepare(
+        'INSERT INTO synthesis_inputs(file_path) SELECT path FROM files WHERE path = ?'
+      );
       for (const file of files) insert.run(file);
     })();
   }
