@@ -23,7 +23,15 @@ import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
-import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import {
+  claudeTarget,
+  cleanupLegacyHooks,
+  writeLocalMcpEntry,
+  writePromptHookEntry,
+  removePromptHookEntry,
+} from '../src/installer/targets/claude';
+import { writeProjectMcpEntry } from '../src/installer/targets/opencode';
+import { getMcpServerConfig } from '../src/installer/targets/shared';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -3063,5 +3071,93 @@ describe('Antigravity macOS command persistence (#1443)', () => {
   it.runIf(process.platform === 'darwin')('falls back to the bare command when lookup fails', () => {
     vi.stubEnv('PATH', tmpHome);
     expect(installCommand()).toBe('codegraph');
+  });
+});
+
+// `codegraph init` writes a project-level MCP entry pinned to the project with
+// `--path`, so an agent that launches the server from somewhere other than the
+// project root — a sandboxed worktree, most visibly opencode's — still finds
+// `.codegraph/`, instead of silently answering from no project at all.
+describe('Installer targets — project-root-pinned MCP entries (codegraph init)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let tmpProject: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    // The cwd is deliberately a DIFFERENT directory from the project, because
+    // the whole point of the pinned write is that it does not follow the cwd.
+    tmpCwd = mkTmpDir('cwd');
+    tmpProject = mkTmpDir('project');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    for (const dir of [tmpHome, tmpCwd, tmpProject]) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('appends --path only when a project root is given', () => {
+    expect(getMcpServerConfig().args).toEqual(['serve', '--mcp']);
+    expect(getMcpServerConfig(tmpProject).args).toEqual(['serve', '--mcp', '--path', tmpProject]);
+  });
+
+  it('Claude Code: writeLocalMcpEntry writes .mcp.json in the project, not the cwd', () => {
+    const res = writeLocalMcpEntry(tmpProject);
+    expect(res.path).toBe(path.join(tmpProject, '.mcp.json'));
+    expect(res.action).toBe('created');
+    expect(fs.existsSync(path.join(tmpCwd, '.mcp.json'))).toBe(false);
+
+    const written = JSON.parse(fs.readFileSync(res.path, 'utf8'));
+    expect(written.mcpServers.codegraph.args).toEqual(['serve', '--mcp', '--path', tmpProject]);
+    // Claude Code defers MCP tools behind a tool-search step without this.
+    expect(written.mcpServers.codegraph.alwaysLoad).toBe(true);
+  });
+
+  it('Claude Code: re-running is idempotent', () => {
+    expect(writeLocalMcpEntry(tmpProject).action).toBe('created');
+    expect(writeLocalMcpEntry(tmpProject).action).toBe('unchanged');
+  });
+
+  it('Claude Code: uninstall in the project reverses the pinned entry', () => {
+    const file = writeLocalMcpEntry(tmpProject).path;
+    process.chdir(tmpProject);
+    claudeTarget.uninstall('local');
+
+    const after = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+    expect(after.mcpServers?.codegraph).toBeUndefined();
+  });
+
+  it('opencode: writeProjectMcpEntry writes opencode.jsonc in the project, not the cwd', () => {
+    const res = writeProjectMcpEntry(tmpProject);
+    expect(res.path).toBe(path.join(tmpProject, 'opencode.jsonc'));
+    expect(fs.existsSync(path.join(tmpCwd, 'opencode.jsonc'))).toBe(false);
+
+    const written = parseJsonc(fs.readFileSync(res.path, 'utf8'));
+    const entry = written.mcp.servers.codegraph;
+    expect(entry.command).toEqual(['codegraph', 'serve', '--mcp', '--path', tmpProject]);
+    // The OpenCode 2 shape must survive the pinned write (#1698).
+    expect(entry.disabled).toBe(false);
+    expect(entry.codemode).toBe(false);
+  });
+
+  it('opencode: preserves a sibling MCP server and is idempotent', () => {
+    const file = path.join(tmpProject, 'opencode.jsonc');
+    const sibling = { type: 'local', command: ['other-server'] };
+    fs.writeFileSync(file, JSON.stringify({ mcp: { servers: { other: sibling } } }, null, 2));
+
+    expect(writeProjectMcpEntry(tmpProject).action).toBe('updated');
+    expect(writeProjectMcpEntry(tmpProject).action).toBe('unchanged');
+
+    const written = parseJsonc(fs.readFileSync(file, 'utf8'));
+    expect(written.mcp.servers.other).toEqual(sibling);
+    expect(written.mcp.servers.codegraph.command).toEqual(['codegraph', 'serve', '--mcp', '--path', tmpProject]);
   });
 });

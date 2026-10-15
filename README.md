@@ -116,6 +116,8 @@ codegraph init
 
 <sub>`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done.</sub>
 
+<sub>**Auto-config:** `codegraph init` also writes a project-level MCP entry — `opencode.jsonc` for opencode, `.mcp.json` for Claude Code — pinned to the project with `--path <project_root>`. An agent that launches the server from somewhere other than the project root (a sandboxed worktree, most visibly opencode's) would otherwise leave it unable to find `.codegraph/`, and the session would quietly answer from no project. The write is idempotent: re-running `codegraph init` never rewrites an identical entry.</sub>
+
 <div align="center">
 
 ![1_C_VYnhpys0UHrOuOgpgoyw](https://github.com/user-attachments/assets/f168182f-4d9a-44e0-94d7-08d018cc8a3a)
@@ -432,6 +434,8 @@ codegraph init
 
 Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project. Add `--yes` to skip every prompt (scripts / CI / container bootstraps).
 
+<sub>`codegraph init` also writes a project-level MCP entry for opencode (`opencode.jsonc`) and Claude Code (`.mcp.json`), pinned to the project with `--path`, so an agent that launches the server from outside the project still finds `.codegraph/`.</sub>
+
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
 <details>
@@ -457,6 +461,22 @@ npm install -g @colbymchenry/codegraph
 ```
 
 `alwaysLoad` keeps `codegraph_explore` loaded from the first prompt. Claude Code otherwise defers every MCP tool behind a tool-search step, so a fresh session sees only the tool's name until the model searches for it.
+
+**Launching from outside the project?** If your agent starts the MCP server somewhere other than the project root — a sandboxed worktree, for example — add `--path` with the project's absolute path, or the server won't find `.codegraph/`:
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "/absolute/path/to/your/project"],
+      "alwaysLoad": true
+    }
+  }
+}
+```
+
+`codegraph init` writes exactly that entry for you, in the project's own `./.mcp.json` (Claude Code) and `opencode.jsonc` (opencode). Keep `--path` out of a *global* config — one absolute path there would pin every project to a single directory.
 
 **Add to `~/.claude/settings.json` (optional, for auto-allow):**
 ```json
