@@ -1939,6 +1939,7 @@ export class ToolHandler {
   // agent instead of "no project loaded" — today only the Windows/WSL
   // shared-index error (#995). Engine-maintained; cleared by a successful open.
   private defaultOpenFailure: WslSharedIndexError | null = null;
+  private activeProjectRoots = new Map<string, number>();
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -2378,19 +2379,34 @@ export class ToolHandler {
     await this.awaitCatchUpGate(gate);
   }
 
+  private pinProject(projectPath: unknown): string | null {
+    const resolved = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
+    if (!resolved) return null;
+    const root = canonicalPath(resolved);
+    this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
+    return root;
+  }
+
+  private unpinProject(root: string | null): void {
+    if (!root) return;
+    const count = this.activeProjectRoots.get(root)!;
+    if (count === 1) this.activeProjectRoots.delete(root);
+    else this.activeProjectRoots.set(root, count - 1);
+  }
+
   /**
    * Never evict a graph while a tool call or its timed-out reconcile uses it.
    * Evicts over the LRU bound, on close, and once idle past the timeout
    * (#2087). The cache is in last-use order, so idle entries lead it.
    */
   private trimProjects(): void {
-    if (this.activeCalls > 0) return;
+    if (this.activeCalls > 0 && (this.closing || this.activeProjectRoots.size === 0)) return;
     const idleMs = resolveProjectIdleTimeoutMs();
     const now = Date.now();
     for (const [root, cg] of this.projectCache) {
       const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
       if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
-      if (this.projectGates.has(cg)) continue;
+      if (this.projectGates.has(cg) || [...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active))) continue;
       this.projectCache.delete(root);
       this.projectUsedAt.delete(root);
       if (this.projectLifecycle) {
@@ -2401,7 +2417,7 @@ export class ToolHandler {
         });
       } else cg.close();
     }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+    if (this.closing && this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) {
       for (const resolve of this.closeWaiters.splice(0)) resolve();
     }
     this.scheduleIdleRelease(idleMs);
@@ -2415,7 +2431,7 @@ export class ToolHandler {
   private scheduleIdleRelease(idleMs: number): void {
     if (this.idleReleaseTimer || this.closing || idleMs <= 0) return;
     for (const [root, cg] of this.projectCache) {
-      if (this.projectGates.has(cg)) continue;
+      if (this.projectGates.has(cg) || [...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active))) continue;
       const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
       this.idleReleaseTimer = setTimeout(() => {
         this.idleReleaseTimer = null;
@@ -2462,7 +2478,7 @@ export class ToolHandler {
     this.idleReleaseTimer = null;
     this.nestedRepoCache.clear();
     this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
@@ -2763,6 +2779,7 @@ export class ToolHandler {
   ): Promise<ToolResult> {
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
+    let pinnedRoot: string | null = null;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2789,6 +2806,7 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      pinnedRoot = this.pinProject(pathCheck);
       // An explicit project gets the same first-call guarantee as the default
       // (#1835): its post-open catch-up sync finishes (time-boxed) before we
       // serve it. Resolved on the main thread so the watcher lives here even
@@ -2907,6 +2925,7 @@ export class ToolHandler {
         'continue without codegraph for this task.'
       );
     } finally {
+      this.unpinProject(pinnedRoot);
       this.activeCalls--;
       this.trimProjects();
     }
@@ -2977,6 +2996,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const pinnedRoot = this.pinProject(args.projectPath);
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -2994,6 +3014,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.unpinProject(pinnedRoot);
+      this.trimProjects();
     }
   }
 
