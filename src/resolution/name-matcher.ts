@@ -9806,13 +9806,14 @@ function cppIteratorElement(type: CppWrittenType, at: UnresolvedRef, context: Re
 
 /**
  * The type of the object `x.m` or `x->m` (`op`) names a member of, given
- * `x`'s text: `x`'s own type for `.`, what it points at or holds for `->`.
+ * `x`'s text: `x`'s own type for `.`, what it points at, holds or iterates
+ * over for `->` (cppDereferenced).
  */
 function cppMemberObject(object: string, op: string, at: UnresolvedRef, context: ResolutionContext, depth: number): CppWrittenType | null {
   const type = cppExpressionType(object, at, context, depth + 1);
   const followed = type && cppFollowWrittenAliases(type, at, context);
   if (!followed) return null;
-  if (op === '->') return cppPointee(followed);
+  if (op === '->') return cppDereferenced(followed, at, context);
   return isCppPointerType(followed.text) ? null : followed;
 }
 
@@ -9834,7 +9835,7 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   if (text.startsWith('*')) {
     const pointer = cppExpressionType(text.slice(1), at, context, depth + 1);
     const followed = pointer && cppFollowWrittenAliases(pointer, at, context);
-    return followed && cppPointee(followed);
+    return followed && cppDereferenced(followed, at, context);
   }
   const caller = context.getNodeById?.(at.fromNodeId);
   if (!caller) return null;
@@ -10317,10 +10318,29 @@ function cppArrowTarget(
 ): CppWrittenType | null {
   const held = cppHeldType(raw);
   if (held) return isCppLibraryHolder(raw, context) ? { ...site, text: held } : null;
-  const container = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(raw))?.[1];
-  const written = declared ?? site;
-  const element = container ? cppRangeElementOf({ ...written, text: container }, ref, context, 1) : null;
-  return element && (element.scope === written.scope || !isCppTemplateParameterType(element)) ? element : null;
+  return cppIteratorTarget({ ...(declared ?? site), text: raw }, ref, context);
+}
+
+/**
+ * The element a container's iterator of the type `iterator` points at, read
+ * from the container's template arguments (cppArrowTarget). Null for any
+ * other type, and for an element a class template's own `begin()` or
+ * `operator*` writes with its template parameter.
+ */
+function cppIteratorTarget(iterator: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  const container = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(iterator.text))?.[1];
+  const element = container ? cppRangeElementOf({ ...iterator, text: container }, at, context, 1) : null;
+  return element && (element.scope === iterator.scope || !isCppTemplateParameterType(element)) ? element : null;
+}
+
+/**
+ * What dereferencing a value of the type `type` gives, for `*x` and `x->`:
+ * what a pointer points at or a holder holds (cppPointee), or the element a
+ * container's iterator points at (cppIteratorTarget) — the `Node*` of
+ * `*nodes.begin()` over a `std::vector<Node*>`.
+ */
+function cppDereferenced(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  return cppPointee(type) ?? cppIteratorTarget(type, at, context);
 }
 
 /** Whether the holder `raw` names (cppHeldType) is the library's: no type of the project's has its name. */
@@ -10750,15 +10770,79 @@ function cppImplicitReceiver(ref: UnresolvedRef, context: ResolutionContext): 'b
   };
   const verdict = at(Math.max(0, ref.column));
   if (verdict !== null || !/[^\x00-\x7f]/.test(line)) return verdict;
-  // The column may count UTF-8 bytes, which wider characters before the call outnumber.
+  const index = cppUtf8Column(line, ref.column);
+  return index === null ? null : at(index);
+}
+
+/**
+ * Where in `line` a call's `column` is when it counts UTF-8 bytes, which
+ * wider characters before the call outnumber. Null when no character starts
+ * there, or the two agree.
+ */
+function cppUtf8Column(line: string, column: number): number | null {
   let bytes = 0;
   let index = 0;
-  while (index < line.length && bytes < ref.column) {
+  while (index < line.length && bytes < column) {
     const point = line.codePointAt(index)!;
     bytes += point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
     index += point > 0xffff ? 2 : 1;
   }
-  return bytes === ref.column && index !== ref.column ? at(index) : null;
+  return bytes === column && index !== column ? index : null;
+}
+
+/** A call on a dereferenced variable, up to the member's name: `(*it)->`, `(*node).`. */
+const CPP_DEREFERENCED_RECEIVER = /^\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(->|\.)\s*(?:template\s+)?/;
+
+/**
+ * The variable a C++ call the extractor recorded by its bare name is made on
+ * through a dereference, with the operator — `it` and `->` for
+ * `(*it)->Visit()` — read at the call's column, where its receiver starts.
+ * Null for any other call, `(*this).Visit()` included (cppImplicitReceiver's).
+ */
+function cppDereferencedReceiver(ref: UnresolvedRef, context: ResolutionContext): { name: string; op: string } | null {
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (line === undefined) return null;
+  const at = (column: number): { name: string; op: string } | null => {
+    const text = line.slice(column);
+    const receiver = CPP_DEREFERENCED_RECEIVER.exec(text);
+    if (!receiver || receiver[1] === 'this') return null;
+    const rest = text.slice(receiver[0].length);
+    if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
+    return cppArgumentListFollows(rest, ref.referenceName.length) ? { name: receiver[1]!, op: receiver[2]! } : null;
+  };
+  const found = at(Math.max(0, ref.column));
+  if (found || !/[^\x00-\x7f]/.test(line)) return found;
+  const index = cppUtf8Column(line, ref.column);
+  return index === null ? null : at(index);
+}
+
+/**
+ * A C++ call the extractor recorded by its bare name on a dereferenced
+ * variable — `(*it)->Visit()` over a `std::vector<Node*>`, `(*vit).Weight()`
+ * over a `std::vector<Node>`, `(*node).Weight()` on a `Node*` — calls a
+ * member of the class the dereferenced value has (cppMemberObject), looked
+ * up as C++ looks it up where that type is written. By its bare name the
+ * call went to whichever class had a method of that name.
+ *  - The member of that class, or of a class it derives from.
+ *  - null when no project method is called: a library type (`(*it).size()`
+ *    over a `std::vector<std::string>`), a template parameter's, or a class
+ *    that surely lacks the method (cppLacksMethod).
+ *  - undefined when the call is on no such receiver, or its type can't be
+ *    read or placed: the name strategies decide, as before.
+ */
+function matchCppDereferencedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const receiver = cppDereferencedReceiver(ref, context);
+  if (!receiver) return undefined;
+  const object = cppMemberObject(`(*${receiver.name})`, receiver.op, ref, context, 0);
+  if (!object || isCppPointerType(object.text)) return undefined;
+  if (isCppLibraryType(object.text, context)) return null;
+  const found = cppClassWritten(object.text, object, ref, context);
+  if (found === undefined) return undefined;
+  if (found === null) return null;
+  if (!found.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
+  const method = cppMethodOf(found.node, ref.referenceName, ref, context);
+  if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return cppLacksMethod(found.node, context) ? null : undefined;
 }
 
 /** Whether `text` from `from` on is an argument list, after any template arguments (`<Foo, 3>(`). */
@@ -11910,7 +11994,7 @@ function cppChainInnerType(inner: string, ref: UnresolvedRef, context: Resolutio
   const recvType = op ? cppExpressionType(recv, ref, context, 1) : null;
   const followed = recvType && cppFollowWrittenAliases(recvType, ref, context);
   if (!followed) return null;
-  const object = op === '->' ? cppPointee(followed) : isCppPointerType(followed.text) ? null : followed;
+  const object = op === '->' ? cppDereferenced(followed, ref, context) : isCppPointerType(followed.text) ? null : followed;
   const cls = object && cppWrittenClass(object, ref, context);
   return cls ? cppReturnTypeOf(cppMethodsOf(cls, inner.slice(dot + 1), ref, context), context) : null;
 }
@@ -16350,6 +16434,15 @@ function matchReferenceInner(
   if (ref.language === 'dart' && ref.referenceKind === 'calls') {
     const prefixed = nmTimedT('dartPrefixed', ref, () => matchDartPrefixedCall(ref, context));
     if (prefixed !== undefined) return prefixed;
+  }
+
+  // A C++ call on a dereferenced variable, which the extractor records by its
+  // bare name — `(*it)->Visit()` — is a call on what the variable points at,
+  // or on nothing of the project's: the strategies below would take any
+  // `Visit`, even a free function of that name.
+  if (ref.language === 'cpp' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const dereferenced = nmTimedT('cppDeref', ref, () => matchCppDereferencedCall(ref, context));
+    if (dereferenced !== undefined) return dereferenced;
   }
 
   // Try strategies in order of confidence
