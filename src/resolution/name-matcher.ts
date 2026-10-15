@@ -2461,9 +2461,10 @@ function readGoScopes(code: string): GoScopeIndex {
     }
   }
   // Each `func`'s receiver, parameters and results, bound in its body. A
-  // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it.
+  // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it, and
+  // so is a `func(…)` result type after a signature's `)` (#2580).
   for (const m of code.matchAll(/(?<![\w.])func\b/g)) {
-    if (/(?:\]|\bchan)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    if (/(?:[\]*)]|\bchan(?:[ \t]*<-)?)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
     const sig = goSignature(code, m.index! + 4);
     if (!sig) continue;
     for (const [from, to] of sig.groups) {
@@ -2646,7 +2647,8 @@ function goScopesOf(index: GoScopeIndex, name: string): Array<[number, number, G
     }
     const from = goStatementEnd(index.code, d.at);
     let to = block[1];
-    if (d.kind === 'case') {
+    // A `case` clause's names, header or body, end at the next clause.
+    {
       const clause = /\n[ \t]*(?:case\b|default[ \t]*:)/g;
       clause.lastIndex = from;
       for (let m = clause.exec(index.code); m && m.index < to; m = clause.exec(index.code)) {
@@ -14219,6 +14221,17 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
   }
   memo.set(typeNode.id, embedded);
   return embedded;
+}
+
+/**
+ * A bare Go name a parameter or local of the enclosing function declares at
+ * `ref`: Go gives it the innermost block, so a bare call there is to the
+ * func value, which has no node, never a package-level symbol of that name
+ * (#2580). Checked ahead of every strategy, frameworks included.
+ */
+export function isGoShadowedBareName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  return goLocalDecl(ref.referenceName, ref, context) !== undefined && rustGoCallShape(ref, context)?.shape === 'bare';
 }
 
 /**
