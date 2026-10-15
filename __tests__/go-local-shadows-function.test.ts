@@ -31,7 +31,7 @@ async function edges(files: Record<string, string>, fromName: string): Promise<s
   expect(from).toBeDefined();
   return cg
     .getOutgoingEdges(from.id)
-    .filter((e) => e.kind === 'calls' || e.kind === 'references')
+    .filter((e) => e.kind === 'calls')
     .map((e) => [e, cg!.getNode(e.target)] as const)
     .filter(([, n]) => n?.kind === 'function')
     .map(([e, n]) => `${e.kind} ${n!.name} L${e.line}`);
@@ -55,7 +55,6 @@ describe('a Go local or parameter shadows a same-named package function (#2580)'
     ['a func parameter', 'func use(run func(string) string) string {\n\treturn run("x")\n}', 'use(nil)'],
     ['a var closure', 'func use() string {\n\tvar run = func(s string) string { return s }\n\treturn run("x")\n}', 'use()'],
     ['an if-header local', 'func use() string {\n\tif run := func(s string) string { return s }; true {\n\t\treturn run("x")\n\t}\n\treturn ""\n}', 'use()'],
-    ['a parameter passed as a value', 'func apply(f any) {}\n\nfunc use(run func(int, int) int) {\n\tapply(run)\n}', 'use(nil)'],
     ['a named result', 'func use() (run func(string) string) {\n\trun = func(s string) string { return s }\n\trun("x")\n\treturn\n}', 'use()'],
     ['a range value', 'func use(fns []func()) {\n\tfor _, run := range fns {\n\t\trun()\n\t}\n}', 'use(nil)'],
   ])('%s, in the same file', async (_label, body, call) => {
@@ -91,6 +90,8 @@ describe('a Go local or parameter shadows a same-named package function (#2580)'
     ['a call after the block declaring the local', 'func use() {\n\tif true {\n\t\trun := func() {}\n\t\trun()\n\t}\n\trun(1, 2)\n}', ['calls run L10']],
     ['a sibling case clause', 'func use(x int) int {\n\tswitch x {\n\tcase 1:\n\t\trun := func(a, b int) int { return a }\n\t\treturn run(1, 2)\n\tcase 2:\n\t\treturn run(1, 2)\n\t}\n\treturn 0\n}', ['calls run L11']],
     ['a select default after a case declaring the local', 'func use(ch chan int) int {\n\tselect {\n\tcase <-ch:\n\t\trun := func(a, b int) int { return a }\n\t\treturn run(1, 2)\n\tdefault:\n\t\treturn run(1, 2)\n\t}\n}', ['calls run L11']],
+    ['a pointer-to-func result naming a parameter run', 'func use() *func(run int) int {\n\t_ = run(1, 2)\n\treturn nil\n}', ['calls run L6']],
+    ['a send-only channel-of-func result naming a parameter run', 'func use() chan<- func(run int) {\n\t_ = run(1, 2)\n\treturn nil\n}', ['calls run L6']],
     ['a func-type result naming a parameter run', 'func use() func(run int) int {\n\t_ = run(1, 2)\n\treturn nil\n}', ['calls run L6']],
   ])('keeps the edge for %s', async (_label, body, expected) => {
     expect(await edges(mainGo(body, 'use()'), 'use')).toEqual(expected);

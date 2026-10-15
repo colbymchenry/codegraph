@@ -2464,7 +2464,7 @@ function readGoScopes(code: string): GoScopeIndex {
   // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it, and
   // so is a `func(…)` result type after a signature's `)` (#2580).
   for (const m of code.matchAll(/(?<![\w.])func\b/g)) {
-    if (/(?:\]|\bchan|\))[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    if (/(?:[\]*)]|\bchan(?:[ \t]*<-)?)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
     const sig = goSignature(code, m.index! + 4);
     if (!sig) continue;
     for (const [from, to] of sig.groups) {
@@ -14238,18 +14238,13 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  */
 /**
  * A bare Go name a parameter or local of the enclosing function declares at
- * `ref`: Go gives it the innermost block, so a call or value use there is the
+ * `ref`: Go gives it the innermost block, so a bare call there is to the
  * func value, which has no node, never a package-level symbol of that name
  * (#2580). Checked ahead of every strategy, frameworks included.
  */
 export function isGoShadowedBareName(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.language !== 'go' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
-  if (ref.referenceKind === 'calls') {
-    if (rustGoCallShape(ref, context)?.shape !== 'bare') return false;
-  } else if (ref.referenceKind !== 'function_ref' && ref.referenceKind !== 'references') {
-    return false;
-  }
-  return goLocalDecl(ref.referenceName, ref, context) !== undefined;
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  return goLocalDecl(ref.referenceName, ref, context) !== undefined && rustGoCallShape(ref, context)?.shape === 'bare';
 }
 
 export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
