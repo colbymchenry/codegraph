@@ -14224,6 +14224,17 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
 }
 
 /**
+ * A bare Go name a parameter or local of the enclosing function declares at
+ * `ref`: Go gives it the innermost block, so a bare call there is to the
+ * func value, which has no node, never a package-level symbol of that name
+ * (#2580). Checked ahead of every strategy, frameworks included.
+ */
+export function isGoShadowedBareName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  return goLocalDecl(ref.referenceName, ref, context) !== undefined && rustGoCallShape(ref, context)?.shape === 'bare';
+}
+
+/**
  * A Go call made through a type assertion — `srv.(KVServer).Range(ctx, in)`,
  * `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a method of
  * the asserted type: its own, the one its interface declares, or one embedding
@@ -14236,17 +14247,6 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
  * no receiver to go on. Undefined when the call is not made through an
  * assertion.
  */
-/**
- * A bare Go name a parameter or local of the enclosing function declares at
- * `ref`: Go gives it the innermost block, so a bare call there is to the
- * func value, which has no node, never a package-level symbol of that name
- * (#2580). Checked ahead of every strategy, frameworks included.
- */
-export function isGoShadowedBareName(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
-  return goLocalDecl(ref.referenceName, ref, context) !== undefined && rustGoCallShape(ref, context)?.shape === 'bare';
-}
-
 export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
   const asserted = goAssertedType(ref, context);
