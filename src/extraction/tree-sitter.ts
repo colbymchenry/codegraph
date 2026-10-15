@@ -5311,7 +5311,12 @@ export class TreeSitterExtractor {
         }
       }
     } else {
-      const func = getChildByField(node, 'function') || node.namedChild(0);
+      let func = getChildByField(node, 'function') || node.namedChild(0);
+      // tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+      // `await f`; the call is to `f` (#2586). Mirrored in the kernel's extract_call.
+      if (func?.type === 'await_expression' && (this.language === 'typescript' || this.language === 'tsx')) {
+        func = func.namedChild(0) ?? func;
+      }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the

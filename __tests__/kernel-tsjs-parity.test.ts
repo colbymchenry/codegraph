@@ -126,6 +126,19 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
+  it.each([['ts', 'typescript'], ['tsx', 'tsx']] as const)('an awaited call with type arguments names its callee: %s (#2586)', (ext, language) => {
+    const source = [
+      'export async function a() { return await fetchApi<User>("/me"); }',
+      'export async function b() { return await api.fetchApi<User>("/me"); }',
+      'export async function c() { return (await load())(); }',
+      '',
+    ].join('\n');
+    const result = assertParity(`awaited.${ext}`, source, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi']));
+    expect(calls.some((n) => n.startsWith('await'))).toBe(false);
+  });
+
   it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {
     // Mostly long lines dense with code punctuation, as a minifier writes them.
     const line = `var a={b:function(){return c(1,2)},d:function(e){return e}};window.L={f:function(){return a.b()}};`.repeat(40);

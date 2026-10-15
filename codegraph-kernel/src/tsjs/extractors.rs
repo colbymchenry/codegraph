@@ -1400,7 +1400,16 @@ impl<'t> Walker<'t> {
         }
         let func = node
             .child_by_field_name("function")
-            .or_else(|| node.named_child(0));
+            .or_else(|| node.named_child(0))
+            // `await f<T>(x)` parses with `await f` as the callee; the call is
+            // to `f` (#2586). Mirrors TreeSitterExtractor.extractCall.
+            .map(|f| {
+                if self.variant.is_ts() && f.kind() == "await_expression" {
+                    f.named_child(0).unwrap_or(f)
+                } else {
+                    f
+                }
+            });
         let mut callee_name = String::new();
 
         if let Some(func) = func {

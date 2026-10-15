@@ -764,6 +764,29 @@ function main() {
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
     expect(calls.some((c) => c.referenceName === 'processData')).toBe(true);
   });
+
+  // tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+  // `await f`, so the ref was named `await f` and matched nothing (#2586).
+  it.each([['user.ts'], ['user.tsx']])('an awaited call with type arguments names its callee: %s (#2586)', (file) => {
+    const code = [
+      'export async function awaited() { return await fetchApi<User>("/me"); }',
+      'export async function assigned() { const u = await fetchApi<User>("/me"); return u; }',
+      'export async function viaNamespace() { return await api.fetchApi<User>("/me"); }',
+      'export async function viaThis() { return await this.load<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName);
+    };
+    expect(byFn('awaited')).toEqual(['fetchApi']);
+    expect(byFn('assigned')).toEqual(['fetchApi']);
+    expect(byFn('viaNamespace')).toEqual(['api.fetchApi']);
+    expect(byFn('viaThis')).toEqual(['load']);
+    expect(calls.some((c) => c.referenceName.startsWith('await'))).toBe(false);
+  });
 });
 
 describe('Arrow Function Export Extraction', () => {
