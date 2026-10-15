@@ -1152,11 +1152,19 @@ export class QueryBuilder {
       // protobuf stub) outranks the real `server/etcdserver/server.go`
       // (470 edges) by 4×, and the boost would push the agent toward
       // generated code.
+      //
+      // CROSS JOIN pins the loop order to edges first, then a primary-key
+      // lookup per end: one pass over the edges whatever the statistics say.
+      // With a plain JOIN the planner may start from nodes and, for each node,
+      // walk every node in its file and probe edges by (source, target) —
+      // quadratic in nodes per file. Sampled stats (`analysis_limit` +
+      // `PRAGMA optimize`) can under-count nodes per file and pick that plan,
+      // and a few huge files (a generated R.java) then cost ~100 s (#2571).
       this.stmts.getDominantFile = this.db.prepare(`
         SELECT n.file_path AS file_path, COUNT(*) AS edge_count
         FROM edges e
-        JOIN nodes n ON e.source = n.id
-        JOIN nodes m ON e.target = m.id
+        CROSS JOIN nodes n ON e.source = n.id
+        CROSS JOIN nodes m ON e.target = m.id
         WHERE n.file_path = m.file_path
         GROUP BY n.file_path
         ORDER BY edge_count DESC
