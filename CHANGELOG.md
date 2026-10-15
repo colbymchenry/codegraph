@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Qwen Code is now a supported agent: `codegraph install` detects it and wires up the CodeGraph MCP server, the CodeGraph section in your `QWEN.md`, and auto-approve permissions, with existing settings and other MCP servers preserved and `codegraph uninstall` reversing it cleanly. Restart Qwen Code after installing so the server loads.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
