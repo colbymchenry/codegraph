@@ -185,17 +185,17 @@ function remember(path: string, entry: CachedTree): void {
   }
 }
 
-async function treeFor(absPath: string, language: Language): Promise<CachedTree | null> {
+export async function treeFor(absPath: string, language: Language, maxBytes = MAX_PARSE_BYTES): Promise<CachedTree | null> {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(absPath);
   } catch {
     return null;
   }
+  if (stat.size > maxBytes) return null;
   const key = `${language}:${stat.mtimeMs}:${stat.size}`;
   const hit = treeCache.get(absPath);
   if (hit && hit.key === key) return hit;
-  if (stat.size > MAX_PARSE_BYTES) return null;
   let source: string;
   try {
     source = fs.readFileSync(absPath, 'utf8');
