@@ -79,10 +79,7 @@ afterEach(() => {
 describe('synthesis inputs from a lazily loaded workspace package (#2565)', () => {
   it('records the loading file as an input, and a sync after an edit to it succeeds', async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2565-'));
-    for (const [file, text] of Object.entries(FILES)) {
-      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-      fs.writeFileSync(path.join(root, file), text);
-    }
+    write(root, FILES);
     cg = await CodeGraph.init(root, { index: true });
     expect(inputs(cg)).toContain('src/App.tsx');
     expect(inputs(cg)).not.toContain('packages/icons');
@@ -94,6 +91,7 @@ describe('synthesis inputs from a lazily loaded workspace package (#2565)', () =
     expect(indexed.has('src/App.tsx')).toBe(true);
     expect(indexed.has('packages/icons')).toBe(false);
     expect(inputs(cg)).toContain('src/App.tsx');
+    expect(inputs(cg)).not.toContain('packages/icons');
   });
   // The issue's own trigger: the edit is to ANOTHER file with markup, not the
   // one that loads the package, and every such sync failed.
