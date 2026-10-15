@@ -84,6 +84,11 @@ const EXHAUSTION_REASON =
   'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
   '(or install git sync hooks) to refresh the graph after changes.';
 
+/** The project directory itself was deleted (or moved away) while watched. */
+const ROOT_REMOVED_REASON =
+  'Project directory was removed; auto-sync disabled. Run `codegraph sync` ' +
+  'once it is back to refresh the graph.';
+
 /**
  * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
  * Unlike {@link EXHAUSTION_REASON} this does not disable the watcher — the
@@ -306,6 +311,8 @@ export class FileWatcher {
   private watchedRealDirs = new Map<string, string>();
   private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The one pending "is the project root still there" check (see armRootCheck). */
+  private rootCheckTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * True when the pending set does NOT exactly describe the change (a
    * directory removal's children are unknown from the event, #1285) — the
@@ -470,7 +477,10 @@ export class FileWatcher {
     this.recursiveWatcher = watchImpl(
       this.projectRoot,
       { recursive: true, persistent: true },
-      (_event, filename) => this.handleDirEvent(this.projectRoot, filename)
+      (_event, filename) => {
+        this.armRootCheck();
+        this.handleDirEvent(this.projectRoot, filename);
+      }
     );
     this.recursiveWatcher.on('error', (err: unknown) => {
       if (isWatchResourceExhaustion(err)) {
@@ -480,6 +490,26 @@ export class FileWatcher {
       logWarn('File watcher error', { error: String(err) });
     });
     this.refreshWatchTree();
+  }
+
+  /**
+   * Windows never ends a recursive watch whose directory was deleted: it keeps
+   * re-reporting the removal, over 100,000 events a second under Node 25
+   * (measured 2026-10-10: a watched project deleted held 89% of a core until
+   * the process exited, and the debounce never fired). So any event arms ONE
+   * existence check of the project root a second later (never one per event:
+   * a build can emit thousands a second), and a root that is gone degrades the
+   * watcher, which closes the stream. The last event of any burst still gets a
+   * check after it.
+   */
+  private armRootCheck(): void {
+    if (this.rootCheckTimer || this.stopped) return;
+    this.rootCheckTimer = setTimeout(() => {
+      this.rootCheckTimer = null;
+      if (this.stopped || fs.existsSync(this.projectRoot)) return;
+      this.degrade(ROOT_REMOVED_REASON, { projectRoot: this.projectRoot });
+    }, 1000);
+    this.rootCheckTimer.unref?.();
   }
 
   /** Reconcile logical directory paths with real targets, including retargeted links. */
@@ -863,6 +893,8 @@ export class FileWatcher {
     this.stopped = true;
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
+    if (this.rootCheckTimer) clearTimeout(this.rootCheckTimer);
+    this.rootCheckTimer = null;
     this.knownDirs.clear();
     this.watchedRealDirs.clear();
     this.recoveringFromLock = false;
