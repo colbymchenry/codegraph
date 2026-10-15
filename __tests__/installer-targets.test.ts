@@ -79,6 +79,8 @@ function setHome(dir: string): { restore: () => void } {
     COPILOT_HOME: process.env.COPILOT_HOME,
     CODEX_HOME: process.env.CODEX_HOME,
     CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+    PIG_HOME: process.env.PIG_HOME,
+    PIG_CODING_AGENT_DIR: process.env.PIG_CODING_AGENT_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -88,6 +90,8 @@ function setHome(dir: string): { restore: () => void } {
   delete process.env.COPILOT_HOME;
   delete process.env.CODEX_HOME;
   delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.PIG_HOME;
+  delete process.env.PIG_CODING_AGENT_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -98,6 +102,8 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
       if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
       if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
+      if (prev.PIG_HOME === undefined) delete process.env.PIG_HOME; else process.env.PIG_HOME = prev.PIG_HOME;
+      if (prev.PIG_CODING_AGENT_DIR === undefined) delete process.env.PIG_CODING_AGENT_DIR; else process.env.PIG_CODING_AGENT_DIR = prev.PIG_CODING_AGENT_DIR;
     },
   };
 }
@@ -3063,5 +3069,108 @@ describe('Antigravity macOS command persistence (#1443)', () => {
   it.runIf(process.platform === 'darwin')('falls back to the bare command when lookup fails', () => {
     vi.stubEnv('PATH', tmpHome);
     expect(installCommand()).toBe('codegraph');
+  });
+});
+
+describe('Installer target — PiG', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('pig-home');
+    tmpCwd = mkTmpDir('pig-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('writes the codegraph server into the XDG agent dir by default (XDG_CONFIG_HOME/pig/agent/mcp.json)', () => {
+    const pig = getTarget('pig')!;
+    pig.install('global', { autoAllow: true });
+
+    const file = path.join(tmpHome, '.config', 'pig', 'agent', 'mcp.json');
+    expect(fs.existsSync(file)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+      exposure: 'direct',
+      description: expect.any(String),
+    });
+    // Same shape `pig mcp add` writes: no `type` key.
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+  });
+
+  it('falls back to ~/.pig/agent when XDG_CONFIG_HOME is unset', () => {
+    delete process.env.XDG_CONFIG_HOME;
+    getTarget('pig')!.install('global', { autoAllow: true });
+    expect(fs.existsSync(path.join(tmpHome, '.pig', 'agent', 'mcp.json'))).toBe(true);
+  });
+
+  it('honors PIG_HOME (PIG_HOME/agent/mcp.json)', () => {
+    const home = path.join(tmpHome, 'custom-pig');
+    process.env.PIG_HOME = home;
+    getTarget('pig')!.install('global', { autoAllow: true });
+    expect(fs.existsSync(path.join(home, 'agent', 'mcp.json'))).toBe(true);
+  });
+
+  it('PIG_CODING_AGENT_DIR wins over PIG_HOME and XDG', () => {
+    const agent = path.join(tmpHome, 'agent-override');
+    process.env.PIG_HOME = path.join(tmpHome, 'ignored');
+    process.env.PIG_CODING_AGENT_DIR = agent;
+    const pig = getTarget('pig')!;
+    expect(pig.describePaths('global')).toEqual([path.join(agent, 'mcp.json')]);
+    pig.install('global', { autoAllow: true });
+    expect(fs.existsSync(path.join(agent, 'mcp.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, 'ignored', 'agent', 'mcp.json'))).toBe(false);
+  });
+
+  it('local location writes nothing and says to use --location=global', () => {
+    const pig = getTarget('pig')!;
+    expect(pig.supportsLocation('local')).toBe(false);
+    const result = pig.install('local', { autoAllow: true });
+    expect(result.files).toEqual([]);
+    expect(result.notes?.join(' ')).toMatch(/--location=global/);
+    expect(fs.existsSync(path.join(tmpCwd, '.pig'))).toBe(false);
+  });
+
+  it('uninstall keeps a sibling server and other settings; deletes a file it would leave empty', () => {
+    const pig = getTarget('pig')!;
+    const file = path.join(tmpHome, '.config', 'pig', 'agent', 'mcp.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { other: { command: 'x' } } }, null, 2) + '\n');
+
+    pig.install('global', { autoAllow: true });
+    pig.uninstall('global');
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.mcpServers).toEqual({ other: { command: 'x' } });
+    expect(after.mcpServers.codegraph).toBeUndefined();
+
+    // Sole server, but another top-level setting: only mcpServers goes.
+    fs.writeFileSync(file, JSON.stringify({ autoEnableCodemode: false, mcpServers: { codegraph: { command: 'codegraph' } } }) + '\n');
+    pig.uninstall('global');
+    expect(JSON.parse(fs.readFileSync(file, 'utf-8'))).toEqual({ autoEnableCodemode: false });
+
+    // From-scratch install: uninstall leaves no empty mcp.json behind.
+    fs.rmSync(file);
+    pig.install('global', { autoAllow: true });
+    pig.uninstall('global');
+    expect(fs.existsSync(file)).toBe(false);
+    expect(pig.uninstall('global').files[0].action).toBe('not-found');
+  });
+
+  it('printConfig explains the global-only location instead of printing nothing', () => {
+    const pig = getTarget('pig')!;
+    expect(pig.printConfig('local')).toMatch(/--location=global/);
+    expect(pig.printConfig('global')).toContain('"exposure": "direct"');
   });
 });
