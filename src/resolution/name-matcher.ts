@@ -9189,12 +9189,14 @@ const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function
 const CPP_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>`;
 /**
  * A declared type as the declarator regex reads it, what it carries included:
- * `const FieldDescriptor* PROTOBUF_NULLABLE*`, and a leading `::` that names
- * the global scope (`::upb::Arena arena`), which C++ lookup starts from. A
- * `::` after a name, a template's arguments or a `)` is no such `::`: in
- * `SkipList<Key, Comparator>::Iterator iter`, `Iterator` is SkipList's.
+ * `const FieldDescriptor* PROTOBUF_NULLABLE*`, a leading `::` that names the
+ * global scope (`::upb::Arena arena`), which C++ lookup starts from, and the
+ * class template a member type is written in: `SkipList<Key,
+ * Comparator>::Iterator iter` is SkipList's `Iterator`, which read from its
+ * `Iterator` alone was the namespace's own. (A `::` after a name, a
+ * template's arguments or a `)` is no leading `::`.)
  */
-const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|(?:(?<![\w>):])::\s*)?[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS})?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|(?:(?<![\w>):])::\s*)?[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS}(?:\s*::\s*[A-Za-z_][\w:]*)?)?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
 /** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
 const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
 /** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
@@ -10197,7 +10199,10 @@ function cppTypesNamed(name: string, context: ResolutionContext): Node[] {
  * `_t` name has no members of its own: it is a scalar (`std::size_t`, so
  * the declaration is another variable's), a tag, or a trait that names
  * another type (rocksdb's `std::conditional_t<kIsDigested, void*, Slice>
- * dict`).
+ * dict`). So is a member of a template's specialization other than an
+ * iterator: `std::vector<Slice>::value_type` is a `Slice`, and googletest's
+ * `typename std::tuple_element<N - 1, MatcherTuple>::type matcher` one of its
+ * matcher classes.
  */
 function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   if ((raw.match(/</g)?.length ?? 0) !== (raw.match(/>/g)?.length ?? 0)) return false;
@@ -10205,11 +10210,28 @@ function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
   if (!segments || segments.length < 2) return false;
   const name = segments[segments.length - 1]!;
   if (!/^[a-z]/.test(name) || /_t$/.test(name)) return false;
+  if (!CPP_ITERATOR_NAME.test(name) && isCppSpecializationMember(raw)) return false;
   if (segments.slice(0, -1).some((s) => cppTypesNamed(s, context).length > 0)) return false;
   const declared = cppTypesNamed(name, context);
   if (segments[0] !== 'std') return declared.length === 0 || cppFindsOnlyNamesakes(raw, context);
   const spelled = segments.join('::');
   return !declared.some((n) => n.qualifiedName === spelled || n.qualifiedName.endsWith(`::${spelled}`));
+}
+
+/** A container's iterator type: `iterator`, `const_reverse_iterator`, `local_iterator`. */
+const CPP_ITERATOR_NAME = /^(?:const_)?(?:reverse_|local_)?iterator$/;
+
+/**
+ * Is a C++ type written as a member of a template's specialization:
+ * `std::vector<int>::iterator`, `SkipList<Key, Comparator>::Iterator`?
+ */
+function isCppSpecializationMember(raw: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '<') depth++;
+    else if (raw[i] === '>' && --depth === 0 && /^\s*::/.test(raw.slice(i + 1))) return true;
+  }
+  return false;
 }
 
 /** Library types whose `->` reaches the value they hold. */
