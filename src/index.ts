@@ -46,6 +46,10 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
+import { serializationAliases, type SerializationAliasOptions, type SerializationAliasReport } from './graph/serialization-aliases';
+export type { SerializationAliasOptions, SerializationAliasReport } from './graph/serialization-aliases';
+export type { FieldContract } from './graph/field-contracts';
+
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
@@ -2223,9 +2227,12 @@ export class CodeGraph {
     return this.queries.hasFilesUnder(dir);
   }
 
-  /**
-   * Get all tracked files
-   */
+  /** Read explicit serde and Go JSON field names from current indexed source files. */
+  getSerializationAliases(options: SerializationAliasOptions = {}): Promise<SerializationAliasReport> {
+    return serializationAliases(this, options);
+  }
+
+  /** Get all tracked files. */
   getFiles(): FileRecord[] {
     return this.queries.getAllFiles();
   }
