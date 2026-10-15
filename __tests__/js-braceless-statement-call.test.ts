@@ -1,6 +1,7 @@
 /**
- * A receiver-less call that is the body of a braceless `if`, `while` or `for`
- * — `if (e.key === "Escape") setOpen(false);` — is still a bare call (#2585).
+ * A receiver-less call that is the body of a braceless `if`, `while`, `for` or
+ * `do` — `if (e.key === "Escape") setOpen(false);` — is still a bare call
+ * (#2585), also when the header wraps lines or holds a `)` in a string.
  * The character before the name is the `)` that closes the statement's header,
  * and that `)` used to read as the end of a receiver. The call then skipped
  * both guards a bare JS/TS call gets: no type member, and no other file's
@@ -62,7 +63,7 @@ export function Dialog(xs: number[]) {
 }
 `;
 
-describe('a call that is the body of a braceless if/while/for (#2585)', () => {
+describe('a call that is the body of a braceless if/while/for/do (#2585)', () => {
   let tmpDir: string | undefined;
   let cg: CodeGraph | undefined;
 
@@ -91,6 +92,33 @@ describe('a call that is the body of a braceless if/while/for (#2585)', () => {
     for (const fn of ['a', 'b', 'c', 'w', 'f', 'g', 'h', 'k', 'm', 'n']) {
       expect(callees(cg, fn), fn).not.toContain('property:setOpen');
     }
+  });
+
+  it('still resolves a bare call after a braceless header to its own target', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-braceless-'));
+    fs.writeFileSync(path.join(tmpDir, 'util.ts'), `export function helper() { return 1; }
+export function use(open: boolean) {
+  if (open) helper();
+}
+`);
+    cg = await CodeGraph.init(tmpDir, { index: true });
+
+    expect(callees(cg, 'use')).toEqual(['function:helper']);
+  });
+
+  it('still resolves a call through a parenthesized receiver', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-braceless-'));
+    fs.writeFileSync(path.join(tmpDir, 'svc.ts'), `export class Svc {
+  run() { return 1; }
+}
+export function make(): Svc { return new Svc(); }
+export function use() {
+  return (make()).run();
+}
+`);
+    cg = await CodeGraph.init(tmpDir, { index: true });
+
+    expect(callees(cg, 'use')).toContain('function:make');
   });
 
   it('still resolves a call on a receiver after a braceless header', async () => {
