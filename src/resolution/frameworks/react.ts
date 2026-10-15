@@ -501,11 +501,14 @@ const MAX_REEXPORT_HOPS = 4;
  * `export { default } from './page'`, `export { Page as Component } from
  * './page'`, `export * from './page'`, which forwards every name but the
  * default, or an import it exports again, `import { Page } from './page';
- * export { Page }`. As in JavaScript, a name the file exports itself hides one an
- * `export *` would forward, and a name two `export *` modules both forward is
- * exported by neither. `reads` collects every file the lookup reads.
+ * export { Page }`, or in a value, outline's `const Avatar =
+ * AvatarWithHoverCard; export { Avatar }`. As in JavaScript, a name the file
+ * exports itself hides one an `export *` would forward, and a name two
+ * `export *` modules both forward is exported by neither. `reads` collects
+ * every file the lookup reads. A JSX tag imported from the project renders it
+ * too (`jsxChild`).
  */
-function exportedComponent(
+export function exportedComponent(
   file: string,
   name: string,
   context: ResolutionContext,
@@ -523,17 +526,40 @@ function exportedComponent(
   const code = stripCommentsForRegex(context.readFile(file) ?? '', 'typescript');
   const local = ownExport(code, name);
   if (local) {
-    const named = context.getNodesInFile(file).filter((n) => n.name === local && EXPORTED_COMPONENT_KINDS.has(n.kind));
-    const declared = named.find((n) => n.qualifiedName === local) ?? named[0];
+    const nodes = context.getNodesInFile(file);
+    const declaredAs = (binding: string): Node | undefined => {
+      const named = nodes.filter((n) => n.name === binding && EXPORTED_COMPONENT_KINDS.has(n.kind));
+      return named.find((n) => n.qualifiedName === binding) ?? named[0];
+    };
+    const exported = declaredAs(local);
+    // A constant that holds another binding is that binding: outline's
+    // `Avatar/index.ts` is `const Avatar = AvatarWithHoverCard; export { Avatar }`.
+    // (A `let` may be assigned another component before it is used.)
+    let binding = local;
+    let declared = exported;
+    for (let hop = 0; declared && hop < MAX_REEXPORT_HOPS; hop++) {
+      const held = declared.kind === 'constant' ? heldBinding(declared, context) : null;
+      if (!held) break;
+      binding = held;
+      declared = declaredAs(held);
+    }
     // A value is what it wraps: `export default Page` of `const Page = observer(function Page_() {…})`.
-    if (declared) return (declared.kind === 'constant' || declared.kind === 'variable' ? wrappedComponent(declared, context)?.id : undefined) ?? declared.id;
+    // So is a component node minted for a wrapper around another component
+    // (`const MemoizedBlurhash = memo(Blurhash)`), which has no body to render from.
+    if (declared) {
+      const wrapped = declared.kind === 'constant' || declared.kind === 'variable' ? wrappedComponent(declared, context)
+        : declared.kind === 'component' ? handedComponent(declared, context) : null;
+      return (wrapped ?? declared).id;
+    }
     // A name the module imports and exports again — `import { Page } from
     // './page'; export { Page }`, `import Page from './Page'; export default
     // Page` — is the page that import names. `export default withAuth(Page)`
     // hands over no binding of its own.
-    if (name === 'default' && !exportsBinding(code, local)) return null;
-    const imported = context.getImportMappings(file, language).find((m) => m.localName === local);
-    return imported && !imported.isNamespace ? forwarded(imported.source, imported.isDefault ? 'default' : imported.exportedName) : null;
+    if (binding === local && name === 'default' && !exportsBinding(code, local)) return null;
+    const imported = context.getImportMappings(file, language).find((m) => m.localName === binding);
+    const id = imported && !imported.isNamespace ? forwarded(imported.source, imported.isDefault ? 'default' : imported.exportedName) : null;
+    // A held binding that leads nowhere leaves the value itself the export.
+    return id ?? exported?.id ?? null;
   }
   const reExports = context.getReExports?.(file, language) ?? [];
   for (const re of reExports) {
@@ -801,10 +827,33 @@ function wrappedComponent(value: Node, context: ResolutionContext): Node | null 
   const held = inner.find((n) => n.name === value.name) ??
     (inner.length === 1 && inner[0]!.endLine === value.endLine ? inner[0]! : null);
   if (held || inner.length > 0) return held;
+  return handedComponent(value, context, nodes);
+}
+
+/**
+ * The binding a value holds and nothing more — `AvatarWithHoverCard` of
+ * outline's `const Avatar = AvatarWithHoverCard`, past a type assertion (`=
+ * Page as FC`) — or null for any other initializer.
+ */
+function heldBinding(value: Node, context: ResolutionContext): string | null {
+  const code = stripCommentsForRegex(declarationText(value, context), 'typescript');
+  const init = initializerAt(code, value.name.length);
+  if (init < 0) return null;
+  const held = /^\s*([A-Za-z_$][\w$]*)\s*(?:$|(?:as|satisfies)\s)/.exec(code.slice(init, statementEnd(code, init)));
+  return held && held[1] !== value.name ? held[1]! : null;
+}
+
+/**
+ * The component of its own file a wrapper call around a declaration hands
+ * over: `const TableView = observer(TableViewInner)`, or mastodon's `const
+ * MemoizedBlurhash = memo(Blurhash)`, whose component node has no body of its
+ * own to render from.
+ */
+function handedComponent(value: Node, context: ResolutionContext, nodes = context.getNodesInFile(value.filePath)): Node | null {
   const code = stripCommentsForRegex(declarationText(value, context), 'typescript');
   const init = initializerAt(code, value.name.length);
   const handed = init < 0 ? null : wrappedName(code.slice(init, statementEnd(code, init)));
-  return handed && isPascalCase(handed)
+  return handed && isPascalCase(handed) && handed !== value.name
     ? nodes.find((n) => n.name === handed && n.qualifiedName === handed && COMPONENT_KINDS.has(n.kind)) ?? null
     : null;
 }

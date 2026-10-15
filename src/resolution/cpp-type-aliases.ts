@@ -62,6 +62,13 @@ export interface CppAliasedType {
 interface TypeName {
   names: string[];
   templated: boolean[];
+  /**
+   * Written from the global scope (`::upb::Arena`), so looked up there alone:
+   * protobuf's `namespace hpb::internal::backend::upb { using Arena =
+   * ::upb::Arena; }` would otherwise find its own namespace's `upb::Arena`,
+   * the alias itself.
+   */
+  global?: boolean;
 }
 
 /** `SkipList<const char*, Cmp<int>>::Iterator` → `SkipList::Iterator`. */
@@ -105,13 +112,19 @@ function cppTypeName(raw: string): TypeName | null {
   }
   parts.push(part.trim());
   templated.push(args);
-  if (parts[0] === '') {
-    // A leading `::` names the global scope.
+  // A leading `::` names the global scope.
+  const global = parts[0] === '';
+  if (global) {
     parts.shift();
     templated.shift();
   }
   if (parts.length === 0 || !parts.every((p) => /^[A-Za-z_]\w*$/.test(p))) return null;
-  return { names: parts, templated };
+  return global ? { names: parts, templated, global } : { names: parts, templated };
+}
+
+/** The scopes a written name is looked up from: the global scope alone for `::Name`. */
+function scopesFor(name: TypeName, scopes: readonly string[]): readonly string[] {
+  return name.global ? [''] : scopes;
 }
 
 /** Is a written type a pointer (`Table*`, `const Foo* const`), not counting its template arguments? */
@@ -430,7 +443,7 @@ function baseClassesOf(cls: string, context: ResolutionContext): string[] {
     for (const part of splitTopLevel(text.slice(colon + 1, brace))) {
       const name = cppTypeName(part.replace(/\b(?:public|protected|private|virtual)\b/g, ' '));
       if (!name) continue;
-      const base = classNamed(name.names, scopesWithin(parentScope(cls)), context);
+      const base = classNamed(name.names, scopesFor(name, scopesWithin(parentScope(cls))), context);
       if (base && base !== cls && !bases.includes(base)) bases.push(base);
     }
   }
@@ -518,7 +531,8 @@ export function resolveCppAliasedType(rawType: string, ref: UnresolvedRef, conte
   if (!name) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
   const scope = callerScope(caller);
-  const local = localAliasedType(name.names[0]!, caller, ref, context);
+  // (`::Foo` is no alias the calling function declares.)
+  const local = name.global ? undefined : localAliasedType(name.names[0]!, caller, ref, context);
   const resolved = local !== undefined
     ? expand(local, name.names.slice(1), name.templated.slice(1), scope, ref, context, 1,
       caller ? templateParametersAround(caller, context) : undefined)
@@ -621,7 +635,7 @@ export function cppAliasedTypeWritten(
 ): { text: string; alias: Node } | null | undefined {
   const name = cppTypeName(written);
   if (!name) return undefined;
-  const { found, next } = lookupSegments(name, scopes, ref, context);
+  const { found, next } = lookupSegments(name, scopesFor(name, scopes), ref, context);
   if (!found || typeof found !== 'object' || 'cls' in found) return undefined;
   if ('ambiguous' in found || next !== name.names.length || isAliasTemplate(found.alias, context)) return null;
   const text = declarationText(found.alias, context);
@@ -689,7 +703,7 @@ function follow(
   context: ResolutionContext,
   hops: number,
 ): CppAliasedType | null | undefined {
-  const { found, next } = lookupSegments(name, scopesWithin(scope), ref, context);
+  const { found, next } = lookupSegments(name, scopesFor(name, scopesWithin(scope)), ref, context);
   if (!found || typeof found !== 'object' || !('alias' in found)) return undefined;
   const alias = found.alias;
   if (hops >= MAX_HOPS) return null;
@@ -721,11 +735,13 @@ function expand(
   if (!target || parameters?.has(target.names[0]!)) return null;
   const pointer = isCppPointerType(written);
   const names = [...target.names, ...rest];
-  const further = follow({ names, templated: [...target.templated, ...restTemplated] }, scope, ref, context, hops);
+  const further = follow({ names, templated: [...target.templated, ...restTemplated], global: target.global }, scope, ref, context, hops);
   if (further === null) return null;
   if (further) return { ...further, pointer: further.pointer || pointer };
-  const cls = classNamed(names, scopesWithin(scope), context);
+  // `::upb::Arena` is looked up from the global scope, whatever scope writes it.
+  const from = target.global ? '' : scope;
+  const cls = classNamed(names, scopesWithin(from), context);
   const classTemplate = !!cls && context.getNodesByQualifiedName(cls)
     .some((n) => isCFamily(n) && CLASS_KINDS.has(n.kind) && templateParametersAround(n, context).size > 0);
-  return { target: target.names, rest: [...rest], scope, pointer, classTemplate };
+  return { target: target.names, rest: [...rest], scope: from, pointer, classTemplate };
 }

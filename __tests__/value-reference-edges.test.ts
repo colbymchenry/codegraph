@@ -124,6 +124,33 @@ describe('value-reference edges', () => {
     expect(valueRefReaders(cg, 'THEME_TOKENS')).toEqual(expect.arrayContaining(['Label', 'Box']));
   });
 
+  it('edges readers in a .jsx file, as it does the same code in .js or .tsx', async () => {
+    // `.jsx` is a language of its own, parsed with the JavaScript grammar. It
+    // used to be missing from the value-reference languages, so a component in
+    // a .jsx file had no edge to the lazy page it renders or the table it maps
+    // over, while the same code in a .js or .tsx file had both.
+    fs.writeFileSync(
+      path.join(dir, 'routes.jsx'),
+      [
+        "import { lazy } from 'react';",
+        "import Loadable from './Loadable';",
+        "const LoginPage = Loadable(lazy(() => import('./pages/Login')));",
+        "const NAV_ITEMS = [{ path: '/login', label: 'Login' }];",
+        'export function AuthRoutes() {',
+        '  return <LoginPage />;',
+        '}',
+        'export function Nav() {',
+        '  return <ul>{NAV_ITEMS.map((item) => <li key={item.path}>{item.label}</li>)}</ul>;',
+        '}',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(valueRefReaders(cg, 'LoginPage')).toEqual(['AuthRoutes']);
+    expect(valueRefReaders(cg, 'NAV_ITEMS')).toEqual(['Nav']);
+  });
+
   it('edges same-file readers to a module-level const/static (Rust)', async () => {
     fs.writeFileSync(
       path.join(dir, 'lib.rs'),
