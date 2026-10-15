@@ -56,13 +56,15 @@ import {
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
 import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
+import { MODULE_DEPENDENCY_EDGE_KINDS, matchBoundaryRules, moduleCycles, type ArchitectureBoundaryRule, type BoundaryViolation, type ModuleCycleReport } from './graph/architecture';
+import { toPosixPath, normalizeRoot, passThroughDirs, moduleIdFor, collapseLoneRootFiles, pickDefaultView, pickDefaultDepth } from './graph/module-map';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
-import { deriveProjectNameTokens } from './search/query-utils';
+import { deriveProjectNameTokens, isTestFile } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
@@ -148,6 +150,68 @@ export interface IndexOptions {
  *
  * Provides the primary interface for interacting with the code knowledge graph.
  */
+export interface ArchitectureReportOptions {
+  /**
+   * Directory the module grouping starts at; `''` is the repository root.
+   *
+   * Left out (or `null`), the scope is picked the way the viewer's map picks it — the source
+   * directory holding the most non-test symbols, with a depth that is neither one dominant box
+   * nor a crowd. Name a root to check a scope the auto rule would not have chosen.
+   */
+  root?: string | null;
+  /** Path segments under `root` that name a module. Defaults to the depth the auto rule picks. */
+  depth?: number;
+  /** Edges below this confidence are left out of every count. */
+  minConfidence?: number;
+  /** Only count edges the source writes down. */
+  requireDeclared?: boolean;
+  rules?: readonly ArchitectureBoundaryRule[];
+  /** Cap on reported violations; `violationsTruncated` says whether any were left out. */
+  maxViolations?: number;
+  /** Edges shown per violation; `evidenceTotal` says how many exist. */
+  maxEdgesPerViolation?: number;
+  maxCycles?: number;
+}
+
+export interface ArchitectureViolationEvidence {
+  fromFile: string;
+  toFile: string;
+  fromName: string;
+  toName: string;
+  kind: Edge['kind'];
+  line: number | null;
+  column: number | null;
+  /** Whether the edge came from something the source writes down (import, qualified name, ...). */
+  declared: boolean;
+}
+
+export interface ArchitectureReport {
+  root: string;
+  depth: number;
+  /**
+   * Whether `root`/`depth` were picked here rather than asked for.
+   *
+   * Worth carrying: a CI gate whose scope is chosen at run time checks a different set of modules
+   * the day a new top-level directory changes which one wins.
+   */
+  autoScope: boolean;
+  minConfidence: number;
+  requireDeclared: boolean;
+  /** Modules the files were grouped into, after loose-file buckets were folded. */
+  modules: number;
+  /** Cross-module links, counted per edge kind before the per-pair fold. */
+  dependencies: number;
+  rules: { configured: number; violated: number };
+  /** Rule matches dropped because every edge behind them was a bare name match. */
+  uncertainPairs: number;
+  violations: Array<BoundaryViolation & {
+    evidence: ArchitectureViolationEvidence[];
+    evidenceTotal: number;
+  }>;
+  violationsTruncated: boolean;
+  cycles: ModuleCycleReport;
+}
+
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
@@ -1881,10 +1945,98 @@ export class CodeGraph {
     return this.queries.aggregateModuleGraph(assignments, options);
   }
 
-  /**
-   * Every ordered pair of files where one reaches into the other — the edge
-   * list a cycle finder runs on. See {@link QueryBuilder.getCrossFileDependencyPairs}.
-   */
+  /** Report forbidden module dependencies and cycles using the viewer's grouping. */
+  getArchitectureReport(options: ArchitectureReportOptions = {}): ArchitectureReport {
+    const minConfidence = options.minConfidence ?? 0.6;
+    const requireDeclared = options.requireDeclared ?? true;
+    const rules = options.rules ?? [];
+    const maxViolations = options.maxViolations ?? 50;
+    const edgesPerViolation = options.maxEdgesPerViolation ?? 5;
+    const maxCycles = options.maxCycles ?? 20;
+
+    // Grouping the whole repository at a fixed depth mixes tests, scripts and
+    // sibling packages into the picture, and on a repository whose program lives
+    // under one directory it collapses into a single box made of everything. The
+    // viewer faces the same choice and answers it in `pickDefaultView`; a report
+    // that answered it differently would disagree with the map about what a
+    // module is. Naming a root (or a depth) opts out.
+    const fileRecords = this.getFiles().map((file) => {
+      const path = toPosixPath(file.path);
+      return { path, symbols: file.nodeCount ?? 0, test: isTestFile(path) };
+    });
+    const passThrough = passThroughDirs(fileRecords.map((file) => file.path));
+    const autoRoot = options.root === undefined || options.root === null;
+    const view = autoRoot ? pickDefaultView(fileRecords, passThrough) : null;
+    const root = view ? view.root : normalizeRoot(options.root ?? '');
+    const depth = options.depth ?? view?.depth ?? pickDefaultDepth(fileRecords, root, passThrough);
+
+    const paths = fileRecords.map((file) => file.path);
+    const assignments: Array<{ filePath: string; module: string }> = [];
+    for (const filePath of paths) {
+      const assigned = moduleIdFor(filePath, root, depth, passThrough);
+      if (assigned) assignments.push({ filePath, module: assigned.id });
+    }
+    const renamed = collapseLoneRootFiles(new Set(assignments.map((entry) => entry.module)));
+    if (renamed.size > 0) {
+      for (const entry of assignments) {
+        const next = renamed.get(entry.module);
+        if (next !== undefined) entry.module = next;
+      }
+    }
+    const moduleOfFile = new Map(assignments.map((entry) => [entry.filePath, entry.module]));
+
+    const aggregation = assignments.length === 0
+      ? { links: [], pairs: [] }
+      : this.getModuleAggregation(assignments, {
+          kinds: MODULE_DEPENDENCY_EDGE_KINDS,
+          minConfidence,
+          topPairsPerLink: 0,
+          pairKinds: [],
+        });
+
+    const allMatches = matchBoundaryRules(aggregation.links, rules, { requireDeclared: false });
+    const matched = matchBoundaryRules(aggregation.links, rules, { requireDeclared });
+    const uncertainPairs = requireDeclared ? allMatches.length - matched.length : 0;
+    const violations = matched.slice(0, maxViolations);
+    const edges = violations.length === 0
+      ? []
+      : this.queries.getCrossModuleEdges(
+          assignments,
+          violations.map((violation) => ({ source: violation.source, target: violation.target })),
+          { kinds: MODULE_DEPENDENCY_EDGE_KINDS, minConfidence, maxRowsPerPair: edgesPerViolation },
+        );
+    const evidenceByPair = new Map<string, typeof edges>();
+    for (const edge of edges) {
+      const key = `${edge.sourceModule}\u0000${edge.targetModule}`;
+      const list = evidenceByPair.get(key);
+      if (list) list.push(edge);
+      else evidenceByPair.set(key, [edge]);
+    }
+
+    return {
+      root,
+      depth,
+      autoScope: view !== null,
+      minConfidence,
+      requireDeclared,
+      modules: new Set(assignments.map((entry) => entry.module)).size,
+      dependencies: aggregation.links.length,
+      rules: { configured: rules.length, violated: matched.length },
+      uncertainPairs,
+      violations: violations.map((violation) => {
+        const pairEdges = evidenceByPair.get(`${violation.source}\u0000${violation.target}`) ?? [];
+        return {
+          ...violation,
+          evidenceTotal: pairEdges[0]?.pairTotal ?? pairEdges.length,
+          evidence: pairEdges.map(({ pairTotal: _pairTotal, ...rest }) => rest),
+        };
+      }),
+      violationsTruncated: matched.length > violations.length,
+      cycles: moduleCycles(this.getFileDependencyPairs(minConfidence), moduleOfFile, { maxCycles }),
+    };
+  }
+
+  /** Ordered cross-file dependency pairs used by cycle analysis. */
   getFileDependencyPairs(minConfidence = 0): Array<{ source: string; target: string }> {
     return this.queries.getCrossFileDependencyPairs(minConfidence);
   }

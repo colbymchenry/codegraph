@@ -2908,6 +2908,109 @@ export class QueryBuilder {
    * a cycle conjured by a common method name is a false alarm a reader cannot
    * check.
    */
+  getCrossModuleEdges(
+    assignments: ReadonlyArray<{ filePath: string; module: string }>,
+    pairs: ReadonlyArray<{ source: string; target: string }>,
+    options: { kinds: readonly EdgeKind[]; minConfidence: number; maxRowsPerPair: number }
+  ): Array<{
+    sourceModule: string;
+    targetModule: string;
+    fromFile: string;
+    toFile: string;
+    fromName: string;
+    toName: string;
+    kind: EdgeKind;
+    line: number | null;
+    column: number | null;
+    declared: boolean;
+    /** How many edges this pair has in total, so a capped list can say what it left out. */
+    pairTotal: number;
+  }> {
+    if (assignments.length === 0 || pairs.length === 0 || options.kinds.length === 0) return [];
+    const CONFIDENCE = `COALESCE(json_extract(e.metadata, '$.confidence'), 1)`;
+    const DECLARED = `(json_extract(e.metadata, '$.resolvedBy') IN ('import', 'qualified-name')
+                       OR e.kind IN ('extends', 'implements')
+                       OR (json_extract(e.metadata, '$.resolvedBy') = 'instance-method'
+                           AND ${CONFIDENCE} >= 0.9))`;
+
+    this.db.exec('DROP TABLE IF EXISTS temp.cg_arch_modules');
+    this.db.exec('DROP TABLE IF EXISTS temp.cg_arch_pairs');
+    this.db.exec('CREATE TEMP TABLE cg_arch_modules (path TEXT PRIMARY KEY, mod TEXT NOT NULL)');
+    this.db.exec('CREATE TEMP TABLE cg_arch_pairs (source TEXT NOT NULL, target TEXT NOT NULL)');
+    try {
+      this.db.exec('BEGIN');
+      try {
+        const insertModule = this.db.prepare('INSERT OR REPLACE INTO cg_arch_modules (path, mod) VALUES (?, ?)');
+        for (const row of assignments) insertModule.run(row.filePath, row.module);
+        const insertPair = this.db.prepare('INSERT INTO cg_arch_pairs (source, target) VALUES (?, ?)');
+        for (const pair of pairs) insertPair.run(pair.source, pair.target);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+
+      const rows = this.db
+        .prepare(
+          `SELECT ms.mod AS sourceModule, mt.mod AS targetModule,
+                  sn.file_path AS fromFile, tn.file_path AS toFile,
+                  sn.name AS fromName, tn.name AS toName,
+                  e.kind AS kind, e.line AS line, e.col AS column,
+                  CASE WHEN ${DECLARED} THEN 1 ELSE 0 END AS declared,
+                  COUNT(*) OVER (PARTITION BY ms.mod, mt.mod) AS "pairTotal"
+             FROM edges e
+             JOIN nodes sn ON sn.id = e.source
+             JOIN nodes tn ON tn.id = e.target
+             JOIN cg_arch_modules ms ON ms.path = sn.file_path
+             JOIN cg_arch_modules mt ON mt.path = tn.file_path
+             JOIN cg_arch_pairs p ON p.source = ms.mod AND p.target = mt.mod
+            WHERE e.kind IN (SELECT value FROM json_each(?))
+              AND ms.mod <> mt.mod
+              AND ${CONFIDENCE} >= ?
+            ORDER BY sourceModule, targetModule, declared DESC, line, col`
+        )
+        .all(JSON.stringify(options.kinds), options.minConfidence) as Array<{
+        sourceModule: string;
+        targetModule: string;
+        fromFile: string;
+        toFile: string;
+        fromName: string;
+        toName: string;
+        kind: EdgeKind;
+        line: number | null;
+        column: number | null;
+        declared: number;
+        pairTotal: number;
+      }>;
+
+      const perPair = new Map<string, number>();
+      const out: ReturnType<QueryBuilder['getCrossModuleEdges']> = [];
+      for (const row of rows) {
+        const key = `${row.sourceModule}\u0000${row.targetModule}`;
+        const seen = perPair.get(key) ?? 0;
+        if (seen >= options.maxRowsPerPair) continue;
+        perPair.set(key, seen + 1);
+        out.push({
+          sourceModule: row.sourceModule,
+          targetModule: row.targetModule,
+          fromFile: row.fromFile,
+          toFile: row.toFile,
+          fromName: row.fromName,
+          toName: row.toName,
+          kind: row.kind,
+          line: typeof row.line === 'number' ? row.line : null,
+          column: typeof row.column === 'number' ? row.column : null,
+          declared: row.declared === 1,
+          pairTotal: row.pairTotal,
+        });
+      }
+      return out;
+    } finally {
+      this.db.exec('DROP TABLE IF EXISTS temp.cg_arch_modules');
+      this.db.exec('DROP TABLE IF EXISTS temp.cg_arch_pairs');
+    }
+  }
+
   getCrossFileDependencyPairs(minConfidence: number): Array<{ source: string; target: string }> {
     return this.db
       .prepare(
