@@ -558,6 +558,11 @@ export class ContextBuilder {
         // Title-case the symbol: "REST" → "Rest", "bulk" → "Bulk", "allocation" → "Allocation"
         const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
         if (titleCased === sym) continue; // already title-case (e.g., "Engine") — handled by exact match
+        // Fast negative gate: if no node name starts with this prefix (case-insensitive),
+        // skip the searchNodes call. This avoids LIKE/fuzzy fallbacks when the term
+        // provably has zero matches. Step 2b filters results by startsWith anyway, so
+        // skipping when the prefix gate returns false cannot lose a result.
+        if (!this.queries.hasNodesByLowerNamePrefix(titleCased)) continue;
         // Fetch more results since popular prefixes have many matches
         const prefixResults = this.queries.searchNodes(titleCased, {
           limit: 30,

@@ -465,6 +465,15 @@ export interface SearchOptions {
   /** Offset for pagination */
   offset?: number;
 
+  /**
+   * Skip expensive fallback channels (LIKE full-table scan, fuzzy Levenshtein)
+   * when the caller has already proven the name does not exist via a cheap
+   * index seek. Default false. Only set true for callers/callees/impact/node
+   * lookups where "not found" must be instant; broad-recall paths (explore)
+   * keep the full pipeline.
+   */
+  exactMode?: boolean;
+
   /** Whether search is case-sensitive */
   caseSensitive?: boolean;
 }
