@@ -531,7 +531,8 @@ export function resolveCppAliasedType(rawType: string, ref: UnresolvedRef, conte
   if (!name) return undefined;
   const caller = context.getNodeById?.(ref.fromNodeId);
   const scope = callerScope(caller);
-  const local = localAliasedType(name.names[0]!, caller, ref, context);
+  // (`::Foo` is no alias the calling function declares.)
+  const local = name.global ? undefined : localAliasedType(name.names[0]!, caller, ref, context);
   const resolved = local !== undefined
     ? expand(local, name.names.slice(1), name.templated.slice(1), scope, ref, context, 1,
       caller ? templateParametersAround(caller, context) : undefined)

@@ -9187,8 +9187,14 @@ const CPP_FUNCTION_WRAPPER_TYPE = String.raw`(?:::\s*)?(?:std\s*::\s*(?:function
  * into `b`'s type.
  */
 const CPP_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>`;
-/** A declared type as the declarator regex reads it, what it carries included: `const FieldDescriptor* PROTOBUF_NULLABLE*`. */
-const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS})?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
+/**
+ * A declared type as the declarator regex reads it, what it carries included:
+ * `const FieldDescriptor* PROTOBUF_NULLABLE*`, and a leading `::` that names
+ * the global scope (`::upb::Arena arena`), which C++ lookup starts from. A
+ * `::` after a name, a template's arguments or a `)` is no such `::`: in
+ * `SkipList<Key, Comparator>::Iterator iter`, `Iterator` is SkipList's.
+ */
+const CPP_DECLARATOR_TYPE = String.raw`(?:${CPP_FUNCTION_WRAPPER_TYPE}|(?:(?<![\w>):])::\s*)?[A-Za-z_][\w:]*(?:\s*${CPP_TEMPLATE_ARGUMENTS})?)(?:\s*(?:${CPP_DECLARATOR_CV}|[*&]+(?:\s*${CPP_DECLARATOR_ANNOTATION})*))*`;
 /** A line that is a declared type and nothing else, what may come before a type included: `const std::map<int, Foo*>&`. */
 const CPP_TYPE_LINE = new RegExp(String.raw`^\s*(?:(?:const|volatile|static|mutable|constexpr|inline)\s+)*${CPP_DECLARATOR_TYPE}\s*$`);
 /** An annotation macro's call after a declared name: leveldb's `VersionSet* const versions_ GUARDED_BY(mutex_);`. */
@@ -10399,9 +10405,10 @@ function isCppOutsideQualifiedType(raw: string, site: CppNameSite, context: Reso
  * scopes in front of what is written, and the index leaves some out of a name
  * (one a macro opens, one a parse error lost). A namespace alias stands for
  * what it names, and a macro that names a namespace (`ROCKSDB_NAMESPACE`) for
- * that namespace. Never so for a name one of the project's types qualifies,
- * for an unqualified name, or for the end of a declaration begun on an
- * earlier line.
+ * that namespace. A `std::` name is the very name or none of the project's:
+ * a global `string` class is no `std::string`. Never so for a name one of the
+ * project's types qualifies, for an unqualified name, or for the end of a
+ * declaration begun on an earlier line.
  */
 function cppFindsOnlyNamesakes(raw: string, context: ResolutionContext, method?: string): boolean {
   if ((raw.match(/</g)?.length ?? 0) !== (raw.match(/>/g)?.length ?? 0)) return false;
@@ -10412,7 +10419,9 @@ function cppFindsOnlyNamesakes(raw: string, context: ResolutionContext, method?:
   const alias = cppNamespaceAliases(context).get(segments[0]!);
   const written = [segments, ...(alias ? [[...alias.split('::'), ...segments.slice(1)]] : [])]
     .flatMap((s) => cppNamespaceSpellings(s.join('::'), context));
-  const fits = (owner: string): boolean => written.some((w) => owner === w || owner.endsWith(`::${w}`) || w.endsWith(`::${owner}`));
+  const std = segments[0] === 'std';
+  const fits = (owner: string): boolean => written.some((w) =>
+    owner === w || owner.endsWith(`::${w}`) || (!std && w.endsWith(`::${owner}`)));
   const owners = cppTypesNamed(name, context).map((n) => n.qualifiedName);
   if (method) {
     const methods = context.getMethodMatches?.(name, method, 'cpp') ?? context.getNodesByName(method).filter((m) =>
@@ -13362,20 +13371,22 @@ export function matchMethodCall(
       // project's own `hpb::StatusOr`. The name strategies decide.
       if (inferredType && isCppArrowThroughOutsideType(objectOrClass!, cppDecl, ref, context)) inferredType = null;
       // Below, the type's last name finds a method of any class of that name.
-      // A capitalized type written with its namespace whose every such class
-      // is a namesake (cppFindsOnlyNamesakes) calls none of them, and is past
-      // guessing by the receiver's name too, as isUndeclaredTypeName rules
-      // where no class shares the name: protobuf's `absl::Status _status` in
-      // a macro body reached `upb::Status::ok`, and its generated
-      // `DescriptorProto::ExtensionRange`, which the index doesn't hold,
-      // reached `Descriptor::ExtensionRange::options`. A `->` on a value calls
-      // a member of what it holds, which the name strategies decide. (A
-      // lowercase type is isCppLibraryType's; a member of a template
-      // parameter, `typename PolicyT::Payload`, is whatever the template
-      // argument makes it.)
-      if (inferredType && /^[A-Z]/.test(inferredType) && cppDecl.raw !== undefined && !cppDecl.aliased &&
+      // A type written with its namespace whose every such class is a
+      // namesake (cppFindsOnlyNamesakes) calls none of them: protobuf's
+      // `absl::Status _status` in a macro body reached `upb::Status::ok`, and
+      // its generated `DescriptorProto::ExtensionRange`, which the index
+      // doesn't hold, reached `Descriptor::ExtensionRange::options`. A
+      // capitalized one is past guessing by the receiver's name too, as
+      // isUndeclaredTypeName rules where no class shares the name; a `->` on
+      // a value calls a member of what it holds, which the name strategies
+      // decide. A lowercase one is guessed for as where no class shares its
+      // name: the library-type rule below decides, or the name strategies for
+      // a declaration read outside the calling function, which may be another
+      // variable's. (A member of a template parameter, `typename
+      // PolicyT::Payload`, is whatever the template argument makes it.)
+      if (inferredType && cppDecl.raw !== undefined && !cppDecl.aliased &&
           cppFindsOnlyNamesakes(cppDecl.raw, context, methodName!) && !isCppTemplateMember(cppDecl.raw, ref, context)) {
-        if (cppDecl.pointer || cppMemberOperator(objectOrClass!, ref, context) !== '->') return null;
+        if (/^[A-Z]/.test(inferredType) && (cppDecl.pointer || cppMemberOperator(objectOrClass!, ref, context) !== '->')) return null;
         inferredType = null;
       }
     }
