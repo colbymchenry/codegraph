@@ -51,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  nim: 'tree-sitter-nim.wasm',
 };
 
 /**
@@ -171,6 +172,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // Nim: modules/scripts (.nim), NimScript (.nims) and Nimble package files
+  // (.nimble) — all three parse with the same grammar. `.nimble` is a NimScript
+  // file (`requires`/`task` macros), not a config format, so it is source.
+  // `.nim.cfg` never lands here: only the FINAL extension is consulted.
+  '.nim': 'nim',
+  '.nims': 'nim',
+  '.nimble': 'nim',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -446,6 +454,10 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // alaviss/tree-sitter-nim @ ac72ba30 (MPL-2.0): tree-sitter-wasms ships no Nim
+  // at all. Built from the commit's checked-in parser.c with tree-sitter-cli
+  // 0.26.x `build --wasm` (ABI 14) — see docs/grammars/tree-sitter-nim.md.
+  'nim',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -937,6 +949,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    nim: 'Nim',
     unknown: 'Unknown',
   };
   return names[language] || language;

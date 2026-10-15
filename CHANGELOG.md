@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Nim is now indexed (`.nim`, `.nims`, `.nimble`): procs, funcs, methods, iterators, templates and macros with their signatures, `object` and `ref object` types with their fields and their `of` inheritance, enums with their members, concepts, and import and call edges. A `method` is linked to the type of its first parameter, so the overrides of a base type are told apart.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
