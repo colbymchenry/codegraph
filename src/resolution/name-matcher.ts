@@ -9323,6 +9323,11 @@ interface CppWrittenType {
   file: string;
   line: number;
   parameters: ReadonlySet<string>;
+  /**
+   * The array dimensions a declarator gives a variable of `text`, which the
+   * type doesn't show: `Status statuses[3]` is a `Status` with one.
+   */
+  array?: number;
 }
 
 /**
@@ -9363,6 +9368,74 @@ function cppOpeningParen(text: string, close: number): number {
     else if (text[i] === '(' && --depth === 0) return i;
   }
   return -1;
+}
+
+/** Where the `[` that the `]` at `text[close]` closes opens, or -1. */
+function cppOpeningBracket(text: string, close: number): number {
+  let depth = 0;
+  for (let i = close; i >= 0; i--) {
+    if (text[i] === ']') depth++;
+    else if (text[i] === '[' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** Where the `]` that closes the `[` at `text[open]` is, or -1. */
+function cppClosingBracket(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '[') depth++;
+    else if (text[i] === ']' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * How many array dimensions the C++ declarator that the code `rest` follows
+ * declares: one for the `[kNumShards];` after `LRUCache shard_`. (Not an
+ * attribute's `[[…]]`.)
+ */
+function cppArrayDimensions(rest: string): number {
+  let dimensions = 0;
+  for (let open = /^\s*\[(?!\[)/.exec(rest); open; open = /^\s*\[(?!\[)/.exec(rest)) {
+    dimensions++;
+    const close = cppClosingBracket(rest, open[0].length - 1);
+    if (close < 0) break;
+    rest = rest.slice(close + 1);
+  }
+  return dimensions;
+}
+
+/** An element of the array `type`: the type it is declared with, one dimension less. */
+function cppArrayElement(type: CppWrittenType): CppWrittenType {
+  const { array, ...element } = type;
+  return array !== undefined && array > 1 ? { ...element, array: array - 1 } : element;
+}
+
+/**
+ * The element a subscript of a value of the type `type` reads: an array's,
+ * what a pointer points at, a library map's mapped value, a sequence's
+ * element (a library container's, or one of CPP_PROJECT_SEQUENCES'), or what
+ * a class's `operator[]` returns. Null for anything else: a `std::string`'s
+ * `char`, or a class whose `operator[]` the index doesn't hold.
+ */
+function cppSubscriptElement(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  if (type.array) return cppArrayElement(type);
+  if (isCppPointerType(type.text)) return cppPointee(type);
+  const segments = cppTypeSegments(type.text);
+  const last = segments?.[segments.length - 1];
+  if (!segments || !last) return null;
+  const library = segments[0] === 'std' || segments[0] === 'absl';
+  if (library && CPP_LIBRARY_MAPS.has(last)) {
+    const value = cppTemplateArguments(type.text)?.[1];
+    return value ? { ...type, text: cppWithoutNullability(value) } : null;
+  }
+  if ((library && CPP_LIBRARY_SEQUENCES.has(last)) || CPP_PROJECT_SEQUENCES.has(last)) return cppRangeElementOf(type, at, context);
+  if (library) return null;
+  const cls = cppWrittenClass(type, at, context);
+  if (!cls) return null;
+  const element = cppReturnTypeOf(cppMethodsOf(cls, 'operator[]', at, context), context);
+  return element ? { ...element, text: element.text.replace(/&+\s*$/, '').trim() } : null;
 }
 
 /**
@@ -9501,6 +9574,7 @@ function cppFollowWrittenAliases(type: CppWrittenType, at: UnresolvedRef, contex
       file: alias.filePath,
       line: alias.startLine,
       parameters: cppTemplateParameters(alias, context),
+      ...(current.array ? { array: current.array } : {}),
     };
   }
   return null;
@@ -9581,7 +9655,8 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
           m = matchCppDeclarator(code, declarator);
         }
       }
-      if (!m || code!.slice(m.index + m[0].length).startsWith('(')) continue;
+      const rest = m ? code!.slice(m.index + m[0].length) : '';
+      if (!m || rest.startsWith('(')) continue;
       let depth = depths[from - decl.startLine]!;
       for (const c of code!.slice(from === decl.startLine ? decl.startColumn : 0, m.index)) {
         if (c === '(') depth++;
@@ -9589,7 +9664,15 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
       }
       const type = depth <= 0 ? normalizeCppTypeName(m[1]!) : null;
       if (type && type !== 'auto') {
-        member = { text: m[1]!, scope: decl.qualifiedName, file: decl.filePath, line: from, parameters: cppTemplateParameters(decl, context) };
+        const array = cppArrayDimensions(rest);
+        member = {
+          text: m[1]!,
+          scope: decl.qualifiedName,
+          file: decl.filePath,
+          line: from,
+          parameters: cppTemplateParameters(decl, context),
+          ...(array > 0 ? { array } : {}),
+        };
         break;
       }
     }
@@ -9727,13 +9810,15 @@ function cppPointee(type: CppWrittenType): CppWrittenType | null {
 }
 
 /**
- * The element type of a range of the type `type`, as written: a
- * container's first template argument (`autovector<ColumnFamilyData*>`), or,
- * for one of the project's classes, what its `begin()` returns dereferenced
- * — rocksdb's `ColumnFamilySet`, whose iterator's `operator*` returns a
- * `ColumnFamilyData*`. Null when that can't be read.
+ * The element type of a range of the type `type`, as written: an array's
+ * (cppArrayElement), a container's first template argument
+ * (`autovector<ColumnFamilyData*>`), or, for one of the project's classes,
+ * what its `begin()` returns dereferenced — rocksdb's `ColumnFamilySet`,
+ * whose iterator's `operator*` returns a `ColumnFamilyData*`. Null when that
+ * can't be read.
  */
 function cppRangeElementOf(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext, hops = 0): CppWrittenType | null {
+  if (type.array) return cppArrayElement(type);
   const range = cppFollowWrittenAliases(type, at, context);
   if (!range || isCppPointerType(range.text) || hops > 2) return null;
   const segments = cppTypeSegments(range.text);
@@ -9814,7 +9899,7 @@ function cppMemberObject(object: string, op: string, at: UnresolvedRef, context:
   const followed = type && cppFollowWrittenAliases(type, at, context);
   if (!followed) return null;
   if (op === '->') return cppDereferenced(followed, at, context);
-  return isCppPointerType(followed.text) ? null : followed;
+  return isCppPointerType(followed.text) || followed.array ? null : followed;
 }
 
 /**
@@ -9856,11 +9941,19 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
       return cppExpressionType(decl.initializer.text, { ...at, line: decl.initializer.line, column: 0 }, context, depth + 1);
     }
     // (A data member of the caller's class has its type as `declared`.)
-    return decl.raw !== undefined && decl.callers && !decl.shadowed ? { ...callers, text: decl.raw } : null;
+    if (decl.raw === undefined || !decl.callers || decl.shadowed) return null;
+    return { ...callers, text: decl.raw, ...(decl.array ? { array: decl.array } : {}) };
   }
   // `new Foo(…)`: a pointer to what it constructs.
   const created = /^new\s+((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(?:[({[][\s\S]*)?$/.exec(text);
   if (created) return { ...callers, text: `${created[1]!.trim()}*` };
+  // `statuses[i]`, `(*m)[key]`: the element a subscript reads.
+  if (text.endsWith(']')) {
+    const open = cppOpeningBracket(text, text.length - 1);
+    const container = open > 0 ? cppExpressionType(text.slice(0, open), at, context, depth + 1) : null;
+    const followed = container && cppFollowWrittenAliases(container, at, context);
+    return followed && cppSubscriptElement(followed, at, context);
+  }
   if (!text.endsWith(')')) {
     // `compact_->sub_compact_states`: a data member of the object's class;
     // `it->second` through a map's iterator: the member of the `std::pair`.
@@ -10106,6 +10199,8 @@ interface CppReceiverDeclaration {
   classTemplate?: boolean;
   /** The declared type as written (`std::vector<Slice>*`). */
   raw?: string;
+  /** The array dimensions the declarator gives the receiver (`Status statuses[3]`), which `raw` doesn't show. */
+  array?: number;
   /** The declaration is the calling function's own, or a member of its class (isCppCallersDeclaration). */
   callers?: boolean;
   /**
@@ -10338,11 +10433,13 @@ function cppIteratorTarget(iterator: CppWrittenType, at: UnresolvedRef, context:
 
 /**
  * What dereferencing a value of the type `type` gives, for `*x` and `x->`:
- * what a pointer points at or a holder holds (cppPointee), or the element a
- * container's iterator points at (cppIteratorTarget) — the `Node*` of
- * `*nodes.begin()` over a `std::vector<Node*>`.
+ * an array's first element, what a pointer points at or a holder holds
+ * (cppPointee), or the element a container's iterator points at
+ * (cppIteratorTarget) — the `Node*` of `*nodes.begin()` over a
+ * `std::vector<Node*>`.
  */
 function cppDereferenced(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  if (type.array) return cppArrayElement(type);
   return cppPointee(type) ?? cppIteratorTarget(type, at, context);
 }
 
@@ -10794,33 +10891,52 @@ function cppUtf8Column(line: string, column: number): number | null {
 }
 
 /**
- * A call's receiver the extractor drops, up to the member's name: a
- * dereferenced variable (`(*it)->`), the member of a pair a variable holds
- * or points at (`it->second.`, `entry.first->`), or both (`(*it).second.`).
- * Groups: the receiver, the operator.
+ * A call's receiver the extractor drops, at the start of `text` (its literals
+ * blanked) up to the member's name: a variable or a dereferenced one
+ * (`(*it)`), then what the extractor can't spell — subscripts
+ * (`statuses[i]`, `(*m)[key]`) and the member of a pair (`it->second`,
+ * `cfs[i].first`) — and the operator. Null when the variable has none of it
+ * (the extractor spells `it.Flush()`), it is `(*this)` alone
+ * (cppImplicitReceiver's), or a subscript doesn't close.
  */
-const CPP_UNSPELLED_RECEIVER = /^((?:\(\s*\*\s*[A-Za-z_]\w*\s*\))(?:\s*(?:->|\.)\s*(?:first|second)\b)?|[A-Za-z_]\w*\s*(?:->|\.)\s*(?:first|second)\b)\s*(->|\.)\s*(?:template\s+)?/;
+function cppUnspelledReceiverText(text: string): { expression: string; op: string; length: number } | null {
+  const head = /^(?:\(\s*\*\s*([A-Za-z_]\w*)\s*\)|[A-Za-z_]\w*)/.exec(text);
+  if (!head) return null;
+  let end = head[0].length;
+  let unspelled = head[1] !== undefined && head[1] !== 'this';
+  for (let open = /^\s*\[/.exec(text.slice(end)); open; open = /^\s*\[/.exec(text.slice(end))) {
+    const close = cppClosingBracket(text, end + open[0].length - 1);
+    if (close < 0) return null;
+    end = close + 1;
+    unspelled = true;
+  }
+  const member = /^\s*(?:->|\.)\s*(?:first|second)\b/.exec(text.slice(end));
+  if (member) {
+    end += member[0].length;
+    unspelled = true;
+  }
+  const op = unspelled ? /^\s*(->|\.)\s*(?:template\s+)?/.exec(text.slice(end)) : null;
+  return op ? { expression: text.slice(0, end).trim(), op: op[1]!, length: end + op[0].length } : null;
+}
 
 /**
  * The receiver a C++ call the extractor recorded by its bare name is made
- * on, when it is one CPP_UNSPELLED_RECEIVER reads, with the operator — `(*it)`
+ * on, when cppUnspelledReceiverText reads one, with the operator — `(*it)`
  * and `->` for `(*it)->Visit()`, `it->second` and `.` for
- * `it->second.Flush()` — read at the call's column, where the receiver
- * starts. Null for any other call: on `(*this)` (cppImplicitReceiver's), or
- * on a receiver the extractor spells.
+ * `it->second.Flush()`, `statuses[i]` and `.` for `statuses[i].ok()` — read
+ * at the call's column, where the receiver starts. Null for any other call.
  */
 function cppUnspelledReceiver(ref: UnresolvedRef, context: ResolutionContext): { expression: string; op: string } | null {
-  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
-  if (line === undefined) return null;
+  const raw = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  const line = raw === undefined ? null : cppCodeOf(cppLiteralsBlanked(raw, ref.line, cppNonCodeLines(ref.filePath, context)));
+  if (!line) return null;
   const at = (column: number): { expression: string; op: string } | null => {
     const text = line.slice(column);
-    const receiver = CPP_UNSPELLED_RECEIVER.exec(text);
-    if (!receiver || receiver[1]!.replace(/\s+/g, '') === '(*this)') return null;
-    const rest = text.slice(receiver[0].length);
+    const receiver = cppUnspelledReceiverText(text);
+    if (!receiver) return null;
+    const rest = text.slice(receiver.length);
     if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
-    return cppArgumentListFollows(rest, ref.referenceName.length)
-      ? { expression: receiver[1]!.replace(/\s+/g, ''), op: receiver[2]! }
-      : null;
+    return cppArgumentListFollows(rest, ref.referenceName.length) ? { expression: receiver.expression, op: receiver.op } : null;
   };
   const found = at(Math.max(0, ref.column));
   if (found || !/[^\x00-\x7f]/.test(line)) return found;
@@ -11075,9 +11191,9 @@ type CppArgumentType = { kind: 'char' | 'number' | 'zero' | 'bool' | 'null' } | 
 /**
  * What the argument `arg` of the call at `ref` is, where that can be read: a
  * character, number, `true`/`false` or `nullptr` literal, or the written
- * type of a name the calling function declares, of `&name`, of `name[i]`
- * (rocksdb's `TryLock(column_family[i], keys[i], …)` on a
- * `std::vector<Slice>`), or of an expression (cppExpressionType). Null
+ * type of a name the calling function declares, of `&name`, or of an
+ * expression (cppExpressionType) — the element `keys[i]` reads in rocksdb's
+ * `TryLock(column_family[i], keys[i], …)` on a `std::vector<Slice>`. Null
  * otherwise. (String literals are cppOverloadFit's.)
  */
 function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
@@ -11095,14 +11211,6 @@ function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCon
     const written = decl.declared?.text ?? decl.raw;
     if (!written || !decl.callers || decl.shadowed) return null;
     return { kind: 'type', text: address ? `${written}*` : written };
-  }
-  // `keys[i]`: an element of the container, or what the pointer points at, a name the calling function declares is.
-  const subscript = /^([A-Za-z_]\w*)\s*\[[^[\]]*\]$/.exec(text);
-  if (subscript) {
-    const container = cppExpressionType(subscript[1]!, ref, context, 0);
-    const followed = container && cppFollowWrittenAliases(container, ref, context);
-    const element = followed && (isCppPointerType(followed.text) ? cppPointee(followed) : cppRangeElementOf(followed, ref, context));
-    return element ? { kind: 'type', text: element.text } : null;
   }
   const typed = /^(?:u8|u|U|L)?R?["']/.test(text) ? null : cppExpressionType(text, ref, context, 0);
   return typed ? { kind: 'type', text: typed.text } : null;
@@ -11361,12 +11469,13 @@ function cppRebindsReceiver(line: string, escapedReceiver: string): boolean {
     new RegExp(String.raw`\bauto\s*&{0,2}\s*\[[^\]]*\b${escapedReceiver}\b[^\]]*\]`).test(line);
 }
 
-/** Record the C++ declaration receiver inference settles on. */
-function noteCppDeclaration(found: CppReceiverDeclaration | undefined, raw: string, callers: boolean): void {
+/** Record the C++ declaration receiver inference settles on, with the array dimensions its declarator gives it. */
+function noteCppDeclaration(found: CppReceiverDeclaration | undefined, raw: string, callers: boolean, array = 0): void {
   if (!found) return;
   found.raw = raw;
   found.callers = callers;
   found.pointer = isCppPointerType(raw);
+  found.array = array > 0 ? array : undefined;
 }
 
 /**
@@ -11446,7 +11555,8 @@ function inferCppReceiverType(
         found.shadowed = true;
       } else if (normalized) {
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
-        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope);
+        const array = cppArrayDimensions(line.slice(declaratorMatch.index + declaratorMatch[0].length));
+        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
       } else if (cppTypeBeganAbove(declaratorMatch[1] ?? '')) {
         // The end of a declaration begun on an earlier line, maybe the
@@ -11526,7 +11636,8 @@ function inferCppReceiverType(
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized && normalized !== 'auto') {
         const inCallerScope = isCppCallersDeclaration(headerPath, i + 1, ref, context);
-        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope);
+        const array = cppArrayDimensions(line.slice(declaratorMatch.index + declaratorMatch[0].length));
+        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array);
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
       }
     }
