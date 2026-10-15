@@ -47,7 +47,18 @@ export function Dialog(xs: number[]) {
   function k(e: KeyboardEvent) {
     if (e.key === "Escape" && (open || xs.length)) setOpen(false);
   }
-  return [a, b, c, w, f, g, h, k];
+  function m(s: string) {
+    if (xs.length > 0 &&
+        open) setOpen(false);
+    if (s === ")") setOpen(true);
+    if (/\\)/.test(s)) setOpen(false);
+    if (\`\${s})\` === s) setOpen(true);
+    if (s === "(") setOpen(false);
+  }
+  function n() {
+    do setOpen(false); while (open);
+  }
+  return [a, b, c, w, f, g, h, k, m, n];
 }
 `;
 
@@ -77,23 +88,24 @@ describe('a call that is the body of a braceless if/while/for (#2585)', () => {
     fs.writeFileSync(path.join(tmpDir, 'src/Dialog.tsx'), DIALOG);
     cg = await CodeGraph.init(tmpDir, { index: true });
 
-    for (const fn of ['a', 'b', 'c', 'w', 'f', 'g', 'h', 'k']) {
+    for (const fn of ['a', 'b', 'c', 'w', 'f', 'g', 'h', 'k', 'm', 'n']) {
       expect(callees(cg, fn), fn).not.toContain('property:setOpen');
     }
   });
 
-  it('still keeps a call written through a parenthesized receiver', async () => {
+  it('still resolves a call on a receiver after a braceless header', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-braceless-'));
     fs.writeFileSync(path.join(tmpDir, 'svc.ts'), `export class Svc {
+  setOpen(v: boolean) { return v; }
   run() { return 1; }
 }
-export function make(): Svc { return new Svc(); }
-export function use() {
-  return (make()).run();
+export function use(svc: Svc, open: boolean) {
+  if (open) svc.setOpen(false);
+  while (open) svc.run();
 }
 `);
     cg = await CodeGraph.init(tmpDir, { index: true });
 
-    expect(callees(cg, 'use')).toContain('function:make');
+    expect(callees(cg, 'use').sort()).toEqual(['method:run', 'method:setOpen']);
   });
 });

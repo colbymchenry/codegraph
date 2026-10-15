@@ -3244,38 +3244,13 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   let end = Math.min(ref.column, line.length);
   while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
   if (end === 0 || !RECEIVER_TAIL_CHAR.test(line[end - 1]!)) return true;
-  if (line[end - 1] === ')' && closesStatementHeader(line, end - 1)) return true;
+  // In JS/TS a receiver ends in `.` or `?.`, so a `)` right before the name
+  // closes a statement header — `if (open) setOpen()`, `for (…) f()`, a header
+  // that wraps lines or holds a `)` in a string — and the call is bare (#2585).
+  if (line[end - 1] === ')' && JS_FAMILY.has(ref.language)) return true;
   let start = end;
   while (start > 0 && WORD_CHAR.test(line[start - 1]!)) start--;
   return BARE_CALL_KEYWORDS.has(line.slice(start, end));
-}
-
-/**
- * Whether the `)` at `close` ends an `if (…)` / `while (…)` / `for (…)` header,
- * so what follows it is the statement's braceless body — `if (open) setOpen()`
- * — and not a call on a receiver (#2585). Read back to the matching `(` on the
- * same line; a header that spans lines, or a `)` inside a string, gives no
- * match and leaves the call where it was.
- */
-function closesStatementHeader(line: string, close: number): boolean {
-  let depth = 0;
-  let open = close;
-  for (; open >= 0; open--) {
-    const ch = line[open];
-    if (ch === ')') depth++;
-    else if (ch === '(' && --depth === 0) break;
-  }
-  if (open < 0) return false;
-  const wordBefore = (at: number): { word: string; start: number } => {
-    let end = at;
-    while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
-    let start = end;
-    while (start > 0 && WORD_CHAR.test(line[start - 1]!)) start--;
-    return { word: line.slice(start, end), start };
-  };
-  let { word, start } = wordBefore(open);
-  if (word === 'await') ({ word } = wordBefore(start)); // `for await (…)`
-  return STATEMENT_HEADER_KEYWORDS.has(word);
 }
 
 /** `\s*[(<]` from a given index (sticky) — an optional call's `?.(` too. */
@@ -3290,10 +3265,8 @@ const RECEIVER_TAIL_CHAR = /[.\w$\])]/;
  */
 const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
-  'if', 'switch', 'for', 'range',
+  'if', 'switch', 'for', 'range', 'do',
 ]);
-/** Statements whose `(…)` header can be followed by a braceless body. */
-const STATEMENT_HEADER_KEYWORDS: ReadonlySet<string> = new Set(['if', 'while', 'for']);
 
 /**
  * A C# / VB.NET reference whose site is a TYPE position: `Type sourceType`,
