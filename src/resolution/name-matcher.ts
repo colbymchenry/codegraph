@@ -14222,6 +14222,19 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
 }
 
 /**
+ * The module of a Python `from X import …`, which the extractor refs at the
+ * statement's start. It names a module or package, never a symbol: `from app
+ * import email` is not a use of a variable named `app` (#2584).
+ */
+export function isPythonFromImportModule(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || ref.referenceKind !== 'imports') return false;
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n'))?.[ref.line - 1];
+  if (line === undefined) return false;
+  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^from\\s+${name}\\s+import\\b`).test(line.slice(ref.column));
+}
+
+/**
  * A Go call made through a type assertion — `srv.(KVServer).Range(ctx, in)`,
  * `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a method of
  * the asserted type: its own, the one its interface declares, or one embedding
