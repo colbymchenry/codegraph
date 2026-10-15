@@ -226,10 +226,6 @@ function rowToFileRecord(row: FileRow): FileRecord {
 }
 
 /**
- * Query builder for the knowledge graph database
- */
-
-/**
  * Files ranked by edges between two of their own symbols — the input to
  * `getDominantFile`. CROSS JOIN pins the loop order to edges first, then a
  * lookup by id for each end: one pass over the edges whatever the statistics
@@ -251,6 +247,9 @@ export const DOMINANT_FILE_SQL = `
   LIMIT 20
 `;
 
+/**
+ * Query builder for the knowledge graph database
+ */
 export class QueryBuilder {
   private db: SqliteDatabase;
 
@@ -1175,6 +1174,7 @@ export class QueryBuilder {
       // protobuf stub) outranks the real `server/etcdserver/server.go`
       // (470 edges) by 4×, and the boost would push the agent toward
       // generated code.
+      // Edges-first and tie-broken by path on purpose: see DOMINANT_FILE_SQL (#2571).
       this.stmts.getDominantFile = this.db.prepare(DOMINANT_FILE_SQL);
     }
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
