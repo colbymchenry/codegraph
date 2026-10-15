@@ -135,12 +135,13 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
       'export async function e() { return await api.get<User>("/me").then(r => r); }',
       'export async function f() { return await /* typed */ fetchApi<User>("/me"); }',
       'export async function g() { return await await fetchApi<User>("/me"); }',
+      'export async function h() { return await // typed\n fetchApi<User>("/me").then(r => r); }',
       '',
     ].join('\n');
     const result = assertParity(`awaited.${ext}`, source, language);
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
     expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi', 'fetchApi().json', 'api.get().then']));
-    expect(calls.some((n) => /^await|^\/\*/.test(n))).toBe(false);
+    expect(calls.some((n) => /^await|^\/[*/]/.test(n))).toBe(false);
   });
 
   it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {

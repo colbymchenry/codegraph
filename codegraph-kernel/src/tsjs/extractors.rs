@@ -1499,8 +1499,6 @@ impl<'t> Walker<'t> {
         Some(self.text(property).to_string())
     }
 
-    /// The callee of a call-expression receiver when it is a plain identifier
-    /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     /// `await f<T>(x)` parses with `await f` as the callee; the call is to
     /// `f` (#2586). Peels every `await`, skipping a comment written after one.
     /// TS-family only. Mirrors peelTsAwaitCallee.
@@ -1517,6 +1515,8 @@ impl<'t> Walker<'t> {
         cur
     }
 
+    /// The callee of a call-expression receiver when it is a plain identifier
+    /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
         let inner = self.peel_await_callee(call.child_by_field_name("function")?);
         Self::plain_member_name(self.text(inner))
