@@ -9862,9 +9862,12 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
   const created = /^new\s+((?:::\s*)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(?:[({[][\s\S]*)?$/.exec(text);
   if (created) return { ...callers, text: `${created[1]!.trim()}*` };
   if (!text.endsWith(')')) {
-    // `compact_->sub_compact_states`: a data member of the object's class.
+    // `compact_->sub_compact_states`: a data member of the object's class;
+    // `it->second` through a map's iterator: the member of the `std::pair`.
     const field = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(text);
     const object = field && cppMemberObject(field[1]!, field[2]!, at, context, depth);
+    const element = object && cppPairMember(object, field![3]!, at, context);
+    if (element) return element;
     const cls = object && cppWrittenClass(object, at, context);
     return cls ? cppDataMemberType(cls.qualifiedName, field![3]!, context) : null;
   }
@@ -10790,25 +10793,34 @@ function cppUtf8Column(line: string, column: number): number | null {
   return bytes === column && index !== column ? index : null;
 }
 
-/** A call on a dereferenced variable, up to the member's name: `(*it)->`, `(*node).`. */
-const CPP_DEREFERENCED_RECEIVER = /^\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(->|\.)\s*(?:template\s+)?/;
+/**
+ * A call's receiver the extractor drops, up to the member's name: a
+ * dereferenced variable (`(*it)->`), the member of a pair a variable holds
+ * or points at (`it->second.`, `entry.first->`), or both (`(*it).second.`).
+ * Groups: the receiver, the operator.
+ */
+const CPP_UNSPELLED_RECEIVER = /^((?:\(\s*\*\s*[A-Za-z_]\w*\s*\))(?:\s*(?:->|\.)\s*(?:first|second)\b)?|[A-Za-z_]\w*\s*(?:->|\.)\s*(?:first|second)\b)\s*(->|\.)\s*(?:template\s+)?/;
 
 /**
- * The variable a C++ call the extractor recorded by its bare name is made on
- * through a dereference, with the operator — `it` and `->` for
- * `(*it)->Visit()` — read at the call's column, where its receiver starts.
- * Null for any other call, `(*this).Visit()` included (cppImplicitReceiver's).
+ * The receiver a C++ call the extractor recorded by its bare name is made
+ * on, when it is one CPP_UNSPELLED_RECEIVER reads, with the operator — `(*it)`
+ * and `->` for `(*it)->Visit()`, `it->second` and `.` for
+ * `it->second.Flush()` — read at the call's column, where the receiver
+ * starts. Null for any other call: on `(*this)` (cppImplicitReceiver's), or
+ * on a receiver the extractor spells.
  */
-function cppDereferencedReceiver(ref: UnresolvedRef, context: ResolutionContext): { name: string; op: string } | null {
+function cppUnspelledReceiver(ref: UnresolvedRef, context: ResolutionContext): { expression: string; op: string } | null {
   const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
   if (line === undefined) return null;
-  const at = (column: number): { name: string; op: string } | null => {
+  const at = (column: number): { expression: string; op: string } | null => {
     const text = line.slice(column);
-    const receiver = CPP_DEREFERENCED_RECEIVER.exec(text);
-    if (!receiver || receiver[1] === 'this') return null;
+    const receiver = CPP_UNSPELLED_RECEIVER.exec(text);
+    if (!receiver || receiver[1]!.replace(/\s+/g, '') === '(*this)') return null;
     const rest = text.slice(receiver[0].length);
     if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
-    return cppArgumentListFollows(rest, ref.referenceName.length) ? { name: receiver[1]!, op: receiver[2]! } : null;
+    return cppArgumentListFollows(rest, ref.referenceName.length)
+      ? { expression: receiver[1]!.replace(/\s+/g, ''), op: receiver[2]! }
+      : null;
   };
   const found = at(Math.max(0, ref.column));
   if (found || !/[^\x00-\x7f]/.test(line)) return found;
@@ -10817,28 +10829,35 @@ function cppDereferencedReceiver(ref: UnresolvedRef, context: ResolutionContext)
 }
 
 /**
- * A C++ call the extractor recorded by its bare name on a dereferenced
- * variable — `(*it)->Visit()` over a `std::vector<Node*>`, `(*vit).Weight()`
- * over a `std::vector<Node>`, `(*node).Weight()` on a `Node*` — calls a
- * member of the class the dereferenced value has (cppMemberObject), looked
- * up as C++ looks it up where that type is written. By its bare name the
- * call went to whichever class had a method of that name.
+ * A C++ call the extractor recorded by its bare name on a receiver it drops
+ * (cppUnspelledReceiver) — `(*it)->Visit()` over a `std::vector<Node*>`,
+ * `(*node).Weight()` on a `Node*`, `it->second.Flush()` through a map's
+ * iterator — calls a member of the class that receiver has
+ * (cppMemberObject), looked up as C++ looks it up where that type is
+ * written. By its bare name the call went to whichever class had a method of
+ * that name.
  *  - The member of that class, or of a class it derives from.
  *  - null when no project method is called: a library type (`(*it).size()`
- *    over a `std::vector<std::string>`), a template parameter's, or a class
- *    that surely lacks the method (cppLacksMethod).
+ *    over a `std::vector<std::string>`, `it->second.size()` on a map of
+ *    strings), a template parameter's, or a class that surely lacks the
+ *    method (cppLacksMethod).
  *  - undefined when the call is on no such receiver, or its type can't be
  *    read or placed: the name strategies decide, as before.
  */
-function matchCppDereferencedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const receiver = cppDereferencedReceiver(ref, context);
+function matchCppUnspelledReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const receiver = cppUnspelledReceiver(ref, context);
   if (!receiver) return undefined;
-  const object = cppMemberObject(`(*${receiver.name})`, receiver.op, ref, context, 0);
+  const object = cppMemberObject(receiver.expression, receiver.op, ref, context, 0);
   if (!object || isCppPointerType(object.text)) return undefined;
   if (isCppLibraryType(object.text, context)) return null;
   const found = cppClassWritten(object.text, object, ref, context);
   if (found === undefined) return undefined;
-  if (found === null) return null;
+  // A template parameter's type names no particular class when the calling
+  // function writes it; one another template writes is what the call's
+  // specialization makes it — rocksdb's `CoreLocalArray<T>` returns a
+  // `std::pair<T*, size_t>` from `AccessElementAndIndex()` — so the call
+  // goes on as before.
+  if (found === null) return isCppTemplateParameterType(object) && object.scope !== context.getNodeById?.(ref.fromNodeId)?.qualifiedName ? undefined : null;
   if (!found.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
   const method = cppMethodOf(found.node, ref.referenceName, ref, context);
   if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
@@ -11768,6 +11787,19 @@ function cppBindingElements(type: CppWrittenType, at: UnresolvedRef, context: Re
   const segments = followed && cppTypeSegments(followed.text);
   if (!followed || segments?.length !== 2 || segments[0] !== 'std' || (segments[1] !== 'pair' && segments[1] !== 'tuple')) return null;
   return cppTemplateArguments(followed.text)?.map((text) => ({ ...followed, text: cppWithoutNullability(text) })) ?? null;
+}
+
+/**
+ * The member `first` or `second` of a `std::pair` of the type `pair`, as a
+ * map's iterator points at one: its first or second element. Null for any
+ * other member or type.
+ */
+function cppPairMember(pair: CppWrittenType, member: string, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  const index = member === 'first' ? 0 : member === 'second' ? 1 : -1;
+  const followed = index >= 0 ? cppFollowWrittenAliases(pair, at, context) : null;
+  if (!followed || cppTypeSegments(followed.text)?.join('::') !== 'std::pair') return null;
+  const element = cppTemplateArguments(followed.text)?.[index];
+  return element ? { ...followed, text: cppWithoutNullability(element) } : null;
 }
 
 /** Where the statement that `text` begins ends: its first `;` outside brackets, or -1. */
@@ -16436,13 +16468,14 @@ function matchReferenceInner(
     if (prefixed !== undefined) return prefixed;
   }
 
-  // A C++ call on a dereferenced variable, which the extractor records by its
-  // bare name — `(*it)->Visit()` — is a call on what the variable points at,
-  // or on nothing of the project's: the strategies below would take any
-  // `Visit`, even a free function of that name.
+  // A C++ call on a dereferenced variable or a pair's member, which the
+  // extractor records by its bare name — `(*it)->Visit()`,
+  // `it->second.Flush()` — is a call on what that receiver is, or on nothing
+  // of the project's: the strategies below would take any `Visit`, even a
+  // free function of that name.
   if (ref.language === 'cpp' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
-    const dereferenced = nmTimedT('cppDeref', ref, () => matchCppDereferencedCall(ref, context));
-    if (dereferenced !== undefined) return dereferenced;
+    const unspelled = nmTimedT('cppUnspelled', ref, () => matchCppUnspelledReceiverCall(ref, context));
+    if (unspelled !== undefined) return unspelled;
   }
 
   // Try strategies in order of confidence
