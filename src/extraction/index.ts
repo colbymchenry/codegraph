@@ -1850,6 +1850,7 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  private detectedFrameworkProbes = new Set<string>();
   /**
    * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
    * files it is derived from (`codegraph.json`, `.gitignore`). See
@@ -1907,7 +1908,7 @@ export class ExtractionOrchestrator {
    * the DB hasn't been populated yet, but detect() only uses readFile,
    * fileExists, and getAllFiles, so that's fine.
    */
-  private buildDetectionContext(files: string[]): ResolutionContext {
+  private buildDetectionContext(files: string[], probes?: Set<string>): ResolutionContext {
     const rootDir = this.rootDir;
     return {
       getNodesInFile: () => [],
@@ -1919,6 +1920,7 @@ export class ExtractionOrchestrator {
       getAllFiles: () => files,
       getProjectRoot: () => rootDir,
       fileExists: (relativePath: string) => {
+        probes?.add(relativePath);
         const full = validatePathWithinRoot(rootDir, relativePath);
         if (!full) return false;
         try {
@@ -1928,6 +1930,7 @@ export class ExtractionOrchestrator {
         }
       },
       readFile: (relativePath: string) => {
+        probes?.add(relativePath);
         const full = validatePathWithinRoot(rootDir, relativePath);
         if (!full) return null;
         try {
@@ -1967,8 +1970,10 @@ export class ExtractionOrchestrator {
   private ensureDetectedFrameworks(files?: string[]): string[] {
     if (this.detectedFrameworkNames !== null) return this.detectedFrameworkNames;
     const fileList = files ?? scanDirectory(this.rootDir);
-    const context = this.buildDetectionContext(fileList);
+    const probes = new Set<string>();
+    const context = this.buildDetectionContext(fileList, probes);
     this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
+    this.detectedFrameworkProbes = probes;
     const declared = declaredDependencies(context);
     this.gatedFrameworks = new Map();
     for (const name of this.detectedFrameworkNames) {
@@ -3495,6 +3500,11 @@ export class ExtractionOrchestrator {
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
       await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides, this.rootDir));
+    }
+
+    if (filesAdded > 0 || filesRemoved > 0 || filesToIndex.some(file => this.detectedFrameworkProbes.has(file))) {
+      this.detectedFrameworkNames = null;
+      this.ensureDetectedFrameworks(scopedPaths?.length ? undefined : currentFiles);
     }
 
     // Index changed files
