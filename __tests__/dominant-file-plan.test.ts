@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
+import { DOMINANT_FILE_SQL } from '../src/db/queries';
 
 /** sqlite_stat1 after a sampled ANALYZE of this repo's own index. */
 const SAMPLED_STATS: Array<[string, string, string]> = [
@@ -55,25 +56,36 @@ describe('dominant file query plan (#2571)', () => {
     for (const row of SAMPLED_STATS) insert.run(...row);
     db.exec('ANALYZE sqlite_schema'); // reload the planted statistics
 
-    // Capture the statement getDominantFile prepares.
-    const queries = (cg as any).queries;
-    const prepare = queries.db.prepare.bind(queries.db);
-    let sql: string | undefined;
-    queries.db.prepare = (text: string) => {
-      if (/COUNT\(\*\) AS edge_count/.test(text)) sql = text;
-      return prepare(text);
-    };
-    let dominant;
-    try {
-      dominant = queries.getDominantFile();
-    } finally {
-      queries.db.prepare = prepare;
-    }
+    const plan = (sql: string) =>
+      (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>).map((r) => r.detail);
 
-    expect(dominant?.filePath).toBe('core.ts');
-    expect(sql).toBeDefined();
-    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>).map((r) => r.detail);
-    expect(plan[0]).toMatch(/^SCAN e\b/);
-    expect(plan.join(' | ')).not.toMatch(/SEARCH m USING INDEX idx_nodes_file_path/);
+    // Control: under these statistics a plain join takes the quadratic plan,
+    // so this test still tells the two apart.
+    const plain = plan(DOMINANT_FILE_SQL.replace(/CROSS JOIN/g, 'JOIN'));
+    expect(plain.join(' | ')).toMatch(/SEARCH m USING INDEX idx_nodes_file_path/);
+
+    const fixed = plan(DOMINANT_FILE_SQL);
+    expect(fixed[0]).toMatch(/^SCAN e\b/);
+    expect(fixed.join(' | ')).not.toMatch(/SEARCH m USING INDEX idx_nodes_file_path/);
+    expect((cg as any).queries.getDominantFile()?.filePath).toBe('core.ts');
+  });
+
+  // The plan no longer decides between files with the same count: the old
+  // plan happened to emit them by path, the edges-first one does not, and a
+  // tie at the edge of the 20-row window can decide the dominant file.
+  it('breaks a tie in edge count by path, whatever the plan', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-2571-'));
+    const chain = (prefix: string) =>
+      Array.from({ length: 25 }, (_, i) => `export function ${prefix}${i}() { return ${prefix}${i + 1}(); }`).join('\n') +
+      `\nexport function ${prefix}25() { return 0; }\n`;
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src/zeta.ts'), chain('z'));
+    fs.writeFileSync(path.join(root, 'src/alpha.ts'), chain('a'));
+    cg = await CodeGraph.init(root, { index: true });
+    (cg as any).db.db.exec('ANALYZE');
+
+    const dominant = (cg as any).queries.getDominantFile();
+    expect(dominant?.edgeCount).toBe(dominant?.nextEdgeCount);
+    expect(dominant?.filePath).toBe('src/alpha.ts');
   });
 });
