@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- You can now choose how much code the Claude Code prompt hook adds to your prompts, instead of only turning it off. Set `CODEGRAPH_PROMPT_HOOK_MAX_CHARS` (for example `3000`) to add less source per prompt, or `CODEGRAPH_PROMPT_HOOK_MODE=nudge` to add only the names of the matching code and a reminder to call `codegraph_explore`, so Claude pulls source when it needs it. Both help long sessions, where every added prompt is re-read on each later turn. Thanks @deivydarwoft for the report. (#2435)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.

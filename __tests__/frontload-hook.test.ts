@@ -13,7 +13,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'node:child_process';
 import { CodeGraph } from '../src';
-import { planFrontload, isTaskNotification, isAgentMessage, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+import { planFrontload, isTaskNotification, isAgentMessage, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection, promptHookInjectionMax, isPromptHookNudgeMode } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
@@ -321,7 +321,7 @@ export class OrderStateMachine {
   });
   afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
-  function hook(prompt: string): string {
+  function hook(prompt: string, extraEnv: Record<string, string> = {}): string {
     const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
       cwd: tmp,
       input: JSON.stringify({ cwd: tmp, prompt }),
@@ -333,6 +333,7 @@ export class OrderStateMachine {
         CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
         // Enable only the hook subprocess under test.
         CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
+        ...extraEnv,
       },
     });
     expect(result.error).toBeUndefined();
@@ -387,6 +388,49 @@ export class OrderStateMachine {
       expect(output).toContain('OrderStateMachine');
       expect(output).not.toContain('Structural context from CodeGraph');
     }
+  });
+
+  it('CODEGRAPH_PROMPT_HOOK_MODE=nudge names symbols instead of injecting source (#2435)', () => {
+    const nudge = { CODEGRAPH_PROMPT_HOOK_MODE: 'nudge' };
+    for (const prompt of ['how does OrderStateMachine work?', 'como submitOrder()?', 'como state machine?']) {
+      const output = hook(prompt, nudge);
+      expect.soft(output, prompt).toContain('CodeGraph found indexed symbols matching this prompt');
+      expect.soft(output, prompt).not.toContain('Structural context from CodeGraph');
+      expect.soft(output, prompt).not.toContain('return true;');
+    }
+    expect(hook('how does OrderStateMachine work?', nudge)).toContain('OrderStateMachine (class');
+    // A structural keyword with no indexed name to point at still gets a one-line reminder.
+    const reminder = hook('como funciona a máquina de estados?', nudge);
+    expect(reminder).toContain('This project has a CodeGraph index');
+    expect(reminder).not.toContain('return true;');
+    expect(hook('run the tests and report back', nudge)).toBe('');
+    expect(hook('eu como pizza toda sexta', nudge)).toBe('');
+  });
+
+  it('CODEGRAPH_PROMPT_HOOK_MAX_CHARS lowers the injected explore text (#2435)', () => {
+    const full = hook('how does OrderStateMachine work?');
+    const capped = hook('how does OrderStateMachine work?', { CODEGRAPH_PROMPT_HOOK_MAX_CHARS: '120' });
+    expect(capped).toContain('Structural context from CodeGraph');
+    expect(capped).toContain('…(truncated; call codegraph_explore for the rest)');
+    expect(capped.length).toBeLessThan(full.length);
+  });
+});
+
+describe('prompt-hook settings (#2435)', () => {
+  it('CODEGRAPH_PROMPT_HOOK_MAX_CHARS can only lower the cap', () => {
+    expect(promptHookInjectionMax({})).toBe(PROMPT_HOOK_INJECTION_MAX);
+    expect(promptHookInjectionMax({ CODEGRAPH_PROMPT_HOOK_MAX_CHARS: '3000' })).toBe(3000);
+    expect(promptHookInjectionMax({ CODEGRAPH_PROMPT_HOOK_MAX_CHARS: ' 3000 ' })).toBe(3000);
+    for (const bad of ['', '0', '-5', '3.5', 'abc', '1e3', '20000']) {
+      expect.soft(promptHookInjectionMax({ CODEGRAPH_PROMPT_HOOK_MAX_CHARS: bad }), bad).toBe(PROMPT_HOOK_INJECTION_MAX);
+    }
+  });
+
+  it('CODEGRAPH_PROMPT_HOOK_MODE=nudge is the only value that turns on nudge mode', () => {
+    expect(isPromptHookNudgeMode({})).toBe(false);
+    expect(isPromptHookNudgeMode({ CODEGRAPH_PROMPT_HOOK_MODE: 'nudge' })).toBe(true);
+    expect(isPromptHookNudgeMode({ CODEGRAPH_PROMPT_HOOK_MODE: ' Nudge ' })).toBe(true);
+    expect(isPromptHookNudgeMode({ CODEGRAPH_PROMPT_HOOK_MODE: 'full' })).toBe(false);
   });
 });
 

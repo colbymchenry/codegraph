@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, promptHookInjectionMax, isPromptHookNudgeMode, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1538,8 +1538,11 @@ program
       // verified against the graph below, so a tech brand ("JavaScript") that
       // merely looks like code doesn't inject spurious context.
       const keyworded = hasStructuralKeyword(prompt);
-      const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
-      const proseWords = keyworded ? [] : extractProseCandidates(prompt);
+      // Nudge mode (#2435) never runs explore, so even a keyworded prompt
+      // needs candidates to name.
+      const nudgeMode = isPromptHookNudgeMode();
+      const codeTokens = keyworded && !nudgeMode ? [] : extractCodeTokens(prompt);
+      const proseWords = keyworded && !nudgeMode ? [] : extractProseCandidates(prompt);
       if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
       // Decide what to inject, shaped by WHERE the index(es) are: the nearest
@@ -1571,7 +1574,7 @@ program
           // must not inject). Keyword-bearing prompts skip verification — the
           // keyword is signal enough.
           const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
-          if (keyworded || tokenVerified) {
+          if (!nudgeMode && (keyworded || tokenVerified)) {
             const { ToolHandler } = await import('../mcp/tools');
             const handler = new ToolHandler(cg);
             const result = await handler.execute('codegraph_explore', { query: prompt });
@@ -1582,7 +1585,7 @@ program
               // above that it persists the output to a file and the model sees a
               // 2 KB preview (#1694). PROMPT_HOOK_INJECTION_MAX (9,000) leaves
               // room for the wrapper and the projectPath nudge lines below.
-              const body = capPromptHookInjection(text);
+              const body = capPromptHookInjection(text, promptHookInjectionMax());
               // For a front-loaded SUB-project, a follow-up explore needs its path.
               const more = plan.viaSubScan
                 ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
@@ -1613,15 +1616,38 @@ program
           // server's own catch-up sync usually pays first (it runs at every
           // session start). A distinct noop outcome keeps a dormant vocab
           // from polluting the noop-unverified recall signal.
+          // In nudge mode, verified code tokens lead the list: they are the
+          // names the HIGH tier would have explored.
+          const tokenHits = nudgeMode
+            ? codeTokens.flatMap((t) => cg.getNodesByName(t).slice(0, 1))
+              .map(({ name, kind, filePath, startLine }) => ({ name, kind, filePath, startLine }))
+            : [];
           const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
-          if (!vocabReady) { gate('noop-vocab-empty'); return; }
-          const related = cg.getSegmentMatches(proseWords);
-          if (related.length === 0) { gate('noop-unverified'); return; }
+          const seen = new Set<string>();
+          const related = [...tokenHits, ...(vocabReady ? cg.getSegmentMatches(proseWords) : [])]
+            .filter((m) => !seen.has(m.name) && !!seen.add(m.name))
+            .slice(0, 6);
+          const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
+          if (related.length === 0) {
+            // A keyword already marks this as a structural question, so nudge
+            // mode still reminds the agent the graph exists (#2435).
+            if (nudgeMode && keyworded) {
+              process.stdout.write(
+                `<codegraph_context note="This project has a CodeGraph index — query the graph before searching files.">\n` +
+                `Call codegraph_explore${projectHint} with the names involved in this request to get their source, ` +
+                `call paths, and blast radius — cheaper and more complete than Read/Grep.\n${others}` +
+                `</codegraph_context>\n`,
+              );
+              gate('medium-nudge-reminder');
+              return;
+            }
+            gate(vocabReady ? 'noop-unverified' : 'noop-vocab-empty');
+            return;
+          }
           const lines = related
             .map((m) => `  - ${m.name} (${m.kind} — ${m.filePath}:${m.startLine})`)
             .join('\n');
           const exampleQuery = related.slice(0, 3).map((m) => m.name).join(' ');
-          const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
           process.stdout.write(
             `<codegraph_context note="CodeGraph found indexed symbols matching this prompt — query the graph before searching files.">\n` +
             `This project's CodeGraph index contains symbols matching this request:\n${lines}\n` +
@@ -1629,7 +1655,7 @@ program
             `to get their source, call paths, and blast radius — cheaper and more complete than Read/Grep.\n${others}` +
             `</codegraph_context>\n`,
           );
-          gate('medium-segment');
+          gate(nudgeMode ? 'medium-nudge-mode' : 'medium-segment');
         } finally {
           cg.destroy();
         }
