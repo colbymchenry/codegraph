@@ -7857,6 +7857,10 @@ export function matchByExactName(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  // A Go parameter or local shadows every package-level symbol of its name in
+  // its block, same file included: a bare call to it calls the func value,
+  // which has no node (#2580).
+  if (ref.language === 'go' && rustGoShape?.shape === 'bare' && goLocalDecl(ref.referenceName, ref, context)) return null;
   const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
     ? kotlinChainReceiver(ref, context) : null;
   const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
@@ -15842,6 +15846,10 @@ export function matchFuzzy(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  // A Go parameter or local shadows every package-level symbol of its name in
+  // its block, same file included: a bare call to it calls the func value,
+  // which has no node (#2580).
+  if (ref.language === 'go' && rustGoShape?.shape === 'bare' && goLocalDecl(ref.referenceName, ref, context)) return null;
   const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
     ? kotlinChainReceiver(ref, context) : null;
   const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
