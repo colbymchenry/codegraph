@@ -244,6 +244,7 @@ export class QueryBuilder {
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
+  private filePathsMemo: { stamp: string; value: readonly string[] } | undefined;
 
   // getDominantFile()'s answer, tagged with the database change stamp it was
   // computed under (see getChangeStamp). Query-independent, so one value
@@ -391,6 +392,7 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.filePathsMemo = undefined;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -3778,12 +3780,17 @@ export class QueryBuilder {
   /**
    * Get all tracked file paths (lightweight — no full FileRecord objects)
    */
-  getAllFilePaths(): string[] {
+  getAllFilePaths(): readonly string[] {
+    const stamp = this.db.inTransaction === false ? this.getChangeStamp() : null;
+    if (stamp !== null && this.filePathsMemo?.stamp === stamp) return this.filePathsMemo.value;
+    this.filePathsMemo = undefined;
     if (!this.stmts.getAllFilePaths) {
       this.stmts.getAllFilePaths = this.db.prepare('SELECT path FROM files ORDER BY path');
     }
     const rows = this.stmts.getAllFilePaths.all() as Array<{ path: string }>;
-    return rows.map((r) => r.path);
+    const value = Object.freeze(rows.map(row => row.path));
+    if (stamp !== null) this.filePathsMemo = { stamp, value };
+    return value;
   }
 
   /**
