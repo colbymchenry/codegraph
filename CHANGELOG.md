@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **F#** (`.fs` and `.fsx`): namespaces, modules, functions, values, active patterns, unions, records, enums, classes with their members and exceptions become searchable symbols.
+- In F#, `inherit` and `interface ... with` link a type to what it extends and implements, `open` and script `#load` are recorded as imports, and calls are followed through application, pipes, operators and qualified names.
+- In F#, a name resolves the way F# scopes it, through `open`, a module or type written before it, `[<AutoOpen>]` modules and `namespace global`, so a `map` or `format` in an unrelated namespace is never taken for yours.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
