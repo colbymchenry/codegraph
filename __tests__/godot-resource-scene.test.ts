@@ -41,7 +41,17 @@ describe('godot scenes', () => {
     );
     fs.writeFileSync(
       path.join(dir, 'scripts', 'bar.gd'),
-      ['extends Control', '', 'func _on_pressed() -> void:', '\tpass', ''].join('\n')
+      [
+        'extends Control',
+        '',
+        'func _on_pressed() -> void:',
+        '\tpass',
+        '',
+        'func touch() -> void:',
+        '\tvar a = $Label',
+        '\tvar b = get_node("Bar/Label")',
+        '',
+      ].join('\n')
     );
     fs.writeFileSync(
       path.join(dir, 'scripts', 'user.gd'),
@@ -101,6 +111,16 @@ describe('godot scenes', () => {
       .all()
       .map((r: any) => r.sn);
     expect(sceneUsers).toContain('user.gd');
+
+    // `$Label` / `get_node("Bar/Label")` resolve onto the scene node they name.
+    const nodeRefs = db
+      .prepare(
+        `SELECT s.name sn, t.kind tk, t.name tn FROM edges e
+         JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE e.kind = 'references' AND t.kind = 'component'`
+      )
+      .all();
+    expect(nodeRefs).toContainEqual({ sn: 'touch', tk: 'component', tn: 'Label' });
 
     cg.destroy();
   });

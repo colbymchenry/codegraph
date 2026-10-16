@@ -142,6 +142,38 @@ function extractExtends(node: SyntaxNode, source: string): string | null {
   return null;
 }
 
+/**
+ * A node-path reference from inside a script (`$LeftSideInfo/Hp`,
+ * `%Unique`, `get_node("…")`) — resolved onto the scene node the path names
+ * (GDScript and Godot resources share a language family for exactly this).
+ */
+function addNodePathReference(ctx: ExtractorContext, node: SyntaxNode, path: string): void {
+  const normalized = path.replace(/^\.?\/*/, '');
+  if (!normalized) return;
+  const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
+  if (!parentId) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: parentId,
+    referenceName: normalized,
+    referenceKind: 'references',
+    line: node.startPosition.row + 1,
+    column: node.startPosition.column,
+  });
+}
+
+/** `$Foo/Bar` / `%Unique` — the grammar's dedicated `get_node` node. Its path
+ * segments are anonymous tokens (no named children), so take the node text:
+ * `$Name`, `$/Root/Name`, `$%Unique`, `%Name`, quoted segments included. */
+function claimShorthandNodePath(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const path = getNodeText(node, ctx.source)
+    .trim()
+    .replace(/^[%$]+/, '')
+    .replace(/"([^"]*)"/g, '$1');
+  if (!path) return false;
+  addNodePathReference(ctx, node, path);
+  return true;
+}
+
 /** preload/load, emit_signal/connect and signal attributes — shared by both walkers. */
 function claimGdscriptCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const callee = calleeName(node, ctx.source);
@@ -151,6 +183,11 @@ function claimGdscriptCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   }
   if (callee === 'emit_signal' || callee === 'connect') {
     return claimStringSignalReference(node, ctx);
+  }
+  if (callee === 'get_node' || callee === 'get_node_or_null' || callee === 'has_node') {
+    const path = firstStringArgument(node, ctx.source);
+    if (path) addNodePathReference(ctx, node, path);
+    return true; // claimed either way: no bare `get_node` call ref
   }
   return false;
 }
@@ -200,6 +237,12 @@ export const gdscriptExtractor: LanguageExtractor = {
       return true;
     }
 
+    // `$Foo/Bar` / `%Unique` — the grammar parses the shorthand as a dedicated
+    // `get_node` node; file the scene-node reference it names.
+    if (node.type === 'get_node') {
+      return claimShorthandNodePath(node, ctx);
+    }
+
     // preload/load at script top level (`const X = preload("res://…")`).
     if (node.type === 'call') {
       return claimGdscriptCall(node, ctx);
@@ -232,6 +275,9 @@ export const gdscriptExtractor: LanguageExtractor = {
   visitBodyNode: (node: SyntaxNode, ctx) => {
     if (node.type === 'call') {
       return claimGdscriptCall(node, ctx);
+    }
+    if (node.type === 'get_node') {
+      return claimShorthandNodePath(node, ctx);
     }
     if (node.type === 'attribute') {
       return claimAttributeSignalReference(node, ctx);

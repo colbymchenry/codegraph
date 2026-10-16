@@ -8134,7 +8134,10 @@ export function matchByQualifiedName(
 
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
-  const parts = ref.referenceName.split(/[:.]/);
+  // Upstream and local path-segment styles: use dot for module-like refs,
+  // slash for path-like imports (`pkg/path::fn`) that should still
+  // prefer same-file matches before arity-only fallbacks.
+  const parts = ref.referenceName.split(/[:./]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
     const partialCandidates = cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
