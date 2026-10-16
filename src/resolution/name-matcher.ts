@@ -11025,6 +11025,62 @@ function cppUnspelledReceiver(ref: UnresolvedRef, context: ResolutionContext): {
   return index === null ? null : at(index);
 }
 
+/** A member chain and the operator after it: `props->rep.db_id` and `.`, `this->mu_` and `->`. */
+const CPP_MEMBER_CHAIN = /^([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*(\.|->)\s*(?:template\s+)?/;
+
+/**
+ * The member chain a C++ call the extractor recorded by its bare name is made
+ * on, with the operator after it — `options.cf_paths` and `.` for
+ * `options.cf_paths.emplace_back(…)`, `props->rep.db_id` and `.` for
+ * `props->rep.db_id.size()` — read at the call's column, where the chain
+ * starts. Null for any other call, a receiver of one name among them (the
+ * extractor spells those).
+ */
+function cppMemberChainReceiver(ref: UnresolvedRef, context: ResolutionContext): { expression: string; op: string } | null {
+  const raw = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  const line = raw === undefined ? null : cppCodeOf(cppLiteralsBlanked(raw, ref.line, cppNonCodeLines(ref.filePath, context)));
+  if (!line) return null;
+  const at = (column: number): { expression: string; op: string } | null => {
+    const chain = CPP_MEMBER_CHAIN.exec(line.slice(column));
+    if (!chain || !/\.|->/.test(chain[1]!)) return null;
+    const rest = line.slice(column + chain[0].length);
+    if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
+    return cppArgumentListFollows(rest, ref.referenceName.length) ? { expression: chain[1]!, op: chain[2]! } : null;
+  };
+  const found = at(Math.max(0, ref.column));
+  if (found || !/[^\x00-\x7f]/.test(line)) return found;
+  const index = cppUtf8Column(line, ref.column);
+  return index === null ? null : at(index);
+}
+
+/**
+ * A C++ call on a data member reached through a member chain, which the
+ * extractor records by its bare name, calls no project method when that
+ * member's type is from outside the project: a library type
+ * (isCppLibraryType) or one under a namespace the project declares nothing
+ * in (isCppOutsideQualifiedType). By its bare name the call went to any
+ * project method of that name: rocksdb's `options.cf_paths.emplace_back(…)`
+ * on a `std::vector<DbPath>` reached `autovector::emplace_back`,
+ * `props->rep.db_id.size()` on a `std::string` `BlobContents::size`, and
+ * protobuf's `state_->child_pid.has_value()` on a `std::optional<pid_t>`
+ * `Option::has_value`. Unlike a call chain's, a member chain's operator is
+ * read where it is written, so a library template of a template parameter is
+ * no matter: `.` calls a member of `std::vector<T>` itself, and `->` on a
+ * `std::unique_ptr<T>` one of `T`, which is none of the project's to tell.
+ *  - null for such a member: no project method is called.
+ *  - undefined for any other call, or a member whose type can't be read or is
+ *    the project's: the name strategies decide, as before.
+ */
+function matchCppOutsideMemberChainCall(ref: UnresolvedRef, context: ResolutionContext): null | undefined {
+  const receiver = cppMemberChainReceiver(ref, context);
+  if (!receiver) return undefined;
+  const object = cppMemberObject(receiver.expression, receiver.op, ref, context, 0);
+  if (!object || isCppPointerType(object.text)) return undefined;
+  if (isCppLibraryType(object.text, context)) return null;
+  return cppClassWritten(object.text, object, ref, context) === undefined &&
+    isCppOutsideQualifiedType(object.text, object, context) ? null : undefined;
+}
+
 /**
  * A C++ call the extractor recorded by its bare name on a receiver it drops
  * (cppUnspelledReceiver) — `(*it)->Visit()` over a `std::vector<Node*>`,
@@ -16970,6 +17026,10 @@ function matchReferenceInner(
   if (ref.language === 'cpp' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const unspelled = nmTimedT('cppUnspelled', ref, () => matchCppUnspelledReceiverCall(ref, context));
     if (unspelled !== undefined) return unspelled;
+    // So is one on a member reached through a chain, `options.cf_paths.emplace_back(…)`,
+    // when that member's type is from outside the project.
+    const outside = nmTimedT('cppOutsideMemberChain', ref, () => matchCppOutsideMemberChainCall(ref, context));
+    if (outside !== undefined) return outside;
   }
 
   // Try strategies in order of confidence
