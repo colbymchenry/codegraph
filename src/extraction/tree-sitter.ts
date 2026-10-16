@@ -479,6 +479,21 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
 ]);
 
 /**
+ * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+ * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
+ * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ */
+function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (cur.type === 'await_expression') {
+    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
  * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
  * tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
  * belongs to the right operand, so a non-null over a binary expression peels
@@ -5312,7 +5327,10 @@ export class TreeSitterExtractor {
         }
       }
     } else {
-      const func = getChildByField(node, 'function') || node.namedChild(0);
+      let func = getChildByField(node, 'function') || node.namedChild(0);
+      if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
+        func = peelTsAwaitCallee(func);
+      }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the
@@ -5579,7 +5597,8 @@ export class TreeSitterExtractor {
               // static receiver at all — emit nothing: a silent miss, never a
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
-              const innerFn = getChildByField(receiver, 'function');
+              let innerFn = getChildByField(receiver, 'function');
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
