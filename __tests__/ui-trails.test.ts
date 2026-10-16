@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as http from 'http';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -26,11 +27,15 @@ import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } fro
 import {
   encodeResolvedRun,
   isTrailId,
+  listStoredTrails,
   parseTrail,
   slugify,
   TRAILS_RELATIVE_DIR,
+  type StoredTrail,
   type WireTrailHop,
 } from '../src/ui-server/api';
+import { writeStoredTrail } from '../src/ui-server/api/trail-store';
+import { resetTrailAuthor, trailAuthor } from '../src/ui-server/api/trails';
 
 interface Res {
   status: number;
@@ -113,6 +118,29 @@ async function idOf(name: string): Promise<string> {
 
 function trailsDir(): string {
   return path.join(projectRoot, TRAILS_RELATIVE_DIR);
+}
+
+function storedTrail(id: string): StoredTrail {
+  return {
+    version: 1,
+    id,
+    name: 'Must stay inside',
+    note: '',
+    author: 'test',
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    hops: [
+      {
+        dir: 'start',
+        name: 'start',
+        qualifiedName: 'start',
+        kind: 'function',
+        file: 'src/start.ts',
+        line: 1,
+        id: 'function:start',
+      },
+    ],
+  };
 }
 
 /** Re-index in place, the way a `codegraph sync` would after an edit. */
@@ -216,6 +244,141 @@ describe('trail ids', () => {
   });
 });
 
+describe('trail write containment', () => {
+  it.runIf(process.platform !== 'win32')(
+    'refuses a missing trail directory below a symlink that leaves the project',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-symlink-'));
+      const project = path.join(base, 'project');
+      const outside = path.join(base, 'outside');
+      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.symlinkSync(outside, path.join(project, '.codegraph', 'ui'), 'dir');
+
+      try {
+        expect(() => writeStoredTrail(project, storedTrail('must-stay-inside'))).toThrow(
+          /outside the project/
+        );
+        expect(fs.existsSync(path.join(outside, 'trails'))).toBe(false);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'allows a project root reached through a symlink when the real path stays inside it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-root-link-'));
+      const project = path.join(base, 'project');
+      const alias = path.join(base, 'project-link');
+      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+      fs.symlinkSync(project, alias, 'dir');
+
+      try {
+        expect(() => writeStoredTrail(alias, storedTrail('safe-root-link'))).not.toThrow();
+        expect(
+          fs.existsSync(path.join(project, TRAILS_RELATIVE_DIR, 'safe-root-link.json'))
+        ).toBe(true);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+});
+
+describe('trail read containment', () => {
+  it.runIf(process.platform !== 'win32')(
+    'skips a trail file symlinked outside the project instead of reading it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-read-link-'));
+      const project = path.join(base, 'project');
+      const outside = path.join(base, 'outside');
+      const dir = path.join(project, TRAILS_RELATIVE_DIR);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(
+        path.join(outside, 'secret.json'),
+        JSON.stringify({ ...storedTrail('outside'), note: 'must not be read' })
+      );
+      fs.symlinkSync(path.join(outside, 'secret.json'), path.join(dir, 'linked.json'));
+
+      try {
+        expect(listStoredTrails(project)).toEqual({ trails: [], skipped: 1 });
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'skips a FIFO in the trails directory without blocking on it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-read-fifo-'));
+      const project = path.join(base, 'project');
+      const dir = path.join(project, TRAILS_RELATIVE_DIR);
+      fs.mkdirSync(dir, { recursive: true });
+      // A FIFO with no writer: a blocking open would hang here until one showed up.
+      execFileSync('mkfifo', [path.join(dir, 'blocked.json')]);
+
+      try {
+        // Run current TS source in a child: a synchronous open blocks Vitest's
+        // own timeout, but the parent's execFileSync timeout can kill the child.
+        const script = `
+          const fs = require('fs');
+          const ts = require('typescript');
+          require.extensions['.ts'] = (module, filename) => {
+            const source = fs.readFileSync(filename, 'utf8');
+            const { outputText } = ts.transpileModule(source, {
+              compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+            });
+            module._compile(outputText, filename);
+          };
+          const { listStoredTrails } = require(process.argv[1]);
+          process.stdout.write(JSON.stringify(listStoredTrails(process.argv[2])));
+        `;
+        const result = execFileSync(process.execPath, [
+          '-e', script, path.resolve(__dirname, '../src/ui-server/api/trail-store.ts'), project,
+        ], {
+          cwd: path.resolve(__dirname, '..'),
+          encoding: 'utf8',
+          timeout: 5_000,
+          killSignal: 'SIGKILL',
+        });
+        expect(JSON.parse(result)).toEqual({ trails: [], skipped: 1 });
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    },
+    10_000
+  );
+});
+
+describe('trail author cache', () => {
+  it('keeps git user names separate for projects served by one process', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-authors-'));
+    const first = path.join(base, 'first');
+    const second = path.join(base, 'second');
+
+    try {
+      for (const [dir, author] of [
+        [first, 'Alice Project'],
+        [second, 'Bob Project'],
+      ] as const) {
+        fs.mkdirSync(dir, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: dir });
+        execFileSync('git', ['config', 'user.name', author], { cwd: dir });
+      }
+      resetTrailAuthor();
+      expect(trailAuthor(first)).toBe('Alice Project');
+      expect(trailAuthor(second)).toBe('Bob Project');
+    } finally {
+      resetTrailAuthor();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('parseTrail', () => {
   it('rejects a file that is not a trail rather than half-reading it', () => {
     expect(parseTrail('x', 'not json')).toBeNull();
@@ -223,6 +386,12 @@ describe('parseTrail', () => {
     expect(parseTrail('x', '{"name":"a"}')).toBeNull();
     expect(parseTrail('x', '{"name":"a","hops":[]}')).toBeNull();
     expect(parseTrail('x', '{"name":"","hops":[{"qualifiedName":"a"}]}')).toBeNull();
+  });
+
+  it('rejects a declared format version this build does not understand', () => {
+    expect(
+      parseTrail('future', JSON.stringify({ ...storedTrail('future'), version: 2 }))
+    ).toBeNull();
   });
 
   it('takes its id from the FILE, not from the field inside it', () => {
