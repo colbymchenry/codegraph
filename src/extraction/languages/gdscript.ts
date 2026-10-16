@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
-import type { LanguageExtractor } from '../tree-sitter-types';
+import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
 // Node names follow PrestonKnopp/tree-sitter-gdscript (ABI-15).
 // GDScript is Python-like: indentation-based, dynamically typed, with
@@ -26,19 +26,99 @@ function extractString(node: SyntaxNode, source: string): string | null {
 }
 
 /**
- * If `callNode` is `preload("res://...")` or `load("res://...")`,
- * return the path string; otherwise null.
+ * Names of signals declared in this source (`signal NAME` at the start of a
+ * line; annotations sit on their own lines). Engine signals (`pressed`,
+ * `finished`, …) are declared nowhere in the file and stay out of the graph.
+ * A cheap textual pre-scan: the extractor has no per-file init hook and the
+ * AST walk is not guaranteed to reach a declaration before its uses.
  */
-function preloadOrLoad(callNode: SyntaxNode, source: string): string | null {
-  const name = getChildByField(callNode, 'name');
-  if (!name || name.type !== 'identifier') return null;
-  const callee = getNodeText(name, source);
-  if (callee !== 'preload' && callee !== 'load') return null;
+function declaredSignalNames(source: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of source.matchAll(/^[ \t]*signal[ \t]+([A-Za-z_][A-Za-z0-9_]*)/gm)) {
+    const name = m[1];
+    if (name) names.add(name);
+  }
+  return names;
+}
 
-  const args = getChildByField(callNode, 'arguments');
-  if (!args) return null;
-  const str = findDescendant(args, 'string');
+/** The callee of a GDScript `call` node — the grammar carries no `name` field. */
+function calleeName(node: SyntaxNode, source: string): string {
+  const callee = node.namedChildren.find((c) => c.type === 'identifier');
+  return callee ? getNodeText(callee, source) : '';
+}
+
+/** First string-literal argument of a call node, unquoted. */
+function firstStringArgument(node: SyntaxNode, source: string): string | null {
+  const args = getChildByField(node, 'arguments');
+  const str = args ? findDescendant(args, 'string') : null;
   return str ? extractString(str, source) : null;
+}
+
+/** Reference from the enclosing scope (file or function) to a declared signal. */
+function addSignalReference(ctx: ExtractorContext, node: SyntaxNode, signalName: string): void {
+  const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
+  if (!parentId) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: parentId,
+    referenceName: signalName,
+    referenceKind: 'references',
+    line: node.startPosition.row + 1,
+    column: node.startPosition.column,
+  });
+}
+
+/**
+ * `preload("res://…")` / `load("res://…")` → an import node plus an import
+ * reference from the enclosing scope, so the target file shows up as a
+ * dependent in impact queries.
+ */
+function claimImport(node: SyntaxNode, ctx: ExtractorContext): void {
+  const path = firstStringArgument(node, ctx.source);
+  if (!path) return;
+  const imp = ctx.createNode('import', path, node, {
+    signature: getNodeText(node, ctx.source).trim().slice(0, 100),
+  });
+  const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
+  if (imp && parentId) {
+    ctx.addUnresolvedReference({
+      fromNodeId: parentId,
+      referenceName: path,
+      referenceKind: 'imports',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+}
+
+/**
+ * `some_signal.emit(...)` / `some_signal.connect(...)` — the grammar parses
+ * these as `attribute` (identifier + attribute_call), which the generic call
+ * walker ignores entirely. A reference is filed only for a signal declared in
+ * the file, so engine signals (`pressed`, `finished`, …) add no edges.
+ */
+function claimAttributeSignalReference(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const [obj, call] = node.namedChildren;
+  if (!obj || !call || obj.type !== 'identifier' || call.type !== 'attribute_call') return false;
+  const methodNode = call.namedChildren.find((c) => c.type === 'identifier');
+  const method = methodNode ? getNodeText(methodNode, ctx.source) : '';
+  if (method !== 'emit' && method !== 'connect') return false;
+  const signalName = getNodeText(obj, ctx.source);
+  if (!declaredSignalNames(ctx.source).has(signalName)) return false;
+  addSignalReference(ctx, node, signalName);
+  return true;
+}
+
+/**
+ * `emit_signal("name", …)` / `connect("name", …)` — the string forms; the
+ * receiver is the implicit `self`. Claimed either way so the generic walker
+ * doesn't file a `calls emit_signal` reference that resolves to nothing.
+ */
+function claimStringSignalReference(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const signalName = firstStringArgument(node, ctx.source);
+  if (signalName && declaredSignalNames(ctx.source).has(signalName)) {
+    addSignalReference(ctx, node, signalName);
+  }
+  return true;
 }
 
 /**
@@ -60,6 +140,19 @@ function extractExtends(node: SyntaxNode, source: string): string | null {
   const str = typeNode.namedChildren.find((c) => c.type === 'string');
   if (str) return extractString(str, source);
   return null;
+}
+
+/** preload/load, emit_signal/connect and signal attributes — shared by both walkers. */
+function claimGdscriptCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const callee = calleeName(node, ctx.source);
+  if (callee === 'preload' || callee === 'load') {
+    claimImport(node, ctx);
+    return true;
+  }
+  if (callee === 'emit_signal' || callee === 'connect') {
+    return claimStringSignalReference(node, ctx);
+  }
+  return false;
 }
 
 export const gdscriptExtractor: LanguageExtractor = {
@@ -89,32 +182,27 @@ export const gdscriptExtractor: LanguageExtractor = {
   // This is handled by the extraction framework via nodeStack context.
   getReceiverType: () => undefined,
 
-  // Handle preload/load calls and extends clauses.
+  // Handle signal declarations, preload/load call sites and extends clauses.
   visitNode: (node: SyntaxNode, ctx) => {
     const source = ctx.source;
 
-    // Handle preload/load as import edges.
-    if (node.type === 'call') {
-      const path = preloadOrLoad(node, source);
-      if (path) {
-        const imp = ctx.createNode('import', path, node, {
-          signature: getNodeText(node, source).trim().slice(0, 100),
+    // Signal declarations: `signal name(params)`. Indexed as a field so
+    // emitters and subscribers have a findable declaration (the same choice
+    // VB.NET events made).
+    if (node.type === 'signal_statement') {
+      const nameNode = getChildByField(node, 'name');
+      if (nameNode) {
+        const params = getChildByField(node, 'parameters');
+        ctx.createNode('field', getNodeText(nameNode, source), node, {
+          signature: params ? getNodeText(params, source) : undefined,
         });
-        if (imp && ctx.nodeStack.length > 0) {
-          const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
-          if (parentId) {
-            ctx.addUnresolvedReference({
-              fromNodeId: parentId,
-              referenceName: path,
-              referenceKind: 'imports',
-              line: node.startPosition.row + 1,
-              column: node.startPosition.column,
-            });
-          }
-        }
-        return true; // claimed as import, not a generic call
       }
-      return false;
+      return true;
+    }
+
+    // preload/load at script top level (`const X = preload("res://…")`).
+    if (node.type === 'call') {
+      return claimGdscriptCall(node, ctx);
     }
 
     // Handle extends clauses on class_name_statement.
@@ -135,6 +223,19 @@ export const gdscriptExtractor: LanguageExtractor = {
       return false;
     }
 
+    return false;
+  },
+
+  // Function bodies are walked by a separate walker that never reaches
+  // visitNode — signal emit/connect and preload call sites inside functions
+  // are claimed here.
+  visitBodyNode: (node: SyntaxNode, ctx) => {
+    if (node.type === 'call') {
+      return claimGdscriptCall(node, ctx);
+    }
+    if (node.type === 'attribute') {
+      return claimAttributeSignalReference(node, ctx);
+    }
     return false;
   },
 };
