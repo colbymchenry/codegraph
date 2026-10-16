@@ -38,6 +38,22 @@
  * division, so only a `references` ref is read as a path.
  */
 export function referenceNameTail(referenceName: string, referenceKind?: string): string {
+  // Named HDL connections carry structured module/port/instance identity.
+  // Retry on the formal port name when a previously removed port reappears.
+  for (const prefix of ['hdl:port-position:', 'hdl:wildcard:']) {
+    if (referenceName.startsWith(prefix)) {
+      try {
+        const parts: unknown = JSON.parse(referenceName.slice(prefix.length));
+        if (Array.isArray(parts) && typeof parts[0] === 'string') return parts[0];
+      } catch { /* Fall back for malformed internal references. */ }
+    }
+  }
+  if (referenceName.startsWith('hdl:port:')) {
+    try {
+      const parts: unknown = JSON.parse(referenceName.slice('hdl:port:'.length));
+      if (Array.isArray(parts) && parts.length === 3 && typeof parts[1] === 'string') return parts[1];
+    } catch { /* Malformed refs retain the generic tail behavior below. */ }
+  }
   if (referenceKind === 'imports' && referenceName.replace(/\/+$/, '').includes('/')) {
     const stem = pathStem(referenceName);
     if (stem) return stem;
