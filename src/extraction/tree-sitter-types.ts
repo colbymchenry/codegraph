@@ -257,6 +257,16 @@ export interface LanguageExtractor {
   visitNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
 
   /**
+   * Language hook for nodes inside function bodies, called before the generic
+   * call/instantiation handling. Return true when the node was claimed (the
+   * generic handling is skipped for it; its children are still walked).
+   * Function bodies are traversed by a separate walker that never reaches
+   * visitNode, so forms that only ever appear inside bodies (e.g. GDScript
+   * `sig.emit(...)` / `preload(...)`) must be claimed here.
+   */
+  visitBodyNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
+
+  /**
    * Synthesize members that exist at compile time but not in the source AST,
    * called at the end of class extraction with the class still on the scope
    * stack (so `ctx.createNode` attaches containment + qualified names) and the
