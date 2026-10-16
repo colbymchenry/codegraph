@@ -98,6 +98,21 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('named class expressions retain their inner scope: %s (#2499)', (ext, language) => {
+    const source = fs.readFileSync(path.join(FIXTURE_DIR, 'named-class-expressions.js'), 'utf8');
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`expressions.${ext}`, source.replace(/\r?\n/g, ending), language);
+      const expressions = result.nodes.filter(n => n.kind === 'class' && ['Widget', 'Named', 'Local'].includes(n.name));
+      expect(expressions.map(n => n.name).sort()).toEqual(['Local', 'Named', 'Widget']);
+      for (const expression of expressions) {
+        expect(expression.isExported).toBe(false);
+        expect(expression.signature).toMatch(/^class /);
+      }
+    }
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('named object literals own their members: %s (#2300)', (ext, language) => {
     const source = [
       '/* é😀 */ const Api = { read() { helper(); }, close: () => helper(), gen: function* () { yield 1; }, \'quoted-key\': function () {}, [dyn()]() { helper(); }, eager: helper(), alias: helper, helper };',

@@ -186,7 +186,10 @@ impl<'t> Walker<'t> {
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             visibility: self.visibility_of(node),
-            is_exported: Some(self.is_exported(node)),
+            is_exported: Some(node.kind() != "class" && self.is_exported(node)),
+            signature: if node.kind() == "class" {
+                resolved_body.map(|body| self.src[node.start_byte()..body.start_byte()].trim_end().to_string())
+            } else { None },
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else {
