@@ -9620,31 +9620,23 @@ function cppWrittenClass(type: CppWrittenType, at: UnresolvedRef, context: Resol
   return found && CPP_CLASS_KINDS.has(found.node.kind) ? found.node : null;
 }
 
-/**
- * The type the C++ class `cls` declares its data member `name` with, as
- * written, in the class's scope: `std::vector<SubcompactionState>` for
- * rocksdb's `CompactionState::sub_compact_states`. Data members are not
- * indexed, so the class's own lines are read — one inside none of the
- * functions or classes nested in it. Null when none of them declares it
- * (a base class may).
- */
-function cppDataMemberType(cls: string, name: string, context: ResolutionContext): CppWrittenType | null {
-  for (const decl of context.getNodesByQualifiedName(cls)) {
-    const member = cppDataMemberIn(decl, name, context);
-    if (member) return member;
-  }
-  return null;
-}
-
 const CPP_DATA_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWrittenType | null>>();
 const CPP_NESTED_SPANS = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
 const CPP_CLASS_PAREN_DEPTHS = new WeakMap<ResolutionContext, Map<string, number[]>>();
 
 /**
- * cppDataMemberType for one declaration of the class, `decl`. A declarator
- * inside parentheses is a parameter of a method the class declares — which
- * has no node of its own, so its lines are the class's — not a member:
- * rocksdb's `DB` declares `CreateColumnFamilies(const
+ * The type the C++ class `decl` declares its data member `name` with, as
+ * written, in the class's scope: `std::vector<SubcompactionState>` for
+ * rocksdb's `CompactionState::sub_compact_states`. Data members are not
+ * indexed, so the class's own lines are read — one inside none of the
+ * functions or classes nested in it. Null when none of them declares it
+ * (a base class may). Only `decl`'s own: a class of the same qualified name
+ * another file declares for itself is another class — rocksdb's
+ * `db_bench_tool.cc` and `db_stress_shared_state.h` each declare a
+ * `ThreadState`, whose `rand` is a `Random64` in one and a `Random` in the
+ * other. A declarator inside parentheses is a parameter of a method the
+ * class declares — which has no node of its own, so its lines are the
+ * class's — not a member: rocksdb's `DB` declares `CreateColumnFamilies(const
  * std::vector<ColumnFamilyDescriptor>& column_families, …)`. Nor is a name
  * an argument list follows, a method.
  */
@@ -10031,7 +10023,7 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     const element = object && cppPairMember(object, field![3]!, at, context);
     if (element) return element;
     const cls = object && cppWrittenClass(object, at, context);
-    return cls ? cppDataMemberType(cls.qualifiedName, field![3]!, context) : null;
+    return cls ? cppDataMemberIn(cls, field![3]!, context) : null;
   }
   const open = cppOpeningParen(text, text.length - 1);
   const callee = open > 0 ? text.slice(0, open).trim() : '';
@@ -11055,30 +11047,42 @@ function cppMemberChainReceiver(ref: UnresolvedRef, context: ResolutionContext):
 
 /**
  * A C++ call on a data member reached through a member chain, which the
- * extractor records by its bare name, calls no project method when that
- * member's type is from outside the project: a library type
- * (isCppLibraryType) or one under a namespace the project declares nothing
- * in (isCppOutsideQualifiedType). By its bare name the call went to any
- * project method of that name: rocksdb's `options.cf_paths.emplace_back(…)`
- * on a `std::vector<DbPath>` reached `autovector::emplace_back`,
- * `props->rep.db_id.size()` on a `std::string` `BlobContents::size`, and
- * protobuf's `state_->child_pid.has_value()` on a `std::optional<pid_t>`
- * `Option::has_value`. Unlike a call chain's, a member chain's operator is
- * read where it is written, so a library template of a template parameter is
- * no matter: `.` calls a member of `std::vector<T>` itself, and `->` on a
- * `std::unique_ptr<T>` one of `T`, which is none of the project's to tell.
- *  - null for such a member: no project method is called.
- *  - undefined for any other call, or a member whose type can't be read or is
- *    the project's: the name strategies decide, as before.
+ * extractor records by its bare name, calls a member of the class that
+ * member's type names, looked up as C++ looks it up where the type is
+ * written (cppMemberObject reads each member's declared type in its class).
+ * By its bare name the call went to whichever class had a method of that
+ * name, or, in a method, to the method's own class: rocksdb's
+ * `thread->rnd.Next()` on a `Random rnd` reached `ArenaWrappedDBIter::Next`,
+ * `meta.smallest.user_key()` on an `InternalKey` `ClippingIterator::user_key`,
+ * and `options.cf_paths.emplace_back(…)` on a `std::vector<DbPath>`
+ * `autovector::emplace_back`. Unlike a call chain's, a member chain's
+ * operator is read where it is written, so a library template of a template
+ * parameter is no matter: `.` calls a member of `std::vector<T>` itself, and
+ * `->` on a `std::unique_ptr<T>` one of `T`.
+ *  - The member of that class, or of a class it derives from.
+ *  - null when no project method is called: a type from outside the project,
+ *    a library type (isCppLibraryType) or one under a namespace the project
+ *    declares nothing in (isCppOutsideQualifiedType); a template parameter's
+ *    type the calling function writes; or a class that surely lacks the
+ *    method (cppLacksMethod).
+ *  - undefined for any other call, or a member whose type can't be read or
+ *    placed: the name strategies decide, as before.
  */
-function matchCppOutsideMemberChainCall(ref: UnresolvedRef, context: ResolutionContext): null | undefined {
+function matchCppMemberChainCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   const receiver = cppMemberChainReceiver(ref, context);
   if (!receiver) return undefined;
   const object = cppMemberObject(receiver.expression, receiver.op, ref, context, 0);
   if (!object || isCppPointerType(object.text)) return undefined;
   if (isCppLibraryType(object.text, context)) return null;
-  return cppClassWritten(object.text, object, ref, context) === undefined &&
-    isCppOutsideQualifiedType(object.text, object, context) ? null : undefined;
+  const found = cppClassWritten(object.text, object, ref, context);
+  if (found === undefined) return isCppOutsideQualifiedType(object.text, object, context) ? null : undefined;
+  // (As for an unspelled receiver: a template parameter another template
+  // writes is what the call's specialization makes it.)
+  if (found === null) return isCppTemplateParameterType(object) && object.scope !== context.getNodeById?.(ref.fromNodeId)?.qualifiedName ? undefined : null;
+  if (!found.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
+  const method = cppMethodOf(found.node, ref.referenceName, ref, context);
+  if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return cppLacksMethod(found.node, context) ? null : undefined;
 }
 
 /**
@@ -17026,10 +17030,9 @@ function matchReferenceInner(
   if (ref.language === 'cpp' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const unspelled = nmTimedT('cppUnspelled', ref, () => matchCppUnspelledReceiverCall(ref, context));
     if (unspelled !== undefined) return unspelled;
-    // So is one on a member reached through a chain, `options.cf_paths.emplace_back(…)`,
-    // when that member's type is from outside the project.
-    const outside = nmTimedT('cppOutsideMemberChain', ref, () => matchCppOutsideMemberChainCall(ref, context));
-    if (outside !== undefined) return outside;
+    // So is one on a member reached through a chain, `thread->rnd.Next()`.
+    const chained = nmTimedT('cppMemberChain', ref, () => matchCppMemberChainCall(ref, context));
+    if (chained !== undefined) return chained;
   }
 
   // Try strategies in order of confidence
