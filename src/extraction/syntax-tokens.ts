@@ -362,6 +362,8 @@ export interface SyntaxRegion {
 
 const SCRIPT_BLOCK = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi;
 const TS_LANG_ATTR = /lang\s*=\s*["'](ts|typescript)["']/i;
+/** Vue's extractor reads `lang="tsx"` with the TSX grammar; Svelte's has no TSX. */
+const TSX_LANG_ATTR = /lang\s*=\s*["']tsx["']/i;
 /** Astro's frontmatter: a `---` fence at the very top of the file. */
 const ASTRO_FRONTMATTER = /^(---\r?\n)([\s\S]*?)\r?\n---/;
 
@@ -392,10 +394,16 @@ export function syntaxRegionsFor(source: string, language: Language): SyntaxRegi
     regions.push({
       start,
       end: start + body.length,
-      language: TS_LANG_ATTR.test(match[1] ?? '') ? 'typescript' : 'javascript',
+      language: scriptLanguage(match[1] ?? '', language),
     });
   }
   return regions;
+}
+
+/** The grammar a `<script>` block with these attributes is read with. */
+function scriptLanguage(attrs: string, host: Language): Language {
+  if (host === 'vue' && TSX_LANG_ATTR.test(attrs)) return 'tsx';
+  return TS_LANG_ATTR.test(attrs) ? 'typescript' : 'javascript';
 }
 
 /* --------------------------------------------------------------- the API -- */
