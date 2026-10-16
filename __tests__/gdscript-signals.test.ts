@@ -27,29 +27,29 @@ describe('gdscript signals and imports', () => {
   it('indexes signal declarations, emit/connect references and preload imports', async () => {
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
     fs.writeFileSync(
-      path.join(dir, 'src', 'battle.gd'),
+      path.join(dir, 'src', 'signals.gd'),
       [
         'extends Node',
         '',
-        'signal battle_finished(battle_id: String)',
+        'signal data_loaded(request_id: String)',
         '',
         'func emit_it() -> void:',
-        '\tbattle_finished.emit("x")',
+        '\tdata_loaded.emit("x")',
         '',
         'func wire() -> void:',
-        '\tbattle_finished.connect(_on_battle_finished)',
+        '\tdata_loaded.connect(_on_data_loaded)',
         '',
         'func legacy() -> void:',
-        '\temit_signal("battle_finished", "x")',
+        '\temit_signal("data_loaded", "x")',
         '',
         'func legacy_connect() -> void:',
-        '\tconnect("battle_finished", Callable(self, "_on_battle_finished"))',
+        '\tconnect("data_loaded", Callable(self, "_on_data_loaded"))',
         '',
         'func subscribe(other: Node) -> void:',
-        '\tother.battle_finished.connect(_on_battle_finished)',
+        '\tother.data_loaded.connect(_on_data_loaded)',
         '',
         'func engine_signal(tween: Tween) -> void:',
-        '\ttween.finished.connect(_on_battle_finished)',
+        '\ttween.finished.connect(_on_data_loaded)',
       ].join('\n')
     );
     fs.writeFileSync(path.join(dir, 'src', 'target.gd'), 'extends Node\n');
@@ -70,7 +70,7 @@ describe('gdscript signals and imports', () => {
     const db = (cg as any).db.db;
 
     const signal = db
-      .prepare(`SELECT id, kind FROM nodes WHERE name = 'battle_finished' AND kind = 'field'`)
+      .prepare(`SELECT id, kind FROM nodes WHERE name = 'data_loaded' AND kind = 'field'`)
       .get();
     expect(signal).toBeTruthy();
 
@@ -78,7 +78,7 @@ describe('gdscript signals and imports', () => {
       .prepare(
         `SELECT s.name AS src FROM edges e
          JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
-         WHERE e.kind = 'references' AND t.name = 'battle_finished'
+         WHERE e.kind = 'references' AND t.name = 'data_loaded'
          ORDER BY s.name`
       )
       .all()

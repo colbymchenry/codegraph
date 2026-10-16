@@ -101,7 +101,7 @@ function lastChainName(node: SyntaxNode, source: string): string {
 /**
  * `some_signal.emit(...)` / `some_signal.connect(...)` — the grammar parses
  * these as `attribute` (… + attribute_call), which the generic call walker
- * ignores entirely. A chain (`camera.layout_changed.connect(…)`, Godot's
+ * ignores entirely. A chain (`node.data_loaded.connect(…)`, Godot's
  * everyday cross-file subscription) names the signal by its last segment;
  * a bare `self` signal is filed only when declared in the file, so engine
  * signals (`pressed`, `finished`, …) add no edges.
@@ -160,7 +160,7 @@ function extractExtends(node: SyntaxNode, source: string): string | null {
 }
 
 /**
- * A node-path reference from inside a script (`$LeftSideInfo/Hp`,
+ * A node-path reference from inside a script (`$Foo/Bar`,
  * `%Unique`, `get_node("…")`) — resolved onto the scene node the path names
  * (GDScript and Godot resources share a language family for exactly this).
  */
