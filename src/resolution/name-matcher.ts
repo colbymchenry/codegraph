@@ -19,6 +19,7 @@ import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncluders } from './cpp-includers';
+import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -11219,8 +11220,15 @@ function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: 
  * own or one a header it includes defines, else one with external linkage —
  * the best placed of them (findBestMatch). jemalloc's tests call the
  * `static inline do_arena_create` of the arena_util.h they include, not a
- * neighbouring test's own `static do_arena_create`. `chosen` itself for
- * anything but a C or C++ call, or when no function is in sight.
+ * neighbouring test's own `static do_arena_create`. What the file sees only
+ * when the build sets a flag nothing in the project sets
+ * (isCFeatureVariant) yields to a definition with external linkage that the
+ * build without it calls: lua-cjson's fpconv.h defines `fpconv_init` under
+ * `#ifdef USE_INTERNAL_FPCONV`, and redis's build calls fpconv.c's. A call
+ * compiled only with such a flag itself is left to the file's own: redis's
+ * quicklist.c tests call its `static mstime` inside `#ifdef REDIS_TEST`.
+ * `chosen` itself for anything but a C or C++ call, or when no function is
+ * in sight.
  */
 function cppFunctionOverload(chosen: Node, candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node {
   if ((ref.language !== 'cpp' && ref.language !== 'c') || ref.referenceKind !== 'calls') return chosen;
@@ -11229,7 +11237,12 @@ function cppFunctionOverload(chosen: Node, candidates: Node[], ref: UnresolvedRe
   if (overloads.length === 0) return chosen;
   if (ref.language === 'c') {
     const own = overloads.filter((n) => n.filePath === ref.filePath || cppIncluders(n.filePath, context).has(ref.filePath));
-    return findBestMatch(ref, own.length > 0 ? own : overloads, context) ?? chosen;
+    const external = own.length > 0 ? overloads.filter((n) => !own.includes(n) && !isStaticCFunction(n, context)) : [];
+    const outside = external.length > 0 && own.every((n) => isCFeatureVariant(n, ref, context)) &&
+      !isOffByDefault(ref.filePath, ref.line, context)
+      ? external.filter((n) => !isCFeatureVariant(n, ref, context))
+      : [];
+    return findBestMatch(ref, outside.length > 0 ? outside : own.length > 0 ? own : overloads, context) ?? chosen;
   }
   return cppOverloadFor(overloads.includes(chosen) ? [chosen, ...overloads.filter((n) => n !== chosen)] : overloads, chosen.name, ref, context);
 }
