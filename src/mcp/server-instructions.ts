@@ -59,6 +59,8 @@ calls; a grep/read exploration is dozens.
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.
 - Explore matches names and indexed code words lexically, not by meaning; an empty result reports word matches and may suggest indexed candidate names to retry with \`codegraph_explore\`.
 
+- Quote literal UI text or error messages (for example, \`where is "Access denied" emitted?\`) to return bounded exact matches with current file/line evidence. Named files/symbols and flow queries retain graph exploration. Text matches are not call-path or runtime proof; check scanned/skipped/truncated coverage when no match is shown.
+
 ## Anti-patterns
 
 - **Trust codegraph's results — don't re-verify them with grep.** They come from a full AST parse; re-checking with grep is slower, less accurate, and wastes context.
