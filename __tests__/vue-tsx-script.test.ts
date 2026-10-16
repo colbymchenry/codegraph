@@ -74,6 +74,19 @@ describe('Vue <script lang="tsx">', () => {
     expect(result.errors.filter((e) => e.code === 'parse_error')).toEqual([]);
   });
 
+  it('reads lang the same way in the extractor and the viewer, whatever its case or quotes', () => {
+    for (const attr of [`lang="TSX"`, `lang='tsx'`]) {
+      const source = TYPES_AND_JSX.replace('lang="tsx"', attr);
+      expect(scriptRegion(source).language).toBe('tsx');
+      const result = extractFromSource('Row.vue', source);
+      expect(result.nodes.some((n) => n.kind === 'interface' && n.name === 'RowProps')).toBe(true);
+      expect(result.errors.filter((e) => e.code === 'parse_error')).toEqual([]);
+    }
+    const ts = `<script setup lang="TS">\ninterface P { a: string }\n</script>\n`;
+    expect(scriptRegion(ts).language).toBe('typescript');
+    expect(extractFromSource('C.vue', ts).nodes.some((n) => n.kind === 'interface' && n.name === 'P')).toBe(true);
+  });
+
   it('still reads lang="ts" as TypeScript and no lang as JavaScript', () => {
     const ts = `<script setup lang="ts">\nconst n: number = 1;\n</script>\n`;
     const js = `<script setup>\nconst n = 1;\n</script>\n`;

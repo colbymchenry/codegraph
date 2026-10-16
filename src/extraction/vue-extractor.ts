@@ -208,8 +208,9 @@ export class VueExtractor {
       const attrs = match[1] || '';
       const content = match.groups?.content || match[2] || '';
 
-      // The script's language from its lang attribute: tsx, TypeScript or JavaScript
-      const lang = /lang\s*=\s*["'](tsx|ts|typescript)["']/.exec(attrs)?.[1];
+      // The script's language from its lang attribute: tsx, TypeScript or JavaScript.
+      // Matched case-insensitively, as the viewer's syntax regions do.
+      const lang = /lang\s*=\s*["'](tsx|ts|typescript)["']/i.exec(attrs)?.[1]?.toLowerCase();
       const language: Language = lang === 'tsx' ? 'tsx' : lang ? 'typescript' : 'javascript';
 
       // Detect <script setup>
