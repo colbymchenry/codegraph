@@ -11,6 +11,7 @@ import { AgentTarget, Location, TargetId } from './types';
 import { claudeTarget } from './claude';
 import { cursorTarget } from './cursor';
 import { codexTarget } from './codex';
+import { devinTarget } from './devin';
 import { opencodeTarget } from './opencode';
 import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
@@ -24,6 +25,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
   cursorTarget,
   codexTarget,
+  devinTarget,
   opencodeTarget,
   hermesTarget,
   geminiTarget,
