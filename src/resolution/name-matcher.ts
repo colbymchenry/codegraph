@@ -7961,7 +7961,7 @@ export function matchByExactName(
   const candidates = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
-    : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : filtered;
+    : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
 
   if (candidates.length === 0) {
     return null;
@@ -8038,9 +8038,9 @@ export function matchByQualifiedName(
   // inside a namespace a macro opens, which only looks global in the index
   // (fmt's `struct pipe`); step 5 of matchReference reads those.
   if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.startsWith('::')) {
-    const global = keepForRef(context.getNodesByQualifiedName(ref.referenceName.slice(2))).filter((n) =>
+    const global = cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName.slice(2))).filter((n) =>
       (n.language === 'cpp' || n.language === 'c') &&
-      !cppMacroNamespaceFrames(n.filePath, context).some((f) => f.start <= n.startLine && f.end >= n.startLine));
+      !cppMacroNamespaceFrames(n.filePath, context).some((f) => f.start <= n.startLine && f.end >= n.startLine)), ref, context);
     const chosen = preferCallSiteFile(global, ref.filePath)[0];
     if (!chosen) return null;
     return {
@@ -8051,7 +8051,7 @@ export function matchByQualifiedName(
     };
   }
 
-  let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  let candidates = cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context);
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
   // That own using ends the lookup here, and resolveOne drops it (an import
@@ -8121,8 +8121,8 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
+    const partialCandidates = cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
+      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName)), ref, context);
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
@@ -10758,8 +10758,11 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
 
 /**
  * C++ class `cls`'s method `name`: its own — of its overloads, the one the
- * call's arguments fit (cppOverloadFor) — else the nearest one of a class
- * it derives from, through the base edges every declaration of `cls` has.
+ * call's arguments fit (cppOverloadFor), and of a member template's explicit
+ * specializations, the one its template arguments name (cppSpecializationPool;
+ * null when it names none of them and they are all `cls` has) — else the
+ * nearest one of a class it derives from, through the base edges every
+ * declaration of `cls` has.
  * When other classes share `cls`'s qualified name, its own are the ones
  * defined in its body, else where it is: the local classes of gtest bodies
  * in one namespace are each `ns::TEST_F::Listener`, and leveldb's
@@ -10772,7 +10775,11 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   const want = `${cls.qualifiedName}::${name}`;
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
-  const own = named.filter((n) => n.qualifiedName === want);
+  const family = named.filter((n) => n.qualifiedName === want);
+  const own = cppSpecializationPool(family, ref, context);
+  // Specializations of the class's own member template, none the call's:
+  // what C++ finds is the template, which has no body here.
+  if (own.length === 0 && family.length > 0) return null;
   if (own.length > 0) {
     const ordered = preferCallSiteFile(cppVisibleFirst(own, ref, context), ref.filePath);
     if (ref.referenceName.includes('().')) return ordered[0]!;
@@ -11111,12 +11118,12 @@ function cppScopeDeclarations(qualifiedName: string, decls: Node[], inner: Node,
  * through a macro, which no node shows: lookup would stop there.
  */
 function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | 'this', ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
-  const own = context.getNodesByQualifiedName(`${scope.qualifiedName}::${name}`).filter((n) =>
+  const own = cppSpecializationPool(context.getNodesByQualifiedName(`${scope.qualifiedName}::${name}`).filter((n) =>
     n.kind === 'method' && (n.language === 'cpp' || n.language === 'c') &&
     // A namesake class's members are defined where it is: leveldb's
     // fault-injection test declares a `FileState` of its own, with no
     // `Truncate`, beside memenv.cc's.
-    (!scope.narrowed || scope.decls.some((d) => d.filePath === n.filePath || cppIncluders(d.filePath, context).has(n.filePath))));
+    (!scope.narrowed || scope.decls.some((d) => d.filePath === n.filePath || cppIncluders(d.filePath, context).has(n.filePath)))), ref, context);
   const holder = scope.holds ? scope.decls[0]! : null;
   const inline = holder ? own.filter((n) => n.filePath === holder.filePath && rangeWithin(n, holder)) : [];
   // A class with no name (a partial specialization, an unnamed struct)
@@ -11138,7 +11145,7 @@ function cppScopeMethod(scope: CppClassScope, name: string, receiver: 'bare' | '
       // two-parameter template beside it).
       const siblings = context.getNodesByQualifiedName(inherited.qualifiedName).filter((n) =>
         n.id !== inherited.id && n.kind === 'method' && (n.language === 'cpp' || n.language === 'c'));
-      return cppOverloadFor([inherited, ...preferCallSiteFile(siblings, ref.filePath)], name, ref, context);
+      return cppOverloadFor(cppSpecializationPool([inherited, ...preferCallSiteFile(siblings, ref.filePath)], ref, context), name, ref, context);
     }
   }
   return null;
@@ -11176,6 +11183,107 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
     }
   }
   return best;
+}
+
+/**
+ * Of the C++ functions `candidates` a call may reach, the ones the template
+ * arguments it writes allow. An explicit specialization is named like the
+ * template it specializes, so a call meets both among that name's candidates:
+ *  - a call that writes template arguments is to the specialization written
+ *    with the same ones — rocksdb's `Deserialize<int64_t>(src, offset)` is
+ *    `template <> int64_t Deserialize<int64_t>(…)` — else to the template
+ *    itself or an ordinary overload: fmt's `num_bits<unsigned short>()` is
+ *    `num_bits<T>()`, not the `num_bits<uint128>()` beside the call. None is
+ *    left when specializations are all there is: protobuf's template
+ *    `ReadPrimitive<CType, DeclaredType>(…)` calls whichever one its
+ *    arguments become.
+ *  - a call that writes none, or another reference, reaches a
+ *    specialization only when there is nothing else.
+ * The candidates as they are when none is a specialization.
+ */
+function cppSpecializationPool(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (ref.language !== 'cpp') return candidates;
+  const written = candidates.map((n) => cppSpecializationArguments(n, context));
+  if (written.every((w) => w === null)) return candidates;
+  const others = candidates.filter((_, i) => written[i] === null);
+  const args = cppCallTemplateArguments(ref, context);
+  if (args === null) return others.length > 0 ? others : candidates;
+  const named = candidates.filter((_, i) => written[i] !== null && cppTemplateArgumentsMatch(written[i]!, args));
+  return named.length > 0 ? named : others;
+}
+
+/** Per context: a C++ function's id → the template arguments it is an explicit specialization for (null: none). */
+const CPP_SPECIALIZATION_ARGUMENTS = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+
+/**
+ * The template arguments the C++ function or method `n` is an explicit
+ * specialization for, as its definition writes them after its name:
+ * `int32_t` and `WireFormatLite::TYPE_INT32` for protobuf's `template <>
+ * inline bool WireFormatLite::ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>(…)`.
+ * A method a macro defines is read from its expansion. Null for a template's
+ * own definition, any other function, and a specialization that leaves its
+ * arguments to be deduced.
+ */
+export function cppSpecializationArguments(n: Node, context: ResolutionContext): string[] | null {
+  // A constructor, whose signature is its parameter list, is never specialized
+  // by name: gmock's `template <typename Func> Action(const Action<Func>& action)`
+  // writes `Action<Func>` for a parameter.
+  if (n.language !== 'cpp' || (n.kind !== 'function' && n.kind !== 'method') || n.signature?.startsWith('(')) return null;
+  let memo = CPP_SPECIALIZATION_ARGUMENTS.get(context);
+  if (!memo) CPP_SPECIALIZATION_ARGUMENTS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  // (A method a macro defines carries its expansion as its signature.)
+  const lines = n.signature ? [] : context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = n.signature || lines.slice(n.startLine - 1, n.startLine + 11).join('\n').slice(n.startColumn);
+  const args = cppTemplateArgumentsAfter(head, n.name, 0);
+  memo.set(n.id, args);
+  return args;
+}
+
+/**
+ * The template arguments the C++ call at `ref` writes after the name it
+ * calls — `unsigned short` for fmt's `num_bits<unsigned short>()` — or null
+ * when it writes none, leaving them to be deduced.
+ */
+function cppCallTemplateArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(ref.line - 1, ref.line + 3).join('\n');
+  return cppTemplateArgumentsAfter(text, ref.referenceName.split(/::|\.|->/).pop()!, Math.max(0, ref.column));
+}
+
+/**
+ * The template arguments `text` writes right after `name`, the first time
+ * from `from` on it is written as a word of its own, as they compare
+ * (cppTemplateArgumentKey). Null when it writes none there, or `<>`.
+ */
+function cppTemplateArgumentsAfter(text: string, name: string, from: number): string[] | null {
+  for (let at = text.indexOf(name, from); at >= 0; at = text.indexOf(name, at + 1)) {
+    const open = at + name.length;
+    if (/[\w$]/.test(text[at - 1] ?? '') || /[\w$]/.test(text[open] ?? '')) continue;
+    const end = text[open] === '<' ? cppTemplateArgumentsEnd(text, open) : -1;
+    const args = end < 0 ? [] : splitCppTopLevel(text.slice(open + 1, end)).map(cppTemplateArgumentKey);
+    return args.length > 0 ? args : null;
+  }
+  return null;
+}
+
+/** A C++ template argument as it compares: spaced only between words. */
+function cppTemplateArgumentKey(arg: string): string {
+  return arg.replace(/\s*([^\w\s])\s*/g, '$1').replace(/\s+/g, ' ');
+}
+
+/**
+ * Whether a call's template arguments `call` are the ones a specialization
+ * writes, `written`: each the same, or the same name qualified further on
+ * one side (`TYPE_INT64` inside the class, `WireFormatLite::TYPE_INT64`
+ * outside it).
+ */
+function cppTemplateArgumentsMatch(written: string[], call: string[]): boolean {
+  return written.length === call.length && written.every((w, i) => {
+    const c = call[i]!;
+    return w === c || w.endsWith(`::${c}`) || c.endsWith(`::${w}`);
+  });
 }
 
 const CPP_DELETED_FUNCTIONS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -16136,7 +16244,7 @@ export function matchFuzzy(
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
-  const languageCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const languageCandidates = cppSpecializationPool(sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates, ref, context);
   const finalCandidates = dartBare || (dartTypeRef && dartPrefix === null) ? preferOwnDartLibrary(languageCandidates, ref, context) : languageCandidates;
 
   // Both post-pipeline visibility guards (#1745 language-local + #1719 sealed
@@ -16803,13 +16911,14 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
     const effective = prefix.length > 0 ? `${prefix.join('::')}::${n.qualifiedName}` : alias ? n.qualifiedName : '';
     if (effective === target) matches.push(n);
   }
+  const pool = cppSpecializationPool(matches, ref, context);
   // A declaration outside the tests over one in them; among an overload set,
   // the one the call's arguments fit: `fmt::format("{}", v)` is format.h's
   // `format(format_string, T&&...)`, not color.h's `format(const text_style&, …)`.
-  const args = matches.length > 1 && ref.referenceKind === 'calls' ? cppCallArguments(ref, name, context) : null;
+  const args = pool.length > 1 && ref.referenceKind === 'calls' ? cppCallArguments(ref, name, context) : null;
   let best: Node | null = null;
   let bestScore = -Infinity;
-  for (const n of matches) {
+  for (const n of pool) {
     const score = (isTestPath(n.filePath) ? -10 : 0) + (args ? cppOverloadFit(n, name, args, context) : 0);
     if (score > bestScore) { best = n; bestScore = score; }
   }

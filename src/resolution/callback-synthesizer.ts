@@ -39,7 +39,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
-import { crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
+import { cppSpecializationArguments, crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
 import { declaredComponent, exportedComponent, lazyValueModules } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 
@@ -747,8 +747,10 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
  * (the override), so trace/callees from the interface method reach the
  * implementation(s). Over-approximation accepted (reachability-correct); capped
  * per class and gated to C++ to avoid touching other languages' dispatch.
+ * An explicit specialization of a member template, which shares the
+ * template's name, overrides nothing and is overridden by nothing.
  */
-async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -757,6 +759,7 @@ async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Pro
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
+  const overridable = (m: Node): boolean => cppSpecializationArguments(m, ctx) === null;
   for (const cls of queries.iterateNodesByKind('class')) {
     if ((++scanned255 & 63) === 0) await onYield();
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
@@ -764,12 +767,12 @@ async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Pro
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
       const base = queries.getNodeById(ext.target);
       if (!base || base.language !== 'cpp' || base.id === cls.id) continue;
-      const baseMethods = new Map(methodsOf(base.id).map((m) => [m.name, m]));
+      const baseMethods = new Map(methodsOf(base.id).filter(overridable).map((m) => [m.name, m]));
       let added = 0;
       for (const m of subMethods) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
         const bm = baseMethods.get(m.name);
-        if (!bm || bm.id === m.id) continue;
+        if (!bm || bm.id === m.id || !overridable(m)) continue;
         const key = `${bm.id}>${m.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -4539,7 +4542,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
   { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
   { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
-  { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
+  { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppOverrideEdges(q, c, y) },
   {
     name: 'ifaceEdges',
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
