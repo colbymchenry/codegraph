@@ -9904,6 +9904,46 @@ function cppLibraryIteratorOf(object: CppWrittenType, member: string): CppWritte
   return CPP_LIBRARY_SEQUENCES.has(last) || CPP_LIBRARY_MAPS.has(last) ? { ...object, text: `${container}::${kind}` } : null;
 }
 
+/** The standard library's container adaptors, whose element is their first template argument. */
+const CPP_LIBRARY_ADAPTORS: ReadonlySet<string> = new Set(['stack', 'queue', 'priority_queue']);
+
+/**
+ * What the member `member` of a library container or holder of the type
+ * `object` hands out, where the container's type is written: an element of
+ * a sequence for `front()`, `back()` and `at(i)` — of one of
+ * CPP_PROJECT_SEQUENCES' too — the value a map's `at(key)` maps to, the
+ * element of a `std::stack`'s `top()` or a `std::queue`'s `front()` and
+ * `back()`, the pointer a smart pointer's `get()` returns and the value an
+ * optional's or an `absl::StatusOr`'s `value()` returns (cppHeldType).
+ * rocksdb's `cfds.front()->GetName()` over an `autovector<ColumnFamilyData*>`
+ * calls ColumnFamilyData's. Null for any other member or type.
+ */
+function cppLibraryElementOf(object: CppWrittenType, member: string, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  if (isCppPointerType(object.text)) return null;
+  const text = cppWithoutTypeKeywords(object.text);
+  const segments = cppTypeSegments(text);
+  const last = segments?.[segments.length - 1];
+  if (!segments || !last) return null;
+  const library = segments[0] === 'std' || segments[0] === 'absl';
+  if (member === 'front' || member === 'back' || member === 'at') {
+    if ((library && CPP_LIBRARY_SEQUENCES.has(last)) || CPP_PROJECT_SEQUENCES.has(last)) return cppRangeElementOf(object, at, context);
+    if (member === 'at' && library && CPP_LIBRARY_MAPS.has(last)) {
+      const value = cppTemplateArguments(text)?.[1];
+      return value ? { ...object, text: cppWithoutNullability(value) } : null;
+    }
+  }
+  if (segments[0] === 'std' && CPP_LIBRARY_ADAPTORS.has(last) && (member === 'top' || ((member === 'front' || member === 'back') && last === 'queue'))) {
+    const element = cppTemplateArguments(text)?.[0];
+    return element ? { ...object, text: cppWithoutNullability(element) } : null;
+  }
+  const held = cppHeldType(text);
+  if (!held || held.includes('[')) return null;
+  const holder = segments.join('::');
+  if (member === 'get' && (holder === 'std::unique_ptr' || holder === 'std::shared_ptr' || holder === 'absl::NoDestructor')) return { ...object, text: `${held}*` };
+  if ((member === 'value' || member === 'value_or') && (holder === 'std::optional' || holder === 'absl::optional' || holder === 'absl::StatusOr')) return { ...object, text: held };
+  return null;
+}
+
 /** What dereferencing an iterator of the type `type` gives, as written. */
 function cppIteratorElement(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext, hops: number): CppWrittenType | null {
   const iterator = cppFollowWrittenAliases(type, at, context);
@@ -10020,6 +10060,9 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     // `logs_.begin()`, `map.find(key)`: the iterator a library container hands out.
     const iterator = object && !member[4] ? cppLibraryIteratorOf(object, member[3]!) : null;
     if (iterator) return iterator;
+    // `ws.front()`, `m.at(key)`, `p.get()`, `s.value()`: what it holds.
+    const element = object && !member[4] ? cppLibraryElementOf(object, member[3]!, at, context) : null;
+    if (element) return element;
     const cls = object && cppWrittenClass(object, at, context);
     if (!cls) return null;
     const methods = cppMethodsOf(cls, member[3]!, at, context);
@@ -12330,6 +12373,8 @@ function cppChainInnerType(inner: string, ref: UnresolvedRef, context: Resolutio
   const followed = recvType && cppFollowWrittenAliases(recvType, ref, context);
   if (!followed) return null;
   const object = op === '->' ? cppDereferenced(followed, ref, context) : isCppPointerType(followed.text) ? null : followed;
+  const element = object && cppLibraryElementOf(object, inner.slice(dot + 1), ref, context);
+  if (element) return element;
   const cls = object && cppWrittenClass(object, ref, context);
   return cls ? cppReturnTypeOf(cppMethodsOf(cls, inner.slice(dot + 1), ref, context), context) : null;
 }
