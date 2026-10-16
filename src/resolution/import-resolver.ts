@@ -22,6 +22,7 @@ import {
   localReceiverTypePatterns,
   normalizeInferredTypeName,
   goRefQualifier,
+  pythonFunctionModuleAlias,
 } from './name-matcher';
 
 /**
@@ -2158,6 +2159,16 @@ function resolvePythonModuleMember(
   // The immediate member of the module (first segment after the receiver).
   const member = ref.referenceName.substring(dotIdx + 1).split('.')[0];
   if (!member) return null;
+
+  // `import a.b as X` inside the calling function binds X there, ahead of any
+  // module-level binding of X, and the file's mappings don't hold it (#2600).
+  const local = pythonFunctionModuleAlias(receiver, ref, context);
+  if (local) {
+    const localPath = resolveImportPath(local, ref.filePath, ref.language, context) ??
+      findPythonModuleFile(local, context, ref.filePath)?.filePath ?? null;
+    const target = localPath && localPath !== ref.filePath ? pythonModuleSymbol(localPath, member, context, 0) : null;
+    return target ? { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' } : null;
+  }
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;

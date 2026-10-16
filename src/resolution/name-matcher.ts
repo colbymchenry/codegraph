@@ -615,6 +615,31 @@ function pythonBindsLocally(name: string, ref: UnresolvedRef, context: Resolutio
   return false;
 }
 
+/**
+ * The module `name` is bound to by an `import a.b as name` written in the
+ * function around `ref` — the innermost one that binds `name` at all (#2600).
+ * Import mappings are per file and read only module-level `import` lines, so
+ * such a function-local alias has none. Null when that function binds `name`
+ * any other way, binds it to several modules, or imports an undotted module
+ * (an optional dependency's name can match any project file's basename).
+ */
+export function pythonFunctionModuleAlias(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return null;
+  const lines = pythonMemberLines(ref.filePath, context);
+  const statements = pythonStatementStarts(ref.filePath, context);
+  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const scope of scopes) {
+    const bindings = pythonOwnLines(scope, ref.filePath, context).flatMap(i => pythonLineBindings(lines, i, statements, name));
+    if (bindings.length === 0) continue;
+    const modules = new Set(bindings.map(b => b.kind === 'import' && b.key.endsWith(':*') ? b.key.slice(0, -2) : ''));
+    const [module] = modules;
+    return modules.size === 1 && module && module.includes('.') && !pythonBindsLocally(name, ref, context, false) ? module : null;
+  }
+  return null;
+}
+
 /** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
 function pythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
   return pythonNameScan(context, `imports\0${filePath}\0${name}`, () => scanPythonImportKeys(name, filePath, context));
