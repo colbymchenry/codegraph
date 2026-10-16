@@ -2486,7 +2486,7 @@ export class ExtractionOrchestrator {
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES}); raise via CODEGRAPH_MAX_SOURCE_FILE_SIZE_BYTES`,
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -2838,7 +2838,7 @@ export class ExtractionOrchestrator {
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES}); raise via CODEGRAPH_MAX_SOURCE_FILE_SIZE_BYTES`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',

@@ -1,12 +1,21 @@
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 
+const DEFAULT_MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
+
 /**
  * Largest source file CodeGraph will parse or read during resolution. Generated
  * bundles, minified sources, and dependency archives above this limit provide no
- * useful symbols; 1 MB covers essentially all hand-written source.
+ * useful symbols; 1 MB covers essentially all hand-written source. Override via
+ * `CODEGRAPH_MAX_SOURCE_FILE_SIZE_BYTES` for codebases with legitimately large,
+ * symbol-dense generated files (e.g. HDL netlists/RTL wrappers) where the
+ * default silently skips real content.
  */
-export const MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
+export const MAX_SOURCE_FILE_SIZE_BYTES = (() => {
+  const raw = process.env.CODEGRAPH_MAX_SOURCE_FILE_SIZE_BYTES;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_SOURCE_FILE_SIZE_BYTES;
+})();
 
 /**
  * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is

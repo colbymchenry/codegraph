@@ -7832,6 +7832,20 @@ export function matchByExactName(
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
   const sameName = context.getNodesByName(ref.referenceName);
+  // Ubiquitous-name ceiling (#999), checked on the RAW fetch rather than after
+  // filtering: a name redeclared in nearly every file (vendored IP-core
+  // boilerplate is the extreme case — CG-41) was filtered, shape-scanned and
+  // scored in full on every ONE of its many references before this bailed,
+  // since the ceiling used to gate `candidates.length` (post-filter) instead
+  // of `sameName.length` (pre-filter). That made the per-ref cost O(K) even
+  // though the result was always declined anyway once filtering couldn't
+  // narrow a truly ubiquitous name below the ceiling — the matchMethodCall
+  // counterpart of this check (Strategy 3, below) already bails here, before
+  // the O(K) work; this one didn't. Precise strategies (qualified-name,
+  // import, class-name) already ran before this function.
+  if (sameName.length > AMBIGUOUS_NAME_CEILING) {
+    return null;
+  }
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
   // (#1839), and never a type that happens to share the name (#2070: expat's
@@ -7983,14 +7997,8 @@ export function matchByExactName(
     };
   }
 
-  // Ubiquitous-name ceiling (#999): above it, picking one target among K
-  // same-named defs by directory proximity is unreliable AND O(K) per ref — the
-  // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
-  // Decline; the precise strategies (qualified-name, import, class-name) already
-  // ran. Falls through to fuzzy, which itself only resolves a UNIQUE candidate.
-  if (candidates.length > AMBIGUOUS_NAME_CEILING) {
-    return null;
-  }
+  // `candidates` is a filtered subset of `sameName`, already bailed above
+  // when it exceeded AMBIGUOUS_NAME_CEILING — so candidates.length can't.
 
   // Multiple matches - try to narrow down
   const nearest = findBestMatch(ref, candidates, context);
