@@ -45,6 +45,9 @@ describe('gdscript signals and imports', () => {
         'func legacy_connect() -> void:',
         '\tconnect("battle_finished", Callable(self, "_on_battle_finished"))',
         '',
+        'func subscribe(other: Node) -> void:',
+        '\tother.battle_finished.connect(_on_battle_finished)',
+        '',
         'func engine_signal(tween: Tween) -> void:',
         '\ttween.finished.connect(_on_battle_finished)',
       ].join('\n')
@@ -80,7 +83,7 @@ describe('gdscript signals and imports', () => {
       )
       .all()
       .map((r: any) => r.src);
-    expect(refs).toEqual(['emit_it', 'legacy', 'legacy_connect', 'wire']);
+    expect(refs).toEqual(['emit_it', 'legacy', 'legacy_connect', 'subscribe', 'wire']);
 
     const engineRefs = db
       .prepare(

@@ -90,20 +90,37 @@ function claimImport(node: SyntaxNode, ctx: ExtractorContext): void {
   }
 }
 
+/** The last identifier of an attribute chain (`a.b.c` → `c`); a bare
+ * identifier names itself. */
+function lastChainName(node: SyntaxNode, source: string): string {
+  if (node.type === 'identifier') return getNodeText(node, source);
+  const last = node.namedChildren[node.namedChildren.length - 1];
+  return last ? lastChainName(last, source) : '';
+}
+
 /**
  * `some_signal.emit(...)` / `some_signal.connect(...)` — the grammar parses
- * these as `attribute` (identifier + attribute_call), which the generic call
- * walker ignores entirely. A reference is filed only for a signal declared in
- * the file, so engine signals (`pressed`, `finished`, …) add no edges.
+ * these as `attribute` (… + attribute_call), which the generic call walker
+ * ignores entirely. A chain (`camera.layout_changed.connect(…)`, Godot's
+ * everyday cross-file subscription) names the signal by its last segment;
+ * a bare `self` signal is filed only when declared in the file, so engine
+ * signals (`pressed`, `finished`, …) add no edges.
  */
 function claimAttributeSignalReference(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const [obj, call] = node.namedChildren;
-  if (!obj || !call || obj.type !== 'identifier' || call.type !== 'attribute_call') return false;
+  const kids = node.namedChildren;
+  if (kids.length < 2) return false;
+  const call = kids[kids.length - 1];
+  if (!call || call.type !== 'attribute_call') return false;
   const methodNode = call.namedChildren.find((c) => c.type === 'identifier');
   const method = methodNode ? getNodeText(methodNode, ctx.source) : '';
   if (method !== 'emit' && method !== 'connect') return false;
-  const signalName = getNodeText(obj, ctx.source);
-  if (!declaredSignalNames(ctx.source).has(signalName)) return false;
+  const obj = kids[kids.length - 2];
+  if (!obj) return false;
+  const signalName = lastChainName(obj, ctx.source);
+  if (!signalName) return false;
+  if (kids.length === 2 && obj.type === 'identifier' && !declaredSignalNames(ctx.source).has(signalName)) {
+    return false;
+  }
   addSignalReference(ctx, node, signalName);
   return true;
 }
