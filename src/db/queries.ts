@@ -252,6 +252,12 @@ export class QueryBuilder {
     | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
     | undefined;
 
+  // getAllNodeNames()'s list under the same change-stamp rule, plus the list's
+  // indices bucketed by lowercased length for searchNodesFuzzy (built lazily).
+  private nodeNamesMemo:
+    | { stamp: string; names: string[]; byLength?: Map<number, number[]> }
+    | undefined;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -391,6 +397,7 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.nodeNamesMemo = undefined;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -1722,13 +1729,34 @@ export class QueryBuilder {
     const lowered = text.toLowerCase();
     const maxDist = lowered.length <= 4 ? 1 : 2;
 
-    // Pull the distinct name list once. The set is cached on QueryBuilder
-    // by getAllNodeNames(); even on a 200k-node project the distinct
-    // name set is typically O(10k) because most names repeat. The
-    // candidate-cap below bounds memory regardless.
-    const allNames = this.getAllNodeNames();
+    // The distinct name list is cached per database change stamp; even on a
+    // 200k-node project it is typically O(100k) at most because most names
+    // repeat. The candidate-cap below bounds memory regardless.
+    //
+    // A name whose lowercased length differs from the query's by more than
+    // maxDist can't be within maxDist edits (boundedEditDistance rejects it on
+    // length alone), so only the names inside that length window are scanned,
+    // visited in list order so ties keep the order a full scan gives them.
+    const memo = this.getNodeNamesMemo();
+    const allNames = memo.names;
+    if (!memo.byLength) {
+      const byLength = new Map<number, number[]>();
+      for (let i = 0; i < allNames.length; i++) {
+        const len = allNames[i]!.toLowerCase().length;
+        let bucket = byLength.get(len);
+        if (!bucket) byLength.set(len, (bucket = []));
+        bucket.push(i);
+      }
+      memo.byLength = byLength;
+    }
+    const window: number[] = [];
+    for (let len = lowered.length - maxDist; len <= lowered.length + maxDist; len++) {
+      for (const i of memo.byLength.get(len) ?? []) window.push(i);
+    }
+    window.sort((a, b) => a - b);
     const candidates: Array<{ name: string; dist: number }> = [];
-    for (const name of allNames) {
+    for (const i of window) {
+      const name = allNames[i]!;
       const dist = boundedEditDistance(name.toLowerCase(), lowered, maxDist);
       if (dist <= maxDist) candidates.push({ name, dist });
     }
@@ -1849,10 +1877,15 @@ export class QueryBuilder {
     // nameMatchBonus) can promote results that BM25 alone undervalues.
     const ftsLimit = Math.max(limit * 5, 100);
 
+    // Join on rowid, not the TEXT `id`: nodes_fts is external-content with
+    // content_rowid='rowid', so the rowids are equal by construction, and the
+    // `id` join cost an autoindex probe per FTS match — most of the query's
+    // time on a common prefix ("get"*, "service"*), which every explore term
+    // pays.
     let sql = `
       SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
       FROM nodes_fts
-      JOIN nodes ON nodes_fts.id = nodes.id
+      JOIN nodes ON nodes.rowid = nodes_fts.rowid
       WHERE nodes_fts MATCH ?
     `;
 
@@ -3790,6 +3823,28 @@ export class QueryBuilder {
    * Get all distinct node names (lightweight — just name strings for pre-filtering)
    */
   getAllNodeNames(): string[] {
+    return this.getNodeNamesMemo().names.slice();
+  }
+
+  /**
+   * The distinct-name list, read once per database change stamp. The fuzzy
+   * fallback asks for it once per query term that found nothing else, and the
+   * DISTINCT scan behind it costs tens of ms on a large index — a long explore
+   * query paid it dozens of times. Same stamp rules as getDominantFile.
+   */
+  private getNodeNamesMemo(): { names: string[]; byLength?: Map<number, number[]> } {
+    if (this.db.inTransaction !== false) {
+      this.nodeNamesMemo = undefined;
+      return { names: this.readAllNodeNames() };
+    }
+    const stamp = this.getChangeStamp();
+    if (this.nodeNamesMemo?.stamp !== stamp) {
+      this.nodeNamesMemo = { stamp, names: this.readAllNodeNames() };
+    }
+    return this.nodeNamesMemo;
+  }
+
+  private readAllNodeNames(): string[] {
     if (!this.stmts.getAllNodeNames) {
       this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
     }

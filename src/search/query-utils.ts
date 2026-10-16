@@ -214,6 +214,21 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
   return [...tokens];
 }
 
+// scorePathRelevance runs once per scored result and split every query word
+// each time, so a long query paid words × results extractSearchTerms calls.
+// The split depends on the word alone; keep it (bounded) across calls.
+const PATH_WORD_TERMS_MAX = 10_000;
+const pathWordTermsCache = new Map<string, string[]>();
+function pathWordTerms(word: string): string[] {
+  let terms = pathWordTermsCache.get(word);
+  if (!terms) {
+    if (pathWordTermsCache.size >= PATH_WORD_TERMS_MAX) pathWordTermsCache.clear();
+    terms = extractSearchTerms(word, { stems: false });
+    pathWordTermsCache.set(word, terms);
+  }
+  return terms;
+}
+
 /**
  * Score path relevance to a query
  * Higher score = more relevant path
@@ -255,7 +270,7 @@ export function scorePathRelevance(
   for (const word of scored) {
     // Use base terms only — stem variants inflate path scores by generating
     // many near-duplicate terms that all match the same path segments.
-    const subtokens = extractSearchTerms(word, { stems: false });
+    const subtokens = pathWordTerms(word);
     if (subtokens.length === 0) continue;
     // Exact filename match (strongest)
     if (subtokens.some((t) => fileName.includes(t))) score += 10;
