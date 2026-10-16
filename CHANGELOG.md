@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Vue, a `<script lang="tsx">` block is now read as TSX. Before, it was read as JavaScript, which cannot parse its TypeScript: a script holding only `defineProps` or `withDefaults` was reported as producing no symbols, and an `interface` declared in the script was missing from the graph. The source viewer now highlights these blocks as TSX too. Re-index Vue projects that use `lang="tsx"` after upgrading. Thanks @leadingGo for the report. (#2570)
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
 - In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.

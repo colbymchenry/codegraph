@@ -192,13 +192,13 @@ export class VueExtractor {
     content: string;
     startLine: number;
     isSetup: boolean;
-    isTypeScript: boolean;
+    language: Language;
   }> {
     const blocks: Array<{
       content: string;
       startLine: number;
       isSetup: boolean;
-      isTypeScript: boolean;
+      language: Language;
     }> = [];
 
     const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
@@ -208,8 +208,10 @@ export class VueExtractor {
       const attrs = match[1] || '';
       const content = match.groups?.content || match[2] || '';
 
-      // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
+      // The script's language from its lang attribute: tsx, TypeScript or JavaScript.
+      // Matched case-insensitively, as the viewer's syntax regions do.
+      const lang = /lang\s*=\s*["'](tsx|ts|typescript)["']/i.exec(attrs)?.[1]?.toLowerCase();
+      const language: Language = lang === 'tsx' ? 'tsx' : lang ? 'typescript' : 'javascript';
 
       // Detect <script setup>
       const isSetup = /\bsetup\b/.test(attrs);
@@ -229,7 +231,7 @@ export class VueExtractor {
         content,
         startLine: contentStartLine,
         isSetup,
-        isTypeScript,
+        language,
       });
     }
 
@@ -240,10 +242,10 @@ export class VueExtractor {
    * Process a script block by delegating to TreeSitterExtractor
    */
   private processScriptBlock(
-    block: { content: string; startLine: number; isSetup: boolean; isTypeScript: boolean },
+    block: { content: string; startLine: number; isSetup: boolean; language: Language },
     componentNodeId: string
   ): void {
-    const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
+    const scriptLanguage = block.language;
 
     // Check if the script language parser is available
     if (!isLanguageSupported(scriptLanguage)) {
