@@ -340,7 +340,13 @@ export function resolveImportPath(
   const key = `${language}\0${fromFile}\0${importPath}`;
   const hit = memo.get(key);
   if (hit !== undefined || memo.has(key)) return hit ?? null;
-  const resolved = resolveImportPathUncached(importPath, fromFile, language, context);
+  const found = resolveImportPathUncached(importPath, fromFile, language, context);
+  // Return the indexed spelling of the path. The alias and direct-path
+  // branches join the specifier as written, and the disk probe in
+  // `fileExists` accepts `src/widgets/Chart//index.tsx` (a trailing-slash
+  // specifier) or `src/widgets/./Chart/index.tsx`, which every lookup keyed by
+  // the indexed path then misses (#2577).
+  const resolved = found && path.posix.normalize(found);
   memo.set(key, resolved);
   return resolved;
 }
