@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` now detects and configures Factory Droid: it adds the CodeGraph MCP server to `~/.factory/mcp.json` (or the project's `.factory/mcp.json`, which is designed to be committed and shared with the team) plus a short CodeGraph section in `AGENTS.md`, and Droid picks the server up automatically with no restart.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.

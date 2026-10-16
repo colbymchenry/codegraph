@@ -2995,6 +2995,77 @@ describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
   });
 });
 
+describe('Installer targets — Droid paths', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('global install writes ~/.factory/mcp.json + ~/.factory/AGENTS.md', () => {
+    const droid = getTarget('droid')!;
+    const result = droid.install('global', { autoAllow: false });
+
+    const mcpPath = path.join(tmpHome, '.factory', 'mcp.json');
+    const agentsPath = path.join(tmpHome, '.factory', 'AGENTS.md');
+    expect(result.files.map((f) => path.resolve(f.path))).toEqual([
+      path.resolve(mcpPath),
+      path.resolve(agentsPath),
+    ]);
+    const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(mcp.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+    expect(fs.readFileSync(agentsPath, 'utf-8')).toContain('<!-- CODEGRAPH_START -->');
+  });
+
+  it('local install writes ./.factory/mcp.json + ./AGENTS.md, never the user profile', () => {
+    const droid = getTarget('droid')!;
+    droid.install('local', { autoAllow: false });
+
+    expect(fs.existsSync(path.join(tmpCwd, '.factory', 'mcp.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpCwd, 'AGENTS.md'))).toBe(true);
+    // The project layer lives beside the project, never under the user profile.
+    expect(fs.existsSync(path.join(tmpHome, '.factory'))).toBe(false);
+  });
+
+  it('preserves sibling MCP servers; uninstall removes only ours', () => {
+    const droid = getTarget('droid')!;
+    const mcpPath = path.join(tmpHome, '.factory', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcpPath), { recursive: true });
+    const sibling = { type: 'http', url: 'https://example.com/mcp', disabled: false };
+    fs.writeFileSync(mcpPath, JSON.stringify({ mcpServers: { engram: sibling } }, null, 2) + '\n');
+
+    expect(droid.detect('global').alreadyConfigured).toBe(false);
+    droid.install('global', { autoAllow: false });
+    let mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(mcp.mcpServers.engram).toEqual(sibling);
+    expect(mcp.mcpServers.codegraph).toBeDefined();
+    expect(droid.detect('global').alreadyConfigured).toBe(true);
+
+    droid.uninstall('global');
+    mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(mcp.mcpServers.codegraph).toBeUndefined();
+    expect(mcp.mcpServers.engram).toEqual(sibling);
+  });
+});
+
 describe('Antigravity macOS command persistence (#1443)', () => {
   let tmpHome: string;
   let homeRestore: { restore: () => void };
