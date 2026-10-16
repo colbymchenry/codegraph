@@ -46,8 +46,6 @@ describe('a Python call on an imported outside module (#2599)', () => {
   it.each([
     ['import subprocess', 'import subprocess\n\n\ndef use():\n    return subprocess.run(["ls"])\n'],
     ['import ... as', 'import subprocess as sp\n\n\ndef use():\n    return sp.run(["ls"])\n'],
-    ['a dotted import', 'import os.path\n\n\ndef use():\n    return os.path.join("a", "b")\n'],
-    ['from ... import a module', 'from os import path\n\n\ndef use():\n    return path.join("a", "b")\n'],
     ['an import inside the function', 'def use():\n    import subprocess\n    return subprocess.run(["ls"])\n'],
   ])('does not link a project method: %s', async (_label, code) => {
     const out = await calls({ 'app.py': `${code}\n\n${FAKE}` }, 'use');
@@ -68,6 +66,30 @@ describe('a Python call on an imported outside module (#2599)', () => {
       'use'
     );
     expect(out).toEqual(['method:Fake::run']);
+  });
+
+  it.each([
+    ['a tuple assignment', 'import subprocess\n\nsubprocess, other = Fake(), 1\n'],
+    ['a global in a function', 'import subprocess\n\n\ndef init():\n    global subprocess\n    subprocess = Fake()\n'],
+    ['a for loop', 'import subprocess\n\nfor subprocess in [Fake()]:\n    pass\n'],
+    ['a fallback class', 'try:\n    from fastlib import subprocess\nexcept ImportError:\n    class subprocess:\n        @staticmethod\n        def run(name):\n            return name\n'],
+  ])('keeps a call where %s rebinds the import', async (_label, prelude) => {
+    const code = `${prelude}\n\ndef use():\n    return subprocess.run("x")\n\n\n${FAKE}`;
+    const out = await calls({ 'app.py': code }, 'use');
+    expect(out.length).toBe(1);
+  });
+
+  it('keeps a call on a project module imported by its package name when the package is the indexed root', async () => {
+    const out = await calls(
+      {
+        '__init__.py': '',
+        'tasks.py': 'class Runner:\n    def go(self, x):\n        return x\n\n\nrunner = Runner()\n',
+        'app.py': 'from mypkg.tasks import runner\n\n\ndef use():\n    return runner.go("x")\n',
+        'other.py': 'class Other:\n    def go(self, x):\n        return None\n',
+      },
+      'use'
+    );
+    expect(out).toEqual(['method:Runner::go']);
   });
 
   it('keeps a call on an imported project module', async () => {

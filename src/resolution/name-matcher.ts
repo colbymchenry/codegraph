@@ -3600,22 +3600,37 @@ function isPythonProjectModule(module: string, context: ResolutionContext): bool
 
 /**
  * A receiver the file binds only by importing a module from outside the
- * project — `import subprocess`, `import numpy as np` — and that neither the
- * module nor the calling function rebinds. A call on it is that module's function, never
- * a project class's method of the same name (#2599).
+ * project — `import subprocess`, `import numpy as np` — never rebinding it at
+ * module scope (an assignment, a `for`/`with`/tuple target, a `global` write
+ * in a function, a fallback `class`/`def` of that name) nor in the calling
+ * function. A call on it is that module's function, never a project class's
+ * method of the same name (#2599).
  */
 export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
-  const keys = pythonImportKeys(name, ref.filePath, context);
-  if (keys.size === 0 || pythonBindsLocally(name, ref, context, false)) return false;
-  // `import config` then `config = Config()` at module scope: the assignment wins.
-  if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && isPythonModuleGlobal(n, context))) return false;
-  // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
-  // the module `a` tells that `x` comes from outside.
-  return [...keys].every((key) => {
-    const module = key.slice(0, key.indexOf(':'));
-    return !module.startsWith('.') && !isPythonProjectModule(module, context);
+  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, ref.filePath, context);
+    if (keys.size === 0) return false;
+    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
+    // the module `a` tells that `x` comes from outside.
+    return [...keys].every((key) => {
+      const module = key.slice(0, key.indexOf(':'));
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, context);
+    });
   });
+  return outside && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * Whether `a.b.c` is a project module from some import root: `a/b/c.py`, or —
+ * with the package itself indexed as the root — `b/c.py` or `c.py`. Erring
+ * toward "project" only leaves a call to the name strategies, as before.
+ */
+function isPythonProjectModuleAnyRoot(module: string, context: ResolutionContext): boolean {
+  const parts = module.split('.');
+  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), context));
 }
 
 const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
