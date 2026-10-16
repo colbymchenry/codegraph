@@ -332,10 +332,9 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
       type = pythonFieldType(receiver, owner, ref, context);
     } else {
       type = pythonLocalType(receiver, ref, context);
-      const global = type === null
-        ? context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) : undefined;
-      if (global && !pythonBindsLocally(receiver, ref, context, true)) {
-        return result(pythonGlobalMembers(global, member, ref, context));
+      const viaGlobal = type === null ? pythonGlobalReceiverTarget(receiver, member, ref, context) : undefined;
+      if (viaGlobal !== undefined) {
+        return viaGlobal ? { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'function-ref' } : null;
       }
     }
     // A type name used directly (`Store.fetch`) is scoped just like an annotation.
@@ -926,6 +925,44 @@ function pythonDynamicGlobalWrite(name: string, filePath: string, context: Resol
     if (uses > safe) return true;
   }
   return false;
+}
+
+/**
+ * What `receiver.member` reaches through a module-level instance of this
+ * file — `_svc = SceneService()` at module scope, then `_svc.delete` (#2074)
+ * or `_svc.delete(obj)` (#2582). Undefined when `receiver` is not that global
+ * where the ref is: a parameter, a local, or a `def`/`class` written directly
+ * in an enclosing function shadows it. Otherwise the one method or function every class the global
+ * may hold has or inherits — never a property, an attribute or the referring
+ * node itself (allowed for a `call`: recursion) — or null when there is none.
+ */
+function pythonGlobalReceiverTarget(
+  receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext, call = false,
+): Node | null | undefined {
+  const global = pythonNameScan(context, `global\0${ref.filePath}\0${receiver}`, () =>
+    context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
+  if (!global || pythonBindsLocally(receiver, ref, context, true)) return undefined;
+  // A `def _svc` / `class _svc` nested in an enclosing function binds the name there.
+  const nodes = context.getNodesInFile(ref.filePath);
+  const scopes = nodes.filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
+  const innermost = (n: Node) => nodes
+    .filter(c => c.id !== n.id && (c.kind === 'function' || c.kind === 'method' || c.kind === 'class') &&
+      c.startLine < n.startLine && c.endLine >= n.startLine)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  if (nodes.some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
+      scopes.some(f => f.id === innermost(n)?.id))) return undefined;
+  if (!pythonOwnGlobalWrites(global, context) || pythonExternalWrites(global, context).writers.has(ref.filePath)) {
+    return null;
+  }
+  const classes = pythonGlobalClasses(global, ref, context);
+  if (!classes) return null;
+  // A class without the member (a base from outside the project may supply it) leaves it unknown.
+  if (classes.some(cls => pythonMembers(cls, member, ref, context).length === 0)) return null;
+  const pool = pythonGlobalMembers(global, member, ref, context).filter(n => sameLanguageFamily(n.language, ref.language));
+  const target = pool.length === 1 ? pool[0]! : undefined;
+  // A method value naming its own method is no reference; a call through the global is recursion.
+  return target && (target.kind === 'function' || target.kind === 'method') && (call || target.id !== ref.fromNodeId) &&
+    !isPythonProperty(target, context) ? target : null;
 }
 
 /**
@@ -14110,6 +14147,14 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // A module-level instance of this file — `_svc = SceneService()` — called
+    // from a function: the method its class has or inherits (#2582), as for a
+    // method value through the same global (#2074). Otherwise the call goes on
+    // to the strategies below, as before.
+    if (!inferredType && ref.language === 'python' && dotMatch && /^\w+$/.test(objectOrClass!)) {
+      const viaGlobal = pythonGlobalReceiverTarget(objectOrClass!, methodName!, ref, context, true);
+      if (viaGlobal) return { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    }
     // A Go parameter named like an import is declared through a package as
     // often as not (`logger logger.Interface`), which the patterns above
     // don't read; the scope reader kept its type. Not a field's: in
