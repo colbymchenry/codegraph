@@ -3008,7 +3008,10 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
       (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
-    if (candidate.kind === 'function' && C_SOURCE_EXT.test(candidate.filePath) && isStaticCFunction(candidate, context)) return false;
+    // A source file's `static` function, only for that file and one that
+    // `#include`s it: hiredis's async.c includes dict.c.
+    if (candidate.kind === 'function' && C_SOURCE_EXT.test(candidate.filePath) && isStaticCFunction(candidate, context) &&
+        !cppIncluders(candidate.filePath, context).has(ref.filePath)) return false;
     return !isCppTranslationUnitLocal(candidate, ref, context);
   }
   if (lang === 'go') {
@@ -11211,14 +11214,23 @@ function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: 
  * where it is; protobuf's `ParseWithLimit(limit, data, result)` on an
  * `int32_t result` is the overload taking an `int32_t&`, not the
  * `int64_t&` one nearer the call. A function hides a class of its name, so
- * a call is to the function when `chosen` is that class. `chosen` itself
- * for anything but a C++ call, or when no function is in sight.
+ * a call is to the function when `chosen` is that class. C has no
+ * overloads: a C call reaches the function of the name its file sees — its
+ * own or one a header it includes defines, else one with external linkage —
+ * the best placed of them (findBestMatch). jemalloc's tests call the
+ * `static inline do_arena_create` of the arena_util.h they include, not a
+ * neighbouring test's own `static do_arena_create`. `chosen` itself for
+ * anything but a C or C++ call, or when no function is in sight.
  */
 function cppFunctionOverload(chosen: Node, candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node {
-  if (ref.language !== 'cpp' || ref.referenceKind !== 'calls') return chosen;
+  if ((ref.language !== 'cpp' && ref.language !== 'c') || ref.referenceKind !== 'calls') return chosen;
   const overloads = candidates.filter((n) => n.kind === 'function' && n.qualifiedName === chosen.qualifiedName &&
     isVisibleAcrossFiles(n, ref, context));
   if (overloads.length === 0) return chosen;
+  if (ref.language === 'c') {
+    const own = overloads.filter((n) => n.filePath === ref.filePath || cppIncluders(n.filePath, context).has(ref.filePath));
+    return findBestMatch(ref, own.length > 0 ? own : overloads, context) ?? chosen;
+  }
   return cppOverloadFor(overloads.includes(chosen) ? [chosen, ...overloads.filter((n) => n !== chosen)] : overloads, chosen.name, ref, context);
 }
 
