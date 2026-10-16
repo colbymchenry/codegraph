@@ -9439,16 +9439,30 @@ function cppSubscriptElement(type: CppWrittenType, at: UnresolvedRef, context: R
 }
 
 /**
+ * The expanded definition a C++ method that a macro defines carries as its
+ * signature (cpp-macro-methods.ts), `inline const FileDescriptor*
+ * Descriptor::file() const` for protobuf's `PROTOBUF_DEFINE_ACCESSOR(Descriptor,
+ * file, const FileDescriptor*)`: its source is the invocation, which spells
+ * neither its return type nor its parameters. Null for any other node.
+ */
+function cppMacroMethodHead(fn: Node): string | null {
+  if (fn.kind !== 'method' || !fn.signature) return null;
+  const name = fn.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`::\\s*${name}\\s*\\(`).test(fn.signature) ? fn.signature : null;
+}
+
+/**
  * The return type of a C or C++ function, as its declaration writes it:
  * `std::vector<const FieldDescriptor*>` for `std::vector<const
  * FieldDescriptor*> FieldNumberOrder(…)`. (The index keeps only `vector`.)
  * Null for none that can be read: a constructor, `void`, `auto` or
- * `decltype(…)`.
+ * `decltype(…)`. A method a macro defines is read from its expansion.
  */
 function cppWrittenReturnType(fn: Node, context: ResolutionContext): string | null {
-  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/);
-  if (!lines) return null;
-  const head = lines.slice(fn.startLine - 1, fn.startLine + 2).join(' ').slice(fn.startColumn);
+  const macro = cppMacroMethodHead(fn);
+  const lines = macro === null ? context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) : null;
+  if (macro === null && !lines) return null;
+  const head = macro ?? lines!.slice(fn.startLine - 1, fn.startLine + 2).join(' ').slice(fn.startColumn);
   const name = fn.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/^operator/, 'operator\\s*');
   const declared = new RegExp(String.raw`^(.*?)(?:\b[A-Za-z_]\w*\s*(?:<[^<>;{}]*>)?\s*::\s*)*\b${name}\s*\(`).exec(head);
   let written = declared?.[1];
@@ -11169,9 +11183,11 @@ const CPP_DELETED_FUNCTIONS = new WeakMap<ResolutionContext, Map<string, boolean
 /**
  * Whether the C++ function or method `n`, named `name`, is declared deleted:
  * from its name to the declaration's `;` or body, it says `= delete`
- * (protobuf's `void reset(T* PROTOBUF_NULLABLE) = delete;`).
+ * (protobuf's `void reset(T* PROTOBUF_NULLABLE) = delete;`). A method a macro
+ * defines has a body.
  */
 function isCppDeletedFunction(n: Node, name: string, context: ResolutionContext): boolean {
+  if (cppMacroMethodHead(n) !== null) return false;
   let memo = CPP_DELETED_FUNCTIONS.get(context);
   if (!memo) CPP_DELETED_FUNCTIONS.set(context, (memo = new Map()));
   const hit = memo.get(n.id);
@@ -16859,7 +16875,11 @@ function cppTemplateArgumentsEnd(text: string, at: number): number {
 /** The balanced `( … )` after `name` from `line`/`column` of `file` (up to a dozen lines), or null. */
 function cppParenListAfter(file: string, line: number, column: number, name: string, context: ResolutionContext): string | null {
   const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
-  const text = lines.slice(line - 1, line + 11).join('\n');
+  return cppParenListIn(lines.slice(line - 1, line + 11).join('\n'), column, name);
+}
+
+/** The `( … )` that follows `name` in `text`, from `column` on, without its parentheses. */
+function cppParenListIn(text: string, column: number, name: string): string | null {
   const at = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
   if (!at) return null;
   const open = column + at.index + at[0].length - 1;
@@ -16913,10 +16933,11 @@ const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, strin
  * absl::optional<Semantic> semantic)` below the class, whose declaration
  * gave `semantic` its `= absl::nullopt`. Its own list when the class
  * declares the method with the same parameter types and no default, or
- * not at all.
+ * not at all. A method a macro defines writes its list in its expansion.
  */
 function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
-  const own = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  const macro = cppMacroMethodHead(n);
+  const own = macro !== null ? cppParenListIn(macro, 0, name) : cppParenListAfter(n.filePath, n.startLine, 0, name, context);
   if (own === null || n.kind !== 'method') return own;
   let memo = CPP_OVERLOAD_PARAMETERS.get(context);
   if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
