@@ -11,9 +11,9 @@
  *   abstraction instead.
  */
 
-import * as path from 'path';
-import * as os from 'os';
 import {
+  claudeMcpJsonPath,
+  claudeSettingsJsonPath,
   writeMcpEntry,
   writePermissionsEntry,
 } from './targets/claude';
@@ -40,20 +40,13 @@ export function writePermissions(location: InstallLocation): void {
 }
 
 export function hasMcpConfig(location: InstallLocation): boolean {
-  // local scope lives in ./.mcp.json (project scope); global is the
-  // user-scope ~/.claude.json. Mirrors the Claude target's paths.
-  const file = location === 'global'
-    ? path.join(os.homedir(), '.claude.json')
-    : path.join(process.cwd(), '.mcp.json');
-  const config = readJsonFile(file);
+  // Same paths the Claude target writes, CLAUDE_CONFIG_DIR included.
+  const config = readJsonFile(claudeMcpJsonPath(location));
   return !!config.mcpServers?.codegraph;
 }
 
 export function hasPermissions(location: InstallLocation): boolean {
-  const file = location === 'global'
-    ? path.join(os.homedir(), '.claude', 'settings.json')
-    : path.join(process.cwd(), '.claude', 'settings.json');
-  const settings = readJsonFile(file);
+  const settings = readJsonFile(claudeSettingsJsonPath(location));
   const allow = settings.permissions?.allow;
   if (!Array.isArray(allow)) return false;
   return allow.some((p: string) => p.startsWith('mcp__codegraph__'));
