@@ -117,6 +117,7 @@ export const LANGUAGES = [
   'cobol',
   'vbnet',
   'gdscript',
+  'godot_resource',
   'erlang',
   'terraform',
   'unknown',

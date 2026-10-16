@@ -35,6 +35,7 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { GodotResourceExtractor } from './godot-resource-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
 import {
@@ -8329,6 +8330,11 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'godot_resource') {
+    // Use custom extractor for Godot text scenes/resources (.tscn/.tres/project.godot):
+    // scene nodes, script attachments and signal connections.
+    const extractor = new GodotResourceExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
