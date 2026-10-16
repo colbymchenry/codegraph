@@ -7989,7 +7989,8 @@ export function matchByExactName(
   }
 
   // Multiple matches - try to narrow down
-  const bestMatch = findBestMatch(ref, candidates, context);
+  const nearest = findBestMatch(ref, candidates, context);
+  const bestMatch = nearest && cppFunctionOverload(nearest, candidates, ref, context);
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
@@ -8045,7 +8046,7 @@ export function matchByQualifiedName(
     if (!chosen) return null;
     return {
       original: ref,
-      targetNodeId: chosen.id,
+      targetNodeId: cppFunctionOverload(chosen, global, ref, context).id,
       confidence: global.length === 1 || chosen.filePath === ref.filePath ? 0.95 : 0.85,
       resolvedBy: 'qualified-name',
     };
@@ -8080,7 +8081,7 @@ export function matchByQualifiedName(
     if (ordered[0]!.filePath === ref.filePath) {
       return {
         original: ref,
-        targetNodeId: ordered[0]!.id,
+        targetNodeId: cppFunctionOverload(ordered[0]!, ordered, ref, context).id,
         confidence: 0.95,
         resolvedBy: 'qualified-name',
       };
@@ -8127,7 +8128,7 @@ export function matchByQualifiedName(
     if (chosen) {
       return {
         original: ref,
-        targetNodeId: chosen.id,
+        targetNodeId: cppFunctionOverload(chosen, partialCandidates, ref, context).id,
         confidence: 0.85,
         resolvedBy: 'qualified-name',
       };
@@ -9219,6 +9220,15 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
 /** buildDeclaratorRegex's `regex` run on the code `line`, with its type as cppDeclaratorType gives it. */
 function matchCppDeclarator(line: string, regex: RegExp): RegExpExecArray | null {
   const m = regex.exec(line);
+  if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
+  return m;
+}
+
+/** matchCppDeclarator's first match in `line` from `from` on. */
+function matchCppDeclaratorFrom(line: string, regex: RegExp, from: number): RegExpExecArray | null {
+  const global = new RegExp(regex.source, 'g');
+  global.lastIndex = from;
+  const m = global.exec(line);
   if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
   return m;
 }
@@ -11169,7 +11179,15 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
   if (!args) return overloads[0]!;
   const fits = overloads.map((n) => cppOverloadFit(n, name, args, context));
   const top = Math.max(...fits);
-  const tied = overloads.filter((_, i) => fits[i] === top);
+  return cppArgumentTypeChoice(overloads.filter((_, i) => fits[i] === top), name, args, ref, context);
+}
+
+/**
+ * Of overloads the call's arguments `args` fit alike by count (in
+ * preference order), the one the types the arguments have where the call
+ * reads them fit best (cppArgumentTypeFit); the first on a tie.
+ */
+function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: UnresolvedRef, context: ResolutionContext): Node {
   if (tied.length === 1 || args.length === 0) return tied[0]!;
   const types = args.map((arg) => cppArgumentType(arg, ref, context));
   if (types.every((t) => t === null)) return tied[0]!;
@@ -11183,6 +11201,25 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
     }
   }
   return best;
+}
+
+/**
+ * The C++ function a call of `chosen`'s name reaches among `candidates`:
+ * of its overloads — the functions of its qualified name the call's file
+ * can see (isVisibleAcrossFiles), `chosen` first — the one the call's
+ * arguments fit (cppOverloadFor). The name strategies pick a function by
+ * where it is; protobuf's `ParseWithLimit(limit, data, result)` on an
+ * `int32_t result` is the overload taking an `int32_t&`, not the
+ * `int64_t&` one nearer the call. A function hides a class of its name, so
+ * a call is to the function when `chosen` is that class. `chosen` itself
+ * for anything but a C++ call, or when no function is in sight.
+ */
+function cppFunctionOverload(chosen: Node, candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node {
+  if (ref.language !== 'cpp' || ref.referenceKind !== 'calls') return chosen;
+  const overloads = candidates.filter((n) => n.kind === 'function' && n.qualifiedName === chosen.qualifiedName &&
+    isVisibleAcrossFiles(n, ref, context));
+  if (overloads.length === 0) return chosen;
+  return cppOverloadFor(overloads.includes(chosen) ? [chosen, ...overloads.filter((n) => n !== chosen)] : overloads, chosen.name, ref, context);
 }
 
 /**
@@ -11651,7 +11688,13 @@ function inferCppReceiverType(
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
     if (!line || !receiverPattern.test(line)) continue;
 
-    const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
+    let declaratorMatch = matchCppDeclarator(line, declaratorRegex);
+    // A parameter named like the function it belongs to is declared after
+    // the function's own name on its head: protobuf's `std::string
+    // u64(uint64_t u64) {` gives `u64` a `uint64_t`, not a `std::string`.
+    if (declaratorMatch && memberCaller?.name === receiverName && line[declaratorMatch.index + declaratorMatch[0].length] === '(') {
+      declaratorMatch = matchCppDeclaratorFrom(line, declaratorRegex, declaratorMatch.index + declaratorMatch[0].length) ?? declaratorMatch;
+    }
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized === 'auto') {
@@ -16912,17 +16955,17 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
     if (effective === target) matches.push(n);
   }
   const pool = cppSpecializationPool(matches, ref, context);
+  if (pool.length === 0) return null;
   // A declaration outside the tests over one in them; among an overload set,
-  // the one the call's arguments fit: `fmt::format("{}", v)` is format.h's
-  // `format(format_string, T&&...)`, not color.h's `format(const text_style&, …)`.
+  // the one the call's arguments fit, by count, then by type:
+  // `fmt::format("{}", v)` is format.h's `format(format_string, T&&...)`,
+  // not color.h's `format(const text_style&, …)`.
   const args = pool.length > 1 && ref.referenceKind === 'calls' ? cppCallArguments(ref, name, context) : null;
-  let best: Node | null = null;
-  let bestScore = -Infinity;
-  for (const n of pool) {
-    const score = (isTestPath(n.filePath) ? -10 : 0) + (args ? cppOverloadFit(n, name, args, context) : 0);
-    if (score > bestScore) { best = n; bestScore = score; }
-  }
-  return best ? { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
+  const scores = pool.map((n) => (isTestPath(n.filePath) ? -10 : 0) + (args ? cppOverloadFit(n, name, args, context) : 0));
+  const top = Math.max(...scores);
+  const tied = pool.filter((_, i) => scores[i] === top);
+  const best = args ? cppArgumentTypeChoice(tied, name, args, ref, context) : tied[0]!;
+  return { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' };
 }
 
 /** Split `a, f(b, c), d<e, f>` at its top-level commas. */
