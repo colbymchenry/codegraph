@@ -717,7 +717,7 @@ export class CodeGraph {
           // maintenance checkpoint don't contend for the checkpointer lock
           // (the loser would silently no-op and leave the WAL unfolded).
           if (walValve) { walValve.stop(); await walValve.drain(); }
-          await this.db.runMaintenance();
+          await this.db.runMaintenance({ fullAnalyze: true });
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
         }
 
