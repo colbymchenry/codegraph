@@ -164,6 +164,8 @@ export interface ResolutionContext {
    * Optional so external/test contexts compile without it.
    */
   getSupertypeNodes?(id: string): Node[];
+  /** Resolved extends edges only; implements is not a runtime superclass. */
+  getSuperclassNodes?(id: string): Node[];
   /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`

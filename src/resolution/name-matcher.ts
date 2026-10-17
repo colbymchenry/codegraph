@@ -9,6 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { matchImportedConstructorMethod } from './js-constructor-methods';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
@@ -14203,6 +14204,8 @@ export function matchMethodCall(
       inferredType = awaited.name;
     }
     if (inferredType) {
+      const importedConstructor = matchImportedConstructorMethod(inferredType, objectOrClass!, methodName!, ref, context);
+      if (importedConstructor !== undefined) return importedConstructor;
       // A Go local bound from a type assertion calls a method of the type Go
       // finds for it, or nothing the project declares: `flusher.Flush()` after
       // `flusher, ok := w.(http.Flusher)` went to a project type named after it.

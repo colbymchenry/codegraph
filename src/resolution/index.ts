@@ -30,6 +30,7 @@ import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { matchJsSuperCall, clearJsConstructorMemos } from './js-constructor-methods';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
@@ -573,6 +574,7 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
+      clearJsConstructorMemos(this.context);
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
@@ -934,6 +936,16 @@ export class ReferenceResolver {
         return supers;
       },
 
+      getSuperclassNodes: (id: string) => {
+        const key = `extends\0${id}`;
+        const hit = this.supertypeNodeMemo.get(key);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes = this.queries.getOutgoingEdges(id, ['extends'])
+          .map(edge => this.nodeById(edge.target)).filter((node): node is Node => !!node);
+        this.supertypeNodeMemo.set(key, { gen: this.supertypeGen, nodes });
+        return nodes;
+      },
+
       getSupertypeNodes: (id: string) => {
         const hit = this.supertypeNodeMemo.get(id);
         if (hit && hit.gen === this.supertypeGen) return hit.nodes;
@@ -1271,6 +1283,8 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    const jsSuper = matchJsSuperCall(ref, this.context);
+    if (jsSuper !== undefined) return jsSuper;
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
@@ -3365,6 +3379,9 @@ export class ReferenceResolver {
    */
   private gateSuperSelfCall(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result || ref.referenceKind !== 'calls' || result.targetNodeId !== ref.fromNodeId) return result;
+    // JS/TS super calls were already handled at their exact call-site above;
+    // a real recursive call on the same line must retain its self-edge.
+    if (['javascript', 'jsx', 'typescript', 'tsx', 'arkts'].includes(ref.language)) return result;
     const name = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf('.'), ref.referenceName.lastIndexOf(':')) + 1);
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) return result;
     const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
