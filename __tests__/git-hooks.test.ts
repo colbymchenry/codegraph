@@ -127,3 +127,138 @@ describe('git sync hooks', () => {
     expect(isSyncHookInstalled(repo)).toBe(false);
   });
 });
+
+/**
+ * Run a hook the way git does, with a fake `codegraph` first on PATH that
+ * records its argv and cwd. The hook backgrounds the call, so poll for the log.
+ */
+function runHookWithFakeCodegraph(hookFile: string, cwd: string): string[] {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-fakebin-'));
+  const log = path.join(bin, 'calls.log');
+  try {
+    fs.writeFileSync(
+      path.join(bin, 'codegraph'),
+      `#!/bin/sh\necho "cwd=$(pwd) args=$*" >> '${log}'\n`,
+      { mode: 0o755 },
+    );
+    try {
+      execFileSync(hookFile, [], {
+        cwd,
+        stdio: 'ignore',
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+      });
+    } catch {
+      /* a hook that exits non-zero still ran; the log says what it did */
+    }
+    const deadline = Date.now() + 3000;
+    while (!fs.existsSync(log) && Date.now() < deadline) {
+      execFileSync('sleep', ['0.05']);
+    }
+    return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
+  } finally {
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+}
+
+describe('git sync hooks — project roots and existing hooks', () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-githooks-')));
+    gitInit(repo);
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(repo)) fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  const hookFile = (): string => path.join(repo, '.git', 'hooks', 'post-commit');
+
+  it.runIf(process.platform !== 'win32')('syncs the sub-project it was installed for, not the repo top level', () => {
+    const sub = path.join(repo, 'packages', 'app');
+    fs.mkdirSync(sub, { recursive: true });
+
+    installGitSyncHook(sub, ['post-commit']);
+
+    // git runs hooks from the top of the work tree
+    const calls = runHookWithFakeCodegraph(hookFile(), repo);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain(`args=sync ${sub}`);
+  });
+
+  it('keeps one block per project root, and removes only its own', () => {
+    const a = path.join(repo, 'a');
+    const b = path.join(repo, 'b');
+    fs.mkdirSync(a);
+    fs.mkdirSync(b);
+
+    installGitSyncHook(a, ['post-commit']);
+    installGitSyncHook(b, ['post-commit']);
+    installGitSyncHook(a, ['post-commit']); // re-install stays idempotent per root
+
+    const body = fs.readFileSync(hookFile(), 'utf8');
+    expect(body.split('# >>> codegraph sync hook >>>').length - 1).toBe(2);
+    expect(isSyncHookInstalled(a, ['post-commit'])).toBe(true);
+    expect(isSyncHookInstalled(b, ['post-commit'])).toBe(true);
+
+    removeGitSyncHook(a, ['post-commit']);
+    expect(isSyncHookInstalled(a, ['post-commit'])).toBe(false);
+    expect(isSyncHookInstalled(b, ['post-commit'])).toBe(true);
+  });
+
+  it('does not report a hook installed for another project root', () => {
+    const a = path.join(repo, 'a');
+    const b = path.join(repo, 'b');
+    fs.mkdirSync(a);
+    fs.mkdirSync(b);
+
+    installGitSyncHook(a, ['post-commit']);
+    expect(isSyncHookInstalled(b, ['post-commit'])).toBe(false);
+  });
+
+  it('treats a block from an older install as the top-level project\'s', () => {
+    const legacy = [
+      '#!/bin/sh',
+      '# >>> codegraph sync hook >>>',
+      'if command -v codegraph >/dev/null 2>&1; then',
+      '  ( codegraph sync >/dev/null 2>&1 & ) >/dev/null 2>&1',
+      'fi',
+      '# <<< codegraph sync hook <<<',
+      '',
+    ].join('\n');
+    fs.writeFileSync(hookFile(), legacy, { mode: 0o755 });
+    const sub = path.join(repo, 'sub');
+    fs.mkdirSync(sub);
+
+    expect(isSyncHookInstalled(repo, ['post-commit'])).toBe(true);
+    expect(isSyncHookInstalled(sub, ['post-commit'])).toBe(false);
+
+    // Re-installing for the top level replaces the old block rather than adding one.
+    installGitSyncHook(repo, ['post-commit']);
+    const body = fs.readFileSync(hookFile(), 'utf8');
+    expect(body.split('# >>> codegraph sync hook >>>').length - 1).toBe(1);
+  });
+
+  it('leaves a hook written in another language untouched', () => {
+    const python = '#!/usr/bin/env python3\nprint("my hook")\n';
+    fs.writeFileSync(hookFile(), python, { mode: 0o755 });
+
+    const result = installGitSyncHook(repo, ['post-commit']);
+
+    expect(fs.readFileSync(hookFile(), 'utf8')).toBe(python);
+    expect(result.installed).toEqual([]);
+    expect(result.unsupported).toEqual(['post-commit']);
+    expect(isSyncHookInstalled(repo, ['post-commit'])).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('still syncs when the existing shell hook ends with exit', () => {
+    fs.writeFileSync(hookFile(), '#!/bin/sh\necho "my hook"\nexit 0\n', { mode: 0o755 });
+
+    installGitSyncHook(repo, ['post-commit']);
+
+    const body = fs.readFileSync(hookFile(), 'utf8');
+    expect(body).toContain('echo "my hook"');
+    expect(body.startsWith('#!/bin/sh\n')).toBe(true);
+    expect(runHookWithFakeCodegraph(hookFile(), repo)).toHaveLength(1);
+  });
+});
