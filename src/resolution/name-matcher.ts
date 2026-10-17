@@ -10016,14 +10016,17 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     return followed && cppSubscriptElement(followed, at, context);
   }
   if (!text.endsWith(')')) {
-    // `compact_->sub_compact_states`: a data member of the object's class;
-    // `it->second` through a map's iterator: the member of the `std::pair`.
+    // `compact_->sub_compact_states`: a data member of the object's class, or
+    // of a class it derives from — rocksdb's `Options` declares none of its
+    // own, and inherits `table_factory`, `statistics` and the rest from
+    // `DBOptions` and `ColumnFamilyOptions`; `it->second` through a map's
+    // iterator: the member of the `std::pair`.
     const field = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(text);
     const object = field && cppMemberObject(field[1]!, field[2]!, at, context, depth);
     const element = object && cppPairMember(object, field![3]!, at, context);
     if (element) return element;
     const cls = object && cppWrittenClass(object, at, context);
-    return cls ? cppDataMemberIn(cls, field![3]!, context) : null;
+    return cls ? cppInheritedDataMember([cls], field![3]!, context, 0, new Set([cls.qualifiedName])) : null;
   }
   const open = cppOpeningParen(text, text.length - 1);
   const callee = open > 0 ? text.slice(0, open).trim() : '';
