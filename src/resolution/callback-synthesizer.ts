@@ -1917,6 +1917,19 @@ function writtenBare(src: string, name: string): boolean {
   return false;
 }
 
+/** The tags a parent's span holds (see reactJsxChildEdges); `src` is the owned text of an owning parent. */
+type SpanTags = { tags: Map<string, number>; bare: Set<string>; src: string };
+
+/**
+ * Whether the lines a file or top-level value owns (#2587) declare `name`
+ * (`const Card = vi.fn()` in a test callback). Only those lines are read, so
+ * a parameter or local of a function elsewhere in the file binds nothing here.
+ */
+function ownLinesBind(name: string, src: string): boolean {
+  const n = name.replace(/\$/g, '\\$');
+  return new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(src);
+}
+
 /**
  * What a tag renders when its parent binds the name itself: a component the
  * parent declares in its own lines (`const Row = ({ row }) => <tr />` in a
@@ -1934,7 +1947,10 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
- * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
+ * JSX hop. Link parent → each capitalized JSX child it renders. A parent is a
+ * method, function or component — or, for a tag outside all of those, the
+ * top-level value or the file that holds it (#2587), as for a plain call
+ * there. File-oriented
  * (read each JSX file once). Precision gates: the parent must write the name as
  * a tag in its code, not in a comment, a string or a template (react-router's
  * "You cannot render a <Router> inside another <Router>"; `jsxCode`), and
@@ -1954,6 +1970,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
+  const VALUE_PARENT_KINDS = new Set(['constant', 'variable']);
   // Once per module and export for the whole pass: what a tag imported from
   // the project renders. The lookup reads and comment-strips the module.
   const exports = new Map<string, Node | null>();
@@ -1977,9 +1994,53 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560). A
     // TypeScript `.ts` file holds no JSX either: a `<Name>` there is a type
     // assertion or text, like outline's OpenSearch XML template.
-    const parents = ctx.getNodesInFile(file).filter(
-      (n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language)
-    );
+    const inFile = ctx.getNodesInFile(file);
+    const fns = inFile.filter((n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language));
+    // JSX outside every function renders from where a plain call there is
+    // attributed (#2587): a top-level `const ICONS = { a: <Icon /> }` from the
+    // const, `createRoot(el).render(<App />)` or a test's
+    // `it('…', () => render(<Card />))` from the file. Ownership is by line:
+    // a value owns the lines of its span no function or class holds and no
+    // other value shares; the file, the lines no node but itself, an import,
+    // an export or a framework's route holds. So no tag counts twice.
+    // The file's lines read as code, split once: a tag in a comment or a
+    // string is text (`jsxCode`).
+    let lines: string[] | null = null;
+    const holds = (n: Node) => PARENT_KINDS.has(n.kind) || n.kind === 'class';
+    let fileNode = inFile.find((n) => n.kind === 'file' && JSX_FAMILY.includes(n.language));
+    const owns = new Map<string, (line: number) => boolean>();
+    let values: Node[] = [];
+    if (fileNode) {
+      // Per line: 1 when a function or class holds it, 2 when any other node does.
+      const held = new Uint8Array((fileNode.endLine || 0) + 2);
+      const valuesOn = new Uint8Array(held.length);
+      for (const n of inFile) {
+        if (n.kind === 'file' || n.kind === 'import' || n.kind === 'export' || n.kind === 'route' ||
+            !n.startLine || !n.endLine) continue;
+        const mark = holds(n) ? 1 : 2;
+        for (let l = n.startLine; l <= n.endLine && l < held.length; l++) if (held[l] !== 1) held[l] = mark;
+      }
+      // A top-level value: its first line is in no function or class.
+      values = inFile.filter((n) => VALUE_PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language) &&
+        held[n.startLine] !== 1);
+      // A line a value shares with another statement (`const root =
+      // createRoot(el); root.render(<App />)`) is no one's — not the value's,
+      // and not the file's, which owns only lines no node holds: ownership is
+      // by line, so its tags get no edge rather than a wrong one. Read as
+      // code, so a comment there is no statement.
+      const raw = (lines ??= (jsxCode(content) ?? content).split('\n'));
+      for (const v of values) {
+        for (let l = v.startLine; l <= v.endLine && l < valuesOn.length; l++) if (valuesOn[l]! < 2) valuesOn[l]!++;
+        const before = (raw[v.startLine - 1] ?? '').slice(0, v.startColumn ?? 0);
+        const after = (raw[v.endLine - 1] ?? '').slice(v.endColumn ?? Infinity);
+        if (!/^\s*(?:(?:export|declare|default|const|let|var)\s+)*$/.test(before)) valuesOn[v.startLine] = 2;
+        if (!/^[\s;]*$/.test(after)) valuesOn[v.endLine] = 2;
+      }
+      for (const v of values) owns.set(v.id, (line) => held[line] !== 1 && valuesOn[line] === 1);
+      if (held.subarray(1, fileNode.endLine + 1).includes(0)) owns.set(fileNode.id, (line) => !held[line]);
+      else fileNode = undefined;
+    }
+    const parents = [...fns, ...values, ...(fileNode ? [fileNode] : [])];
     if (parents.length === 0) continue;
     // Read once per file, and only when a name actually turns out ambiguous.
     let imports: Map<string, string> | null = null;
@@ -1997,19 +2058,22 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
     // file is split once, not once per function, and read as code once: a
     // tag in a comment or a string is text (`jsxCode`).
-    let lines: string[] | null = null;
     // Each name a span holds, and the line of its first tag: 0 while only type
     // argument or parameter lists name it (`opensTag`). `bare` holds the
     // names it also writes outside a tag (`writtenBare`).
-    const tagsBySpan = new Map<string, { tags: Map<string, number>; bare: Set<string> }>();
+    const tagsBySpan = new Map<string, SpanTags>();
     for (const parent of parents) {
       if (!parent.startLine || !parent.endLine) continue;
-      const span = `${parent.startLine}:${parent.endLine}`;
+      const own = owns.get(parent.id);
+      const span = own ? parent.id : `${parent.startLine}:${parent.endLine}`;
       let names = tagsBySpan.get(span);
       if (!names) {
-        names = { tags: new Map<string, number>(), bare: new Set<string>() };
+        names = { tags: new Map<string, number>(), bare: new Set<string>(), src: '' };
         lines ??= (jsxCode(content) ?? content).split('\n');
-        const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
+        // An owning parent reads only its own lines; the rest stay as blank lines.
+        const spanLines = lines.slice(parent.startLine - 1, parent.endLine);
+        const src = (own ? spanLines.map((text, i) => (own(parent.startLine + i) ? text : '')) : spanLines).join('\n');
+        if (own) names.src = src;
         if (src.includes('</') || src.includes('/>')) {
           let line = parent.startLine;
           let counted = 0;
@@ -2030,7 +2094,8 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
         if (!line) continue;
         let child = jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
         // A name the parent binds itself by its first tag is that local.
-        if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
+        if (child && names.bare.has(name) &&
+            (own ? ownLinesBind(name, names.src) : jsCodeBindsName(name, parent, file, line, ctx))) {
           child = declaredInside(ctx, name, parent, child);
         }
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;

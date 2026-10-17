@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
 - In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.
