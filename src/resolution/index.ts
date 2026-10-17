@@ -34,7 +34,7 @@ import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, findPythonModuleFile, isPythonReceiverRebound, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -2759,6 +2759,7 @@ export class ReferenceResolver {
    * serve; anything else stays a silent miss rather than a wrong edge.
    */
   private isPythonProjectModule(ref: UnresolvedRef, receiver: string): boolean {
+    if (isPythonReceiverRebound(ref, receiver, this.context)) return false;
     for (const imp of this.context.getImportMappings(ref.filePath, ref.language)) {
       if (imp.localName !== receiver) continue;
       // `import pkg.mod` / `import pkg.mod as m` binds the module `source`
@@ -2771,6 +2772,15 @@ export class ReferenceResolver {
           ? `${imp.source}${imp.exportedName}`
           : `${imp.source}.${imp.exportedName}`;
       if (resolveImportPath(specifier, ref.filePath, ref.language!, this.context)) {
+        return true;
+      }
+      // resolveImportPath only maps RELATIVE dotted paths; an ABSOLUTE package
+      // path (`app.db` from `from app import db`, or `import app.db as db`)
+      // resolves to null there, so fall back to the dotted-module file lookup
+      // — the same asymmetry resolvePythonModuleMember already handles. Without
+      // it, a builtin-method name served by an absolute module import
+      // (`db.get`) is dropped by the filter and loses its real `calls` edge.
+      if (findPythonModuleFile(specifier, this.context, ref.filePath)) {
         return true;
       }
     }

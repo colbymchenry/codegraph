@@ -11,7 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
-import { stripCommentsForRegex } from './strip-comments';
+import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { moduleTail } from '../db/reference-tail';
@@ -322,6 +322,8 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
+  pyFunctionScopes.delete(context);
+  pyFileInfos.delete(context);
   PY_MODULE_SYMBOLS.delete(context);
   PROJECT_FOLDER_SUFFIXES.delete(context);
 }
@@ -2131,6 +2133,425 @@ export function resolveViaImport(
   return null;
 }
 
+/** One Python scope (a def, a class, or the function under inspection) inside a function's text. */
+interface PyScope {
+  isClass: boolean;
+  parent: PyScope | null;
+  /** First and last source line (1-based) the scope spans, header included. */
+  start: number;
+  end: number;
+  params: Set<string>;
+  /** Logical statements of the scope's own body, nested def/class bodies excluded. */
+  statements: Array<{ text: string; start: number; end: number }>;
+  /** `id` → how the scope binds it: a plain rebinding, a local import, or not at all. */
+  binds: Map<string, 'bind' | 'import' | null>;
+}
+
+const pyFunctionScopes = new WeakMap<ResolutionContext, Map<string, PyScope[]>>();
+
+type PyLine = { indent: number; text: string; start: number; end: number };
+
+/** A Python file read once: its comment/string-blanked logical statements and its defs, for every function scope built from it. */
+interface PyFileInfo {
+  lines: PyLine[];
+  /** Functions and methods, by start line. */
+  fns: Node[];
+  /** Innermost function around a function (null: none), by node id. */
+  outers: Map<string, Node | null>;
+  /** `fnId\0name` → whether the function's own text has `name` as a word. */
+  mentions: Map<string, boolean>;
+  size: number;
+}
+
+const pyFileInfos = new WeakMap<ResolutionContext, Map<string, PyFileInfo>>();
+/** Characters of statement text kept per context; the oldest files are dropped past it. */
+const PY_FILE_INFO_BUDGET = 48_000_000;
+
+function pyFileInfo(filePath: string, context: ResolutionContext): PyFileInfo {
+  let memo = pyFileInfos.get(context);
+  if (!memo) pyFileInfos.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const src = context.readFile(filePath) ?? '';
+  const lines = pyLogicalLines(blankStringContents(stripCommentsForRegex(src, 'python')));
+  const fns = context.getNodesInFile(filePath)
+    .filter((n) => n.kind === 'function' || n.kind === 'method')
+    .sort((a, b) => a.startLine - b.startLine);
+  const info: PyFileInfo = { lines, fns, outers: new Map(), mentions: new Map(), size: src.length };
+  memo.set(filePath, info);
+  let total = 0;
+  for (const f of memo.values()) total += f.size;
+  for (const key of memo.keys()) {
+    if (total <= PY_FILE_INFO_BUDGET || key === filePath) break;
+    total -= memo.get(key)!.size;
+    memo.delete(key);
+  }
+  return info;
+}
+
+/** The file's logical lines lying within `fn`. */
+function pyLinesWithin(info: PyFileInfo, fn: Node): PyLine[] {
+  let lo = 0;
+  let hi = info.lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (info.lines[mid]!.start < fn.startLine) lo = mid + 1;
+    else hi = mid;
+  }
+  let end = lo;
+  while (end < info.lines.length && info.lines[end]!.end <= fn.endLine) end++;
+  return info.lines.slice(lo, end);
+}
+
+/** Whether `text` holds `word` as a whole identifier. */
+function pyHasWord(text: string, word: string): boolean {
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!/\w/.test(text[at - 1] ?? '') && !/\w/.test(text[at + word.length] ?? '')) return true;
+  }
+  return false;
+}
+
+const PY_DEF_RE = /^(?:async\s+)?def\s+(\w+)\s*\(/;
+const PY_CLASS_RE = /^class\s+(\w+)/;
+
+/** Logical statements of a Python source: continuation lines joined, comments and strings already blanked. */
+function pyLogicalLines(source: string): Array<{ indent: number; text: string; start: number; end: number }> {
+  const out: Array<{ indent: number; text: string; start: number; end: number }> = [];
+  let depth = 0;
+  let cur: { indent: number; text: string; start: number; end: number } | null = null;
+  const physical = source.split(/\r?\n/);
+  for (let i = 0; i < physical.length; i++) {
+    const raw = physical[i]!;
+    if (!cur) {
+      if (!raw.trim()) continue;
+      cur = { indent: raw.length - raw.trimStart().length, text: '', start: i + 1, end: i + 1 };
+    }
+    cur.text += (cur.text ? ' ' : '') + raw.trim();
+    cur.end = i + 1;
+    for (const ch of raw) {
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    }
+    if (depth === 0 && !raw.trimEnd().endsWith('\\')) {
+      if (cur.text.endsWith('\\')) cur.text = cur.text.slice(0, -1);
+      out.push(cur);
+      cur = null;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** The depth-0 characters of `text`, with everything inside brackets replaced by a space. */
+function pyDepthZero(text: string): string {
+  let depth = 0;
+  let out = '';
+  for (const ch of text) {
+    if (ch === '(' || ch === '[' || ch === '{') { if (depth++ === 0) out += ch; else out += ' '; }
+    else if (ch === ')' || ch === ']' || ch === '}') { depth = Math.max(0, depth - 1); out += depth === 0 ? ch : ' '; }
+    else out += depth > 0 ? ' ' : ch;
+  }
+  return out;
+}
+
+/** Bare names a target list binds: `a, (b, *c)` → a, b, c — not `a.b`, `a[i]`, or names inside a call/subscript. */
+function pyTargetNames(text: string): Set<string> {
+  const names = new Set<string>();
+  const trailer: boolean[] = [];
+  const re = /[A-Za-z_]\w*|[([{)\]}]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const tok = m[0];
+    if (tok === '(' || tok === '[' || tok === '{') {
+      const before = text.slice(0, m.index).trimEnd();
+      trailer.push(/[\w)\]]$/.test(before) || trailer.includes(true));
+    } else if (tok === ')' || tok === ']' || tok === '}') {
+      trailer.pop();
+    } else if (!trailer.includes(true) && !/\.\s*$/.test(text.slice(0, m.index)) && !/^\s*[.([]/.test(text.slice(m.index + tok.length))) {
+      names.add(tok);
+    }
+  }
+  return names;
+}
+
+/** Names a `match` case pattern captures: bare names, not dotted values, class names, keyword names or literals. */
+function pyPatternCaptures(pattern: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of pattern.matchAll(/[A-Za-z_]\w*/g)) {
+    const before = pattern.slice(0, m.index);
+    const after = pattern.slice(m.index + m[0].length);
+    if (/\.\s*$/.test(before) || /\w$/.test(before)) continue; // `a.b` attribute, `1e5` literal
+    if (/^\s*[.(]/.test(after) || /^\s*=(?!=)/.test(after)) continue;
+    if (m[0] === '_' || m[0] === 'None' || m[0] === 'True' || m[0] === 'False') continue;
+    names.add(m[0]);
+  }
+  return names;
+}
+
+/** What one logical statement does to `id`: rebinds it, imports it locally, or neither. */
+function pyStatementBinds(statement: string, id: string): 'bind' | 'import' | null {
+  const text = statement.trim();
+  const named = PY_DEF_RE.exec(text)?.[1] ?? PY_CLASS_RE.exec(text)?.[1];
+  if (named !== undefined) return named === id ? 'bind' : null;
+  if (/:=/.test(text) && new RegExp(`\\b${id}\\s*:=`).test(text.replace(/\blambda\b[^:]*:/g, ' '))) return 'bind';
+
+  // `case db:`, `case [db, *_]:`, `case Point(x=db) if ok:` — a capture pattern binds, then an optional inline body.
+  const caseHead = /^case\s+(?![=.,)\]:;])/.exec(text);
+  if (caseHead) {
+    const colon = pyDepthZero(text).indexOf(':', caseHead[0].length);
+    if (colon > 0) {
+      let pattern = text.slice(caseHead[0].length, colon);
+      const guardAt = pyDepthZero(pattern).search(/\bif\b/);
+      if (guardAt >= 0) pattern = pattern.slice(0, guardAt);
+      if (pyPatternCaptures(pattern).has(id)) return 'bind';
+      const rest = text.slice(colon + 1);
+      return rest.trim() ? pyStatementBinds(rest, id) : null;
+    }
+  }
+
+  // `if c: x = 1`, `for x in xs: ...`, `with a as x: ...`, `else: x = 1` — header, then an optional inline body.
+  const header = /^(?:async\s+)?(if|elif|while|for|with|except|else|try|finally)\b\*?/.exec(text);
+  if (header) {
+    const flat = pyDepthZero(text);
+    const colon = flat.indexOf(':', header[0].length);
+    const head = colon < 0 ? text : text.slice(header[0].length, colon);
+    const rest = colon < 0 ? '' : text.slice(colon + 1);
+    if (header[1] === 'for') {
+      const inAt = pyDepthZero(head).search(/\bin\b/);
+      if (pyTargetNames(inAt < 0 ? head : head.slice(0, inAt)).has(id)) return 'bind';
+    } else if (header[1] === 'with' || header[1] === 'except') {
+      for (const as of head.matchAll(/\bas\s+(\([^)]*\)|\[[^\]]*\]|\w+)/g)) {
+        if (pyTargetNames(as[1]!).has(id)) return 'bind';
+      }
+    }
+    return rest.trim() ? pyStatementBinds(rest, id) : null;
+  }
+
+  const parts = text.length > 1 ? pyDepthZero(text).split(';') : [text];
+  if (parts.length > 1) {
+    let at = 0;
+    for (const part of parts) {
+      const found = pyStatementBinds(text.slice(at, at + part.length), id);
+      if (found) return found;
+      at += part.length + 1;
+    }
+    return null;
+  }
+
+  const del = /^del\b\s*(.*)$/.exec(text);
+  if (del) return pyTargetNames(del[1]!).has(id) ? 'bind' : null;
+
+  const from = /^from\s+\S+\s+import\s+(.+)$/.exec(text);
+  const plain = from ? null : /^import\s+(.+)$/.exec(text);
+  if (from || plain) {
+    for (const item of (from ?? plain)![1]!.replace(/[()]/g, ' ').split(',')) {
+      const [name, alias] = item.trim().split(/\s+as\s+/);
+      const bound = alias ?? (from ? name : name?.split('.')[0]);
+      if (bound === id) return 'import';
+    }
+    return null;
+  }
+
+  // Assignment: every plain `=` at depth 0 but the last ends a target; `op=` and `x: T = v` have one target.
+  let flat = pyDepthZero(text);
+  const lambdaAt = flat.search(/\blambda\b/);
+  if (lambdaAt >= 0) flat = flat.slice(0, lambdaAt);
+  const targets: string[] = [];
+  let from0 = 0;
+  for (let i = 0; i < flat.length; i++) {
+    if (flat[i] !== '=') continue;
+    const prev = flat[i - 1] ?? '';
+    if (flat[i + 1] === '=') { i++; continue; }
+    if (prev === ':') continue;
+    if (/[=!]/.test(prev) || (/[<>]/.test(prev) && !/^(?:<<|>>)$/.test(flat.slice(i - 2, i)))) continue;
+    const aug = /[-+*/%&|^@<>]/.test(prev);
+    targets.push(text.slice(from0, aug ? i - 1 : i));
+    if (aug) break;
+    from0 = i + 1;
+  }
+  for (const target of targets) {
+    const colon = pyDepthZero(target).indexOf(':');
+    if (pyTargetNames(colon < 0 ? target : target.slice(0, colon)).has(id)) return 'bind';
+  }
+  return null;
+}
+
+/** Scopes of the function `fn`, outermost first: its own body and every def/class nested in it. */
+function pyScopesOf(fn: Node, context: ResolutionContext): PyScope[] {
+  let memo = pyFunctionScopes.get(context);
+  if (!memo) pyFunctionScopes.set(context, (memo = new Map()));
+  const hit = memo.get(fn.id);
+  if (hit) return hit;
+  const lines = pyLinesWithin(pyFileInfo(fn.filePath, context), fn);
+  const root: PyScope = { isClass: false, parent: null, start: fn.startLine, end: fn.endLine, params: new Set(), statements: [], binds: new Map() };
+  const scopes = [root];
+  const stack: Array<{ scope: PyScope; indent: number }> = [{ scope: root, indent: -1 }];
+  const paramsOf = (header: string): string[] => {
+    const open = header.indexOf('(');
+    const flat = pyDepthZero(header.slice(open));
+    const close = flat.indexOf(')');
+    const inner = header.slice(open + 1, open + close);
+    const out: string[] = [];
+    let depth = 0;
+    let from = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') depth--;
+      else if ((ch === ',' && depth === 0) || i === inner.length) {
+        const name = /^\s*\*{0,2}\s*([A-Za-z_]\w*)/.exec(inner.slice(from, i))?.[1];
+        if (name) out.push(name);
+        from = i + 1;
+      }
+    }
+    return out;
+  };
+  let sawHeader = false;
+  for (const line of lines) {
+    if (!sawHeader && PY_DEF_RE.test(line.text) && !line.text.startsWith('@')) {
+      sawHeader = true;
+      root.start = line.start;
+      stack[0]!.indent = line.indent;
+      for (const p of paramsOf(line.text)) root.params.add(p);
+      const colon = pyDepthZero(line.text).indexOf(':', line.text.indexOf(')'));
+      const inline = colon < 0 ? '' : line.text.slice(colon + 1).trim();
+      if (inline) root.statements.push({ text: inline, start: line.start, end: line.end });
+      continue;
+    }
+    if (!sawHeader) continue;
+    while (stack.length > 1 && line.indent <= stack[stack.length - 1]!.indent) {
+      const closed = stack.pop()!;
+      closed.scope.end = Math.min(closed.scope.end, line.start - 1);
+    }
+    const top = stack[stack.length - 1]!.scope;
+    const isDef = PY_DEF_RE.test(line.text);
+    const isClass = PY_CLASS_RE.test(line.text);
+    top.statements.push({ text: line.text, start: line.start, end: line.end });
+    if (isDef || isClass) {
+      const scope: PyScope = { isClass, parent: top, start: line.start, end: fn.endLine, params: new Set(isDef ? paramsOf(line.text) : []), statements: [], binds: new Map() };
+      const colon = pyDepthZero(line.text).indexOf(':', isDef ? line.text.indexOf(')') : 0);
+      const inline = colon < 0 ? '' : line.text.slice(colon + 1).trim();
+      if (inline) scope.statements.push({ text: inline, start: line.start, end: line.end });
+      scopes.push(scope);
+      stack.push({ scope, indent: line.indent });
+    }
+  }
+  memo.set(fn.id, scopes);
+  return scopes;
+}
+
+/** The import specs (as `source\0name\0isNamespace`, matching the file's mappings) a scope's local imports bind to `id`; `?` when unreadable. */
+function pyScopeImportKeys(scope: PyScope, id: string): Set<string> {
+  const keys = new Set<string>();
+  for (const st of scope.statements) {
+    if (pyStatementBinds(st.text, id) !== 'import') continue;
+    const text = st.text.trim();
+    const from = /^from\s+([\w.]+)\s+import\s+(.+)$/.exec(text);
+    const plain = from ? null : /^import\s+(.+)$/.exec(text);
+    let found = false;
+    if (from || plain) {
+      for (const item of (from ?? plain)![from ? 2 : 1]!.replace(/[()]/g, ' ').split(',')) {
+        const [name, alias] = item.trim().split(/\s+as\s+/);
+        if (!name) continue;
+        if ((alias ?? (from ? name : name.split('.')[0])) !== id) continue;
+        found = true;
+        if (from) keys.add(`${from[1]}\0${name}\0false`);
+        else keys.add(`${alias ? name : name.split('.')[0]}\0*\0true`);
+      }
+    }
+    if (!found) keys.add('?'); // `if c: import x as y`, `a; import x` — not worth parsing
+  }
+  return keys;
+}
+
+function pyScopeBinds(scope: PyScope, id: string): 'bind' | 'import' | null {
+  if (scope.binds.has(id)) return scope.binds.get(id)!;
+  let result: 'bind' | 'import' | null = scope.params.has(id) ? 'bind' : null;
+  for (const s of scope.statements) {
+    const found = result === 'bind' ? null : pyStatementBinds(s.text, id);
+    if (found === 'bind') result = 'bind';
+    else if (found === 'import') result = 'import';
+  }
+  scope.binds.set(id, result);
+  return result;
+}
+
+/** Whether a comprehension variable or lambda parameter on this statement is named `id`. */
+function pyStatementShadows(text: string, id: string): boolean {
+  for (const m of text.matchAll(/\bfor\b([^\n]*?)\bin\b/g)) if (pyTargetNames(m[1]!).has(id)) return true;
+  for (const m of text.matchAll(/\blambda\b([^:]*):/g)) {
+    if (m[1]!.split(',').some((p) => /^\s*\*{0,2}\s*([A-Za-z_]\w*)/.exec(p)?.[1] === id)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the function a Python reference sits in rebinds `receiver` itself,
+ * so `x.method()` is a call on that local rather than on the module an import
+ * bound to the same name at file level.
+ *
+ * Python scoping, read from the function's own text (comments and strings
+ * blanked): the call's scope chain — its function plus any def nested around
+ * it — rebinds `x` when `x` is a parameter, a statement-level assignment /
+ * augmented / annotated target, a `for` / `with … as` / `except … as` target,
+ * a `del`, a nested def/class of that name, or a walrus. A comprehension
+ * variable or lambda parameter only shadows inside its own expression, so it
+ * counts only on the call's own statement. A parameter of a def NOT around the
+ * call, keyword arguments (`x=x`), and text in comments do not count. A
+ * function-local `import … as x` is a rebinding only when it binds `x` to a
+ * different module than the file does, or the file binds `x` to more than one
+ * module (which one the call means is then unknowable).
+ * Module-level code and an unreadable node report false.
+ */
+export function isPythonReceiverRebound(ref: UnresolvedRef, receiver: string, context: ResolutionContext): boolean {
+  const fn = context.getNodeById?.(ref.fromNodeId);
+  if (!fn || (fn.kind !== 'function' && fn.kind !== 'method')) return false;
+  const id = receiver.split('.')[0]!;
+  if (!/^[A-Za-z_]\w*$/.test(id)) return false;
+  const info = pyFileInfo(fn.filePath, context);
+  const localImports = new Set<string>();
+  const mentionKey = `${fn.id}\0${id}`;
+  let mentioned = info.mentions.get(mentionKey);
+  if (mentioned === undefined) {
+    mentioned = pyLinesWithin(info, fn).some((l) => pyHasWord(l.text, id));
+    info.mentions.set(mentionKey, mentioned);
+  }
+  // Only a function whose own text names the receiver can rebind it.
+  if (mentioned) {
+    const scopes = pyScopesOf(fn, context);
+    let inner = scopes[0]!;
+    for (const s of scopes) if (s.start <= ref.line && ref.line <= s.end && s.start >= inner.start) inner = s;
+    for (let s: PyScope | null = inner; s; s = s.parent) {
+      if (s.isClass && s !== inner) continue; // a class body is not visible from the defs inside it
+      const binds = pyScopeBinds(s, id);
+      if (binds === 'bind') return true;
+      if (binds === 'import') for (const k of pyScopeImportKeys(s, id)) localImports.add(k);
+      const own = s.statements.find((st) => st.start <= ref.line && ref.line <= st.end);
+      if (own && pyStatementShadows(own.text, id)) return true;
+    }
+  }
+  // A def nested in another function sees that function's locals (a closure).
+  let outer = info.outers.get(fn.id);
+  if (outer === undefined) {
+    outer = null;
+    for (const n of info.fns) {
+      if (n.startLine > fn.startLine) break;
+      if (n.id === fn.id || n.endLine < fn.endLine) continue;
+      if (!outer || n.endLine - n.startLine < outer.endLine - outer.startLine) outer = n;
+    }
+    info.outers.set(fn.id, outer);
+  }
+  if (outer && isPythonReceiverRebound({ ...ref, fromNodeId: outer.id, line: fn.startLine }, id, context)) return true;
+  if (localImports.size === 0) return false;
+  const specs = new Set<string>();
+  for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
+    if (imp.localName === id) specs.add(`${imp.source}\0${imp.exportedName}\0${imp.isNamespace}`);
+  }
+  if (specs.size > 1) return true;
+  // A local import is the file's own binding unless it names a different module.
+  return specs.size === 1 && [...localImports].some((k) => !specs.has(k));
+}
+
 /**
  * Resolve a Python qualified reference whose receiver is an imported MODULE:
  * `certs.where()` after `from . import certs`, `mod.func()` after `import mod`
@@ -2158,6 +2579,8 @@ function resolvePythonModuleMember(
   // The immediate member of the module (first segment after the receiver).
   const member = ref.referenceName.substring(dotIdx + 1).split('.')[0];
   if (!member) return null;
+  // A receiver the function rebinds is a local, not the imported module.
+  if (isPythonReceiverRebound(ref, receiver, context)) return null;
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
@@ -2408,7 +2831,7 @@ function pythonModuleSymbolUncached(file: string, name: string, context: Resolut
   return undefined;
 }
 
-function findPythonModuleFile(
+export function findPythonModuleFile(
   mod: string,
   context: ResolutionContext,
   excludeFilePath: string
