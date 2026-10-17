@@ -224,11 +224,31 @@ export function scorePathRelevance(
   projectNameTokens?: Set<string>,
   isDeprioritized?: boolean,
 ): number {
-  const pathLower = filePath.toLowerCase();
-  const fileName = path.basename(filePath).toLowerCase();
-  const dirName = path.dirname(filePath).toLowerCase();
-  let score = 0;
+  return scorePreparedPathRelevance(
+    filePath,
+    preparePathRelevanceQuery(query, projectNameTokens),
+    isDeprioritized,
+  );
+}
 
+/**
+ * The query's half of {@link scorePathRelevance}, which is the same for every
+ * path scored against that query. A ranker scoring many candidate paths for
+ * one query prepares it once: re-splitting a multi-KB prompt per candidate was
+ * most of the retrieval time on long prompts (#2184).
+ */
+export interface PathRelevanceQuery {
+  /** The query has no words: every path scores 0, penalties included. */
+  readonly empty: boolean;
+  /** Sub-tokens of each scored query word, in query order; words with none are left out. */
+  readonly wordTokens: readonly (readonly string[])[];
+  readonly isTestQuery: boolean;
+}
+
+export function preparePathRelevanceQuery(
+  query: string,
+  projectNameTokens?: Set<string>,
+): PathRelevanceQuery {
   // Score per original query WORD, not per sub-token. A single PascalCase word
   // splits into many sub-tokens (a project name "SuperBizAgent" →
   // superbizagent / super / biz / agent) that all match the SAME path segment,
@@ -239,7 +259,7 @@ export function scorePathRelevance(
   // camelCase/snake split per word (so `getUserName` still matches a
   // `get_user_name` path) — we just attribute each word's matches once.
   const allWords = query.split(/\s+/).filter((w) => w.length > 0);
-  if (allWords.length === 0) return 0;
+  if (allWords.length === 0) return { empty: true, wordTokens: [], isTestQuery: false };
 
   // A query word that just names the PROJECT (its go.mod / package.json / repo
   // name) carries no discriminative path signal — drop it so the rest of the
@@ -252,11 +272,32 @@ export function scorePathRelevance(
       : allWords;
   const scored = words.length > 0 ? words : allWords;
 
+  const wordTokens: string[][] = [];
   for (const word of scored) {
     // Use base terms only — stem variants inflate path scores by generating
     // many near-duplicate terms that all match the same path segments.
     const subtokens = extractSearchTerms(word, { stems: false });
-    if (subtokens.length === 0) continue;
+    if (subtokens.length > 0) wordTokens.push(subtokens);
+  }
+
+  const queryLower = query.toLowerCase();
+  const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
+  return { empty: false, wordTokens, isTestQuery };
+}
+
+/** {@link scorePathRelevance} against a query prepared by {@link preparePathRelevanceQuery}. */
+export function scorePreparedPathRelevance(
+  filePath: string,
+  query: PathRelevanceQuery,
+  isDeprioritized?: boolean,
+): number {
+  if (query.empty) return 0;
+  const pathLower = filePath.toLowerCase();
+  const fileName = path.basename(filePath).toLowerCase();
+  const dirName = path.dirname(filePath).toLowerCase();
+  let score = 0;
+
+  for (const subtokens of query.wordTokens) {
     // Exact filename match (strongest)
     if (subtokens.some((t) => fileName.includes(t))) score += 10;
     // Directory match
@@ -274,9 +315,7 @@ export function scorePathRelevance(
   //    standing statement by the project, so it is NOT waived. The name-bonus
   //    damping at the call site is what keeps such a tree findable.
   //  - a path that is both is docked ONCE, not twice.
-  const queryLower = query.toLowerCase();
-  const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
-  const offTarget = (!isTestQuery && isTestFile(filePath)) || isDeprioritized === true;
+  const offTarget = (!query.isTestQuery && isTestFile(filePath)) || isDeprioritized === true;
   if (offTarget) {
     score -= 15;
   }
