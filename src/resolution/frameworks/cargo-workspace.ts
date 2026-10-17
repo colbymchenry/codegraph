@@ -214,12 +214,66 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
   return expanded;
 }
 
+/** Join a manifest directory and a relative `path = "…"`, posix and normalized; null when it leaves the project. */
+function joinInsideProject(manifestDir: string, relPath: string): string | null {
+  const parts: string[] = [];
+  for (const seg of `${manifestDir}/${relPath}`.replace(/\\/g, '/').split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  return parts.length > 0 ? parts.join('/') : null;
+}
+
+/**
+ * The `path` dependencies a manifest declares, by the name code writes them
+ * (the dependency KEY, which a `package = "…"` rename makes differ from the
+ * crate's own name): `sim = { path = "crates/sim" }` in `[dependencies]`,
+ * `[dev-dependencies]`, `[build-dependencies]`, target-specific tables, and a
+ * workspace root's `[workspace.dependencies]`; also the `[dependencies.sim]`
+ * table form. Paths resolve against the manifest's directory.
+ */
+function parsePathDependencies(cargoToml: string, manifestDir: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  let inDeps = false;
+  let tableDep: string | null = null;
+  for (const raw of cargoToml.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) {
+      const table = header[1]!.trim();
+      tableDep = /(?:^|\.)(?:dev-|build-)?dependencies\.([A-Za-z0-9_-]+)$/.exec(table)?.[1] ?? null;
+      inDeps = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(table);
+      continue;
+    }
+    if (tableDep) {
+      const p = /^path\s*=\s*["']([^"']+)["']/.exec(line)?.[1];
+      const dir = p ? joinInsideProject(manifestDir, p) : null;
+      if (dir) out.push([tableDep, dir]);
+      continue;
+    }
+    if (!inDeps) continue;
+    const entry = /^([A-Za-z0-9_-]+)\s*=\s*\{(.*)\}\s*$/.exec(line);
+    const p = entry ? /\bpath\s*=\s*["']([^"']+)["']/.exec(entry[2]!)?.[1] : undefined;
+    const dir = p ? joinInsideProject(manifestDir, p) : null;
+    if (entry && dir) out.push([entry[1]!, dir]);
+  }
+  return out;
+}
+
 /**
  * Build a map from crate-name aliases to workspace member directory paths.
  * Example: "mytool-core" and "mytool_core" -> "crates/mytool-core"
  *
  * Supports glob members (e.g. `members = ["crates/*"]`) via picomatch
- * when the context exposes `listDirectories`.
+ * when the context exposes `listDirectories`. Also maps every in-project
+ * `path` dependency the root or a member manifest declares, by its dependency
+ * key — a renamed (`core_sim = { path = "../sim", package = "sim" }`) or
+ * non-member (`vendor/foo`) crate is reached the same way a member is.
  */
 export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
   const result = new Map<string, string>();
@@ -228,11 +282,13 @@ export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<strin
 
   const rawMembers = parseWorkspaceMembers(rootCargoToml);
   const members = expandMembers(rawMembers, context);
+  const manifests: Array<[string, string]> = [['', rootCargoToml]];
 
   for (const memberPath of members) {
     const memberCargoPath = `${memberPath}/Cargo.toml`;
     const memberCargoToml = context.readFile(memberCargoPath);
     if (!memberCargoToml) continue;
+    manifests.push([memberPath, memberCargoToml]);
 
     const packageName = parsePackageName(memberCargoToml);
     if (!packageName) continue;
@@ -240,5 +296,39 @@ export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<strin
     addCrateAlias(result, packageName, memberPath);
   }
 
+  // The map is workspace-wide, but a dependency key is per manifest: two crates
+  // may bind `util` to different directories. A key with more than one target
+  // is dropped — unresolved beats resolving one crate's `util::` to the other's.
+  const depDirs = new Map<string, Set<string>>();
+  for (const [manifestDir, manifest] of manifests) {
+    for (const [depName, depDir] of parsePathDependencies(manifest, manifestDir)) {
+      if (result.has(depName) || !context.readFile(`${depDir}/Cargo.toml`)) continue;
+      const key = depName.replace(/-/g, '_');
+      const dirs = depDirs.get(key) ?? new Set<string>();
+      dirs.add(depDir);
+      depDirs.set(key, dirs);
+    }
+  }
+  for (const [manifestDir, manifest] of manifests) {
+    for (const [depName, depDir] of parsePathDependencies(manifest, manifestDir)) {
+      if (result.has(depName) || !context.readFile(`${depDir}/Cargo.toml`)) continue;
+      if (depDirs.get(depName.replace(/-/g, '_'))!.size > 1) continue;
+      addCrateAlias(result, depName, depDir);
+    }
+  }
+
   return result;
+}
+
+/**
+ * The directory holding a crate's library root (`lib.rs`), relative to the
+ * project: `[lib] path = "…"`'s directory when the manifest sets one, else
+ * `<crate>/src`.
+ */
+export function cargoCrateSourceDir(crateDir: string, context: ResolutionContext): string {
+  const base = crateDir === '.' ? '' : crateDir;
+  const lib = getSection(context.readFile(base ? `${base}/Cargo.toml` : 'Cargo.toml') ?? '', 'lib');
+  const libPath = lib ? /^\s*path\s*=\s*["']([^"']+)["']/m.exec(lib)?.[1] : undefined;
+  const libDir = libPath ? joinInsideProject(base, libPath.replace(/\/?[^/]*$/, '')) : null;
+  return libDir ?? (base ? `${base}/src` : 'src');
 }
