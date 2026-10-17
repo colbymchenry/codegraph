@@ -5219,6 +5219,11 @@ function rustGoReceiverName(text: string): string {
         const literal = /^\(\s*&?\s*([A-Za-z_][\w.]*)\s*\{/.exec(src.slice(j, i + 1));
         if (literal) return literal[1]!;
       }
+      // `Xyz { x: 1.0 }.to_val()` — a struct literal names its type (#2614).
+      if (ch === '}' && out === '') {
+        const literal = /(?:^|[^\w.:])([A-Z]\w*)\s*$/.exec(src.slice(0, j));
+        if (literal) return literal[1]!;
+      }
       i = j - 1;
     } else if (/[\w$.:!]/.test(ch)) {
       if (ch !== '!') out = ch + out;
@@ -7861,6 +7866,10 @@ export function matchByExactName(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  // `vis.map.get("a")` / `Xyz { x: 1.0 }.to_val()` arrive as bare `get` / `to_val`:
+  // the receiver's written type picks the method, or rules every one out (#2614).
+  const rustReceiver = ref.language === 'rust' && rustGoShape?.shape === 'chained'
+    ? rustWrittenReceiverType(rustGoShape.receiver, ref, context) : null;
   const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
     ? kotlinChainReceiver(ref, context) : null;
   const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
@@ -7870,6 +7879,8 @@ export function matchByExactName(
     !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
     !(swiftShape && !isSwiftCallTarget(n, swiftShape, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
+    !(rustReceiver === 'outside') &&
+    !(typeof rustReceiver === 'object' && rustReceiver !== null && n.qualifiedName !== `${rustReceiver.type}::${ref.referenceName}`) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
@@ -14332,6 +14343,20 @@ export function matchMethodCall(
     return matchRustSelfCall(methodName!, ref, context);
   }
 
+  // Rust call through a parameter, a local or a field read on one, or on a
+  // struct literal — `names.contains(&k)`, `vis.map.get("a")`,
+  // `Xyz { x: 1.0 }.to_val()` (#2614). EXCLUSIVE like the branches above
+  // whenever the receiver's type is written down: a project type calls its
+  // own method or nothing, and a slice, a `HashMap` or anything else from
+  // outside the project calls nothing of the project's. A receiver whose
+  // type is not written (a closure's argument, a `for` binding) resolves as
+  // before.
+  if (ref.language === 'rust' && dotMatch) {
+    const written = rustWrittenReceiverType(objectOrClass!, ref, context);
+    if (written === 'outside') return null;
+    if (written) return resolveMethodOnType(written.type, methodName!, ref, context, 0.9, 'instance-method');
+  }
+
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
   // emitted as `this.mailer.send` (#1496). Same discipline as the Rust branch
   // above, and EXCLUSIVE for the same reason: the field's declared type off
@@ -14488,6 +14513,13 @@ export function matchMethodCall(
   // never a method some type of that name owns.
   if (ref.language === 'rust' && match === colonMatch && /^[a-z_][\w]*(?:::[a-z_]\w*)*$/.test(objectOrClass!)) {
     return null;
+  }
+  // Rust `J::from(i)` under `use serde_json::Value as J`: a path through a
+  // name a `use` binds from the standard library or a dependency names that
+  // crate's item, never a project type's same-named method (#2614).
+  if (ref.language === 'rust' && match === colonMatch) {
+    const uses = rustUsesOf(ref.filePath, context);
+    if (uses.external.has(objectOrClass!) && !uses.bound.has(objectOrClass!)) return null;
   }
   // `string.Equals(…)`, `object.ReferenceEquals(…)`: a C# keyword type.
   if (ref.language === 'csharp' && /^(?:string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)$/.test(objectOrClass!)) {
@@ -15369,6 +15401,135 @@ export function rustFieldTypeName(raw: string): string | null {
   if (RUST_NON_PROJECT_FIELD_TYPES.has(seg)) return null;
   if (/^[A-Z]$/.test(seg)) return null; // bare single-letter generic parameter
   return seg;
+}
+
+/**
+ * The type a Rust receiver is written with where `ref` calls through it
+ * (#2614): a project type's name, `'outside'` when what is written names
+ * nothing of the project's, or null when nothing is written down. Read from
+ * the source alone, never guessed from the receiver's name:
+ *
+ *  - a struct literal or unit struct, `Xyz { x: 1.0 }.to_val()`, names its
+ *    type;
+ *  - a parameter or local of the enclosing function, by its declaration —
+ *    `names: &[&str]`, `let m: HashMap<_, _> = …`, `let o = Obj { … }`,
+ *    `let o = Obj::new(…)` — the last one before the call;
+ *  - a field read on either, `vis.map`, by the field's declared type.
+ *
+ * A written type is outside the project when it is a slice, tuple, array, raw
+ * pointer or primitive; a name a `use` binds from the standard library or a
+ * dependency (`HashMap`, `use serde_json::Value as J`); or a name no Rust
+ * type of the project declares. A generic parameter, a closure, a `for`
+ * binding or a value the declaration does not type stays unknown (null): the
+ * call resolves as before. The reporter's `names.contains(&k)` on a slice
+ * went to `Obj::contains`, `vis.map.get("a")` on a `HashMap` field to
+ * `Ext::get`, `J::from(i)` to a local `impl From<io::Error> for Fail`, and
+ * `Xyz { x: 1.0 }.to_val()` to `Stat::to_val` — a same-named method of
+ * another type, when the type is right there in the source.
+ */
+function rustWrittenReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): { type: string } | 'outside' | null {
+  const [head, ...links] = receiver.split('.');
+  if (!head || !/^[A-Za-z_]\w*$/.test(head) || head === 'self' || head === 'Self') return null;
+  let written: string | null;
+  if (/^[A-Z]/.test(head)) {
+    written = head; // `Xyz { … }` / a unit struct — rustGoReceiverName drops the braces
+  } else {
+    written = rustLocalDeclaredType(head, ref, context);
+    if (written === null) return null;
+  }
+  let type = rustWrittenTypeOf(written, ref, context);
+  for (const link of links) {
+    if (type === 'outside' || type === null) return type;
+    const field = rustDeclaredFieldType(type.type, link, ref, context);
+    if (field === null) return null;
+    type = rustWrittenTypeOf(field, ref, context);
+  }
+  return type;
+}
+
+/** What a written Rust type names: a project type, `'outside'`, or null for one that cannot be told (a generic parameter). */
+function rustWrittenTypeOf(written: string, ref: UnresolvedRef, context: ResolutionContext): { type: string } | 'outside' | null {
+  const raw = written.trim().replace(/^&\s*(?:'\w+\s+)?(?:mut\s+)?/, '');
+  // A slice, array, tuple, raw pointer or function type is nobody's project type.
+  if (/^[[(*]|^(?:unsafe\s+|extern\s+"[^"]*"\s+)?fn\b/.test(raw)) return 'outside';
+  const name = rustFieldTypeName(written);
+  if (name === null) {
+    const seg = raw.replace(/[<>+].*$/, '').trim().split('::').filter(Boolean).pop() ?? '';
+    // A primitive (`str`, `u8`, `bool`); a single letter is a generic parameter.
+    return /^[A-Za-z_]\w*$/.test(seg) && RUST_NON_PROJECT_FIELD_TYPES.has(seg) ? 'outside' : null;
+  }
+  const uses = rustUsesOf(ref.filePath, context);
+  if (uses.external.has(name) && !uses.bound.has(name)) return 'outside';
+  const declared = context.getNodesByName(name).filter((n) => n.language === 'rust' &&
+    (n.kind === 'struct' || n.kind === 'enum' || n.kind === 'union' || n.kind === 'class' || n.kind === 'trait' || n.kind === 'type_alias'));
+  if (declared.length === 0) return 'outside';
+  // A trait (`impl IntoResettable<T>`, `&dyn Source`) names any of its
+  // implementors, and an alias whatever it stands for: neither is a type whose
+  // own methods the call can be checked against, so the call resolves as before.
+  return declared.every((n) => n.kind === 'trait' || n.kind === 'type_alias') ? null : { type: name };
+}
+
+/**
+ * The type the enclosing function declares `name` with, as written: a
+ * parameter's annotation, a `let name: T`, or a `let name = T { … }` /
+ * `T::new(…)` / `T::default()`. The last declaration before the call wins
+ * (shadowing). Null when the function cannot be read or declares `name`
+ * without a type we can read.
+ */
+function rustLocalDeclaredType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || (caller.kind !== 'function' && caller.kind !== 'method') || caller.filePath !== ref.filePath) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return null;
+  const strip = (l: string): string => l.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // The signature: from the function's first line to the one that opens its body.
+  let open = caller.startLine - 1;
+  while (open < Math.min(lines.length, ref.line) - 1 && !/\{/.test(strip(lines[open]!))) open++;
+  const signature = lines.slice(caller.startLine - 1, open + 1).map(strip).join(' ').replace(/\{.*$/, '');
+  let found: string | null = null;
+  const param = new RegExp(`(?<![\\w.])(?:mut\\s+)?${n}\\s*:\\s*([^,)]+)`).exec(signature.replace(/^[^(]*\(/, ''));
+  if (param) found = param[1]!;
+  const typed = new RegExp(`\\blet\\s+(?:mut\\s+)?${n}\\s*:\\s*([^=;]+?)\\s*(?:=|;)`);
+  const built = new RegExp(`\\blet\\s+(?:mut\\s+)?${n}\\s*=\\s*((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Z]\\w*)\\s*(?:\\{|::\\s*(?:new|default)\\s*\\()`);
+  const untyped = new RegExp(`\\blet\\s+(?:mut\\s+)?(?:\\(?[^=;]*\\b)?${n}\\b`);
+  for (let i = open + 1; i < ref.line - 1 && i < lines.length; i++) {
+    const line = strip(lines[i]!);
+    const m = typed.exec(line) ?? built.exec(line);
+    // A construction types the local only when it is the whole initializer:
+    // `let matches = Command::new("x").arg(…).get_matches();` holds what the
+    // chain returns, and a chain continued on the next lines is not read.
+    if (m) found = m[0].startsWith('let') && typed.exec(line) === null &&
+      (!/;\s*$/.test(line) || /[)}]\s*\./.test(line.slice(m.index + m[0].length))) ? null : m[1]!;
+    else if (untyped.test(line)) found = null; // rebound to something the line does not type
+  }
+  // `sc: &mut Self`, `let mut err = Self::new(…)` in an impl: `Self` is the
+  // impl's type, carried in the method's qualified name (`Error::invalid_subcommand` → `Error`).
+  if (found !== null && /^&?\s*(?:'\w+\s+)?(?:mut\s+)?Self\b/.test(found.trim())) {
+    const sep = caller.qualifiedName.lastIndexOf('::');
+    return sep > 0 ? caller.qualifiedName.slice(0, sep).split('::').pop()! : null;
+  }
+  return found;
+}
+
+/**
+ * The declared type text of `field` in the project's Rust type `owner`, read
+ * from the struct's own declaration lines (fields are not graph nodes); null
+ * when no such field is declared there.
+ */
+function rustDeclaredFieldType(owner: string, field: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
+    (n) => (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class') && n.language === 'rust');
+  const fieldRe = new RegExp(`(?<![\\w.])${field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*([^,{}]+)`);
+  for (const s of owners) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    for (const rawLine of source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine)) {
+      const m = fieldRe.exec(rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''));
+      if (m?.[1]) return m[1];
+    }
+  }
+  return null;
 }
 
 /**
@@ -16515,6 +16676,10 @@ export function matchFuzzy(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  // `vis.map.get("a")` / `Xyz { x: 1.0 }.to_val()` arrive as bare `get` / `to_val`:
+  // the receiver's written type picks the method, or rules every one out (#2614).
+  const rustReceiver = ref.language === 'rust' && rustGoShape?.shape === 'chained'
+    ? rustWrittenReceiverType(rustGoShape.receiver, ref, context) : null;
   const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
     ? kotlinChainReceiver(ref, context) : null;
   const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
@@ -16558,6 +16723,8 @@ export function matchFuzzy(
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
+    !(rustReceiver === 'outside') &&
+    !(typeof rustReceiver === 'object' && rustReceiver !== null && n.qualifiedName !== `${rustReceiver.type}::${ref.referenceName}`) &&
     !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
     !(swiftShape && !isSwiftCallTarget(n, swiftShape, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
