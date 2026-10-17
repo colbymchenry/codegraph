@@ -289,3 +289,20 @@ class SiblingAccessorK {
         register(fromInit)
     }
 }
+
+class ReceiverChainK(private val engine: EngineK) {
+    fun chains() {
+        engine.pump.drain()
+        this.engine.drain()
+        engine?.pump?.drain()
+        engine
+            .pump
+            .drain()
+        engine.a.b.c.drain()
+        engine.a.b.c.d.drain()
+        engine!!.pump.drain()
+        (engine).pump.drain()
+        engine.pump().drain()
+        super.toString().length.toString()
+    }
+}
