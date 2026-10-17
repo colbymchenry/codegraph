@@ -38,14 +38,27 @@ done
 [ "$ready" = 1 ] || { echo "claude never drew its UI"; cap; tmux kill-session -t "$SESSION" 2>/dev/null; exit 1; }
 
 # Accept the per-folder "Is this a project you trust?" dialog if it shows (first
-# time claude opens a given repo). Option 1 ("Yes, I trust this folder") is
-# pre-selected, so Enter accepts. This dialog also contains ❯, so it must be
-# cleared before the type-and-verify loop or keystrokes land on the menu.
+# time claude opens a given repo). Which option is pre-selected varies by Claude
+# Code version — current builds put "No, exit" first — so move the cursor onto
+# "Yes, I trust this folder" explicitly before pressing Enter; a bare Enter on
+# "No, exit" quits claude. This dialog also contains ❯, so it must be cleared
+# before the type-and-verify loop or keystrokes land on the menu.
 for _ in $(seq 1 20); do
   cap | grep -q "trust this folder" || break
-  tmux send-keys -t "$SESSION" Enter
+  if cap | grep -qE "❯ *(1\. *)?No, exit"; then tmux send-keys -t "$SESSION" Down; sleep 0.5; fi
+  cap | grep -qE "❯ *(2\. *)?Yes, I trust" && tmux send-keys -t "$SESSION" Enter
   sleep 1
 done
+
+# Never type into a bare shell. If claude exited (declined dialog, bad flag,
+# crash), the type-and-verify loop below would still "see" the prompt echoed at
+# the shell and send it as a command. claude must still be the pane's program.
+sleep 2
+case "$(tmux display -p -t "$SESSION" '#{pane_current_command}')" in
+  bash|zsh|sh|fish|dash)
+    echo "claude exited before the prompt was sent (pane is a shell) — aborting"
+    cap; tmux kill-session -t "$SESSION" 2>/dev/null; exit 1 ;;
+esac
 
 # Type-and-verify: send the prompt, confirm a distinctive chunk of it actually
 # landed in the input box, retry if it didn't (handles the early-❯ race where
