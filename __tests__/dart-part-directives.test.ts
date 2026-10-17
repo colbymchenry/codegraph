@@ -214,3 +214,83 @@ void main() {}
     expect(part.dependents).toEqual(['lib/src/framework.dart']);
   });
 });
+
+/**
+ * Dart privacy is per library: a `_name` declared in one file of a library is
+ * visible in its `part` files and the other way round, but not in another
+ * library that imports it (#2466).
+ */
+describe('Dart private members across part files', () => {
+  let root = '';
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dart-part-private-'));
+    writeTree(root, {
+      'pubspec.yaml': 'name: app\n',
+      'lib/greeter.dart': `part 'greeter_format.dart';
+part 'greeter_shout.dart';
+part 'src/_greeter_whisper.dart';
+
+class Greeter with _Formatting, _Shouting, _Whispering {
+  String greet(String name) => _format(name);
+  String hello() => _local();
+  String _local() => 'hi';
+}
+
+void _trace(String s) => print(s);
+`,
+      'lib/greeter_format.dart': `part of 'greeter.dart';
+
+mixin _Formatting {
+  String _format(String name) {
+    _trace(name);
+    return 'Hello, $name';
+  }
+}
+`,
+      'lib/greeter_shout.dart': `part of 'greeter.dart';
+
+mixin _Shouting on _Formatting {
+  String shout(String name) => _format(name).toUpperCase();
+}
+`,
+      'lib/src/_greeter_whisper.dart': `part of '../greeter.dart';
+
+mixin _Whispering on _Formatting {
+  String whisper(String name) => _format(name).toLowerCase();
+}
+`,
+      // Another library: the greeter's privates are not its to call.
+      'lib/caller.dart': `import 'greeter.dart';
+
+void outsider() => _trace('x');
+`,
+    });
+    cg = await CodeGraph.init(root, { index: true });
+  });
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function callEdges(): string[] {
+    const files = ['lib/greeter.dart', 'lib/greeter_format.dart', 'lib/greeter_shout.dart', 'lib/src/_greeter_whisper.dart', 'lib/caller.dart'];
+    const ids = files.flatMap((f) => cg.getNodesInFile(f).map((n) => n.id));
+    return cg.getOutgoingEdgesFrom(ids, ['calls'])
+      .map((e) => `${cg.getNode(e.source)!.qualifiedName} -> ${cg.getNode(e.target)!.qualifiedName}`)
+      .sort();
+  }
+
+  it('links a call to a private member declared in another file of the same library', () => {
+    // `outsider` in lib/caller.dart gets no edge: _trace is private to the greeter library.
+    expect(callEdges()).toEqual([
+      'Greeter::greet -> _Formatting::_format',
+      'Greeter::hello -> Greeter::_local',
+      '_Formatting::_format -> _trace',
+      '_Shouting::shout -> _Formatting::_format',
+      '_Whispering::whisper -> _Formatting::_format',
+    ]);
+  });
+});
