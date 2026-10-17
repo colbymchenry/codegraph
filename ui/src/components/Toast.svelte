@@ -6,9 +6,10 @@
 -->
 <script lang="ts">
   import { toast } from '../lib/toast.svelte';
+  import { localize } from '../lib/i18n.svelte';
 </script>
 
-<div class="live-region" aria-live="polite">
+<div class="live-region" aria-live="polite" use:localize>
   {#if toast.message}
     <div class="toast">{toast.message}</div>
   {/if}

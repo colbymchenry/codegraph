@@ -29,6 +29,8 @@
  */
 
 import type {
+  WireBrowsePage,
+  WireNeighborPage,
   WireDeadCode,
   WireEntryPoints,
   WireFilePayload,
@@ -114,6 +116,11 @@ export interface MapRequest {
   root?: string | null;
   /** How many path segments under the root name a module. */
   depth?: number;
+  /** 在预算判断前筛选测试模块与最低引用权重。 */
+  includeTests?: boolean;
+  minWeight?: number;
+  /** 显式请求当前小范围的文件级循环。 */
+  details?: boolean;
 }
 
 export interface SearchRequest {
@@ -204,7 +211,13 @@ export interface StepsRequest {
  * Everything here answers a question except `saveTrail`/`deleteTrail`, which
  * are optional for exactly that reason.
  */
+export interface BrowseRequest { root?: string; kind?: 'directories' | 'files' | 'symbols'; cursor?: string; limit?: number }
+export interface NeighborRequest { id: string; direction?: 'in' | 'out'; cursor?: string; limit?: number }
+
 export interface GraphAdapter {
+  /** 可选分页能力，旧宿主继续使用已有列表。 */
+  browse?(request: BrowseRequest, signal?: AbortSignal): Promise<WireBrowsePage>;
+  neighbors?(request: NeighborRequest, signal?: AbortSignal): Promise<WireNeighborPage>;
   /** The index's own facts: counts, thresholds, the blast scale. */
   stats(signal?: AbortSignal): Promise<WireStats>;
   search(query: string, opts?: SearchRequest, signal?: AbortSignal): Promise<WireSearch>;
@@ -271,6 +284,9 @@ export interface HttpAdapterOptions {
    * `api/stats`, so it survives being mounted under a sub-path.
    */
   baseUrl?: string;
+  /** 项目 API 前缀，例如 /api/projects/demo。 */
+  apiBase?: string;
+  signal?: AbortSignal;
   /** Injectable for tests and for a host that wraps `fetch` with auth. */
   fetch?: typeof globalThis.fetch;
 }
@@ -306,13 +322,15 @@ export const WRITE_HEADER = 'X-CodeGraph-UI';
  */
 export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapter {
   const base = options.baseUrl ?? '';
+  const address = (path: string) => options.apiBase ? `${options.apiBase.replace(/\/$/, '')}/${path.replace(/^api\//, '')}` : `${base}${path}`;
   const doFetch = options.fetch ?? ((...args: Parameters<typeof globalThis.fetch>) =>
     globalThis.fetch(...args));
 
   async function call<T>(path: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
+    signal = options.signal ? (signal ? AbortSignal.any([signal, options.signal]) : options.signal) : signal;
     let response: Response;
     try {
-      response = await doFetch(`${base}${path}`, { ...init, signal });
+      response = await doFetch(address(path), { ...init, signal });
     } catch (cause) {
       if (signal?.aborted) throw cause;
       throw new ApiFailure(
@@ -324,6 +342,7 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
     }
 
     const body = (await response.json().catch(() => null)) as unknown;
+    signal?.throwIfAborted();
     if (!response.ok) {
       const failure = (body as ApiErrorBody | null) ?? {};
       throw new ApiFailure(
@@ -385,6 +404,17 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
       return getJson<WireSource>(`api/source${query(params)}`, signal);
     },
 
+    browse(request, signal) {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(request)) if (value !== undefined) params.set(key, String(value));
+      return getJson<WireBrowsePage>(`api/browse${query(params)}`, signal);
+    },
+    neighbors(request, signal) {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(request)) if (value !== undefined) params.set(key, String(value));
+      return getJson<WireNeighborPage>(`api/neighbors${query(params)}`, signal);
+    },
+
     file: (path, signal) => getJson<WireFilePayload>(`api/file/${encodePath(path)}`, signal),
 
     fileCode: (path, signal) =>
@@ -400,9 +430,12 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
     },
 
     map(request = {}, signal) {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams({ bounded: '1' });
       if (request.root !== undefined && request.root !== null) params.set('root', request.root);
       if (request.depth) params.set('depth', String(request.depth));
+      if (request.includeTests !== undefined) params.set('tests', request.includeTests ? '1' : '0');
+      if (request.minWeight !== undefined) params.set('minWeight', String(request.minWeight));
+      if (request.details) params.set('details', '1');
       return getJson<WireMapPayload>(`api/map${query(params)}`, signal);
     },
 
@@ -452,7 +485,7 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
 
     events(handlers) {
       if (typeof EventSource === 'undefined') return () => {};
-      const stream = new EventSource(`${base}api/events`);
+      const stream = new EventSource(address('api/events'));
       stream.addEventListener('hello', (event) => handlers.hello(parse(event)));
       stream.addEventListener('changed', (event) => handlers.changed(parse(event)));
       stream.addEventListener('index', (event) => handlers.index(parse(event)));

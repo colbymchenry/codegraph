@@ -11,6 +11,12 @@
   can audit is a diagram that gets believed too much.
 -->
 <script lang="ts">
+  import { moduleTarget } from '../../lib/map-scope';
+  import DirectoryBrowser from '../graph/DirectoryBrowser.svelte';
+  import { getGraphAdapter } from '../../lib/adapter';
+  import { graphText } from '../../lib/graph-copy';
+  import { graphCycles } from '../../lib/graph-analysis';
+  import VirtualList from '../graph/VirtualList.svelte';
   import ExportButtons from '../ExportButtons.svelte';
   import { fileHref } from '../../lib/navigation';
   import { plural } from '../../lib/symbol-model';
@@ -22,12 +28,13 @@
     layout: MapLayout;
     selected: string | null;
     includeTests: boolean;
+    detailsRequested?: boolean;
+    detailsLoading?: boolean;
+    detailsFailed?: boolean;
+    onLoadDetails?: () => void;
     files: string[];
     onToggleTests: (value: boolean) => void;
     onSelectRoot: (root: string) => void;
-    /** What the reader asked for, or `null` when the depth in `payload` was chosen for them. */
-    chosenDepth: number | null;
-    onSelectDepth: (depth: number | null) => void;
     onSelect: (id: string | null) => void;
     /** Builds the map as an SVG at a given device-pixel scale. */
     buildSvg: (scale: number) => string;
@@ -37,41 +44,24 @@
 
   let {
     payload,
+    detailsRequested = false,
+    detailsLoading = false,
+    detailsFailed = false,
+    onLoadDetails,
     layout,
     selected,
-    includeTests,
     files,
-    onToggleTests,
-    onSelectRoot,
-    chosenDepth,
-    onSelectDepth,
     onSelect,
+    onSelectRoot,
     buildSvg,
     exportName,
   }: Props = $props();
-
-  /**
-   * The grouping options.
-   *
-   * The first one is the default and is not a number: the answering side reads
-   * the repository and picks the shallowest grouping that is not one box
-   * holding the whole program. The numbers below it are there for when its
-   * choice is wrong for what the reader is looking at — an escape hatch, not
-   * the thing anybody should have to reach for.
-   */
-  const DEPTHS = [1, 2, 3, 4] as const;
-
-  function depthLabel(depth: number): string {
-    return depth === 1 ? 'top-level folders' : `${depth} folders deep`;
-  }
-
-  /** An em dash the mono face has; the select is narrow enough to notice a tofu. */
-  const DASH = '\u2014';
 
   const selectedNode = $derived(
     selected === null ? null : (layout.nodes.find((n) => n.id === selected) ?? null)
   );
   const selectedModule = $derived(selectedNode?.module ?? null);
+  const target = $derived(selectedModule ? moduleTarget(selectedModule) : null);
   /** Which of the listed files are tool-generated — the rows drawn in ink-4. */
   const generatedFiles = $derived(new Set(selectedModule?.generatedFiles ?? []));
 
@@ -92,82 +82,34 @@
           .sort((a, b) => b.count - a.count || a.source.localeCompare(b.source))
   );
 
-  const thinCount = $derived(layout.edges.filter((e) => e.thin && !e.back).length);
+  const thinCount = $derived(layout.edges.filter((e) => e.thin).length);
+  const moduleCycles = $derived(graphCycles(layout.nodes.map(n=>n.id),layout.edges.filter(e=>!e.thin)));
 </script>
 
 <aside class="mapside">
   <h2>Architecture map</h2>
   <p>
-    Derived from the graph, not drawn by hand: each module sits one layer above the modules it
-    depends on, so reading top to bottom follows the dependency direction. Line weight is how many
-    calls, imports and type references cross the link.
+    {graphText('默认从左向右分层，也可切换力导向、同心圆或环形。同心圆按连接数量排列，连接多的节点更靠内。箭头从调用或依赖方指向目标，双向依赖合并为双箭头；悬停显示各方向数量。拖动节点可整理位置，播放仅示意静态关系。', 'The default layout is left to right; force-directed, concentric and circular layouts are also available. Concentric rings place nodes with more neighbours closer to the centre. Arrows point from caller or dependent to target; mutual dependencies share a double arrow. Hover for directional counts. Drag to arrange; playback illustrates static relationships.')}
   </p>
 
   <!-- The map is the thing people paste into a README, so the way out sits
        directly under the sentence explaining what it is. -->
   <ExportButtons build={buildSvg} filename={exportName} />
 
-  <label class="field">
-    <span>Showing</span>
-    <select
-      value={payload.root}
-      onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
-    >
-      {#each payload.roots as option (option.root)}
-        <option value={option.root}>{option.label} · {option.files} files</option>
-      {/each}
-    </select>
-  </label>
-
-  <!-- The grouping. A repository whose whole program sits under one directory
-       draws as one box at the shallowest setting, which is why the default is
-       chosen from the repository rather than fixed at 1. -->
-  <label class="field">
-    <span>Grouping</span>
-    <select
-      value={chosenDepth === null ? 'auto' : String(chosenDepth)}
-      onchange={(event) => {
-        const value = (event.currentTarget as HTMLSelectElement).value;
-        onSelectDepth(value === 'auto' ? null : Number(value));
-      }}
-    >
-      <option value="auto">automatic {DASH} {depthLabel(payload.depth)}</option>
-      {#each DEPTHS as option (option)}
-        <option value={String(option)}>{depthLabel(option)}</option>
-      {/each}
-    </select>
-  </label>
-
-  <label class="toggle">
-    <input
-      type="checkbox"
-      checked={includeTests}
-      onchange={(event) => onToggleTests((event.currentTarget as HTMLInputElement).checked)}
-    />
-    Include test modules
-  </label>
-
   <div class="notes">
+    {#if payload.detailsDeferred}
+      <p class="dim">{graphText('概览仅加载模块关系。调用点请在符号关系列表中查看；文件级循环需要显式加载。', 'The overview loads module relationships only. Inspect call sites in symbol relationships; load file-level cycles explicitly.')}</p>
+      {#if onLoadDetails}<button class="load-details" disabled={detailsLoading} onclick={onLoadDetails}>{detailsLoading && detailsRequested ? graphText('加载中…', 'Loading…') : graphText('加载文件级循环', 'Load file-level cycles')}</button>{/if}
+      {#if detailsRequested && !detailsLoading && !detailsFailed}<p class="dim">{graphText('该范围仍超过 400 个文件或 2000 条文件关系，请进一步缩小目录范围后加载。', 'This scope still exceeds 400 files or 2,000 file relationships. Narrow the directory before loading cycles.')}</p>{/if}
+    {:else if detailsRequested && payload.cycles.total === 0 && !payload.cycles.truncated}
+      <p class="dim">{graphText('当前文件范围已检查，未发现文件级循环。', 'The current file scope was checked; no file-level cycles were found.')}</p>
+    {/if}
     {#if thinCount > 0}
       <p class="dim">
-        {plural(thinCount, 'link')} carrying fewer than {layout.minWeight} references
-        {thinCount === 1 ? 'is' : 'are'} hidden until you select a module {thinCount === 1
-          ? 'it'
-          : 'they'} touch.
+        {graphText('权重筛选隐藏关系：', 'Relationships hidden by weight filter: ')}{thinCount} · &lt; {layout.minWeight}
       </p>
     {/if}
-    {#if layout.basis.kind === 'declared'}
-      <p class="dim">
-        The layering uses the {layout.basis.declaredLinks} of {layout.basis.totalLinks} links with an
-        import, a qualified name, an inheritance clause or a typed receiver behind them. Bare
-        name matches still count toward line weight, but they do not decide what sits above what.
-      </p>
-    {:else}
-      <p class="dim">
-        Too few links here carry an import or a declared type, so the layering uses raw reference
-        counts. A name shared by two unrelated modules can move a box.
-      </p>
-    {/if}
+    <p class="dim">{graphText('布局与模块级循环分析使用当前筛选范围内的真实有向关系。模块级循环与下方文件级循环独立计算；缺失置信度不作推断。', 'Layout and module cycles use real directed relationships in the filtered scope. Module cycles and file cycles below are computed independently; missing confidence is not inferred.')}</p>
     {#if payload.excluded.uncertainEdges > 0}
       <p class="dim">
         {plural(payload.excluded.uncertainEdges, 'cross-module reference')} below confidence {payload
@@ -183,8 +125,7 @@
       <summary>
         Mutual dependencies
         <span class="dim">
-          · {plural(layout.mutual.length, 'pair')} — the lighter direction, dashed when
-          selected
+          · {plural(layout.mutual.length, 'pair')} · {graphText('双箭头，保留两个方向计数', 'double arrow, both directional counts retained')}
         </span>
       </summary>
       {#each layout.mutual.slice(0, 8) as pair (pair.back.source + pair.back.target)}
@@ -199,21 +140,21 @@
     </details>
   {/if}
 
-  {#if layout.moduleCycles.length > 0}
+  {#if moduleCycles.length > 0}
     <details>
       <summary>
-        Dependency cycles
+        {graphText('模块级循环', 'Module cycles')}
         <span class="dim">
-          · {plural(layout.moduleCycles.length, 'loop')} of three or more modules
+          · {moduleCycles.length}
         </span>
       </summary>
-      {#each layout.moduleCycles.slice(0, 6) as cycle, i (i)}
-        <div class="cyc">{cycle.join(' → ')} → {cycle[0]}</div>
+      {#each moduleCycles.slice(0, 6) as cycle, i (i)}
+        <div class="cyc"><button onclick={() => onSelect(cycle[0] ?? null)}>{cycle.join(' → ')} → {cycle[0]}</button></div>
       {/each}
     </details>
   {/if}
 
-  {#if payload.cycles.total > 0}
+  {#if payload.cycles.total > 0 && (payload.detailsDeferred === undefined || detailsRequested)}
     <details>
       <summary>
         Circular imports between files
@@ -257,15 +198,6 @@
         {/if}
       </p>
 
-      {#if (selectedModule.dependents?.files ?? 0) > 0}
-        <p class="reach">
-          <b>{plural(selectedModule.dependents.files, 'file')}</b> outside it, across
-          {plural(selectedModule.dependents.modules, 'module')}, reference straight into it — the
-          floor on what a change here has to be checked against, and the bar along the bottom of
-          the box.
-        </p>
-      {/if}
-
       {#if selectedNode?.island}
         <p class="island">
           Nothing in the index depends on this module — no import, call or reference crosses into
@@ -276,16 +208,19 @@
       {@render linkList('depends on', dependencies, 'target')}
       {@render linkList('depended on by', dependents, 'source')}
 
-      <div class="pair label">files</div>
-      {#if files.length > 0}
-        {#each files as file (file)}
+      {#if target?.kind === 'file'}
+        <a class="filerow" href={fileHref(target.path)}>{target.path}</a>
+      {:else if target && getGraphAdapter().browse}
+        <DirectoryBrowser root={target.path} filesOnly={target.kind === 'root-files'} onOpen={onSelectRoot} />
+      {:else if files.length > 0}
+        <VirtualList items={files}>{#snippet row(file)}
           <a
             class="filerow"
             class:gen={generatedFiles.has(file)}
             href={fileHref(file)}
             title={generatedFiles.has(file) ? `${file} — tool-generated` : file}>{file}</a
           >
-        {/each}
+        {/snippet}</VirtualList>
       {:else}
         <div class="pair dim">no files in the index for this module</div>
       {/if}
@@ -303,28 +238,32 @@
 {#snippet linkList(label: string, links: WireMapLink[], side: 'source' | 'target')}
   <div class="pair label">{label}</div>
   {#if links.length > 0}
-    {#each links as link (link.source + link.target)}
+    <VirtualList items={links}>{#snippet row(link)}
       <div class="pair">
         <b>{side === 'target' ? link.target : link.source}</b>
         <span>{link.count}</span>
       </div>
-    {/each}
+    {/snippet}</VirtualList>
   {:else}
     <div class="pair dim">nothing</div>
   {/if}
 {/snippet}
 
 <style>
+  .load-details{min-height:36px;padding:4px 10px;border:1px solid var(--rule);background:var(--paper);color:var(--ink);font:14px var(--sans)}
   .mapside {
-    border-left: 1px solid var(--rule-soft);
+    border-left: 1px solid var(--route-branch);
     overflow: auto;
     padding: 14px 16px;
-    background: var(--paper);
+    background: var(--paper-2);
+    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--route-branch) 28%, transparent);
   }
   h2 {
     margin: 0 0 6px;
     font-size: 15px;
     font-weight: 600;
+    padding-left: 8px;
+    border-left: 3px solid var(--route-main);
   }
   p {
     margin: 0 0 10px;
@@ -339,41 +278,6 @@
   .notes p {
     font-size: 11.5px;
     margin-bottom: 8px;
-  }
-  .reach {
-    font-size: 11.5px;
-    margin: 0 0 8px;
-  }
-  .field {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 12.5px;
-    color: var(--ink-2);
-    margin: 12px 0 8px;
-  }
-  .field select {
-    flex: 1 1 auto;
-    min-width: 0;
-    font: 12px var(--mono);
-    color: var(--ink);
-    background: var(--paper);
-    border: 1px solid var(--rule-soft);
-    border-radius: 0;
-    padding: 3px 4px;
-  }
-  .toggle {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 12.5px;
-    color: var(--ink-2);
-    margin: 0 0 12px;
-    cursor: pointer;
-  }
-  .toggle input {
-    margin: 0;
-    accent-color: var(--ink);
   }
   details {
     margin: 4px 0 10px;

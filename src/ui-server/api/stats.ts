@@ -92,7 +92,7 @@ export function resetBlastScaleCache(): void {
   cachedScale = null;
 }
 
-export function buildStats(cg: CodeGraph, projectRoot: string): unknown {
+export function buildStats(cg: CodeGraph, projectRoot: string, summary = false): unknown {
   const stats = cg.getStats();
   const build = cg.getIndexBuildInfo();
 
@@ -144,6 +144,6 @@ export function buildStats(cg: CodeGraph, projectRoot: string): unknown {
      * bare number. See {@link blastScaleFor} for what "sampled" costs and
      * concedes.
      */
-    blastScale: blastScaleFor(cg, projectRoot, stats.edgeCount),
+    blastScale: summary ? { maxDirect: 0, maxWithinHops: 0, hops: BLAST_DEPTH, sampled: 0, estimated: true } : blastScaleFor(cg, projectRoot, stats.edgeCount),
   };
 }

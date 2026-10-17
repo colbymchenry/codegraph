@@ -1,3 +1,4 @@
+let projectEpoch = 0;
 /**
  * The trail — the path of symbols the reader walked to get here.
  *
@@ -44,6 +45,7 @@ function remember(id: string, info: { name?: string | null; kind?: string | null
 }
 
 export const trail = {
+  resetProject(): void { projectEpoch++; hops = []; known.clear(); nameless.clear(); },
   get hops(): readonly TrailHop[] {
     return hops;
   },
@@ -145,12 +147,14 @@ export const trail = {
 const nameless = new Set<string>();
 
 export async function resolveTrailNames(): Promise<void> {
+  const epoch = projectEpoch;
   const unknown = hops
     .filter((hop) => !hop.name && !known.get(hop.id)?.name && !nameless.has(hop.id))
     .map((hop) => hop.id);
   if (unknown.length === 0) return;
   try {
     const { items, missing } = await fetchNodeRefs(unknown);
+    if (epoch !== projectEpoch) return;
     for (const node of items) {
       trail.resolve(node.id, {
         name: node.kind === 'file' ? node.file : node.name,

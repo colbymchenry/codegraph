@@ -31,7 +31,8 @@ import {
   wrapText,
 } from '../ui/src/lib/export-svg';
 import { buildFlowLayout } from '../ui/src/lib/flow-model';
-import { buildMapLayout } from '../ui/src/lib/map-model';
+import { mapEdgePath } from '../ui/src/lib/map-edge-path';
+import { buildMapLayout, portPoint, isEdgeVisible } from '../ui/src/lib/map-model';
 import type {
   WireFlow,
   WireFlowBoundary,
@@ -408,6 +409,18 @@ describe('flowSvg', () => {
     expect(svg).toContain('>right</text>');
   });
 
+  it('uses the route palette for the active path and its inactive branches', () => {
+    const both = [flow('a', ['start', 'left', 'end']), flow('b', ['start', 'right', 'end'])];
+    const svg = flowSvg(buildFlowLayout(both, 'a'), { activeFlowId: 'a', showAll: true });
+
+    expect(EXPORT_COLORS.routeMain).toBe('#b66a00');
+    expect(EXPORT_COLORS.routeBranch).toBe('#147c98');
+    expect(svg).toContain(`stroke="${EXPORT_COLORS.routeMain}"`);
+    expect(svg).toContain(`stroke="${EXPORT_COLORS.routeBranch}"`);
+    expect(svg).toContain('data-route-station="main"');
+    expect(svg).toContain('data-route-station="branch"');
+  });
+
   it('writes the caption next to the mark', () => {
     const svg = flowSvg(layout, { caption: 'execute → rowToFileRecord · 3 hops' });
     expect(svg).toContain('execute → rowToFileRecord · 3 hops');
@@ -433,6 +446,20 @@ describe('mapSvg', () => {
     ],
   };
   const layout = buildMapLayout(payload, { includeTests: false });
+
+  it.each(['curve', 'straight'] as const)('导出 %s 线型复用端口路径并保留末端箭头', edgeStyle => {
+    const svg = mapSvg(layout, { edgeStyle });
+    assertWellFormed(svg);
+    for (const edge of layout.edges.filter(edge => isEdgeVisible(edge, null))) {
+      const from = layout.nodes.find(node => node.id === edge.source)!;
+      const to = layout.nodes.find(node => node.id === edge.target)!;
+      const path = mapEdgePath({ source: portPoint(from, edge.id, 'source'), target: portPoint(to, edge.id, 'target') }, edgeStyle);
+      expect(svg).toContain(`<path d="${path}"`);
+      const element = svg.slice(svg.indexOf(`<path d="${path}"`)).split('/>')[0]!;
+      expect(element).toContain('marker-end="url(#map-arrow-');
+    }
+    if (edgeStyle === 'curve') expect(svg).toBe(mapSvg(layout));
+  });
 
   it('is well-formed, light, and marked', () => {
     const svg = mapSvg(layout);
@@ -504,6 +531,39 @@ describe('mapSvg', () => {
     );
   });
 
+  it('uses branch, focused and return route colours without losing dashed cycles', () => {
+    const mutual = buildMapLayout(
+      {
+        modules: [mod('src/a'), mod('src/b'), mod('src/c')],
+        links: [link('src/a', 'src/b', 12), link('src/b', 'src/a', 4), link('src/b', 'src/c', 8)],
+      },
+      { includeTests: false }
+    );
+
+    const resting = mapSvg(mutual);
+    const focused = mapSvg(mutual, { selected: 'src/b' });
+
+    expect(resting).toContain(`stroke="${EXPORT_COLORS.routeBranch}"`);
+    expect(focused).toContain(`stroke="${EXPORT_COLORS.routeMain}"`);
+    expect(focused).toContain(`stroke="${EXPORT_COLORS.routeReturn}"`);
+    expect(focused).toContain('stroke-dasharray="4 3"');
+  });
+
+  it('exports tactical stations for focused, branch and muted modules', () => {
+    const stations = buildMapLayout(
+      {
+        modules: [mod('src/a'), mod('src/b'), mod('src/apart')],
+        links: [link('src/a', 'src/b', 12)],
+      },
+      { includeTests: false }
+    );
+    const svg = mapSvg(stations, { selected: 'src/a' });
+
+    expect(svg).toContain('data-route-station="main"');
+    expect(svg).toContain('data-route-station="branch"');
+    expect(svg).toContain('data-route-station="muted"');
+  });
+
   it('dims a module the selection does not touch, and only that one', () => {
     // src/bin reaches both other modules, so a fixture needs a fourth module
     // standing apart before dimming has anything to say.
@@ -512,8 +572,8 @@ describe('mapSvg', () => {
       { includeTests: false }
     );
     const svg = mapSvg(apart, { selected: 'src/bin' });
-    // Exactly one box goes grey: its rule and its two lines of text.
-    expect(svg.split(`stroke="${EXPORT_COLORS.ink4}"`).length - 1).toBe(1);
+    // 只有一个站点弱化；颜色同时用于状态轨和圆环，因此以语义标记计数。
+    expect(svg.split('data-route-station="muted"').length - 1).toBe(1);
     expect(svg.split(`fill="${EXPORT_COLORS.ink4}"`).length - 1).toBe(2);
   });
 

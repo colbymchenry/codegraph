@@ -43,6 +43,7 @@ import { badRequest, intParam, notFound } from './respond';
 import { createSiteReader } from './when';
 import type { BranchGuard, SiteLoop, SiteTrigger } from '../../graph/branch-guards';
 import { buildProgram, type ProgramSite, type WireProgram } from './program';
+import { enforceStepsBudget, type GraphBudgetMetadata } from './graph-budget';
 import { classifyEffect, implicitResponseStatus, responseStatus, type Effect } from './effects';
 import { guardLabel } from '../../graph/branch-guards';
 import { looksLikeComponent, routeRoots } from './route-roots';
@@ -203,7 +204,7 @@ export interface WireStepLink {
   trigger?: WireStepTrigger;
 }
 
-export interface WireStepsPayload {
+export interface WireStepsPayload extends GraphBudgetMetadata {
   anchor: WireNodeRef;
   /** Other symbols that share the anchor's name, when it was given by name. */
   ambiguous: WireNodeRef[];
@@ -1567,7 +1568,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     },
   });
 
-  return {
+  const payload: WireStepsPayload = {
     anchor: toNodeRef(anchor),
     ambiguous,
     project,
@@ -1584,6 +1585,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     index,
     timing: { elapsedMs: Date.now() - started },
   };
+  return query.get('bounded') === '1' ? enforceStepsBudget(payload) : payload;
 }
 
 // =============================================================================

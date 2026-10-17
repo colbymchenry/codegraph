@@ -30,7 +30,15 @@ export default defineWorkspace([
     test: {
       name: 'engine',
       include: ['__tests__/**/*.test.ts'],
-      exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
+      exclude: [
+        '**/node_modules/**',
+        '**/dist/**',
+        '__tests__/ui-package.test.ts',
+        '__tests__/ui-i18n.test.ts',
+        '__tests__/ui-theme-preference.test.ts',
+        '__tests__/ui-guide.test.ts',
+        '__tests__/ui-legend-i18n.test.ts',
+      ],
     },
   },
   {
@@ -48,16 +56,14 @@ export default defineWorkspace([
     test: {
       name: 'ui',
       globals: true,
-      include: ['__tests__/ui-package.test.ts'],
+      include: [
+        '__tests__/ui-package.test.ts',
+        '__tests__/ui-i18n.test.ts',
+        '__tests__/ui-theme-preference.test.ts',
+        '__tests__/ui-guide.test.ts',
+        '__tests__/ui-legend-i18n.test.ts',
+      ],
       environment: 'jsdom',
-      server: {
-        deps: {
-          // `@xyflow/svelte` ships uncompiled `.svelte` files, so it has to go
-          // through the plugin above rather than be externalised to Node,
-          // which has no idea what a `.svelte` file is.
-          inline: [/@xyflow\/svelte/],
-        },
-      },
     },
   },
 ]);

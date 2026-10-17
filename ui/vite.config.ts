@@ -25,6 +25,7 @@ export default defineConfig(({ command }) => {
 
   return {
     plugins: [svelte()],
+    worker: { format: 'es' },
     // Relative asset URLs: the CLI serves this at '/', but a relative base also
     // survives being opened from the filesystem or mounted under a sub-path.
     base: './',
@@ -42,6 +43,7 @@ export default defineConfig(({ command }) => {
     server: {
       host: '127.0.0.1',
       port: 5174,
+      proxy: process.env.CODEGRAPH_UI_API ? { '/api': { target: process.env.CODEGRAPH_UI_API, changeOrigin: true } } : undefined,
     },
   };
 });

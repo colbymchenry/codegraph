@@ -1,3 +1,4 @@
+import { dispatchWorkbench } from './workbench';
 /**
  * The read-only JSON API the viewer reads its screens from.
  *
@@ -61,7 +62,8 @@ import { buildSteps } from './steps';
 import { buildDeadCode } from './deadcode';
 import { buildFlow } from './flow';
 import { buildTrails, removeTrail, saveTrail, type TrailsOptions } from './trails';
-import { EventHub } from './events';
+import { EventHub, type EventProbeLoader } from './events';
+import { buildIndexRevision } from './index-revision';
 
 export { GraphSession } from './session';
 export { ApiError } from './respond';
@@ -147,6 +149,10 @@ export interface GraphApi {
 }
 
 export interface GraphApiOptions {
+  /** 工作区将 SSE 数据库探测交给已有 Worker 池。 */
+  eventProbe?: EventProbeLoader;
+  /** SSE 可选项目标识；单项目旧协议保持原样。 */
+  projectId?: string;
   /** Absolute path of the indexed project to read. */
   projectRoot: string;
   /**
@@ -173,6 +179,9 @@ const API_INDEX = {
   readOnly: false,
   writes: ['POST /api/trails', 'DELETE /api/trails/<id>'],
   endpoints: [
+    { path: '/api/index-revision', description: '索引状态及指定时间之后最多 200 个变更文件。', params: ['since'] },
+    { path: '/api/browse', description: '按目录、文件或符号分页浏览项目。', params: ['root', 'kind', 'cursor', 'limit'] },
+    { path: '/api/neighbors', description: '按方向分页读取节点关系，保留独立调用位置。', params: ['id', 'direction', 'cursor', 'limit'] },
     { path: '/api/stats', description: 'Index state, graph counts, detected frameworks.' },
     { path: '/api/search', description: 'Ranked symbol search.', params: ['q', 'limit'] },
     {
@@ -243,7 +252,7 @@ export function createGraphApi(options: GraphApiOptions): GraphApi {
   const session = new GraphSession(options.projectRoot);
   // Watches nothing until a browser subscribes, and stops again when the last
   // one goes away — mounting the API costs no watch descriptors.
-  const events = new EventHub(options.projectRoot, session);
+  const events = new EventHub(options.projectRoot, session, options.projectId, options.eventProbe);
   const trails: TrailsOptions = {
     readOnly: options.readOnly === true,
     readOnlyReason:
@@ -263,11 +272,16 @@ export function createGraphApi(options: GraphApiOptions): GraphApi {
       if (ctx.method === 'POST' || ctx.method === 'DELETE') {
         return await dispatchWrite(route, req, res, ctx, session, trails);
       }
+      if (route === '/api/browse' || route === '/api/neighbors') {
+        return ok(res, dispatchWorkbench(session.acquire(), ctx.projectRoot, route, ctx.query), ctx.method);
+      }
       switch (route) {
         case '/api':
           return ok(res, API_INDEX, ctx.method);
+        case '/api/index-revision':
+          return ok(res, buildIndexRevision(session.acquire(), ctx.query), ctx.method);
         case '/api/stats':
-          return ok(res, buildStats(session.acquire(), ctx.projectRoot), ctx.method);
+          return ok(res, buildStats(session.acquire(), ctx.projectRoot, ctx.query.get('summary') === '1'), ctx.method);
         case '/api/search':
           return ok(res, buildSearch(session.acquire(), ctx.query), ctx.method);
         case '/api/routes':
@@ -275,7 +289,7 @@ export function createGraphApi(options: GraphApiOptions): GraphApi {
         case '/api/map':
           return ok(res, buildMap(session.acquire(), ctx.projectRoot, ctx.query), ctx.method);
         case '/api/screens':
-          return ok(res, await buildScreens(session.acquire(), ctx.projectRoot), ctx.method);
+          return ok(res, await buildScreens(session.acquire(), ctx.projectRoot, ctx.query), ctx.method);
         case '/api/steps':
           return ok(res, await buildSteps(session.acquire(), ctx.projectRoot, ctx.query), ctx.method);
         case '/api/deadcode':

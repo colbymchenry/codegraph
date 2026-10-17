@@ -1,0 +1,7 @@
+.cg-select{display:inline-flex;position:relative;min-width:0;max-width:100%;vertical-align:middle}
+.cg-select>button{font:inherit;color:var(--ink);background:var(--paper-2);border:1px solid var(--rule);border-radius:4px;padding:6px 8px;min-height:32px;cursor:pointer;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cg-select-menu{position:absolute;left:0;top:100%;z-index:100;min-width:100%;width:max-content;max-width:min(360px,85vw);overflow:auto;padding:6px;box-sizing:border-box;background:var(--paper-2);color:var(--ink);border:1px solid var(--rule);border-radius:5px;box-shadow:0 6px 20px #0003;display:flex;flex-direction:column;gap:3px}
+.cg-select-menu[hidden]{display:none}
+.cg-select-menu>button{font:inherit;text-align:left;border:0;border-radius:3px;background:transparent;color:inherit;padding:7px 10px;cursor:pointer;white-space:normal}
+.cg-select-menu>button:hover,.cg-select-menu>button:focus-visible,.cg-select-menu>button[aria-selected=true]{background:var(--paper);outline:1px solid var(--route-main);outline-offset:-1px}
+.cg-select button:disabled{opacity:.4;cursor:default}

@@ -1,0 +1,85 @@
+name: Pinable sync checks
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        default: ''
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pinable-sync-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CODEGRAPH_TELEMETRY: '0'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Verify upstream ancestry and README ownership
+        run: node scripts/pinable/sync-upstream.mjs --check
+      - name: Test safe sync and repeated merges
+        run: node --test scripts/pinable/sync-upstream.test.mjs
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:lib
+      - name: Full engine and UI regression suite
+        shell: bash
+        run: npm test -- --maxWorkers=2 --minWorkers=1 2>&1 | tee full-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pinable-full-test-log
+          path: full-tests.log
+          if-no-files-found: ignore
+
+  native-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Build native extraction kernel
+        run: npm run build:kernel
+      - name: Native extraction and resolution regressions
+        shell: bash
+        run: >-
+          npm test -- __tests__/kernel-tsjs-parity.test.ts
+          __tests__/rust-self-owner.test.ts __tests__/awaited-receiver.test.ts
+          __tests__/release-main-regressions.test.ts
+          --maxWorkers=2 --minWorkers=1 2>&1 | tee native-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pinable-native-test-log
+          path: native-tests.log
+          if-no-files-found: ignore

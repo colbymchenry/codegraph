@@ -644,6 +644,9 @@ export interface WireMapCycle {
 }
 
 export interface WireMapPayload {
+  /** 未加载文件级循环；不能据此推断不存在循环。 */
+  detailsDeferred?: boolean;
+  budget?: { exceeded: boolean; nodes: number; edges: number; maxNodes: number; maxEdges: number; edgesExact?: boolean };
   root: string;
   depth: number;
   roots: Array<{ root: string; label: string; files: number }>;
@@ -1035,4 +1038,16 @@ export interface WireTrails {
   replaced?: boolean;
   /** The id just removed, on the answer to a delete. */
   deleted?: string;
+}
+
+/** 工作台分页只声明已读取的数据；游标绑定索引版本。 */
+export interface WireBrowsePage {
+  items: Array<{ kind: 'directory' | 'file' | 'symbol'; path: string; name?: string; files?: number; node?: WireNodeRef }>;
+  nextCursor: string | null;
+  revision: string;
+}
+export interface WireNeighborPage {
+  items: Array<{ edge: WireEdge; node: WireNodeRef }>;
+  nextCursor: string | null;
+  revision: string;
 }

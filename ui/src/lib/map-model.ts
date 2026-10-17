@@ -185,6 +185,8 @@ export interface MapNodeLayout {
 }
 
 export interface MapEdgeLayout {
+  /** Bend points supplied by the architecture layout worker. */
+  controlPoints?: [number, number][];
   id: string;
   source: string;
   target: string;
@@ -197,6 +199,8 @@ export interface MapEdgeLayout {
   back: boolean;
   /** Below the weight threshold — drawn only when a touching module is selected. */
   thin: boolean;
+  /** 大型循环网格内的边仍需在概览中可见。 */
+  compactCycle?: boolean;
   /**
    * Which way the link runs through the layering: `down` to a lower layer,
    * `up` to a higher one, `level` along its own. Under `directional` ports
@@ -239,6 +243,8 @@ export interface MapLayout {
   mutual: MutualPair[];
   /** Module-level cycles of three or more, in the drawn graph. */
   moduleCycles: string[][];
+  /** 以确定性网格展示的大型强连通分量。 */
+  compactCycles?: string[][];
 }
 
 export interface MapLayoutOptions {
@@ -289,7 +295,7 @@ export function strokeWidthFor(count: number): number {
 }
 
 /**
- * A link's stable identity, and the id Svelte Flow keys its edge on.
+ * A link's stable identity, and the id G6 keys its edge on.
  *
  * NUL is the separator because a module id is a path and a path may contain
  * anything else — including the spaces, arrows and colons that read nicer.
@@ -344,10 +350,42 @@ export function buildMapLayout(
   for (const link of acyclic) out.get(link.source)?.push(link.target);
   for (const list of out.values()) list.sort();
 
+  const components = options.layering ? [] : moduleCycles(modules.map(m => m.id), layeringLinks, 1);
+  const compactCycles = components.filter(group => group.length >= 20);
+  const compactMember = new Map<string, string>();
+  for (const group of compactCycles) for (const id of group) compactMember.set(id, group[0]!);
   const layer = new Map<string, number>();
   if (options.layering) {
     for (const [id, value] of options.layering(modules.map((m) => m.id), acyclic)) layer.set(id, value);
     for (const module of modules) if (!layer.has(module.id)) layer.set(module.id, 0);
+  } else if (compactCycles.length) {
+    // 先在缩合图中排依赖层，再给每个循环预留完整网格高度，跨分量边仍向下。
+    const groupOf = new Map<string, string>();
+    const rowsNeeded = new Map<string, number>();
+    const columns = new Map<string, number>();
+    for (const group of components) {
+      const key = group[0]!;
+      const cols = group.length >= 20 ? Math.ceil(Math.sqrt(group.length)) : 1;
+      columns.set(key, cols);
+      rowsNeeded.set(key, Math.ceil(group.length / cols));
+      for (const id of group) groupOf.set(id, key);
+    }
+    const dependencies = new Map(components.map(group => [group[0]!, new Set<string>()]));
+    for (const link of layeringLinks) {
+      const from = groupOf.get(link.source)!; const to = groupOf.get(link.target)!;
+      if (from !== to) dependencies.get(from)!.add(to);
+    }
+    const bases = new Map<string, number>();
+    const baseOf = (id: string): number => {
+      const known = bases.get(id); if (known !== undefined) return known;
+      let base = 0;
+      for (const next of dependencies.get(id) ?? []) base = Math.max(base, baseOf(next) + rowsNeeded.get(next)!);
+      bases.set(id, base); return base;
+    };
+    for (const group of components) {
+      const key = group[0]!; const base = baseOf(key); const cols = columns.get(key)!;
+      group.forEach((id, index) => layer.set(id, base + rowsNeeded.get(key)! - 1 - Math.floor(index / cols)));
+    }
   } else {
     for (const module of modules) longestPath(module.id, out, layer, new Set());
   }
@@ -495,6 +533,7 @@ export function buildMapLayout(
       width: strokeWidthFor(link.count),
       back: from.layer <= to.layer,
       thin: link.count < minWeight,
+      ...(compactMember.has(link.source) && compactMember.get(link.source) === compactMember.get(link.target) ? { compactCycle: true } : {}),
       route,
     };
     edges.push(edge);
@@ -551,9 +590,10 @@ export function buildMapLayout(
       totalLinks: links.length,
     },
     minWeight,
-    hiddenLinks: edges.filter((e) => e.thin || e.back).length,
+    hiddenLinks: edges.filter((e) => !isEdgeVisible(e, null)).length,
     mutual: mutual.sort((a, b) => b.back.count - a.back.count || a.back.source.localeCompare(b.back.source)),
     moduleCycles: moduleCycles(modules.map((m) => m.id), edges),
+    ...(compactCycles.length ? { compactCycles } : {}),
   };
 }
 
@@ -566,6 +606,7 @@ export function buildMapLayout(
  */
 export function isEdgeVisible(edge: MapEdgeLayout, selected: string | null): boolean {
   if (selected !== null) return edge.source === selected || edge.target === selected;
+  if (edge.compactCycle && !edge.thin) return true;
   return !edge.thin && !edge.back;
 }
 
@@ -658,7 +699,7 @@ function longestPath(
 }
 
 /** Strongly connected components of three or more modules, in the drawn graph. */
-function moduleCycles(ids: readonly string[], edges: readonly MapEdgeLayout[]): string[][] {
+function moduleCycles(ids: readonly string[], edges: readonly Pick<MapEdgeLayout, 'source' | 'target'>[], minimum = 3): string[][] {
   const out = new Map<string, string[]>(ids.map((id) => [id, []]));
   for (const edge of edges) out.get(edge.source)?.push(edge.target);
   for (const list of out.values()) list.sort();
@@ -693,7 +734,7 @@ function moduleCycles(ids: readonly string[], edges: readonly MapEdgeLayout[]): 
         component.push(popped);
         if (popped === id) break;
       }
-      if (component.length > 2) found.push(component.sort());
+      if (component.length >= minimum) found.push(component.sort());
     }
   };
 

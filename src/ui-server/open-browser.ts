@@ -68,6 +68,7 @@ export function openBrowser(url: string, platform: NodeJS.Platform = process.pla
     const child = spawn(open.command, open.args, {
       detached: true,
       stdio: 'ignore',
+      windowsHide: true,
       // `start` is a shell builtin reached through `cmd /c`, so no shell here.
       shell: false,
     });

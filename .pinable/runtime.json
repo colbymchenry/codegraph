@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "nodeVersion": "v24.21.0",
+  "releasePrefix": "pinable-runtime-v",
+  "targets": ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"]
+}

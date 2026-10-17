@@ -171,7 +171,7 @@ src/
   index.ts                the LIBRARY's entry — everything the package exports
   main.ts                 fonts + tokens, mounts App into index.html's #app
   app.css                 the app's reset, shell grid and primitives
-  lib/theme.css           the design tokens (light/dark) + the Svelte Flow map
+  lib/theme.css           the shared design tokens (light/dark)
   lib/adapter.ts          GraphAdapter, createHttpAdapter, the registry
   lib/wire.ts             every Wire* payload shape — types only, no runtime
   lib/api.ts              the screens' calls, one line each, over the adapter
@@ -304,9 +304,7 @@ Home.
   the selected screen fifteen of them share one box's width), in the first of
   five lanes walking away from that box in which it overlaps nothing, centred
   on its own curve at that height. A pill that fits nowhere is counted and the
-  panel says so. Pills are HTML in Svelte Flow's edge-label layer, above every
-  stroke; the selection alone decides where they go, so hovering never reflows
-  them.
+  panel says so. The retained model computes semantic label text; the live G6 renderer places labels on the current routed edge. Hovering updates styles without relayout.
 - **The panel and the picture point at each other.** A row under the pointer
   lights its line and prints the whole condition on it; a line under the
   pointer tints its row.
@@ -314,6 +312,12 @@ Home.
 The geometry — ports, curves, pill lanes — is arithmetic in `screens-model.ts`
 and `map-model.ts`, tested without a browser in
 `__tests__/ui-screens-model.test.ts`.
+
+## G6 graph workbench
+
+All four canvases now use exact `@antv/g6@5.1.1` and `@antv/layout@2.0.0`. The historical geometry helpers described above remain public for compatibility; live rendering uses `GraphScene` / `GraphController`, native Canvas nodes, and Svelte HTML cards for Flow. Selection and hover update styles without relayout. Current Map/Flow exports capture rendered paths and code, not the legacy SVG layout.
+
+See [architecture and verification](../docs/design/g6-graph-workbench.md) for layouts, shared obstacle routing, grouping, directed BFS and budgets. To inspect fixtures locally, run `npm run dev -w ui` and open `/g6-verify.html?view=map` (also flow/screens/steps), or `/g6-verify.html?nodes=400`. These verification entries are excluded from production builds.
 
 ## Where the graph stops
 

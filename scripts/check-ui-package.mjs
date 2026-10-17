@@ -38,6 +38,14 @@ const DIST = join(UI, 'dist');
  * a host imports it.
  */
 const APP_ONLY = [
+  'lib/workspace.svelte.js',
+  'lib/workspace.svelte.d.ts',
+  'components/ProjectOverview.svelte',
+  'components/ProjectOverview.svelte.d.ts',
+  'components/WorkspaceOverview.svelte',
+  'components/WorkspaceOverview.svelte.d.ts',
+  'components/WorkspaceSearch.svelte',
+  'components/WorkspaceSearch.svelte.d.ts',
   'main.js',
   'main.d.ts',
   'App.svelte',
@@ -93,6 +101,11 @@ const all = [...files(DIST)];
  * looking is right for both.
  */
 function resolveSpecifiers(source, fromFile) {
+  // svelte-package 会编译 Worker，URL 字面量也必须指向发布后的 JS。
+  source = source.replace(/new URL\((['"])(\.[^'"]+\.worker)\.ts\1,\s*import\.meta\.url\)/g, (match, quote, worker) => {
+    if (!existsSync(resolve(dirname(fromFile), `${worker}.js`))) fail(`Missing worker asset: ${worker}.js`);
+    return `new URL(${quote}${worker}.js${quote}, import.meta.url)`;
+  });
   return source.replace(
     /(\bfrom\s*|\bimport\s*\(\s*)(['"])(\.[^'"]*)\2/g,
     (match, head, quote, spec) => {

@@ -14,6 +14,7 @@
   that drifts away from its line is worse than no rail at all.
 -->
 <script lang="ts">
+  import SymbolRelationships from '../components/SymbolRelationships.svelte';
   import { tick, untrack } from 'svelte';
   import CalleeRail from '../components/symbol/CalleeRail.svelte';
   import CallersRail from '../components/symbol/CallersRail.svelte';
@@ -618,6 +619,7 @@
               testFiles={callers.tests.files.length}
             />
           {/if}
+          <SymbolRelationships id={payload.node.id} file={payload.node.file} />
         </section>
 
         <aside class="rail-right" bind:this={railEl} aria-label="Calls">

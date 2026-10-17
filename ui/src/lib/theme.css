@@ -1,10 +1,8 @@
 /* =====================================================================
    @colbymchenry/codegraph-ui — design tokens
 
-   The engine's paper/ink editorial system, as specified in
-   docs/design/codegraph-ui-design-spec.md §2.2: flat, hairline rules,
-   square corners everywhere, no shadows, no gradients, sentence case,
-   one oxblood accent, one amber (the "untested" badge).
+   线路主题遵循 docs/design/codegraph-ui-design-spec.md §2.2：方形战术站点、
+   交通线路式关系线、句式大小写，以及 Archivo / IBM Plex Mono 双字体。
 
    This file is the package's whole theming surface. Import it once and
    override any variable on a narrower selector — the components read
@@ -20,35 +18,38 @@
 
 /* ---------- tokens: light / paper (the bare :root set) ---------- */
 :root {
-  --paper: #f7f6f2;
-  --paper-2: #f1efe8;
-  --press: #e8e6dd;
-  --press-2: #dedbd0;
-  --ink: #16150f;
-  --ink-2: #56544a;
-  --ink-3: #87847a;
-  --ink-4: #b4b1a5;
-  --rule: #16150f;
-  --rule-soft: #d6d3c8;
-  --rule-faint: #e6e3d9;
-  --accent: #7a2230;
-  --accent-ink: #5e1a25;
-  --accent-soft: #f0e3e5;
-  --accent-line: #d9b3b9;
+  --paper: #f7f8fa;
+  --paper-2: #eef1f5;
+  --press: #e3e8ef;
+  --press-2: #d2dbe6;
+  --ink: #202b3b;
+  --ink-2: #455369;
+  --ink-3: #58677c;
+  --ink-4: #8390a1;
+  --node-border: #71849a;
+  --rule: #c5ceda;
+  --rule-soft: #d2d9e3;
+  --rule-faint: #e3e8ef;
+  --accent: #3867a8;
+  --accent-ink: #294f85;
+  --accent-wash: var(--accent-soft);
+  --accent-soft: #e5edf8;
+  --accent-line: #7196c8;
   --amber: #8a5a0b;
   --amber-soft: #f3e9d2;
 
-  /* The one code colour that is not a plain re-use of the ink ramp.
-     The spec asks for comments at --ink-3; measured against --paper that
-     is 3.46:1 and against the hot-line tint --accent-soft it is 3.00:1,
-     both under the 4.5:1 an AA reading of 12.5px body text needs. This is
-     the smallest step DOWN the same warm-grey ramp that clears 4.5:1 on
-     all three backgrounds a code line can have (paper 5.23, paper-2 4.92,
-     accent-soft 4.53) while staying quieter than --ink-2, which strings
-     and numbers use — so the recession order the spec describes is
-     unchanged, only legible. Dark needed the mirror step UP (4.51 on
-     accent-soft, where --ink-3 was 4.10). */
-  --code-comment: #6a675d;
+  /* 颜色只补充关系语义：实线仍表示直接关系，虚线仍表示推断或回路，
+     粗细仍表示权重，因此线路在无颜色环境下也可辨认。 */
+  --route-main: #3867a8;
+  --route-branch: #147c98;
+  --route-return: #b8443e;
+  --route-muted: #8390a1;
+  --route-grid: #e3e8ef;
+  --route-band: #eef1f5;
+
+  /* 注释沿用次级文字色；当前亮暗调色板在纸面、次级纸面和强调底色上
+     均保持正文所需的 AA 对比度，同时仍弱于字符串和数字使用的 --ink-2。 */
+  --code-comment: #58677c;
 
   --sans: 'Archivo Variable', 'Archivo', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
@@ -57,7 +58,7 @@
 
   /* App-shell geometry, shared by the grid and by anything that has to
      offset itself under the bars (sticky rail headers, SVG overlays). */
-  --topbar-h: 48px;
+  --topbar-h: 64px;
   --trailbar-h: 34px;
 
   color-scheme: light dark;
@@ -69,24 +70,31 @@
    win over the OS preference. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --paper: #16150f;
-    --paper-2: #1c1a14;
-    --press: #23211a;
-    --press-2: #2c2a22;
-    --ink: #f3f1ea;
-    --ink-2: #b8b5a8;
-    --ink-3: #87847a;
-    --ink-4: #5d5b52;
-    --rule: #f3f1ea;
-    --rule-soft: #34322a;
-    --rule-faint: #26241d;
-    --accent: #d48b96;
-    --accent-ink: #e5a5ae;
-    --accent-soft: #33201f;
-    --accent-line: #6b3a42;
+    --paper: #141a23;
+    --paper-2: #1b2330;
+    --press: #243044;
+    --press-2: #30405a;
+    --ink: #e8f1ee;
+    --ink-2: #b3c3bf;
+    --ink-3: #899e9a;
+    --ink-4: #668087;
+    --node-border: #8399af;
+  --rule: #46556b;
+    --rule-soft: #29424a;
+    --rule-faint: #172a32;
+    --accent: #87ace2;
+    --accent-ink: #b0cbf0;
+    --accent-soft: #203149;
+    --accent-line: #5475a6;
     --amber: #d9a94a;
     --amber-soft: #2e2716;
-    --code-comment: #8e8b81;
+    --route-main: #87ace2;
+    --route-branch: #49afc7;
+    --route-return: #e06a63;
+    --route-muted: #668087;
+    --route-grid: #183039;
+    --route-band: #102129;
+    --code-comment: #899e9a;
   }
 }
 
@@ -97,24 +105,31 @@
    put a light reader inside a dark application, and the reverse. */
 :root[data-theme='dark'],
 [data-theme='dark'] {
-  --paper: #16150f;
-  --paper-2: #1c1a14;
-  --press: #23211a;
-  --press-2: #2c2a22;
-  --ink: #f3f1ea;
-  --ink-2: #b8b5a8;
-  --ink-3: #87847a;
-  --ink-4: #5d5b52;
-  --rule: #f3f1ea;
-  --rule-soft: #34322a;
-  --rule-faint: #26241d;
-  --accent: #d48b96;
-  --accent-ink: #e5a5ae;
-  --accent-soft: #33201f;
-  --accent-line: #6b3a42;
+  --paper: #141a23;
+  --paper-2: #1b2330;
+  --press: #243044;
+  --press-2: #30405a;
+  --ink: #e8f1ee;
+  --ink-2: #b3c3bf;
+  --ink-3: #899e9a;
+  --ink-4: #668087;
+  --node-border: #8399af;
+  --rule: #46556b;
+  --rule-soft: #29424a;
+  --rule-faint: #172a32;
+  --accent: #87ace2;
+  --accent-ink: #b0cbf0;
+  --accent-soft: #203149;
+  --accent-line: #5475a6;
   --amber: #d9a94a;
   --amber-soft: #2e2716;
-  --code-comment: #8e8b81;
+  --route-main: #87ace2;
+  --route-branch: #49afc7;
+  --route-return: #e06a63;
+  --route-muted: #668087;
+  --route-grid: #183039;
+  --route-band: #102129;
+  --code-comment: #899e9a;
   color-scheme: dark;
 }
 
@@ -122,71 +137,30 @@
    the OS is painting dark. `:root[data-theme='light']` needs no block — the
    media query above already excludes it. */
 [data-theme='light'] {
-  --paper: #f7f6f2;
-  --paper-2: #f1efe8;
-  --press: #e8e6dd;
-  --press-2: #dedbd0;
-  --ink: #16150f;
-  --ink-2: #56544a;
-  --ink-3: #87847a;
-  --ink-4: #b4b1a5;
-  --rule: #16150f;
-  --rule-soft: #d6d3c8;
-  --rule-faint: #e6e3d9;
-  --accent: #7a2230;
-  --accent-ink: #5e1a25;
-  --accent-soft: #f0e3e5;
-  --accent-line: #d9b3b9;
+  --paper: #f7f8fa;
+  --paper-2: #eef1f5;
+  --press: #e3e8ef;
+  --press-2: #d2dbe6;
+  --ink: #202b3b;
+  --ink-2: #455369;
+  --ink-3: #58677c;
+  --ink-4: #8390a1;
+  --node-border: #71849a;
+  --rule: #c5ceda;
+  --rule-soft: #d2d9e3;
+  --rule-faint: #e3e8ef;
+  --accent: #3867a8;
+  --accent-ink: #294f85;
+  --accent-soft: #e5edf8;
+  --accent-line: #7196c8;
   --amber: #8a5a0b;
   --amber-soft: #f3e9d2;
-  --code-comment: #6a675d;
+  --route-main: #3867a8;
+  --route-branch: #147c98;
+  --route-return: #b8443e;
+  --route-muted: #8390a1;
+  --route-grid: #e3e8ef;
+  --route-band: #eef1f5;
+  --code-comment: #58677c;
   color-scheme: light;
-}
-
-/* ---------- Svelte Flow ----------
-   The Map and the Flow strip draw on @xyflow/svelte, which ships its own
-   blue-on-white palette in `--xy-*` variables. Mapping them onto the ink
-   ramp here — rather than in each canvas — is what stops a host from
-   seeing library defaults in the gaps our custom node and edge
-   components do not paint: the pane behind the cards, the controls, the
-   minimap, the selection ring, the attribution.
-
-   Set on :root so it reaches the portalled panes too. A host that wants
-   the library's own look overrides these after importing this file. */
-:root {
-  --xy-background-color: var(--paper);
-  --xy-background-pattern-color: var(--rule-faint);
-
-  --xy-edge-stroke: var(--ink-3);
-  --xy-edge-stroke-selected: var(--accent);
-  --xy-edge-stroke-width: 1;
-  --xy-connectionline-stroke: var(--ink-3);
-
-  --xy-node-color: var(--ink);
-  --xy-node-background-color: var(--paper);
-  --xy-node-border: 1px solid var(--rule-soft);
-  --xy-node-boxshadow-hover: none;
-  --xy-node-boxshadow-selected: none;
-  --xy-selection-background-color: var(--accent-soft);
-  --xy-selection-border: 1px solid var(--accent-line);
-
-  --xy-handle-background-color: transparent;
-  --xy-handle-border-color: transparent;
-
-  --xy-controls-button-background-color: var(--paper);
-  --xy-controls-button-background-color-hover: var(--press);
-  --xy-controls-button-color: var(--ink-2);
-  --xy-controls-button-color-hover: var(--ink);
-  --xy-controls-button-border-color: var(--rule-soft);
-  --xy-controls-box-shadow: none;
-
-  --xy-minimap-background-color: var(--paper-2);
-  --xy-minimap-mask-background-color: var(--paper);
-  --xy-minimap-node-background-color: var(--rule-soft);
-  --xy-minimap-node-stroke-color: var(--ink-3);
-
-  --xy-attribution-background-color: transparent;
-
-  --xy-resize-background-color: var(--accent);
-  --xy-error-color: var(--accent);
 }

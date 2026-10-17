@@ -19,7 +19,6 @@
   thing it does not mean.
 -->
 <script lang="ts">
-  import { Handle, Position } from '@xyflow/svelte';
   import { endCapText, type FlowEndCapLayout } from '../../lib/flow-model';
   import { basename } from '../../lib/symbol-model';
 
@@ -41,7 +40,6 @@
   class:dim={data.dimmed}
   style={`width:${cap.width}px;min-height:${cap.height}px`}
 >
-  <Handle type="target" position={Position.Left} id="in" isConnectable={false} />
 
   <p class="lead"><b>Where the graph stops.</b> {text.intro}</p>
 
@@ -97,7 +95,8 @@
     box-sizing: border-box;
     padding: 12px;
     background: var(--paper);
-    border: 1px dashed var(--rule-soft);
+    border: 1px dashed var(--route-muted);
+    box-shadow: inset 3px 0 0 var(--route-muted);
     color: var(--ink-2);
     font-size: 12px;
     line-height: 1.45;
@@ -155,7 +154,7 @@
   }
 
   .row:hover .nm {
-    color: var(--accent);
+    color: var(--accent-ink);
   }
 
   .nm {

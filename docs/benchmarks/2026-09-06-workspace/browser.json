@@ -1,0 +1,80 @@
+{
+  "browser": "Chromium 152.0.0.0",
+  "viewport": {
+    "width": 1088,
+    "height": 724
+  },
+  "warmGraphBeforeFinalInteractionOptimizationMs": [
+    188.1,
+    155.5,
+    155.1,
+    168.8,
+    142.1,
+    240.3,
+    168.9,
+    186.1,
+    165,
+    166.1,
+    365.4,
+    256.3,
+    172.6,
+    172.3,
+    291.1,
+    407.6,
+    260.2,
+    337,
+    297.7,
+    474.7
+  ],
+  "warmGraphP95Ms": 407.6,
+  "panZoomSample": {
+    "fps": 47.3186,
+    "frames": 30,
+    "note": "仅输入发生及其后100ms内RAF样本，2次平移及4次滚轮缩放。"
+  },
+  "workspaceSwitches": {
+    "count": 50,
+    "scopeDepths": [
+      1,
+      2
+    ],
+    "mismatch": 0,
+    "consoleErrors": 0,
+    "heapMilestonesBytes": [
+      60219054,
+      212838500,
+      42228496,
+      249262421,
+      69129214
+    ],
+    "afterNaturalGcBytes": 25985886,
+    "eventSamples": 190,
+    "eventP95Ms": 40.1
+  },
+  "limitations": [
+    "performance.memory为浏览器估计值，未强制GC。",
+    "首次暖图样本早于最后的增量本地化和Handle优化；交互复测需单独记录。",
+    "后续交互复测时浏览器工具报告Mac锁定；新增长任务、长动画帧、事件处理及可见性探针，尚未取得对应记录。"
+  ],
+  "lateInteractionSamples": {
+    "inputRangeMs": [
+      22,
+      33
+    ],
+    "selectionAndLocateRangeMs": [
+      190,
+      922
+    ],
+    "selectionTargetMs": 100,
+    "selectionTargetMet": false,
+    "note": "固定尺寸保留修复前会话的少量样本范围；未保存全部逐次事件，不据此计算P95。"
+  },
+  "fixedMeasurementRegression": {
+    "nodes": 400,
+    "changedNodeObjects": 390,
+    "dimensionsPreserved": true,
+    "handleBoundsPreserved": true,
+    "nodesInitialized": true,
+    "method": "当前 @xyflow/system adoptUserNodes 的自动回归；不是浏览器延迟测量。"
+  }
+}

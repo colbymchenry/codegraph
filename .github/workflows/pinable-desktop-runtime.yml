@@ -1,0 +1,259 @@
+name: Pinable desktop runtimes
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/pinable-desktop-runtime.yml'
+      - '.github/workflows/pinable-sync-checks.yml'
+      - '.pinable/runtime.json'
+      - 'scripts/pinable/runtime/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pinable-desktop-runtime.yml'
+      - '.pinable/runtime.json'
+      - 'scripts/pinable/runtime/**'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a new Pinable prerelease (main only; never npm or latest)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pinable-runtime-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CODEGRAPH_TELEMETRY: '0'
+  DO_NOT_TRACK: '1'
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  quality:
+    uses: ./.github/workflows/pinable-sync-checks.yml
+    with:
+      source_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test producer safety guards
+        run: python -m unittest discover -s scripts/pinable/runtime -p 'test_*.py' -v
+      - name: Test native watcher probe lifecycle
+        run: node --test scripts/pinable/runtime/test-watch-probe.cjs
+      - run: npm ci
+      - run: npm run build
+      - name: Stage locked production application
+        run: |
+          python scripts/pinable/runtime/runtime.py stage-app
+          (cd release/pinable-work/app/lib && npm ci --omit=dev --ignore-scripts)
+          python scripts/pinable/runtime/runtime.py pack-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinable-codegraph-application
+          path: release/pinable-app.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  runtime:
+    needs: prepare
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-22.04
+            goos: linux
+            goarch: amd64
+            triple: x86_64-unknown-linux-gnu
+            library: libcodegraph_kernel.so
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+            goos: linux
+            goarch: arm64
+            triple: aarch64-unknown-linux-gnu
+            library: libcodegraph_kernel.so
+          - target: darwin-x64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            triple: x86_64-apple-darwin
+            library: libcodegraph_kernel.dylib
+          - target: darwin-arm64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+            triple: aarch64-apple-darwin
+            library: libcodegraph_kernel.dylib
+          - target: win32-x64
+            runner: windows-2022
+            goos: windows
+            goarch: amd64
+            triple: x86_64-pc-windows-msvc
+            library: codegraph_kernel.dll
+          - target: win32-arm64
+            runner: windows-11-arm
+            goos: windows
+            goarch: arm64
+            triple: aarch64-pc-windows-msvc
+            library: codegraph_kernel.dll
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: pinable-codegraph-application
+          path: release
+      - name: Test and build shell-free launcher
+        working-directory: scripts/pinable/runtime/launcher
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go test ./...
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$GITHUB_WORKSPACE/release/native-launcher" .
+      - name: Build mandatory native kernel from Cargo.lock
+        run: cargo build --manifest-path codegraph-kernel/Cargo.toml --release --locked --target '${{ matrix.triple }}'
+      - name: Bundle verified official Node and locked application
+        run: >-
+          python scripts/pinable/runtime/runtime.py bundle
+          --target '${{ matrix.target }}'
+          --kernel 'codegraph-kernel/target/${{ matrix.triple }}/release/${{ matrix.library }}'
+          --launcher release/native-launcher
+      - name: Run extracted runtime on its native OS and architecture
+        run: python scripts/pinable/runtime/runtime.py verify --target '${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinable-codegraph-${{ matrix.target }}
+          path: release/pinable-runtime/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  collect:
+    needs: [quality, runtime]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: pinable-codegraph-*
+          # The application artifact is downloaded separately, not into the
+          # publish directory: it is not a distributable runtime.
+          path: release/downloaded
+      - name: Collect only six tested runtime artifacts
+        run: |
+          mkdir -p release/pinable-runtime
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
+            cp "release/downloaded/pinable-codegraph-$target/"* release/pinable-runtime/
+          done
+          python scripts/pinable/runtime/runtime.py manifest
+          (cd release/pinable-runtime && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinable-codegraph-all-platforms
+          path: release/pinable-runtime/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinable-codegraph-manifest
+          path: |
+            release/pinable-runtime/*.json
+            release/pinable-runtime/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: collect
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'PinableAgents/codegraph'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: pinable-codegraph-all-platforms
+          path: artifacts
+      - name: Publish immutable Pinable prerelease without modifying upstream releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum -c SHA256SUMS
+          sha=$(jq -er '.source.revision' codegraph-runtime-manifest.json)
+          tag=$(jq -er '.source.releaseTag' codegraph-runtime-manifest.json)
+          version=$(jq -er '.source.version' codegraph-runtime-manifest.json)
+          test "$sha" = "$GITHUB_SHA"
+          test "$tag" = "pinable-runtime-v${version}-${sha:0:12}"
+          # Fail closed on an existing tag or an unavailable remote. --target
+          # alone does not guarantee the commit when a tag already exists.
+          status=0
+          git ls-remote --exit-code --refs "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" > "$RUNNER_TEMP/runtime-tag.txt" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::Release tag already exists or could not be checked; refusing to publish."
+            exit 1
+          fi
+          # Atomically reserve a NEW tag at the verified source revision.
+          # A concurrent creator makes this POST fail; no tag is overwritten.
+          created_sha=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$tag" -f "sha=$sha" --jq '.object.sha')
+          test "$created_sha" = "$sha"
+          # No --clobber: existing tags/assets are never silently replaced.
+          printf 'Pinable Desktop CodeGraph runtime.\n\nSource: `%s`\n\nSix native-platform smoke tests and the existing full quality gates passed. See codegraph-runtime-manifest.json and SHA256SUMS. No Pinable code signing/notarization is applied. This producer manifest does not replace Desktop component-lock.json.\n' "$sha" > "$RUNNER_TEMP/runtime-release-notes.md"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --draft --prerelease --latest=false --title "Pinable CodeGraph ${version} (${sha:0:12})" \
+            --notes-file "$RUNNER_TEMP/runtime-release-notes.md" ./*
+          # Check again after draft creation: a concurrent external tag write
+          # must not publish assets under a different source revision.
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')
+          test "$tag_sha" = "$sha"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
