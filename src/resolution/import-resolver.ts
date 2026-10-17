@@ -346,7 +346,9 @@ export function resolveImportPath(
   // `fileExists` accepts `src/widgets/Chart//index.tsx` (a trailing-slash
   // specifier) or `src/widgets/./Chart/index.tsx`, which every lookup keyed by
   // the indexed path then misses (#2577).
-  const resolved = found && path.posix.normalize(found);
+  // Leave paths containing `..` unchanged: folding a parent segment after a
+  // symlink can select a different file, notably in C/C++ include directories.
+  const resolved = found && !found.split('/').includes('..') ? path.posix.normalize(found) : found;
   memo.set(key, resolved);
   return resolved;
 }

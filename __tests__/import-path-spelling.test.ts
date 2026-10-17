@@ -15,7 +15,7 @@ import { CodeGraph } from '../src';
 import { resolveImportPath } from '../src/resolution/import-resolver';
 import type { ResolutionContext } from '../src/resolution';
 
-/** A context whose `fileExists` accepts any spelling the filesystem would. */
+/** A context whose `fileExists` mirrors the resolver's lexical disk probe. */
 function contextWithFiles(files: string[]): ResolutionContext {
   const set = new Set(files);
   return {
@@ -44,13 +44,56 @@ describe('resolveImportPath returns the indexed spelling of a path', () => {
     expect(resolveImportPath('@/./lib/util', 'src/App.tsx', 'tsx', ctx)).toBe('src/lib/util.ts');
   });
 
-  it('folds a `..` segment', () => {
-    expect(resolveImportPath('src/widgets/../lib/util', 'src/App.tsx', 'tsx', ctx)).toBe('src/lib/util.ts');
+  it('preserves a `..` segment that may follow a symlink', () => {
+    expect(resolveImportPath('src/widgets/../lib/util', 'src/App.tsx', 'tsx', ctx)).toBe('src/widgets/../lib/util.ts');
   });
 
   it('leaves the plain spelling unchanged', () => {
     expect(resolveImportPath('@/widgets/Chart', 'src/App.tsx', 'tsx', ctx)).toBe('src/widgets/Chart/index.tsx');
     expect(resolveImportPath('./lib/util', 'src/App.tsx', 'tsx', ctx)).toBe('src/lib/util.ts');
+  });
+});
+
+describe('a C/C++ include containing a symlink followed by `..`', () => {
+  let root = '';
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-include-parent-'));
+    fs.mkdirSync(path.join(root, 'inc'));
+    fs.mkdirSync(path.join(root, 'headers', 'dir'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'inc', 'thing.h'), '#define WRONG_HEADER 1\n');
+    fs.writeFileSync(path.join(root, 'headers', 'thing.h'), '#define RIGHT_HEADER 1\n');
+    fs.symlinkSync(
+      path.join(root, 'headers', 'dir'),
+      path.join(root, 'inc', 'link'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    for (const ext of ['c', 'cpp']) {
+      fs.writeFileSync(path.join(root, 'src', `use.${ext}`), '#include <link/../thing.h>\n');
+    }
+    fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+      { directory: root, file: 'src/use.c', arguments: ['cc', '-Iinc', '-c', 'src/use.c'] },
+    ]));
+    cg = await CodeGraph.init(root, { index: true });
+  });
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(['c', 'cpp'])('does not fold the %s include into a different indexed header', (ext) => {
+    const fileNodes = cg.getNodesByKind('file');
+    const source = fileNodes.find((n) => n.filePath === `src/use.${ext}`)!;
+    expect(source).toBeDefined();
+    expect(fileNodes.some((n) => n.filePath === 'inc/thing.h')).toBe(true);
+    expect(fileNodes.some((n) => n.filePath === 'headers/thing.h')).toBe(true);
+    // On POSIX the physical target is headers/thing.h, not inc/thing.h.
+    // Preserve the existing unresolved result rather than inventing a wrong edge.
+    const imports = cg.getOutgoingEdges(source.id).filter((e) => e.kind === 'imports');
+    expect(imports).toEqual([]);
   });
 });
 
