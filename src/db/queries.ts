@@ -4,6 +4,7 @@
  * Prepared statements for CRUD operations on the knowledge graph.
  */
 
+import * as path from 'path';
 import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
 import {
   Node,
@@ -2112,8 +2113,14 @@ export class QueryBuilder {
   replaceSynthesisInputs(files: string[]): void {
     this.db.transaction(() => {
       this.db.exec('DELETE FROM synthesis_inputs');
-      const insert = this.db.prepare('INSERT INTO synthesis_inputs(file_path) VALUES (?)');
-      for (const file of files) insert.run(file);
+      // The column references files(path), so an input is stored under the
+      // indexed file's own spelling, and a path that is no indexed file is
+      // skipped rather than failing the write (#2565). On a SynthesisStage
+      // connection this writes the temp table that publish copies to main.
+      const insert = this.db.prepare(
+        'INSERT OR IGNORE INTO synthesis_inputs(file_path) SELECT path FROM files WHERE path = ?'
+      );
+      for (const file of files) insert.run(indexedPathOf(file));
     })();
   }
 
@@ -4699,4 +4706,15 @@ function foldModuleRows(
   }
 
   return { links: [...links.values()], pairs };
+}
+
+/**
+ * A path as the index stores it: forward slashes, no `.` or empty segments,
+ * no trailing slash. A synthesis pass can be handed a module path spelled the
+ * way its import wrote it (`import('@/widgets/Chart/')` →
+ * `src/widgets/Chart//index.ts`), which names an indexed file under another
+ * spelling.
+ */
+function indexedPathOf(file: string): string {
+  return path.posix.normalize(file.replace(/\\/g, '/')).replace(/\/+$/, '');
 }

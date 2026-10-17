@@ -70,8 +70,12 @@ export class SynthesisStage {
         insert.run(i, i + 2000);
         await yieldToLoop();
       }
+      // Re-checked against files inside the write lock: the inputs were staged
+      // before it, and a file deleted since would fail the FK and roll back
+      // every synthesized edge with it (#2565).
       this.db.exec(`DELETE FROM main.synthesis_inputs;
-        INSERT INTO main.synthesis_inputs SELECT * FROM temp.synthesis_inputs`);
+        INSERT INTO main.synthesis_inputs(file_path) SELECT file_path FROM temp.synthesis_inputs
+          WHERE file_path IN (SELECT path FROM main.files)`);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
