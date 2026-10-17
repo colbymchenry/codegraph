@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Bash** and shell scripts — `.sh`, `.bash`, `.bats` and extensionless scripts whose first line names `bash` or `sh` — with their functions, variables, calls between scripts, the files they `source` or run (including paths built from the script's own directory, like `"$(dirname "$0")/lib.sh"`), and each Bats `@test` as its own symbol with the helpers it `load`s. Thanks @Omar-Elwazeery, @Adam0120 and @danielmevit. (#1203, #1217)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.

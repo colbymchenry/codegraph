@@ -177,6 +177,9 @@ const CODE_FAMILY: Record<string, string> = {
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
+  // A shell command name is a program on PATH as often as a function — a
+  // script's `build` or `install` must not bind to a Python or Go `build()`.
+  bash: 'bash',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
@@ -1207,8 +1210,12 @@ export function matchFunctionRef(
   return null;
 }
 
-/** Languages with no nested named functions: nesting in the graph is never a scope. */
-const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
+/**
+ * Languages where nesting in the graph is never a scope: C/C++ have no nested
+ * named functions, and a Bash function defined inside another becomes global
+ * the moment the outer one runs.
+ */
+const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp', 'bash']);
 /** Types a function body can declare for itself. */
 const LOCAL_TYPE_KINDS = new Set<string>(['class', 'struct', 'enum', 'interface', 'trait', 'type_alias']);
 

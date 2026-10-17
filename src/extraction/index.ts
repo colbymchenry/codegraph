@@ -24,7 +24,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure, isPotentialBashShebangPath } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -1462,15 +1462,17 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
   const classify = (statusCode: string, rel: string): void => {
     const filePath = normalizePath(prefix + rel);
-    if (!isSource(filePath)) return;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
       // path is already tracked in the DB, where removal is always correct — and
       // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
-      out.deleted.push(filePath);
+      // A deleted extensionless script has no shebang left to read, so its
+      // path alone lets it through.
+      if (isSource(filePath) || isPotentialBashShebangPath(filePath)) out.deleted.push(filePath);
       return;
     }
+    if (!isSource(filePath)) return;
 
     // Added (`??`) / modified files inside an excluded dir must not enter the
     // index — match against the repo-relative path, same as the full scan. (#766)
