@@ -8268,10 +8268,11 @@ export class TreeSitterExtractor {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
         // expression) a bare exprDot is ambiguous with a field/property access,
-        // so there we only descend for paren'd inner calls.
-        if (node.type === 'statement') {
-          this.extractPascalParenlessCall(child);
-        } else {
+        // so there it is recorded as a call reference that only ever binds to
+        // a method (`Result := Obj.Value + 1`); a field or property read gets
+        // no edge. Paren'd inner calls are also visited.
+        this.extractPascalParenlessCall(child);
+        if (node.type !== 'statement') {
           for (let j = 0; j < child.namedChildCount; j++) {
             const grandchild = child.namedChild(j);
             if (grandchild?.type === 'exprCall') {

@@ -5796,6 +5796,55 @@ end.
       expect(isCalled('TDecoy::DoIt')).toBe(false);
     });
 
+    it('extracts paren-less method calls inside expressions (#2514)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'UnitA.pas'),
+        `unit UnitA;
+interface
+type
+  TProvider = class
+  public
+    function Value: Integer;
+    function ValueParens(): Integer;
+  public
+    Count: Integer;
+    property Total: Integer read Value;
+  end;
+  TConsumer = class
+  private
+    FProvider: TProvider;
+  public
+    function UseNoParens: Integer;
+    function UseParens: Integer;
+    function UseFieldRead: Integer;
+  end;
+implementation
+function TProvider.Value: Integer; begin Result := 1; end;
+function TProvider.ValueParens(): Integer; begin Result := 2; end;
+function TConsumer.UseNoParens: Integer;
+begin
+  Result := FProvider.Value + 1;
+end;
+function TConsumer.UseParens: Integer;
+begin
+  Result := FProvider.ValueParens() + 1;
+end;
+function TConsumer.UseFieldRead: Integer;
+begin
+  Result := FProvider.Count + FProvider.Total;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('TProvider::ValueParens')).toEqual(['UseParens']);
+      // Only UseNoParens: reading the field `Count` or the property `Total` in
+      // an expression must not draw a call edge to any method.
+      expect(callerNamesOf('TProvider::Value')).toEqual(['UseNoParens']);
+      const useFieldRead = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'TConsumer::UseFieldRead');
+      expect(cg.getOutgoingEdges(useFieldRead!.id).filter((e) => e.kind === 'calls')).toEqual([]);
+    });
+
     it('does NOT turn a property write/read into a call edge (only statement-level dots are calls)', async () => {
       fs.writeFileSync(
         path.join(tempDir, 'main.pas'),
