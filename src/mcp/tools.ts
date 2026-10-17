@@ -2411,9 +2411,13 @@ export class ToolHandler {
    * Arm one unref'd timer for the oldest project a trim could release. A
    * project whose catch-up is still running is trimmed when that settles; the
    * 1s floor keeps a project a trim must skip from re-arming in a tight loop.
+   * Each call replaces the armed timer, so an older project whose catch-up
+   * settles after a newer one armed the timer keeps its own deadline.
    */
   private scheduleIdleRelease(idleMs: number): void {
-    if (this.idleReleaseTimer || this.closing || idleMs <= 0) return;
+    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
+    this.idleReleaseTimer = null;
+    if (this.closing || idleMs <= 0) return;
     for (const [root, cg] of this.projectCache) {
       if (this.projectGates.has(cg)) continue;
       const due = (this.projectUsedAt.get(root) ?? Date.now()) + idleMs - Date.now();
