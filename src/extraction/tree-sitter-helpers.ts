@@ -112,7 +112,7 @@ const DOCSTRING_WRAPPER_TYPES = new Set([
  * never truncated. The per-line markers are anchored at line start, so
  * they're safe to apply to any comment.
  */
-function cleanCommentMarkers(comment: string): string {
+export function cleanCommentMarkers(comment: string): string {
   let c = comment.trim();
   if (c.startsWith('/*')) c = c.replace(/^\/\*+!?/, '').replace(/\*+\/$/, '');
   else if (c.startsWith('--[')) c = c.replace(/^--\[=*\[/, '').replace(/\]=*\]$/, '');
@@ -164,7 +164,10 @@ export function getPrecedingDocstring(
       sibling.type === 'comment' ||
       sibling.type === 'line_comment' ||
       sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
+      sibling.type === 'documentation_comment' ||
+      // Cangjie (camelCase node names)
+      sibling.type === 'lineComment' ||
+      sibling.type === 'blockComment'
     ) {
       comments.unshift(sibling);
       sibling = sibling.previousNamedSibling;

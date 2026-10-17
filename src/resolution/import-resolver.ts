@@ -1088,6 +1088,8 @@ export function extractImportMappings(
     mappings.push(...extractGoImports(content));
   } else if (language === 'java' || language === 'kotlin') {
     mappings.push(...extractJavaImports(content));
+  } else if (language === 'cangjie') {
+    mappings.push(...extractCangjieImports(content));
   } else if (language === 'php') {
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
@@ -1390,6 +1392,38 @@ function extractJavaImports(content: string): ImportMapping[] {
 }
 
 /**
+ * Cangjie imports: `import a.b.C`, `import a.b.C as D`, `import a.b.{C, D as E}`,
+ * optionally `public`/`internal`-prefixed, with an organization-qualified
+ * root written `org::pkg`. Sources are dotted FQNs (`org::` spelled `org.`,
+ * matching the package namespace the extractor creates). Wildcards
+ * (`import a.b.*`) bind no single name and are skipped.
+ */
+function extractCangjieImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const stripped = content.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const re = /^\s*(?:(?:public|protected|internal|private)\s+)?import\s+([\w.:]+?)(?:\.\{([^}]*)\}|\s+as\s+(\w+))?\s*$/gm;
+  let match: RegExpExecArray | null;
+  const push = (fqn: string, alias?: string): void => {
+    if (fqn.endsWith('.*')) return;
+    const parts = fqn.split('.');
+    const exportedName = parts[parts.length - 1]!;
+    mappings.push({ localName: alias ?? exportedName, exportedName, source: fqn, isDefault: false, isNamespace: false });
+  };
+  while ((match = re.exec(stripped)) !== null) {
+    const base = match[1]!.replace(/::/g, '.');
+    if (match[2] !== undefined) {
+      for (const item of match[2].split(',')) {
+        const m = item.trim().match(/^([\w.]+)(?:\s+as\s+(\w+))?$/);
+        if (m) push(`${base}.${m[1]}`, m[2]);
+      }
+    } else {
+      push(base, match[3]);
+    }
+  }
+  return mappings;
+}
+
+/**
  * Extract PHP import mappings (use statements)
  */
 function extractPHPImports(content: string): ImportMapping[] {
@@ -1596,7 +1630,7 @@ export function resolveJvmImport(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  if (ref.language !== 'java' && ref.language !== 'kotlin') return null;
+  if (ref.language !== 'java' && ref.language !== 'kotlin' && ref.language !== 'cangjie') return null;
 
   const fqn = ref.referenceName;
   const lastDot = fqn.lastIndexOf('.');
@@ -1607,7 +1641,17 @@ export function resolveJvmImport(
   if (sym === '*') return null;
 
   const candidates = context.getNodesByQualifiedName(`${pkg}::${sym}`);
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    // Cangjie `import a.b.*` is recorded as the package itself (`a.b`): link
+    // it to that package's namespace node closest to the importer.
+    if (ref.language === 'cangjie') {
+      const pkgNodes = context.getNodesByQualifiedName(fqn).filter((n) => n.kind === 'namespace');
+      if (pkgNodes.length > 0) {
+        return { original: ref, targetNodeId: pickClosestJvmCandidate(pkgNodes, ref.filePath).id, confidence: 0.9, resolvedBy: 'import' };
+      }
+    }
+    return null;
+  }
 
   // Kotlin Multiplatform: an `expect` declaration and its `actual`s share one
   // FQN across source sets (commonMain / androidMain / appleMain). Taking the
@@ -1625,11 +1669,14 @@ export function resolveJvmImport(
   };
 }
 
-/** `Alias` / `Alias.member` through a renaming Kotlin import, by the imported FQN. */
-function resolveJvmAlias(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ResolvedRef | null {
+/**
+ * `Alias` / `Alias.member` through a renaming Kotlin import, by the imported
+ * FQN. With `anyImport` (Cangjie) a non-renaming import binds the same way.
+ */
+function resolveJvmAlias(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext, anyImport = false): ResolvedRef | null {
   const dot = ref.referenceName.indexOf('.');
   const root = dot < 0 ? ref.referenceName : ref.referenceName.slice(0, dot);
-  const imp = imports.find((m) => m.localName === root && m.localName !== m.exportedName);
+  const imp = imports.find((m) => m.localName === root && (anyImport || m.localName !== m.exportedName));
   if (!imp) return null;
   const parts = imp.source.split('.');
   // The package is some prefix of the FQN; the rest is the type path (`Outer::Inner`).
@@ -2020,6 +2067,14 @@ export function resolveViaImport(
   ) {
     const moduleFile = resolveModuleImportToFile(ref, imports, context);
     if (moduleFile) return moduleFile;
+  }
+
+  // Cangjie: an imported name (`Foo`, `Foo.member`, or an alias) is found by
+  // its FQN — the package namespace gives every top-level symbol `pkg::Name`.
+  // Filenames carry no symbol names, so the path-based lookup below can't.
+  if (ref.language === 'cangjie' && ref.referenceKind !== 'imports') {
+    const imported = resolveJvmAlias(ref, imports, context, true);
+    if (imported) return imported;
   }
 
   // Kotlin's `import app.model.Outer.Inner as Made`: `Made.create()` is the

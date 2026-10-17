@@ -25,6 +25,7 @@ import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, ma
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
+import { gateCangjieTarget } from './cangjie-target-gate';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
@@ -78,7 +79,7 @@ const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
  * second pass. Dotted-receiver languages resolve via matchDottedCallChain; the
  * `::`-receiver ones (Rust) via matchScopedCallChain.
  */
-const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal']);
+const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal', 'cangjie']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
@@ -1230,6 +1231,8 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
+    // A Cangjie reference never lands on an `extend` node, nor on a UI-named
+    // enum case or a library method it can't name (see ./cangjie-target-gate).
     // A Swift type reference never lands on an `extension X {}` node, nor on a
     // nested type it cannot name bare (see ./swift-type-visibility).
     // A name a declaration around the reference declares as a type parameter
@@ -1237,7 +1240,11 @@ export class ReferenceResolver {
     // and a Dart call to a parameter or local calls that (./dart-local-scope).
     const candidate = gateDartLocal(
       gateTypeParameter(
-        gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+        gateCangjieTarget(
+          gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+          ref,
+          this.context,
+        ),
         ref,
         this.context,
       ),
@@ -1336,14 +1343,14 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
+    // ArkTS and Cangjie chained-attribute refs carry a leading dot (`.titleStyle`) that
     // routes them to the decorator-gated matcher; the symbol itself is
     // indexed under the bare name, so the existence check strips the dot.
     // Nix static path imports (`import ./x.nix`) and JS/TS module paths
     // (`require('./x')`) name a FILE, not a symbol — they bypass the
     // symbol-existence check and resolve via resolveViaImport.
     let existenceName =
-      ref.language === 'arkts' && ref.referenceName.startsWith('.')
+      (ref.language === 'arkts' || ref.language === 'cangjie') && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
