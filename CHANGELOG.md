@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
+### Security
+
+- Indexing now bounds re-export searches so deeply interconnected modules cannot cause exponential work and block the process. (#1337)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
@@ -159,6 +167,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In React with TypeScript, a component that renders a generic component and passes it type arguments, like outline's `<PaginatedList<Document> items={…} />` or excalidraw's `<DropdownMenuItemContentRadio<"contain" | "overlap"> …>`, now links to the component it renders. Before, a tag followed by type arguments was skipped, so the generic component looked unused by the screens that render it, and `codegraph_explore`'s call paths, callers and impact stopped short of it. Re-index React projects after upgrading.
 - In React, a component that a file declares itself as a value is now what that file's JSX renders, whatever else in the repository shares its name. A lazily loaded page, like `const RegisterPage = Loadable(lazy(() => import('./pages/Register')))`, a `dynamic(() => import(…))` component or one loaded only in development (`IS_DEV ? lazy(…) : null`), links to the component its module exports, including the one its loader picks and one an `export default observer(Login)` wraps; a wrapped component like `const Settings = observer(function Settings() {…})`, `React.memo(Rows, areEqual)` or `forwardRef(ComboboxInner) as {…}` links to the function it wraps; and an alias like `const DialogPortal = DialogPrimitive.Portal` links to its own declaration. Before, `<RegisterPage />` was linked to any lone component of that name elsewhere, often in another app of the same repository, so `codegraph_explore`, callers and impact followed it into the wrong app while the page it really renders had no caller. React Router layouts declared this way follow the same rule, and a TSX type named like a value the file declares now stays in that file. Re-index React projects after upgrading.
 - In React, a JSX tag imported from one of your own modules now links to the component that module exports under that name, read the way a lazily loaded page's module already is. That includes going through an `index` file or barrel that passes the component on, like outline's `Sidebar/index.ts` with `import Sidebar from './App'; export default Sidebar` or its `Avatar/index.ts` with `const Avatar = AvatarWithHoverCard`, and past a wrapper such as `export default observer(AppSidebar)`, `React.memo(StaticCanvas, areEqual)` or mastodon's `const MemoizedBlurhash = memo(Blurhash)`. Before, a tag was matched by its name and the import only broke ties, so outline's `<Sidebar>` linked to an unrelated styled `Sidebar` in a sibling file, a default import under another name linked to whatever other component its module exported, and an import through a barrel could land on another app's component of the same name. A tag whose module exports an unnamed component, like `export default () => …`, now links to nothing instead of to a namesake elsewhere. A lazily loaded React Router page exported as such a value or wrapper links to the component it holds too, the one with the markup. `codegraph sync` and the file watcher redraw these links when only the file that passes the component on changes. Re-index React projects after upgrading.
+
+#### Haskell indexing
+
+- Large Haskell projects index and refresh exported definitions faster while preserving import visibility and ambiguity checks. (#1337)
+
+- Haskell local functions keep their callers when they shadow a parameter with the same name. (#1337)
+
+- Custom Haskell functions named like standard combinators no longer create calls to arguments they do not execute. (#1337)
+
+- Haskell pattern synonyms now retain calls through local helpers while excluding quoted code that is not executed.
+
+- Haskell calls now respect nested and inline local scopes, keeping helpers from capturing unrelated calls elsewhere in a function.
+
+- Haskell names shared by a module declaration and an import remain unresolved when ambiguous, including after an imported module changes its exports.
+
+- Haskell record fields shared by several constructors resolve as one selector per type, and applied deriving clauses no longer create false class relationships.
+
+- Haskell record construction now links each field to the type named by its constructor, including through qualified imports.
+
+- Incremental Haskell updates refresh affected module imports with fewer database reads while preserving unrelated graph relationships.
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 ## [1.6.2] - 2026-10-03
 

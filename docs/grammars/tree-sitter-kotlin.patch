@@ -1,7 +1,7 @@
 --- a/src/scanner.c	2026-09-30 10:25:12
 +++ b/src/scanner.c	2026-09-30 10:25:12
 @@ -285,9 +285,11 @@
- 
+
    if (sameline) {
      switch (lexer->lookahead) {
 -      // Don't insert a semicolon before an else
@@ -11,6 +11,6 @@
        case 'e':
 -        return !scan_for_word(lexer, "lse", 3);
 +        return false;
- 
+
        case 'i':
          return scan_for_word(lexer, "mport", 5);

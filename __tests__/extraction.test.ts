@@ -467,6 +467,24 @@ in
 });
 
 describe('TypeScript Extraction', () => {
+  it('keeps WASM node IDs on the kernel collision-aware wire contract', () => {
+    // Distinct scopes can legally contain same-named declarations on one line.
+    // Both paths preserve the first declaration's legacy ID and append the
+    // column for a later collision, so neither declaration overwrites the other.
+    const result = extractFromSource(
+      'same-line.ts',
+      'if (true) { function same() {} } if (false) { function same() {} }',
+      'typescript',
+    );
+    const functions = result.nodes.filter((node) => node.kind === 'function' && node.name === 'same');
+    expect(functions).toHaveLength(2);
+    const first = functions[0]!;
+    const second = functions[1]!;
+    const legacyId = generateNodeId('same-line.ts', first.kind, first.name, first.startLine);
+    expect(first.id).toBe(legacyId);
+    expect(second.id).toBe(`${legacyId}:${second.startColumn}`);
+  });
+
   it('should extract function declarations', () => {
     const code = `
 export function processPayment(amount: number): Promise<Receipt> {
@@ -8322,6 +8340,24 @@ describe('Directory Exclusion', () => {
 
     expect(files).toContain('packages/app/src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('should exclude Haskell build trees without hiding neighboring source', () => {
+    const sourceDir = path.join(tempDir, 'packages', 'app');
+    const stackCache = path.join(tempDir, '.stack-work', 'downloaded', 'dep', 'src');
+    const cabalCache = path.join(tempDir, 'dist-newstyle', 'src', 'dep');
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.mkdirSync(stackCache, { recursive: true });
+    fs.mkdirSync(cabalCache, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'Main.hs'), 'module Main where\n');
+    fs.writeFileSync(path.join(stackCache, 'StackDependency.hs'), 'module StackDependency where\n');
+    fs.writeFileSync(path.join(cabalCache, 'CabalDependency.hs'), 'module CabalDependency where\n');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('packages/app/Main.hs');
+    expect(files.some((file) => file.startsWith('.stack-work/'))).toBe(false);
+    expect(files.some((file) => file.startsWith('dist-newstyle/'))).toBe(false);
   });
 
   it('should apply a nested .gitignore only to its own subtree', () => {

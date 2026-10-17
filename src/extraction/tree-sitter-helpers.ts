@@ -116,11 +116,12 @@ function cleanCommentMarkers(comment: string): string {
   let c = comment.trim();
   if (c.startsWith('/*')) c = c.replace(/^\/\*+!?/, '').replace(/\*+\/$/, '');
   else if (c.startsWith('--[')) c = c.replace(/^--\[=*\[/, '').replace(/\]=*\]$/, '');
+  else if (c.startsWith('{-')) c = c.replace(/^\{-[|^]?/, '').replace(/-\}$/, '');
   else if (c.startsWith('(*')) c = c.replace(/^\(\*/, '').replace(/\*\)$/, '');
   else if (c.startsWith('{')) c = c.replace(/^\{/, '').replace(/\}$/, '');
   return c
     .replace(/^\/\/[/!]?\s?/gm, '') // // , and Rust/Swift doc lines /// //!
-    .replace(/^--\s?/gm, '') //        Lua/Luau line comments
+    .replace(/^--[|^]?\s?/gm, '') //   Lua/Luau lines and Haskell Haddock
     .replace(/^#\s?/gm, '') //         Python/Ruby/shell line comments
     .replace(/^%+\s?/gm, '') //        Erlang line comments (% / %% / %%%)
     .replace(/^\s*\*\s?/gm, '') //     block-comment continuation (* foo)
@@ -164,7 +165,8 @@ export function getPrecedingDocstring(
       sibling.type === 'comment' ||
       sibling.type === 'line_comment' ||
       sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
+      sibling.type === 'documentation_comment' ||
+      sibling.type === 'haddock'
     ) {
       comments.unshift(sibling);
       sibling = sibling.previousNamedSibling;
