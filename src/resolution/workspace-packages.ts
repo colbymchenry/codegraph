@@ -18,8 +18,10 @@
  *   - reads `workspaces` (array OR `{ packages: [...] }`) from package.json,
  *     plus a minimal `pnpm-workspace.yaml` `packages:` list
  *   - expands one level of `*` / `**` globs (`packages/*`, `apps/*`)
- *   - subpath resolution is directory-based (`@scope/ui/sub` → `<ui>/sub`);
- *     it does NOT yet honour a member's `exports` map or `main` field
+ *   - a member's declared entry (`exports`, then `main` / `module`) and its
+ *     subpath `exports` are tried first; otherwise, or when that file isn't
+ *     in the project (build output), resolution is directory-based
+ *     (`@scope/ui/sub` → `<ui>/sub`)
  *   - returns null when the project declares no workspaces, so single-
  *     package repos pay nothing and see no behaviour change.
  */
@@ -38,9 +40,17 @@ export interface WorkspacePackages {
    * the member's real barrel even when it doesn't follow an index-file
    * convention — and independent of the CONSUMER's language (a `.ts` file
    * importing an `.ets` barrel resolves without `.ets` in the TS candidate
-   * list). Absent for npm/pnpm members (their index conventions cover it).
+   * list). ohpm members only; npm/pnpm members use {@link exportsByName}.
    */
   entryByName?: Map<string, string>;
+  /**
+   * npm/yarn/bun/pnpm member `name` → its package.json entry points: an
+   * `exports` key (`.`, `./schema`, `./utils/*`) → candidate target files
+   * relative to projectRoot (posix), in preference order. `.` also lists
+   * `main` and `module`. A target may name build output that isn't in the
+   * project, so the resolver tries each and then the member's directory.
+   */
+  exportsByName?: Map<string, Map<string, string[]>>;
 }
 
 /**
@@ -64,6 +74,12 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
     }
   }
 
+  const exportsByName = new Map<string, Map<string, string[]>>();
+  for (const [name, dir] of byName) {
+    const entries = readPackageEntries(projectRoot, dir);
+    if (entries) exportsByName.set(name, entries);
+  }
+
   // HarmonyOS/OpenHarmony (ArkTS) modular projects: every module's
   // oh-package.json5 declares its local siblings as `"data": "file:../../
   // core/data"` dependencies, and code then imports the bare name
@@ -80,7 +96,70 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   if (byName.size === 0) return null;
 
   logDebug('workspace packages loaded', { count: byName.size });
-  return { byName, entryByName: entryByName.size > 0 ? entryByName : undefined };
+  return {
+    byName,
+    entryByName: entryByName.size > 0 ? entryByName : undefined,
+    exportsByName: exportsByName.size > 0 ? exportsByName : undefined,
+  };
+}
+
+/**
+ * Conditions tried for a conditional `exports` target, in this order. Others
+ * (`node`, `browser`, custom ones) are not guessed.
+ */
+const EXPORT_CONDITIONS = ['types', 'import', 'default', 'require'];
+
+/**
+ * Read a member's package.json entry points (see
+ * {@link WorkspacePackages.exportsByName}). Null when it declares none.
+ */
+function readPackageEntries(projectRoot: string, dirRel: string): Map<string, string[]> | null {
+  let pkg: { exports?: unknown; main?: unknown; module?: unknown } | null;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, dirRel, 'package.json'), 'utf-8'));
+  } catch {
+    return null;
+  }
+  if (!pkg || typeof pkg !== 'object') return null;
+
+  const raw = new Map<string, string[]>();
+  const exp = pkg.exports;
+  if (exp && typeof exp === 'object' && !Array.isArray(exp)
+      && Object.keys(exp).some((k) => k.startsWith('.'))) {
+    for (const [key, value] of Object.entries(exp)) {
+      if (key.startsWith('.')) raw.set(key, exportTargets(value));
+    }
+  } else if (exp !== undefined) {
+    raw.set('.', exportTargets(exp)); // a string, array or conditions for `.`
+  }
+  for (const field of [pkg.main, pkg.module]) {
+    if (typeof field === 'string') raw.set('.', [...(raw.get('.') ?? []), field]);
+  }
+
+  const out = new Map<string, string[]>();
+  for (const [key, targets] of raw) {
+    const files = targets.map((t) => toProjectPath(projectRoot, dirRel, t)).filter((t): t is string => !!t);
+    if (files.length > 0) out.set(key, files);
+  }
+  return out.size > 0 ? out : null;
+}
+
+/** Flatten an `exports` value (string, fallback array, conditions) to target paths. */
+function exportTargets(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(exportTargets);
+  if (!value || typeof value !== 'object') return [];
+  const conditions = value as Record<string, unknown>;
+  return EXPORT_CONDITIONS.filter((c) => c in conditions).flatMap((c) => exportTargets(conditions[c]));
+}
+
+/** A member-relative target (`./src/index.ts`) → projectRoot-relative posix, or null if it escapes. */
+function toProjectPath(projectRoot: string, dirRel: string, target: string): string | null {
+  if (!target.trim()) return null;
+  const abs = path.resolve(projectRoot, dirRel, target.trim());
+  const memberRel = path.relative(path.resolve(projectRoot, dirRel), abs);
+  if (memberRel.startsWith('..') || path.isAbsolute(memberRel)) return null;
+  return path.relative(projectRoot, abs).replace(/\\/g, '/');
 }
 
 /**
@@ -198,16 +277,18 @@ function readOhpmFileDeps(manifestAbs: string): Array<[string, string]> {
 }
 
 /**
- * Rewrite a bare workspace import to a path relative to projectRoot,
- * WITHOUT an extension — the caller applies the language's extension/index
- * resolution. `@scope/ui/widgets` → `packages/ui/widgets`; the bare package
- * name `@scope/ui` → its directory. Returns `null` when no member package
- * name matches.
+ * Rewrite a bare workspace import to candidate paths relative to projectRoot,
+ * in the order to try them — the caller applies the language's extension/
+ * index resolution to each and takes the first that exists. The member's
+ * declared entry for the import (package.json `exports` / `main` / `module`,
+ * or ohpm `main`) comes first; then, for npm members, the directory form:
+ * `@scope/ui/widgets` → `packages/ui/widgets`, bare `@scope/ui` → its
+ * directory. Returns `null` when no member package name matches.
  */
 export function resolveWorkspaceImport(
   importPath: string,
   ws: WorkspacePackages
-): string | null {
+): string[] | null {
   // Longest matching package name wins, so `@scope/ui/core` prefers a
   // `@scope/ui/core` package over a `@scope/ui` one when both exist.
   let bestName: string | null = null;
@@ -224,9 +305,32 @@ export function resolveWorkspaceImport(
   // check hits it without extension/index guessing.
   if (!subpath) {
     const entry = ws.entryByName?.get(bestName);
-    if (entry) return entry;
+    if (entry) return [entry];
   }
-  return (dir + subpath).replace(/\/{2,}/g, '/');
+  const declared = matchExport('.' + subpath, ws.exportsByName?.get(bestName));
+  return [...declared, (dir + subpath).replace(/\/{2,}/g, '/')];
+}
+
+/**
+ * The targets an `exports` map gives `key` (`.`, `./schema`): an exact key,
+ * else the `*` pattern with the longest prefix, its `*` replaced by the match.
+ */
+function matchExport(key: string, entries: Map<string, string[]> | undefined): string[] {
+  if (!entries) return [];
+  const exact = entries.get(key);
+  if (exact) return exact;
+  let best: { prefix: string; star: string; targets: string[] } | null = null;
+  for (const [pattern, targets] of entries) {
+    const star = pattern.indexOf('*');
+    if (star === -1 || pattern.indexOf('*', star + 1) !== -1) continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (key.length < prefix.length + suffix.length || !key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    if (best && prefix.length <= best.prefix.length) continue;
+    best = { prefix, star: key.slice(prefix.length, key.length - suffix.length), targets };
+  }
+  if (!best) return [];
+  return best.targets.filter((t) => t.split('*').length === 2).map((t) => t.replace('*', best!.star));
 }
 
 /** Read workspace glob patterns from package.json + pnpm-workspace.yaml. */
