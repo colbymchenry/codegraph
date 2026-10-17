@@ -196,6 +196,16 @@ const GENERATED_CONTENT_PATTERNS: ReadonlyArray<RegExp> = [
 ];
 
 /**
+ * A tree-sitter `parser.c`. Releases before 0.25 print no banner, but every
+ * generated parser includes the runtime header and defines
+ * `LANGUAGE_VERSION`; a grammar's hand-written `scanner.c` includes the
+ * header and never defines the version.
+ */
+function isTreeSitterParser(head: string): boolean {
+  return /^#include\s+"tree_sitter\/parser\.h"/m.test(head) && /^#define\s+LANGUAGE_VERSION\s+\d+/m.test(head);
+}
+
+/**
  * Whether the head of `content` carries a recognized machine-generation
  * banner. Bounded to {@link HEADER_SCAN_CHARS} / {@link HEADER_SCAN_LINES},
  * and the marker must sit on a comment line — a generator's own source, which
@@ -208,6 +218,7 @@ export function hasGeneratedHeader(content: string): boolean {
   if (!content) return false;
 
   const head = content.length > HEADER_SCAN_CHARS ? content.slice(0, HEADER_SCAN_CHARS) : content;
+  if (isTreeSitterParser(head)) return true;
   // Fast reject for ~every hand-written file: no line splitting, no allocation
   // (V8 keeps `head` as a sliced view of `content`).
   if (!GENERATED_STEM.test(head)) return false;
