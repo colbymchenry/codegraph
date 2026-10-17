@@ -67,10 +67,9 @@ export function upsertTomlTable(
   header: string,
   block: string,
 ): { content: string; action: 'inserted' | 'replaced' | 'unchanged' } {
-  const headerLine = `[${header}]`;
-  const headerIdx = findHeaderIndex(fileContent, headerLine);
+  const found = findHeader(fileContent, header);
 
-  if (headerIdx === -1) {
+  if (!found) {
     // Insert at end with separating blank line if there's existing content.
     const trimmed = fileContent.trimEnd();
     const sep = trimmed.length > 0 ? '\n\n' : '';
@@ -81,7 +80,8 @@ export function upsertTomlTable(
   }
 
   // Find the end of this block: next table header or EOF.
-  const blockEnd = findNextTableHeader(fileContent, headerIdx + headerLine.length);
+  const headerIdx = found.start;
+  const blockEnd = findNextTableHeader(fileContent, found.end);
   const existingBlock = fileContent.substring(headerIdx, blockEnd).replace(/\n+$/, '');
 
   if (existingBlock === block) {
@@ -102,6 +102,11 @@ export function upsertTomlTable(
   };
 }
 
+/** Whether `fileContent` opens the table `header` names, however the line is written. */
+export function hasTomlTable(fileContent: string, header: string): boolean {
+  return findHeader(fileContent, header) !== null;
+}
+
 /**
  * Remove a top-level dotted-key TOML table block. Returns the
  * possibly-empty new content + an action flag.
@@ -110,27 +115,53 @@ export function removeTomlTable(
   fileContent: string,
   header: string,
 ): { content: string; action: 'removed' | 'not-found' } {
-  const headerLine = `[${header}]`;
-  const headerIdx = findHeaderIndex(fileContent, headerLine);
-  if (headerIdx === -1) return { content: fileContent, action: 'not-found' };
+  const found = findHeader(fileContent, header);
+  if (!found) return { content: fileContent, action: 'not-found' };
 
-  const blockEnd = findNextTableHeader(fileContent, headerIdx + headerLine.length);
-  const before = fileContent.substring(0, headerIdx).replace(/\n+$/, '');
+  const blockEnd = findNextTableHeader(fileContent, found.end);
+  const before = fileContent.substring(0, found.start).replace(/\n+$/, '');
   const after = fileContent.substring(blockEnd).replace(/^\n+/, '');
   const joined = before + (before && after ? '\n\n' : '') + after;
   return { content: joined, action: 'removed' };
 }
 
 /**
- * Locate the byte index of a header line (`[foo.bar]`) when it
- * appears at the start of a line. Returns -1 if not found.
+ * Locate the line that opens the table `header` names, as TOML reads it:
+ * indented or not, with spaces inside the brackets and around the dots,
+ * each key part bare or quoted, a comment after it. Returns the line's
+ * start and end offsets, or null when no line opens that table. A
+ * header-shaped line inside a multiline value is a value, not a header
+ * (the same scan {@link findNextTableHeader} uses).
+ *
+ * Only a column-0 `[mcp_servers.codegraph]` used to be found: an indented
+ * block — valid TOML, and how some hands write nested tables — was taken
+ * for absent, and a second `[mcp_servers.codegraph]` was appended. A table
+ * defined twice is invalid TOML, so Codex could load none of its config.
  */
-function findHeaderIndex(content: string, headerLine: string): number {
-  // Search BOL or right after a newline.
-  if (content.startsWith(headerLine)) return 0;
-  const needle = '\n' + headerLine;
-  const idx = content.indexOf(needle);
-  return idx === -1 ? -1 : idx + 1;
+function findHeader(content: string, header: string): { start: number; end: number } | null {
+  const escape = (part: string): string => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const keys = header.split('.').map((part) => `(?:${escape(part)}|"${escape(part)}"|'${escape(part)}')`);
+  const pattern = new RegExp(
+    String.raw`^[ \t]*\[[ \t]*${keys.join(String.raw`[ \t]*\.[ \t]*`)}[ \t]*\][ \t]*(?:#.*)?\r?$`
+  );
+  const state: TomlLexState = { multilineString: null, arrayDepth: 0, inlineTableDepth: 0 };
+  let lineStart = 0;
+  for (;;) {
+    const newlineIdx = content.indexOf('\n', lineStart);
+    const lineEnd = newlineIdx === -1 ? content.length : newlineIdx;
+    const line = content.slice(lineStart, lineEnd);
+    if (
+      state.multilineString === null &&
+      state.arrayDepth === 0 &&
+      state.inlineTableDepth === 0 &&
+      pattern.test(line)
+    ) {
+      return { start: lineStart, end: lineEnd };
+    }
+    scanTomlLine(line, state);
+    if (newlineIdx === -1) return null;
+    lineStart = newlineIdx + 1;
+  }
 }
 
 /**

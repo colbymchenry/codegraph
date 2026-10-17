@@ -22,7 +22,7 @@ import { spawnSync } from 'child_process';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
-import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
+import { upsertTomlTable, removeTomlTable, buildTomlTable, hasTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
@@ -953,6 +953,37 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(afterUninstall).toContain('"other"');
   });
 
+  it('codex: an indented [mcp_servers.codegraph] is replaced, never duplicated (#2562)', () => {
+    const codex = getTarget('codex')!;
+    const tomlPath = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(tomlPath), { recursive: true });
+    fs.writeFileSync(tomlPath, [
+      'model = "o3"',
+      '',
+      '  [mcp_servers.codegraph]',
+      '    command = "codegraph"',
+      '    args = ["serve", "--mcp"]',
+      '',
+      '[mcp_servers.other]',
+      'command = "other"',
+      '',
+    ].join('\n'));
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+
+    const result = codex.install('global', { autoAllow: false });
+    expect(result.files.find((f) => f.path.endsWith('config.toml'))!.action).toBe('updated');
+    const after = fs.readFileSync(tomlPath, 'utf-8');
+    expect(after.match(/\[mcp_servers\.codegraph\]/g)).toHaveLength(1);
+    expect(after).toContain('model = "o3"');
+    expect(after).toContain('[mcp_servers.other]\ncommand = "other"');
+    expect(after).not.toContain('    command');
+
+    codex.uninstall('global');
+    const gone = fs.readFileSync(tomlPath, 'utf-8');
+    expect(gone).not.toContain('codegraph');
+    expect(gone).toContain('[mcp_servers.other]');
+  });
+
   it('codex: user-added key inside [mcp_servers.codegraph] survives idempotent re-install', () => {
     const codex = getTarget('codex')!;
     codex.install('global', { autoAllow: false });
@@ -1610,6 +1641,67 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
 
     expect(upserted.content).toBe(`${block}\n\n${historyTable}`);
     expect(removed.content).toBe(historyTable);
+  });
+});
+
+describe('TOML header search — a header line as TOML reads it (#2562)', () => {
+  const block = buildTomlTable('mcp_servers.codegraph', { command: 'codegraph', args: ['serve', '--mcp'] });
+
+  it('an indented header opens the block: upsert replaces it, remove removes it', () => {
+    const existing = [
+      '  [mcp_servers.codegraph]',
+      '    command = "old"',
+      '    args = ["old"]',
+      '',
+      '[zzz]',
+      'baz = "qux"',
+      '',
+    ].join('\n');
+    const upserted = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    expect(upserted.action).toBe('replaced');
+    expect(upserted.content).toBe(`${block}\n\n[zzz]\nbaz = "qux"\n`);
+    expect(upsertTomlTable(upserted.content, 'mcp_servers.codegraph', block).action).toBe('unchanged');
+
+    const removed = removeTomlTable(existing, 'mcp_servers.codegraph');
+    expect(removed.action).toBe('removed');
+    expect(removed.content).toBe('[zzz]\nbaz = "qux"\n');
+  });
+
+  it.each([
+    '[ mcp_servers.codegraph ]',
+    '[mcp_servers . codegraph]',
+    '[mcp_servers."codegraph"]',
+    "['mcp_servers'.codegraph]",
+    '[mcp_servers.codegraph] # ours',
+    '\t[mcp_servers.codegraph]\r',
+  ])('%s is the codegraph table', (header) => {
+    const existing = `${header}\ncommand = "old"\n`;
+    expect(hasTomlTable(existing, 'mcp_servers.codegraph')).toBe(true);
+    const { content, action } = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    expect(action).toBe('replaced');
+    expect(content).toBe(`${block}\n`);
+  });
+
+  it.each([
+    '[mcp_servers.codegraph2]',
+    '[mcp_servers.codegraph.env]',
+    '[[mcp_servers.codegraph]]',
+    '[mcp_servers]',
+    'x = "[mcp_servers.codegraph]"',
+  ])('%s is not the codegraph table', (line) => {
+    expect(hasTomlTable(`${line}\ncommand = "old"\n`, 'mcp_servers.codegraph')).toBe(false);
+  });
+
+  it('a header-shaped line inside a multiline string is a value, not the header', () => {
+    const existing = [
+      '[other]',
+      'description = """',
+      '  [mcp_servers.codegraph]',
+      '"""',
+      '',
+    ].join('\n');
+    expect(hasTomlTable(existing, 'mcp_servers.codegraph')).toBe(false);
+    expect(upsertTomlTable(existing, 'mcp_servers.codegraph', block).action).toBe('inserted');
   });
 });
 
