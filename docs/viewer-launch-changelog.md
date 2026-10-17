@@ -125,6 +125,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Screens, links and navigation
 
+- **One busy inline handler no longer hides the other routes.** Entry points counted the page by the symbols each route reaches, not by routes, so an inline handler with dozens of calls used up the page by itself and the routes after it went unlisted. The page now holds as many routes as it asks for.
+
 - **Routes served by a component are listed.** Entry points and the Steps picker listed a route only when a function, method or class served it. A Vue Router, Nuxt, Svelte or Astro screen is served by a component, so those apps' routes weren't listed at all. They are now, each with the component that serves it.
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
