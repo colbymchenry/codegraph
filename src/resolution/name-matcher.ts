@@ -8149,22 +8149,6 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
- * Is `n` the method `name` of the class `cls` a receiver is taken to name
- * (the class-name and capitalized-receiver strategies of matchMethodCall)?
- * In C and C++, only one of exactly that class: protobuf's `arena.get()`
- * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
- * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
- * other languages, any method of the name whose qualified name has the
- * class's name in it, as before.
- */
-function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
-  if (n.kind !== 'method' || n.name !== name) return false;
-  return cls.language === 'c' || cls.language === 'cpp'
-    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
-    : n.qualifiedName.includes(cls.name);
-}
-
-/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -14426,8 +14410,7 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+      const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
       if (methodNode) {
         return {
@@ -14495,7 +14478,7 @@ export function matchMethodCall(
   }
 
   // Strategy 2: Instance variable receiver - try capitalized form to find class
-  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
+  // e.g., "permissionEngine" → look for a class named "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
@@ -14507,8 +14490,7 @@ export function matchMethodCall(
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+        const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
         if (methodNode) {
           return {
@@ -15737,6 +15719,29 @@ function matchTsThisFieldCall(
     return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
   }
   return null;
+}
+
+/**
+ * The `method` named `methodName` declared on `classNode`, among the nodes of
+ * the class's file: the class's exact qualified name first, then the
+ * owner-by-name form the resolver uses elsewhere (`Logger::log`,
+ * `ns::Logger::log`). Never a substring test: `FileLogger::log` contains
+ * `Logger`.
+ *
+ * Known limitation — same-named NESTED classes: the owner-by-name form also
+ * matches `Outer::Logger::log`, and every same-named class is a candidate in
+ * the caller's loop, so a nested `Outer::Logger` can take a top-level
+ * `Logger.log()` (declared first, or the only one with the method). Choosing
+ * among them needs each language's scope rules.
+ */
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
+  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+  const exact = `${classNode.qualifiedName}::${methodName}`;
+  const byName = `${classNode.name}::${methodName}`;
+  return (
+    methods.find((n) => n.qualifiedName === exact) ??
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
+  );
 }
 
 /**
