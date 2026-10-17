@@ -27,6 +27,7 @@ import { playResolver } from './play';
 import { goResolver } from './go';
 import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
+import { ocamlResolver } from './ocaml';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
@@ -78,6 +79,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   goframeResolver,
   // Rust
   rustResolver,
+  // OCaml — dune library wrapper (`Lib.Mod.f`) → `Mod::f`
+  ocamlResolver,
   // C#
   aspnetResolver,
   // Swift

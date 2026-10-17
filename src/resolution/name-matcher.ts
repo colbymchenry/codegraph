@@ -165,6 +165,8 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet',
   svelte: 'web', vue: 'web', astro: 'web',
   cfml: 'cfml', cfscript: 'cfml',
+  // An `.mli` and its `.ml` are one module.
+  ocaml: 'ocaml', ocaml_interface: 'ocaml',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;
@@ -7791,6 +7793,29 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
 /**
  * Try to resolve a reference by exact name match
  */
+/**
+ * The modules an OCaml receiver-less call `f x` can read `f` from beyond its own
+ * file: the ones the file (or a binding in it) `open`s or `include`s, as
+ * `A::B` paths — null when the ref is not such a call. Anything else is the
+ * stdlib, which names no project symbol: a local helper (`and tag acc f`) must
+ * not bind to an unrelated file's `tag`.
+ */
+function ocamlBareOpens(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  if ((ref.language !== 'ocaml' && ref.language !== 'ocaml_interface') || ref.referenceKind !== 'calls') return null;
+  if (!/^[A-Za-z_][\w']*$/.test(ref.referenceName)) return null;
+  return context.getNodesInFile(ref.filePath).filter((n) => n.kind === 'import').map((n) => n.name.replace(/\./g, '::'));
+}
+
+/** Whether `n` is something an OCaml bare call may name: a function or value of its own file (or the `.mli`/`.ml` beside it), or of an opened module. */
+function isOcamlBareTarget(n: Node, ref: UnresolvedRef, opens: readonly string[]): boolean {
+  if (n.kind !== 'function' && n.kind !== 'constant') return false;
+  const stem = (file: string): string => file.replace(/\.mli?$/, '');
+  if (stem(n.filePath) === stem(ref.filePath)) return true;
+  const owner = n.qualifiedName.split('::').slice(0, -1).join('::');
+  // `open Lib.Entry` (dune wrapper) opens file module `Entry`: either path may carry the extra prefix.
+  return opens.some((o) => owner === o || owner.endsWith(`::${o}`) || o.endsWith(`::${owner}`));
+}
+
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -7839,6 +7864,7 @@ export function matchByExactName(
   // upstream's language gate on the chosen result.
   const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp') &&
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
+  const ocamlOpens = ocamlBareOpens(ref, context);
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
@@ -7898,6 +7924,7 @@ export function matchByExactName(
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
+    !(ocamlOpens && !isOcamlBareTarget(n, ref, ocamlOpens)) &&
     !(typeRef && !canNameInTypePosition(n)) &&
     // A Scala type position (`Arbitrary[B]`) never names a method: an
     // `implicit def A: Order[A]` shares its name with half of cats' type
@@ -16528,7 +16555,9 @@ export function matchFuzzy(
   // lowercase index is for.
   const bareR = isBareRCall(ref, context);
   const solidityBare = isReceiverLessSolidityCall(ref, context);
+  const ocamlOpens = ocamlBareOpens(ref, context);
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
+    !(ocamlOpens && !isOcamlBareTarget(n, ref, ocamlOpens)) &&
     !(bareR && n.kind === 'method') &&
     !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     // `new …MockData()` makes an instance of a type; a method is never what it names.
