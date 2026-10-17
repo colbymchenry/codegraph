@@ -17,7 +17,6 @@ import {
   ExtractionError,
   Edge,
   UnresolvedReference,
-  ReferenceKind,
 } from '../types';
 import { QueryBuilder, NodeIdentity } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -35,6 +34,8 @@ import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks
 import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
+import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
@@ -1772,38 +1773,6 @@ function scanDirectoryWalk(
 }
 
 /**
- * Resurrect a resolution edge that is about to be dropped (its target symbol
- * was removed, renamed, or its whole file deleted) as the ORIGINAL unresolved
- * reference that created it, read from the refName/refKind stamp
- * `createEdges` writes into edge metadata. Inserted as status='pending', the
- * ref is consumed by the same sync's resolution sweep: it rebinds to an
- * alternative definition if one exists, or parks as status='failed' where the
- * #1240 retry finds it if the symbol later reappears.
- *
- * Returns null — drop silently, the pre-#1240 behavior — for edges without a
- * refName stamp (created before the stamp existed, or synthesized): rebuilding
- * a ref from the target's plain node name would strip the receiver/qualifier
- * context the original text carried (`h.greet` → `greet`) and could rebind
- * somewhere a full re-index never would. Silent beats wrong.
- */
-function resurrectRefFromDroppedEdge(
-  e: Edge & { sourceFilePath: string; sourceLanguage: Language }
-): UnresolvedReference | null {
-  const refName = e.metadata?.refName;
-  if (typeof refName !== 'string' || refName.length === 0) return null;
-  const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
-  return {
-    fromNodeId: e.source,
-    referenceName: refName,
-    referenceKind: refKind,
-    line: e.line ?? 0,
-    column: e.column ?? 0,
-    filePath: e.sourceFilePath,
-    language: e.sourceLanguage,
-  };
-}
-
-/**
  * What tells a file's nodes apart across a re-index, coarsest first. (kind,
  * name) is the #899 key and settles every name a file defines once; a name it
  * defines more than once — the same method on two classes, a method's
@@ -3240,14 +3209,15 @@ export class ExtractionOrchestrator {
    * - edges whose source is in a file this sync already re-extracted are
    *   skipped — their references were re-resolved from scratch moments ago;
    * - very common names are skipped by the per-name ceiling in
-   *   `getResolutionEdgesByTargetName`.
+   *   `getResolutionEdgesByTargetName`, counted over the edges up to
+   *   `countedUpToEdgeId` when given (those before the sync's failed-ref retry).
    *
    * Returns the number of references resurrected.
    */
-  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): number {
+  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[], countedUpToEdgeId?: number): number {
     if (definitionDelta.length === 0) return 0;
     const alreadyFresh = new Set(changedFilePaths);
-    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta);
+    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta, undefined, countedUpToEdgeId);
 
     const edgeIds: number[] = [];
     const refs: UnresolvedReference[] = [];
@@ -3311,6 +3281,8 @@ export class ExtractionOrchestrator {
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
     // pairs below to derive `definitionDelta` (CG-33).
     const pairsBefore = new Set<string>();
+    // Importers' import statements, read once per sync for the files it removes.
+    const importReader = createImportReader(this.rootDir);
 
     onProgress?.({
       phase: 'scanning',
@@ -3416,10 +3388,27 @@ export class ExtractionOrchestrator {
       this.queries.deleteFile(tracked.path);
       filesRemoved++;
     };
+    const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
-        removeTracked(tracked);
+        removed.push(tracked);
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    // The references other files make THROUGH the removed ones to files that
+    // stay (a package `__init__.py` or an `index.ts` re-exporting what it
+    // imports) go back to pending too: the cascade keeps their edges, and a
+    // fresh index of the tree without these files binds them differently or
+    // not at all. Before any of them is deleted, and for all of them at once.
+    if (removed.length > 0) {
+      const tImporters = Date.now();
+      const reopened = reopenReferencesThroughRemovedFiles(this.queries, importReader, removed);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-removed-module-importers: ${Date.now() - tImporters}ms (${reopened} refs re-opened)`);
+    }
+    for (const tracked of removed) {
+      removeTracked(tracked);
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -3472,7 +3461,10 @@ export class ExtractionOrchestrator {
       // Not source after all — an MPEG transport stream named `.ts` (#1910):
       // a new one is ignored, a tracked file that became one is removed.
       if (content === null) {
-        if (tracked) removeTracked(tracked);
+        if (tracked) {
+          reopenReferencesThroughRemovedFiles(this.queries, importReader, [tracked]);
+          removeTracked(tracked);
+        }
         continue;
       }
       const contentHash = hashContent(content);

@@ -143,6 +143,24 @@ pub fn preceding_docstring_stepping_over(
     src: &str,
     step_over: &[&str],
 ) -> Option<String> {
+    preceding_docstring_with(node, src, step_over, false)
+}
+
+/// getPrecedingDocstring's `skipTrailing` (Go) — the comments the run opens
+/// with that belong to the line above are left out: one written after code on
+/// its line (`const n = 4 // four.`), and any that begins on the line such a
+/// comment ends. Go reads them as that line's comment, never the next
+/// declaration's doc.
+pub fn preceding_docstring_skipping_trailing(node: Node, src: &str) -> Option<String> {
+    preceding_docstring_with(node, src, &[], true)
+}
+
+fn preceding_docstring_with(
+    node: Node,
+    src: &str,
+    step_over: &[&str],
+    skip_trailing: bool,
+) -> Option<String> {
     let mut anchor = node;
     while let Some(parent) = anchor.parent() {
         if is_wrapper(parent.kind()) {
@@ -152,11 +170,11 @@ pub fn preceding_docstring_stepping_over(
         }
     }
 
-    let mut comments: Vec<&str> = Vec::new();
+    let mut comments: Vec<Node> = Vec::new();
     let mut sibling = anchor.prev_named_sibling();
     while let Some(s) = sibling {
         if is_comment(s.kind()) {
-            comments.push(&src[s.byte_range()]);
+            comments.push(s);
             sibling = s.prev_named_sibling();
         } else if step_over.contains(&s.kind()) {
             sibling = s.prev_named_sibling();
@@ -164,19 +182,43 @@ pub fn preceding_docstring_stepping_over(
             break;
         }
     }
-    if comments.is_empty() {
+    comments.reverse(); // collected nearest-first; TS unshifts to keep source order
+
+    let mut first = 0;
+    if skip_trailing {
+        let mut end_row = 0;
+        for c in &comments {
+            let trails = if first == 0 {
+                follows_code_on_its_line(*c, src)
+            } else {
+                c.start_position().row == end_row
+            };
+            if !trails {
+                break;
+            }
+            end_row = c.end_position().row;
+            first += 1;
+        }
+    }
+    if first == comments.len() {
         return None;
     }
-    comments.reverse(); // collected nearest-first; TS unshifts to keep source order
     Some(
-        comments
+        comments[first..]
             .iter()
-            .map(|c| clean_comment_markers(c))
+            .map(|c| clean_comment_markers(&src[c.byte_range()]))
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
             .to_string(),
     )
+}
+
+/// followsCodeOnItsLine (tree-sitter-helpers.ts) — whether code comes before
+/// `node` on the line it starts on.
+fn follows_code_on_its_line(node: Node, src: &str) -> bool {
+    let before = src[..node.start_byte()].trim_end_matches([' ', '\t']);
+    !before.is_empty() && !before.ends_with(['\n', '\r'])
 }
 
 #[cfg(test)]
@@ -230,5 +272,31 @@ mod tests {
             preceding_docstring_stepping_over(f, src, &["annotation"]).as_deref(),
             Some("a\nb")
         );
+    }
+
+    /// Skipping trailing comments leaves out one written after code on its
+    /// line and one beginning on the line it ends; a comment on a line of its
+    /// own still opens the run. Without it, nothing is left out.
+    #[test]
+    fn skips_the_comments_that_trail_code() {
+        let grammar = crate::langs::grammar_for("go").expect("go grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let src = "package p\n\nconst n = 4 /* a */ // b\n// c\nfunc f() {}\n\nvar m = 1 // d\nfunc g() {}\n";
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let func = |name: &str| {
+            (0..root.named_child_count())
+                .filter_map(|i| root.named_child(i))
+                .find(|n| {
+                    n.kind() == "function_declaration"
+                        && n.child_by_field_name("name").map(|id| &src[id.byte_range()]) == Some(name)
+                })
+                .expect(name)
+        };
+        assert_eq!(preceding_docstring(func("f"), src).as_deref(), Some("a\nb\nc"));
+        assert_eq!(preceding_docstring_skipping_trailing(func("f"), src).as_deref(), Some("c"));
+        assert_eq!(preceding_docstring(func("g"), src).as_deref(), Some("d"));
+        assert_eq!(preceding_docstring_skipping_trailing(func("g"), src), None);
     }
 }

@@ -45,7 +45,7 @@ agent read-reduction (see §4.3).
 
 | Symbol | Role |
 |---|---|
-| `VALUE_REF_LANGS` (static Set) | languages the feature runs for. Currently `typescript`, `javascript`, `tsx`, `go`, `python`, `rust`, `ruby`, `c`, `java`, `csharp`, `php`, `scala`, `kotlin`, `swift`, `dart`, `pascal`. **Add the new language here.** |
+| `VALUE_REF_LANGS` (static Set) | languages the feature runs for. Currently `typescript`, `javascript`, `tsx`, `jsx`, `arkts`, `go`, `python`, `rust`, `ruby`, `c`, `java`, `csharp`, `php`, `scala`, `kotlin`, `swift`, `dart`, `pascal`. **Add the new language here.** |
 | `valueRefsEnabled` | `process.env.CODEGRAPH_VALUE_REFS !== '0'` — default ON, env opts out. |
 | `MAX_VALUE_REF_NODES` (20_000) | per-scope traversal cap (and the shadow-scan cap). |
 | `captureValueRefScope(kind, name, id, node)` | called from `createNode` on every node. Records **targets** (file-scope `const`/`var`) and **reader scopes** (`function`/`method`/`const`/`var`). |
@@ -169,7 +169,7 @@ the bottom of this section).
 
 | Language | How |
 |---|---|
-| TypeScript, JavaScript, tsx | file-scope `const`/`var`; the original languages |
+| TypeScript, JavaScript, tsx, jsx | file-scope `const`/`var`; the original languages (`jsx` was left out until 2026-10 — see the design doc's tsx note) |
 | Python | module-level `NAME =` |
 | Go | package `const`/`var` |
 | Rust | module + impl `const`/`static` |

@@ -266,6 +266,12 @@ describe('sync links an import of a file that appears after the importer', () =>
     expect(synced.ownStatements).toBe(0);
     expect(cg.getPendingReferenceCount()).toBe(0);
 
+    // A full re-index links the same. It has to start from an empty database,
+    // as `codegraph index` does: indexAll over this one skips the unchanged
+    // importer and keeps the edges the sync wrote. Close first: recreate
+    // unlinks the database file, which a held handle makes EBUSY on Windows.
+    cg.close();
+    cg = await CodeGraph.recreate(root);
     await cg.indexAll();
     expect(importsOf(c.from)).toEqual(synced);
   }, 60_000);

@@ -21,19 +21,23 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { clearCppTypeAliasMemos } from './cpp-type-aliases';
+import { clearCppIncluderMemos } from './cpp-includers';
+import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks } from './frameworks';
+import { detectFrameworks, getResolvingFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -42,7 +46,8 @@ import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule 
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
-import type { ReExport } from './types';
+import type { CrossFileNodes, ReExport } from './types';
+import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
@@ -127,20 +132,6 @@ const PYTHON_BUILT_IN_METHODS = new Set([
   'startswith', 'endswith', 'find', 'index', 'count', 'encode', 'decode',
   'format', 'isdigit', 'isalpha', 'isalnum',
   'read', 'write', 'readline', 'readlines', 'close', 'flush', 'seek',
-]);
-
-const GO_STDLIB_PACKAGES = new Set([
-  'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
-  'time', 'path', 'bytes', 'strings', 'strconv', 'errors', 'context',
-  'json', 'xml', 'csv', 'html', 'template', 'regexp', 'reflect',
-  'runtime', 'testing', 'flag', 'bufio', 'crypto', 'encoding',
-  'filepath', 'hash', 'mime', 'rand', 'signal', 'sql', 'syscall',
-  'unicode', 'unsafe', 'atomic', 'binary', 'debug', 'exec', 'heap',
-  'ring', 'scanner', 'tar', 'zip', 'gzip', 'zlib', 'tls', 'url',
-  'user', 'pprof', 'trace', 'ast', 'build', 'parser', 'printer',
-  'token', 'types', 'cgo', 'plugin', 'race', 'ioutil',
-  // Kubernetes-common stdlib aliases
-  'utilruntime', 'utilwait', 'utilnet',
 ]);
 
 const GO_BUILT_INS = new Set([
@@ -232,6 +223,8 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  /** `frameworks` narrowed to those that resolve each reference language (see getResolvingFrameworks). */
+  private frameworksByLanguage = new Map<Language, FrameworkResolver[]>();
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
   // collected in-memory and left pending in the DB until the post-pass
   // finishes, so a restart can recover the queue (#1577). Drained by
@@ -285,6 +278,8 @@ export class ReferenceResolver {
   // 565s of combined worker time (~581µs each, recursion-multiplied).
   private supertypeGen = 0;
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+  // getSupertypeNodes' memo, by node id, under the same generation tag.
+  private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -292,6 +287,7 @@ export class ReferenceResolver {
     // Lazy invalidation via the gen tag; bound the map so a long run over many
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+    if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -356,7 +352,18 @@ export class ReferenceResolver {
    */
   initialize(): void {
     this.frameworks = detectFrameworks(this.context);
+    this.frameworksByLanguage.clear();
     this.clearCaches();
+  }
+
+  /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
+  private frameworksFor(language: Language): FrameworkResolver[] {
+    let frameworks = this.frameworksByLanguage.get(language);
+    if (!frameworks) {
+      frameworks = getResolvingFrameworks(this.frameworks, language);
+      this.frameworksByLanguage.set(language, frameworks);
+    }
+    return frameworks;
   }
 
   /**
@@ -384,8 +391,97 @@ export class ReferenceResolver {
         });
       }
     }
+    for (const fw of this.frameworks) {
+      if (!fw.crossFileNodes) continue;
+      try {
+        updated += this.reconcileCrossFileNodes(fw.crossFileNodes(this.context));
+      } catch (err) {
+        logDebug(`Framework '${fw.name}' crossFileNodes failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     if (updated > 0) this.clearCaches();
     return updated;
+  }
+
+  /**
+   * Bring a framework's cross-file nodes in line with what it wants now:
+   * insert the new ones with their references (pending, for the resolution
+   * that follows), rename the ones whose name changed, and remove the ones it
+   * no longer wants. A removed node's incoming resolution edges go back to
+   * being the references that made them, exactly as when a file is deleted,
+   * so they rebind elsewhere or park as failed. Unchanged nodes are not
+   * touched, so their edges survive. Returns the number of nodes changed.
+   */
+  private reconcileCrossFileNodes(result: CrossFileNodes): number {
+    const wanted = new Map<string, Node>();
+    for (const node of result.nodes) if (result.owns(node)) wanted.set(node.id, node);
+    const existing = new Map<string, Node>();
+    for (const node of this.queries.getNodesByKind(result.kind)) if (result.owns(node)) existing.set(node.id, node);
+    let changed = 0;
+    for (const [id, old] of existing) {
+      if (wanted.has(id)) continue;
+      const refs = this.queries.getCrossFileIncomingEdgesWithTarget(old.filePath)
+        .filter((e) => e.target === id)
+        .map((e) => resurrectRefFromDroppedEdge(e))
+        .filter((r): r is UnresolvedReference => r !== null);
+      if (refs.length > 0) this.queries.insertUnresolvedRefsBatch(refs);
+      this.queries.deleteNode(id);
+      changed++;
+    }
+    const added: Node[] = [];
+    for (const [id, node] of wanted) {
+      const old = existing.get(id);
+      if (!old) added.push(node);
+      else if (old.name !== node.name || old.qualifiedName !== node.qualifiedName) {
+        this.queries.updateNode(node);
+        changed++;
+      }
+    }
+    if (added.length > 0) {
+      this.queries.insertNodes(added);
+      const ids = new Set(added.map((n) => n.id));
+      this.queries.insertUnresolvedRefsBatch(result.references.filter((r) => ids.has(r.fromNodeId)));
+      changed += added.length;
+    }
+    return changed;
+  }
+
+  /**
+   * Put back in the pending set the route references whose answer reads a
+   * module in `changedFilePaths` (`FrameworkResolver.lazyModules`), for a
+   * sync's resolution sweep. Returns the number put back.
+   *
+   * A route that renders a same-file `const Docs = lazy(() =>
+   * import('./pages/Docs'))` binds to the declaration while the module is
+   * missing, and nothing revisited it once the module was added: the
+   * reference had resolved, so it was never parked for the failed-ref retry,
+   * and the rebind of the names a sync defines (CG-33) reaches it only when
+   * the module's component is named like the declaration. An edit that gives
+   * the module its default export, or moves it to another component, changes
+   * the answer the same way: a route's edge follows its old target through
+   * the module's re-index. So does a page behind a barrel the module
+   * forwards. References written in a changed file were resolved against the
+   * new files already.
+   */
+  reopenRouteModuleReaders(changedFilePaths: readonly string[]): number {
+    const readers = this.frameworks.filter((f) => f.lazyModules);
+    if (readers.length === 0 || changedFilePaths.length === 0) return 0;
+    const changed = new Set(changedFilePaths);
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const edge of this.queries.getRouteEdgesMovedBy(changedFilePaths)) {
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (!ref) continue;
+      const asked: UnresolvedRef = { ...ref, filePath: edge.sourceFilePath, language: edge.sourceLanguage };
+      const reads = readers.some((f) => f.lazyModules!(asked, this.context).some((file) => changed.has(file)));
+      if (!reads) continue;
+      edgeIds.push(edge.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
   }
 
   /**
@@ -455,6 +551,7 @@ export class ReferenceResolver {
     this.methodMatchCache.clear();
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
+    this.supertypeNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -476,6 +573,10 @@ export class ReferenceResolver {
       clearVbnetReceiverMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
+      clearCppTypeAliasMemos(this.context);
+      clearCppSupertypeMemos(this.context);
+      clearCppIncluderMemos(this.context);
+      clearCFeatureVariantMemos(this.context);
     }
   }
 
@@ -569,11 +670,28 @@ export class ReferenceResolver {
    */
   private createContext(): ResolutionContext {
     return {
-      resolveImport: (ref) => resolveViaImport(ref, this.context),
-      isOutOfRepoImport: (source, fromFile, language) =>
-        isExternalImport(source, language, this.context) &&
-        resolveImportPath(source, fromFile, language, this.context) === null &&
-        this.isDeclaredOutsidePackage(source, fromFile),
+      // A C or C++ `#include` the import resolver can't place is linked by the
+      // end of its path, as resolveOneInner's name matching does: protobuf's
+      // `google/protobuf/descriptor.upb.h`, which two generated copies end in.
+      // cppIncluders reads includes through this, so it sees the include edges
+      // a reader sees. A standard header is never the project's: `<math.h>`
+      // is not jemalloc's test/math.h, which only its includers may see.
+      resolveImport: (ref) => resolveViaImport(ref, this.context) ??
+        ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
+          !isExternalImport(ref.referenceName, ref.language, this.context) ? matchByFilePath(ref, this.context) : null),
+      // A path alias makes an import the project's only when it maps the
+      // import to a file the index holds. Matching its prefix is not enough:
+      // cord-field's `"*": ["./typings/*"]` matches every package, and
+      // counting the match bound 169 imports of `@mui/material`'s Typography
+      // to its own. Nor is a path that exists on disk: home-assistant's
+      // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
+      // `node_modules`, topcoder's `config` package on its `config/` folder.
+      isOutOfRepoImport: (source, fromFile, language) => {
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        const resolved = resolveImportPath(source, fromFile, language, this.context);
+        if (resolved !== null && this.isIndexedFile(resolved)) return false;
+        return this.isDeclaredOutsidePackage(source, fromFile);
+      },
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -816,6 +934,18 @@ export class ReferenceResolver {
         return supers;
       },
 
+      getSupertypeNodes: (id: string) => {
+        const hit = this.supertypeNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, RESOLUTION_READ_EDGE_KINDS)) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
+      },
+
       getImportMappings: (filePath: string, language) => {
         const cacheKey = filePath;
         const cached = this.importMappingCache.get(cacheKey);
@@ -906,6 +1036,8 @@ export class ReferenceResolver {
       getCppIncludeDirs: () => {
         return loadCppIncludeDirs(this.projectRoot);
       },
+
+      getCppIncludeNodes: () => this.queries.getCppIncludeNodes(),
     };
   }
 
@@ -947,7 +1079,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
 
       // Report progress every 1% to avoid too many updates
@@ -1142,6 +1274,11 @@ export class ReferenceResolver {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+    // A C or C++ base class is the one C++ name lookup finds from where the
+    // class is declared — never a namesake of another namespace or language,
+    // which a framework's heuristics or name matching would take (see
+    // ./cpp-supertypes).
+    if (isCppSupertypeRef(ref)) return matchCppSupertype(ref, this.context);
 
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
@@ -1153,6 +1290,11 @@ export class ReferenceResolver {
     // A Dart annotation (`@riverpod`, `@Riverpod(…)`) is a constant or a
     // constructor call, as written — never a method or function by its name.
     if (isDartAnnotation(ref)) return matchDartAnnotation(ref, this.context);
+    // A Go call through a type assertion (`srv.(KVServer).Range(ctx, in)`),
+    // which arrives by its bare name, is to a method of the asserted type, or
+    // to nothing the project declares.
+    const asserted = matchGoAssertedCall(ref, this.context);
+    if (asserted !== undefined) return asserted;
 
     // A section or snippet a Shopify theme's file names is that theme's own,
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
@@ -1207,6 +1349,11 @@ export class ReferenceResolver {
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // A C or C++ name written from the global scope (`::_pbi::PrivateAccess::
+    // GenerateParseTable`, `::memset`) exists when the name under the `::` does.
+    if ((ref.language === 'cpp' || ref.language === 'c') && existenceName.startsWith('::')) {
+      existenceName = existenceName.slice(2);
+    }
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -1216,7 +1363,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -1291,12 +1438,16 @@ export class ReferenceResolver {
 
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution. Cross-language bridges
-    // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
-    // JS → native `calls`); other code references obey the shared family gate.
+    // Strategy 1: Try framework-specific resolution, by the frameworks that
+    // read this reference's language: Express's `logger` middleware rule took
+    // a Go method's `*zap.Logger` result for the method itself (etcd).
+    // Cross-language bridges are deliberately preserved (Drupal `routing.yml`
+    // → PHP controller, RN JS → native `calls`); each lists the language its
+    // references are written in. Other code references obey the shared
+    // family gate.
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
-    for (const framework of this.frameworks) {
+    for (const framework of this.frameworksFor(ref.language)) {
       const resolved = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       // Name the resolver on the edge (`metadata.framework`): a Swift→ObjC or
       // React Native bridge hop says how it got into the graph, as a
@@ -1551,20 +1702,34 @@ export class ReferenceResolver {
    * ref's line), so a sibling must not inherit this row's failure (#1269).
    */
   private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
-    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }>;
-    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+    byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>;
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }>;
   } {
-    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string }> = [];
-    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    const byRowId: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }> = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }> = [];
     for (const r of unresolved) {
-      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind });
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName, referenceKind: r.referenceKind, nameTail: r.nameTail });
       else legacyKeys.push({
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
         referenceKind: r.referenceKind,
+        nameTail: r.nameTail,
       });
     }
     return { byRowId, legacyKeys };
+  }
+
+  /**
+   * `ref`, which no strategy resolved, with the tail it is parked under when
+   * that is not the one its name gives: a reference through an import
+   * binding the module doesn't declare by that name waits for the module
+   * (see importBindingTail). Decided here, where the file's import mappings
+   * are still cached from the attempt — in a resolver-pool worker too.
+   */
+  private parkable(ref: UnresolvedRef): UnresolvedRef {
+    const tail = importBindingTail(ref, this.context);
+    if (tail) ref.nameTail = tail;
+    return ref;
   }
 
   /** A deferred attempt is unfinished work, not a final failure (#1577). */
@@ -1801,7 +1966,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
       // Fast-path the per-ref yield check: awaiting the async no-op costs a
       // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
@@ -1921,7 +2086,7 @@ export class ReferenceResolver {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
       } else {
-        unresolved.push(ref);
+        unresolved.push(this.parkable(ref));
       }
     }
     this.deferredRowIds.clear(); // the admission side now owns both queues
@@ -2486,6 +2651,96 @@ export class ReferenceResolver {
     return this.frameworks.map((f) => f.name);
   }
 
+  /** The project file a module specifier written in `fromFile` names, as its import resolves it; null when none. */
+  resolveModuleFile(specifier: string, fromFile: string, language: Language): string | null {
+    return resolveImportPath(specifier, fromFile, language, this.context);
+  }
+
+  /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
+  hasNavigationRouters(): boolean {
+    return this.frameworks.some((f) => f.navigation !== undefined);
+  }
+
+  /**
+   * Put back in the pending set the navigation calls `routes` — route nodes a
+   * sync added, removed or renamed ({@link changedRoutes}) — may now resolve
+   * differently, for the sync's resolution sweep: the calls parked as failed,
+   * and the calls whose `navigates` edges a router's resolver made. Calls in
+   * `changedFilePaths` are left alone; the sync resolved them against the new
+   * routes already. Returns the number of references put back.
+   *
+   * A navigation call names its route by path (`navigate('/login')`) and its
+   * reference by the router's method (`navigate`, `history.push`), so a route
+   * table that changed in another file is invisible to the rest of sync. A
+   * call parked as failed while its route was missing is keyed on `push`,
+   * which no synced file defines, and a resolved call keeps the route it bound
+   * to while a better one was missing (a catch-all, a parameter route, one arm
+   * of a conditional) or a route renamed under it. A full index resolves every
+   * call against the final table. Each router says which calls a route of its
+   * own can answer (`FrameworkResolver.navigation`): the method tails, and the
+   * apps whose files match against that route's table. A name more of those
+   * calls share than `perNameCeiling` is skipped, as the symbol retry skips a
+   * common tail.
+   */
+  reopenNavigationsFor(routes: readonly Node[], changedFilePaths: readonly string[] = [], perNameCeiling: number = 500): number {
+    if (routes.length === 0) return 0;
+    const plans: Array<{ router: FrameworkResolver; scopes: string[] }> = [];
+    const tails = new Set<string>();
+    for (const router of this.frameworks) {
+      if (!router.navigation) continue;
+      const scopes = new Set<string>();
+      for (const route of routes) {
+        for (const scope of router.navigation.scope(route, this.context) ?? []) scopes.add(scope);
+      }
+      if (scopes.size === 0) continue;
+      plans.push({ router, scopes: [...scopes] });
+      for (const tail of router.navigation.tails) tails.add(tail);
+    }
+    if (plans.length === 0) return 0;
+    const claimed = (name: string, filePath: string): boolean =>
+      plans.some(({ router, scopes }) => scopes.some((scope) => filePath.startsWith(scope)) && router.claimsReference?.(name) === true);
+
+    const fresh = new Set(changedFilePaths);
+    const failed = new Map<string, number[]>();
+    for (const ref of this.queries.getFailedCallsByTail([...tails])) {
+      if (fresh.has(ref.filePath) || !claimed(ref.referenceName, ref.filePath)) continue;
+      const rowIds = failed.get(ref.referenceName);
+      if (rowIds) rowIds.push(ref.rowId);
+      else failed.set(ref.referenceName, [ref.rowId]);
+    }
+    const resolved = new Map<string, Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>>();
+    for (const edge of this.queries.getResolvedNavigations()) {
+      const name = edge.metadata?.refName;
+      if (typeof name !== 'string' || fresh.has(edge.sourceFilePath) || !claimed(name, edge.sourceFilePath)) continue;
+      const edges = resolved.get(name);
+      if (edges) edges.push(edge);
+      else resolved.set(name, [edge]);
+    }
+
+    const rowIds: number[] = [];
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    // A conditional's arms are edges of one call: it goes back as one reference.
+    const sites = new Set<string>();
+    for (const name of new Set([...failed.keys(), ...resolved.keys()])) {
+      const rows = failed.get(name) ?? [];
+      const edges = resolved.get(name) ?? [];
+      if (rows.length + edges.length > perNameCeiling) continue;
+      for (const rowId of rows) rowIds.push(rowId);
+      for (const edge of edges) {
+        const ref = resurrectRefFromDroppedEdge(edge);
+        if (!ref) continue;
+        edgeIds.push(edge.edgeId);
+        const site = `${ref.fromNodeId}\0${ref.referenceName}\0${ref.line}\0${ref.column}`;
+        if (sites.has(site)) continue;
+        sites.add(site);
+        refs.push(ref);
+      }
+    }
+    if (edgeIds.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return this.queries.reopenFailedReferences(rowIds) + refs.length;
+  }
+
   /**
    * True when `receiver` is a local name bound by an import that resolves to a
    * file IN THIS PROJECT — the only case where letting a python
@@ -2618,7 +2873,13 @@ export class ReferenceResolver {
       const dotIdx = name.indexOf('.');
       if (dotIdx > 0) {
         const pkg = name.substring(0, dotIdx);
-        if (GO_STDLIB_PACKAGES.has(pkg)) {
+        // Not a local bound from a type assertion that is named like one:
+        // grpc-go's `parser.ParseConfig(…)` after `parser, ok :=
+        // b.(balancer.ConfigParser)`. Nor a call on any other parameter or
+        // local of the name that can hold one of the project's values: gin's
+        // `context.AbortWithError(…)` in `func(context *Context)`.
+        if (GO_STDLIB_PACKAGES.has(pkg) && !isGoAssertedLocal(pkg, ref, this.context) &&
+            !isGoProjectLocalCall(ref, this.context)) {
           return true;
         }
       }
@@ -2646,12 +2907,15 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      // A leading `::` names the global scope: `::std::move` is `std::move`,
+      // `::memset` is `memset`.
+      const scoped = name.startsWith('::') ? name.slice(2) : name;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
-      if (name.startsWith('std::')) return true;
-      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
-        return !this.hasAnyPossibleMatch(name);
+      if (scoped.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(scoped) || CPP_BUILT_INS.has(scoped)) {
+        return !this.hasAnyPossibleMatch(scoped);
       }
     }
 
@@ -3003,6 +3267,10 @@ export class ReferenceResolver {
    * inside a type never is, and neither is the import statement the reference
    * was written in.
    *
+   * For a Go type position: the target is a type of the package Go reads the
+   * name from, moved there when a strategy found a method, a function or
+   * another package's type (see goTypePositionTarget).
+   *
    * For `extends`/`implements`, it cannot be describing a real supertype when:
    *
    *  1. The target's kind can never be a supertype (an enum member, a method,
@@ -3034,6 +3302,12 @@ export class ReferenceResolver {
     if (ref.referenceKind === 'calls') {
       const target = this.nodeById(result.targetNodeId);
       if (target?.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(target.signature ?? '')) return null;
+      // A Go call made through an expression — `h.Validate().Error()`, a
+      // `.Metrics()` chained onto the line above — calls a method of whatever
+      // the expression is. A type is called only bare (`T(x)`, `(*T)(x)`) or
+      // through its package; as a struct here it read as an instantiation.
+      if (target && ref.language === 'go' && GO_TYPE_KINDS.has(target.kind) &&
+          !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
     }
 
     // An `imports` reference names something importable — never a member that
@@ -3048,6 +3322,20 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
+    // A Go alias names its type as an embedding does (below): written through
+    // a package that is none of the file's imports as indexed, the type found
+    // by its bare name is another package's namesake, or the alias itself.
+    if (ref.language === 'go' && ref.referenceKind === 'references' &&
+        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+
+    // A Go type position — a parameter or result type, a composite literal's
+    // type — names a type of the package Go reads it from (route handlers are
+    // `references` too, but values).
+    if (ref.language === 'go' && (ref.referenceKind === 'instantiates' ||
+        (ref.referenceKind === 'references' && this.nodeById(ref.fromNodeId)?.kind !== 'route'))) {
+      return goTypePositionTarget(result, ref, this.context);
+    }
+
     if (!isInheritanceRef(ref)) return result;
     const target = this.nodeById(result.targetNodeId);
     if (target && !isSupertypeTarget(target)) {
@@ -3056,10 +3344,10 @@ export class ReferenceResolver {
       result = { ...result, targetNodeId: type.id };
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
-    // A Go type embedded through a package (`yaml.Node`) is that package's.
-    // When the package is none of the file's imports as indexed, a type found
-    // by its bare name is some other package's namesake: prometheus's
-    // `RuleGroupNode` embeds yaml's `Node`, not discovery/kubernetes's.
+    // A Go type embedded through a package (`clientv3.KV`) is that package's.
+    // When the package is none of the file's imports as indexed (clientv3
+    // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its
+    // bare name is some other package's namesake.
     if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
     return result;
   }
@@ -3097,6 +3385,12 @@ export class ReferenceResolver {
     if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
     const target = this.nodeById(result.targetNodeId);
     return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+  }
+
+  /** Is `filePath` (project-relative) one of the files the index holds? */
+  private isIndexedFile(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/');
+    return this.knownFiles ? this.knownFiles.has(normalized) : this.queries.getFileByPath(normalized) !== null;
   }
 
   /** The repository's own package name, from its root package.json; null without one. */
@@ -3198,6 +3492,20 @@ export class ReferenceResolver {
 function goDirOf(p: string): string {
   const dir = path.posix.dirname(p.replace(/\\/g, '/'));
   return dir === '.' || dir === '/' ? '' : dir;
+}
+
+/**
+ * The routes a sync added, removed or renamed: `before` is every route node
+ * before the sync changed a file, `after` every one after its post-extract
+ * pass, and a route whose file and path are on one side only changed. A route
+ * renamed in place — the same node under a new path — is in the result twice,
+ * as its old self and its new one.
+ */
+export function changedRoutes(before: readonly Node[], after: readonly Node[]): Node[] {
+  const key = (route: Node): string => `${route.filePath}\0${route.name}`;
+  const beforeKeys = new Set(before.map(key));
+  const afterKeys = new Set(after.map(key));
+  return [...before.filter((route) => !afterKeys.has(key(route))), ...after.filter((route) => !beforeKeys.has(key(route)))];
 }
 
 /**

@@ -26,11 +26,12 @@ import {
   FindRelevantContextOptions,
   UnresolvedReference,
   IndexHealth,
+  Language,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
-import { importPathKeys } from './db/reference-tail';
+import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -48,10 +49,12 @@ import {
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
+  changedRoutes,
   createResolver,
   ResolutionResult,
 } from './resolution';
-import { hasSynthesisPattern } from './resolution/callback-synthesizer';
+import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
+import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -922,8 +925,15 @@ export class CodeGraph {
         let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
+        // The route nodes as they were before this sync replaced or removed a
+        // file — read at the first change, so a sync that changes nothing
+        // reads nothing, and only where a router binds navigation calls to
+        // routes. Compared with the routes after runPostExtract below.
+        const watchRoutes = this.resolver.hasNavigationRouters();
+        let routesBefore = null as Node[] | null;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
               (content !== undefined && hasSynthesisPattern(filePath, content)))) {
@@ -931,6 +941,19 @@ export class CodeGraph {
               this.queries.setMetadata('synthesis_pending', '1');
             }
           });
+
+        // A component a tag in an unchanged file may render: `<Team />` links
+        // to the `Team` this sync adds. The gate above reads each changed file
+        // on its own, and a component with no markup of its own (`return null`,
+        // a wrapper) matches none of its patterns. Removing one needs no check:
+        // a component a tag rendered had synthesized edges into its file.
+        if (!refreshSynthesis && result.definitionDelta && result.changedFilePaths) {
+          const delta = new Set(result.definitionDelta);
+          if (this.queries.getNodesByFiles(result.changedFilePaths).some((n) => delta.has(n.name) && isJsxChildCandidate(n))) {
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+        }
 
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
@@ -940,22 +963,50 @@ export class CodeGraph {
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
-        // (regex over *.module.ts only).
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        // (regex over *.module.ts only). A removal counts too: deleting the
+        // file that hands a React Router table to the router leaves the
+        // table's routes behind unless this pass runs to take them away.
+        // (A pure-removal sync still resolves refs below — the deletion path
+        // resurrects the removed file's incoming edges as pending refs, #1240
+        // removal case — and runPostExtract starts by dropping the resolver's
+        // name caches, which a long-lived daemon warmed against the
+        // pre-removal graph.)
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
-        } else if (result.filesRemoved > 0) {
-          // A pure-removal sync still resolves refs below — the deletion path
-          // resurrects the removed file's incoming edges as pending refs
-          // (#1240 removal case) and the orphan sweep consumes them. In a
-          // long-lived process (daemon) the resolver's name caches were
-          // warmed against the pre-removal graph; drop them so resolution
-          // sees the post-removal state. (runPostExtract above clears caches
-          // itself, so the changed-files branch is already covered.)
-          this.resolver.clearCaches();
+        }
+
+        // A route that appeared, went away or was renamed changes what a
+        // navigation call in an UNCHANGED file resolves to: `history.push(
+        // '/login')` binds again once `/login` is back. While the route was
+        // missing the call was parked as failed, or bound to a catch-all, and
+        // nothing below revisits it: the retry keys on the names this sync's
+        // files define, which a call named for the router's method (`push`)
+        // never matches. Put those calls back in the pending set for the sweep
+        // below, and let the synthesizers redraw the links markup makes to
+        // routes. The route table is final here: renames and table routes are
+        // runPostExtract's.
+        if (routesBefore) {
+          const tNav = Date.now();
+          const routes = changedRoutes(routesBefore, this.queries.getNodesByKind('route'));
+          const reopened = this.resolver.reopenNavigationsFor(routes, result.changedFilePaths ?? []);
+          if (routes.length > 0 && !refreshSynthesis) {
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-navigation-retry: ${Date.now() - tNav}ms (${routes.length} routes changed, ${reopened} refs re-opened)`);
+          }
         }
 
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        // The last edge before the failed-ref retry below: the rebind's
+        // per-name ceiling counts only edges up to it (see
+        // resurrectStaleResolutionEdges).
+        let edgesBeforeRetry: number | undefined;
+        // And the last edge before this sync resolved anything: an importer's
+        // edge up to it was bound before a module this sync adds was there.
+        const edgesBeforeResolution = this.queries.getMaxEdgeId();
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
@@ -984,26 +1035,63 @@ export class CodeGraph {
             // now resolve, and nothing else ever revisits them (their rows
             // were parked as status='failed' by an earlier completed pass).
             // Look them up by the symbol names the changed files now carry
-            // and re-resolve just that set. On a sync where no failed ref
-            // matches, this is one indexed lookup.
+            // and re-resolve just that set. The names include each file's
+            // own, which a reference written as a path
+            // (`snippets/price.liquid`) waits under, and the keys a route's
+            // lazily loaded module waits under (`module:Team` for
+            // `lazy-import:./pages/Team`), as does a reference through an
+            // import binding the module declares under another name
+            // (`module:tag` for `import tagsController from
+            // './tag/tag.controller'`): each resolves through the module, so
+            // an edit can satisfy it as well as an added file. On a sync
+            // where no failed ref matches, this is one indexed lookup.
             const tRetry = Date.now();
-            const retryable = this.queries.getRetryableFailedReferences(
-              this.queries.getNodeNamesByFiles(result.changedFilePaths)
-            );
+            edgesBeforeRetry = this.queries.getMaxEdgeId();
+            const retryable = this.queries.getRetryableFailedReferences([...new Set([
+              ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
+              ...result.changedFilePaths.flatMap(moduleReferenceKeys),
+            ])]);
             // A failed import waits for a file, a folder or a namespace, not a
             // symbol: `package:app/b.dart` for a file named `b.dart`, `./ui`
             // for `ui/index.ts`, `using Foo.Bar` for that namespace's node.
             // Look those up by what the ADDED files can be imported as (a
             // modified file was already there for any import of it), and by
             // the namespaces and modules the changed files declare.
+            // A scoped package that a `tsconfig` path or a workspace package maps
+            // to an added file (`@excalidraw/common` to `packages/common/src/
+            // index.ts`) waits under its last segment, which that file's keys
+            // never give: look its failed imports up by the specifier itself.
+            // An import of the importer's own folder or the one above (`.`,
+            // `..`) waits under no key at all, so each is tried where written.
+            const addedFiles = new Set(result.addedFilePaths ?? []);
+            const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
+              const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
+              return file !== null && addedFiles.has(file);
+            };
+            const resolvedModules = addedFiles.size === 0 ? [] : this.queries.getFailedScopedImports()
+              .filter((s) => resolvesToAdded(s.name, s.filePath, s.language))
+              .map((s) => s.name);
+            const folderImports = addedFiles.size === 0 ? [] : this.queries.getFailedFolderImports()
+              .filter((ref) => ref.filePath !== undefined && ref.language !== undefined &&
+                resolvesToAdded(ref.referenceName, ref.filePath, ref.language));
             const retryRows = new Set(retryable.map((ref) => ref.rowId));
             const importRetry = this.queries.getRetryableFailedImports(
               (result.addedFilePaths ?? []).flatMap(importPathKeys),
-              this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module'])
+              this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module']),
+              undefined,
+              resolvedModules
             );
-            for (const ref of importRetry) {
-              if (!retryRows.has(ref.rowId)) retryable.push(ref);
+            for (const ref of [...importRetry, ...folderImports]) {
+              if (!retryRows.has(ref.rowId)) {
+                retryable.push(ref);
+                retryRows.add(ref.rowId);
+              }
             }
+            // In row order, as a full index resolves them: when two refs make
+            // the same edge, such as a route's lazily loaded class that its
+            // layout also renders, the one written first names it, as it
+            // does in a fresh index.
+            retryable.sort((a, b) => (a.rowId ?? 0) - (b.rowId ?? 0));
             if (retryable.length > 0) {
               options.onProgress?.({
                 phase: 'resolving',
@@ -1018,6 +1106,46 @@ export class CodeGraph {
               });
             }
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
+
+            // A module that appeared, such as a package `__init__.py` or an
+            // `index.ts` re-exporting what it imports: what the files importing
+            // it bound by name in its absence, or failed, goes back to pending
+            // for the sweep below, which binds it through the module as a fresh
+            // index does. (The removal half runs before removed files are deleted.)
+            const importReader = createImportReader(this.projectRoot);
+            const added = (result.addedFilePaths ?? []).flatMap((filePath) => {
+              const file = this.queries.getFileByPath(filePath);
+              return file ? [{ path: filePath, language: file.language }] : [];
+            });
+            if (added.length > 0) {
+              const tAdded = Date.now();
+              const reopened = reopenReferencesThroughAddedFiles(
+                this.queries, importReader, added, edgesBeforeResolution,
+                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language)
+              );
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
+            }
+
+            // A failed reference that waits for a module through a barrel —
+            // React Router's `import:@/pages#HomePage`, parked under
+            // `module:pages` — waits for a file below the barrel too
+            // (`pages/Home/index.tsx`), whose own keys name its folder and
+            // stem. Those parked under the keys of the barrels that pass on a
+            // file this sync adds, or one whose definitions it changed, go
+            // back to pending for the sweep; a body-only edit satisfies none.
+            const tBarrels = Date.now();
+            const delta = new Set(result.definitionDelta ?? []);
+            const seeds = new Map<string, Language>(added.map((file) => [file.path, file.language]));
+            const modified = result.changedFilePaths.filter((filePath) => !seeds.has(filePath));
+            if (delta.size > 0 && modified.length > 0) {
+              for (const node of this.queries.getNodesByFiles(modified)) {
+                if (delta.has(node.name)) seeds.set(node.filePath, node.language);
+              }
+            }
+            const throughBarrels = reopenReferencesThroughBarrels(
+              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language }))
+            );
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-barrel-modules: ${Date.now() - tBarrels}ms (${throughBarrels} refs re-opened)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -1066,12 +1194,25 @@ export class CodeGraph {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(
             result.definitionDelta,
-            result.changedFilePaths ?? []
+            result.changedFilePaths ?? [],
+            edgesBeforeRetry
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
             );
+          }
+        }
+
+        // The same for a route whose answer is read from a module: one that
+        // renders `const Docs = lazy(() => import('./pages/Docs'))` binds to
+        // the component the module exports, so it moves when the module is
+        // added or edited, though no name it carries changes.
+        if (filesChanged && result.changedFilePaths) {
+          const tModules = Date.now();
+          const reopened = this.resolver.reopenRouteModuleReaders(result.changedFilePaths);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-route-modules: ${Date.now() - tModules}ms (${reopened} refs re-opened)`);
           }
         }
 
@@ -1649,6 +1790,24 @@ export class CodeGraph {
    */
   getUnresolvedSupertypeSourcesAmong(nodeIds: Iterable<string>): Set<string> {
     return this.queries.getUnresolvedSupertypeSourcesAmong(nodeIds);
+  }
+
+  /**
+   * The names each of the given symbols refers to, by reference kind, where
+   * the resolver could not follow the reference — a decorator or an interface
+   * from outside the index, which leaves no edge. Ids with none are absent.
+   */
+  getUnresolvedReferenceNamesFrom(nodeIds: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, string[]> {
+    return this.queries.getUnresolvedReferenceNamesFrom(nodeIds, kinds);
+  }
+
+  /**
+   * Every symbol that refers to each of the given names, by reference kind,
+   * where the resolver could not follow it: for `implements`, every class that
+   * names a given interface from outside the index.
+   */
+  getUnresolvedReferenceSourcesNamed(names: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, Set<string>> {
+    return this.queries.getUnresolvedReferenceSourcesNamed(names, kinds);
   }
 
   /**

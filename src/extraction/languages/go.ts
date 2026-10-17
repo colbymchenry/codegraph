@@ -64,6 +64,45 @@ export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: 
   return GO_PREDECLARED_TYPES.has(getNodeText(type, source)) ? undefined : type;
 }
 
+/**
+ * The name nodes of the types a Go `type_alias` node names on its right-hand
+ * side, in source order: an alias's (`Event` in `type Event = mvccpb.Event`,
+ * `List` and `Event` in `type Page = List[Event]`) and a defined type's
+ * (`WatchResponse` in `type WatchChan <-chan WatchResponse`, `Context` in
+ * `type HandlerFunc func(*Context)`), each where it is written, so resolution
+ * reads a package qualifier back. Not types it names: the declaration's own
+ * type parameters (`T` in `type Items[T any] = List[T]`), Go's predeclared
+ * types, and its own name written bare, which in a recursive type (`type
+ * stateFn func(*Lexer) stateFn`) is the declaration itself. A generic alias
+ * has no rule in tree-sitter-go 0.23: it parses as a `type_spec` whose `=` is
+ * an error, and reads as any other declaration here.
+ */
+export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[] {
+  const type = getChildByField(node, 'type');
+  if (!type) return [];
+  const nameNode = getChildByField(node, 'name');
+  const own = nameNode ? getNodeText(nameNode, source) : undefined;
+  const params = new Set<string>();
+  for (const decl of getChildByField(node, 'type_parameters')?.namedChildren ?? []) {
+    for (const c of decl.namedChildren) {
+      if (c.type === 'identifier') params.add(getNodeText(c, source));
+    }
+  }
+  const names: SyntaxNode[] = [];
+  // `qualified`: the name of a `pkg.Name`, which is that package's whatever
+  // this one declares.
+  const walk = (n: SyntaxNode, qualified: boolean): void => {
+    if (n.type === 'type_identifier') {
+      const text = getNodeText(n, source);
+      if (!GO_PREDECLARED_TYPES.has(text) && (qualified || (!params.has(text) && text !== own))) names.push(n);
+      return;
+    }
+    for (const c of n.namedChildren) walk(c, n.type === 'qualified_type');
+  };
+  walk(type, false);
+  return names;
+}
+
 export const goExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration'],
   classTypes: [], // Go doesn't have classes
@@ -71,7 +110,7 @@ export const goExtractor: LanguageExtractor = {
   interfaceTypes: [],  // Handled via type_spec → resolveTypeAliasKind
   structTypes: [],     // Handled via type_spec → resolveTypeAliasKind
   enumTypes: [],
-  typeAliasTypes: ['type_spec'], // Go type declarations
+  typeAliasTypes: ['type_spec', 'type_alias'], // `type A B` and `type A = B`
   importTypes: ['import_declaration'],
   callTypes: ['call_expression'],
   variableTypes: ['var_declaration', 'short_var_declaration', 'const_declaration'],
@@ -92,7 +131,8 @@ export const goExtractor: LanguageExtractor = {
     return sig;
   },
   resolveTypeAliasKind: (node, _source) => {
-    // Go type_spec: `type Foo struct { ... }` or `type Bar interface { ... }`
+    // Go type_spec: `type Foo struct { ... }` or `type Bar interface { ... }`,
+    // and an alias of a literal (`type Foo = struct { ... }`) alike.
     // The inner type is in the 'type' field of the type_spec node
     const typeChild = getChildByField(node, 'type');
     if (!typeChild) return undefined;
@@ -128,4 +168,21 @@ export const goExtractor: LanguageExtractor = {
     const match = text.match(/\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/);
     return match?.[1];
   },
+  // A type declared on its own, `type Foo struct{…}`, is a `type_declaration`
+  // holding one spec, and its doc comment comes before the declaration, outside
+  // the spec. A member of a `type ( … )` group has its comment beside it in the
+  // parentheses, and the comment above the group is the group's. A group of one
+  // is that type's declaration, as go doc reads it, unless its member has a
+  // comment of its own.
+  getDeclarationWrapper: (node) => {
+    const parent = node.parent;
+    if (parent?.type !== 'type_declaration' || !parent.firstNamedChild?.equals(node)) return undefined;
+    const specs = parent.namedChildren.filter(
+      (c: SyntaxNode) => c.type === 'type_spec' || c.type === 'type_alias'
+    );
+    return specs.length === 1 ? parent : undefined;
+  },
+  // A comment after code on its line (`const sides = 4 // sides of a square.`)
+  // is that line's, never the doc of the declaration below it.
+  docstringSkipsTrailingComments: true,
 };
