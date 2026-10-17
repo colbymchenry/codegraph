@@ -121,6 +121,22 @@ const parentPid = Number(process.argv[1]);
 const timeoutMs = Number(process.argv[2]);
 const capMs = Number(process.argv[3]);
 const progressPaths = process.argv.slice(4);
+// #2404: the daemon multiplexes roots beyond the one this watchdog was armed
+// with; syncs on those roots must also count as disk progress. Union the argv
+// paths with a small JSON file next to the keyed DB, re-read on each snap —
+// writers are the engines that attach additional roots. argv paths remain
+// authoritative for "deferral enabled"; a missing/unreadable file means
+// argv-only, exactly as before. Stale entries stat-fail to a constant
+// fingerprint, so they can never create false deferrals.
+const dynamicPathsFile = progressPaths.length ? require('path').join(require('path').dirname(progressPaths[0]), 'watchdog-paths.json') : null;
+function allProgressPaths() {
+  if (!dynamicPathsFile) return progressPaths;
+  try {
+    const extra = JSON.parse(fs.readFileSync(dynamicPathsFile, 'utf8'));
+    if (Array.isArray(extra) && extra.length) return progressPaths.concat(extra.filter((p) => typeof p === 'string'));
+  } catch (e) {}
+  return progressPaths;
+}
 const secs = Math.round(timeoutMs / 1000);
 function kill(extra) {
   // Timestamped so daemon.log kills can be correlated with anything (#1431) —
@@ -133,7 +149,7 @@ function kill(extra) {
 // forward disk progress — a slow synchronous SQLite statement, not a wedge.
 function snap() {
   let s = '';
-  for (const p of progressPaths) {
+  for (const p of allProgressPaths()) {
     try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }
   }
   return s;
