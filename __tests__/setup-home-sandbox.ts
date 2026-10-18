@@ -54,7 +54,7 @@ if (process.platform === 'win32') {
   delete process.env.LOCALAPPDATA;
 }
 process.env.XDG_CONFIG_HOME = path.join(home, '.config');
-for (const override of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME']) {
+for (const override of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'PIG_HOME', 'PIG_CODING_AGENT_DIR']) {
   delete process.env[override];
 }
 

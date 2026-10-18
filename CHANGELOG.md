@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- PiG, the Go port of the Pi coding agent, is now a supported agent: `codegraph install` detects it and adds CodeGraph to its MCP servers (`--target=pig` to pick it by hand), and `codegraph uninstall` removes it again.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
