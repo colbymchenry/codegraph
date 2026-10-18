@@ -50,7 +50,7 @@ export class LiquidExtractor {
         // Extract schema block
         this.extractSchema(fileNode.id);
 
-        // Extract assign statements as variables
+        // Extract assign and capture declarations as variables
         this.extractAssignments(fileNode.id);
       }
     } catch (error) {
@@ -411,11 +411,18 @@ export class LiquidExtractor {
   }
 
   /**
-   * Extract {% assign var = value %} statements
+   * Extract assign and capture variable declarations in either tag spelling.
    */
   private extractAssignments(fileNodeId: string): void {
     // Both spellings. Most of a modern theme's assigns are the bare kind.
-    for (const match of this.findTagOccurrences('assign', `(\\w+)\\s*=`)) {
+    const declarations = [
+      ...this.findTagOccurrences('assign', `(\\w+)\\s*=`),
+      // Liquid Ruby and LiquidJS accept quoted names and permissive trailing
+      // tokens. This is a declaration extractor, not a dialect validator.
+      ...this.findTagOccurrences('capture', `(['"]?)([A-Za-z_][\\w-]*?)\\2(?=\\s|[-]?%\\}|$)`)
+        .map(match => ({ ...match, groups: [match.groups[0]!, match.groups[2]!] })),
+    ].sort((a, b) => a.index - b.index);
+    for (const match of declarations) {
       const variableName = match.groups[1];
       const line = this.getLineNumber(match.index);
 
