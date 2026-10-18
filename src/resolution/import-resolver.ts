@@ -3272,24 +3272,20 @@ export function pythonModulePath(source: string, fromFile: string): string | nul
  * way resolution reads it for the call (inferLocalReceiverType, memoized per
  * file, scope and receiver, so a call the matcher just tried costs a lookup):
  * the binding the type is written through, `LRUCache` of `new LRUCache<K,
- * V>(…)` or `lib` of `new lib.LRUCache()`, or of the element type of an
- * array (`results: URI[]`). Undefined for a type the file doesn't import, in
- * a file that imports nothing, for a method arrays have called on an array
- * (`results.push(…)`), and for a type's property (`ids: Element["ids"]`):
- * resolution links the first to no project class and reads no type from the
- * second, so no edit of the type's module links either. Array calls were most
- * of what this parked on vscode, and retrying them nearly doubled what an
- * edit of `uri.ts` retried.
+ * V>(…)` or `lib` of `new lib.LRUCache()`, of the element type of an array
+ * (`results: URI[]`), or of the type whose property it is (`Emitter<E>['event']`).
+ * Undefined for a type the file doesn't import, in a file that imports
+ * nothing, and for a method arrays have called on an array (`results.push(…)`):
+ * resolution links that to no project class, so no edit of the type's module
+ * does. Such calls were most of what this parked on vscode, and retrying them
+ * nearly doubled what an edit of `uri.ts` retried.
  */
 function localTypeBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext, mappings: ImportMapping[]): ImportMapping | undefined {
   if (mappings.length === 0) return undefined;
   const decl: { raw?: string } = {};
   const type = inferLocalReceiverType(receiver, ref, context, decl);
   if (!type || !decl.raw) return undefined;
-  if (type.endsWith(']')) {
-    const element = arrayElementType(type);
-    if (element === undefined || JS_ARRAY_METHODS.has(ref.referenceName.slice(receiver.length + 1))) return undefined;
-  }
+  if (arrayElementType(type) !== undefined && JS_ARRAY_METHODS.has(ref.referenceName.slice(receiver.length + 1))) return undefined;
   const head = decl.raw.split(/[.<[\s]/)[0];
   return mappings.find((m) => m.localName === head);
 }

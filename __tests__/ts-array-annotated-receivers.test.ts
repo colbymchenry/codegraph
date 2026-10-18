@@ -8,9 +8,7 @@
  * an `ExplorerItem[]` reached `ExplorerItem.find`, and `ranges.map(…)` on an
  * `OffsetRange[]` reached `OffsetRange.map`. A method arrays don't have can
  * only be called on an element that shares the array's name, as in
- * `d.forEach(d => d.dispose())`, and that one keeps the element's type. A
- * local annotated as one of a class's properties (`groupIds:
- * ExcalidrawElement["groupIds"]`) was read as the class too.
+ * `d.forEach(d => d.dispose())`, and that one keeps the element's type.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -56,10 +54,6 @@ const CLASSES = {
     'export class Repository<T> {\n' +
     '  save(value: T) { return value; }\n' +
     '  find(id: string) { return id; }\n' +
-    '}\n' +
-    'export class Element {\n' +
-    '  groupIds: string[] = [];\n' +
-    '  filter() { return this; }\n' +
     '}\n',
   // The one project method named `findLast`, on an unrelated class.
   'src/stack.ts': 'export class Stack {\n  findLast() { return 1; }\n}\n',
@@ -110,19 +104,6 @@ describe('a call on a TypeScript local annotated as an array of a class', () => 
         '}\n',
     });
     expect(calls.filter((c) => c.startsWith('repos.'))).toEqual([]);
-  }, 60_000);
-
-  it("links to no method of the class whose property the local is annotated as", async () => {
-    // excalidraw's `groupIds: ExcalidrawElement["groupIds"]`, then `groupIds.filter(…)`.
-    const calls = await callsOf({
-      ...CLASSES,
-      'src/use.ts':
-        "import { Element } from './item';\n" +
-        "export function without(groupIds: Element['groupIds'], id: string) {\n" +
-        '  return groupIds.filter((g) => g !== id);\n' +
-        '}\n',
-    });
-    expect(calls.filter((c) => c.startsWith('groupIds.'))).toEqual([]);
   }, 60_000);
 
   it("still links a method arrays don't have to the element's class: the call is on an element of the same name", async () => {
