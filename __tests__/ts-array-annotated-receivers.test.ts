@@ -9,6 +9,12 @@
  * `OffsetRange[]` reached `OffsetRange.map`. A method arrays don't have can
  * only be called on an element that shares the array's name, as in
  * `d.forEach(d => d.dispose())`, and that one keeps the element's type.
+ *
+ * A local annotated as one of a type's properties (`groupIds:
+ * ExcalidrawElement["groupIds"]`) was read as that type too, so its calls
+ * reached the type's methods of the same name. Its type is one the
+ * annotation names without saying: like an outside type, it links to
+ * nothing, and the call isn't matched by its name either.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -131,5 +137,37 @@ describe('a call on a TypeScript local annotated as an array of a class', () => 
         '}\n',
     });
     expect(calls).toEqual(['item.find -> Item::find', 'repo.find -> Repository::find']);
+  }, 60_000);
+});
+
+describe("a call on a TypeScript local annotated as one of a type's properties", () => {
+  it('links to no method of that type', async () => {
+    // excalidraw's `groupIds: ExcalidrawElement["groupIds"]`, then `groupIds.filter(…)`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/element.ts': 'export class Element {\n  groupIds: string[] = [];\n  filter() { return this; }\n}\n',
+      'src/use.ts':
+        "import { Element } from './element';\n" +
+        "export function without(groupIds: Element['groupIds'], id: string) {\n" +
+        '  return groupIds.filter((g) => g !== id);\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('groupIds.'))).toEqual([]);
+  }, 60_000);
+
+  it("is not matched to a method by the call's name either", async () => {
+    // vscode's `invocation: Parameters<typeof rawFinalizeToolInvocation>[0]`:
+    // left untyped, the receiver's name alone would pick `Logger.info`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/logger.ts': 'export class Logger {\n  info(message: string) { return message; }\n}\n',
+      'src/use.ts':
+        "import { Logger } from './logger';\n" +
+        'function make(logger: Logger) { return logger; }\n' +
+        'export function log(logger: Parameters<typeof make>[0]) {\n' +
+        "  return logger.info('x');\n" +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('logger.'))).toEqual([]);
   }, 60_000);
 });

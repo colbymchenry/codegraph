@@ -13069,7 +13069,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // A type followed by brackets is captured whole, so matchMethodCall
         // can tell an array of it (`items: Item[]`, `items: Item<K>[]`), whose
         // own methods aren't an element's (arrayElementType), from one of its
-        // properties (`groupIds: Element["groupIds"]`).
+        // properties (`groupIds: Element["groupIds"]`), which isn't it.
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
@@ -14216,12 +14216,15 @@ export function matchMethodCall(
     // declares, where `distinctElements.find(…)` on vscode's `ExplorerItem[]`
     // reached `ExplorerItem.find`; any other is called on one of its elements
     // under the same name, as in `d.forEach(d => d.dispose())`, so it takes
-    // the element's type. A type's property (`Emitter<E>['event']`,
-    // `Parameters<typeof f>[0]`) is still read as the type.
+    // the element's type. A type's property or element (`groupIds:
+    // ExcalidrawElement["groupIds"]`, `Parameters<typeof f>[0]`) is a type
+    // the annotation names without saying, like an outside type's: not the
+    // type it indexes, whose methods vscode's `Emitter<E>['event']` reached,
+    // and not one to guess by the method's name.
     if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
       const element = arrayElementType(inferredType);
-      if (element !== undefined && JS_ARRAY_METHODS.has(methodName!)) return null;
-      inferredType = element ?? inferredType.replace(/\s*\[[^\]]*\]$/, '');
+      if (element === undefined || JS_ARRAY_METHODS.has(methodName!)) return null;
+      inferredType = element;
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
