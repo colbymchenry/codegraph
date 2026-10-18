@@ -170,9 +170,10 @@ describe('a failed member call on a typed local', () => {
       ...CALLERS,
       // A local of a built-in type, of a package's, of a type the file
       // declares itself and one a factory returns: none waits for a module of
-      // the project. Nor does a method of `this` passed as a value, which
-      // resolution looks up in the enclosing class, whatever `this` is
-      // declared as.
+      // the project. Nor does a local or a parameter declared as an array of
+      // an imported class, whose calls are the array's, or a method of `this`
+      // passed as a value, which resolution looks up in the enclosing class,
+      // whatever `this` is declared as.
       'src/other.ts':
         "import { createCache, LRUCache } from './factory';\n" +
         "import QuickLRU from 'quick-lru';\n" +
@@ -186,6 +187,11 @@ describe('a failed member call on a typed local', () => {
         '  mine.peek();\n' +
         '  const made = createCache();\n' +
         "  made.get('k');\n" +
+        '  const caches: LRUCache<string, number>[] = [];\n' +
+        '  caches.push(made);\n' +
+        '}\n' +
+        'export function each(all: LRUCache<string, number>[]) {\n' +
+        '  return all.map((c) => c);\n' +
         '}\n' +
         'export function bound(this: LRUCache<string, number>) {\n' +
         "  return ['k'].map(this.peek);\n" +
@@ -211,6 +217,8 @@ describe('a failed member call on a typed local', () => {
       expect(tails('src/other.ts', 'pkg.get')).toEqual(['get']);
       expect(tails('src/other.ts', 'mine.peek')).toEqual(['peek']);
       expect(tails('src/other.ts', 'made.get')).toEqual(['get']);
+      expect(tails('src/other.ts', 'caches.push')).toEqual(['push']);
+      expect(tails('src/other.ts', 'all.map')).toEqual(['map']);
       expect(tails('src/other.ts', 'this.peek')).toEqual(['peek']);
     } finally {
       db.close();

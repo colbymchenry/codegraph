@@ -13713,7 +13713,10 @@ export function inferLocalReceiverType(
         const type = matchLine(i);
         if (type) {
           states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw });
-          if (decl) decl.raw = lastRaw;
+          if (decl) {
+            decl.raw = lastRaw;
+            decl.line = i;
+          }
           return type;
         }
       }
@@ -13732,13 +13735,19 @@ export function inferLocalReceiverType(
       }
       state.hi = callIdx;
       if (state.ansIdx < startIdx) return null;
-      if (decl) decl.raw = state.ansRaw;
+      if (decl) {
+        decl.raw = state.ansRaw;
+        decl.line = state.ansIdx;
+      }
       return state.ansType;
     }
     for (let i = callIdx; i >= startIdx; i--) {
       const type = matchLine(i);
       if (type) {
-        if (decl) decl.raw = lastRaw;
+        if (decl) {
+          decl.raw = lastRaw;
+          decl.line = i;
+        }
         return type;
       }
     }
@@ -14956,13 +14965,16 @@ interface GoProjectType {
 
 /**
  * What inferLocalReceiverType tells its caller besides the type: the type as
- * the declaration spells it (`raw`), and for a Go local bound from a type
- * assertion, the type goWrittenType finds for it (`asserted`; null for one
- * with no method the project declares). `asserted` is unset when the local
- * is declared some other way, or goWrittenType can't tell its type.
+ * the declaration spells it (`raw`), the 0-based index of the line it was
+ * read from (`line`, set with `raw` by the line scan), and for a Go local
+ * bound from a type assertion, the type goWrittenType finds for it
+ * (`asserted`; null for one with no method the project declares). `asserted`
+ * is unset when the local is declared some other way, or goWrittenType can't
+ * tell its type.
  */
 interface GoReceiverDecl {
   raw?: string;
+  line?: number;
   asserted?: GoProjectType | null;
 }
 

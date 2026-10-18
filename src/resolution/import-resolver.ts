@@ -3134,9 +3134,10 @@ export function isBoundToOutOfRepoImport(
  *    refs an edit of a hot module retries on vscode, and none of them resolved.
  *  - a direct member call on a local the file declares with a type it
  *    imports (`const cache = new LRUCache(10)`, `cache: LRUCache<K, V>`, a
- *    typed parameter, then `cache.get(k)`): resolution reads that declaration
- *    and calls the member of the class, which the type's binding imports, so
- *    the call waits for that module as a member of the binding itself does.
+ *    typed parameter, then `cache.get(k)`), but not an array of it:
+ *    resolution reads that declaration and calls the member of the class,
+ *    which the type's binding imports, so the call waits for that module as a
+ *    member of the binding itself does.
  * Resolution reaches each through the module, so a sync's retry has to find
  * it by the module: under the module's {@link moduleTail} ('module:tag'), the
  * key a sync looks up for every file it adds or changes, so the file that
@@ -3270,14 +3271,33 @@ export function pythonModulePath(source: string, fromFile: string): string | nul
  * file, scope and receiver, so a call the matcher just tried costs a lookup):
  * the binding the type is written through, `LRUCache` of `new LRUCache<K,
  * V>(…)` or `lib` of `new lib.LRUCache()`. Undefined for a type the file
- * doesn't import, and in a file that imports nothing.
+ * doesn't import, in a file that imports nothing, and for a local declared as
+ * an array of the type (`results: URI[]`). Resolution reads the element type
+ * there too, but the call is the array's (`results.push(…)`), which no edit
+ * of the type's module links: such calls were most of what this parked on
+ * vscode, and retrying them nearly doubled what an edit of `uri.ts` retried.
  */
 function localTypeBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext, mappings: ImportMapping[]): ImportMapping | undefined {
   if (mappings.length === 0) return undefined;
-  const decl: { raw?: string } = {};
-  if (!inferLocalReceiverType(receiver, ref, context, decl)) return undefined;
-  const head = decl.raw?.split('.')[0];
-  return head ? mappings.find((m) => m.localName === head) : undefined;
+  const decl: { raw?: string; line?: number } = {};
+  if (!inferLocalReceiverType(receiver, ref, context, decl) || !decl.raw) return undefined;
+  const head = decl.raw.split('.')[0];
+  const binding = mappings.find((m) => m.localName === head);
+  if (!binding || decl.line === undefined) return binding;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const declaration = lines?.[decl.line];
+  return declaration !== undefined && declaresArrayOf(declaration, receiver, decl.raw) ? undefined : binding;
+}
+
+/** A `name: Type` annotation, the type's arguments, and the `[` of an array of it: `items: Item<K, V>[]`. */
+const ANNOTATION = /([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w.$]*)\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*(\[)?/g;
+
+/** Whether `line` annotates `name` as an array of `type`: `items: Item[]`, `items: Item<K>[] = []`. */
+function declaresArrayOf(line: string, name: string, type: string): boolean {
+  for (const m of line.matchAll(ANNOTATION)) {
+    if (m[1] === name && m[2] === type) return m[3] !== undefined;
+  }
+  return false;
 }
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
