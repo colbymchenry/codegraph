@@ -4,9 +4,10 @@
  * `{% render 'price' %}` renders the `snippets/price.liquid` of the theme the
  * file belongs to; `{% section 'header' %}` and a JSON template's section
  * `"type"` name a file in that theme's `sections/`. Shopify never looks in
- * another theme. The Liquid extractor records these as `snippets/<name>.liquid`
- * and `sections/<name>.liquid`, and the path matcher took any file whose path
- * ends with that, so in a repository holding several themes (a theme tool's
+ * another theme. The Liquid extractor records these as `snippets/<name>.liquid`,
+ * `sections/<name>.liquid` and, for a `{% sections %}` group,
+ * `sections/<group>.json`, and the path matcher took any file whose path ends
+ * with that, so in a repository holding several themes (a theme tool's
  * examples, a store's seasonal themes) a theme missing a section linked to
  * another theme's copy of it.
  *

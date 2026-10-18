@@ -14,6 +14,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In a Shopify theme, a JSON template or section group that starts with the comment the theme editor writes at the top now links the sections it lists, at the line of each section's `type`. Before, such a file linked nothing, so most sections of an editor-saved theme looked unused. Re-index Shopify themes after upgrading. (#2494)
+- In a Shopify theme layout, `{% sections 'header-group' %}` now links to the section group `sections/header-group.json`. Before, only the singular `{% section %}` tag was linked. (#2494)
+- A `{% schema %}` written inside `{% comment %}` or `{% raw %}` in a Liquid file is no longer indexed as a definition. (#2494)
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
 - In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.
