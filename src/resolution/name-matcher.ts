@@ -13066,10 +13066,11 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // at `<` so a generic-typed param (`repo: Repository<User>`) still yields
         // `Repository`. resolveMethodOnType validates the type actually declares
         // the method, so the looser match produces no edge on a mis-inference.
-        // An array of a type (`items: Item[]`, `items: Item<K>[]`) is captured
-        // whole, so matchMethodCall can tell the array's own methods from an
-        // element's (arrayElementType).
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[\\s*\\])?)`), // lg: Logger  (annotation or typed param)
+        // A type followed by brackets is captured whole: an array of it
+        // (`items: Item[]`, `items: Item<K>[]`), whose own methods
+        // matchMethodCall tells from an element's (arrayElementType), or one
+        // of its properties (`groupIds: Element["groupIds"]`), which isn't it.
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -14210,15 +14211,18 @@ export function matchMethodCall(
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
     }
-    // An array of a type (`items: Item[]`): a method arrays have is the
-    // array's, which no project class declares, where `distinctElements.find(…)`
-    // on vscode's `ExplorerItem[]` reached `ExplorerItem.find`. Any other is
-    // called on one of its elements under the same name, as in
-    // `d.forEach(d => d.dispose())`, so it takes the element's type.
-    const element = inferredType && ESM_FAMILY.has(ref.language) ? arrayElementType(inferredType) : undefined;
-    if (element !== undefined) {
-      if (JS_ARRAY_METHODS.has(methodName!)) return null;
-      inferredType = element;
+    // A TS annotation with brackets after the type isn't that type. An array
+    // of it (`items: Item[]`): a method arrays have is the array's, which no
+    // project class declares, where `distinctElements.find(…)` on vscode's
+    // `ExplorerItem[]` reached `ExplorerItem.find`; any other is called on
+    // one of its elements under the same name, as in `d.forEach(d =>
+    // d.dispose())`, so it takes the element's type. One of its properties
+    // (`groupIds: Element["groupIds"]`) has a type the annotation doesn't
+    // say, as an unannotated local does.
+    if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
+      const element = arrayElementType(inferredType);
+      if (element !== undefined && JS_ARRAY_METHODS.has(methodName!)) return null;
+      inferredType = element ?? null;
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
