@@ -14284,7 +14284,7 @@ export function matchMethodCall(
           : ref.language === 'go'
             ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
             : ESM_FAMILY.has(ref.language) && !awaited
-              ? tsImportedTypeFile(decl.raw ?? inferredType, ref, context)
+              ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
               : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
