@@ -3272,32 +3272,19 @@ export function pythonModulePath(source: string, fromFile: string): string | nul
  * the binding the type is written through, `LRUCache` of `new LRUCache<K,
  * V>(…)` or `lib` of `new lib.LRUCache()`. Undefined for a type the file
  * doesn't import, in a file that imports nothing, and for a local declared as
- * an array of the type (`results: URI[]`). Resolution reads the element type
- * there too, but the call is the array's (`results.push(…)`), which no edit
- * of the type's module links: such calls were most of what this parked on
- * vscode, and retrying them nearly doubled what an edit of `uri.ts` retried.
+ * an array of the type (`results: URI[]`): resolution types it as the array
+ * it is, whose calls (`results.push(…)`) no project class declares, so no
+ * edit of the type's module links them. Such calls were most of what this
+ * parked on vscode, and retrying them nearly doubled what an edit of
+ * `uri.ts` retried.
  */
 function localTypeBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext, mappings: ImportMapping[]): ImportMapping | undefined {
   if (mappings.length === 0) return undefined;
-  const decl: { raw?: string; line?: number } = {};
-  if (!inferLocalReceiverType(receiver, ref, context, decl) || !decl.raw) return undefined;
+  const decl: { raw?: string } = {};
+  const type = inferLocalReceiverType(receiver, ref, context, decl);
+  if (!type || type.endsWith(']') || !decl.raw) return undefined;
   const head = decl.raw.split('.')[0];
-  const binding = mappings.find((m) => m.localName === head);
-  if (!binding || decl.line === undefined) return binding;
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
-  const declaration = lines?.[decl.line];
-  return declaration !== undefined && declaresArrayOf(declaration, receiver, decl.raw) ? undefined : binding;
-}
-
-/** A `name: Type` annotation, the type's arguments, and the `[` of an array of it: `items: Item<K, V>[]`. */
-const ANNOTATION = /([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w.$]*)\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*(\[)?/g;
-
-/** Whether `line` annotates `name` as an array of `type`: `items: Item[]`, `items: Item<K>[] = []`. */
-function declaresArrayOf(line: string, name: string, type: string): boolean {
-  for (const m of line.matchAll(ANNOTATION)) {
-    if (m[1] === name && m[2] === type) return m[3] !== undefined;
-  }
-  return false;
+  return mappings.find((m) => m.localName === head);
 }
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;

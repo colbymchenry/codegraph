@@ -13061,7 +13061,11 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // at `<` so a generic-typed param (`repo: Repository<User>`) still yields
         // `Repository`. resolveMethodOnType validates the type actually declares
         // the method, so the looser match produces no edge on a mis-inference.
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger  (annotation or typed param)
+        // An array of a type (`items: Item[]`, `items: Item<K>[]`) is captured
+        // whole: its calls are the array's, which no project class declares,
+        // where the bare `Item` linked vscode's `distinctElements.find(…)` on
+        // an `ExplorerItem[]` to `ExplorerItem.find`.
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[\\s*\\])?)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -13713,10 +13717,7 @@ export function inferLocalReceiverType(
         const type = matchLine(i);
         if (type) {
           states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw });
-          if (decl) {
-            decl.raw = lastRaw;
-            decl.line = i;
-          }
+          if (decl) decl.raw = lastRaw;
           return type;
         }
       }
@@ -13735,19 +13736,13 @@ export function inferLocalReceiverType(
       }
       state.hi = callIdx;
       if (state.ansIdx < startIdx) return null;
-      if (decl) {
-        decl.raw = state.ansRaw;
-        decl.line = state.ansIdx;
-      }
+      if (decl) decl.raw = state.ansRaw;
       return state.ansType;
     }
     for (let i = callIdx; i >= startIdx; i--) {
       const type = matchLine(i);
       if (type) {
-        if (decl) {
-          decl.raw = lastRaw;
-          decl.line = i;
-        }
+        if (decl) decl.raw = lastRaw;
         return type;
       }
     }
@@ -14965,16 +14960,13 @@ interface GoProjectType {
 
 /**
  * What inferLocalReceiverType tells its caller besides the type: the type as
- * the declaration spells it (`raw`), the 0-based index of the line it was
- * read from (`line`, set with `raw` by the line scan), and for a Go local
- * bound from a type assertion, the type goWrittenType finds for it
- * (`asserted`; null for one with no method the project declares). `asserted`
- * is unset when the local is declared some other way, or goWrittenType can't
- * tell its type.
+ * the declaration spells it (`raw`), and for a Go local bound from a type
+ * assertion, the type goWrittenType finds for it (`asserted`; null for one
+ * with no method the project declares). `asserted` is unset when the local
+ * is declared some other way, or goWrittenType can't tell its type.
  */
 interface GoReceiverDecl {
   raw?: string;
-  line?: number;
   asserted?: GoProjectType | null;
 }
 
