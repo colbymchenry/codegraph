@@ -97,7 +97,7 @@ function hasExportDeclaration(block: SyntaxNode): boolean {
 export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
-  classTypes: ['class_declaration', 'abstract_class_declaration'],
+  classTypes: ['class_declaration', 'abstract_class_declaration', 'class'],
   // `method_signature` is the interface/type-literal form of a method; without it
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need
