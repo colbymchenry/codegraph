@@ -41,7 +41,16 @@ export function gitWorktreeRoot(dir: string): string | null {
       // 60s liveness watchdog and SIGKILL a healthy daemon (#1139).
       timeout: 5000,
     }).trim();
-    return out ? realpath(out) : null;
+    if (!out) return null;
+    const gitRoot = realpath(out);
+    let candidate = realpath(dir);
+    for (;;) {
+      if (sameDirectory(candidate, gitRoot)) return candidate;
+      const parent = path.dirname(candidate);
+      if (parent === candidate) break;
+      candidate = parent;
+    }
+    return gitRoot;
   } catch {
     return null;
   }
@@ -98,12 +107,13 @@ export function detectWorktreeIndexMismatch(
   if (!worktreeRoot) return null;
 
   const resolvedIndexRoot = realpath(indexRoot);
-  if (worktreeRoot === resolvedIndexRoot) return null;
+  if (sameDirectory(worktreeRoot, resolvedIndexRoot)) return null;
 
   // Only flag it when the index root is itself a real working-tree root. This
   // distinguishes "borrowed another worktree's index" from "index sits in a
   // plain ancestor directory", and avoids warning outside git entirely.
-  if (gitWorktreeRoot(resolvedIndexRoot) !== resolvedIndexRoot) return null;
+  const indexWorktreeRoot = gitWorktreeRoot(resolvedIndexRoot);
+  if (!indexWorktreeRoot || !sameDirectory(indexWorktreeRoot, resolvedIndexRoot)) return null;
 
   // Don't flag a nested repo (submodule / embedded clone) that `indexRoot`'s
   // index ALREADY covers: indexing a super-repo descends into its submodules
@@ -117,7 +127,7 @@ export function detectWorktreeIndexMismatch(
   // not — so suppress only when the two clearly differ. (#1031, #1033)
   const worktreeCommon = gitCommonDir(worktreeRoot);
   const indexCommon = gitCommonDir(resolvedIndexRoot);
-  if (worktreeCommon && indexCommon && worktreeCommon !== indexCommon) return null;
+  if (worktreeCommon && indexCommon && !sameDirectory(worktreeCommon, indexCommon)) return null;
 
   return { worktreeRoot, indexRoot: resolvedIndexRoot };
 }
@@ -162,7 +172,8 @@ export function nestedRepositoryBelow(startPath: string, indexRoot: string): Nes
   if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
 
   const repoCommon = gitCommonDir(repoRoot);
-  if (!repoCommon || repoCommon === gitCommonDir(realpath(indexRoot))) return null;
+  const indexCommon = gitCommonDir(realpath(indexRoot));
+  if (!repoCommon || !indexCommon || sameDirectory(repoCommon, indexCommon)) return null;
   return { root: repoRoot, relPath: rel.split(path.sep).join('/') };
 }
 
@@ -214,5 +225,19 @@ function realpath(p: string): string {
     return fs.realpathSync(path.resolve(p));
   } catch {
     return path.resolve(p);
+  }
+}
+
+function sameDirectory(left: string, right: string): boolean {
+  const leftPath = path.resolve(left);
+  const rightPath = path.resolve(right);
+  if (leftPath === rightPath) return true;
+  if (process.platform === 'win32' && leftPath.toLowerCase() === rightPath.toLowerCase()) return true;
+  try {
+    const leftStat = fs.statSync(leftPath);
+    const rightStat = fs.statSync(rightPath);
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch {
+    return false;
   }
 }
