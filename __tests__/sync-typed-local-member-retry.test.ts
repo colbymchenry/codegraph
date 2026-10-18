@@ -169,8 +169,10 @@ describe('a failed member call on a typed local', () => {
     write(root, {
       ...CALLERS,
       // A local of a built-in type, of a package's, of a type the file
-      // declares itself, one a factory returns, and `this` typed by its
-      // parameter: none waits for a module of the project.
+      // declares itself and one a factory returns: none waits for a module of
+      // the project. Nor does a method of `this` passed as a value, which
+      // resolution looks up in the enclosing class, whatever `this` is
+      // declared as.
       'src/other.ts':
         "import { createCache, LRUCache } from './factory';\n" +
         "import QuickLRU from 'quick-lru';\n" +

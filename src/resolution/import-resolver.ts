@@ -3132,11 +3132,11 @@ export function isBoundToOutOfRepoImport(
  *    member hangs off is what another member returns or holds, seldom a type
  *    the module declares. Parked under the module as well, they tripled the
  *    refs an edit of a hot module retries on vscode, and none of them resolved.
- *  - a direct member of a local the file declares with a type it imports
- *    (`const cache = new LRUCache(10)`, `cache: LRUCache<K, V>`, a typed
- *    parameter, then `cache.get(k)`): resolution reads that declaration and
- *    calls the member of the class, which the type's binding imports, so the
- *    call waits for that module as a member of the binding itself does.
+ *  - a direct member call on a local the file declares with a type it
+ *    imports (`const cache = new LRUCache(10)`, `cache: LRUCache<K, V>`, a
+ *    typed parameter, then `cache.get(k)`): resolution reads that declaration
+ *    and calls the member of the class, which the type's binding imports, so
+ *    the call waits for that module as a member of the binding itself does.
  * Resolution reaches each through the module, so a sync's retry has to find
  * it by the module: under the module's {@link moduleTail} ('module:tag'), the
  * key a sync looks up for every file it adds or changes, so the file that
@@ -3156,7 +3156,7 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   if (!receiver && !IDENTIFIER.test(name)) return undefined;
   const mappings = context.getImportMappings(ref.filePath, ref.language);
   const binding = mappings.find((m) => m.localName === name) ??
-    (receiver ? localTypeBinding(receiver, ref, context, mappings) : undefined);
+    (receiver && ref.referenceKind === 'calls' ? localTypeBinding(receiver, ref, context, mappings) : undefined);
   if (!binding || (!receiver && !binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
   if (isExternalImport(binding.source, ref.language, context) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
@@ -3265,16 +3265,15 @@ export function pythonModulePath(source: string, fromFile: string): string | nul
 }
 
 /**
- * The import binding of the type a local is declared with, read the way
- * resolution reads it (inferLocalReceiverType, memoized per file, scope and
- * receiver, so a ref the matcher just tried costs a lookup): the binding the
- * type is written through, `LRUCache` of `new LRUCache<K, V>(…)` or `lib` of
- * `new lib.LRUCache()`. Undefined for `this` and `super`, which resolution
- * types by the enclosing class, for a type the file doesn't import, and in a
- * file that imports nothing.
+ * The import binding of the type a call's receiver is declared with, read the
+ * way resolution reads it for the call (inferLocalReceiverType, memoized per
+ * file, scope and receiver, so a call the matcher just tried costs a lookup):
+ * the binding the type is written through, `LRUCache` of `new LRUCache<K,
+ * V>(…)` or `lib` of `new lib.LRUCache()`. Undefined for a type the file
+ * doesn't import, and in a file that imports nothing.
  */
 function localTypeBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext, mappings: ImportMapping[]): ImportMapping | undefined {
-  if (mappings.length === 0 || receiver === 'this' || receiver === 'super') return undefined;
+  if (mappings.length === 0) return undefined;
   const decl: { raw?: string } = {};
   if (!inferLocalReceiverType(receiver, ref, context, decl)) return undefined;
   const head = decl.raw?.split('.')[0];
