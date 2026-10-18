@@ -177,6 +177,24 @@ describe("a call on a TypeScript local annotated as one of a type's properties",
     expect(calls.filter((c) => c.startsWith('visibility.'))).toEqual(['visibility.isVisible -> Visibility::isVisible']);
   }, 60_000);
 
+  it("links to nothing when the property's type lacks the method, not to a guess", async () => {
+    // The property is declared as an intersection, whose head names no
+    // `isVisible`: neither the indexed type's own method nor one found by
+    // the receiver's name, like `VisibilityService.isVisible`, is the call's.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/service.ts':
+        'export interface Filter {\n  showAll(): boolean;\n}\n' +
+        'export class VisibilityService {\n  readonly pullRequests!: Filter & { isVisible(): boolean };\n  isVisible() { return false; }\n}\n',
+      'src/use.ts':
+        "import { VisibilityService } from './service';\n" +
+        "export function shown(visibility: VisibilityService['pullRequests']) {\n" +
+        '  return visibility.isVisible();\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('visibility.'))).toEqual([]);
+  }, 60_000);
+
   it("links an array property's own methods to nothing", async () => {
     // excalidraw's `groupIds: ExcalidrawElement["groupIds"]`, then `groupIds.filter(…)`.
     const calls = await callsOf({

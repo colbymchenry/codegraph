@@ -14220,15 +14220,17 @@ export function matchMethodCall(
     // IChatWidget['inputEditor']`) has the type that property is declared
     // with, an array of it the same way, where the type it indexes reached
     // vscode's `ISessionChatPillVisibilityService.isVisible` through
-    // `['pullRequests']`. One whose type isn't written in the project
-    // (`Parameters<typeof f>[0]`, a getter) names no type to call, or to
-    // guess by the method's name.
+    // `['pullRequests']`. That type decides alone, as a `this.<field>`
+    // call's does (matchTsThisFieldCall): the method is its, or nothing the
+    // method's name would guess, as for a property whose type isn't written
+    // in the project (`Parameters<typeof f>[0]`, a getter).
     if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
       const element = arrayElementType(inferredType);
       const declared = element !== undefined ? { type: element, array: true } : tsIndexedPropertyType(inferredType, ref, context);
       if (!declared || (declared.array && JS_ARRAY_METHODS.has(methodName!))) return null;
       inferredType = normalizeInferredTypeName(declared.type);
       if (!inferredType) return null;
+      if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method');
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
