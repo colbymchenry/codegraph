@@ -35,6 +35,8 @@ const CALLERS: Files = {
   'src/use-param.ts': "import { LRUCache } from './lru-cache';\nexport function c(cache: LRUCache<string, number>) {\n  return cache.get('k');\n}\n",
   'src/use-namespace.ts': "import * as lib from './lru-cache';\nexport function g() {\n  const cache = new lib.LRUCache<string, number>(3);\n  return cache.get('k');\n}\n",
   'src/use-default.ts': "import Store from './store';\nexport function e() {\n  const s = new Store();\n  return s.get();\n}\n",
+  // A call on an element that shares the array's name: the element's class.
+  'src/use-each.ts': "import { LRUCache } from './lru-cache';\nexport function h(cs: LRUCache<string, number>[]) {\n  cs.forEach((cs) => cs.get('k'));\n}\n",
   'src/noise.ts': NOISE,
 };
 
@@ -50,6 +52,7 @@ const LINKS = [
   'cache.get: calls src/use-new.ts -> method src/lru-cache.ts::LRUCache::get',
   'cache.get: calls src/use-param.ts -> method src/lru-cache.ts::LRUCache::get',
   'cache.set: calls src/use-new.ts -> method src/lru-cache.ts::LRUCache::set',
+  'cs.get: calls src/use-each.ts -> method src/lru-cache.ts::LRUCache::get',
   's.get: calls src/use-default.ts -> method src/store.ts::Store::get',
 ];
 
@@ -212,6 +215,8 @@ describe('a failed member call on a typed local', () => {
       expect(tails('src/use-param.ts', 'cache.get')).toEqual(['module:lru-cache']);
       expect(tails('src/use-namespace.ts', 'cache.get')).toEqual(['module:lru-cache']);
       expect(tails('src/use-default.ts', 's.get')).toEqual(['module:store']);
+      expect(tails('src/use-each.ts', 'cs.get')).toEqual(['module:lru-cache']);
+      expect(tails('src/use-each.ts', 'cs.forEach')).toEqual(['forEach']);
 
       expect(tails('src/other.ts', 'seen.get')).toEqual(['get']);
       expect(tails('src/other.ts', 'pkg.get')).toEqual(['get']);

@@ -6,8 +6,9 @@
  * stopped at `[`, so `items.find(…)` linked to `Item.find` whenever the class
  * declares a method of that name: on vscode, `distinctElements.find(…)` on
  * an `ExplorerItem[]` reached `ExplorerItem.find`, and `ranges.map(…)` on an
- * `OffsetRange[]` reached `OffsetRange.map`. Where the class has no such
- * method, the call went on to be matched by its name alone.
+ * `OffsetRange[]` reached `OffsetRange.map`. A method arrays don't have can
+ * only be called on an element that shares the array's name, as in
+ * `d.forEach(d => d.dispose())`, and that one keeps the element's type.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -48,6 +49,7 @@ const CLASSES = {
     'export class Item {\n' +
     '  find(key: string) { return key; }\n' +
     '  push(value: number) { return value; }\n' +
+    '  flush() { return 0; }\n' +
     '}\n' +
     'export class Repository<T> {\n' +
     '  save(value: T) { return value; }\n' +
@@ -102,6 +104,20 @@ describe('a call on a TypeScript local annotated as an array of a class', () => 
         '}\n',
     });
     expect(calls.filter((c) => c.startsWith('repos.'))).toEqual([]);
+  }, 60_000);
+
+  it("still links a method arrays don't have to the element's class: the call is on an element of the same name", async () => {
+    // vscode's `d.forEach(d => d.dispose())` on an `IDisposable[]`, and
+    // `extensions.map(extensions => extensions.syncInstalledExtensionsWithGallery(…))`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/use.ts':
+        "import { Item } from './item';\n" +
+        'export function flushAll(d: Item[]) {\n' +
+        '  d.forEach((d) => d.flush());\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('d.'))).toEqual(['d.flush -> Item::flush']);
   }, 60_000);
 
   it('still links a call on a local annotated as the class, generic or not', async () => {

@@ -9,7 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -12847,6 +12847,11 @@ export function normalizeInferredTypeName(raw: string): string | null {
   return seg;
 }
 
+/** The element type of an array type a TS annotation gave (`Item[]`, `Item []` → `Item`), or undefined. */
+export function arrayElementType(type: string): string | undefined {
+  return /^(.+?)\s*\[\s*\]$/.exec(type)?.[1];
+}
+
 /**
  * A Java / C# type's optional type arguments (one level of nesting) and array
  * ranks, as a regex source: `<L, R>`, `<string, List<int>>`, `[]`, `[,]`.
@@ -13062,9 +13067,8 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // `Repository`. resolveMethodOnType validates the type actually declares
         // the method, so the looser match produces no edge on a mis-inference.
         // An array of a type (`items: Item[]`, `items: Item<K>[]`) is captured
-        // whole: its calls are the array's, which no project class declares,
-        // where the bare `Item` linked vscode's `distinctElements.find(…)` on
-        // an `ExplorerItem[]` to `ExplorerItem.find`.
+        // whole, so matchMethodCall can tell the array's own methods from an
+        // element's (arrayElementType).
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[\\s*\\])?)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
@@ -14205,6 +14209,16 @@ export function matchMethodCall(
     if (awaited) {
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
+    }
+    // An array of a type (`items: Item[]`): a method arrays have is the
+    // array's, which no project class declares, where `distinctElements.find(…)`
+    // on vscode's `ExplorerItem[]` reached `ExplorerItem.find`. Any other is
+    // called on one of its elements under the same name, as in
+    // `d.forEach(d => d.dispose())`, so it takes the element's type.
+    const element = inferredType && ESM_FAMILY.has(ref.language) ? arrayElementType(inferredType) : undefined;
+    if (element !== undefined) {
+      if (JS_ARRAY_METHODS.has(methodName!)) return null;
+      inferredType = element;
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
