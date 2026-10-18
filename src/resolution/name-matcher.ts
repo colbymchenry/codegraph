@@ -13584,7 +13584,7 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
  * without patterns or when no declaration is found. Bounded to the enclosing
  * scope so a same-named variable in another function can't leak in.
  */
-function inferLocalReceiverType(
+export function inferLocalReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
