@@ -37,8 +37,7 @@ const CALLERS: Files = {
   'src/use-default.ts': "import Store from './store';\nexport function e() {\n  const s = new Store();\n  return s.get();\n}\n",
   // A call on an element that shares the array's name: the element's class.
   'src/use-each.ts': "import { LRUCache } from './lru-cache';\nexport function h(cs: LRUCache<string, number>[]) {\n  cs.forEach((cs) => cs.get('k'));\n}\n",
-  // One of the class's properties, which resolution links to nothing: no edit
-  // of the class's module links it, so it keeps its own tail.
+  // One of the class's properties, which resolution reads as the class.
   'src/use-prop.ts': "import { LRUCache } from './lru-cache';\nexport function i(max: LRUCache<string, number>['max']) {\n  return max.toFixed(0);\n}\n",
   'src/noise.ts': NOISE,
 };
@@ -220,7 +219,7 @@ describe('a failed member call on a typed local', () => {
       expect(tails('src/use-default.ts', 's.get')).toEqual(['module:store']);
       expect(tails('src/use-each.ts', 'cs.get')).toEqual(['module:lru-cache']);
       expect(tails('src/use-each.ts', 'cs.forEach')).toEqual(['forEach']);
-      expect(tails('src/use-prop.ts', 'max.toFixed')).toEqual(['toFixed']);
+      expect(tails('src/use-prop.ts', 'max.toFixed')).toEqual(['module:lru-cache']);
 
       expect(tails('src/other.ts', 'seen.get')).toEqual(['get']);
       expect(tails('src/other.ts', 'pkg.get')).toEqual(['get']);

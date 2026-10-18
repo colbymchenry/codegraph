@@ -14216,15 +14216,19 @@ export function matchMethodCall(
     // declares, where `distinctElements.find(…)` on vscode's `ExplorerItem[]`
     // reached `ExplorerItem.find`; any other is called on one of its elements
     // under the same name, as in `d.forEach(d => d.dispose())`, so it takes
-    // the element's type. A type's property or element (`groupIds:
-    // ExcalidrawElement["groupIds"]`, `Parameters<typeof f>[0]`) is a type
-    // the annotation names without saying, like an outside type's: not the
-    // type it indexes, whose methods vscode's `Emitter<E>['event']` reached,
-    // and not one to guess by the method's name.
+    // the element's type. One of a type's properties (`editor:
+    // IChatWidget['inputEditor']`) has the type that property is declared
+    // with, an array of it the same way, where the type it indexes reached
+    // vscode's `ISessionChatPillVisibilityService.isVisible` through
+    // `['pullRequests']`. One whose type isn't written in the project
+    // (`Parameters<typeof f>[0]`, a getter) names no type to call, or to
+    // guess by the method's name.
     if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
       const element = arrayElementType(inferredType);
-      if (element === undefined || JS_ARRAY_METHODS.has(methodName!)) return null;
-      inferredType = element;
+      const declared = element !== undefined ? { type: element, array: true } : tsIndexedPropertyType(inferredType, ref, context);
+      if (!declared || (declared.array && JS_ARRAY_METHODS.has(methodName!))) return null;
+      inferredType = normalizeInferredTypeName(declared.type);
+      if (!inferredType) return null;
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
@@ -15515,7 +15519,15 @@ function matchRustSelfFieldCall(
  * patterns each time, a third of all method-call matching on vscode. Derived
  * from file source: drops with clearNameMatcherMemos.
  */
-const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, { valueType: boolean; type: string } | null>>();
+const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDecl | null>>();
+/**
+ * A TS field's declared type as tsFieldDeclaration reads it: the type it
+ * names (`Mailer` of `mailer: Mailer<T>`), whether that is a value's
+ * (`typeof X`), and whether the field holds an array of it (`items: Item[]`).
+ */
+type TsFieldDecl = { valueType: boolean; type: string; array?: boolean };
+/** What follows a field's type when the field holds an array of it: `[]`, after any type arguments. */
+const TS_ARRAY_SUFFIX = /^\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*\[\s*\]/;
 /** A class's comment-stripped lines, and which of them hold each `[\w$#]` token. */
 interface TsClassDecl {
   lines: string[];
@@ -15569,7 +15581,7 @@ const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
 ];
 
 /** The first declaration of `field` on one line, as `line.match` of its patterns in order would find it. */
-function tsFieldOnLine(line: string, field: string): { valueType: boolean; type: string } | null {
+function tsFieldOnLine(line: string, field: string): TsFieldDecl | null {
   let at: number[] | null = null;
   for (let i = line.indexOf(field); i !== -1; i = line.indexOf(field, i + 1)) {
     const end = i + field.length;
@@ -15581,7 +15593,7 @@ function tsFieldOnLine(line: string, field: string): { valueType: boolean; type:
     for (const i of at) {
       re.lastIndex = i;
       const m = re.exec(line);
-      if (m && m[1]) return { valueType, type: m[1] };
+      if (m && m[1]) return { valueType, type: m[1], array: TS_ARRAY_SUFFIX.test(line.slice(re.lastIndex)) };
     }
   }
   return null;
@@ -15644,7 +15656,7 @@ function tsFieldDeclaration(
   cls: Node,
   field: string,
   context: ResolutionContext
-): { valueType: boolean; type: string } | null {
+): TsFieldDecl | null {
   let memo = TS_FIELD_DECL_MEMO.get(context);
   if (!memo) {
     memo = new Map();
@@ -15653,7 +15665,7 @@ function tsFieldDeclaration(
   const key = cls.id + '\0' + field;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
-  let found: { valueType: boolean; type: string } | null = null;
+  let found: TsFieldDecl | null = null;
   const decl = tsClassDecl(cls, context);
   if (decl && TS_FIELD_TOKEN.test(field)) {
     // Every pattern needs the field as a whole `[\w$#]` run — the lookbehind
@@ -15675,13 +15687,34 @@ function tsFieldDeclaration(
       for (const { re, valueType } of patterns) {
         const m = line.match(re);
         if (!m || !m[1]) continue;
-        found = { valueType, type: m[1] };
+        found = { valueType, type: m[1], array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
         break scan;
       }
     }
   }
   memo.set(key, found);
   return found;
+}
+
+/**
+ * What a TS indexed type (`editor: IChatWidget['inputEditor']`) is: the type
+ * that property is declared with in the project class or interface it
+ * indexes, and whether the property holds an array of it. Null when the key
+ * isn't a string literal (`Parameters<typeof f>[0]`, `T[K]`), the indexed
+ * type isn't the project's, or the property's type isn't written there (a
+ * getter, `typeof`).
+ */
+function tsIndexedPropertyType(indexed: string, ref: UnresolvedRef, context: ResolutionContext): { type: string; array: boolean } | null {
+  const m = /^([A-Za-z_$][\w$]*)\s*\[\s*(['"])([\w$]+)\2\s*\]$/.exec(indexed);
+  if (!m) return null;
+  const owners = preferCallSiteFile(context.getNodesByName(m[1]!), ref.filePath).filter((n) =>
+    (n.kind === 'class' || n.kind === 'interface' || n.kind === 'type_alias' || n.kind === 'component') &&
+    sameLanguageFamily(n.language, ref.language));
+  for (const owner of owners) {
+    const decl = tsFieldDeclaration(owner, m[3]!, context);
+    if (decl) return decl.valueType ? null : { type: decl.type, array: decl.array === true };
+  }
+  return null;
 }
 
 /**

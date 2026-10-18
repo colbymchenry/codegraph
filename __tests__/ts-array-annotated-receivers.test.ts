@@ -10,11 +10,12 @@
  * only be called on an element that shares the array's name, as in
  * `d.forEach(d => d.dispose())`, and that one keeps the element's type.
  *
- * A local annotated as one of a type's properties (`groupIds:
- * ExcalidrawElement["groupIds"]`) was read as that type too, so its calls
- * reached the type's methods of the same name. Its type is one the
- * annotation names without saying: like an outside type, it links to
- * nothing, and the call isn't matched by its name either.
+ * A local annotated as one of a type's properties (`editor:
+ * IChatWidget['inputEditor']`) was read as that type too, so its calls
+ * reached the type's methods of the same name, or none. It has the type the
+ * property is declared with, an array of it the same way; one whose type
+ * isn't written in the project (`Parameters<typeof f>[0]`) links to nothing,
+ * and the call isn't matched by its name either.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -141,7 +142,42 @@ describe('a call on a TypeScript local annotated as an array of a class', () => 
 });
 
 describe("a call on a TypeScript local annotated as one of a type's properties", () => {
-  it('links to no method of that type', async () => {
+  it('links to the method of the type that property is declared with', async () => {
+    // vscode's `editor: IChatWidget['inputEditor']`, then `editor.executeEdits(…)`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/widget.ts':
+        'export class CodeEditor {\n  executeEdits() { return true; }\n}\n' +
+        'export interface Widget {\n  readonly inputEditor: CodeEditor;\n}\n' +
+        // Another `executeEdits`, so the method's name alone picks neither.
+        'export class DiffEditor {\n  executeEdits() { return false; }\n}\n',
+      'src/use.ts':
+        "import { Widget } from './widget';\n" +
+        "export function edit(ed: Widget['inputEditor']) {\n" +
+        '  return ed.executeEdits();\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('ed.'))).toEqual(['ed.executeEdits -> CodeEditor::executeEdits']);
+  }, 60_000);
+
+  it('links to that type rather than to a method of the type it indexes', async () => {
+    // vscode's `visibility: ISessionChatPillVisibilityService['pullRequests']`,
+    // then `visibility.isVisible(…)`, which reached the service's own `isVisible`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/service.ts':
+        'export class Visibility {\n  isVisible() { return true; }\n}\n' +
+        'export class VisibilityService {\n  readonly pullRequests: Visibility = new Visibility();\n  isVisible() { return false; }\n}\n',
+      'src/use.ts':
+        "import { VisibilityService } from './service';\n" +
+        "export function shown(visibility: VisibilityService['pullRequests']) {\n" +
+        '  return visibility.isVisible();\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.startsWith('visibility.'))).toEqual(['visibility.isVisible -> Visibility::isVisible']);
+  }, 60_000);
+
+  it("links an array property's own methods to nothing", async () => {
     // excalidraw's `groupIds: ExcalidrawElement["groupIds"]`, then `groupIds.filter(…)`.
     const calls = await callsOf({
       ...CLASSES,
@@ -155,7 +191,7 @@ describe("a call on a TypeScript local annotated as one of a type's properties",
     expect(calls.filter((c) => c.startsWith('groupIds.'))).toEqual([]);
   }, 60_000);
 
-  it("is not matched to a method by the call's name either", async () => {
+  it("is not matched to a method by the call's name when the property's type isn't written in the project", async () => {
     // vscode's `invocation: Parameters<typeof rawFinalizeToolInvocation>[0]`:
     // left untyped, the receiver's name alone would pick `Logger.info`.
     const calls = await callsOf({
