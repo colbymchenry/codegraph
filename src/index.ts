@@ -971,6 +971,9 @@ export class CodeGraph {
         // removal case — and runPostExtract starts by dropping the resolver's
         // name caches, which a long-lived daemon warmed against the
         // pre-removal graph.)
+        if (result.filesAdded > 0 || result.filesRemoved > 0) {
+          this.resolver.initialize();
+        }
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
         }
