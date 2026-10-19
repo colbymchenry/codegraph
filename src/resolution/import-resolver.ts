@@ -1382,10 +1382,17 @@ function extractGoImports(content: string): ImportMapping[] {
 
   const mapping = (localName: string, source: string): ImportMapping =>
     ({ localName, exportedName: '*', source, isDefault: false, isNamespace: true });
+  // Go binds a name to one import of a file, so a name another import is
+  // given explicitly is not an unaliased import's: etcd's benchmark tool has
+  // `"github.com/cheggaaa/pb/v3"` (package pb) beside
+  // `v3 "go.etcd.io/etcd/client/v3"`, and listed first, pb took every `v3.`.
+  const explicit = new Set(specs.flatMap(({ name }) => (name !== undefined && name !== '.' && name !== '_' ? [name] : [])));
   // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
   // its last path element.
-  const mappings = specs.map(({ name, source }) =>
-    mapping(name === undefined || name === '.' ? source.split('/').pop()! : name, source));
+  const mappings = specs
+    .map(({ name, source }) => ({ explicitly: name !== undefined && name !== '.', localName: name === undefined || name === '.' ? source.split('/').pop()! : name, source }))
+    .filter(({ explicitly, localName }) => explicitly || !explicit.has(localName))
+    .map(({ localName, source }) => mapping(localName, source));
   const bound = new Set(mappings.map((m) => m.localName));
   const assumed = new Map<string, string[]>();
   for (const { name, source } of specs) {
