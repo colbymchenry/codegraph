@@ -46,9 +46,9 @@ export function isClassLikeDefinition(node: SyntaxNode): boolean {
 /**
  * The `declaration` a class, struct, union or enum is defined in the type of —
  * `struct Foo { … } foo;` — or null for one written on its own, in a typedef or
- * in a member's type.
+ * in a member's type. Objective-C shares it (objc.ts).
  */
-function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
+export function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
   if (!isClassLikeDefinition(node)) return null;
   const parent = node.parent;
   return parent?.type === 'declaration' && getChildByField(parent, 'type')?.id === node.id ? parent : null;
@@ -60,9 +60,10 @@ function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
  * type of `static struct { … } SPT;` (only `SPT`), so the struct is indexed as
  * `SPT`, the way `typedef struct { … } Name;` is indexed as `Name`. Undefined
  * for a named type, and when the declaration declares no variable (a
- * function's return type). Mirrored in the kernel (ccpp/mod.rs).
+ * function's return type). Mirrored in the kernel (ccpp/mod.rs). Objective-C
+ * shares it (objc.ts), and has no kernel walker.
  */
-function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
+export function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
   if (getChildByField(node, 'name')) return undefined;
   const declaration = definingDeclaration(node);
   if (!declaration) return undefined;

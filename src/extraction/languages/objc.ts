@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import { definingDeclaration, unnamedTypeVariableName } from './c-cpp';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -116,7 +117,14 @@ export const objcExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   getReturnType: extractObjcReturnType,
-  resolveName: extractObjcMethodName,
+  // A method is named by its selector. An unnamed struct, union or enum
+  // defined in a declaration's type takes the first variable's name, as in C:
+  // `static struct { … } placeholder;` is the struct `placeholder`.
+  resolveName: (node, source) =>
+    extractObjcMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+  // A struct, union or enum defined in a declaration's type is documented by
+  // the comment above the declaration.
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   extractPropertyName: extractObjcPropertyName,
   resolveBody: (node, bodyField) => {
     const fromField = getChildByField(node, bodyField);

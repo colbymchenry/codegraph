@@ -636,12 +636,16 @@ export class TreeSitterExtractor {
   private cppBraceScopes: CppBraceScopes | null = null;
   private cppClassScopes = new NestedIntervals<string>();
   private cppClassScopeIds = new Set<string>();
-  // C/C++: whether a class, struct, union or enum defined in the type of a
-  // declaration outside any body is walked (see visitNode). Not in a C++ file
-  // whose tree has errors and whose braces don't balance: error recovery can
-  // close a namespace or a class at the wrong `}`, or run a class past its
-  // own, and with no brace scopes to correct it the walked class would land
-  // in the wrong scope.
+  // C, C++ and Objective-C: whether a class, struct, union or enum defined in
+  // the type of a declaration outside any body is walked (see visitNode). Not
+  // in a C++ file whose tree has errors and whose braces don't balance: error
+  // recovery can close a namespace or a class at the wrong `}`, or run a class
+  // past its own, and with no brace scopes to correct it the walked class
+  // would land in the wrong scope. C and Objective-C files take the walk even
+  // with errors: neither grammar has a namespace or a class written as a type
+  // (an @interface or @implementation is not one), and a struct, union or
+  // enum body holds fields and enumerators, not functions. Most Objective-C
+  // trees have errors; a macro such as `NS_ASSUME_NONNULL_BEGIN` is enough.
   private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
@@ -744,6 +748,7 @@ export class TreeSitterExtractor {
       }
       this.walkDeclaredTypes =
         this.language === 'c' ||
+        this.language === 'objc' ||
         (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
@@ -1514,14 +1519,15 @@ export class TreeSitterExtractor {
       this.extractor.variableTypes.includes(nodeType) &&
       (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
     ) {
-      // C/C++: a class, struct, union or enum defined in the declaration's
-      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
-      // definition like one written on its own, and the variables keep their
-      // nodes beside it. So is a class the tree reads as a declaration's type
-      // in a file walked in brace scopes (`class X {…}` glued to the tokens
-      // after it by error recovery). In a class or function body the children
-      // walk reaches it; here, this branch skips that walk. Mirrored in the
-      // kernel (ccpp/mod.rs visit_node).
+      // C, C++ and Objective-C: a class, struct, union or enum defined in the
+      // declaration's type (`struct Foo { … } foo;`, `static struct { … }
+      // SPT;`) is a definition like one written on its own, and the variables
+      // keep their nodes beside it. So is a class the tree reads as a
+      // declaration's type in a file walked in brace scopes (`class X {…}`
+      // glued to the tokens after it by error recovery). In a class or
+      // function body the children walk reaches it; here, this branch skips
+      // that walk. Mirrored in the kernel (ccpp/mod.rs visit_node), which has
+      // no Objective-C walker.
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);

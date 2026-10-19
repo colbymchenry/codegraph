@@ -1998,6 +1998,9 @@ const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
  */
 const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
 
+/** The C types an Objective-C file can define, as opposed to its classes and protocols. */
+const OBJC_C_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'type_alias']);
+
 /** Per context: a C/C++ type's qualified name → its declarations. */
 const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 /** Per context: a C/C++ file → the line and resolved file of each `#include` it writes. */
@@ -3138,6 +3141,8 @@ function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
  *   whichever USB class file ranked first. So is what a source file's
  *   unnamed namespace declares, and a type only source files declare, with
  *   its members (isCppTranslationUnitLocal).
+ * - **Objective-C**: a struct, union, enum or typedef a `.m` / `.mm` source
+ *   file defines is local to that file, as in C. A class is not.
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -3208,6 +3213,11 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
         !cppIncluders(candidate.filePath, context).has(ref.filePath)) return false;
     return !isCppTranslationUnitLocal(candidate, ref, context);
   }
+  // An Objective-C source file is a translation unit too: a C type it defines
+  // is its own. ObjFW's runtime keeps `static struct Lock { … } *locks;` in
+  // synchronized.m, and the AmigaOS `Lock(path, mode)` calls in other files
+  // make no such struct. (A class is the runtime's, wherever it is written.)
+  if (lang === 'objc' && OBJC_C_TYPE_KINDS.has(candidate.kind) && C_SOURCE_EXT.test(candidate.filePath)) return false;
   if (lang === 'go') return isGoNameVisible(candidate, ref);
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
