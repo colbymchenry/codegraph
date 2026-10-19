@@ -1964,8 +1964,9 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     if (!source || !CONSUMER_HINT.test(source)) continue;
     const scan = scanRoutes(source, allowsJsx(file), { objects: ROUTER_CALL.test(source), uses: true });
     for (const use of scan.uses) {
-      const table = use.literal !== undefined ? { file, at: use.literal } : tableNamed(use.name!, file, context);
-      enqueue(table, pathValues(use.prefix, file, context), file, use.layouts);
+      const tables = use.literal !== undefined ? [{ file, at: use.literal }] : tableNamed(use.name!, file, context);
+      const prefix = pathValues(use.prefix, file, context);
+      for (const table of tables) enqueue(table, prefix, file, use.layouts);
     }
   }
   const made = new Set<string>();
@@ -1975,7 +1976,10 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     const source = context.readFile(file);
     if (!source) continue;
     const scan = scanRoutes(source, allowsJsx(file), { table: { at, prefix: prefix.map((lit) => ({ lit })), layouts } });
-    for (const named of scan.names) enqueue(tableNamed(named, file, context), pathValues(named.prefix, file, context), file, named.layouts);
+    for (const named of scan.names) {
+      const prefix = pathValues(named.prefix, file, context);
+      for (const table of tableNamed(named, file, context)) enqueue(table, prefix, file, named.layouts);
+    }
     if (ROUTER_CALL.test(source)) continue;
     const lineAt = makeLineAt(source, 1);
     for (const route of scan.routes) {
@@ -2016,40 +2020,50 @@ function scriptLanguage(filePath: string): Language {
   return /\.tsx$/.test(filePath) ? 'tsx' : /\.[cm]?ts$/.test(filePath) ? 'typescript' : /\.jsx$/.test(filePath) ? 'jsx' : 'javascript';
 }
 
+/** A table literal: the file it is written in, and where it opens. */
+interface TableLiteral {
+  file: string;
+  at: number;
+}
+
 /**
- * The literal a table name stands for in `file`: declared there, or
+ * The literals a table name stands for in `file`: declared there, or
  * imported. A value that holds a call's result — Medusa's `const routes =
- * getRouteMap({ … })` — stands for the table the function returns.
+ * getRouteMap({ … })` — stands for the tables the function returns.
  */
-function tableNamed(named: TableName, file: string, context: ResolutionContext, depth = 0): { file: string; at: number } | null {
+function tableNamed(named: TableName, file: string, context: ResolutionContext, depth = 0): TableLiteral[] {
   const source = context.readFile(file);
-  if (!source) return null;
+  if (!source) return [];
   const safe = stripCommentsForRegex(source, 'typescript');
   const local = declaredTable(safe, named.name, named.call, visibleAt(named.at, safe, file, context));
-  if (typeof local === 'number') return { file, at: local };
-  if (local) return depth > 3 ? null : tableNamed(local, file, context, depth + 1);
+  if (local.length > 0) return tablesAt(local, file, context, depth);
   const language = scriptLanguage(file);
   const mapping = context.getImportMappings(file, language).find((m) => m.localName === named.name);
-  if (!mapping || mapping.isNamespace || depth > 3) return null;
+  if (!mapping || mapping.isNamespace || depth > 3) return [];
   const target = resolveImportPath(mapping.source, file, language, context);
-  if (!target) return null;
+  if (!target) return [];
   return exportedTable(target, mapping.isDefault ? 'default' : mapping.exportedName, named.call, context, depth + 1);
 }
 
-/** The literal `file` exports as `exported`: `export default [ … ]`, `export default AppRoutes`, `export const routes = [ … ]`, re-exports followed. */
-function exportedTable(file: string, exported: string, call: boolean, context: ResolutionContext, depth: number): { file: string; at: number } | null {
+/** The literals `sites` in `file` stand for: each literal written there, and the tables each function named returns. */
+function tablesAt(sites: TableSite[], file: string, context: ResolutionContext, depth: number): TableLiteral[] {
+  return sites.flatMap((site) =>
+    typeof site === 'number' ? [{ file, at: site }] : depth > 3 ? [] : tableNamed(site, file, context, depth + 1));
+}
+
+/** The literals `file` exports as `exported`: `export default [ … ]`, `export default AppRoutes`, `export const routes = [ … ]`, re-exports followed. */
+function exportedTable(file: string, exported: string, call: boolean, context: ResolutionContext, depth: number): TableLiteral[] {
   const source = context.readFile(file);
-  if (!source) return null;
+  if (!source) return [];
   const safe = stripCommentsForRegex(source, 'typescript');
   let local = exported;
   if (exported === 'default') {
     const m = /\bexport\s+default\s+/.exec(safe);
     if (m) {
       const after = m.index + m[0].length;
-      const inline = call ? returnedTable(safe, after) : heldTable(safe, after);
-      if (typeof inline === 'number') return { file, at: inline };
-      // `export default buildRoutes()`
-      if (inline) return depth > 3 ? null : tableNamed(inline, file, context, depth + 1);
+      // `export default [ … ]`, `export default buildRoutes()`, `export default function routes() { … }`.
+      const inline = call ? returnedTables(safe, after) : heldTable(safe, after);
+      if (inline.length > 0) return tablesAt(inline, file, context, depth);
       local = /^([A-Za-z_$][\w$]*)\s*(?:;|\n|$)/.exec(safe.slice(after))?.[1] ?? '';
     } else local = /\bexport\s*\{[^}]*?\b([A-Za-z_$][\w$]*)\s+as\s+default\b/.exec(safe)?.[1] ?? '';
   } else {
@@ -2058,10 +2072,9 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     if (alias) local = alias[1]!;
   }
   // What a module exports is declared at its top level.
-  const at = local ? declaredTable(safe, local, call, visibleAt(undefined, safe, file, context)) : null;
-  if (typeof at === 'number') return { file, at };
-  if (at) return depth > 3 ? null : tableNamed(at, file, context, depth + 1);
-  if (depth > 3) return null;
+  const declared = local ? declaredTable(safe, local, call, visibleAt(undefined, safe, file, context)) : [];
+  if (declared.length > 0) return tablesAt(declared, file, context, depth);
+  if (depth > 3) return [];
   // `export { routes } from './routes'`, `export { default as routes } from './routes'`, `export * from './routes'`.
   const language = scriptLanguage(file);
   for (const re of context.getReExports?.(file, language) ?? []) {
@@ -2069,48 +2082,61 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     const target = resolveImportPath(re.source, file, language, context);
     if (!target) continue;
     const found = exportedTable(target, re.kind === 'named' ? re.originalName : exported, call, context, depth + 1);
-    if (found) return found;
+    if (found.length > 0) return found;
   }
-  return null;
+  return [];
 }
 
 /**
- * Where `name`'s table literal opens, for `const name = [ … ]` (or a function
- * returning one when `call`) — or, for `const name = getRouteMap({ … })`, the
- * function whose returned table the value holds. Of several declarations of
- * the name, the one `visible` picks.
+ * Where `name`'s table literal opens, for `const name = [ … ]` (or the tables
+ * a function returns when `call`) — or, for `const name = getRouteMap({ …
+ * })`, the function whose returned table the value holds. Of several
+ * declarations of the name, the one `visible` picks.
  */
 function declaredTable(
   safe: string,
   name: string,
   call: boolean,
   visible: (keywords: number[]) => number | undefined
-): number | TableName | null {
+): TableSite[] {
   const id = name.replace(/\$/g, '\\$');
   const decls = [...safe.matchAll(new RegExp(`(?:^|[^\\w$.])((?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*)`, 'g'))];
   const chosen = decls.length > 0 ? visible(decls.map((d) => d.index + d[0].length - d[1]!.length)) : undefined;
   const decl = chosen === undefined ? undefined : decls[chosen];
   if (decl) {
     const after = decl.index + decl[0].length;
-    if (call) return returnedTable(safe, after);
-    return heldTable(safe, after);
+    return call ? returnedTables(safe, after) : heldTable(safe, after);
   }
-  if (!call) return null;
+  if (!call) return [];
   const fn = new RegExp(`(?:^|[^\\w$.])function\\s+${id}\\s*\\(`).exec(safe);
-  return fn ? returnedTable(safe, fn.index + fn[0].indexOf('function')) : null;
+  return fn ? returnedTables(safe, fn.index + fn[0].indexOf('function')) : [];
 }
 
+/** A table to read: where its literal opens in the file at hand, or a function whose returned tables to read. */
+type TableSite = number | TableName;
+
 /**
- * The table a value written at `at` gives: the literal there, or the
+ * The tables a value written at `at` gives: the literal there, or the
  * function a call there names — `getRouteMap({ … })`, `await loadRoutes()` —
- * whose returned table it is.
+ * whose returned table it is, and through `useMemo` what its callback
+ * returns: `useMemo(() => getRoutes(user), [user])`, `useMemo(getRoutes, [])`.
  */
-function heldTable(safe: string, at: number): number | TableName | null {
-  if (safe[at] === '[' || safe[at] === '{') return at;
+function heldTable(safe: string, at: number): TableSite[] {
+  // Parentheses around the value change nothing: `return ([ … ])`.
+  while (safe[at] === '(') at = skipSpace(safe, at + 1);
+  if (safe[at] === '[' || safe[at] === '{') return [at];
+  const memo = /(?:React\s*\.\s*)?useMemo\s*(?:<[^()]*>)?\s*\(\s*/y;
+  memo.lastIndex = at;
+  if (memo.test(safe)) {
+    const handed = /([A-Za-z_$][\w$]*)\s*,/y;
+    handed.lastIndex = memo.lastIndex;
+    const fn = handed.exec(safe);
+    return fn ? [{ name: fn[1]!, call: true, at: memo.lastIndex }] : returnedTables(safe, memo.lastIndex);
+  }
   const call = /(await\s+)?([A-Za-z_$][\w$]*)\s*\(/y;
   call.lastIndex = at;
   const m = call.exec(safe);
-  return m ? { name: m[2]!, call: true, at: at + (m[1]?.length ?? 0) } : null;
+  return m ? [{ name: m[2]!, call: true, at: at + (m[1]?.length ?? 0) }] : [];
 }
 
 /**
@@ -2149,22 +2175,151 @@ function visibleAt(use: number | undefined, safe: string, file: string, context:
   };
 }
 
-/** The table a function at `at` returns: `(user) => [ … ]`, `(user) => ([ … ])`, `function routes(user) { return [ … ]; }`. */
-function returnedTable(safe: string, at: number): number | null {
-  const head = /^(?:async\s+)?(?:function\b[^(]*\([^)]*\)|\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^={]*)?(=>)?\s*/.exec(safe.slice(at));
-  if (!head) return null;
-  let i = at + head[0].length;
-  if (head[1]) {
-    while (safe[i] === '(') {
-      i++;
-      while (/\s/.test(safe[i] ?? '')) i++;
-    }
-    if (safe[i] === '[') return i;
+/**
+ * The tables the function written at `at` returns: its expression body's
+ * (`(user) => [ … ]`, `() => buildRoutes()`), or what each `return` of its
+ * own hands back, an early guard (`if (!user) return [];`) and every branch
+ * alike. A `return` in a function written inside it (`.map((p) => { return
+ * [ … ]; })`, a method's) is that function's.
+ */
+function returnedTables(safe: string, at: number): TableSite[] {
+  const body = functionBody(safe, at);
+  if (!body) return [];
+  if (!body.block) return heldTable(safe, body.start);
+  return ownReturns(safe, body.start, body.end).flatMap((value) => heldTable(safe, value));
+}
+
+/**
+ * Where the function written at `at` keeps its body: a block, from its `{` to
+ * its `}`, or an arrow's expression, at `start`. Null for no function.
+ */
+function functionBody(safe: string, at: number): { block: boolean; start: number; end: number } | null {
+  let i = skipSpace(safe, at);
+  const keyword = (word: string): boolean => {
+    const re = new RegExp(`${word}\\b`, 'y');
+    re.lastIndex = i;
+    if (!re.test(safe)) return false;
+    i = skipSpace(safe, re.lastIndex);
+    return true;
+  };
+  keyword('async');
+  const arrow = !keyword('function');
+  const name = /\*?\s*[A-Za-z_$][\w$]*/y;
+  if (!arrow) {
+    name.lastIndex = i;
+    if (name.test(safe)) i = skipSpace(safe, name.lastIndex);
+  }
+  if (safe[i] === '(') {
+    const close = matchBracket(safe, i);
+    if (close < 0) return null;
+    i = skipSpace(safe, close + 1);
+  } else {
+    // `user => [ … ]`
+    const param = /[A-Za-z_$][\w$]*/y;
+    param.lastIndex = i;
+    if (!arrow || !param.test(safe)) return null;
+    i = skipSpace(safe, param.lastIndex);
+  }
+  // A return type, up to the arrow or the body: `(): RouteObject[] => [ … ]`.
+  if (safe[i] === ':') {
+    const stop = safe.indexOf(arrow ? '=>' : '{', i);
+    if (stop < 0) return null;
+    i = stop;
+  }
+  if (arrow) {
+    if (!safe.startsWith('=>', i)) return null;
+    i = skipSpace(safe, i + 2);
+    if (safe[i] !== '{') return { block: false, start: i, end: i };
   }
   if (safe[i] !== '{') return null;
-  const close = matchBracket(safe, i);
-  const ret = /\breturn\s*(?:\(\s*)?\[/.exec(safe.slice(i, close < 0 ? safe.length : close));
-  return ret ? i + ret.index + ret[0].length - 1 : null;
+  const end = blockEnd(safe, i);
+  return end < 0 ? null : { block: true, start: i, end };
+}
+
+/** The statements that start a block of their own after a parenthesized head: never a method's. */
+const BLOCK_HEADS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+
+/**
+ * Where each `return` of the block opening at `open` hands back its value:
+ * the block's own, past the functions written inside it — an arrow's block,
+ * a `function`, a method like `lazy() { … }`.
+ */
+function ownReturns(safe: string, open: number, close: number): number[] {
+  const values: number[] = [];
+  /** Past the body of a function whose parameters open at `paren`; -1 when there is none. */
+  const pastBody = (paren: number): number => {
+    const params = paren < 0 ? -1 : matchBracket(safe, paren);
+    if (params < 0) return -1;
+    let i = skipSpace(safe, params + 1);
+    if (safe[i] === ':') i = safe.indexOf('{', i);
+    return i >= 0 && safe[i] === '{' ? blockEnd(safe, i) : -1;
+  };
+  for (let i = open + 1; i < close; i++) {
+    const ch = safe[i]!;
+    if (opensString(safe, i)) {
+      const end = skipString(safe, i);
+      if (end < 0) break;
+      i = end;
+    } else if (ch === '=' && safe[i + 1] === '>') {
+      const body = skipSpace(safe, i + 2);
+      const end = safe[body] === '{' ? blockEnd(safe, body) : -1;
+      i = end < 0 ? i + 1 : end;
+    } else if (/[A-Za-z_$]/.test(ch) && !/[\w$.]/.test(safe[i - 1] ?? '')) {
+      const word = /[A-Za-z_$][\w$]*/y;
+      word.lastIndex = i;
+      word.test(safe);
+      const name = safe.slice(i, word.lastIndex);
+      const next = skipSpace(safe, word.lastIndex);
+      if (name === 'return') {
+        values.push(next);
+      } else if (name === 'function') {
+        const end = pastBody(safe.indexOf('(', next));
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      } else if (safe[next] === '(' && !BLOCK_HEADS.has(name)) {
+        const end = pastBody(next);
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      }
+      i = word.lastIndex - 1;
+    }
+  }
+  return values;
+}
+
+/**
+ * The index of the brace closing the block at `open`, or -1. A quote right
+ * after a word is an apostrophe in JSX text (`<p>Don't</p>`), not a string.
+ */
+function blockEnd(safe: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < safe.length; i++) {
+    if (opensString(safe, i)) {
+      const end = skipString(safe, i);
+      if (end < 0) return -1;
+      i = end;
+      continue;
+    }
+    const ch = safe[i]!;
+    if (ch === '{' || ch === '(' || ch === '[') depth++;
+    else if ((ch === '}' || ch === ')' || ch === ']') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** True for a quote that opens a string or template, not an apostrophe in JSX text. */
+function opensString(safe: string, i: number): boolean {
+  const ch = safe[i];
+  return ch === '`' || ((ch === '"' || ch === "'") && !/[\w$]/.test(safe[i - 1] ?? ''));
+}
+
+function skipSpace(safe: string, i: number): number {
+  while (/\s/.test(safe[i] ?? '')) i++;
+  return i;
 }
 
 /**
