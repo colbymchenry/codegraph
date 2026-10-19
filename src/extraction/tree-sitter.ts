@@ -67,9 +67,10 @@ const REACT_COMPONENT_HOCS = new Set(['forwardRef', 'memo', 'React.forwardRef', 
  * inside a type literal (`type Handle = { stop(): void }`), whose members
  * `extractTypeAlias` already extracts and attaches to the alias (#359) — take
  * the fallback and the file gains a phantom top-level `function stop` beside
- * the real `Handle::stop`.
+ * the real `Handle::stop`. An abstract class's `abstract send(): void` is
+ * one too.
  */
-const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature']);
+const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature', 'abstract_method_signature']);
 
 /** Vue store collections whose object-literal members are the symbols an agent
  *  looks for. Extracted as function nodes so `actions`/`mutations`/`getters` are
