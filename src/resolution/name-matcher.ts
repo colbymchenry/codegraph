@@ -15817,10 +15817,11 @@ function tsFieldDeclaration(
 /**
  * The declaration `onLine` reads, on line `row` of class `cls`'s `lines`. A
  * wrapped `new X(…)` is an X only when the wrapper's call ends the statement
- * and the wrapper returns its argument: `this._register(new Emitter())` is an
- * Emitter, `this._register(new DomEmitter(el, 'keydown')).event` is not, and
- * nor is what `constObservable(value)` or `Promise.resolve(value)` returns.
- * Otherwise the line declares nothing the reader can use, as before.
+ * and the wrapper's declaration returns its argument: `this._register(new
+ * Emitter())` is an Emitter, but neither `this._register(new DomEmitter(el,
+ * 'keydown')).event` nor what a wrapper declared `box<T>(value: T): Box<T>`
+ * returns is. Otherwise the line declares nothing the reader can use, as
+ * before.
  */
 function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
   if (!onLine?.via) return onLine;

@@ -109,9 +109,9 @@ describe('a this.<field> call on a field a class it extends declares', () => {
   }, 60_000);
 
   it('still reads it off a same-named class elsewhere whose type the call\'s file imports', async () => {
-    // vscode's copilot `MockPromptsService` declares its emitter as
-    // `this._register(new Emitter<void>())`, which isn't read; the
-    // workbench's `MockPromptsService` declares the same field.
+    // The calling class's own declaration goes through a wrapper the reader
+    // can't vouch for (`wrap` declares no return type); the same-named
+    // class elsewhere declares the field.
     const calls = await callsOf({
       ...STORES,
       'src/app/mock.ts':
