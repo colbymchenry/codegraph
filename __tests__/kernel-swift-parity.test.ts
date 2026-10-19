@@ -18,7 +18,9 @@
  * assignment-prune case the swift-nio sweep caught, SWIFT_SPEC fn-refs with
  * the label-forward skip and #selector shapes) and its CRLF variant (derived
  * in-memory — #1329); TortureTry.swift: calls written after `try!`, `try?`
- * and `try`, which the Windows kernels' grammar build misparsed.
+ * and `try`, which the Windows kernels' grammar build misparsed;
+ * TortureWrappedCalls.swift: calls through a prefix operator, `try` or
+ * `await`, which the grammar wraps around the callee or receiver.
  *
  * The full-repo sweep lives in scripts/kernel-parity.mjs (Alamofire/vapor/
  * swift-nio, --max-deferral 0.3 — swift error incidence is structurally
@@ -170,6 +172,54 @@ describe.skipIf(!kernelBuilt)('kernel Swift extraction parity', () => {
     // No callee on a `try!` line keeps the `!`.
     const tryBangLines = new Set(lines.flatMap((l, i) => (l.includes('try!') ? [i + 1] : [])));
     expect(refs.filter((r) => tryBangLines.has(r.line) && r.referenceName.includes('!'))).toEqual([]);
+  });
+
+  // A call the grammar wraps. A prefix operator binds to the leftmost operand
+  // (`!isReady()` parses as `(!isReady)()`, `!store.contains(id)` as
+  // `(!store).contains(id)`), and `try`/`await` before a chain to the part
+  // before its last call (`try! Decoder().decode(d)` is
+  // `(try! Decoder()).decode(d)`). Both engines read through the wrappers; an
+  // implicit member (`.success(x)`) keeps its dot. An operator applied to a
+  // parenthesized value parses as a call of the operator: `!(x)` stays a call
+  // of `!`, and `-(x)`, which has no callee node, is no call (its argument
+  // text used to be read as one: `-(id)` called `id`).
+  it('a call through a prefix operator, try or await keeps its name and receiver, LF and CRLF', () => {
+    const source = fs.readFileSync(path.join(FIXTURE_DIR, 'TortureWrappedCalls.swift'), 'utf8');
+    assertParity('fixtures/TortureWrappedCalls.swift', source, 5);
+    assertParity('fixtures/TortureWrappedCalls.swift (crlf)', source.replace(/(?<!\r)\n/g, '\r\n'), 5);
+
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    const refs = tryKernelExtract('fixtures/TortureWrappedCalls.swift', source, 'swift')!.unresolvedReferences;
+    const lines = source.split(/\r?\n/);
+    // The `kind` refs on the first line containing `text`, by name.
+    const on = (text: string, kind: 'calls' | 'references'): string[] => {
+      const i = lines.findIndex((l) => l.includes(text));
+      expect(i, `fixture line "${text}"`).toBeGreaterThanOrEqual(0);
+      return refs.filter((r) => r.line === i + 1 && r.referenceKind === kind).map((r) => r.referenceName).sort();
+    };
+    expect(on('let a = !isReady()', 'calls')).toEqual(['isReady']);
+    expect(on('let b = !store.contains(id)', 'calls')).toEqual(['store.contains']);
+    expect(on('let c = !Config.check()', 'calls')).toEqual(['Config.check']);
+    expect(on('let d = -abs(id)', 'calls')).toEqual(['abs']);
+    expect(on('let e = !Settings.Defaults.isOn()', 'calls')).toEqual(['Settings.Defaults.isOn']);
+    expect(on('let e = !Settings.Defaults.isOn()', 'references')).toEqual(['Settings']);
+    expect(on('let h = !Config.shared.isEnabled', 'references')).toEqual(['Config']);
+    expect(on('let i = ~Mask.all.rawValue', 'references')).toEqual(['Mask']);
+    expect(on('var negated: Bool = !Store.isEmpty()', 'calls')).toEqual(['Store.isEmpty']);
+    expect(on('let j = try! Decoder()', 'calls')).toEqual(['Decoder', 'Decoder().decode']);
+    expect(on('let k = try Parser.make()', 'calls')).toEqual(['Parser.make', 'Parser.make().parse']);
+    expect(on('let l = try! Parser.make().tokens()', 'calls'))
+      .toEqual(['Parser.make', 'Parser.make().tokens', 'Parser.make().tokens().first']);
+    expect(on('let o = try !isValid(data)', 'calls')).toEqual(['isValid']);
+    expect(on('let q = !(items.isEmpty)', 'calls')).toEqual(['!']);
+    expect(on('let r = -(id + 1)', 'calls')).toEqual([]);
+    expect(on('let s = -(id)', 'calls')).toEqual([]);
+    expect(on('return !store.remove(id)', 'calls')).toEqual(['store.remove']);
+    expect(on('guard !Task.isCancelled', 'calls')).toEqual(['isReady']);
+    expect(on('guard !Task.isCancelled', 'references')).toEqual(['Task']);
+    // Unchanged: an implicit member keeps its dot, a lowercase chain stays bare.
+    expect(on('let p: Result<Int, Error> = .success(id)', 'calls')).toEqual(['.success']);
+    expect(on('let n = await loader.load().items()', 'calls')).toEqual(['items', 'loader.load']);
   });
 
   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {

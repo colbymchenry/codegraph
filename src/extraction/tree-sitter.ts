@@ -456,6 +456,57 @@ const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_prope
 const SWIFT_TYPE_PATH_RECEIVER = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+$/;
 
 /**
+ * Swift wrappers that leave a call's target the same. tree-sitter-swift binds
+ * a prefix operator to the leftmost operand, so `!isReady()` parses as
+ * `(!isReady)()` and `!store.contains(x)` as `(!store).contains(x)`; and
+ * `try`/`await` before a chain bind to the part before its last call, so
+ * `try! A().b()` parses as `(try! A()).b()`. An implicit member's leading `.`
+ * (`.success(x)`) is part of the name, not a wrapper. Mirrored in the kernel's
+ * swift.rs.
+ */
+function isSwiftCallWrapper(node: SyntaxNode, source: string): boolean {
+  if (node.type === 'try_expression' || node.type === 'await_expression') return true;
+  return node.type === 'prefix_expression' && !getNodeText(node, source).startsWith('.');
+}
+
+/** The operand a {@link isSwiftCallWrapper} wraps. */
+function swiftWrappedOperand(node: SyntaxNode): SyntaxNode | null {
+  return getChildByField(node, node.type === 'prefix_expression' ? 'target' : 'expr');
+}
+
+/** Strip {@link isSwiftCallWrapper} wrappers off a Swift callee or receiver. */
+function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
+  let cur = node;
+  while (isSwiftCallWrapper(cur, source)) {
+    const inner = swiftWrappedOperand(cur);
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * A Swift receiver's text from its innermost wrapped operand on: the wrappers
+ * sit on the chain's left edge, so `!Settings.Defaults` reads
+ * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
+ */
+function swiftUnwrappedText(node: SyntaxNode, source: string): string {
+  let start = node.startIndex;
+  let cur: SyntaxNode | null = node;
+  while (cur) {
+    if (isSwiftCallWrapper(cur, source)) {
+      cur = swiftWrappedOperand(cur);
+      if (cur) start = cur.startIndex;
+    } else if (cur.type === 'navigation_expression' || cur.type === 'call_expression') {
+      cur = cur.namedChild(0);
+    } else {
+      break;
+    }
+  }
+  return source.substring(start, node.endIndex);
+}
+
+/**
  * Identifier-rooted member chains have no inferred property type (#1566),
  * including host API chains (#1707). Keep the existing `window.MyNamespace`
  * escape for project globals; call-result and `this` receivers have their own
@@ -5347,7 +5398,17 @@ export class TreeSitterExtractor {
         }
       }
     } else {
-      const func = getChildByField(node, 'function') || node.namedChild(0);
+      let func = getChildByField(node, 'function') || node.namedChild(0);
+
+      if (func && this.language === 'swift') {
+        // `-(a + b)`: an operator token applied to a parenthesized value
+        // leaves the call with no callee node, only its arguments — which
+        // must not be read as a callee name. (`!(x)` keeps its `bang` callee:
+        // a project may declare a `prefix func !` for its own types.)
+        // Mirrored in the kernel's extract_call (swift.rs).
+        if (func.type === 'call_suffix') return;
+        func = peelSwiftCallWrappers(func, this.source);
+      }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the
@@ -5427,10 +5488,13 @@ export class TreeSitterExtractor {
             // TS/JS: look through wrappers that keep the receiver the same
             // object (`(x).m()`, `x!.m()`, `(x as T).m()`, `(await f()).m()`),
             // so the branches below see the identifier / call / chain the
-            // call is really made on.
+            // call is really made on. Swift: through a prefix operator, `try`
+            // and `await` (`(!store).contains(x)`, `(try! A()).b()`).
             const receiver = rawReceiver && TS_JS_CHAIN_LANGUAGES.has(this.language)
               ? peelTsJsReceiver(rawReceiver)
-              : rawReceiver;
+              : rawReceiver && this.language === 'swift'
+                ? peelSwiftCallWrappers(rawReceiver, this.source)
+                : rawReceiver;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -5506,7 +5570,12 @@ export class TreeSitterExtractor {
                 // call_expression's first named child (a navigation_expression
                 // `Foo.getInstance`, or a bare identifier for a free/constructor call).
                 const innerNav = receiver.namedChild(0);
-                innerCallee = innerNav ? getNodeText(innerNav, this.source).replace(/\s+/g, '') : '';
+                // Swift: without a `try`/`await`/prefix operator on its left
+                // edge (`try! Foo.make().bar().baz()`).
+                const innerText = !innerNav ? ''
+                  : this.language === 'swift' ? swiftUnwrappedText(innerNav, this.source)
+                  : getNodeText(innerNav, this.source);
+                innerCallee = innerText.replace(/\s+/g, '');
                 // Only re-encode a CLASS / companion-factory / constructor chain,
                 // whose receiver chain starts with a capitalized type
                 // (`Foo.getInstance().bar()`, `Foo().bar()`). An instance chain
@@ -5541,7 +5610,7 @@ export class TreeSitterExtractor {
               this.language === 'swift' &&
               receiver &&
               receiver.type === 'navigation_expression' &&
-              SWIFT_TYPE_PATH_RECEIVER.test(getNodeText(receiver, this.source).replace(/\s+/g, ''))
+              SWIFT_TYPE_PATH_RECEIVER.test(swiftUnwrappedText(receiver, this.source).replace(/\s+/g, ''))
             ) {
               // Swift call through a type path — `API.PackageController.GetRoute.query(on:)`,
               // on one line or split before the `.query`. Keep the path: the
@@ -5549,9 +5618,11 @@ export class TreeSitterExtractor {
               // type's `query` came first (every route in a Vapor app has one).
               // The resolver finds the member on the type the path names, or
               // leaves the call unresolved. An instance chain (`self.store.load()`,
-              // `viewModel.state.reset()`) is not a type path and stays bare.
-              // Mirrored in the kernel's extract_call (swift.rs).
-              calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+              // `viewModel.state.reset()`) is not a type path and stays bare. A
+              // prefix operator on the path's head is not part of it
+              // (`!Settings.Defaults.isOn()`). Mirrored in the kernel's
+              // extract_call (swift.rs).
+              calleeName = `${swiftUnwrappedText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
             } else if (
               this.language === 'cfscript' &&
               receiver &&
@@ -6035,12 +6106,15 @@ export class TreeSitterExtractor {
     // The receiver must be a SIMPLE capitalized identifier — `Type.X`, not the
     // nested `a.B.c` (whose own head member-access is visited separately) nor a
     // lowercase `obj.field` / `pkg.func`.
-    const recv =
+    const rawRecv =
       getChildByField(node, 'object') ??
       getChildByField(node, 'expression') ??
       getChildByField(node, 'scope') ??
       node.namedChild(0);
-    if (!recv) return;
+    if (!rawRecv) return;
+    // Swift binds a prefix operator to the head: `!Config.shared.isOn` is
+    // `(!Config).shared.isOn`. Mirrored in the kernel (swift.rs).
+    const recv = this.language === 'swift' ? peelSwiftCallWrappers(rawRecv, this.source) : rawRecv;
     const t = recv.type;
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
