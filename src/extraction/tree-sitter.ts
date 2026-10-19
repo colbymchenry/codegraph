@@ -23,8 +23,9 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
+import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplTypeName } from './languages/rust';
-import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
+import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -66,9 +67,10 @@ const REACT_COMPONENT_HOCS = new Set(['forwardRef', 'memo', 'React.forwardRef', 
  * inside a type literal (`type Handle = { stop(): void }`), whose members
  * `extractTypeAlias` already extracts and attaches to the alias (#359) — take
  * the fallback and the file gains a phantom top-level `function stop` beside
- * the real `Handle::stop`.
+ * the real `Handle::stop`. An abstract class's `abstract send(): void` is
+ * one too.
  */
-const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature']);
+const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature', 'abstract_method_signature']);
 
 /** Vue store collections whose object-literal members are the symbols an agent
  *  looks for. Extracted as function nodes so `actions`/`mutations`/`getters` are
@@ -558,13 +560,15 @@ export class TreeSitterExtractor {
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
-  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
+  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'jsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
   private static readonly MAX_VALUE_REF_NODES = 20_000;
   private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
   private fileScopeValues = new Map<string, string>();
   private fileScopeValueCounts = new Map<string, number>(); // file-scope nodes per name (conditional-def detection)
   private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
   private errors: ExtractionError[] = [];
+  // Import nodes made for `export … from` statements: no symbols of the file's own.
+  private reExportImports = 0;
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
@@ -734,7 +738,9 @@ export class TreeSitterExtractor {
       this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
 
       // hasError is routine for several grammars; warn only when no symbols survived.
-      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
+      // (A re-export's import of its module is none: a barrel whose other lines
+      // failed to parse has lost what it passes on.)
+      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length - this.reExportImports;
       if (this.tree?.rootNode.hasError && symbolCount === 0) {
         this.errors.push({
           message:
@@ -1578,13 +1584,16 @@ export class TreeSitterExtractor {
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
     }
-    // Re-export from another module — `export { X } from './y'` (TS/JS). A
-    // re-export is a dependency on the source module just like an import, but
-    // the export_statement is otherwise only descended into (no declaration to
-    // extract), so a barrel that ONLY re-exports produced zero edges and showed
-    // 0 dependents. Link each re-exported name to its definition. Children are
-    // still visited (a non-re-export `export const X = …` has no `source` and
-    // falls through to its normal declaration extraction).
+    // Re-export from another module — `export { X } from './y'`, `export * from
+    // './y'` (TS/JS). A re-export is a dependency on the source module just like
+    // an import, but the export_statement is otherwise only descended into (no
+    // declaration to extract), so a barrel that ONLY re-exports produced zero
+    // edges and showed 0 dependents. It imports the module as `import … from`
+    // does — an import node and a reference to the module, which links the
+    // barrel to the file it names (so a barrel of barrels can be followed) —
+    // and links each re-exported name to its definition. Children are still
+    // visited (a non-re-export `export const X = …` has no `source` and falls
+    // through to its normal declaration extraction).
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
@@ -1592,6 +1601,9 @@ export class TreeSitterExtractor {
        this.language === 'arkts') &&
       getChildByField(node, 'source')
     ) {
+      const before = this.nodes.length;
+      this.extractImport(node);
+      this.reExportImports += this.nodes.length - before;
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       if (parentId) this.emitReExportRefs(node, parentId);
     }
@@ -1808,6 +1820,18 @@ export class TreeSitterExtractor {
     const anchor = this.namespacePrefix.indexOf(receiverHead!);
     const prefix = anchor === -1 ? this.namespacePrefix : this.namespacePrefix.slice(0, anchor);
     return prefix.length > 0 ? `${prefix.join('::')}::${base}` : base;
+  }
+
+  /**
+   * The qualified name of a class, struct or union whose declaration writes
+   * its name in a scope (getClassScope): C++'s out-of-line nested `struct
+   * SkipList<Key, Comparator>::Node` is `leveldb::SkipList::Node`, composed
+   * like an out-of-line method's. Its members are qualified under it
+   * (objectPathOwners). Undefined for any other.
+   */
+  private writtenScopeQualifiedName(node: SyntaxNode, name: string): string | undefined {
+    const scope = this.extractor?.getClassScope?.(node, this.source);
+    return scope ? this.composeReceiverQualifiedName(scope, name) : undefined;
   }
 
   /**
@@ -2131,14 +2155,17 @@ export class TreeSitterExtractor {
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
       ...this.cppBodyEnd(resolvedBody),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!classNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(classNode.id, scoped);
     this.openCppClassScope(classNode, resolvedBody);
 
     // Extract extends/implements
@@ -2347,14 +2374,17 @@ export class TreeSitterExtractor {
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const aggregateNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
       ...this.cppBodyEnd(body),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!aggregateNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(aggregateNode.id, scoped);
     this.openCppClassScope(aggregateNode, body);
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
@@ -3817,6 +3847,20 @@ export class TreeSitterExtractor {
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, aggregateNode.id);
+        // A Go struct references the types its fields are declared with, as
+        // the struct: Go fields mint no nodes, and impact never climbs from a
+        // member to its container (Dart's fields are the same, #2327).
+        if (this.language === 'go') {
+          for (const type of goStructFieldTypeNames(node, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: aggregateNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
@@ -3866,7 +3910,7 @@ export class TreeSitterExtractor {
       // impl-navigation can see the contract. Go has no `implements` keyword, so
       // without the interface's method set there's nothing to match against.
       if (this.language === 'go' && typeChild) {
-        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id, node);
       }
       return true;
     }
@@ -3916,8 +3960,11 @@ export class TreeSitterExtractor {
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
    * are `type_elem`s, not methods, and are left to inheritance extraction.
+   * Each method references the types its signature names, as a function does
+   * (`decl` declares the interface): a call through the interface reaches the
+   * method, so impact on a type reaches its callers.
    */
-  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string, decl: SyntaxNode): void {
     this.nodeStack.push(ifaceId);
     for (let i = 0; i < interfaceType.namedChildCount; i++) {
       const m = interfaceType.namedChild(i);
@@ -3926,9 +3973,20 @@ export class TreeSitterExtractor {
       if (!nameNode) continue;
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
-        this.createNode('method', mname, m, {
+        const methodNode = this.createNode('method', mname, m, {
           signature: this.extractor?.getSignature?.(m, this.source),
         });
+        if (methodNode) {
+          for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: methodNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
     }
     this.nodeStack.pop();
@@ -8343,6 +8401,12 @@ export function extractFromSource(
         { sourceIsPreParsed: deferredPre != null }
       );
       result = extractor.extract();
+    }
+    // C++ methods the file's own macros define, read from the original source
+    // after either extractor so both mint them (cpp-macro-methods.ts).
+    if (detectedLanguage === 'cpp') {
+      const preParse = EXTRACTORS.cpp?.preParse;
+      appendCppMacroMethods(result, filePath, source, (text) => (preParse ? preParse(text, filePath) : text));
     }
   }
 

@@ -28,6 +28,7 @@ import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
+import { describeSynthesizedHop } from '../graph/synthesized-hop';
 
 /**
  * Most top-level declarations of one copybook that become entry points — its
@@ -403,31 +404,17 @@ export class ContextBuilder {
     const name = (id: string): string => subgraph.nodes.get(id)?.name ?? id;
 
     // Synthesized (dynamic-dispatch) hops are real `calls` edges but invisible to
-    // static parsing — mark them inline so the agent sees WHERE the callback was
-    // wired up (`registered @file:line`) instead of grepping for it. Keyed by
-    // "source>target".
+    // static parsing — mark them inline so the agent sees WHAT bridged the hop
+    // and WHERE it was wired up (`@file:line`) instead of grepping for it. The
+    // wording is `graph/synthesized-hop.ts`'s, the same explore's Flow uses, plus
+    // the detail this roomier line has space for. Keyed by "source>target".
     const synthByPair = new Map<string, string>();
     for (const e of subgraph.edges) {
-      if (e.kind !== 'calls' || e.provenance !== 'heuristic') continue;
-      const m = e.metadata as Record<string, unknown> | undefined;
-      if (!m?.synthesizedBy) continue;
-      const at = typeof m.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
-      const label = m.synthesizedBy === 'callback'
-        ? `callback via ${m.via ? `\`${String(m.via)}\`` : 'registrar'}${at}`
-        : m.synthesizedBy === 'react-render'
-        ? `React re-render via setState${at}`
-        : m.synthesizedBy === 'jsx-render'
-        ? `renders <${String(m.via || 'child')}>`
-        : m.synthesizedBy === 'vue-handler'
-        ? `Vue @${String(m.event || 'event')} handler`
-        : m.synthesizedBy === 'http-client'
-        ? `HTTP ${String(m.method || 'GET')} ${String(m.href || '')} — the client's call onto its own route${at}`
-        : m.synthesizedBy === 'queue-job'
-        ? `queue job ${m.event ? `\`${String(m.event)}\`` : ''}${m.queue ? ` on \`${String(m.queue)}\`` : ''}${at}`
-        : m.synthesizedBy === 'event-bus' && m.channel === 'socket'
-        ? `socket message ${m.event ? `\`${String(m.event)}\`` : ''}${m.tier === 'client→server' ? ' → server' : m.tier === 'server→client' ? ' → client' : ''}${at}`
-        : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
-      synthByPair.set(`${e.source}>${e.target}`, label);
+      if (e.kind !== 'calls') continue;
+      const hop = describeSynthesizedHop(e);
+      if (!hop) continue;
+      const at = hop.registeredAt ? ` @${hop.registeredAt}` : '';
+      synthByPair.set(`${e.source}>${e.target}`, `${hop.summary}${hop.detail}${at}`);
     }
     const renderChain = (c: string[]): string => {
       let s = name(c[0]!);
@@ -447,7 +434,7 @@ export class ContextBuilder {
       ...kept.map((c) => `- ${renderChain(c)}`),
       '',
       hasSynth
-        ? '_Hops marked `[callback/event …]` are dynamic dispatch bridged by codegraph (with the registration site); the rest are direct calls. codegraph_node any symbol for its body._'
+        ? '_Hops marked `[…]` are dynamic dispatch bridged by codegraph (with the registration site); the rest are direct calls. codegraph_node any symbol for its body._'
         : '_codegraph_node any symbol above for its source + its own callers/callees._',
     ];
     return '\n' + lines.join('\n') + '\n';

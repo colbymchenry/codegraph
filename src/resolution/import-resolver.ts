@@ -8,10 +8,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
-import { applyAliases } from './path-aliases';
+import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
+import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { moduleTail } from '../db/reference-tail';
 import {
@@ -21,21 +22,34 @@ import {
   localReceiverTypePatterns,
   normalizeInferredTypeName,
   goRefQualifier,
+  inferLocalReceiverType,
+  arrayElementType,
+  tsImportedTypeFile,
 } from './name-matcher';
+import { JS_ARRAY_METHODS } from './js-builtins';
 
 /**
  * Extension resolution order by language
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
-  typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
+  // `/index.jsx` last, as tsc probes a directory: a route table resolves the
+  // module its `lazy(() => import('views/x'))` loads as TypeScript, whatever
+  // the file is written in, and admin templates keep their pages in
+  // `views/x/index.jsx`.
+  typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js', '/index.jsx'],
   // ArkTS imports both `.ets` components and plain `.ts` logic modules —
   // HarmonyOS projects are always a mix. `/Index.ets` (capital I) is ohpm's
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
-  tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
-  jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
+  // A JavaScript file imports TypeScript modules too, as the bundler and
+  // tsc's `allowJs` read it: mastodon's `modal_root.jsx` imports
+  // `./audio_modal`, which is `audio_modal.tsx`. JavaScript comes first, so a
+  // `helpers.ts` beside `helpers.js` doesn't take its importers. Never `.d.ts`:
+  // a declaration file is not the module a JavaScript file runs.
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '.ts', '.tsx', '/index.js', '/index.jsx', '/index.ts', '/index.tsx'],
+  tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js', '/index.jsx'],
+  jsx: ['.jsx', '.js', '.tsx', '.ts', '/index.jsx', '/index.js', '/index.tsx', '/index.ts'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
   // (`./lib` → `./lib/index.ts`). Without a list, relative imports from a
   // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).
@@ -84,8 +98,9 @@ const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | un
  * Built from the file's exported rows alone: every worker of the resolver
  * pool builds its own index for each file an import reaches, and decoding
  * whole files there cost more than resolving through them. The two answers
- * that need more — the default-export binding and names a local export
- * clause introduces — read the source and name-targeted rows on first use.
+ * that need more — what the `export default` statement exports and names a
+ * local export clause introduces — read the source and name-targeted rows on
+ * first use.
  */
 interface FileExportIndex {
   /** Exported declarations by name. Read through {@link exportedByName}. */
@@ -93,15 +108,11 @@ interface FileExportIndex {
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
   /**
-   * The node an `export default NAME` statement names, exported at its
-   * declaration or not — the precise answer where `defaultFnClass` is a
-   * guess. `const Home = () => …; export default Home` and the namespace
-   * object `const UploadApi = { uploadARCapture }; export default UploadApi`
-   * are both invisible to the `isExported` index above: neither declaration
-   * has an `export_statement` ancestor. `undefined` until first read through
-   * {@link defaultExportBindingNode}; `null` when there is none.
+   * What the file's own `export default` statement exports — the precise
+   * answer where `defaultComponent`/`defaultFnClass` are guesses. `undefined`
+   * until first read through {@link statedDefaultExport}.
    */
-  defaultBinding?: Node | null;
+  statedDefault?: StatedDefault;
   /**
    * Names a local export clause (`export { impl as alias }`) binds to a
    * declaration the extractor never flagged isExported, for names not in
@@ -111,17 +122,115 @@ interface FileExportIndex {
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
-const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+const DEFAULT_DECLARATION_KINDS = new Set<string>(['function', 'class', 'component']);
 /** Any `export default …` statement: the module is an ES module with a default export. */
 const ESM_DEFAULT_EXPORT_RE = /^[ \t]*export\s+default\b/m;
 const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
-/** The identifier `export default NAME` names in a JS-family file, or null. */
-function defaultExportBinding(filePath: string, context: ResolutionContext): string | null {
-  if (!JS_FAMILY_FILE.test(filePath)) return null;
-  const source = context.readFile(filePath);
-  if (!source || !source.includes('export default')) return null;
-  return source.match(DEFAULT_EXPORT_BINDING_RE)?.[1] ?? null;
+/**
+ * What a file's own `export default` statement exports: the node it declares
+ * or names, `'anonymous'` for a function or class with no name (no node
+ * stands for it), `'unstated'` when the file says nothing a node answers.
+ */
+type StatedDefault = Node | 'anonymous' | 'unstated';
+
+const EXPORT_DEFAULT_HEAD = /^[ \t]*export\s+default\s+/gm;
+/** `[async] function[*] [NAME]` / `[abstract] class [NAME]`; the name is group 1 or 2. */
+const DEFAULT_DECLARATION_RE =
+  /^(?:async\s+)?function\b\s*(?:\*\s*)?([A-Za-z_$][\w$]*)?|^(?:abstract\s+)?class\b(?:\s+(?!extends\b|implements\b)([A-Za-z_$][\w$]*))?/;
+/** `[async] x =>`, or `[async] (` opening what may be an arrow function's parameters. */
+const DEFAULT_ARROW_RE = /^(?:async\s+)?(?:[A-Za-z_$][\w$]*\s*=>|\()/;
+/** `NAME` alone on its line. */
+const DEFAULT_BINDING_RE = /^([A-Za-z_$][\w$]*)\s*;?[ \t]*(?:\r?\n|$)/;
+
+/**
+ * The value of the `export default` statement whose value starts at `at`, in
+ * comment-stripped code: the name a declaration or a binding gives it,
+ * `'anonymous'` for a function, class or arrow function without one, or null
+ * for any other expression.
+ */
+function readDefaultExport(code: string, at: number): { name: string; nameAt: number; declared: boolean } | 'anonymous' | null {
+  const rest = code.slice(at, at + 2048);
+  const decl = DEFAULT_DECLARATION_RE.exec(rest);
+  if (decl) {
+    const name = decl[1] ?? decl[2];
+    return name ? { name, nameAt: at + decl[0].length - name.length, declared: true } : 'anonymous';
+  }
+  const arrow = DEFAULT_ARROW_RE.exec(rest);
+  if (arrow) {
+    if (!arrow[0].endsWith('(')) return 'anonymous';
+    // A parenthesized list is an arrow function's parameters when `=>` or a
+    // return type (`(…): JSX.Element =>`) follows it; otherwise it is an
+    // expression (`(Foo)`).
+    let depth = 0;
+    for (let i = arrow[0].length - 1; i < rest.length; i++) {
+      if (rest[i] === '(') depth++;
+      else if (rest[i] === ')' && --depth === 0) return /^\s*(?:=>|:)/.test(rest.slice(i + 1)) ? 'anonymous' : null;
+    }
+    return null;
+  }
+  const binding = DEFAULT_BINDING_RE.exec(rest);
+  return binding ? { name: binding[1]!, nameAt: at, declared: false } : null;
+}
+
+/**
+ * What `filePath`'s own `export default` statement exports. The statement
+ * says it outright, where the export index can only guess:
+ * - `export default function Vans() {…}` / `export default class Store` —
+ *   the declaration the statement writes, found by position. A React Router
+ *   data-router page exports its `loader` or `action` above it, and the
+ *   first-exported guess bound the page's default import to the loader.
+ * - `export default Home` — the binding it names, exported at its
+ *   declaration or not: `const Home = () => …` and the namespace object
+ *   `const UploadApi = { uploadARCapture }` have no `export_statement`
+ *   ancestor, so the `isExported` index never sees them.
+ * - `export default function () {…}`, `export default class {…}`, `export
+ *   default () => …` — anonymous: no node is the default export, and any
+ *   exported function beside it (or nested in it, which the extractor flags
+ *   exported too) would be the wrong one.
+ * Anything else — an expression (`memo(Card)`, `new Service()`, `{ … }`), a
+ * binding the file doesn't declare, no statement at all, a non-JS file — is
+ * `'unstated'`. Comments are stripped first. Strings are not masked: a
+ * template whose `${…}` holds another template, or a regex with a backtick,
+ * sets a masker out of step, and it blanked the real statement after it
+ * (outline's 2,900-line styled-components `Styles.ts`). A statement must
+ * name a node of the file instead — one a template only writes as text
+ * names none — and of several statements, one that does wins.
+ */
+function statedDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): StatedDefault {
+  if (idx.statedDefault !== undefined) return idx.statedDefault;
+  let stated: StatedDefault | undefined;
+  const source = JS_FAMILY_FILE.test(filePath) ? context.readFile(filePath) : null;
+  if (source && /\bexport\s+default\b/.test(source)) {
+    const code = stripCommentsForRegex(source, 'typescript');
+    const lineAt = makeLineAt(code, 1);
+    EXPORT_DEFAULT_HEAD.lastIndex = 0;
+    for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
+      const value = readDefaultExport(code, m.index + m[0].length);
+      if (value === 'anonymous') {
+        stated ??= 'anonymous';
+        continue;
+      }
+      stated ??= 'unstated';
+      if (value === null) continue;
+      const named = nodesInFileNamed(filePath, value.name, context);
+      // A declaration starts on the statement's line, or on its name's when
+      // the statement breaks before it (`export default\nfunction X`).
+      const from = lineAt(m.index);
+      const to = lineAt(value.nameAt);
+      const node = value.declared
+        ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
+        : named
+            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+      if (node) {
+        stated = node;
+        break;
+      }
+    }
+  }
+  idx.statedDefault = stated ?? 'unstated';
+  return idx.statedDefault;
 }
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
@@ -168,27 +277,19 @@ function nodesInFileNamed(filePath: string, name: string, context: ResolutionCon
   return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
 }
 
-/** The declaration `export default NAME` names in this file (see FileExportIndex.defaultBinding). */
-function defaultExportBindingNode(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
-  if (idx.defaultBinding === undefined) {
-    const bound = defaultExportBinding(filePath, context);
-    idx.defaultBinding =
-      bound === null
-        ? null
-        : (nodesInFileNamed(filePath, bound, context)
-            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
-  }
-  return idx.defaultBinding ?? undefined;
-}
-
 /**
- * The declaration a module default-exports: the component a single-file
- * component file is, else what an `export default NAME` statement names, else
- * the first exported function or class (`export default class Foo`).
+ * The declaration a module default-exports: what its own `export default`
+ * statement declares or names (see {@link statedDefaultExport}), and nothing
+ * for an anonymous default. Only a default the statement leaves unnamed
+ * (`export default memo(Card)`, `new Service()`), or a module with no
+ * statement, falls back: to the component a single-file component file is,
+ * else to the first exported function or class.
  */
 function esmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
-  return idx.defaultComponent ?? defaultExportBindingNode(filePath, idx, context) ?? idx.defaultFnClass;
+  const stated = statedDefaultExport(filePath, idx, context);
+  if (stated === 'anonymous') return undefined;
+  if (stated !== 'unstated') return stated;
+  return idx.defaultComponent ?? idx.defaultFnClass;
 }
 
 /**
@@ -235,6 +336,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
   PY_MODULE_SYMBOLS.delete(context);
+  PROJECT_FOLDER_SUFFIXES.delete(context);
 }
 
 export function resolveImportPath(
@@ -273,9 +375,10 @@ function resolveImportPathUncached(
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
-  // otherwise be misclassified as npm).
+  // otherwise be misclassified as npm). What still looks like a package
+  // may name a file through the importing app's own config.
   if (isExternalImport(importPath, language, context)) {
-    return null;
+    return resolveFromOwnConfig(importPath, fromFile, language, context);
   }
 
   const projectRoot = context.getProjectRoot();
@@ -422,7 +525,7 @@ const C_CPP_STDLIB_HEADERS = new Set([
  * same syntax, and leaving them out made `isExternalImport` answer "not
  * external" for every npm specifier in an SFC.
  */
-const ESM_IMPORT_LANGUAGES = new Set<Language>([
+export const ESM_IMPORT_LANGUAGES: ReadonlySet<Language> = new Set<Language>([
   'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
 ]);
 
@@ -468,11 +571,13 @@ export function isExternalImport(
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
     }
-    // Project-defined alias prefix? Treat as local.
+    // Project-defined alias prefix? Treat as local. A catch-all `"*"` has no
+    // prefix and matches `react` too: what it names is left to
+    // resolveFromOwnConfig, which keeps the app's packages out.
     const aliases = options.aliasPrefixes === false ? null : context?.getProjectAliases?.();
     if (aliases) {
       for (const pat of aliases.patterns) {
-        if (importPath.startsWith(pat.prefix)) return false;
+        if (pat.prefix !== '' && importPath.startsWith(pat.prefix)) return false;
       }
     }
     // Scoped packages or bare specifiers that don't start with aliases
@@ -634,15 +739,7 @@ function resolveAliasedImport(
   context: ResolutionContext,
   fromFile?: string
 ): string | null {
-  const extensions = EXTENSION_RESOLUTION[language] || [];
-  const tryWithExt = (basePath: string): string | null => {
-    for (const ext of extensions) {
-      const candidate = basePath + ext;
-      if (context.fileExists(candidate)) return candidate;
-    }
-    if (context.fileExists(basePath)) return basePath;
-    return findSourceForEmittedSpecifier(basePath, language, context);
-  };
+  const tryWithExt = (basePath: string): string | null => tryWithExtensions(basePath, language, context);
 
   // 1. tsconfig/jsconfig paths: the config nearest the importing file (an
   //    app of a monorepo keeps its own `@/*`), then the project root's.
@@ -688,6 +785,84 @@ function resolveAliasedImport(
 
   // 3. Direct path.
   return tryWithExt(importPath);
+}
+
+/** The file `basePath` names: with the language's extensions or index files, as is, or as an emitted `.js`. */
+function tryWithExtensions(basePath: string, language: Language, context: ResolutionContext): string | null {
+  for (const ext of EXTENSION_RESOLUTION[language] || []) {
+    const candidate = basePath + ext;
+    if (context.fileExists(candidate)) return candidate;
+  }
+  if (context.fileExists(basePath)) return basePath;
+  return findSourceForEmittedSpecifier(basePath, language, context);
+}
+
+/**
+ * A bare specifier `isExternalImport` takes for a package, resolved through
+ * the importing app's own tsconfig / jsconfig — the one nearest the file,
+ * else the root's — as tsc and a paths-aware bundler resolve it: the most
+ * specific `paths` pattern it matches (a catch-all `"*": ["./src/*"]`, an
+ * alias only a nested app declares), then `baseUrl` (`"baseUrl": "src"`
+ * makes `layout/MainLayout` read `src/layout/MainLayout`). CRA and Vite
+ * admin templates import nearly everything this way.
+ *
+ * Only an indexed file binds: `fileExists` also answers for a folder and
+ * for `node_modules`. A package — one the file's package.json or an
+ * enclosing one declares, or a Node built-in — never binds to a project
+ * module (`lodash` stays lodash even beside a `src/lodash/`), only to a
+ * declaration file the project keeps for it, which is the package as tsc
+ * reads it: `legacy-widgets` under `"*": ["./typings/*"]` is
+ * `typings/legacy-widgets.d.ts`.
+ */
+function resolveFromOwnConfig(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  const candidates = ownConfigCandidates(importPath, fromFile, language, context);
+  if (!candidates) return null;
+  const indexed = (file: string): boolean => context.isIndexedFile?.(file) !== false;
+  if (context.isDeclaredPackage?.(importPath, fromFile) !== false) {
+    if (!EXTENSION_RESOLUTION[language]?.includes('.d.ts')) return null;
+    for (const candidate of candidates) {
+      const declarations = `${candidate}.d.ts`;
+      if (context.fileExists(declarations) && indexed(declarations)) return declarations;
+    }
+    return null;
+  }
+  for (const candidate of candidates) {
+    const hit = tryWithExtensions(candidate, language, context);
+    if (hit && indexed(hit)) return hit;
+  }
+  return null;
+}
+
+/** Where the importing app's own config reads a bare specifier from (see resolveFromOwnConfig), or null when it reads none. */
+function ownConfigCandidates(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string[] | null {
+  if (!ESM_IMPORT_LANGUAGES.has(language) || !importPath || importPath.startsWith('/') || /^[A-Za-z][\w+.-]*:/.test(importPath)) return null;
+  const config = context.getNearestAliases?.(fromFile) ?? context.getProjectAliases?.();
+  if (!config) return null;
+  const candidates = aliasAndBaseUrlCandidates(importPath, config, context.getProjectRoot());
+  return candidates.length > 0 ? candidates : null;
+}
+
+/**
+ * Whether a bare specifier names one of the project's files through the
+ * importing app's own config: its `paths` or `baseUrl` map it to a file the
+ * index holds, and no package the app declares goes by it
+ * (`layout/MainLayout` under `"baseUrl": "src"`). Not a name that maps to
+ * nothing yet: under `"baseUrl": "."` an undeclared `express` is far likelier
+ * a package the manifest leaves out than a module still to come.
+ */
+function namesOwnConfigModule(importPath: string, fromFile: string, language: Language, context: ResolutionContext): boolean {
+  return context.isDeclaredPackage?.(importPath, fromFile) === false &&
+    resolveImportPath(importPath, fromFile, language, context) !== null;
 }
 
 /**
@@ -1212,10 +1387,17 @@ function extractGoImports(content: string): ImportMapping[] {
 
   const mapping = (localName: string, source: string): ImportMapping =>
     ({ localName, exportedName: '*', source, isDefault: false, isNamespace: true });
+  // Go binds a name to one import of a file, so a name another import is
+  // given explicitly is not an unaliased import's: etcd's benchmark tool has
+  // `"github.com/cheggaaa/pb/v3"` (package pb) beside
+  // `v3 "go.etcd.io/etcd/client/v3"`, and listed first, pb took every `v3.`.
+  const explicit = new Set(specs.flatMap(({ name }) => (name !== undefined && name !== '.' && name !== '_' ? [name] : [])));
   // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
   // its last path element.
-  const mappings = specs.map(({ name, source }) =>
-    mapping(name === undefined || name === '.' ? source.split('/').pop()! : name, source));
+  const mappings = specs
+    .map(({ name, source }) => ({ explicitly: name !== undefined && name !== '.', localName: name === undefined || name === '.' ? source.split('/').pop()! : name, source }))
+    .filter(({ explicitly, localName }) => explicitly || !explicit.has(localName))
+    .map(({ localName, source }) => mapping(localName, source));
   const bound = new Set(mappings.map((m) => m.localName));
   const assumed = new Map<string, string[]>();
   for (const { name, source } of specs) {
@@ -1628,25 +1810,53 @@ export function resolvePhpImportedStaticCall(
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
-const JS_MODULE_LANGUAGES: ReadonlySet<string> = new Set(['javascript', 'jsx', 'typescript', 'tsx', 'arkts']);
-
 /**
  * A module specifier written as a path — relative (`./x`, `../x`), rooted, or
- * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — rather than an
- * imported binding's name or a bare package (`react`, `lodash`).
+ * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — or a scoped
+ * package (`@excalidraw/common`), which no binding can be named and which a
+ * `tsconfig` path or a workspace member can map to a project file; rather
+ * than an imported binding's name or a bare package (`react`, `lodash`).
  */
 function isJsPathSpecifier(name: string): boolean {
   return name.startsWith('./') || name.startsWith('../') || name === '.' || name === '..' ||
-    (name.includes('/') && !/\s/.test(name) && !/^@[\w.-]+\/[\w.-]+$/.test(name));
+    (name.includes('/') && !/\s/.test(name));
 }
 
 /**
- * A JS/TS `imports` reference that names a module by path. It names a FILE, not
- * a symbol, so it skips the resolver's name-exists pre-filter — a CommonJS
- * `require('./x')` has no import node of that name to pass it.
+ * A JS/TS `imports` reference that names a module by path — from a script, or
+ * from a Vue, Svelte or Astro component's. It names a FILE, not a symbol, so
+ * it skips the resolver's name-exists pre-filter — a CommonJS `require('./x')`
+ * has no import node of that name to pass it.
  */
 export function isJsPathImportRef(ref: UnresolvedRef): boolean {
-  return ref.referenceKind === 'imports' && JS_MODULE_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
+  return ref.referenceKind === 'imports' && ESM_IMPORT_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
+}
+
+/**
+ * A JS/TS `imports` reference to the module of an import named by one bare
+ * segment — `'config'` in `import { DEFAULT_THEME_MODE } from 'config'` under
+ * `"baseUrl": "src"`. Shaped like a package, it names a file only when
+ * resolveImportPath finds one (the app's `baseUrl` or catch-all `paths`, a
+ * workspace member); a real package stays unresolved. A name some import
+ * binds locally is that binding, not the module, and resolves as one.
+ */
+function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'imports' || !ESM_IMPORT_LANGUAGES.has(ref.language) || isJsPathSpecifier(ref.referenceName)) return false;
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  return imports.some((m) => m.source === ref.referenceName) && !imports.some((m) => m.localName === ref.referenceName);
+}
+
+/**
+ * The file a JS/TS module reference names, the way resolveViaImport reads it:
+ * a path (`../lib/a`, `@/lib/x`), a scoped package a `tsconfig` path or a
+ * workspace member maps to the project, or a bare module under a `baseUrl`.
+ * Null for any other reference, and for one that names no file of the project
+ * but its own.
+ */
+export function jsModuleFile(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!isJsPathImportRef(ref) && !isJsBareModuleRef(ref, context)) return null;
+  const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+  return file && file !== ref.filePath ? file : null;
 }
 
 /** PHP reference kinds whose name is a class name, written as in the source. */
@@ -1725,9 +1935,9 @@ export function resolveViaImport(
   // found the way the runtime finds it: extensions, `index` files, path
   // aliases. Matching the basename instead missed every extensionless one
   // (the common spelling) and could land on a same-named file elsewhere.
-  if (isJsPathImportRef(ref)) {
-    const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
-    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+  const moduleFile = jsModuleFile(ref, context);
+  if (moduleFile) {
+    const fileNode = context.getNodesInFile(moduleFile).find((n) => n.kind === 'file');
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
   }
   // A Dart `import` / `export` URI names a library file, and a `part` URI one
@@ -2643,7 +2853,7 @@ function findGoPackageMember(
 /** Recursive depth cap for re-export chain following. Real codebases
  *  rarely chain barrels more than 2–3 deep; 8 is a generous safety
  *  net that still bounds worst-case work. */
-const REEXPORT_MAX_DEPTH = 8;
+export const REEXPORT_MAX_DEPTH = 8;
 
 /**
  * Find an exported symbol in `filePath`, following `export { x } from
@@ -2709,14 +2919,14 @@ function findExportedSymbolWalk(
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
+    // What the file's own `export default` statement exports beats any
+    // guess; an anonymous default is no node at all, and no neighbour is it.
+    if (statedDefaultExport(filePath, exportIndex, context) === 'anonymous') return undefined;
     // Svelte/Vue single-file components ARE the module's default export,
-    // but are extracted as kind 'component' (not function/class). Prefer
-    // the component node; fall back to an exported function/class for the
-    // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
-    // branch, an `export { default as X } from './X.svelte'` barrel never
-    // resolves and the component shows a false 0 callers (#629).
-    // A component file IS its default export; otherwise the statement that
-    // names the binding beats the first-exported-function guess.
+    // but are extracted as kind 'component' (not function/class), so the
+    // fallback prefers the component node. Without it, an `export { default
+    // as X } from './X.svelte'` barrel never resolves and the component shows
+    // a false 0 callers (#629).
     const direct = esmDefaultExport(filePath, exportIndex, context);
     if (direct) return direct;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
@@ -2866,7 +3076,12 @@ function resolveImportedInstanceMember(
     if (!m || !m[1]) continue;
     const typeName = normalizeInferredTypeName(m[1]);
     if (!typeName) continue;
-    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method');
+    // Several classes may share the name. The value's file says which one:
+    // the class it imports under that name, or else the one it declares.
+    const declaring = ESM_IMPORT_LANGUAGES.has(value.language)
+      ? tsImportedTypeFile(m[1], { ...ref, filePath: value.filePath, language: value.language }, context) ?? value.filePath
+      : undefined;
+    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method', declaring);
     if (resolved) return resolved;
   }
   return null;
@@ -2984,7 +3199,9 @@ function collectRustUseBindings(content: string): Map<string, string> {
  *    has no `src/ports/` directory to walk yet is entirely in-repo — that
  *    generalization measured 13 real trait implementations deleted.
  *  - **ES modules** — `isExternalImport`, which already accounts for tsconfig
- *    path aliases and monorepo workspace packages.
+ *    path aliases and monorepo workspace packages, unless the specifier still
+ *    names a project file through the importing app's `baseUrl` or catch-all
+ *    `paths` (`import Base from 'components/Base'`).
  *
  * Everything else returns false and resolves exactly as before. JVM and Python
  * imports notably do NOT go through `resolveImportPath` (they have dedicated
@@ -3012,36 +3229,71 @@ export function isBoundToOutOfRepoImport(
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
   for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
     if (imp.localName !== name) continue;
-    return isExternalImport(imp.source, ref.language, context);
+    return isExternalImport(imp.source, ref.language, context) &&
+      resolveImportPath(imp.source, ref.filePath, ref.language, context) === null;
   }
   return false;
 }
 
 /**
- * The tail a reference that failed to resolve is parked under when its name
- * is an import binding the module it imports does not declare by that name:
- * a default import (`import tagsController from './tag/tag.controller'`, a
- * CommonJS `require`), a namespace import, or an aliased one (`import {
- * Component as Wrapper }`, `{ default as X }`). Resolution reaches it through
- * the module, so a sync's retry has to find it by the module: under the
- * module's {@link moduleTail} ('module:tag'), the key a sync looks up for
- * every file it adds or changes. Its own name, the default tail, is one the
- * module never declares, so the file that appears or gains the export never
- * found it. A sync still looks it up by that name as well: a binding its
- * module never resolves is linked by the name alone.
+ * The tail a reference that failed to resolve is parked under when it goes
+ * through an import binding the module's key finds and its own tail does not:
+ *  - the binding's whole name, when the module it imports does not declare it
+ *    by that name: a default import (`import tagsController from
+ *    './tag/tag.controller'`, a CommonJS `require`), a namespace import, or an
+ *    aliased one (`import { Component as Wrapper }`, `{ default as X }`) — the
+ *    import itself, a call, `new`, a JSX tag, a value. Its own name, the
+ *    default tail, is one the module never declares. A sync still looks it up
+ *    by that name as well: a binding its module never resolves is linked by
+ *    the name alone.
+ *  - a direct member of any binding, a named import's included
+ *    (`NODE_PATH_EXCLUDELIST.includes(p)`, `store.get(k)`, `NS.make()`). It
+ *    reaches the binding's declaration, or a member of it, through the module,
+ *    and its default tail is the member's name (`includes`, `get`), which the
+ *    module seldom declares and which too many other failed refs share for the
+ *    retry to look it up. A sync still looks it up by that member's name, which
+ *    is the member a namespace import's barrel forwards or the method a guess
+ *    by name links, and by its receiver's, which a barrel's source declares.
+ *    A chain (`URI.file(p).toString()`) or a longer path
+ *    (`vscode.window.showErrorMessage`) keeps its member's name: what its last
+ *    member hangs off is what another member returns or holds, seldom a type
+ *    the module declares. Parked under the module as well, they tripled the
+ *    refs an edit of a hot module retries on vscode, and none of them resolved.
+ *  - a direct member call on a local the file declares with a type it
+ *    imports (`const cache = new LRUCache(10)`, `cache: LRUCache<K, V>`, a
+ *    typed parameter, then `cache.get(k)`), but not an array of it:
+ *    resolution reads that declaration and calls the member of the class,
+ *    which the type's binding imports, so the call waits for that module as a
+ *    member of the binding itself does.
+ * Resolution reaches each through the module, so a sync's retry has to find
+ * it by the module: under the module's {@link moduleTail} ('module:tag'), the
+ * key a sync looks up for every file it adds or changes, so the file that
+ * appears or gains the export finds it.
  *
- * Only a whole-name reference to the binding — the import itself, a call,
- * `new`, a JSX tag, a value — and only for a module of the project: a member
- * read (`NS.member`) waits for the member's name, and a package's binding
- * keeps its tail. Undefined for every other reference.
+ * Only for a module of the project: a package's binding keeps its tail. A
+ * bare specifier is the project's when the importing app's own config
+ * (`baseUrl`, a catch-all `"*"`) maps it to a file the index holds and no
+ * package the app declares goes by it. Undefined for every other reference,
+ * and for the whole name of an unaliased named import, which is the name its
+ * module declares. A Python reference is {@link pythonImportBindingTail}'s,
+ * by its whole name only.
  */
 export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
-  if (!ESM_IMPORT_LANGUAGES.has(ref.language) || !IDENTIFIER.test(ref.referenceName)) return undefined;
-  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === ref.referenceName);
-  if (!binding || (!binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
+  if (ref.language === 'python') return pythonImportBindingTail(ref, context);
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return undefined;
+  // An import's dotted name is a path, not a member.
+  const receiver = ref.referenceKind === 'imports' ? undefined : MEMBER_RECEIVER.exec(ref.referenceName)?.[1];
+  const name = receiver ?? ref.referenceName;
+  if (!receiver && !IDENTIFIER.test(name)) return undefined;
+  const mappings = context.getImportMappings(ref.filePath, ref.language);
+  const binding = mappings.find((m) => m.localName === name) ??
+    (receiver && ref.referenceKind === 'calls' ? localTypeBinding(receiver, ref, context, mappings) : undefined);
+  if (!binding || (!receiver && !binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
   if (isExternalImport(binding.source, ref.language, context) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
-      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix))) {
+      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix)) &&
+      // A module the app's `baseUrl` or catch-all `paths` reads (`layout/MainLayout`).
+      !namesOwnConfigModule(binding.source, ref.filePath, ref.language, context)) {
     return undefined;
   }
   // `..` names a folder through the importing file's own location.
@@ -3051,4 +3303,123 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   return moduleTail(modulePath) || undefined;
 }
 
+/**
+ * {@link importBindingTail} for Python: `from .models import User as
+ * UserModel` and `from . import helpers as h` bind a name their module has as
+ * `User` and `helpers`, `import app.tools as tl` one it has as `tools`. The
+ * module is the one the import names by its dotted path, counted from the
+ * importing file's own package when it starts with dots (`.` is that package,
+ * each further dot the one above): `.models` in `app/main.py` is `app/models`,
+ * parked as 'module:models', and `.` is `app`, 'module:app'. The name may
+ * import a submodule of it (`helpers` is `app/helpers.py`), whose keys hold
+ * the package's name too (moduleReferenceKeys).
+ *
+ * An installed package's alias can't be told from a module the project doesn't
+ * have yet (`from settings import Config as Cfg`), so it waits for its module
+ * too, and a sync still finds it by its own name. An import of the standard
+ * library keeps its tail.
+ *
+ * So does an unaliased `import x`, and an unaliased `from fastapi import
+ * FastAPI` unless its module is in one of the project's own folders
+ * ({@link isProjectPythonModule}). The name is the one the module has, but a
+ * package often re-exports it from the module that declares it
+ * (`fastapi/__init__.py`: `from .applications import FastAPI as FastAPI`), and
+ * a package `__init__.py` that appears or gains the re-export declares no node
+ * of that name. An outside package's names stay off the module keys: every
+ * `from django.db.models import Q` would crowd 'module:models' past the retry
+ * ceiling, and the project's own modules with it.
+ */
+function pythonImportBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!IDENTIFIER.test(ref.referenceName)) return undefined;
+  const binding = context.getImportMappings(ref.filePath, 'python').find((m) => m.localName === ref.referenceName);
+  if (!binding || isExternalImport(binding.source, 'python', context)) return undefined;
+  const declared = binding.isNamespace ? binding.source.slice(binding.source.lastIndexOf('.') + 1) : binding.exportedName;
+  if (declared === binding.localName && (binding.isNamespace || !isProjectPythonModule(binding.source, context))) return undefined;
+  const modulePath = pythonModulePath(binding.source, ref.filePath);
+  return modulePath ? moduleTail(modulePath) || undefined : undefined;
+}
+
+/**
+ * Whether a Python import's module is in one of the project's own folders: a
+ * relative one is, and an absolute one when a folder of the project ends in its
+ * dotted path (`app/api` for `app.api`, the package) or in the package holding
+ * it (`app` for `app.api`, a module file), at any depth, as `src/` layouts put
+ * it. A folder, not a module: `fastapi/__init__.py` is what goes missing, while
+ * `fastapi/` keeps its other files.
+ */
+function isProjectPythonModule(source: string, context: ResolutionContext): boolean {
+  if (source.startsWith('.')) return true;
+  const folders = projectFolderSuffixes(context);
+  const modulePath = source.replace(/\./g, '/');
+  const slash = modulePath.lastIndexOf('/');
+  return folders.has(modulePath) || (slash > 0 && folders.has(modulePath.slice(0, slash)));
+}
+
+/**
+ * Per-context memo: every trailing run of folder names the project's files sit
+ * in (`a/b/c.py` gives 'a/b', 'b' and 'a'). The file set is that of the
+ * resolution pass; dropped by clearImportResolverMemos.
+ */
+const PROJECT_FOLDER_SUFFIXES = new WeakMap<ResolutionContext, Set<string>>();
+
+function projectFolderSuffixes(context: ResolutionContext): Set<string> {
+  let suffixes = PROJECT_FOLDER_SUFFIXES.get(context);
+  if (suffixes) return suffixes;
+  const folders = new Set<string>();
+  for (const file of context.getAllFiles()) {
+    for (let i = file.lastIndexOf('/'); i > 0; i = file.lastIndexOf('/', i - 1)) {
+      const folder = file.slice(0, i);
+      if (folders.has(folder)) break;
+      folders.add(folder);
+    }
+  }
+  suffixes = new Set<string>();
+  for (const folder of folders) {
+    for (let i = -1; ; i = folder.indexOf('/', i + 1)) {
+      suffixes.add(folder.slice(i + 1));
+      if (folder.indexOf('/', i + 1) === -1) break;
+    }
+  }
+  PROJECT_FOLDER_SUFFIXES.set(context, suffixes);
+  return suffixes;
+}
+
+/**
+ * A Python import's module as a project path: `app.models` → 'app/models';
+ * from `app/sub/views.py`, `.models` → 'app/sub/models', `..` → 'app' and
+ * `..forms` → 'app/forms'. Null when its dots climb above the project.
+ */
+export function pythonModulePath(source: string, fromFile: string): string | null {
+  const name = source.replace(/^\.+/, '');
+  const dots = source.length - name.length;
+  if (dots === 0) return name.replace(/\./g, '/');
+  const modulePath = path.posix.join(path.posix.dirname(fromFile), '../'.repeat(dots - 1), name.replace(/\./g, '/'));
+  return modulePath === '..' || modulePath.startsWith('../') ? null : modulePath;
+}
+
+/**
+ * The import binding of the type a call's receiver is declared with, read the
+ * way resolution reads it for the call (inferLocalReceiverType, memoized per
+ * file, scope and receiver, so a call the matcher just tried costs a lookup):
+ * the binding the type is written through, `LRUCache` of `new LRUCache<K,
+ * V>(…)` or `lib` of `new lib.LRUCache()`, of the element type of an array
+ * (`results: URI[]`), or of the type whose property it is (`Emitter<E>['event']`).
+ * Undefined for a type the file doesn't import, in a file that imports
+ * nothing, and for a method arrays have called on an array (`results.push(…)`):
+ * resolution links that to no project class, so no edit of the type's module
+ * does. Such calls were most of what this parked on vscode, and retrying them
+ * nearly doubled what an edit of `uri.ts` retried.
+ */
+function localTypeBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext, mappings: ImportMapping[]): ImportMapping | undefined {
+  if (mappings.length === 0) return undefined;
+  const decl: { raw?: string } = {};
+  const type = inferLocalReceiverType(receiver, ref, context, decl);
+  if (!type || !decl.raw) return undefined;
+  if (arrayElementType(type) !== undefined && JS_ARRAY_METHODS.has(ref.referenceName.slice(receiver.length + 1))) return undefined;
+  const head = decl.raw.split(/[.<[\s]/)[0];
+  return mappings.find((m) => m.localName === head);
+}
+
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+/** The receiver of a direct member reference: `store` of `store.get`, none of `store.get().then` or `a.b.c`. */
+const MEMBER_RECEIVER = /^([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*$/;

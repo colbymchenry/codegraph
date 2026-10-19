@@ -192,6 +192,54 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
   return name;
 }
 
+const CPP_CLASS_SPECIFIERS: ReadonlySet<string> = new Set(['class_specifier', 'struct_specifier', 'union_specifier']);
+
+/**
+ * The `::` segments of a C++ class, struct or union name written with a
+ * scope, the scope's template arguments dropped: `['SkipList', 'Node']` for
+ * an out-of-line nested class `struct SkipList<Key, Comparator>::Node`. Such
+ * a class was indexed `<anonymous>`, so its members were no class's.
+ * Undefined for a plain name, and for a specialization (`class
+ * FunctionMocker<R(Args...)>`, `struct fmt::formatter<Foo>`): named after its
+ * template, it would stand in for the template and every other
+ * specialization of it (fmt's `formatter<weekday, Char> : formatter<std::tm,
+ * Char>` extended `formatter<day, Char>`). Mirrored in the kernel
+ * (ccpp/mod.rs).
+ */
+function cppWrittenClassParts(node: SyntaxNode, source: string): string[] | undefined {
+  if (!CPP_CLASS_SPECIFIERS.has(node.type)) return undefined;
+  const written = getChildByField(node, 'name');
+  if (written?.type !== 'qualified_identifier') return undefined;
+  let innermost: SyntaxNode | null = written;
+  while (innermost?.type === 'qualified_identifier') innermost = getChildByField(innermost, 'name');
+  if (innermost?.type !== 'type_identifier') return undefined;
+  const parts = stripCppTemplateArgs(getNodeText(written, source)).split('::').map((p) => p.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every((p) => /^[A-Za-z_]\w*$/.test(p)) ? parts : undefined;
+}
+
+/**
+ * The name a C++ `qualified_identifier` ends in, past its scopes: the
+ * `template_function` `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` for
+ * `WireFormatLite::ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>`. Null
+ * when the tree lacks one.
+ */
+function cppQualifiedIdName(qid: SyntaxNode): SyntaxNode | null {
+  let name: SyntaxNode | null = qid;
+  while (name?.type === 'qualified_identifier') name = getChildByField(name, 'name');
+  return name;
+}
+
+/**
+ * A C++ definition's name node, as named: an explicit specialization's
+ * (`template_function`) without its template arguments, so
+ * `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` is `ReadPrimitive`,
+ * the name every call to it writes. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppDefinedName(name: SyntaxNode, source: string): string {
+  const own = name.type === 'template_function' ? getChildByField(name, 'name') : null;
+  return getNodeText(own ?? name, source).trim();
+}
+
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
   const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
@@ -199,8 +247,26 @@ function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
+  const name = cppQualifiedIdName(qid);
+  if (name) return cppDefinedName(name, source);
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
   return parts[parts.length - 1];
+}
+
+/**
+ * The name of a C++ function an explicit specialization defines, without its
+ * template arguments: `Swap` for `template <> void Swap<Foo>(Foo& a, Foo& b)`.
+ * Undefined for any other definition. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppSpecializedFunctionName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  let declarator = getChildByField(node, 'declarator');
+  while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
+    declarator = getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+  }
+  if (declarator?.type !== 'function_declarator') return undefined;
+  const inner = getChildByField(declarator, 'declarator');
+  return inner?.type === 'template_function' ? cppDefinedName(inner, source) : undefined;
 }
 
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
@@ -208,15 +274,26 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  if (parts.length <= 1) return undefined;
+  // The scopes are what the qualified id writes before its name: a
+  // specialization's arguments (`ReadPrimitive<int32_t,
+  // WireFormatLite::TYPE_INT32>`) are no scope, though they may write `::`.
+  const name = cppQualifiedIdName(qid);
+  let scopes = getNodeText(qid, source).trim().split('::').filter(Boolean).slice(0, -1).join('::');
+  if (name) {
+    scopes = source.slice(qid.startIndex, name.startIndex).trimEnd();
+    // A `::` the parser supplied in recovery writes nothing: Metal's `vertex
+    // VertexOut vertexShader(…)` reads as `VertexOut::vertexShader`.
+    if (!scopes.endsWith('::')) return undefined;
+  }
+  const parts = scopes.split('::').filter(Boolean);
+  if (parts.length === 0) return undefined;
   // An out-of-line template method definition carries the class's template
   // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
   // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
   // matches it, the same normalization #1043 applies to base-class refs.
   // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
   // included) into qualified_name, which can exceed NAME_MAX (#1286).
-  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  const receiver = stripCppTemplateArgs(parts.join('::'));
   return receiver || undefined;
 }
 
@@ -2400,9 +2477,11 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   resolveName: (node, source) =>
-    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1) ??
+    cppSpecializedFunctionName(node, source),
   getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
+  getClassScope: (node, source) => cppWrittenClassParts(node, source)?.slice(0, -1).join('::') || undefined,
   getReturnType: extractCppReturnType,
   // Constructors (definitions and class-body declarations) carry their
   // parameter list as the signature; a trailing semicolon marks a prototype, so a local `T obj(args)` can be matched

@@ -10555,6 +10555,34 @@ export const registry = [widget];
     expect(names).toContain('beta');
   });
 
+  it('a re-export imports its source module, as an import statement does', () => {
+    const result = extractFromSource(
+      'barrel.ts',
+      `export * from './star';\nexport { alpha } from './named';\nexport * as ns from './space';\n`
+    );
+    const modules = ['./star', './named', './space'];
+    expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.name)).toEqual(modules);
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    for (const module of modules) expect(refs).toContain(module);
+    expect(refs).toContain('alpha');
+  });
+
+  it('a barrel that only re-exports everything is a dependent of the module', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'foo.ts'), `export function helper(): void {}\n`);
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), `export * from './foo';\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/index.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
   it('a value imported/re-exported but never called still makes the importer a dependent', async () => {
     const dir = createTempDir();
     try {
@@ -13691,6 +13719,10 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
   beforeEach(() => {
     tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
   });
 
   it('counts files it could not index, by extension, on the git path', async () => {
