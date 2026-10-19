@@ -509,7 +509,9 @@ function addPythonImporters(
 /**
  * Per importer, what its statements naming the modules import: the modules
  * named whole (not the package around one), and the local names bound. An ES
- * namespace import (`import * as z`) reads whatever its module passes on.
+ * namespace import (`import * as z`) reads whatever its module passes on, and
+ * an ES `export { A } from './x'` names `A`, which it resolves through `./x`
+ * as an import binds it.
  */
 function bindingsOf(importers: Importers, reader: ImportReader): Map<string, { modules: string[]; names: string[] }> {
   const bindings = new Map<string, { modules: string[]; names: string[] }>();
@@ -524,6 +526,11 @@ function bindingsOf(importers: Importers, reader: ImportReader): Map<string, { m
         })
         .map((m) => m.localName)
     );
+    for (const rex of reader.reExports(file, language)) {
+      if (rex.kind !== 'named') continue;
+      const only = sources.get(rex.source);
+      if (only === null || only?.has(rex.originalName)) names.add(rex.originalName);
+    }
     const modules = [...sources].filter(([, only]) => only === null).map(([source]) => source);
     if (modules.length > 0 || names.size > 0) bindings.set(file, { modules, names: [...names] });
   }

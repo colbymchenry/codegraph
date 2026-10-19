@@ -1617,38 +1617,34 @@ const CPP_STEM_HEADERS = new WeakMap<ResolutionContext, Map<string, string[]>>()
 /**
  * The headers a C or C++ file includes under its own name
  * (`conformance_test.cc` → `conformance_test.h`): the declarations its
- * definitions implement.
+ * definitions implement. One beside it, when it includes one, is the only
+ * such header: protobuf's pyext/message.cc implements pyext/message.h, not
+ * the google/protobuf/message.h it also includes; fmt's src/format.cc, with
+ * none beside it, implements include/fmt/format.h.
  */
 function cppSameStemHeaders(filePath: string, context: ResolutionContext): string[] {
   let memo = CPP_STEM_HEADERS.get(context);
   if (!memo) CPP_STEM_HEADERS.set(context, (memo = new Map()));
   let headers = memo.get(filePath);
   if (!headers) {
-    headers = [];
+    const found: string[] = [];
     const stem = fileStem(filePath);
     for (const include of context.getNodesInFile(filePath)) {
       if (include.kind !== 'import' || fileStem(include.name) !== stem) continue;
       const header = cppIncludedFile(include, context);
-      if (header && header !== filePath && fileStem(header) === stem) headers.push(header);
+      if (header && header !== filePath && fileStem(header) === stem) found.push(header);
     }
+    const dir = filePath.slice(0, filePath.lastIndexOf('/') + 1);
+    const beside = found.filter((header) => header.slice(0, header.lastIndexOf('/') + 1) === dir);
+    headers = beside.length > 0 ? beside : found;
     memo.set(filePath, headers);
   }
   return headers;
 }
 
-const TEST_FILES = new WeakMap<ResolutionContext, Map<string, boolean>>();
 const TEST_SUITE_FILES = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
-/** isTestPath, memoized: it is asked of every reference with an ambiguous C or C++ name. */
-function isTestFile(filePath: string, context: ResolutionContext): boolean {
-  let memo = TEST_FILES.get(context);
-  if (!memo) TEST_FILES.set(context, (memo = new Map()));
-  let hit = memo.get(filePath);
-  if (hit === undefined) memo.set(filePath, (hit = isTestPath(filePath)));
-  return hit;
-}
-
-/** isTestSuitePath, memoized: it is asked of every candidate of such a name. */
+/** isTestSuitePath, memoized: it is asked of every candidate of an ambiguous C or C++ name. */
 function isTestSuiteFile(filePath: string, context: ResolutionContext): boolean {
   let memo = TEST_SUITE_FILES.get(context);
   if (!memo) TEST_SUITE_FILES.set(context, (memo = new Map()));
@@ -1675,8 +1671,10 @@ function isInCppTranslationUnit(candidate: Node, ref: UnresolvedRef, context: Re
       ((candidate.kind === 'function' || candidate.kind === 'variable' || candidate.kind === 'constant') &&
         isStaticCFunction(candidate, context))) return false;
   const suite = isTestSuiteFile(candidate.filePath, context);
-  return cppSameStemHeaders(candidate.filePath, context)
-    .some((header) => (!suite || isTestSuiteFile(header, context)) && cppIncluders(header, context).has(ref.filePath));
+  // (The header may be the reference's own: json.h's inline overloads call
+  // the ones json.cc defines.)
+  return cppSameStemHeaders(candidate.filePath, context).some((header) => (!suite || isTestSuiteFile(header, context)) &&
+    (header === ref.filePath || cppIncluders(header, context).has(ref.filePath)));
 }
 
 /**
@@ -1701,29 +1699,49 @@ function isCppNameAloneTarget(n: Node, ref: UnresolvedRef, context: ResolutionCo
 }
 
 /**
- * Same-named candidates for a C or C++ reference in a test, narrowed to the
- * ones its translation unit declares, when there are any. A test is a
- * program of its own, so the name it uses is the one its includes declare:
- * protobuf's csharp generator tests call `TestSourceDir()`, which
- * googletest.h, an include of theirs, declares, and test_util2.h's
- * `TestUtil::TestSourceDir`, a test suite none of them includes, took the
- * calls; a test of the hpb backend calls upb's `upb_Arena_New()` from
- * upb/mem/arena.h, not the copies php-upb.h and ruby-upb.h bundle. For a
- * name the reference writes alone (`byName`), only what the name alone can
- * mean counts (isCppNameAloneTarget), and a call the extractor recorded
- * without the receiver it is written on (`columns()[0].value()`) is left to
- * the name strategies. When the unit declares none of them — a test whose
- * includes don't resolve — the candidates stay as they are. Not for an
- * `#include`, which names a file, nor for production code, which
- * isVisibleAcrossFiles keeps from test suites.
+ * Same-named candidates for a C or C++ reference, narrowed to the ones its
+ * translation unit declares, when there are any: the name a file uses is
+ * one its includes declare. protobuf's csharp generator tests call the
+ * `TestSourceDir()` googletest.h declares, not test_util2.h's
+ * `TestUtil::TestSourceDir`, a test suite none of them includes; its Python
+ * and Ruby extensions and upb's own code call `upb_Encode()` in
+ * upb/wire/encode.c, not the copy php-upb.c bundles; rocksdb's stress tool
+ * calls the `StringToHex()` its db_stress_common.h declares, not
+ * `LDBCommand::StringToHex`. For a name the reference writes alone
+ * (`byName`), only what the name alone can mean counts
+ * (isCppNameAloneTarget), and a call the extractor recorded without the
+ * receiver it is written on (`columns()[0].value()`) is left to the name
+ * strategies. When the unit declares none of them — a file whose includes
+ * don't resolve — the candidates stay as they are. Not for an `#include`,
+ * which names a file.
  */
-function inCppTestTranslationUnit(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext, byName = false): Node[] {
-  if (candidates.length < 2 || (ref.language !== 'c' && ref.language !== 'cpp') ||
-      ref.referenceKind === 'imports' || !isTestFile(ref.filePath, context)) return candidates;
+function withinCppTranslationUnit(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext, byName = false): Node[] {
+  if (candidates.length < 2 || (ref.language !== 'c' && ref.language !== 'cpp') || ref.referenceKind === 'imports') return candidates;
   if (byName && ref.referenceKind === 'calls' && cppImplicitReceiver(ref, context) !== 'bare') return candidates;
+  // A "call" outside any function is a macro, or a declaration read as a call
+  // (rocksdb's c.h `extern … rocksdb_t*` above `rocksdb_open(…);`): no call.
+  if (ref.referenceKind === 'calls' && context.getNodeById?.(ref.fromNodeId)?.kind === 'file') return candidates;
   const within = candidates.filter((n) => isInCppTranslationUnit(n, ref, context) &&
     (!byName || n.filePath === ref.filePath || isCppNameAloneTarget(n, ref, context)));
-  return within.length > 0 ? within : candidates;
+  if (within.length === 0 || within.length === candidates.length) return candidates;
+  // Nor, for a C call, to definitions only a flag nothing sets compiles, past
+  // one the build without it does: that is cppFunctionOverload's choice
+  // (lua-cjson's fpconv.h defines `fpconv_init` under `#ifdef
+  // USE_INTERNAL_FPCONV`; redis's build calls fpconv.c's).
+  if (ref.language === 'c' && ref.referenceKind === 'calls' && within.every((n) => isCFeatureVariant(n, ref, context)) &&
+      !isOffByDefault(ref.filePath, ref.line, context) &&
+      candidates.some((n) => !within.includes(n) && n.kind === 'function' && !isStaticCFunction(n, context) &&
+        !isCFeatureVariant(n, ref, context))) return candidates;
+  // Nor to functions too few or too many arguments for the call, past one
+  // that takes them: glog's `GetStackTrace(stack, ARRAYSIZE(stack), 1)` is
+  // the one stacktrace.h declares, which the stacktrace_*-inl.h headers its
+  // stacktrace.cc includes define, not utilities.h's `GetStackTrace()`.
+  if (ref.referenceKind === 'calls') {
+    const args = cppCallArguments(ref, within[0]!.name, context);
+    if (args && within.every((n) => cppArgumentCountFits(n, n.name, args, context) === false) &&
+        candidates.some((n) => !within.includes(n) && cppArgumentCountFits(n, n.name, args, context) === true)) return candidates;
+  }
+  return within;
 }
 
 const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -8146,7 +8164,7 @@ export function matchByExactName(
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
   // (Above the ceiling below nothing is picked, so no translation unit is read.)
-  const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? inCppTestTranslationUnit(ranked, ref, context, true) : ranked;
+  const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? withinCppTranslationUnit(ranked, ref, context, true) : ranked;
 
   if (candidates.length === 0) {
     return null;
@@ -9240,7 +9258,7 @@ export function resolveMethodOnType(
   // intentionally in ANOTHER file (#314) — is unaffected: those blocks return
   // early whenever an import pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(inCppTestTranslationUnit(cppVisibleFirst(matches, ref, context), ref, context), ref.filePath);
+  const ordered = preferCallSiteFile(withinCppTranslationUnit(cppVisibleFirst(matches, ref, context), ref, context), ref.filePath);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -13185,7 +13203,6 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   clearCppRawStringMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_STEM_HEADERS.delete(context);
-  TEST_FILES.delete(context);
   TEST_SUITE_FILES.delete(context);
   CPP_BASE_SPECS.delete(context);
   CPP_USING_MEMBERS.delete(context);
@@ -14784,7 +14801,7 @@ export function matchMethodCall(
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
     let classCandidates = preferCallSiteFile(
-      inCppTestTranslationUnit(context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind), ref, context),
+      withinCppTranslationUnit(context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind), ref, context),
       ref.filePath,
     );
     // A C# class the call's namespaces can see before one they can't:
@@ -14887,7 +14904,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
       const fuzzyClassCandidates = preferCallSiteFile(
-        inCppTestTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
+        withinCppTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {
@@ -15022,7 +15039,7 @@ export function matchMethodCall(
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
       const std = isStdMethodName(ref.language, methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
-      for (const method of preferCallSiteFile(inCppTestTranslationUnit(targetMethods, ref, context), ref.filePath)) {
+      for (const method of preferCallSiteFile(withinCppTranslationUnit(targetMethods, ref, context), ref.filePath)) {
         if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
@@ -15105,10 +15122,31 @@ function isImportBinding(receiver: string, ref: UnresolvedRef, context: Resoluti
   return context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === root) === true;
 }
 
-/** Does the file bind `name` by importing it from outside the repository? */
+/**
+ * The module the file passes `name` on from with `export { name } from './x'`
+ * (or `export { name as alias } from './x'`), `name` being what that module
+ * calls it, when exactly one statement of the file does. A re-export binds no
+ * local name, so the file's import bindings never hold it.
+ */
+export function reExportSource(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  let source: string | undefined;
+  for (const rex of context.getReExports?.(ref.filePath, ref.language) ?? []) {
+    if (rex.kind !== 'named' || rex.originalName !== name) continue;
+    if (source !== undefined && source !== rex.source) return undefined;
+    source = rex.source;
+  }
+  return source;
+}
+
+/**
+ * Does the file bind `name` by importing it from outside the repository? So
+ * does a barrel's `export { name } from 'pkg'`: its `imports` reference names
+ * the package's export.
+ */
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
-  return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+  const source = binding?.source ?? (ref.referenceKind === 'imports' ? reExportSource(name, ref, context) : undefined);
+  return source !== undefined && context.isOutOfRepoImport?.(source, ref.filePath, ref.language) === true;
 }
 
 /** A module a bundler loads as data, not code: a stylesheet, an image, a GraphQL document, JSON, a font. */
@@ -18569,20 +18607,35 @@ function cppOverloadParameters(n: Node, name: string, context: ResolutionContext
   return found;
 }
 
+/** A C++ parameter that is a pack: `T&&... args`, not the `...` inside `format_string<T...>`. */
+function isCppParameterPack(p: string): boolean {
+  let flat = p;
+  for (let prev = ''; prev !== flat;) { prev = flat; flat = flat.replace(/<[^<>]*>/g, ''); }
+  return flat.includes('...');
+}
+
+/**
+ * Whether as many arguments as `args` can fill the parameters of the C or C++
+ * function `n`, its defaults and a pack counted; null when `n` is no
+ * function or its parameter list can't be read.
+ */
+function cppArgumentCountFits(n: Node, name: string, args: string[], context: ResolutionContext): boolean | null {
+  if (n.kind !== 'function' && n.kind !== 'method') return null;
+  const list = cppOverloadParameters(n, name, context);
+  if (list === null) return null;
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
+  const required = params.filter((p) => !isCppParameterPack(p) && !/=/.test(p)).length;
+  return args.length >= required && (params.some(isCppParameterPack) || args.length <= params.length);
+}
+
 /** How well a call's arguments fit an overload's parameters: arity, and a string literal's first slot. */
 function cppOverloadFit(n: Node, name: string, args: string[], context: ResolutionContext): number {
   if (n.kind !== 'function' && n.kind !== 'method') return -1;
   const list = cppOverloadParameters(n, name, context);
   if (list === null) return 0;
   const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
-  // A pack is `T&&... args`, not the `...` inside `format_string<T...>`.
-  const isPack = (p: string): boolean => {
-    let flat = p;
-    for (let prev = ''; prev !== flat;) { prev = flat; flat = flat.replace(/<[^<>]*>/g, ''); }
-    return flat.includes('...');
-  };
-  const variadic = params.some(isPack);
-  const required = params.filter((p) => !isPack(p) && !/=/.test(p)).length;
+  const variadic = params.some(isCppParameterPack);
+  const required = params.filter((p) => !isCppParameterPack(p) && !/=/.test(p)).length;
   let score = 0;
   if (args.length < required || (!variadic && args.length > params.length)) score -= 3;
   // Each string literal against its parameter: a string type by name over a
@@ -18596,7 +18649,7 @@ function cppOverloadFit(n: Node, name: string, args: string[], context: Resoluti
   for (let i = 0; i < args.length && i < params.length; i++) {
     const arg = args[i]!;
     const param = params[i]!;
-    if (isPack(param)) break;
+    if (isCppParameterPack(param)) break;
     if (!/^(?:u8|u|U|L)?R?"|^FMT_STRING\s*\(/.test(arg)) continue;
     const wideArg = /^LR?"/.test(arg);
     const wideParam = /\bw(?:string|char_t|format|string_view)|wchar_t/.test(param);
