@@ -6,10 +6,12 @@
  * was indexed and those routes linked nothing.
  *
  * Such a folder is now walked and its hand-written source (TypeScript, JSX,
- * Vue, Svelte, Astro) indexed, while what a build step writes there —
- * JavaScript, declarations, CSS, HTML, maps — stays out, as does every `build/`
- * folder outside `src/`. Both enumeration paths, the git-status sync and the
- * watcher share the rule (#1728).
+ * Vue, Svelte, Astro, and Go and C#, as in Go's `src/go/build` or a .NET
+ * solution's `src/Build/` project) indexed, while what a build step writes there —
+ * JavaScript, declarations, CSS, HTML, maps, a frozen app's Python, CMake's
+ * C — stays out, as does every `build/` folder outside `src/`. Both
+ * enumeration paths, the git-status sync and the watcher share the rule
+ * (#1728).
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { execFileSync } from 'child_process';
@@ -69,6 +71,9 @@ describe('the scope of a build folder below src', () => {
     'src/routes/build/+page.svelte',
     'src/pages/build/BuildPage.jsx',
     'src/content/build/Card.astro',
+    // Go and C# toolchains write their output elsewhere.
+    'src/go/build/build.go',
+    'tools/src/Build/BuildManager.cs',
     // A JVM package named `build` keeps every file, as before (#1642).
     'src/main/java/com/acme/build/Script.js',
   ];
@@ -83,6 +88,14 @@ describe('the scope of a build folder below src', () => {
     'src/client/build/static/js/main.4f3a2b1c.js',
     'src/main/resources/static/build/bundle.js',
     'src/main/resources/build/Generated.java',
+    // Builds copy or generate these into a build folder: a frozen app's `.py`,
+    // CMake's C and C++, WordPress's PHP.
+    'src/build/lib/app/main.py',
+    'src/build/CMakeFiles/feature_tests.c',
+    'src/build/CMakeFiles/feature_tests.cxx',
+    'src/build/routes.php',
+    // Rust waits until its name matching keeps a private item to its module.
+    'crates/cli/src/build/mod.rs',
     // The other defaults still apply inside such a folder.
     'src/build/node_modules/pkg/index.ts',
     'src/build/dist/index.ts',
@@ -163,6 +176,21 @@ describe('the scope of a build folder below src', () => {
     write(root, files);
     expect(scanDirectory(root).sort()).toEqual(['src/build/page.tsx']);
   });
+});
+
+describe('a module kept in a build folder below src', () => {
+  it('is indexed for Go and C#', async () => {
+    const root = tempDir();
+    write(root, {
+      'src/go/build/build.go': 'package build\n\nfunc Import(path string) error {\n\treturn nil\n}\n',
+      'tools/src/Build/BuildManager.cs': 'namespace Tools.Build\n{\n    public class BuildManager\n    {\n        public void Run() { }\n    }\n}\n',
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    graphs.push(cg);
+    const names = (file: string) => cg.getNodesInFile(file).map((n) => n.name);
+    expect(names('src/go/build/build.go')).toContain('Import');
+    expect(names('tools/src/Build/BuildManager.cs')).toEqual(expect.arrayContaining(['BuildManager', 'Run']));
+  }, 60_000);
 });
 
 describe('a JS/TS feature kept in src/build', () => {

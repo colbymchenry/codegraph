@@ -652,8 +652,8 @@ What it skips out of the box:
   [supported stack](#supported-languages) — so the graph is your code, not
   third-party noise. This holds even with no `.gitignore`. A `build` folder
   inside `src/` is the exception: no build step writes TypeScript, JSX, Vue,
-  Svelte or Astro files, so those are indexed from it, and a Java, Kotlin or
-  Scala package named `build` is indexed whole.
+  Svelte, Astro, Go or C# files into one, so those are indexed from it,
+  and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.

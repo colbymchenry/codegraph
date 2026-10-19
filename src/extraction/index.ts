@@ -290,18 +290,26 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   // Keep JVM packages named `build` (#1642). Unignore only the directory, not
   // its subtree: other defaults still apply.
   ...JVM_BUILD_PACKAGE_DIRS.map((d) => `!${d}`),
-  // Walk a `build` folder below `src/` too: a JS/TS app can keep a whole
-  // feature there. Only its hand-written source files are indexed — see
-  // buildOutputFolderUnderSrc. Other defaults still apply inside it.
+  // Walk a `build` folder below `src/` too: a project can keep a whole
+  // feature or module there. Only its hand-written source files are indexed
+  // — see buildOutputFolderUnderSrc. Other defaults still apply inside it.
   '!**/src/**/build/',
 ];
 
 /**
- * Source files no compiler or bundler writes: TypeScript (with its module and
- * ArkTS variants), JSX, and Vue, Svelte and Astro components. Build steps emit
- * JavaScript, declarations, CSS, HTML and source maps instead.
+ * Source files no compiler or bundler writes into a build folder: TypeScript
+ * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
+ * components, whose builds emit JavaScript, declarations, CSS, HTML and
+ * source maps instead; and Go and C#, whose toolchains write elsewhere (Go's
+ * binaries, .NET's `bin/` and `obj/`). Python, C and C++, PHP and Java are
+ * left out: setuptools and frozen apps copy `.py` into `build/`, CMake
+ * generates C and C++ there, WordPress builds `build/*.php`. Rust waits too,
+ * though Cargo writes to `target/`: its name matching doesn't yet keep a
+ * private item to its own module, so dioxus's `src/build/patch.rs`, with a
+ * private `type Result`, took 158 `Result` references the crate's own
+ * `pub(crate) type Result` should keep.
  */
-const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro)$/i;
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs)$/i;
 /** TypeScript declarations, which `tsc` writes beside its JavaScript. */
 const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
 /** Matches the JVM packages named `build`, whose whole subtree stays indexed. */
@@ -332,11 +340,12 @@ function srcBuildFolderOf(rel: string): string | null {
  * When `rel` is a file in a `build` folder below `src/` that a build step could
  * have written, that folder (see {@link srcBuildFolderOf}); otherwise null.
  *
- * The folder itself is walked: JS/TS apps keep real source there (luci-go
- * milo's whole `src/build/` feature). But an output tree built or copied into
- * `src/` — a nested CRA app's `build/`, a vendored pdf.js, a Laravel
- * `public/build` — holds JavaScript, CSS, HTML and maps, never TypeScript, JSX
- * or components, so only those hand-written types are indexed from it. Paths
+ * The folder itself is walked: projects keep real source there (luci-go
+ * milo's whole `src/build/` feature, Go's `src/go/build`, a .NET solution's
+ * `src/Build/` project). But an output tree built or copied into `src/` — a
+ * nested CRA app's `build/`, a vendored pdf.js, a Laravel `public/build` —
+ * holds JavaScript, CSS, HTML and maps, never {@link HAND_WRITTEN_SOURCE}, so
+ * only those hand-written types are indexed from it. Paths
  * without an extension are left alone: they are directories (a watcher event
  * for a removed folder carries no trailing slash), never files a build writes.
  */
