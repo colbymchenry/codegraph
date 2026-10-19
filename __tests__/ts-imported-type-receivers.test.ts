@@ -194,14 +194,16 @@ describe('a this.<field> call on a field a class it extends declares', () => {
   it("reads the field's type off a class the base's own file declares", async () => {
     const calls = await callsOf({
       ...STORES,
-      'src/base.ts':
+      // A folder that sorts after `one` and `two`, so folder nearness, which
+      // ties, would pick another `Store`.
+      'src/zeta/base.ts':
         'export class Store {\n  add(v: number) { return v * 10; }\n}\n' +
         'export class Base {\n  protected readonly store = new Store();\n}\n',
       'src/child.ts':
-        "import { Base } from './base';\n" +
+        "import { Base } from './zeta/base';\n" +
         'export class Child extends Base {\n  run() {\n    return this.store.add(1);\n  }\n}\n',
     });
-    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/child.ts: this.store.add -> src/base.ts::Store::add']);
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/child.ts: this.store.add -> src/zeta/base.ts::Store::add']);
   }, 60_000);
 
   it('follows an aliased import to a base of the same name', async () => {
