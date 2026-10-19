@@ -49,11 +49,13 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
+import { classifyLockHolder, describeProcess } from './process-identity';
 import { connectWithHello, DAEMON_HELLO_TIMEOUT_MS, runLocalHandshakeProxy } from './proxy';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
   assertNoRebuild,
+  getWriterPidPath,
   releaseWriterLock,
   tryAcquireWriterLock,
   writerLockHeldMessage,
@@ -448,6 +450,23 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
 }
 
 /**
+ * Are Unix domain sockets unusable on the filesystem backing `dir`? On
+ * FUSE/virtiofs mounts (Windows drives shared into a Linux container) a
+ * socket can be created and bound but `connect()` fails with EINVAL, and
+ * even `unlink()`/`stat()` on the socket can hang in uninterruptible I/O.
+ * Detect via statfs (no socket I/O) instead of probing sockets.
+ */
+export function isFuseFilesystem(dir: string): boolean {
+  try {
+    const st = fs.statfsSync(dir);
+    // FUSE_SUPER_MAGIC — virtiofs is a FUSE filesystem.
+    return (st as { type: number }).type === 0x65735546;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * MCP Server for CodeGraph
  *
  * Implements the Model Context Protocol to expose CodeGraph
@@ -482,6 +501,53 @@ export class MCPServer {
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
+  }
+
+  /**
+   * Tear down a daemon that cannot be used (e.g. because sockets are broken on
+   * this filesystem) so the in-process fallback can own the writer lock and
+   * auto-sync. SIGTERM is unreliable here, so SIGKILL.
+   *
+   * The socket hello that normally proves a daemon's identity cannot work on
+   * such a filesystem, so the OS's view of the process stands in for it: a
+   * live process that is not `codegraph serve --mcp` is never signalled, even
+   * when it reused a stale daemon PID (#1553, #2770).
+   */
+  private async cleanupUnusableDaemon(root: string): Promise<void> {
+    let pid: number | null = null;
+    try {
+      const raw = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+      const info = JSON.parse(raw) as { pid?: number };
+      if (typeof info.pid === 'number' && info.pid > 0 && info.pid !== process.pid) {
+        pid = info.pid;
+      }
+    } catch { /* no pid file */ }
+    if (pid !== null) {
+      const kind = classifyLockHolder(await describeProcess(pid));
+      if (kind === 'codegraph-server') {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+    try { fs.unlinkSync(getDaemonPidPath(root)); } catch { /* ignore */ }
+    // Do NOT unlink the socket itself: on virtiofs that hangs in
+    // uninterruptible I/O. The stale socket is harmless since daemon mode is
+    // disabled on this filesystem.
+    try {
+      const w = readWriterLock(root);
+      if (w && w.pid > 0 && w.pid !== process.pid) {
+        let alive = true;
+        try { process.kill(w.pid, 0); } catch { alive = false; }
+        if (alive && classifyLockHolder(await describeProcess(w.pid)) === 'other') {
+          // The PID has been reused by a process that is not CodeGraph, so
+          // this writer record is stale. A dead holder is cleared by
+          // tryAcquireWriterLock; a live CodeGraph writer is left alone.
+          const cur = readWriterLock(root);
+          if (cur && cur.pid === w.pid) {
+            try { fs.unlinkSync(getWriterPidPath(root)); } catch { /* ignore */ }
+          }
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   /**
@@ -528,6 +594,17 @@ export class MCPServer {
       // No initialized project found — daemon mode has nowhere to put its
       // socket. The fresh-checkout / outside-project case; behave as before.
       return this.startDirect('no .codegraph/ root found');
+    }
+
+    // On filesystems where Unix domain sockets cannot be connected (e.g.
+    // FUSE/virtiofs mounts of Windows drives) the shared daemon is unusable:
+    // it binds but no client can ever reach it, leaving an orphan daemon that
+    // holds the writer lock and disables auto-sync. Detect this up front and
+    // serve fully in-process (with auto-sync) instead.
+    if (isFuseFilesystem(root)) {
+      process.stderr.write('[CodeGraph MCP] Filesystem is FUSE/virtiofs: Unix sockets unusable, serving in-process with auto-sync.\n');
+      await this.cleanupUnusableDaemon(root);
+      return this.startDirect('sockets unusable on this filesystem (FUSE/virtiofs)');
     }
 
     try {
