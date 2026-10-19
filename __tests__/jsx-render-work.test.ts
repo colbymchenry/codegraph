@@ -14,7 +14,7 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 
 /** The source of the pass's tag pattern, to count its scans by. */
-const JSX_TAG_SOURCE = String.raw`<([A-Z][A-Za-z0-9_]*)[\s/>]`;
+const JSX_TAG_SOURCE = String.raw`<([A-Z][A-Za-z0-9_]*)(?=[\s/><])`;
 
 describe('jsx-render pass work', () => {
   let tmpDir: string | undefined;

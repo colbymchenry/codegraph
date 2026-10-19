@@ -341,6 +341,30 @@ const lowerCase = styled.div<Props>\`color: red;\`;
     for (const name of ['Mixin', 'Compared', 'lowerCase']) expect(kind(name), name).toEqual(['constant']);
   });
 
+  it.each([
+    ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('edges the file-scope values a component reads or renders: %s', (ext, language) => {
+    // `.jsx` was left out of the value-reference languages on both paths, so
+    // this file had none of these edges as .jsx and all of them as .js or .tsx.
+    const result = assertParity(`routes.${ext}`, `
+import { lazy } from 'react';
+import Loadable from './Loadable';
+const LoginPage = Loadable(lazy(() => import('./pages/Login')));
+const ROUTE_TABLE = [{ path: '/login', label: 'Login' }];
+const THEME_TOKENS = { color: 'red', size: 12 };
+export function AuthRoutes() { return <LoginPage />; }
+export function Nav() {
+  return <ul style={{ color: THEME_TOKENS.color }}>{ROUTE_TABLE.map((r) => <li key={r.path}>{r.label}</li>)}</ul>;
+}
+export const Box = () => <div data-size={THEME_TOKENS.size} />;
+`, language);
+    const name = (id: string) => result.nodes.find((n) => n.id === id)?.name;
+    expect(result.edges
+      .filter((e) => e.kind === 'references' && e.metadata?.valueRef === true)
+      .map((e) => `${name(e.source)} -> ${name(e.target)}`)
+      .sort()).toEqual(['AuthRoutes -> LoginPage', 'Box -> THEME_TOKENS', 'Nav -> ROUTE_TABLE', 'Nav -> THEME_TOKENS']);
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');

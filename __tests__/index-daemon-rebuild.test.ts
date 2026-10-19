@@ -6,6 +6,7 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { stopDaemonAt, isProcessAlive } from '../src/mcp/daemon-registry';
 import { readWriterLock, releaseWriterLock, tryAcquireWriterLock } from '../src/mcp/writer-lock';
+import { recordedPids, recordSpawns, removeSpawnLog } from './daemon-candidates';
 
 const bin = path.resolve(__dirname, '../dist/bin/codegraph.js');
 let root: string;
@@ -23,7 +24,10 @@ async function until<T>(fn: () => T, timeout = 20000): Promise<NonNullable<T>> {
   throw new Error('Timed out waiting for process/response');
 }
 function start(args: string[]) {
-  const child = spawn(process.execPath, ['--liftoff-only', bin, ...args], { cwd: root, env });
+  // Record the daemons a launcher spawns, for the teardown.
+  const recorder = recordSpawns(root);
+  const child = spawn(process.execPath, ['--liftoff-only', ...recorder.args, bin, ...args],
+    { cwd: root, env: { ...env, ...recorder.env } });
   children.push(child);
   let out = '', err = '';
   child.stdout.on('data', b => out += b);
@@ -65,14 +69,26 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   releaseWriterLock(root, 'rebuild.pid');
-  for (const child of children) {
-    child.stdin.end();
-    if (child.exitCode === null && child.signalCode === null) child.kill();
+  // Close each launcher's stdin and let it exit; never kill one. A launcher
+  // serving calls in-process retries its daemon on a timer, and a retry that
+  // comes due during a call spawns the daemon as soon as that call answers,
+  // just as this teardown begins. On Windows a launcher killed mid-spawn leaves
+  // that daemon suspended for good: it never runs, so no daemon.pid names it
+  // and nothing can stop it.
+  for (const child of children) child.stdin.end();
+  await until(() => children.every(c => c.exitCode !== null || c.signalCode !== null), 30000);
+  // Then stop every daemon the launchers recorded. One spawned as its launcher
+  // exited may still be starting, and stopDaemonAt leaves a daemon running
+  // until it answers, so keep at it until all have exited.
+  const end = Date.now() + 30000;
+  while (recordedPids(root).some(isProcessAlive)) {
+    if (Date.now() > end) throw new Error(`Daemons ${recordedPids(root).filter(isProcessAlive).join(', ')} are still running`);
+    await stopDaemonAt(root, { preserveUnverified: true });
+    await new Promise(r => setTimeout(r, 25));
   }
-  await until(() => children.every(c => c.exitCode !== null || c.signalCode !== null));
-  await stopDaemonAt(root);
+  removeSpawnLog(root);
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-});
+}, 90000);
 
 it.runIf(process.platform === 'win32')('rebuilds after the real MCP client closes with SQLite held by its daemon (#1325)', async () => {
   const server = await client();

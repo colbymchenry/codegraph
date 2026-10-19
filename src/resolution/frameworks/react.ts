@@ -9,7 +9,7 @@ import { Language, Node } from '../../types';
 import { FrameworkExtractionResult, FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
-import { extractLocalExportAliases } from '../alias-binding';
+import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
 import { makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
@@ -35,9 +35,10 @@ export const reactResolver: FrameworkResolver = {
   },
 
   // A data-router `lazy: () => import('./routes/x')` route names a module, not
-  // a symbol; a route's `layout:MainLayout` names the component around it.
+  // a symbol, and `import:./x#Page` the export its loader picks; a route's
+  // `layout:MainLayout` names the component around it.
   claimsReference(name: string): boolean {
-    return name.startsWith(LAZY_ROUTE_PREFIX) || name.startsWith(LAYOUT_PREFIX);
+    return name.startsWith(LAZY_ROUTE_PREFIX) || name.startsWith(LAYOUT_PREFIX) || PICKED_EXPORT.test(name);
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -46,6 +47,13 @@ export const reactResolver: FrameworkResolver = {
     if (!REACT_SCRIPT_LANGUAGES.has(ref.language)) return null;
     if (ref.referenceName.startsWith(LAZY_ROUTE_PREFIX)) {
       const target = lazyRouteComponent(ref.referenceName.slice(LAZY_ROUTE_PREFIX.length), ref.filePath, context);
+      return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
+    }
+    // The export a lazy route's loader picks. Vue Router and Angular name a
+    // lazily loaded component the same way, and their routes' are theirs.
+    const picked = PICKED_EXPORT.exec(ref.referenceName);
+    if (picked) {
+      const target = isReactRouteRef(ref) ? pickedExport(picked[1]!, picked[2]!, ref.filePath, context) : null;
       return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
     }
     // The layout a route renders inside: what happens in it — its header's
@@ -76,15 +84,15 @@ export const reactResolver: FrameworkResolver = {
       isPascalCase(ref.referenceName) &&
       !isBuiltInType(ref.referenceName)
     ) {
-      // What a route renders, when its own file declares it: the module a
-      // `const RegisterPage = Loadable(lazy(() => import('pages/auth/Register')))`
-      // loads, or else that declaration, which name matching binds — never a
-      // same-named component in another app of the repository.
-      if (ref.fromNodeId.startsWith(`route:${ref.filePath}:`)) {
-        const own = declaredComponent(ref.referenceName, ref.filePath, context);
-        if (own !== undefined) {
-          return own ? { original: ref, targetNodeId: own, confidence: 0.9, resolvedBy: 'framework' } : null;
-        }
+      // A name the file declares itself is that declaration, whatever refers
+      // to it — a route's `element`, a page's default export, a type: the
+      // module a `const RegisterPage = Loadable(lazy(() =>
+      // import('pages/auth/Register')))` loads, the function a value wraps, or
+      // else the declaration, which name matching binds — never a same-named
+      // component in another app of the repository.
+      const own = declaredComponent(ref.referenceName, ref.filePath, context);
+      if (own) {
+        return own.component ? { original: ref, targetNodeId: own.component.id, confidence: 0.9, resolvedBy: 'framework' } : null;
       }
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
@@ -200,11 +208,50 @@ export const reactResolver: FrameworkResolver = {
   crossFileNodes(context: ResolutionContext) {
     return { kind: 'route', owns: isTableRoute, ...tableRoutes(context) };
   },
+
+  /**
+   * The modules a route's answer is read from: a lazily loaded page or layout
+   * (`lazy-import:` references, and `import:…#…` for the export a loader
+   * picks), or the one a same-file lazy value the route renders, or renders
+   * inside, loads (`declaredComponent`) — with the modules a barrel there
+   * forwards the lookup to.
+   */
+  lazyModules(ref: UnresolvedRef, context: ResolutionContext): readonly string[] {
+    const name = ref.referenceName;
+    const picked = isReactRouteRef(ref) ? PICKED_EXPORT.exec(name.startsWith(LAYOUT_PREFIX) ? name.slice(LAYOUT_PREFIX.length) : name) : null;
+    if (picked) {
+      const reads = new Set<string>();
+      pickedExport(picked[1]!, picked[2]!, ref.filePath, context, reads);
+      return [...reads];
+    }
+    let spec: string | null | undefined;
+    if (name.startsWith(LAZY_ROUTE_PREFIX)) spec = name.slice(LAZY_ROUTE_PREFIX.length);
+    else if (name.startsWith(LAYOUT_PREFIX + LAZY_ROUTE_PREFIX)) spec = name.slice(LAYOUT_PREFIX.length + LAZY_ROUTE_PREFIX.length);
+    else if (isReactRouteRef(ref)) {
+      // A page or layout the route file declares as a value it loads lazily.
+      const own = name.startsWith(LAYOUT_PREFIX) ? name.slice(LAYOUT_PREFIX.length) : name;
+      const loaded = isPascalCase(own) && !isBuiltInType(own) ? declaredLoader(own, ref.filePath, context) : undefined;
+      if (loaded && loaded.member !== 'default') {
+        const reads = new Set<string>();
+        pickedExport(loaded.spec, loaded.member, ref.filePath, context, reads);
+        return [...reads];
+      }
+      spec = loaded?.spec;
+    }
+    return spec ? lazyRouteFiles(spec, ref.filePath, context) : [];
+  },
 };
 
 const LAZY_ROUTE_PREFIX = 'lazy-import:';
 const ROUTE_PARTS_PREFIX = 'route-parts:';
 const LAYOUT_PREFIX = 'layout:';
+
+/**
+ * The export a lazy route's loader picks, named the way Vue Router and
+ * Angular name a lazily loaded component: `import:./tabs#TestTab`,
+ * `import:./pages/login#default`. The module's path may hold a `#` itself.
+ */
+const PICKED_EXPORT = /^import:(.+)#([A-Za-z_$][\w$]*)$/;
 
 /** One segment of a nested route's path: a literal, or a constant's member expression. */
 interface RoutePart {
@@ -397,11 +444,48 @@ function readObjectPath(text: string, at: number, keys: string[]): string | null
   return null;
 }
 
+/**
+ * The file a lazily loaded module is, from the file that loads it: by the
+ * extensions that file's own imports resolve with (`./MainLayout` is
+ * `MainLayout/index.jsx` from a `.jsx` file), else by TypeScript's.
+ */
+function lazyModuleFile(spec: string, fromFile: string, context: ResolutionContext): string | null {
+  const language = scriptLanguage(fromFile);
+  return resolveImportPath(spec, fromFile, language, context) ??
+    (language === 'typescript' ? null : resolveImportPath(spec, fromFile, 'typescript', context));
+}
+
 /** The component a lazy route module renders: its default export, else its `Component` export. */
-function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext): string | null {
-  const file = resolveImportPath(spec, fromFile, 'typescript', context);
+function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext, reads?: Set<string>): string | null {
+  const file = lazyModuleFile(spec, fromFile, context);
   if (!file) return null;
-  return exportedComponent(file, 'default', context) ?? exportedComponent(file, 'Component', context);
+  return exportedComponent(file, 'default', context, new Set(), reads) ??
+    exportedComponent(file, 'Component', context, new Set(), reads);
+}
+
+/** The files `lazyRouteComponent` reads: the module, and the ones a barrel forwards it to. */
+function lazyRouteFiles(spec: string, fromFile: string, context: ResolutionContext): string[] {
+  const reads = new Set<string>();
+  lazyRouteComponent(spec, fromFile, context, reads);
+  return [...reads];
+}
+
+/**
+ * The component a lazy route's loader picks from the module `spec` loads: the
+ * export named `name`, through barrels. `reads` collects the files it reads.
+ */
+function pickedExport(spec: string, name: string, fromFile: string, context: ResolutionContext, reads?: Set<string>): string | null {
+  const file = lazyModuleFile(spec, fromFile, context);
+  return file ? exportedComponent(file, name, context, new Set(), reads) : null;
+}
+
+/**
+ * True for a reference a React route makes: from a `route:<file>:…` node, in
+ * tsx or jsx, the language React gives its routes even in a `.ts` routes
+ * file. Vue Router's and Angular's routes are never in either.
+ */
+function isReactRouteRef(ref: UnresolvedRef): boolean {
+  return (ref.language === 'tsx' || ref.language === 'jsx') && ref.fromNodeId.startsWith(`route:${ref.filePath}:`);
 }
 
 /** What a module can export as a component: a declaration, or a value holding one. */
@@ -415,22 +499,69 @@ const MAX_REEXPORT_HOPS = 4;
  * Page`, `export function Component`, `export { Page as Component }` — or one
  * it forwards from the module that declares it, as a barrel `index.ts` does:
  * `export { default } from './page'`, `export { Page as Component } from
- * './page'`, or `export * from './page'`, which forwards every name but the
- * default. As in JavaScript, a name the file exports itself hides one an
- * `export *` would forward, and a name two `export *` modules both forward is
- * exported by neither.
+ * './page'`, `export * from './page'`, which forwards every name but the
+ * default, or an import it exports again, `import { Page } from './page';
+ * export { Page }`, or in a value, outline's `const Avatar =
+ * AvatarWithHoverCard; export { Avatar }`. As in JavaScript, a name the file
+ * exports itself hides one an `export *` would forward, and a name two
+ * `export *` modules both forward is exported by neither. `reads` collects
+ * every file the lookup reads. A JSX tag imported from the project renders it
+ * too (`jsxChild`).
  */
-function exportedComponent(file: string, name: string, context: ResolutionContext, visited: ReadonlySet<string> = new Set()): string | null {
+export function exportedComponent(
+  file: string,
+  name: string,
+  context: ResolutionContext,
+  visited: ReadonlySet<string> = new Set(),
+  reads?: Set<string>
+): string | null {
   if (visited.has(file) || visited.size > MAX_REEXPORT_HOPS) return null;
-  const local = ownExport(stripCommentsForRegex(context.readFile(file) ?? '', 'typescript'), name);
-  if (local) return context.getNodesInFile(file).find((n) => n.name === local && EXPORTED_COMPONENT_KINDS.has(n.kind))?.id ?? null;
+  reads?.add(file);
   const language = scriptLanguage(file);
-  const reExports = context.getReExports?.(file, language) ?? [];
   const through = new Set(visited).add(file);
   const forwarded = (source: string, exported: string): string | null => {
     const target = resolveImportPath(source, file, language, context);
-    return target ? exportedComponent(target, exported, context, through) : null;
+    return target ? exportedComponent(target, exported, context, through, reads) : null;
   };
+  const code = stripCommentsForRegex(context.readFile(file) ?? '', 'typescript');
+  const local = ownExport(code, name);
+  if (local) {
+    const nodes = context.getNodesInFile(file);
+    const declaredAs = (binding: string): Node | undefined => {
+      const named = nodes.filter((n) => n.name === binding && EXPORTED_COMPONENT_KINDS.has(n.kind));
+      return named.find((n) => n.qualifiedName === binding) ?? named[0];
+    };
+    const exported = declaredAs(local);
+    // A constant that holds another binding is that binding: outline's
+    // `Avatar/index.ts` is `const Avatar = AvatarWithHoverCard; export { Avatar }`.
+    // (A `let` may be assigned another component before it is used.)
+    let binding = local;
+    let declared = exported;
+    for (let hop = 0; declared && hop < MAX_REEXPORT_HOPS; hop++) {
+      const held = declared.kind === 'constant' ? heldBinding(declared, context) : null;
+      if (!held) break;
+      binding = held;
+      declared = declaredAs(held);
+    }
+    // A value is what it wraps: `export default Page` of `const Page = observer(function Page_() {…})`.
+    // So is a component node minted for a wrapper around another component
+    // (`const MemoizedBlurhash = memo(Blurhash)`), which has no body to render from.
+    if (declared) {
+      const wrapped = declared.kind === 'constant' || declared.kind === 'variable' ? wrappedComponent(declared, context)
+        : declared.kind === 'component' ? handedComponent(declared, context) : null;
+      return (wrapped ?? declared).id;
+    }
+    // A name the module imports and exports again — `import { Page } from
+    // './page'; export { Page }`, `import Page from './Page'; export default
+    // Page` — is the page that import names. `export default withAuth(Page)`
+    // hands over no binding of its own.
+    if (binding === local && name === 'default' && !exportsBinding(code, local)) return null;
+    const imported = context.getImportMappings(file, language).find((m) => m.localName === binding);
+    const id = imported && !imported.isNamespace ? forwarded(imported.source, imported.isDefault ? 'default' : imported.exportedName) : null;
+    // A held binding that leads nowhere leaves the value itself the export.
+    return id ?? exported?.id ?? null;
+  }
+  const reExports = context.getReExports?.(file, language) ?? [];
   for (const re of reExports) {
     if (re.kind === 'named' && re.exportedName === name) return forwarded(re.source, re.originalName);
   }
@@ -446,13 +577,14 @@ function exportedComponent(file: string, name: string, context: ResolutionContex
 }
 
 /**
- * The local name a module's own `export` gives `name`: `export default Page`
- * (or `function Page`, `class Page`), `export function Component`, `export
- * const Component`, `export { Page as Component }`. Null when it has none.
+ * The local name a module's own `export` gives `name`: its default export
+ * (`defaultExportedName`: `export default Page`, `function Page`, `class
+ * Page`, `observer(Page)`), `export function Component`, `export const
+ * Component`, `export { Page as Component }`. Null when it has none.
  */
 function ownExport(source: string, name: string): string | null {
   if (name === 'default') {
-    const declared = /\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*|class\s+)?([A-Za-z_$][\w$]*)/.exec(source)?.[1];
+    const declared = defaultExportedName(source);
     if (declared) return declared;
   } else if (new RegExp(String.raw`\bexport\s+(?:async\s+)?(?:const|let|var|function|class)\s+${name.replace(/\$/g, '\\$')}(?![\w$])`).test(source)) {
     return name;
@@ -461,32 +593,290 @@ function ownExport(source: string, name: string): string | null {
 }
 
 /**
- * A component `filePath` holds in a value of its own, for a route there that
- * renders it: the component of the module a lazy declaration loads (`lazy(()
- * => import('./x'))`, wrapped or not), null for a value that loads none it
- * can find — the value is then the binding, by name — and undefined when the
- * file declares no such value (a function or class component is found the
- * usual way).
+ * The name a module's default export carries: `export default Login`,
+ * `export default function Login`, `export default class Login`, `export
+ * default Login as FC`, or the component a wrapper call hands over —
+ * `observer(Login)`, `React.memo(Login)`, `connect(mapState)(Login)`,
+ * `withTranslation()(withRouter(Login))`.
  */
-function declaredComponent(name: string, filePath: string, context: ResolutionContext): string | null | undefined {
-  const own = (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
-    .find((n) => n.kind === 'constant' || n.kind === 'variable');
-  if (!own) return undefined;
-  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
-  const text = lines.slice(own.startLine - 1, own.endLine).join('\n');
-  const spec = /=>\s*import\s*\(\s*["']([^"']+)["']\s*\)/.exec(text)?.[1];
-  return spec ? lazyRouteComponent(spec, filePath, context) : null;
+function defaultExportedName(source: string): string | null {
+  const at = /\bexport\s+default\s+/.exec(source);
+  if (!at) return null;
+  const rest = source.slice(at.index + at[0].length);
+  const named = /^(?:async\s+)?(?:function\s*\*?\s*|class\s+)([A-Za-z_$][\w$]*)/.exec(rest) ??
+    /^([A-Za-z_$][\w$]*)(?:[ \t]*(?:;|\r?\n|$)|\s+(?:as|satisfies)\s)/.exec(rest);
+  return named ? named[1]! : wrappedName(rest.slice(0, statementEnd(rest, 0)));
+}
+
+/**
+ * The component a wrapper call hands over — `observer(Login)`, `React.memo(Login)`,
+ * `connect(mapState)(Login)`, `withTranslation()(withRouter(Login))`: its last
+ * argument list's lone argument, or a component ahead of the options after it
+ * (`React.memo(TableBody, areEqual)`, `withAuthZ(Page, { … })`), past a type
+ * assertion on the call (`as typeof Login`, or mastodon's
+ * `forwardRef(ComboboxWithRef) as { … }`, which keeps the generics
+ * `forwardRef` drops).
+ */
+function wrappedName(expression: string): string | null {
+  const s = expression.trim();
+  const callee = /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*(?:<[^()]*>)?\s*(?=\()/.exec(s);
+  if (!callee) return null;
+  let end = callee[0].length;
+  let args: string[] = [];
+  for (let open = end; s[open] === '('; ) {
+    const close = matchBracket(s, open);
+    if (close < 0) return null;
+    args = topLevelItems(s.slice(open + 1, close));
+    end = close + 1;
+    for (open = end; /\s/.test(s[open] ?? ''); ) open++;
+  }
+  if (!/^(?:\s+(?:as|satisfies)\s[\s\S]*)?$/.test(s.slice(end))) return null;
+  const first = args[0] ?? '';
+  // `connect(mapState, mapDispatch)` hands over no component yet.
+  if (args.length > 1 && !/^[A-Z]/.test(first)) return null;
+  return /^[A-Za-z_$][\w$]*$/.test(first) ? first : first ? wrappedName(first) : null;
+}
+
+/** True when the module's default export is the binding `local` itself: `export default Page;`, `export { Page as default }`. */
+function exportsBinding(source: string, local: string): boolean {
+  return defaultExportBinding(source) === local;
+}
+
+/**
+ * A value `filePath` declares itself under a component's name, and what it
+ * renders. JavaScript scoping makes the name, used anywhere in that file —
+ * `<RegisterPage />`, a route's `element: <RegisterPage />` — this
+ * declaration, never another file's same-named component: mantis's vite app
+ * bound its `RegisterPage`, a `Loadable(lazy(() =>
+ * import('pages/auth/Register')))`, to the page of that name in the
+ * repository's Next.js app. `component` is the component of the module a lazy
+ * declaration loads (`declaredLoader`), or the function the value wraps
+ * (`observer(function Login() {…})`); null when there is none to find, and
+ * the declaration is then the binding. Undefined when the file declares no
+ * such value (a function or class component is found the usual way).
+ */
+export function declaredComponent(
+  name: string,
+  filePath: string,
+  context: ResolutionContext,
+): { declaration: Node; component: Node | null } | undefined {
+  const declaration = declaredValue(name, filePath, context);
+  if (!declaration) return undefined;
+  const loaded = valueLoader(declaration, context);
+  if (!loaded) return { declaration, component: wrappedComponent(declaration, context) };
+  const id = loaded.member === 'default'
+    ? lazyRouteComponent(loaded.spec, filePath, context)
+    : pickedExport(loaded.spec, loaded.member, filePath, context);
+  return { declaration, component: id ? context.getNodeById?.(id) ?? null : null };
+}
+
+/**
+ * The module a value `filePath` declares as `name` loads lazily, and the
+ * export its loader picks (`valueLoader`) — null for a value that loads none,
+ * undefined when the file declares no such value.
+ */
+function declaredLoader(name: string, filePath: string, context: ResolutionContext): { spec: string; member: string } | null | undefined {
+  const declaration = declaredValue(name, filePath, context);
+  return declaration ? valueLoader(declaration, context) : undefined;
+}
+
+/**
+ * The modules the values `filePath` declares load lazily, with the barrels the
+ * lookups for their components pass through: what a JSX tag naming one of
+ * them is drawn from (`declaredComponent`), so a sync that changes one —
+ * gives a page its default export, rewires a barrel — redraws the tag.
+ */
+export function lazyValueModules(filePath: string, context: ResolutionContext): string[] {
+  const reads = new Set<string>();
+  for (const node of context.getNodesInFile(filePath)) {
+    if ((node.kind !== 'constant' && node.kind !== 'variable') || node.qualifiedName !== node.name || !isPascalCase(node.name)) continue;
+    const loaded = valueLoader(node, context);
+    if (!loaded) continue;
+    if (loaded.member === 'default') lazyRouteComponent(loaded.spec, filePath, context, reads);
+    else pickedExport(loaded.spec, loaded.member, filePath, context, reads);
+  }
+  return [...reads];
+}
+
+/** The module-level `const`, `let` or `var` `filePath` declares as `name`. */
+function declaredValue(name: string, filePath: string, context: ResolutionContext): Node | undefined {
+  return (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
+    .find((n) => (n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === name);
+}
+
+/**
+ * The module a value's initializer hands a lazy loader, and the export the
+ * loader resolves to — `default` unless it picks one: `lazy(() =>
+ * import('./x'))`, wrapped or not (`Loadable(lazy(…))`, `loadable(…)`,
+ * `dynamic(…, { ssr: false })`, `Loadable({ loader: () => import(…) })`),
+ * `dynamic(async () => (await import('./x')).default)`, or a named export
+ * (`.then((m) => ({ default: m.Chart }))`, `.then((m) => m.Chart)`), in either
+ * branch of a conditional (`IS_DEV ? React.lazy(…) : null`). The loader is
+ * read by `loaderValue`, as a data router's is; one it can't read loads the
+ * module its expression's first import names. A function the value wraps is
+ * no loader (`withFallback('Dialog', (props) => { … import('mermaid') … })`):
+ * what it returns renders, and what it imports is its own business.
+ */
+function valueLoader(declaration: Node, context: ResolutionContext): { spec: string; member: string } | null {
+  const code = stripCommentsForRegex(declarationText(declaration, context), 'typescript');
+  const init = initializerAt(code, declaration.name.length);
+  const loader = init < 0 ? null : loaderOf(code.slice(init));
+  if (!loader) return null;
+  const page = loadedPage(loaderValue(loader, new Map()));
+  if (page) return page;
+  const fn = functionParts(loader);
+  const spec = fn && !fn.block ? FIRST_IMPORT.exec(fn.body)?.[1] : undefined;
+  return spec ? { spec, member: 'default' } : null;
+}
+
+/**
+ * The loader function an initializer hands a lazy wrapper: the first function
+ * among its call's arguments, through the wrappers around it (`Loadable(lazy(()
+ * => import('./x')))`) and before the options after it (`dynamic(…, { ssr:
+ * false })`), or an options object's `loader` (`Loadable({ loader: () =>
+ * import(…) })`). Null for an initializer that is no such call.
+ */
+function loaderOf(text: string): string | null {
+  const s = text.trim();
+  const call = /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*(?:<[^()]*>)?\s*\(/.exec(s);
+  if (!call) return conditionalLoader(s);
+  const open = call[0].length - 1;
+  const close = matchBracket(s, open);
+  if (close < 0) return null;
+  for (const arg of topLevelItems(s.slice(open + 1, close))) {
+    const item = arg.trim();
+    if (!item) continue;
+    if (functionParts(item)) return item;
+    if (item.startsWith('{')) {
+      const loader = matchBracket(item, 0) === item.length - 1 ? objectEntries(item.slice(1, -1)).props.get('loader') : undefined;
+      if (loader !== undefined && functionParts(loader)) return loader;
+      continue;
+    }
+    const inner = loaderOf(item);
+    if (inner) return inner;
+  }
+  return conditionalLoader(s);
+}
+
+/**
+ * The loader of a conditional's one branch that has one: SigNoz's `IS_DEV ?
+ * React.lazy(() => import(…)) : null`. Null when neither branch loads, or both
+ * do — the value is then one or the other.
+ */
+function conditionalLoader(text: string): string | null {
+  const branches = conditionalBranches(text);
+  const loaders = branches ? branches.map(loaderOf).filter((l): l is string => l !== null) : [];
+  return loaders.length === 1 ? loaders[0]! : null;
+}
+
+/** The two branches of a conditional expression, `test ? yes : no`; null for any other expression. */
+function conditionalBranches(text: string): [string, string] | null {
+  let question = -1;
+  let open = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'" || ch === '`' || ch === '{' || ch === '(' || ch === '[') {
+      i = ch === '{' || ch === '(' || ch === '[' ? matchBracket(text, i) : skipString(text, i);
+      if (i < 0) return null;
+    } else if (ch === '?') {
+      // `??` and `?.` are no conditional.
+      if (text[i + 1] === '?' || (text[i + 1] === '.' && !/\d/.test(text[i + 2] ?? ''))) i++;
+      else if (open++ === 0) question = i;
+    } else if (ch === ':' && open > 0 && --open === 0) {
+      return [text.slice(question + 1, i), text.slice(i + 1)];
+    }
+  }
+  return null;
+}
+
+/**
+ * The page a lazy wrapper's loader resolves to: a module's default export, an
+ * export it picks, or the `default` of the object `React.lazy` wants (`{
+ * default: m.Chart }`).
+ */
+function loadedPage(value: Loaded | null): { spec: string; member: string } | null {
+  if (value?.kind === 'module') return { spec: value.spec, member: 'default' };
+  if (value?.kind === 'export') return { spec: value.spec, member: value.name };
+  if (value?.kind !== 'object') return null;
+  const inner = objectEntries(value.text).props.get('default');
+  return inner === undefined ? null : loadedPage(valueOf(inner, value.scope));
+}
+
+/** A declarator's own source text: `B = lazy(…)` in `const A = lazy(…), B = lazy(…)`. */
+function declarationText(node: Node, context: ResolutionContext): string {
+  const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? [])
+    .slice(node.startLine - 1, node.endLine);
+  if (lines.length === 0) return '';
+  if (node.endColumn > 0) lines[lines.length - 1] = lines[lines.length - 1]!.slice(0, node.endColumn);
+  lines[0] = lines[0]!.slice(node.startColumn);
+  return lines.join('\n');
+}
+
+/**
+ * The component a value wraps, which is what it renders: the function it
+ * holds (`const Application = observer(function Application() {…})`), or the
+ * component of its own file a wrapper call is handed (`const TableView =
+ * observer(TableViewInner)`). An inner function counts when it has the value's
+ * name or ends where the value does — never a helper inside an arrow the graph
+ * has no node for (`withFallback('X', () => { const load = () => …; … })`).
+ */
+function wrappedComponent(value: Node, context: ResolutionContext): Node | null {
+  const nodes = context.getNodesInFile(value.filePath);
+  const inner = nodes.filter((n) => COMPONENT_KINDS.has(n.kind) &&
+    n.qualifiedName === `${value.qualifiedName}::${n.name}` && n.startLine >= value.startLine && n.endLine <= value.endLine);
+  const held = inner.find((n) => n.name === value.name) ??
+    (inner.length === 1 && inner[0]!.endLine === value.endLine ? inner[0]! : null);
+  if (held || inner.length > 0) return held;
+  return handedComponent(value, context, nodes);
+}
+
+/**
+ * The binding a value holds and nothing more — `AvatarWithHoverCard` of
+ * outline's `const Avatar = AvatarWithHoverCard`, past a type assertion (`=
+ * Page as FC`) — or null for any other initializer.
+ */
+function heldBinding(value: Node, context: ResolutionContext): string | null {
+  const code = stripCommentsForRegex(declarationText(value, context), 'typescript');
+  const init = initializerAt(code, value.name.length);
+  if (init < 0) return null;
+  const held = /^\s*([A-Za-z_$][\w$]*)\s*(?:$|(?:as|satisfies)\s)/.exec(code.slice(init, statementEnd(code, init)));
+  return held && held[1] !== value.name ? held[1]! : null;
+}
+
+/**
+ * The component of its own file a wrapper call around a declaration hands
+ * over: `const TableView = observer(TableViewInner)`, or mastodon's `const
+ * MemoizedBlurhash = memo(Blurhash)`, whose component node has no body of its
+ * own to render from.
+ */
+function handedComponent(value: Node, context: ResolutionContext, nodes = context.getNodesInFile(value.filePath)): Node | null {
+  const code = stripCommentsForRegex(declarationText(value, context), 'typescript');
+  const init = initializerAt(code, value.name.length);
+  const handed = init < 0 ? null : wrappedName(code.slice(init, statementEnd(code, init)));
+  return handed && isPascalCase(handed) && handed !== value.name
+    ? nodes.find((n) => n.name === handed && n.qualifiedName === handed && COMPONENT_KINDS.has(n.kind)) ?? null
+    : null;
 }
 
 /**
  * The component a route's `layout:` reference names, found the way the
  * route's own component is: through the route file's import of it, else
- * declared in reach — or a lazily loaded layout module's component.
+ * declared in reach — or a lazily loaded layout module's component, or the
+ * export its loader picks.
  */
 function layoutComponent(spec: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
   if (spec.startsWith(LAZY_ROUTE_PREFIX)) return lazyRouteComponent(spec.slice(LAZY_ROUTE_PREFIX.length), ref.filePath, context);
+  const picked = isReactRouteRef(ref) ? PICKED_EXPORT.exec(spec) : null;
+  if (picked) return pickedExport(picked[1]!, picked[2]!, ref.filePath, context);
   const mapping = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === spec);
-  if (!mapping) return resolveComponent(spec, ref.filePath, context);
+  if (!mapping) {
+    // A layout the route file declares itself (`const MainLayout =
+    // Loadable(lazy(…))`): no name match follows a `layout:` reference, so
+    // the declaration binds here when there is no component to find.
+    const own = declaredComponent(spec, ref.filePath, context);
+    if (own) return (own.component ?? own.declaration).id;
+    return resolveComponent(spec, ref.filePath, context);
+  }
   const viaImport = context.resolveImport?.({ ...ref, referenceName: spec })?.targetNodeId;
   if (viaImport) return viaImport;
   // `import { default as AppRoot } from './routes/app/root'`: read the module the
@@ -502,11 +892,11 @@ interface RouteDeclaration {
   /** Its path parts, outermost first. */
   parts: RoutePart[];
   component?: string;
-  /** A `lazy: () => import('…')` module. */
+  /** What its `lazy` loader renders, as the route's reference names it (`lazyRouteReference`). */
   lazy?: string;
   /**
    * The route objects around it that render something, outermost first: the
-   * layouts it renders inside, each a component name or `lazy-import:…`.
+   * layouts it renders inside, each a component name, `lazy-import:…` or `import:…#…`.
    */
   layouts: string[];
   at: number;
@@ -636,6 +1026,8 @@ function scanRoutes(
     // then the innermost wrapper: `<RequireAuth><Outlet /></RequireAuth>` renders the guard.
     return own.find(content) ?? props.find(content) ?? [...own].reverse().find((t) => t !== 'Outlet') ?? own[0];
   };
+  // The page an `element` shows: `element={<Outlet />}` renders the route inside it and nothing of its own.
+  const elementPage = (value: string | undefined): string | undefined => componentName(value, true)?.replace(/^Outlet$/, '') || undefined;
   // The few characters before `at`, trailing whitespace skipped: enough for the
   // end-anchored checks below without copying the whole prefix per `/` or `<`.
   const tokenBefore = (at: number): string => {
@@ -755,6 +1147,11 @@ function scanRoutes(
         // Skip a whole entry (spread, method, shorthand), but still visit nested units.
         const entry = i;
         while ((i = trivia(i)) < source.length && source[i] !== ',' && source[i] !== close) i = unit(i);
+        // `async lazy() { … }`: a route's loader written as a method.
+        const method = objects && ch === '{' ? /^(async\s+)?lazy\s*\(/.exec(source.slice(entry, entry + 32)) : null;
+        if (method) {
+          fields.set('lazy', { value: `${method[1] ?? ''}function ${source.slice(entry + method[0].length - 1, i).trim()}`, at: entry });
+        }
         if (routeList && ch === '[') {
           const text = source.slice(entry, i).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '').trim();
           const named = NAMED_ENTRY.exec(text);
@@ -772,7 +1169,7 @@ function scanRoutes(
       const expr = pathField && path === undefined && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(pathField.value) ? pathField.value : undefined;
       const component = componentName(fields.get('element')?.value, true)
         ?? componentName(fields.get('Component')?.value, false);
-      const lazy = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/.exec(fields.get('lazy')?.value ?? '')?.[1];
+      const lazy = lazyRouteReference(fields.get('lazy')?.value, elementPage);
       const index = fields.get('index');
       if (pathField && (path !== undefined || expr)) {
         scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, start: at, end: i, component, lazy });
@@ -824,10 +1221,9 @@ function scanRoutes(
       // `path="team"`, or the same string in braces: `path={"team"}`.
       const path = literal(pathText ?? '') ?? literal(expression('path') ?? '');
       routeTags.push({ at, spreads, path: expression('path')?.trim() });
-      // `element={<Outlet />}` renders the route inside it and nothing of its own.
-      const element = componentName(expression('element'), true)?.replace(/^Outlet$/, '') || undefined;
+      const element = elementPage(expression('element'));
       const component = componentName(expression('component'), false) ?? element;
-      const lazy = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/.exec(expression('lazy') ?? '')?.[1];
+      const lazy = lazyRouteReference(expression('lazy'), elementPage);
       const route: RouteScope = { part: { lit: path ?? '' }, at, start: at, end: source.length, component, lazy, jsx: true };
       if (path) scope = route;
       else if (pathText === undefined || path === '') {
@@ -887,7 +1283,7 @@ function scanRoutes(
   const around = (start: number, end: number): RouteScope[] =>
     scopes.filter((outer) => holds(outer, start, end)).sort((a, b) => a.start - b.start);
   const shown = (p: RoutePart): string => p.lit ?? `{${p.expr}}`;
-  const layoutOf = (s: RouteScope): string => s.component ?? LAZY_ROUTE_PREFIX + s.lazy;
+  const layoutOf = (s: RouteScope): string => (s.component ?? s.lazy)!;
   const partsOf = new Map<RouteScope, RoutePart[]>();
   const pathOf = new Map<RouteScope, string>();
   for (const scope of scopes) {
@@ -1021,6 +1417,11 @@ function elementTags(text: string): { own: string[]; props: string[] } {
 
 /** The comma-separated entries of a list's inside, nested brackets kept whole. */
 function topLevelEntries(text: string): string[] {
+  return topLevelItems(text).filter(Boolean);
+}
+
+/** The same, an empty entry kept for each hole: `[, second]` is `['', 'second']`. */
+function topLevelItems(text: string): string[] {
   const out: string[] = [];
   let depth = 0;
   let from = 0;
@@ -1037,8 +1438,423 @@ function topLevelEntries(text: string): string[] {
       from = i + 1;
     }
   }
-  out.push(text.slice(from).trim());
-  return out.filter(Boolean);
+  // A trailing comma ends a list without adding a hole.
+  const last = text.slice(from).trim();
+  if (last) out.push(last);
+  return out;
+}
+
+// =============================================================================
+// What a data router's `lazy` loader renders
+// =============================================================================
+
+/**
+ * A value a lazy loader hands over, as far as its source says: the module an
+ * `import('./x')` loads, one export of it, a name of the route's own file, an
+ * object literal (read in the scope it is written in), or the array a
+ * `Promise.all([…])` resolves to.
+ */
+type Loaded =
+  | { kind: 'module'; spec: string }
+  | { kind: 'export'; spec: string; name: string }
+  | { kind: 'name'; name: string }
+  | { kind: 'object'; text: string; scope: LoaderScope }
+  | { kind: 'array'; items: Array<Loaded | null> };
+
+/** The names a loader binds, each to what it holds: null for a value it does not read. */
+type LoaderScope = ReadonlyMap<string, Loaded | null>;
+
+const FIRST_IMPORT = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/;
+
+/**
+ * What a data-router `lazy` loader renders, as the route's reference names
+ * it. The loader resolves to the route's properties, and their `Component`,
+ * or the page their `element` shows, is what the route renders:
+ *
+ * - `() => import('./x')` hands over the module's exports: `lazy-import:./x`.
+ * - A loader that picks the page names the export it picks, `import:./x#Page`:
+ *   `const { Page } = await import('./x'); return { Component: Page }`,
+ *   `import('./x').then((m) => ({ Component: m.Page }))`, `({ Component:
+ *   (await import('./x')).Page })`, or React Router 7's `{ Component: async ()
+ *   => (await import('./x')).Page }`; `import:./x#default` for `const {
+ *   default: Component } = await import('./x')`.
+ * - A component of the route's own file it returns is named as written:
+ *   `return { loader, Component: SettingsPage }`.
+ *
+ * Undefined when it renders nothing, handing over only a `loader`. A loader
+ * this does not read, such as a helper's (`lazyPage(() => import('./x'))`)
+ * or `.then(convert)`, loads the module its first import names, as before.
+ */
+function lazyRouteReference(loader: string | undefined, elementPage: (jsx: string) => string | undefined): string | undefined {
+  if (!loader) return undefined;
+  const code = stripCommentsForRegex(loader, 'typescript').trim();
+  const rendered = code.startsWith('{') ? lazyPropertiesRender(code) : routeRender(loaderValue(code, new Map()), elementPage);
+  if (rendered === null) return undefined;
+  if (rendered !== undefined) return rendered;
+  const spec = FIRST_IMPORT.exec(code)?.[1];
+  return spec ? LAZY_ROUTE_PREFIX + spec : undefined;
+}
+
+/**
+ * What route properties a loader resolves to render: the reference for its
+ * page, null for none, undefined for properties this does not read.
+ */
+function routeRender(value: Loaded | null, elementPage: (jsx: string) => string | undefined): string | null | undefined {
+  if (value?.kind === 'module') return LAZY_ROUTE_PREFIX + value.spec;
+  if (value?.kind !== 'object') return undefined;
+  const { props, spreads } = objectEntries(value.text);
+  const component = props.get('Component');
+  const element = props.get('element');
+  const shown = component ?? element;
+  if (shown !== undefined) {
+    const named = component !== undefined ? pageReference(valueOf(component, value.scope)) : undefined;
+    if (named) return named;
+    // The one export the loader imported that it shows, past a guard of the
+    // route file's own: `<AgeGate><FireworksPage /></AgeGate>`, `() =>
+    // <PrivateRoute component={<Favorites />} />`, `withAuth(Page)`.
+    const loaded = loadedExports(shown, value.scope);
+    if (loaded.length === 1) return pageReference(loaded[0]!);
+    const tag = component === undefined && loaded.length === 0 ? elementPage(element!) : undefined;
+    return tag ? pageReference(nameValue(tag, value.scope)) : undefined;
+  }
+  // `{ ...module }`: the module's exports are the route's properties.
+  if (spreads.length === 0) return null;
+  const spread = spreads.length === 1 ? valueOf(spreads[0]!, value.scope) : null;
+  return spread?.kind === 'module' ? LAZY_ROUTE_PREFIX + spread.spec : undefined;
+}
+
+/**
+ * React Router 7's object of lazy properties, `lazy: { loader: …, Component:
+ * async () => (await import('./x')).Page }`: each loads on its own, and the
+ * `Component`'s loader resolves to the page itself.
+ */
+function lazyPropertiesRender(code: string): string | null | undefined {
+  if (matchBracket(code, 0) !== code.length - 1) return undefined;
+  const component = objectEntries(code.slice(1, -1)).props.get('Component');
+  if (component === undefined) return null;
+  const page = pageReference(loaderValue(component, new Map()));
+  if (page) return page;
+  const spec = FIRST_IMPORT.exec(component)?.[1];
+  return spec ? LAZY_ROUTE_PREFIX + spec : undefined;
+}
+
+/** The distinct exports `text` uses through the names a loader bound them to: `Page`, `m.Page`. */
+function loadedExports(text: string, scope: LoaderScope): Loaded[] {
+  const found = new Map<string, Loaded>();
+  for (const m of text.matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)(?:\s*\??\.\s*([A-Za-z_$][\w$]*))?/g)) {
+    const bound = scope.get(m[1]!);
+    const value = bound?.kind === 'module' && m[2] ? memberOf(bound, m[2]) : bound;
+    if (value?.kind === 'export') found.set(`${value.spec}#${value.name}`, value);
+  }
+  return [...found.values()];
+}
+
+/** The reference for the page a value is: an export a loader picks, or a component name of the route's file. */
+function pageReference(value: Loaded | null): string | undefined {
+  if (value?.kind === 'export') return `import:${value.spec}#${value.name}`;
+  if (value?.kind === 'name' && /^[A-Z]/.test(value.name) && value.name !== 'Outlet') return value.name;
+  return undefined;
+}
+
+/**
+ * What the function `text` resolves to when called, `param` handed to its
+ * first parameter: its expression body's value, or what the first `return`
+ * of its body hands back. Null for a function this does not read.
+ */
+function loaderValue(text: string, outer: LoaderScope, param: Loaded | null = null): Loaded | null {
+  const fn = functionParts(text);
+  if (!fn) return null;
+  const scope = new Map(outer);
+  topLevelItems(fn.params).forEach((p, i) => bindPattern(scope, parameterPattern(p), i === 0 ? param : null));
+  return fn.block ? blockValue(fn.body, scope) : valueOf(fn.body, scope);
+}
+
+/**
+ * An arrow function's or a `function`'s parameter list and body, its
+ * `async` and return type skipped. Null for any other expression.
+ */
+function functionParts(text: string): { params: string; body: string; block: boolean } | null {
+  let s = text.trim().replace(/^async\b\s*/, '');
+  const keyword = /^function\b\s*\*?\s*(?:[A-Za-z_$][\w$]*\s*)?/.exec(s);
+  if (keyword) s = s.slice(keyword[0].length);
+  let params: string;
+  let rest: string;
+  if (s.startsWith('(')) {
+    const close = matchBracket(s, 0);
+    if (close < 0) return null;
+    params = s.slice(1, close);
+    rest = s.slice(close + 1).trimStart();
+  } else {
+    const id = keyword ? null : /^[A-Za-z_$][\w$]*/.exec(s);
+    if (!id) return null;
+    params = id[0];
+    rest = s.slice(id[0].length).trimStart();
+  }
+  // `async (): Promise<RouteProps> => …`
+  if (!keyword && rest.startsWith(':')) {
+    const arrow = arrowAt(rest);
+    if (arrow < 0) return null;
+    rest = rest.slice(arrow);
+  }
+  if (keyword) {
+    return rest.startsWith('{') && matchBracket(rest, 0) === rest.length - 1 ? { params, body: rest.slice(1, -1), block: true } : null;
+  }
+  if (!rest.startsWith('=>')) return null;
+  const body = rest.slice(2).trim();
+  if (!body.startsWith('{')) return { params, body, block: false };
+  return matchBracket(body, 0) === body.length - 1 ? { params, body: body.slice(1, -1), block: true } : null;
+}
+
+/** Where the first `=>` outside brackets and strings is in `text`, or -1. */
+function arrowAt(text: string): number {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i = skipString(text, i);
+      if (i < 0) return -1;
+    } else if (ch === '{' || ch === '(' || ch === '[') {
+      i = matchBracket(text, i);
+      if (i < 0) return -1;
+    } else if (ch === '=' && text[i + 1] === '>') return i;
+  }
+  return -1;
+}
+
+/** A parameter's binding pattern, without its type or default: `{ default: Page }` of `{ default: Page }: Module`. */
+function parameterPattern(param: string): string {
+  param = param.replace(/^\.\.\.\s*/, '');
+  if (param.startsWith('{') || param.startsWith('[')) {
+    const close = matchBracket(param, 0);
+    return close < 0 ? '' : param.slice(0, close + 1);
+  }
+  return /^[A-Za-z_$][\w$]*/.exec(param)?.[0] ?? '';
+}
+
+/**
+ * The value a function body hands back from its first top-level `return`,
+ * its declarations bound on the way there. Nested blocks and functions are
+ * stepped over: what is declared or returned in there is theirs.
+ */
+function blockValue(body: string, scope: Map<string, Loaded | null>): Loaded | null {
+  const word = /[A-Za-z_$][\w$]*/y;
+  for (let i = 0; i < body.length;) {
+    const ch = body[i]!;
+    if (ch === '"' || ch === "'" || ch === '`' || ch === '{' || ch === '(' || ch === '[') {
+      const end = ch === '{' || ch === '(' || ch === '[' ? matchBracket(body, i) : skipString(body, i);
+      if (end < 0) return null;
+      i = end + 1;
+      continue;
+    }
+    word.lastIndex = i;
+    const w = word.exec(body)?.[0];
+    if (!w) {
+      i++;
+      continue;
+    }
+    const after = i + w.length;
+    const statement = i === 0 || !/[\w$.]/.test(body[i - 1]!);
+    i = after;
+    if (!statement) continue;
+    if (w === 'return') return valueOf(body.slice(after, statementEnd(body, after)), scope);
+    if (w === 'const' || w === 'let' || w === 'var') i = declare(body, after, scope);
+    else if (w === 'function' || w === 'class') {
+      const name = /^\s*\*?\s*([A-Za-z_$][\w$]*)/.exec(body.slice(after, after + 128));
+      if (name) scope.set(name[1]!, null);
+    }
+  }
+  return null;
+}
+
+/** Bind each declarator of a `const`, `let` or `var` whose first pattern starts at `at`; where the declaration ends. */
+function declare(body: string, at: number, scope: Map<string, Loaded | null>): number {
+  for (let i = at; ;) {
+    while (/\s/.test(body[i] ?? '')) i++;
+    let end: number;
+    if (body[i] === '{' || body[i] === '[') end = matchBracket(body, i) + 1;
+    else end = i + (/^[A-Za-z_$][\w$]*/.exec(body.slice(i, i + 128))?.[0].length ?? 0);
+    if (end <= i) return Math.max(end, i + 1);
+    const pattern = body.slice(i, end);
+    const init = initializerAt(body, end);
+    let stop = end;
+    if (init < 0) bindPattern(scope, pattern, null);
+    else {
+      stop = statementEnd(body, init, true);
+      bindPattern(scope, pattern, valueOf(body.slice(init, stop), scope));
+    }
+    while (/\s/.test(body[stop] ?? '')) stop++;
+    if (body[stop] !== ',') return stop;
+    i = stop + 1;
+  }
+}
+
+/** Where a declarator's initializer starts, past its `: Type` and `=`; -1 when it has none. */
+function initializerAt(body: string, at: number): number {
+  for (let i = at; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i = skipString(body, i);
+      if (i < 0) return -1;
+    } else if (ch === '{' || ch === '(' || ch === '[') {
+      i = matchBracket(body, i);
+      if (i < 0) return -1;
+    } else if (ch === '=') {
+      if (body[i + 1] === '>' || body[i + 1] === '=') i++;
+      else return i + 1;
+    } else if (ch === ';' || ch === ',' || ch === '}' || ch === ')') return -1;
+  }
+  return -1;
+}
+
+/**
+ * Where the statement or declarator from `from` ends: at a `;`, a closing
+ * bracket, a `,` when `comma`, or at a line break neither line continues
+ * across, where JavaScript ends a statement without a semicolon.
+ */
+function statementEnd(text: string, from: number, comma = false): number {
+  let last = '';
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'" || ch === '`' || ch === '{' || ch === '(' || ch === '[') {
+      const end = ch === '{' || ch === '(' || ch === '[' ? matchBracket(text, i) : skipString(text, i);
+      if (end < 0) return text.length;
+      i = end;
+      last = text[end]!;
+      continue;
+    }
+    if (ch === ';' || ch === '}' || ch === ')' || ch === ']' || (comma && ch === ',')) return i;
+    if (ch === '\n') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (last && !/[=(,[{?:&|+\-*/%<>!.]/.test(last) && !/[.?:&|+\-*/%=<>,([]/.test(text[j] ?? '')) return i;
+      continue;
+    }
+    if (!/\s/.test(ch)) last = ch;
+  }
+  return text.length;
+}
+
+/** What expression `text` evaluates to in a loader, or null when it is not one this reads. */
+function valueOf(text: string, scope: LoaderScope): Loaded | null {
+  let s = text.trim();
+  // `await`, and parentheses around the whole expression, change nothing here.
+  for (let before = ''; before !== s;) {
+    before = s;
+    s = s.replace(/^await\b\s*/, '');
+    if (s.startsWith('(') && matchBracket(s, 0) === s.length - 1) s = s.slice(1, -1).trim();
+  }
+  if (s.startsWith('{') || s.startsWith('[')) {
+    if (matchBracket(s, 0) !== s.length - 1) return null;
+    const inside = s.slice(1, -1);
+    return s[0] === '{'
+      ? { kind: 'object', text: inside, scope }
+      : { kind: 'array', items: topLevelItems(inside).map((item) => (item ? valueOf(item, scope) : null)) };
+  }
+  // The head: `import('./x')`, `Promise.all([…])`, a name, or a parenthesized expression.
+  const head = /^(?:(import)\s*\(|(Promise)\s*\.\s*all\s*\(|([A-Za-z_$][\w$]*)|\()/.exec(s);
+  if (!head) return null;
+  let value: Loaded | null;
+  let i: number;
+  if (head[3]) {
+    value = nameValue(head[3], scope);
+    i = head[0].length;
+  } else {
+    const open = head[0].length - 1;
+    const close = matchBracket(s, open);
+    if (close < 0) return null;
+    const inside = s.slice(open + 1, close);
+    if (head[1]) {
+      const spec = /^\s*(["'])([^"'`]+)\1\s*$/.exec(inside)?.[2];
+      value = spec ? { kind: 'module', spec } : null;
+    } else if (head[2]) {
+      const all = valueOf(inside, scope);
+      value = all?.kind === 'array' ? all : null;
+    } else value = valueOf(inside, scope);
+    i = close + 1;
+  }
+  // Then each `.name`, `?.name`, `['name']` and `.then(…)` on it.
+  while (value && i < s.length) {
+    const rest = s.slice(i);
+    const then = /^\s*\??\.\s*then\s*\(/.exec(rest);
+    if (then) {
+      const open = i + then[0].length - 1;
+      const close = matchBracket(s, open);
+      if (close < 0 || value.kind !== 'module') return null;
+      const callback = topLevelItems(s.slice(open + 1, close))[0];
+      value = callback ? loaderValue(callback, scope, value) : null;
+      i = close + 1;
+      continue;
+    }
+    const dot = /^\s*\??\.\s*([A-Za-z_$][\w$]*)/.exec(rest);
+    const bracket = dot ? null : /^\s*\[\s*(["'])([A-Za-z_$][\w$]*)\1\s*\]/.exec(rest);
+    const name = dot?.[1] ?? bracket?.[2];
+    if (name === undefined) return null;
+    value = memberOf(value, name);
+    i += (dot ?? bracket)![0].length;
+  }
+  return value;
+}
+
+/** What a name holds in a loader: what it binds there, or else a name of the route's own file. */
+function nameValue(name: string, scope: LoaderScope): Loaded | null {
+  return scope.has(name) ? scope.get(name) ?? null : { kind: 'name', name };
+}
+
+/** A property of a value: an export of a module, or what an object literal holds under `key`. */
+function memberOf(value: Loaded | null, key: string): Loaded | null {
+  if (value?.kind === 'module') return { kind: 'export', spec: value.spec, name: key };
+  if (value?.kind !== 'object') return null;
+  const text = objectEntries(value.text).props.get(key);
+  return text === undefined ? null : valueOf(text, value.scope);
+}
+
+/**
+ * Bind the names `pattern` declares to the parts of `value` they take: `{
+ * Page, default: Home }` of a module to its exports, `[{ Page }]` to the first
+ * item of a `Promise.all`. A name whose value this does not read is bound to
+ * null, so it never counts as a name of the route's file.
+ */
+function bindPattern(scope: Map<string, Loaded | null>, pattern: string, value: Loaded | null): void {
+  const p = pattern.trim();
+  if (!p) return;
+  if (/^[A-Za-z_$][\w$]*$/.test(p)) {
+    scope.set(p, value);
+    return;
+  }
+  const close = p.startsWith('{') || p.startsWith('[') ? matchBracket(p, 0) : -1;
+  if (close !== p.length - 1) {
+    for (const name of p.matchAll(/[A-Za-z_$][\w$]*/g)) scope.set(name[0], null);
+    return;
+  }
+  const items = topLevelItems(p.slice(1, -1));
+  items.forEach((item, index) => {
+    if (!item) return;
+    const rest = /^\.\.\.\s*([\s\S]*)$/.exec(item);
+    if (rest) return bindPattern(scope, rest[1]!, null);
+    if (p[0] === '[') {
+      return bindPattern(scope, item.replace(/\s*=(?![=>])[\s\S]*$/, ''), value?.kind === 'array' ? value.items[index] ?? null : null);
+    }
+    // `Page`, `Page = Fallback`, `default: Home`, `'default': Home`.
+    const prop = /^(?:([A-Za-z_$][\w$]*)|(["'])([^"']*)\2)\s*(?::\s*([\s\S]+?))?\s*(?:=(?![=>])[\s\S]*)?$/.exec(item);
+    if (!prop) return bindPattern(scope, item.replace(/^[^:]*:/, ''), null);
+    const key = prop[1] ?? prop[3]!;
+    bindPattern(scope, prop[4] ?? key, memberOf(value, key));
+  });
+}
+
+/** An object literal's own properties, each name to its value's text — shorthand and methods included — and its spreads. */
+function objectEntries(text: string): { props: Map<string, string>; spreads: string[] } {
+  const props = new Map<string, string>();
+  const spreads: string[] = [];
+  for (const entry of topLevelEntries(text)) {
+    const spread = /^\.\.\.\s*([\s\S]+)$/.exec(entry);
+    const pair = spread ? null : /^(?:([A-Za-z_$][\w$]*)|(["'])([A-Za-z_$][\w$]*)\2)\s*:\s*([\s\S]+)$/.exec(entry);
+    const method = spread || pair ? null : /^(async\s+)?([A-Za-z_$][\w$]*)\s*\(/.exec(entry);
+    if (spread) spreads.push(spread[1]!);
+    else if (pair) props.set(pair[1] ?? pair[3]!, pair[4]!);
+    else if (method) props.set(method[2]!, `${method[1] ?? ''}function ${entry.slice(method[0].length - 1)}`);
+    else if (/^[A-Za-z_$][\w$]*$/.test(entry)) props.set(entry, entry);
+  }
+  return { props, spreads };
 }
 
 // =============================================================================
@@ -1065,7 +1881,7 @@ function routeReferences(route: RouteDeclaration, fromNodeId: string, filePath: 
   const ref = (referenceName: string): UnresolvedRef =>
     ({ fromNodeId, referenceName, referenceKind: 'references', line, column: 0, filePath, language });
   const refs: UnresolvedRef[] = [];
-  const target = route.component ?? (route.lazy ? LAZY_ROUTE_PREFIX + route.lazy : undefined);
+  const target = route.component ?? route.lazy;
   if (target) refs.push(ref(target));
   for (const layout of route.layouts) refs.push(ref(LAYOUT_PREFIX + layout));
   return refs;

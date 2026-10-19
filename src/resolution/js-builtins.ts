@@ -34,6 +34,21 @@ export const JS_BUILTIN_METHODS = new Set([
 ]);
 
 /**
+ * The methods an array has: `Array.prototype`'s and those every object
+ * inherits. On a local annotated as an array (`items: Item[]`) a call of one
+ * is the array's, never a method of the element's class.
+ */
+export const JS_ARRAY_METHODS = new Set([
+  'at', 'concat', 'copyWithin', 'entries', 'every', 'fill', 'filter', 'find',
+  'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'forEach',
+  'includes', 'indexOf', 'join', 'keys', 'lastIndexOf', 'map', 'pop', 'push',
+  'reduce', 'reduceRight', 'reverse', 'shift', 'slice', 'some', 'sort', 'splice',
+  'toReversed', 'toSorted', 'toSpliced', 'unshift', 'values', 'with',
+  'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
+  'propertyIsEnumerable',
+]);
+
+/**
  * TypeScript primitive type names. Distinct from JS_BUILT_INS on purpose: those
  * are runtime globals a receiver can be constructed from, these only ever come
  * from a type annotation. A receiver typed `string` calls a built-in string

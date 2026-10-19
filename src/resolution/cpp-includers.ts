@@ -3,8 +3,10 @@
  * then the files that include those, out to the translation units.
  *
  * Read from the `import` node extraction mints for every `#include`, each
- * resolved by the import resolver exactly as the graph's include edge is, so
- * "includes" here is the include edge a reader sees. The name matcher asks it
+ * resolved by the coordinator's import lookup as the graph's include edge is
+ * (by the end of its path when nothing else places it, and never to a project
+ * file for a standard header like `<math.h>`), so "includes" here is the
+ * include edge a reader sees. The name matcher asks it
  * whether a C or C++ file named like a test is part of a reference's
  * translation unit: protobuf's conformance framework lives in
  * `conformance/conformance_test.h` and `test_runner.h`, which the suites and
