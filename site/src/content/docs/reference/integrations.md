@@ -15,6 +15,7 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **Kimi Code** — MCP entry goes in `~/.kimi-code/mcp.json` (global) or `./.kimi-code/mcp.json` (project); Kimi Code infers stdio from the `command` field and only connects servers at session start.
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
