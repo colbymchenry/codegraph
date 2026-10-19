@@ -112,4 +112,28 @@ describe('a call on a value of a class its file names', () => {
       'src/app/service.ts: this.logService.trace -> src/platform/log.ts::ILogger::trace',
     ]);
   }, 60_000);
+
+  it('reaches it through an interface another file extends, whose import also names a constant', async () => {
+    // vscode's `ITerminalLogService extends ILogService`, `ILogService` both
+    // an interface and its `createDecorator` constant.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app' }),
+      'src/platform/log.ts':
+        'function createDecorator<T>(id: string): T {\n  return id as unknown as T;\n}\n' +
+        'export interface ILogger {\n  trace(message: string): void;\n}\n' +
+        "export const ILogService = createDecorator<ILogService>('logService');\n" +
+        'export interface ILogService extends ILogger {\n  flush(): void;\n}\n',
+      'src/app/legacy/log.ts': 'export interface ILogger {\n  trace(message: string): void;\n}\n',
+      'src/terminal/terminal.ts':
+        "import { ILogService } from '../platform/log';\n" +
+        'export interface ITerminalLogService extends ILogService {\n  logTerminal(): void;\n}\n',
+      'src/terminal/service.ts':
+        "import { ITerminalLogService } from './terminal';\n" +
+        'export class TerminalService {\n  constructor(private readonly _logService: ITerminalLogService) {}\n' +
+        "  run() {\n    this._logService.trace('a');\n  }\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('this._logService.'))).toEqual([
+      'src/terminal/service.ts: this._logService.trace -> src/platform/log.ts::ILogger::trace',
+    ]);
+  }, 60_000);
 });
