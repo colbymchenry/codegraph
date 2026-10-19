@@ -51,7 +51,7 @@ impl Variant {
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
 fn is_method_type(v: Variant, kind: &str) -> bool {
     kind == "method_definition"
-        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature"))
+        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature" | "abstract_method_signature"))
         || (!v.is_ts() && kind == "field_definition")
 }
 
@@ -74,7 +74,7 @@ fn is_property_type(v: Variant, kind: &str) -> bool {
 /// `function stop` beside the real `Handle::stop`. Mirrors the TS extractor's
 /// SIGNATURE_METHOD_NODE_TYPES (extraction/tree-sitter.ts).
 fn is_signature_method_type(kind: &str) -> bool {
-    kind == "method_signature"
+    matches!(kind, "method_signature" | "abstract_method_signature")
 }
 
 fn is_function_type(kind: &str) -> bool {
