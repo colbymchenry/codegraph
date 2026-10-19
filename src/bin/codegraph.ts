@@ -1511,11 +1511,11 @@ program
 
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
-      const prompt = String(input.prompt || '');
-      // System-injected task notifications and subagent hand-backs are not
-      // user prompts: exit before any project lookup or explore work (#1832,
-      // #2184).
-      if (isTaskNotification(prompt) || isAgentMessage(prompt)) return;
+      // Desktop reminders are hook metadata, not part of the user's query (#2635).
+      const prompt = String(input.prompt || '')
+        .replace(/<system-reminder(?:\s[^>]*)?>[\s\S]*?<\/system-reminder>/g, '').trim();
+      // System envelopes are not user prompts: exit before the gate or project lookup.
+      if (!prompt || isTaskNotification(prompt) || isAgentMessage(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that

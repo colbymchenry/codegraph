@@ -1115,11 +1115,11 @@ export function isTaskNotification(prompt: string): boolean {
 }
 
 /**
- * Claude Code hands a subagent's report back to the parent session as a
- * `<agent-message from="…">…</agent-message>` prompt, which UserPromptSubmit
- * hooks also receive (#2184). Same rule as {@link isTaskNotification}: only a
- * prompt that is entirely that envelope is skipped.
+ * Claude Code delivers subagent reports as `<agent-message from="…">` (#2184)
+ * and local session messages as `<cross-session-message from="…">` (#2635).
+ * Same rule as {@link isTaskNotification}: only a prompt that is entirely
+ * that envelope is skipped.
  */
 export function isAgentMessage(prompt: string): boolean {
-  return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
+  return /^\s*<(agent-message|cross-session-message)(?:\s[^>]*)?>[\s\S]*<\/\1>\s*$/.test(prompt);
 }
