@@ -25,6 +25,7 @@ import {
   inferLocalReceiverType,
   arrayElementType,
   tsImportedTypeFile,
+  reExportSource,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -2246,6 +2247,24 @@ export function resolveViaImport(
         }
       }
     }
+  }
+
+  // A barrel's own `export { A, B as C } from './x'` names `A` and `B` the way
+  // the module calls them, and binds neither, so no import above holds them.
+  // Each resolves through the module the statement names, as an import does:
+  // looked up by its name alone, it reached a namesake elsewhere in the
+  // project (luci-go milo's commit table barrel, a build table's context).
+  if (ref.referenceKind === 'imports' && ESM_IMPORT_LANGUAGES.has(ref.language)) {
+    const source = reExportSource(ref.referenceName, ref, context);
+    const resolvedPath = source === undefined ? null : resolveImportPath(source, ref.filePath, ref.language, context);
+    const targetNode = resolvedPath === null ? undefined : findExportedSymbol(
+      resolvedPath,
+      { isDefault: false, isNamespace: false, exportedName: ref.referenceName, memberName: null },
+      ref.language,
+      context,
+      new Set()
+    );
+    if (targetNode) return { original: ref, targetNodeId: targetNode.id, confidence: 0.9, resolvedBy: 'import' };
   }
 
   return null;
