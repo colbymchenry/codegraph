@@ -7,8 +7,10 @@
  * own file, then took the first declaration indexed: on vscode, calls in
  * `src/vs/` on a `DisposableStore` imported from `vs/base/common/lifecycle`
  * reached copilot's vendored copy under `extensions/copilot/src/util/vs/`,
- * and a test's `Emitter` a fixture's copy. Java and Kotlin already followed
- * the import (#314).
+ * and on an `Emitter` a copilot test fixture's. `this.<field>` calls broke
+ * it by folder nearness, which took react-native's Jest mock of
+ * `NativeEventEmitter` over the class beside it. Java and Kotlin already
+ * followed the import (#314).
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';

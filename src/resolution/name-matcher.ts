@@ -12767,12 +12767,13 @@ const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string
 
 /**
  * The file declaring the type a TS/JS file imports under the name a
- * declaration in it writes (`store: DisposableStore`, `new models.Item()`),
+ * declaration in it writes (`store: DisposableStore`, `new async.Delayer()`),
  * or undefined when the file doesn't import that name. Several classes may
  * share it, a vendored copy, a test fixture or another app's, and the import
- * is what says which one the file means: on vscode, `store: DisposableStore`
- * imported from `vs/base/common/lifecycle` reached copilot's vendored copy,
- * the first declaration indexed.
+ * is what says which one the file means: on vscode, calls on a
+ * `DisposableStore` imported from `vs/base/common/lifecycle` reached
+ * copilot's vendored copy of that file, the first declaration indexed, and
+ * a call whose first declaration was a test fixture's linked to nothing.
  */
 function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
   const name = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/.exec(written.trim())?.[0];
