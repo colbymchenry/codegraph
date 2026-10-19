@@ -8959,6 +8959,8 @@ export function resolveMethodOnType(
    * signal Java imports carry but the call site doesn't (#314).
    * For Go it is the project-relative directory of the package that
    * declares `typeName`, when that is known (resolveGoMethodInPackage).
+   * For TS/JS it is the file declaring the class the caller's file
+   * imports under that name (tsImportedTypeFile).
    */
   preferredFqn?: string,
   /** Recursion guard for the supertype/conformance walk. */
@@ -9024,7 +9026,11 @@ export function resolveMethodOnType(
     return null;
   }
 
-  if (matches.length > 1 && preferredFqn && ref.language !== 'go') {
+  if (matches.length > 1 && preferredFqn && ESM_FAMILY.has(ref.language)) {
+    const chosen = matches.find((m) => m.filePath === preferredFqn);
+    if (chosen) return { original: ref, targetNodeId: chosen.id, confidence, resolvedBy };
+  }
+  if (matches.length > 1 && preferredFqn && ref.language !== 'go' && !ESM_FAMILY.has(ref.language)) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
@@ -9047,9 +9053,9 @@ export function resolveMethodOnType(
   // the definition in the CALL SITE's own file. Without this, every ambiguous
   // call collapses onto the first-indexed definition, so a call in `b/svc.cpp`
   // wrongly points at `a/svc.cpp` (#1079). This runs AFTER the `preferredFqn`
-  // block, so Java/Kotlin import disambiguation — whose target is intentionally
-  // in ANOTHER file (#314) — is unaffected: that block returns early whenever
-  // an import FQN pins the class.
+  // blocks, so Java/Kotlin and TS/JS import disambiguation — whose target is
+  // intentionally in ANOTHER file (#314) — is unaffected: those blocks return
+  // early whenever an import pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
   const ordered = preferCallSiteFile(cppVisibleFirst(matches, ref, context), ref.filePath);
   return {
@@ -12756,6 +12762,42 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
+/** Per-context memo: `<file>\0<type name as written>` → tsImportedTypeFile's answer. */
+const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The file declaring the type a TS/JS file imports under the name a
+ * declaration in it writes (`store: DisposableStore`, `new async.Delayer()`),
+ * or undefined when the file doesn't import that name. Several classes may
+ * share it, a vendored copy, a test fixture or another app's, and the import
+ * is what says which one the file means: on vscode, calls on a
+ * `DisposableStore` imported from `vs/base/common/lifecycle` reached
+ * copilot's vendored copy of that file, the first declaration indexed, and
+ * a call whose first declaration was a test fixture's linked to nothing.
+ */
+function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const name = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/.exec(written.trim())?.[0];
+  if (!name) return undefined;
+  let memo = TS_IMPORTED_TYPE_FILES.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_IMPORTED_TYPE_FILES.set(context, memo);
+  }
+  const key = ref.filePath + '\0' + name;
+  let file = memo.get(key);
+  if (file === undefined) {
+    file = null;
+    const binding = name.split('.')[0]!;
+    if (context.getImportMappings?.(ref.filePath, ref.language)?.some((i) => i.localName === binding)) {
+      const imported = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
+      const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
+      if (node && node.kind !== 'file' && node.filePath !== ref.filePath) file = node.filePath;
+    }
+    memo.set(key, file);
+  }
+  return file ?? undefined;
+}
+
 /**
  * Java/Kotlin: infer a receiver's declared type by walking field declarations
  * in the class enclosing the call site. The field's `signature` is already in
@@ -12924,6 +12966,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PYTHON_IMPORTED_FILES.delete(context);
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
+  TS_IMPORTED_TYPE_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -14240,7 +14283,8 @@ export function matchMethodCall(
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
       // Java/Kotlin: when two classes share the simple name, the file's import
-      // pins WHICH one (#314); Go: the package that declares the type (#2323).
+      // pins WHICH one (#314); Go: the package that declares the type (#2323);
+      // TS/JS: the file declaring the class the file imports under that name.
       // Other languages disambiguate by call-site file.
       const importedFqn =
         ref.language === 'java' || ref.language === 'kotlin'
@@ -14249,7 +14293,9 @@ export function matchMethodCall(
               .find((i) => i.localName === inferredType)?.source
           : ref.language === 'go'
             ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
-            : undefined;
+            : ESM_FAMILY.has(ref.language) && !awaited
+              ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
+              : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
@@ -15768,12 +15814,17 @@ function matchTsThisFieldCall(
     // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
     const typeName = decl.type.split('.').pop()!;
     if (!/^[A-Z]/.test(typeName)) return null;
-    // Two apps in one repo may each declare a `UserService`. The bare-name
-    // path this replaces broke that tie by directory proximity, so keep the
-    // same signal: among the type's declarations of the method, prefer the
-    // one closest to the call site's directory (its own app), never index
-    // order. resolveMethodOnType still answers the single-declaration and
-    // supertype cases.
+    // Two apps in one repo may each declare a `UserService`. The call's file
+    // imports the one its field holds, so that one's method is the call's.
+    // Only the call's file: a field read off a same-named class elsewhere
+    // follows that file's imports, not this one's (vscode's two
+    // `MethodContextProvider`s import two `Symbols`). Without an import, the
+    // bare-name path this replaces broke the tie by directory proximity, so
+    // keep the same signal: among the type's declarations of the method,
+    // prefer the one closest to the call site's directory (its own app),
+    // never index order. resolveMethodOnType still answers the
+    // single-declaration and supertype cases.
+    const imported = tsImportedTypeFile(decl.type, ref, context);
     const declared = context
       .getNodesByName(methodName)
       .filter(
@@ -15783,6 +15834,8 @@ function matchTsThisFieldCall(
           (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
       );
     if (declared.length > 1) {
+      const own = imported !== undefined ? declared.find((n) => n.filePath === imported) : undefined;
+      if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
       const callDirs = ref.filePath.split('/').slice(0, -1);
       const shared = (fp: string) => {
         const dirs = fp.split('/').slice(0, -1);
@@ -15793,7 +15846,7 @@ function matchTsThisFieldCall(
       const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
       return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
     }
-    return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+    return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
   }
   return null;
 }
