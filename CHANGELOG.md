@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
+### Security
+
+- Indexing now bounds re-export searches so deeply interconnected modules cannot cause exponential work and block the process. (#1337)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
@@ -168,6 +176,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In TypeScript and JavaScript, a call on a variable, parameter or field whose class the file imports, like `store.add(…)` with `store: DisposableStore`, now links to the method of the class that import names when other classes in the project share its name, such as a vendored copy, a test mock or another app's class. Before, it linked to whichever of them was indexed first, or to the one in the nearest folder: in vscode, calls on classes imported from vscode's own `vs/base` and `vs/platform` reached the copies the Copilot extension vendors or its test fixtures, in bitwarden the desktop app's `initService.init()` reached the browser extension's `InitService`, and in react-native `Keyboard` and `WebSocket` reached the Jest mock of `NativeEventEmitter`. A call whose first match was a test file's class, which then linked to nothing, now reaches the imported class too. The import is followed through re-exports, `import type`, namespace imports like `new async.Delayer()` and `require(…)`. Re-index TypeScript and JavaScript projects after upgrading.
 - In TypeScript and JavaScript, a call on a value another file exports, like `store.add(…)` after `import { store } from './state'` with `export const store = new Store()` there, now links to the method of the class that file imports or declares when other classes in the project share its name, in Vue, Svelte and Astro components too. Before, it linked to whichever of them was indexed first: in vscode, calls on `FileAccess`, `extUri`, `errorHandler` and `MenuRegistry` reached the copies the Copilot extension vendors or one of its test fixtures, and in folo the mobile app's `settingSyncQueue.init()` reached the desktop app's `SettingSyncQueue`. Re-index TypeScript and JavaScript projects after upgrading.
 - In TypeScript, a call through a field that a wrapper sets up, like `this._onDidChange.fire()` after `private readonly _onDidChange = this._register(new Emitter<void>())` or `= this._store.add(new Emitter<void>())`, now links to the method of the class handed to the wrapper, also in a class that inherits the field. Before, such a field had no type, so its calls linked nowhere, and that is one of the most common ways vscode declares its event emitters and disposables. A wrapper counts only when its own declaration hands back what it is given, like `_register<T>(o: T): T`, so a field set from a wrapper that returns something else, or from a member of what it returns (`.event`), is never taken for the class. A call through an inherited field is also found now when the field is declared further up the class hierarchy than before. Re-index TypeScript projects after upgrading.
+
+#### Haskell indexing
+
+- Large Haskell projects index and refresh exported definitions faster while preserving import visibility and ambiguity checks. (#1337)
+
+- Haskell local functions keep their callers when they shadow a parameter with the same name. (#1337)
+
+- Custom Haskell functions named like standard combinators no longer create calls to arguments they do not execute. (#1337)
+
+- Haskell pattern synonyms now retain calls through local helpers while excluding quoted code that is not executed.
+
+- Haskell calls now respect nested and inline local scopes, keeping helpers from capturing unrelated calls elsewhere in a function.
+
+- Haskell names shared by a module declaration and an import remain unresolved when ambiguous, including after an imported module changes its exports.
+
+- Haskell record fields shared by several constructors resolve as one selector per type, and applied deriving clauses no longer create false class relationships.
+
+- Haskell record construction now links each field to the type named by its constructor, including through qualified imports.
+
+- Incremental Haskell updates refresh affected module imports with fewer database reads while preserving unrelated graph relationships.
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 ## [1.6.2] - 2026-10-03
 

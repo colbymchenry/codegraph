@@ -57,8 +57,13 @@ parser.setLanguage(language);
 let ok = 0, err = 0;
 for (let i = 0; i < iters; i++) {
   const tree = parser.parse(source);
-  if (tree.rootNode.hasError) err++; else ok++;
+  try {
+    if (tree.rootNode.hasError) err++; else ok++;
+  } finally {
+    tree.delete();
+  }
 }
+parser.delete();
 
 console.log(`grammar: ${wasmPath.split('/').pop()}`);
 console.log(`  ABI version: ${language.abiVersion}`);

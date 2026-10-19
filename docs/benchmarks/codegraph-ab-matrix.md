@@ -86,6 +86,20 @@ when the whole flow fits in one or two files) — but reads still drop.
 without-arm additionally ran **52 globs + 37 shell `find`/`grep` (Bash) + 1 sub-agent** that the
 with-arm (**0 Bash, 0 sub-agents**) never needed. (74 agent runs, $29.18 total.)
 
+### Provisional Haskell PR snapshot (excluded from the totals above)
+
+These Haskell results were contributed with the unreleased implementation after the official
+0.9.4 matrix run. They are **one run per arm**, cover Small and Medium repositories only, and are
+directional rather than release-grade evidence; repeat them on Small, Medium, and Large public
+repositories with the current multi-run harness before folding Haskell into the official totals.
+
+| Language | Size | Repo | files | **with** R/G | cg-calls | dur | **without** R/G | dur | reads saved |
+|---|---|---|--:|---|--:|--:|---|--:|--:|
+| Haskell | S | `xmonad` | 39 | 0R / 0G | 2 | 29s | 14R / 1G / 7B / 1Ag | 84s | 14 |
+| Haskell | S | `shellcheck` | 33 | 0R / 0G | 9 | 57s | 20R / 1G / 18B / 1Ag | 118s | 20 |
+| Haskell | M | `purescript` | 270 | 0R / 0G | 9 | 69s | 18R / 15B / 1Ag | 110s | 18 |
+| Haskell | M | `pandoc` | 557 | 0R / 0G | 5 | 50s | 16R / 2G / 15B / 1Ag | 103s | 16 |
+
 ## Observations
 
 - **Biggest wins are medium/large backends with a real route→handler→service flow:** aspnet-jellyfin
@@ -110,10 +124,11 @@ with-arm (**0 Bash, 0 sub-agents**) never needed. (74 agent runs, $29.18 total.)
 
 ## Coverage note
 
-All 14 README frameworks and every flow-relevant language are validated (see the playbook). The
-sizes here are by indexed file count; a few languages lack a clean third size in the corpus
+For the 0.9.4 language set, all 14 README frameworks and every flow-relevant language were
+validated (see the playbook). Sizes here are by indexed file count; a few languages lack a clean third size in the corpus
 (Dart/Kotlin = S/M, Scala/Luau = S only, C = L only, C++ = M only) — those cells are omitted rather
-than faked.
+than faked. This official 0.9.4 claim predates Haskell; the provisional Haskell rows above are not
+part of it and still need the current Small/Medium/Large multi-run validation.
 
 ## Reproduce
 
