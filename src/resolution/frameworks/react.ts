@@ -11,7 +11,7 @@ import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
 import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
-import { makeLineAt } from '../synth-utils';
+import { FN_KINDS, makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
 
@@ -1989,13 +1989,18 @@ function scriptLanguage(filePath: string): Language {
   return /\.tsx$/.test(filePath) ? 'tsx' : /\.[cm]?ts$/.test(filePath) ? 'typescript' : /\.jsx$/.test(filePath) ? 'jsx' : 'javascript';
 }
 
-/** The literal a table name stands for in `file`: declared there, or imported. */
+/**
+ * The literal a table name stands for in `file`: declared there, or
+ * imported. A value that holds a call's result — Medusa's `const routes =
+ * getRouteMap({ … })` — stands for the table the function returns.
+ */
 function tableNamed(named: TableName, file: string, context: ResolutionContext, depth = 0): { file: string; at: number } | null {
   const source = context.readFile(file);
   if (!source) return null;
   const safe = stripCommentsForRegex(source, 'typescript');
-  const local = declaredTable(safe, named.name, named.call);
-  if (local !== null) return { file, at: local };
+  const local = declaredTable(safe, named.name, named.call, visibleAt(named.at, safe, file, context));
+  if (typeof local === 'number') return { file, at: local };
+  if (local) return depth > 3 ? null : tableNamed(local, file, context, depth + 1);
   const language = scriptLanguage(file);
   const mapping = context.getImportMappings(file, language).find((m) => m.localName === named.name);
   if (!mapping || mapping.isNamespace || depth > 3) return null;
@@ -2014,8 +2019,10 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     const m = /\bexport\s+default\s+/.exec(safe);
     if (m) {
       const after = m.index + m[0].length;
-      const inline = call ? returnedTable(safe, after) : safe[after] === '[' || safe[after] === '{' ? after : null;
-      if (inline !== null) return { file, at: inline };
+      const inline = call ? returnedTable(safe, after) : heldTable(safe, after);
+      if (typeof inline === 'number') return { file, at: inline };
+      // `export default buildRoutes()`
+      if (inline) return depth > 3 ? null : tableNamed(inline, file, context, depth + 1);
       local = /^([A-Za-z_$][\w$]*)\s*(?:;|\n|$)/.exec(safe.slice(after))?.[1] ?? '';
     } else local = /\bexport\s*\{[^}]*?\b([A-Za-z_$][\w$]*)\s+as\s+default\b/.exec(safe)?.[1] ?? '';
   } else {
@@ -2023,8 +2030,10 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     const alias = new RegExp(`\\bexport\\s*\\{[^}]*?\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${exported.replace(/\$/g, '\\$')}\\b`).exec(safe);
     if (alias) local = alias[1]!;
   }
-  const at = local ? declaredTable(safe, local, call) : null;
-  if (at !== null) return { file, at };
+  // What a module exports is declared at its top level.
+  const at = local ? declaredTable(safe, local, call, visibleAt(undefined, safe, file, context)) : null;
+  if (typeof at === 'number') return { file, at };
+  if (at) return depth > 3 ? null : tableNamed(at, file, context, depth + 1);
   if (depth > 3) return null;
   // `export { routes } from './routes'`, `export { default as routes } from './routes'`, `export * from './routes'`.
   const language = scriptLanguage(file);
@@ -2038,18 +2047,79 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
   return null;
 }
 
-/** Where `name`'s table literal opens, for `const name = [ … ]` (or a function returning one when `call`). */
-function declaredTable(safe: string, name: string, call: boolean): number | null {
+/**
+ * Where `name`'s table literal opens, for `const name = [ … ]` (or a function
+ * returning one when `call`) — or, for `const name = getRouteMap({ … })`, the
+ * function whose returned table the value holds. Of several declarations of
+ * the name, the one `visible` picks.
+ */
+function declaredTable(
+  safe: string,
+  name: string,
+  call: boolean,
+  visible: (keywords: number[]) => number | undefined
+): number | TableName | null {
   const id = name.replace(/\$/g, '\\$');
-  const decl = new RegExp(`(?:^|[^\\w$.])(?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*`).exec(safe);
+  const decls = [...safe.matchAll(new RegExp(`(?:^|[^\\w$.])((?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*)`, 'g'))];
+  const chosen = decls.length > 0 ? visible(decls.map((d) => d.index + d[0].length - d[1]!.length)) : undefined;
+  const decl = chosen === undefined ? undefined : decls[chosen];
   if (decl) {
     const after = decl.index + decl[0].length;
     if (call) return returnedTable(safe, after);
-    return safe[after] === '[' || safe[after] === '{' ? after : null;
+    return heldTable(safe, after);
   }
   if (!call) return null;
   const fn = new RegExp(`(?:^|[^\\w$.])function\\s+${id}\\s*\\(`).exec(safe);
   return fn ? returnedTable(safe, fn.index + fn[0].indexOf('function')) : null;
+}
+
+/**
+ * The table a value written at `at` gives: the literal there, or the
+ * function a call there names — `getRouteMap({ … })`, `await loadRoutes()` —
+ * whose returned table it is.
+ */
+function heldTable(safe: string, at: number): number | TableName | null {
+  if (safe[at] === '[' || safe[at] === '{') return at;
+  const call = /(await\s+)?([A-Za-z_$][\w$]*)\s*\(/y;
+  call.lastIndex = at;
+  const m = call.exec(safe);
+  return m ? { name: m[2]!, call: true, at: at + (m[1]?.length ?? 0) } : null;
+}
+
+/**
+ * Picks, of a name's declarations in `file` (where each keyword sits), the
+ * one in scope at `use`: in the innermost function around the use that
+ * declares the name, the last declaration before the use, else the first
+ * after it; else one at the module's top level. A declaration inside another
+ * function is that function's own. With no use, it picks one at the top
+ * level, which is what a module exports. The functions are the graph's — a
+ * component, a method, an arrow function held in a `const` — so the blocks
+ * inside one function are not told apart.
+ */
+function visibleAt(use: number | undefined, safe: string, file: string, context: ResolutionContext): (keywords: number[]) => number | undefined {
+  return (keywords) => {
+    const lineStarts = [0];
+    for (let i = safe.indexOf('\n'); i !== -1; i = safe.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+    const offset = (line: number, column: number): number => (lineStarts[line - 1] ?? safe.length) + column;
+    const fns = context.getNodesInFile(file)
+      .filter((n) => FN_KINDS.has(n.kind))
+      .map((n) => ({ start: offset(n.startLine, n.startColumn), end: offset(n.endLine, n.endColumn) }));
+    // The function a declaration's own value is (`const routes = (user) =>
+    // [ … ]`) starts after the keyword, so it is not around it.
+    const around = (at: number) => fns.filter((f) => f.start < at && f.end > at);
+    const scopes = new Set(use === undefined ? [] : around(use));
+    let best: number | undefined;
+    let depth = -1;
+    keywords.forEach((at, i) => {
+      const encl = around(at);
+      if (!encl.every((f) => scopes.has(f))) return;
+      if (encl.length > depth || (encl.length === depth && use !== undefined && at < use)) {
+        best = i;
+        depth = encl.length;
+      }
+    });
+    return best;
+  };
 }
 
 /** The table a function at `at` returns: `(user) => [ … ]`, `(user) => ([ … ])`, `function routes(user) { return [ … ]; }`. */
