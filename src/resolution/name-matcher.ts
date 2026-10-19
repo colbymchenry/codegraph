@@ -14356,11 +14356,14 @@ export function matchMethodCall(
         if (outside === null) return null;
         importedFqn = outside;
       }
-      // The class the file names decides, through its own supertypes
-      // (tsKnownTypeCall), before any same-named class elsewhere.
+      // The class the file names, through its own supertypes
+      // (tsKnownTypeCall), before any same-named class elsewhere. Only a
+      // method found counts: a local's type is read by an unscoped scan
+      // that can find another function's `agent: IAgent`, so one without
+      // the method mustn't rule out what follows, as a field's does.
       if (ESM_FAMILY.has(ref.language) && !awaited) {
         const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, ref, context, 0.9);
-        if (known !== undefined) return known;
+        if (known) return known;
       }
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
