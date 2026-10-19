@@ -92,6 +92,25 @@ describe('a TypeScript receiver a dependency-injection call sets up', () => {
     ]);
   }, 60_000);
 
+  it("has the type inject's type argument names, for a token that isn't a class", async () => {
+    // bitwarden's `protected params = inject<AdvancedUriOptionDialogParams>(DIALOG_DATA)`.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { '@angular/core': '^18.0.0', '@angular/cdk': '^18.0.0' } }),
+      'src/app/params.ts': 'export interface DialogParams {\n  onContinue(): void;\n}\n',
+      'src/app/legacy/params.ts': 'export interface DialogParams {\n  onContinue(): void;\n}\n',
+      'src/app/dialog.component.ts':
+        "import { inject } from '@angular/core';\nimport { DIALOG_DATA } from '@angular/cdk/dialog';\nimport { DialogParams } from './params';\n" +
+        'export class DialogComponent {\n' +
+        '  protected params = inject<DialogParams>(DIALOG_DATA);\n' +
+        '  ok() {\n    this.params.onContinue();\n    const local = inject<DialogParams>(DIALOG_DATA);\n    local.onContinue();\n  }\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.includes('onContinue'))).toEqual([
+      'src/app/dialog.component.ts: local.onContinue -> src/app/params.ts::DialogParams::onContinue',
+      'src/app/dialog.component.ts: this.params.onContinue -> src/app/params.ts::DialogParams::onContinue',
+    ]);
+  }, 60_000);
+
   it("doesn't read a field set from an inject that isn't Angular's", async () => {
     const calls = await callsOf({
       'package.json': JSON.stringify({ name: 'app', dependencies: { vue: '^3.0.0' } }),

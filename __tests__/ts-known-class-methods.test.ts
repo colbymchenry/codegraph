@@ -113,6 +113,23 @@ describe('a call on a value of a class its file names', () => {
     ]);
   }, 60_000);
 
+  it('reaches the class an import renames on the way, not a namesake of the local name', async () => {
+    // bitwarden's `export { MessageSender as MessagingService } from "@bitwarden/messaging"`.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app' }),
+      'src/messaging/sender.ts': 'export abstract class MessageSender {\n  abstract send(command: string): void;\n}\n',
+      'src/common/messaging.service.ts': "export { MessageSender as MessagingService } from '../messaging/sender';\n",
+      'src/desktop/electron-messaging.service.ts': 'export class MessagingService {\n  send(command: string) {\n    return command;\n  }\n}\n',
+      'src/desktop/settings.component.ts':
+        "import { MessagingService } from '../common/messaging.service';\n" +
+        'export class SettingsComponent {\n  constructor(private readonly messagingService: MessagingService) {}\n' +
+        "  save() {\n    this.messagingService.send('saved');\n  }\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('this.messagingService.send'))).toEqual([
+      'src/desktop/settings.component.ts: this.messagingService.send -> src/messaging/sender.ts::MessageSender::send',
+    ]);
+  }, 60_000);
+
   it('reaches it through an interface another file extends, whose import also names a constant', async () => {
     // vscode's `ITerminalLogService extends ILogService`, `ILogService` both
     // an interface and its `createDecorator` constant.

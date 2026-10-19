@@ -13141,7 +13141,9 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // TestServiceAccessor).filesConfigurationService`). A key that isn't a
         // class (Vue's `inject(KEY)`) names no type with the method, so it
         // links nothing.
-        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)(?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
+        // A type argument is the type returned: `inject<Params>(DIALOG_DATA)`.
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*<\\s*([A-Z][\\w.$]*)[^;=(){}]*>\\s*\\((?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*\\(\\s*([A-Z][\\w.$]*)(?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
         // No keyword requirement, so this matches BOTH a local annotation
         // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
         // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`
@@ -15741,12 +15743,13 @@ const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)/y, valueType: false },
   { re: /(?<![\w$#])[\w$#]+\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false },
   { re: /(?<![\w$#])[\w$#]+\b\s*=\s*this\.(?:([\w$#]+)\.)?([\w$#]+)\(\s*(?:new\s+|((?:this\.)?(?:[\w$#]+\.)*createInstance)\s*\(\s*)([A-Za-z_$][\w.$]*)/y, valueType: false, wrapped: true },
-  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*(inject|(?:this\.)?(?:[\w$#]+\.)*createInstance)\s*(?:<[^;=(){}]*>)?\s*\(\s*([A-Z][\w.$]*)/y, valueType: false, injected: true },
+  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*(inject|(?:this\.)?(?:[\w$#]+\.)*createInstance)\s*(?:<\s*([A-Z][\w.$]*)[^;=(){}]*>)?\s*\(\s*([A-Z][\w.$]*)/y, valueType: false, injected: true },
 ];
 
 /** A declaration `pattern` matched (`m`) on `line`: its type, and its wrapper or injector when it has one. */
 function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string): TsFieldOnLine | null {
-  const type = pattern.wrapped ? m[4] : pattern.injected ? m[2] : m[1];
+  // An injector's type argument is the type it returns: `inject<Params>(DIALOG_DATA)`.
+  const type = pattern.wrapped ? m[4] : pattern.injected ? m[2] ?? m[3] : m[1];
   if (!type) return null;
   const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
   if (pattern.wrapped) {
@@ -15843,7 +15846,7 @@ function tsFieldPatterns(field: string): TsFieldPattern[] {
     // `http = inject(HttpClient)`, `filter = this._instaService.createInstance(DocumentFilter)`:
     // an X when the injector is one that hands back an instance (tsFieldRead).
     {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*(inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*(inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<\\s*([A-Z][\\w.$]*)[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
       valueType: false,
       injected: true,
     },
@@ -16086,18 +16089,24 @@ const TS_NAMED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | 'outsid
  * file declares. 'outside' when the file imports it from a package outside
  * the project that no project file declares; null when it can't be found.
  */
-function tsNamedType(written: string, from: Node, at: UnresolvedRef, context: ResolutionContext): Node | 'outside' | null {
+function tsNamedType(
+  written: string,
+  from: Pick<Node, 'filePath' | 'language' | 'id'>,
+  at: UnresolvedRef,
+  context: ResolutionContext,
+): Node | 'outside' | null {
   let memo = TS_NAMED_TYPES.get(context);
   if (!memo) {
     memo = new Map();
     TS_NAMED_TYPES.set(context, memo);
   }
-  const key = from.filePath + '\0' + written;
+  const mapping = context.getImportMappings?.(from.filePath, from.language)?.find((i) => i.localName === written.split('.')[0]);
+  // A name the file declares is looked up past `from` itself.
+  const key = from.filePath + '\0' + written + (mapping ? '' : '\0' + from.id);
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
   const last = written.split('.').pop()!;
   const ref: UnresolvedRef = { ...at, filePath: from.filePath, language: from.language };
-  const mapping = context.getImportMappings?.(from.filePath, from.language)?.find((i) => i.localName === written.split('.')[0]);
   let found: Node | 'outside' | null = null;
   if (mapping && context.isOutOfRepoImport?.(mapping.source, from.filePath, from.language) === true) {
     const ambient = tsOutsideTypeDeclaration(written, last, ref, context);
@@ -16159,8 +16168,10 @@ function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: Re
  * (tsMethodUpChain); null when the whole chain is known and has none, as
  * when the method is a package's: `Emitter extends lsp.Emitter` has no
  * project `fire`, whatever other `Emitter` declares one. Undefined when
- * `file` doesn't declare the type or a supertype can't be found, for the
- * caller's own fallback.
+ * neither `file` nor what `at`'s file imports under the name declares the
+ * type, or a supertype can't be found, for the caller's own fallback. (An
+ * import may rename it: bitwarden's `MessagingService` is `export {
+ * MessageSender as MessagingService }`.)
  */
 function tsKnownTypeCall(
   typeName: string,
@@ -16171,7 +16182,11 @@ function tsKnownTypeCall(
   context: ResolutionContext,
   confidence: number,
 ): ResolvedRef | null | undefined {
-  const known = tsTypeDeclaredIn(file, typeName, context);
+  let known = tsTypeDeclaredIn(file, typeName, context);
+  if (!known) {
+    const named = tsNamedType(typeName, { filePath: at.filePath, language: at.language, id: '' }, at, context);
+    if (named && named !== 'outside') known = named;
+  }
   if (!known) return undefined;
   const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context));
   if (up.method) return { original: ref, targetNodeId: up.method.id, confidence, resolvedBy: 'instance-method' };
