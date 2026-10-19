@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -307,7 +307,7 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
-  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
+  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
   // Per project-relative directory ('' = the root): the module of the nearest
   // go.mod at or above it, up to the project root. Same lazy/immutable
@@ -692,6 +692,8 @@ export class ReferenceResolver {
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
       },
+      isDeclaredPackage: (source, fromFile) => this.isDeclaredOutsidePackage(source, fromFile),
+      isIndexedFile: (filePath) => this.isIndexedFile(filePath),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -3297,6 +3299,13 @@ export class ReferenceResolver {
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
 
+    // A Go name called or passed bare that the function around it binds
+    // itself — a parameter, a `:=`, a `var` — is that binding, never a
+    // declaration of the package: client-go's `init := func(…)` then
+    // `init(t)` calls no `func init()`.
+    if (ref.language === 'go' && (ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref') &&
+        isGoBareName(ref, this.context) && isGoLocallyBound(ref, this.context)) return null;
+
     // A `#define` is a value, never a callee (#1838): a macro defined only in
     // an unrelated file is not what `NAME(x)` here expands to either.
     if (ref.referenceKind === 'calls') {
@@ -3322,11 +3331,13 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
-    // A Go alias names its type as an embedding does (below): written through
-    // a package that is none of the file's imports as indexed, the type found
-    // by its bare name is another package's namesake, or the alias itself.
+    // A Go type declaration — an alias, a defined type, a struct's fields —
+    // names its types as an embedding does (below): written through a package
+    // that is none of the file's imports as indexed, the type found by its
+    // bare name is another package's namesake, or the declaration itself
+    // (`op clientv3.Op` beside the file's own `Op`).
     if (ref.language === 'go' && ref.referenceKind === 'references' &&
-        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+        GO_TYPE_KINDS.has(this.nodeById(ref.fromNodeId)?.kind ?? '') && isGoUnknownQualified(ref, this.context)) return null;
 
     // A Go type position — a parameter or result type, a composite literal's
     // type — names a type of the package Go reads it from (route handlers are

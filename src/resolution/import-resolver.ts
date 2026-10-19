@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
-import { applyAliases } from './path-aliases';
+import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
@@ -32,14 +32,18 @@ import { JS_ARRAY_METHODS } from './js-builtins';
  * Extension resolution order by language
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
-  typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
+  // `/index.jsx` last, as tsc probes a directory: a route table resolves the
+  // module its `lazy(() => import('views/x'))` loads as TypeScript, whatever
+  // the file is written in, and admin templates keep their pages in
+  // `views/x/index.jsx`.
+  typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js', '/index.jsx'],
   // ArkTS imports both `.ets` components and plain `.ts` logic modules —
   // HarmonyOS projects are always a mix. `/Index.ets` (capital I) is ohpm's
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
-  tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
+  tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js', '/index.jsx'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
   // (`./lib` → `./lib/index.ts`). Without a list, relative imports from a
@@ -366,9 +370,10 @@ function resolveImportPathUncached(
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
-  // otherwise be misclassified as npm).
+  // otherwise be misclassified as npm). What still looks like a package
+  // may name a file through the importing app's own config.
   if (isExternalImport(importPath, language, context)) {
-    return null;
+    return resolveFromOwnConfig(importPath, fromFile, language, context);
   }
 
   const projectRoot = context.getProjectRoot();
@@ -561,11 +566,13 @@ export function isExternalImport(
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
     }
-    // Project-defined alias prefix? Treat as local.
+    // Project-defined alias prefix? Treat as local. A catch-all `"*"` has no
+    // prefix and matches `react` too: what it names is left to
+    // resolveFromOwnConfig, which keeps the app's packages out.
     const aliases = options.aliasPrefixes === false ? null : context?.getProjectAliases?.();
     if (aliases) {
       for (const pat of aliases.patterns) {
-        if (importPath.startsWith(pat.prefix)) return false;
+        if (pat.prefix !== '' && importPath.startsWith(pat.prefix)) return false;
       }
     }
     // Scoped packages or bare specifiers that don't start with aliases
@@ -727,15 +734,7 @@ function resolveAliasedImport(
   context: ResolutionContext,
   fromFile?: string
 ): string | null {
-  const extensions = EXTENSION_RESOLUTION[language] || [];
-  const tryWithExt = (basePath: string): string | null => {
-    for (const ext of extensions) {
-      const candidate = basePath + ext;
-      if (context.fileExists(candidate)) return candidate;
-    }
-    if (context.fileExists(basePath)) return basePath;
-    return findSourceForEmittedSpecifier(basePath, language, context);
-  };
+  const tryWithExt = (basePath: string): string | null => tryWithExtensions(basePath, language, context);
 
   // 1. tsconfig/jsconfig paths: the config nearest the importing file (an
   //    app of a monorepo keeps its own `@/*`), then the project root's.
@@ -781,6 +780,84 @@ function resolveAliasedImport(
 
   // 3. Direct path.
   return tryWithExt(importPath);
+}
+
+/** The file `basePath` names: with the language's extensions or index files, as is, or as an emitted `.js`. */
+function tryWithExtensions(basePath: string, language: Language, context: ResolutionContext): string | null {
+  for (const ext of EXTENSION_RESOLUTION[language] || []) {
+    const candidate = basePath + ext;
+    if (context.fileExists(candidate)) return candidate;
+  }
+  if (context.fileExists(basePath)) return basePath;
+  return findSourceForEmittedSpecifier(basePath, language, context);
+}
+
+/**
+ * A bare specifier `isExternalImport` takes for a package, resolved through
+ * the importing app's own tsconfig / jsconfig — the one nearest the file,
+ * else the root's — as tsc and a paths-aware bundler resolve it: the most
+ * specific `paths` pattern it matches (a catch-all `"*": ["./src/*"]`, an
+ * alias only a nested app declares), then `baseUrl` (`"baseUrl": "src"`
+ * makes `layout/MainLayout` read `src/layout/MainLayout`). CRA and Vite
+ * admin templates import nearly everything this way.
+ *
+ * Only an indexed file binds: `fileExists` also answers for a folder and
+ * for `node_modules`. A package — one the file's package.json or an
+ * enclosing one declares, or a Node built-in — never binds to a project
+ * module (`lodash` stays lodash even beside a `src/lodash/`), only to a
+ * declaration file the project keeps for it, which is the package as tsc
+ * reads it: `legacy-widgets` under `"*": ["./typings/*"]` is
+ * `typings/legacy-widgets.d.ts`.
+ */
+function resolveFromOwnConfig(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  const candidates = ownConfigCandidates(importPath, fromFile, language, context);
+  if (!candidates) return null;
+  const indexed = (file: string): boolean => context.isIndexedFile?.(file) !== false;
+  if (context.isDeclaredPackage?.(importPath, fromFile) !== false) {
+    if (!EXTENSION_RESOLUTION[language]?.includes('.d.ts')) return null;
+    for (const candidate of candidates) {
+      const declarations = `${candidate}.d.ts`;
+      if (context.fileExists(declarations) && indexed(declarations)) return declarations;
+    }
+    return null;
+  }
+  for (const candidate of candidates) {
+    const hit = tryWithExtensions(candidate, language, context);
+    if (hit && indexed(hit)) return hit;
+  }
+  return null;
+}
+
+/** Where the importing app's own config reads a bare specifier from (see resolveFromOwnConfig), or null when it reads none. */
+function ownConfigCandidates(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string[] | null {
+  if (!ESM_IMPORT_LANGUAGES.has(language) || !importPath || importPath.startsWith('/') || /^[A-Za-z][\w+.-]*:/.test(importPath)) return null;
+  const config = context.getNearestAliases?.(fromFile) ?? context.getProjectAliases?.();
+  if (!config) return null;
+  const candidates = aliasAndBaseUrlCandidates(importPath, config, context.getProjectRoot());
+  return candidates.length > 0 ? candidates : null;
+}
+
+/**
+ * Whether a bare specifier names one of the project's files through the
+ * importing app's own config: its `paths` or `baseUrl` map it to a file the
+ * index holds, and no package the app declares goes by it
+ * (`layout/MainLayout` under `"baseUrl": "src"`). Not a name that maps to
+ * nothing yet: under `"baseUrl": "."` an undeclared `express` is far likelier
+ * a package the manifest leaves out than a module still to come.
+ */
+function namesOwnConfigModule(importPath: string, fromFile: string, language: Language, context: ResolutionContext): boolean {
+  return context.isDeclaredPackage?.(importPath, fromFile) === false &&
+    resolveImportPath(importPath, fromFile, language, context) !== null;
 }
 
 /**
@@ -1305,10 +1382,17 @@ function extractGoImports(content: string): ImportMapping[] {
 
   const mapping = (localName: string, source: string): ImportMapping =>
     ({ localName, exportedName: '*', source, isDefault: false, isNamespace: true });
+  // Go binds a name to one import of a file, so a name another import is
+  // given explicitly is not an unaliased import's: etcd's benchmark tool has
+  // `"github.com/cheggaaa/pb/v3"` (package pb) beside
+  // `v3 "go.etcd.io/etcd/client/v3"`, and listed first, pb took every `v3.`.
+  const explicit = new Set(specs.flatMap(({ name }) => (name !== undefined && name !== '.' && name !== '_' ? [name] : [])));
   // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
   // its last path element.
-  const mappings = specs.map(({ name, source }) =>
-    mapping(name === undefined || name === '.' ? source.split('/').pop()! : name, source));
+  const mappings = specs
+    .map(({ name, source }) => ({ explicitly: name !== undefined && name !== '.', localName: name === undefined || name === '.' ? source.split('/').pop()! : name, source }))
+    .filter(({ explicitly, localName }) => explicitly || !explicit.has(localName))
+    .map(({ localName, source }) => mapping(localName, source));
   const bound = new Set(mappings.map((m) => m.localName));
   const assumed = new Map<string, string[]>();
   for (const { name, source } of specs) {
@@ -1743,6 +1827,20 @@ export function isJsPathImportRef(ref: UnresolvedRef): boolean {
   return ref.referenceKind === 'imports' && ESM_IMPORT_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
 }
 
+/**
+ * A JS/TS `imports` reference to the module of an import named by one bare
+ * segment — `'config'` in `import { DEFAULT_THEME_MODE } from 'config'` under
+ * `"baseUrl": "src"`. Shaped like a package, it names a file only when
+ * resolveImportPath finds one (the app's `baseUrl` or catch-all `paths`, a
+ * workspace member); a real package stays unresolved. A name some import
+ * binds locally is that binding, not the module, and resolves as one.
+ */
+function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'imports' || !ESM_IMPORT_LANGUAGES.has(ref.language) || isJsPathSpecifier(ref.referenceName)) return false;
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  return imports.some((m) => m.source === ref.referenceName) && !imports.some((m) => m.localName === ref.referenceName);
+}
+
 /** PHP reference kinds whose name is a class name, written as in the source. */
 const PHP_CLASS_NAME_REFS: ReadonlySet<string> = new Set(['instantiates', 'extends', 'implements', 'references']);
 
@@ -1819,7 +1917,7 @@ export function resolveViaImport(
   // found the way the runtime finds it: extensions, `index` files, path
   // aliases. Matching the basename instead missed every extensionless one
   // (the common spelling) and could land on a same-named file elsewhere.
-  if (isJsPathImportRef(ref)) {
+  if (isJsPathImportRef(ref) || isJsBareModuleRef(ref, context)) {
     const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
@@ -3083,7 +3181,9 @@ function collectRustUseBindings(content: string): Map<string, string> {
  *    has no `src/ports/` directory to walk yet is entirely in-repo — that
  *    generalization measured 13 real trait implementations deleted.
  *  - **ES modules** — `isExternalImport`, which already accounts for tsconfig
- *    path aliases and monorepo workspace packages.
+ *    path aliases and monorepo workspace packages, unless the specifier still
+ *    names a project file through the importing app's `baseUrl` or catch-all
+ *    `paths` (`import Base from 'components/Base'`).
  *
  * Everything else returns false and resolves exactly as before. JVM and Python
  * imports notably do NOT go through `resolveImportPath` (they have dedicated
@@ -3111,7 +3211,8 @@ export function isBoundToOutOfRepoImport(
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
   for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
     if (imp.localName !== name) continue;
-    return isExternalImport(imp.source, ref.language, context);
+    return isExternalImport(imp.source, ref.language, context) &&
+      resolveImportPath(imp.source, ref.filePath, ref.language, context) === null;
   }
   return false;
 }
@@ -3151,10 +3252,13 @@ export function isBoundToOutOfRepoImport(
  * key a sync looks up for every file it adds or changes, so the file that
  * appears or gains the export finds it.
  *
- * Only for a module of the project: a package's binding keeps its tail.
- * Undefined for every other reference, and for the whole name of an
- * unaliased named import, which is the name its module declares. A Python
- * reference is {@link pythonImportBindingTail}'s, by its whole name only.
+ * Only for a module of the project: a package's binding keeps its tail. A
+ * bare specifier is the project's when the importing app's own config
+ * (`baseUrl`, a catch-all `"*"`) maps it to a file the index holds and no
+ * package the app declares goes by it. Undefined for every other reference,
+ * and for the whole name of an unaliased named import, which is the name its
+ * module declares. A Python reference is {@link pythonImportBindingTail}'s,
+ * by its whole name only.
  */
 export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
   if (ref.language === 'python') return pythonImportBindingTail(ref, context);
@@ -3169,7 +3273,9 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   if (!binding || (!receiver && !binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
   if (isExternalImport(binding.source, ref.language, context) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
-      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix))) {
+      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix)) &&
+      // A module the app's `baseUrl` or catch-all `paths` reads (`layout/MainLayout`).
+      !namesOwnConfigModule(binding.source, ref.filePath, ref.language, context)) {
     return undefined;
   }
   // `..` names a folder through the importing file's own location.

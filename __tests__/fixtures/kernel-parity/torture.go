@@ -29,6 +29,39 @@ type Stack[T any] struct {
 	items []T
 }
 
+// A struct references the types its fields are declared with, but the types
+// it embeds (supertypes), its own type parameters, predeclared types and its
+// own name written bare.
+type Server struct {
+	handlers HandlersChain
+	byKey    map[Dur][]*Widget `json:"by_key"`
+	events   <-chan pkga.Item
+	grid     [MAX_ITEMS]Widget
+	cb       func(ctx pkga.Context, w *Widget) (*Stack[int], error)
+	a, b     Widget
+	nested   struct {
+		w Widget
+		*Base
+	}
+	codec interface {
+		Encode(pkga.Item) ([]byte, error)
+	}
+	*pkga.Lister[*Widget, pkga.Item]
+	next *Server
+	n    int
+}
+
+type Pool[T any] struct {
+	items []T
+	next  *Pool[T]
+	Stack[T]
+	extra Widget
+}
+
+type AnonFields = struct {
+	w Widget
+}
+
 // Units of time: the group's comment, no member's doc.
 type (
 	Seconds int
@@ -43,6 +76,14 @@ type Core interface {
 	error
 	Marshal(v any) ([]byte, error)
 	Unmarshal(data []byte) error
+}
+
+// An interface method references the types its signature names, but the
+// interface's own type parameters and the predeclared types.
+type Repo[T any] interface {
+	Find(ctx pkga.Context, id Dur) (*Widget, error)
+	Each(fn func(T, *Stack[int]) bool) []pkga.Item
+	Self() Repo[T]
 }
 
 type Number interface {

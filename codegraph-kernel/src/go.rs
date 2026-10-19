@@ -581,6 +581,13 @@ impl<'t> Walker<'t> {
                 // Struct embedding → extends (field_declaration without a
                 // field_identifier), reached via the inheritance recursion.
                 self.extract_inheritance(type_child, row);
+                // The types its fields are declared with are the struct's
+                // references: Go fields mint no nodes.
+                let references = edge_kind_index("references").unwrap();
+                for ty in self.struct_field_type_names(node) {
+                    let text = self.text(ty).to_string();
+                    self.push_ref_at(row, &text, references, ty);
+                }
                 let body = type_child.child_by_field_name("body").unwrap_or(type_child);
                 for i in 0..body.named_child_count() {
                     if let Some(c) = body.named_child(i) {
@@ -603,7 +610,7 @@ impl<'t> Walker<'t> {
             };
             if let Some(type_child) = type_child {
                 self.extract_inheritance(type_child, row);
-                self.extract_go_interface_methods(type_child, row, &name);
+                self.extract_go_interface_methods(type_child, row, &name, node);
             }
             return true;
         }
@@ -627,9 +634,12 @@ impl<'t> Walker<'t> {
         false
     }
 
-    /// extractGoInterfaceMethods: method_elem/method_spec → method nodes.
-    fn extract_go_interface_methods(&mut self, interface_type: Node<'t>, iface_row: u32, iface_name: &str) {
+    /// extractGoInterfaceMethods: method_elem/method_spec → method nodes, each
+    /// referencing the types its signature names (`decl` declares the
+    /// interface).
+    fn extract_go_interface_methods(&mut self, interface_type: Node<'t>, iface_row: u32, iface_name: &str, decl: Node<'t>) {
         self.stack.push(Scope { row: iface_row, kind: "interface", name: iface_name.to_string() });
+        let references = edge_kind_index("references").unwrap();
         for i in 0..interface_type.named_child_count() {
             let Some(m) = interface_type.named_child(i) else { continue };
             if !matches!(m.kind(), "method_elem" | "method_spec") {
@@ -640,10 +650,28 @@ impl<'t> Walker<'t> {
             let mname = self.text(name_node).to_string();
             if !mname.is_empty() {
                 let signature = self.signature_of(m);
-                self.create_node("method", &mname, m, Extra { signature, ..Extra::default() });
+                let Some(row) = self.create_node("method", &mname, m, Extra { signature, ..Extra::default() }) else { continue };
+                for ty in self.interface_method_type_names(m, decl) {
+                    let text = self.text(ty).to_string();
+                    self.push_ref_at(row, &text, references, ty);
+                }
             }
         }
         self.stack.pop();
+    }
+
+    /// goInterfaceMethodTypeNames (languages/go.ts): the name nodes of the
+    /// types an interface method's parameters and results name, but the
+    /// predeclared types and the interface's own type parameters.
+    fn interface_method_type_names(&self, method: Node<'t>, decl: Node<'t>) -> Vec<Node<'t>> {
+        let mut names = Vec::new();
+        let params = self.type_parameter_names(decl);
+        for field in ["parameters", "result"] {
+            if let Some(part) = method.child_by_field_name(field) {
+                self.collect_type_names(part, &params, false, &mut names);
+            }
+        }
+        names
     }
 
     /// extractVariable's Go branch: var/const specs + short_var_declaration.
@@ -897,6 +925,34 @@ impl<'t> Walker<'t> {
         }
     }
 
+    /// goDeclaredNames (languages/go.ts): what a type name written bare
+    /// inside a type declaration can mean without naming another type — the
+    /// declaration's own type parameters, and its own name, which in a
+    /// recursive type is the declaration itself.
+    fn declared_names(&self, decl: Node<'t>) -> HashSet<&'t str> {
+        let mut names = self.type_parameter_names(decl);
+        if let Some(name) = decl.child_by_field_name("name") {
+            names.insert(self.text(name));
+        }
+        names
+    }
+
+    /// goTypeParameterNames (languages/go.ts): the type parameters a type
+    /// declaration declares.
+    fn type_parameter_names(&self, decl: Node<'t>) -> HashSet<&'t str> {
+        let mut names = HashSet::new();
+        if let Some(list) = decl.child_by_field_name("type_parameters") {
+            for param in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
+                for c in (0..param.named_child_count()).filter_map(|j| param.named_child(j)) {
+                    if c.kind() == "identifier" {
+                        names.insert(self.text(c));
+                    }
+                }
+            }
+        }
+        names
+    }
+
     /// goAliasTypeNames (languages/go.ts): the name nodes of the types an
     /// alias's or a defined type's `type` field names, in source order, but
     /// its own type parameters, the predeclared types and its own name written
@@ -905,36 +961,54 @@ impl<'t> Walker<'t> {
     /// around an error, never reaches the kernel (its file defers to wasm).
     fn alias_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
         let mut names = Vec::new();
-        let Some(ty) = node.child_by_field_name("type") else { return names };
-        let own = node.child_by_field_name("name").map(|n| self.text(n));
-        let mut params: HashSet<&str> = HashSet::new();
-        if let Some(list) = node.child_by_field_name("type_parameters") {
-            for decl in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
-                for c in (0..decl.named_child_count()).filter_map(|j| decl.named_child(j)) {
-                    if c.kind() == "identifier" {
-                        params.insert(self.text(c));
-                    }
-                }
-            }
+        if let Some(ty) = node.child_by_field_name("type") {
+            self.collect_type_names(ty, &self.declared_names(node), false, &mut names);
         }
-        self.collect_alias_type_names(ty, &params, own, false, &mut names);
         names
     }
 
-    /// `qualified`: the name of a `pkg.Name`, which is that package's
-    /// whatever this one declares.
-    fn collect_alias_type_names(
-        &self,
-        node: Node<'t>,
-        params: &HashSet<&str>,
-        own: Option<&str>,
-        qualified: bool,
-        out: &mut Vec<Node<'t>>,
-    ) {
+    /// goStructFieldTypeNames (languages/go.ts): the name nodes of the types a
+    /// struct's fields are declared with, in source order, skipped as in
+    /// alias_type_names. An embedded field's type is a supertype
+    /// (embedded_type_name), but the types it is instantiated with are not
+    /// (`Pod` in client-go's `listers.ResourceIndexer[*v1.Pod]`).
+    fn struct_field_type_names(&self, node: Node<'t>) -> Vec<Node<'t>> {
+        let mut names = Vec::new();
+        let fields = node.child_by_field_name("type").and_then(|ty| {
+            (0..ty.named_child_count())
+                .filter_map(|i| ty.named_child(i))
+                .find(|c| c.kind() == "field_declaration_list")
+        });
+        let Some(fields) = fields else { return names };
+        let declared = self.declared_names(node);
+        for field in (0..fields.named_child_count()).filter_map(|i| fields.named_child(i)) {
+            if field.kind() != "field_declaration" {
+                continue;
+            }
+            let mut ty = field.child_by_field_name("type");
+            // Embedded: no field name (extract_inheritance's test).
+            let embedded = !(0..field.named_child_count())
+                .filter_map(|j| field.named_child(j))
+                .any(|c| c.kind() == "field_identifier");
+            if embedded {
+                ty = ty
+                    .filter(|t| t.kind() == "generic_type")
+                    .and_then(|t| t.child_by_field_name("type_arguments"));
+            }
+            if let Some(ty) = ty {
+                self.collect_type_names(ty, &declared, false, &mut names);
+            }
+        }
+        names
+    }
+
+    /// collectGoTypeNames (languages/go.ts). `qualified`: the name of a
+    /// `pkg.Name`, which is that package's whatever this one declares.
+    fn collect_type_names(&self, node: Node<'t>, declared: &HashSet<&str>, qualified: bool, out: &mut Vec<Node<'t>>) {
         stack_guard!();
         if node.kind() == "type_identifier" {
             let text = self.text(node);
-            if !is_go_predeclared_type(text) && (qualified || (!params.contains(text) && own != Some(text))) {
+            if !is_go_predeclared_type(text) && (qualified || !declared.contains(text)) {
                 out.push(node);
             }
             return;
@@ -942,7 +1016,7 @@ impl<'t> Walker<'t> {
         let qualified = node.kind() == "qualified_type";
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.collect_alias_type_names(c, params, own, qualified, out);
+                self.collect_type_names(c, declared, qualified, out);
             }
         }
     }
