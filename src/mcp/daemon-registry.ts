@@ -207,7 +207,9 @@ function removeDaemonArtifacts(root: string, expectedLockContents: string | null
 export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> {
   const pidPath = getDaemonPidPath(root);
   const hadArtifacts = fs.existsSync(pidPath) || (
-    process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => fs.existsSync(p))
+    process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => {
+      try { fs.statSync(p); return true; } catch (e) { return (e as NodeJS.ErrnoException)?.code !== 'ENOENT'; }
+    })
   );
   if (!hadArtifacts) return false;
   let info: DaemonLockInfo | null = null;

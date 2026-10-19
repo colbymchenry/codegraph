@@ -400,6 +400,23 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
  * `new MCPServer(path).start()`. Internally we now pick from direct / proxy /
  * daemon at start time.
  */
+/**
+ * Are Unix domain sockets unusable on the filesystem backing `dir`? On
+ * FUSE/virtiofs mounts (Windows drives shared into a Linux container) a
+ * socket can be created and bound but `connect()` fails with EINVAL, and
+ * even `unlink()`/`stat()` on the socket can hang in uninterruptible I/O.
+ * Detect via statfs (no socket I/O) instead of probing sockets.
+ */
+export function isFuseFilesystem(dir: string): boolean {
+  try {
+    const st = fs.statfsSync(dir);
+    // FUSE_SUPER_MAGIC — virtiofs is a FUSE filesystem.
+    return (st as { type: number }).type === 0x65735546;
+  } catch {
+    return false;
+  }
+}
+
 export class MCPServer {
   private projectPath: string | null;
   // Direct-mode-only state. In daemon mode the per-connection sessions live
@@ -439,6 +456,34 @@ export class MCPServer {
    * On any unexpected failure in step 4 we transparently fall back to direct
    * mode — a misbehaving daemon must never block a session from starting.
    */
+
+  /**
+   * Tear down a daemon that cannot be used (e.g. because sockets are broken on
+   * this filesystem) so the in-process fallback can own the writer lock and
+   * auto-sync. SIGTERM is unreliable here, so SIGKILL.
+   */
+  private cleanupUnusableDaemon(root: string): void {
+    try {
+      const raw = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+      const info = JSON.parse(raw) as { pid?: number };
+      if (typeof info.pid === 'number' && info.pid > 0) {
+        try { process.kill(info.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    } catch { /* no pid file */ }
+    try { fs.unlinkSync(getDaemonPidPath(root)); } catch { /* ignore */ }
+    // Do NOT unlink the socket itself: on virtiofs that hangs in
+    // uninterruptible I/O. The stale socket is harmless since daemon mode is
+    // disabled on this filesystem.
+    try {
+      const w = readWriterLock(root);
+      if (w && w.pid > 0) {
+        let alive = true;
+        try { process.kill(w.pid, 0); } catch { alive = false; }
+        if (!alive) releaseWriterLock(root);
+      }
+    } catch { /* ignore */ }
+  }
+
   async start(): Promise<void> {
     // Long-lived process (direct / proxy / daemon alike): flush buffered
     // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
@@ -470,6 +515,17 @@ export class MCPServer {
       // No initialized project found — daemon mode has nowhere to put its
       // socket. The fresh-checkout / outside-project case; behave as before.
       return this.startDirect('no .codegraph/ root found');
+    }
+
+    // On filesystems where Unix domain sockets cannot be connected (e.g.
+    // FUSE/virtiofs mounts of Windows drives) the shared daemon is unusable:
+    // it binds but no client can ever reach it, leaving an orphan daemon that
+    // holds the writer lock and disables auto-sync. Detect this up front and
+    // serve fully in-process (with auto-sync) instead. (#virtiofs)
+    if (isFuseFilesystem(root)) {
+      process.stderr.write('[CodeGraph MCP] Filesystem is FUSE/virtiofs: Unix sockets unusable, serving in-process with auto-sync.\n');
+      this.cleanupUnusableDaemon(root);
+      return this.startDirect('sockets unusable on this filesystem (FUSE/virtiofs)');
     }
 
     try {

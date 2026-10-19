@@ -84,6 +84,18 @@ export async function runInstaller(): Promise<void> {
 }
 
 export async function runInstallerWithOptions(opts: RunInstallerOptions): Promise<void> {
+  // Guard: the interactive installer needs a TTY. When launched without one
+  // (e.g. an MCP host running `codegraph` with no args, or a non-interactive
+  // shell) clack would block forever reading stdin and corrupt the MCP stdio
+  // channel. Require --yes or refuse up front. (#529-style hang prevention)
+  if (!process.stdin.isTTY && opts.yes !== true) {
+    process.stderr.write(
+      'CodeGraph installer needs an interactive terminal (or --yes for non-interactive mode).\\n' +
+      'Run `codegraph install --yes` in CI/containers, or `codegraph serve --mcp` to start the MCP server.\\n'
+    );
+    process.exit(1);
+  }
+
   const clack = await importESM('@clack/prompts');
 
   clack.intro(`CodeGraph v${getVersion()}`);
