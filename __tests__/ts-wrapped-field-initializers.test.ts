@@ -113,6 +113,26 @@ describe('a this.<field> call on a field a wrapper initializes', () => {
     ]);
   }, 60_000);
 
+  it('reads them in files with CRLF line endings, as a Windows checkout has', async () => {
+    const files: Record<string, string> = {
+      ...LIFECYCLE,
+      'src/app/model.ts':
+        IMPORTS +
+        'class DomEmitter {\n  readonly event = (listener: () => void) => listener;\n  dispose() {}\n}\n' +
+        'export class Model extends Disposable {\n' +
+        '  private readonly _onDidChange = this._register(new Emitter<string>());\n' +
+        '  private readonly _onDidShow = this._store.add(new Emitter<void>());\n' +
+        '  private readonly onKeyDown = this._register(new DomEmitter()).event;\n' +
+        "  change() {\n    this._onDidChange.fire('a');\n    this._onDidShow.fire();\n    this.onKeyDown.dispose();\n  }\n" +
+        '}\n',
+    };
+    const calls = await callsOf(Object.fromEntries(Object.entries(files).map(([file, text]) => [file, text.replace(/\n/g, '\r\n')])));
+    expect(calls.filter((c) => c.includes('.fire') || c.includes('.dispose'))).toEqual([
+      'src/app/model.ts: this._onDidChange.fire -> src/base/event.ts::Emitter::fire',
+      'src/app/model.ts: this._onDidShow.fire -> src/base/event.ts::Emitter::fire',
+    ]);
+  }, 60_000);
+
   it("doesn't read a wrapper whose declaration doesn't return its argument", async () => {
     const calls = await callsOf({
       ...LIFECYCLE,

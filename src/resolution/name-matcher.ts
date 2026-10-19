@@ -15851,9 +15851,9 @@ function tsCallEndsStatement(lines: readonly string[], row: number, open: number
       } else if (c === '(') {
         depth++;
       } else if (c === ')' && --depth === 0) {
-        const rest = line.slice(i + 1);
-        if (!/^\s*(?:;.*)?$/.test(rest)) return false;
-        if (rest.trim()) return true;
+        // Trimmed, not matched up to `$`: a CRLF checkout's lines keep their `\r`.
+        const rest = line.slice(i + 1).trim();
+        if (rest) return rest.startsWith(';');
         const next = lines.slice(r + 1, r + 4).find((l) => l.trim());
         return !next || !/^\s*(?:[.?[(!,:|&+*\/%<>=-]|as\b|satisfies\b)/.test(next);
       }
