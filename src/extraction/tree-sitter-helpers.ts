@@ -139,12 +139,19 @@ function cleanCommentMarkers(comment: string): string {
  * the line above: one written after code on its line (`const n = 4 // four.`),
  * and any that begins on the line such a comment ends. Go reads them as that
  * line's comment, never the next declaration's doc. Default: off.
+ *
+ * `skipDetached` keeps only the comments that end on the line right above the
+ * declaration, together with the ones written on the lines just before them:
+ * a blank line ends the docstring, and a comment that ends on the
+ * declaration's own line documents nothing. That is Go's doc comment, the one
+ * go doc shows. Default: off.
  */
 export function getPrecedingDocstring(
   node: SyntaxNode,
   source: string,
   stepOver: readonly string[] = [],
-  skipTrailing = false
+  skipTrailing = false,
+  skipDetached = false
 ): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
@@ -185,6 +192,19 @@ export function getPrecedingDocstring(
       endRow = comment.endPosition.row;
       first++;
     }
+  }
+  if (skipDetached) {
+    // Walk back from the declaration: the last comment must end on the line
+    // above it, and each one before joins while it ends on the line the next
+    // one starts, or the line before that.
+    let start = comments.length;
+    if (start > first && comments[start - 1]!.endPosition.row + 1 === anchor.startPosition.row) {
+      start--;
+      while (start > first && comments[start - 1]!.endPosition.row + 1 >= comments[start]!.startPosition.row) {
+        start--;
+      }
+    }
+    first = start;
   }
   if (first === comments.length) return undefined;
 

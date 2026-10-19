@@ -185,4 +185,8 @@ export const goExtractor: LanguageExtractor = {
   // A comment after code on its line (`const sides = 4 // sides of a square.`)
   // is that line's, never the doc of the declaration below it.
   docstringSkipsTrailingComments: true,
+  // A doc comment ends on the line right above its declaration, and a blank
+  // line ends it, as go doc reads it: a banner or a note above that blank line
+  // documents nothing.
+  docstringSkipsDetachedComments: true,
 };

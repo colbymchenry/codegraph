@@ -143,16 +143,19 @@ pub fn preceding_docstring_stepping_over(
     src: &str,
     step_over: &[&str],
 ) -> Option<String> {
-    preceding_docstring_with(node, src, step_over, false)
+    preceding_docstring_with(node, src, step_over, false, false)
 }
 
-/// getPrecedingDocstring's `skipTrailing` (Go) — the comments the run opens
-/// with that belong to the line above are left out: one written after code on
-/// its line (`const n = 4 // four.`), and any that begins on the line such a
-/// comment ends. Go reads them as that line's comment, never the next
-/// declaration's doc.
-pub fn preceding_docstring_skipping_trailing(node: Node, src: &str) -> Option<String> {
-    preceding_docstring_with(node, src, &[], true)
+/// getPrecedingDocstring's `skipTrailing` and `skipDetached` (Go). The
+/// comments the run opens with that belong to the line above are left out:
+/// one written after code on its line (`const n = 4 // four.`), and any that
+/// begins on the line such a comment ends. Of the rest, only the comments that
+/// end on the line right above the declaration, together with the ones written
+/// on the lines just before them, are kept: a blank line ends the docstring,
+/// and a comment that ends on the declaration's own line documents nothing.
+/// That is Go's doc comment, the one go doc shows.
+pub fn preceding_docstring_skipping_trailing_and_detached(node: Node, src: &str) -> Option<String> {
+    preceding_docstring_with(node, src, &[], true, true)
 }
 
 fn preceding_docstring_with(
@@ -160,6 +163,7 @@ fn preceding_docstring_with(
     src: &str,
     step_over: &[&str],
     skip_trailing: bool,
+    skip_detached: bool,
 ) -> Option<String> {
     let mut anchor = node;
     while let Some(parent) = anchor.parent() {
@@ -199,6 +203,21 @@ fn preceding_docstring_with(
             end_row = c.end_position().row;
             first += 1;
         }
+    }
+    if skip_detached {
+        // Walk back from the declaration: the last comment must end on the
+        // line above it, and each one before joins while it ends on the line
+        // the next one starts, or the line before that.
+        let mut start = comments.len();
+        if start > first && comments[start - 1].end_position().row + 1 == anchor.start_position().row {
+            start -= 1;
+            while start > first
+                && comments[start - 1].end_position().row + 1 >= comments[start].start_position().row
+            {
+                start -= 1;
+            }
+        }
+        first = start;
     }
     if first == comments.len() {
         return None;
@@ -294,9 +313,40 @@ mod tests {
                 })
                 .expect(name)
         };
+        let skipping_trailing = |n| preceding_docstring_with(n, src, &[], true, false);
         assert_eq!(preceding_docstring(func("f"), src).as_deref(), Some("a\nb\nc"));
-        assert_eq!(preceding_docstring_skipping_trailing(func("f"), src).as_deref(), Some("c"));
+        assert_eq!(skipping_trailing(func("f")).as_deref(), Some("c"));
         assert_eq!(preceding_docstring(func("g"), src).as_deref(), Some("d"));
-        assert_eq!(preceding_docstring_skipping_trailing(func("g"), src), None);
+        assert_eq!(skipping_trailing(func("g")), None);
+    }
+
+    /// Skipping detached comments keeps the comments that end on the line
+    /// above the declaration and those on the lines just before them; a blank
+    /// line ends the run, and a comment on the declaration's own line is not
+    /// kept. Without it, every comment is.
+    #[test]
+    fn skips_the_comments_a_blank_line_detaches() {
+        let grammar = crate::langs::grammar_for("go").expect("go grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let src = "package p\n\n// a\n\n// b\n/*\nc\n*/\n// d\nfunc f() {}\n\n// e\n\nfunc g() {}\n\n/* h */ func h() {}\n";
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let func = |name: &str| {
+            (0..root.named_child_count())
+                .filter_map(|i| root.named_child(i))
+                .find(|n| {
+                    n.kind() == "function_declaration"
+                        && n.child_by_field_name("name").map(|id| &src[id.byte_range()]) == Some(name)
+                })
+                .expect(name)
+        };
+        let skipping_detached = |n| preceding_docstring_with(n, src, &[], false, true);
+        assert_eq!(preceding_docstring(func("f"), src).as_deref(), Some("a\nb\nc\nd"));
+        assert_eq!(skipping_detached(func("f")).as_deref(), Some("b\nc\nd"));
+        assert_eq!(preceding_docstring(func("g"), src).as_deref(), Some("e"));
+        assert_eq!(skipping_detached(func("g")), None);
+        assert_eq!(preceding_docstring(func("h"), src).as_deref(), Some("h"));
+        assert_eq!(skipping_detached(func("h")), None);
     }
 }

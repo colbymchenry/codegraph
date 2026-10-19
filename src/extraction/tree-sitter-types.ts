@@ -191,6 +191,14 @@ export interface LanguageExtractor {
    */
   docstringSkipsTrailingComments?: boolean;
   /**
+   * Keep in a docstring only the comments that end on the line right above
+   * the declaration, together with the ones written on the lines just before
+   * them: a blank line ends it. That is Go's doc comment, the one go doc
+   * shows, so a section banner or a note a blank line separates from a
+   * declaration documents nothing.
+   */
+  docstringSkipsDetachedComments?: boolean;
+  /**
    * Node types that may stand between a declaration and the decorators written
    * before it without ending the scan for them. Dart writes comments there
    * (`@override` `// ignore: must_call_super` `void f()`), and an annotation

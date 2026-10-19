@@ -25,6 +25,8 @@ type Widget struct {
 	name string
 }
 
+// Containers: a banner a blank line separates from Stack, not its doc.
+
 type Stack[T any] struct {
 	items []T
 }
@@ -119,6 +121,9 @@ func (w Widget) Render() string {
 	return w.name
 }
 
+// Callbacks: a section comment above TargetCb's own doc.
+
+// TargetCb is documented right above.
 func TargetCb(n int) {}
 
 func shadowed() {
