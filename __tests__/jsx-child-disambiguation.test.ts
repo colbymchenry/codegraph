@@ -484,6 +484,62 @@ module.exports = { LegacyPage, renderChart };
     expect(renders('LegacyPage')).toEqual(['Legacy app/legacy.tsx:1']);
     expect(renders('renderChart')).toEqual(['Chart app/chart.tsx:1']);
   });
+
+  it('renders nothing for a name the file destructures at its top, unless a function declares it inside itself', async () => {
+    write('examples/finefoods/title.tsx', 'export function Title() {\n  return <h1 />;\n}\n');
+    write('examples/crm/text.tsx', 'export function Text() {\n  return <span />;\n}\n');
+    // refine's pages take antd's typography parts once, at the top.
+    write(
+      'examples/blog/show.tsx',
+      `import { Typography } from 'antd';
+
+const { Title, Text } = Typography;
+
+export function PostShow({ post }) {
+  return (
+    <div>
+      <Title level={5}>Title</Title>
+      <Text>{post.title}</Text>
+    </div>
+  );
+}
+
+export function Summary() {
+  function Text({ children }) {
+    return <p>{children}</p>;
+  }
+  return <Text>summary</Text>;
+}
+`
+    );
+    await index();
+    expect(renders('PostShow')).toEqual([]);
+    expect(renders('Summary')).toEqual(['Text examples/blog/show.tsx:15']);
+  });
+
+  it('still renders the component for a top-level require, a top-level callback’s parameter or another function’s local', async () => {
+    write('app/legacy.tsx', 'export function Legacy() {\n  return <div />;\n}\n');
+    write('app/badge.tsx', 'export function Badge() {\n  return <b />;\n}\n');
+    write('app/chart.tsx', 'export function Chart() {\n  return <canvas />;\n}\n');
+    write(
+      'app/page.jsx',
+      `const { Legacy } = require('./legacy');
+
+[1].forEach(({ Badge }) => Badge);
+
+function helper(props) {
+  const { Chart } = props;
+  return Chart;
+}
+
+export function Page() {
+  return <div><Legacy /><Badge /><Chart />{helper}</div>;
+}
+`
+    );
+    await index();
+    expect(renders('Page')).toEqual(['Badge app/badge.tsx:1', 'Chart app/chart.tsx:1', 'Legacy app/legacy.tsx:1']);
+  });
 });
 
 /**

@@ -2023,6 +2023,47 @@ function destructures(src: string, name: string, end: number): boolean {
   return false;
 }
 
+/** Where a destructuring declaration's pattern opens: `const {`, `let [`. */
+const DESTRUCTURING_DECLARATION = /\b(?:const|let|var)\s*[{[]/g;
+
+/**
+ * The patterns `code` destructures at its top, as [opener, closer] pairs: a
+ * declaration's outside every brace, so in no function, class or block, and
+ * never a top-level callback's parameter. Braces alone are counted: JSX text
+ * may hold a stray `(` or `[`, never a `{` that opens no expression, and
+ * `code` (`jsxCode`) balances them.
+ */
+function topLevelPatterns(code: string): Array<[number, number]> {
+  const patterns: Array<[number, number]> = [];
+  let depth = 0;
+  let at = 0;
+  DESTRUCTURING_DECLARATION.lastIndex = 0;
+  for (let m = DESTRUCTURING_DECLARATION.exec(code); m; m = DESTRUCTURING_DECLARATION.exec(code)) {
+    for (; at < m.index; at++) {
+      if (code[at] === '{') depth++;
+      else if (code[at] === '}') depth--;
+    }
+    if (depth !== 0) continue;
+    const open = m.index + m[0].length - 1;
+    const close = matchingCloser(code, open);
+    if (close > open) patterns.push([open, close]);
+  }
+  return patterns;
+}
+
+/**
+ * Whether one of `patterns` in `code` binds `name` (`bindingElementAt`), so
+ * not in a declaration of `require(…)` or `import(…)`.
+ */
+function patternsBind(code: string, patterns: Array<[number, number]>, name: string): boolean {
+  for (const [open, close] of patterns) {
+    for (let at = code.indexOf(name, open); at !== -1 && at < close; at = code.indexOf(name, at + name.length)) {
+      if (bindingElementAt(code, at, name.length)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Whether the name at `at` is an element of a pattern that binds it — `{
  * Name }`, `{ ...Name }`, `{ key: Name }`, `[Name]` — followed by the next
@@ -2165,9 +2206,11 @@ function skipSpace(code: string, at: number, step: 1 | -1): number {
  * `Layout({ children, Header, Footer, Sider })` rendered another example's
  * `Footer`, and excalidraw's example app rendered the `Sidebar` of its own
  * `ExampleSidebar.tsx` for the library's, out of `const { Sidebar, Footer } =
- * excalidrawLib`. A destructured name keeps linking for a bare call — `const
- * { t } = useI18n()` is that function more often than not — but a tag's is a
- * component the props or a library hand in, which is no node here.
+ * excalidrawLib`. A name the file destructures at its top, like refine's
+ * `const { Title, Text } = Typography`, is a local of every function in it
+ * (`topLevelPatterns`). A destructured name keeps linking for a bare call —
+ * `const { t } = useI18n()` is that function more often than not — but a
+ * tag's is a component the props or a library hand in, which is no node here.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
@@ -2217,6 +2260,8 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
     // file is split once, not once per function, and read as code once: a
     // tag in a comment or a string is text (`jsxCode`).
+    let code: string | null | undefined;
+    const codeOf = () => (code === undefined ? (code = jsxCode(content)) : code);
     let lines: string[] | null = null;
     // Each name a span holds (`spanTags`), read when a function among the
     // parents is, or a function around one.
@@ -2225,11 +2270,26 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       const span = `${fn.startLine}:${fn.endLine}`;
       let names = tagsBySpan.get(span);
       if (!names) {
-        lines ??= (jsxCode(content) ?? content).split('\n');
+        lines ??= (codeOf() ?? content).split('\n');
         names = spanTags(lines.slice(fn.startLine - 1, fn.endLine).join('\n'), fn.startLine);
         tagsBySpan.set(span, names);
       }
       return names;
+    };
+    // Whether the file destructures a name at its top (`topLevelPatterns`),
+    // once per name. Read only off code: a file `jsxCode` can't read binds
+    // nothing here.
+    let topPatterns: Array<[number, number]> | null = null;
+    const topBinds = new Map<string, boolean>();
+    const destructuredAtTop = (name: string): boolean => {
+      let binds = topBinds.get(name);
+      if (binds === undefined) {
+        const src = codeOf();
+        topPatterns ??= src === null ? [] : topLevelPatterns(src);
+        binds = src !== null && topPatterns.length > 0 && patternsBind(src, topPatterns, name);
+        topBinds.set(name, binds);
+      }
+      return binds;
     };
     for (const parent of parents) {
       if (!parent.startLine || !parent.endLine) continue;
@@ -2258,6 +2318,11 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
             }
           }
           if (binder) child = declaredInside(ctx, name, binder, child);
+          // A name the file destructures at its top is every function's local:
+          // refine's pages take `const { Title, Text } = Typography` from antd
+          // and rendered two other examples' `Title` and `Text`. A function
+          // that declares the name inside itself still renders its own.
+          else if (destructuredAtTop(name)) child = declaredInside(ctx, name, around?.[around.length - 1] ?? parent, child);
         }
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
