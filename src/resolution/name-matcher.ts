@@ -15739,13 +15739,14 @@ function tsFieldDeclaration(
 
 /**
  * Resolve a TS/JS `this.<field>.<method>()` call (#1496) through the field's
- * declared type, read off the ENCLOSING class's own declaration lines:
- * a field or constructor-parameter property (`private mailer: Mailer`,
- * `mailer?: Mailer`, `readonly mailer: Mailer`) or an initializer
- * (`mailer = new Mailer()`, `this.mailer = new Mailer()`). The method is then
- * VALIDATED on that type by resolveMethodOnType. Null — never a bare-name
- * fallback — when the field is not declared there or its type is external,
- * a builtin (`this.items.push()`) or not spelled out.
+ * declared type, read off the ENCLOSING class's own declaration lines, or
+ * a class it extends (tsFieldThroughBases): a field or constructor-parameter
+ * property (`private mailer: Mailer`, `mailer?: Mailer`, `readonly mailer:
+ * Mailer`) or an initializer (`mailer = new Mailer()`, `this.mailer = new
+ * Mailer()`). The method is then VALIDATED on that type by
+ * resolveMethodOnType. Null — never a bare-name fallback — when the field is
+ * not declared there or its type is external, a builtin
+ * (`this.items.push()`) or not spelled out.
  */
 function matchTsThisFieldCall(
   field: string,
