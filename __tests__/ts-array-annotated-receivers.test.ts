@@ -263,6 +263,33 @@ describe("a call on a TypeScript local annotated as one of a type's properties",
     ]);
   }, 60_000);
 
+  it("reads one whose property's type isn't written there, a getter's, as the type it indexes, as before", async () => {
+    // vscode's `let mockPty: { onCommandExecuted: Emitter<E>['event'] }`
+    // sits nearer `onCommandExecuted.fire(…)` than the local's own `let
+    // onCommandExecuted: Emitter<E>`; `event` is a getter of `Emitter`.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/emitter.ts':
+        'export class Emitter<T> {\n' +
+        '  get event() { return (listener: (e: T) => void) => listener; }\n' +
+        '  fire(value: T) { return value; }\n' +
+        '}\n',
+      'src/use.test.ts':
+        "import { Emitter } from './emitter';\n" +
+        'declare function suite(name: string, body: () => void): void;\n' +
+        "suite('pty', () => {\n" +
+        '  let onDone: Emitter<number>;\n' +
+        '  let pty: {\n' +
+        "    onDone: Emitter<number>['event'];\n" +
+        '  };\n' +
+        "  suite('fires', () => {\n" +
+        '    onDone.fire(1);\n' +
+        '  });\n' +
+        '});\n',
+    });
+    expect(calls.filter((c) => c.startsWith('onDone.'))).toEqual(['onDone.fire -> Emitter::fire']);
+  }, 60_000);
+
   it("is not matched to a method by the call's name when the property's type isn't written in the project", async () => {
     // vscode's `invocation: Parameters<typeof rawFinalizeToolInvocation>[0]`:
     // left untyped, the receiver's name alone would pick `Logger.info`.

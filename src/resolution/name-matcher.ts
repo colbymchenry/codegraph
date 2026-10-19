@@ -14265,20 +14265,29 @@ export function matchMethodCall(
     // vscode's `ISessionChatPillVisibilityService.isVisible` through
     // `['pullRequests']`. That type decides alone, as a `this.<field>`
     // call's does (matchTsThisFieldCall): the method is its, or nothing the
-    // method's name would guess, as for a property whose type isn't written
-    // in the project (`Parameters<typeof f>[0]`, a getter). Its class is the
-    // one the declaring file imports, as a typed local's is the one the
-    // call's file imports: vscode's `ComponentFixtureContext['disposableStore']`
-    // reached copilot's vendored `DisposableStore`.
+    // method's name would guess. Its class is the one the declaring file
+    // imports, as a typed local's is the one the call's file imports:
+    // vscode's `ComponentFixtureContext['disposableStore']` reached
+    // copilot's vendored `DisposableStore`. A property whose type isn't
+    // written there (a getter like `Emitter`'s `event`, `typeof`), or a key
+    // that isn't a name (`Parameters<typeof f>[0]`), says nothing new, and
+    // is read as the type it indexes, as before: the nearest line declaring
+    // the name may be another variable's type's member, as vscode's `let
+    // mockPty: { onCommandExecuted: Emitter<E>['event'] }` is above calls on
+    // the local `onCommandExecuted`, an `Emitter<E>`.
     if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
       const element = arrayElementType(inferredType);
       const declared = element !== undefined
         ? { type: element, array: true, file: undefined }
         : tsIndexedPropertyType(inferredType, ref, context);
-      if (!declared || (declared.array && JS_ARRAY_METHODS.has(methodName!))) return null;
-      inferredType = normalizeInferredTypeName(declared.type);
-      if (!inferredType) return null;
-      if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method', declared.file);
+      if (!declared) {
+        inferredType = inferredType.replace(/\s*\[[^\]]*\]$/, '');
+      } else {
+        if (declared.array && JS_ARRAY_METHODS.has(methodName!)) return null;
+        inferredType = normalizeInferredTypeName(declared.type);
+        if (!inferredType) return null;
+        if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method', declared.file);
+      }
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
@@ -15755,18 +15764,18 @@ function tsFieldDeclaration(
  * indexes, whether the property holds an array of it, and the file that
  * says which class of that name it is. The indexed type is the one the
  * call's file imports, when it imports one; the property's type is the one
- * the declaring file imports, or else declares (tsImportedTypeFile). Null
- * when the key isn't a string literal (`Parameters<typeof f>[0]`, `T[K]`),
- * the indexed type isn't the project's, or the property's type isn't
- * written there (a getter, `typeof`).
+ * the declaring file imports, or else declares (tsImportedTypeFile).
+ * Undefined when the key isn't a string literal (`Parameters<typeof f>[0]`,
+ * `T[K]`), the indexed type isn't the project's, or the property's type
+ * isn't written there (a getter, `typeof`).
  */
 function tsIndexedPropertyType(
   indexed: string,
   ref: UnresolvedRef,
   context: ResolutionContext
-): { type: string; array: boolean; file: string } | null {
+): { type: string; array: boolean; file: string } | undefined {
   const m = /^([A-Za-z_$][\w$]*)\s*\[\s*(['"])([\w$]+)\2\s*\]$/.exec(indexed);
-  if (!m) return null;
+  if (!m) return undefined;
   const imported = tsImportedTypeFile(m[1]!, ref, context);
   const owners = preferCallSiteFile(context.getNodesByName(m[1]!), imported ?? ref.filePath).filter((n) =>
     (n.kind === 'class' || n.kind === 'interface' || n.kind === 'type_alias' || n.kind === 'component') &&
@@ -15774,11 +15783,11 @@ function tsIndexedPropertyType(
   for (const owner of owners) {
     const decl = tsFieldDeclaration(owner, m[3]!, context);
     if (!decl) continue;
-    if (decl.valueType) return null;
+    if (decl.valueType) return undefined;
     const at = owner.filePath === ref.filePath ? ref : { ...ref, filePath: owner.filePath, language: owner.language };
     return { type: decl.type, array: decl.array === true, file: tsImportedTypeFile(decl.type, at, context) ?? owner.filePath };
   }
-  return null;
+  return undefined;
 }
 
 /**
