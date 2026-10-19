@@ -229,3 +229,27 @@ describe('a this.<field> call on a field a class it extends declares', () => {
     expect(calls.filter((c) => c.includes('this.store.add'))).toEqual([]);
   }, 60_000);
 });
+
+describe('a call on a value whose type a package outside the project gives', () => {
+  it("links to no project class that shares the type's name", async () => {
+    // microsoft-authentication's `_telemetryReporter: TelemetryReporter`,
+    // imported from `@vscode/extension-telemetry`, reached another
+    // extension's `TelemetryReporter` interface.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'ext-telemetry': '^1.0.0' } }),
+      'src/other.ts': 'export interface TelemetryReporter {\n  sendTelemetryEvent(name: string): void;\n}\n',
+      'src/reporter.ts':
+        "import TelemetryReporter from 'ext-telemetry';\n" +
+        'export class Reporter {\n' +
+        '  protected reporter: TelemetryReporter;\n' +
+        '  constructor() {\n    this.reporter = new TelemetryReporter();\n  }\n' +
+        "  send() {\n    this.reporter.sendTelemetryEvent('a');\n  }\n" +
+        '}\n' +
+        "export class Sub extends Reporter {\n  more() {\n    this.reporter.sendTelemetryEvent('b');\n  }\n}\n",
+      'src/local.ts':
+        "import TelemetryReporter from 'ext-telemetry';\n" +
+        "export function f() {\n  const r = new TelemetryReporter();\n  return r.sendTelemetryEvent('c');\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('sendTelemetryEvent'))).toEqual([]);
+  }, 60_000);
+});

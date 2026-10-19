@@ -14274,6 +14274,10 @@ export function matchMethodCall(
       if (decl.asserted !== undefined) {
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
+      // A TS/JS type the file imports from a package outside the project has
+      // no project method, whatever project class shares its name.
+      if (ESM_FAMILY.has(ref.language) && !awaited &&
+          isOutOfRepoBinding(/^[A-Za-z_$][\w$]*/.exec((decl.raw ?? inferredType).trim())?.[0] ?? '', ref, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
@@ -15873,17 +15877,25 @@ function tsFieldCall(
   // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
   const typeName = decl.type.split('.').pop()!;
   if (!/^[A-Z]/.test(typeName)) return null;
-  // Two apps in one repo may each declare a `UserService`. The file the
-  // field is written in imports the one it holds, or declares it, so that
-  // one's method is the call's. Without an import, the bare-name path this
-  // replaces broke the tie by directory proximity, so keep the same signal:
-  // among the type's declarations of the method, prefer the one closest to
-  // the call site's directory (its own app), never index order.
+  // The file the field is written in names its type. One it imports from a
+  // package outside the project has no project method: microsoft-
+  // authentication's `TelemetryReporter` from `@vscode/extension-telemetry`
+  // reached another extension's interface of that name.
+  const at = !declaring || declaring.filePath === ref.filePath
+    ? ref
+    : { ...ref, filePath: declaring.filePath, language: declaring.language };
+  if (isOutOfRepoBinding(decl.type.split('.')[0]!, at, context)) return null;
+  // Two apps in one repo may each declare a `UserService`. That file
+  // imports the one the field holds, or declares it, so that one's method
+  // is the call's. Without an import, the bare-name path this replaces
+  // broke the tie by directory proximity, so keep the same signal: among
+  // the type's declarations of the method, prefer the one closest to the
+  // call site's directory (its own app), never index order.
   // resolveMethodOnType still answers the single-declaration and supertype
   // cases.
-  const imported = !declaring || declaring.filePath === ref.filePath
+  const imported = at === ref
     ? tsImportedTypeFile(decl.type, ref, context)
-    : tsImportedTypeFile(decl.type, { ...ref, filePath: declaring.filePath, language: declaring.language }, context) ?? declaring.filePath;
+    : tsImportedTypeFile(decl.type, at, context) ?? at.filePath;
   const declared = context
     .getNodesByName(methodName)
     .filter(
