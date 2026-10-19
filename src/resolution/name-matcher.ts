@@ -13085,6 +13085,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_FN_CODE.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
+  TS_PASS_THROUGH_WRAPPERS.delete(context);
   TARGET_LANGUAGE.delete(context);
 }
 
@@ -15594,8 +15595,8 @@ function matchRustSelfFieldCall(
 /**
  * Per-context memo for matchTsThisFieldCall's declaration scan: `classId\0field`
  * → the first line of the class that declares the field (as `: typeof X`,
- * `: X`, or `= new X`, tried in that order per line) with its captured type,
- * or null. The scan depends only on the class and the field, but ran for every
+ * `: X`, `= new X`, or `= this.<wrapper>(new X`, tried in that order per
+ * line) with its captured type, or null. The scan depends only on the class and the field, but ran for every
  * `this.<field>.<method>()` call — re-splitting the file and compiling three
  * patterns each time, a third of all method-call matching on vscode. Derived
  * from file source: drops with clearNameMatcherMemos.
@@ -15607,6 +15608,14 @@ const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDec
  * (`typeof X`), and whether the field holds an array of it (`items: Item[]`).
  */
 type TsFieldDecl = { valueType: boolean; type: string; array?: boolean };
+/**
+ * The call an initializer hands `new X(…)` to: `this.<method>(…)`, or
+ * `this.<holder>.<method>(…)` — vscode's `this._register(new Emitter())` and
+ * `this._store.add(new Emitter())`.
+ */
+type TsFieldWrapper = { holder?: string; method: string };
+/** A declaration found on one line; a wrapped one names its wrapper and where the wrapper's `(` is. */
+type TsFieldOnLine = TsFieldDecl & { via?: TsFieldWrapper; open?: number };
 /** What follows a field's type when the field holds an array of it: `[]`, after any type arguments. */
 const TS_ARRAY_SUFFIX = /^\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*\[\s*\]/;
 /** A class's comment-stripped lines, and which of them hold each `[\w$#]` token. */
@@ -15653,16 +15662,29 @@ const TS_TOKEN_CHAR = /[\w$#]/;
  * token occurrence of the field. There the run consumes exactly the field (a
  * shorter prefix cannot continue: every pattern needs `\s`, `?`, `!`, `:` or
  * `=` next), so each matches exactly where the field's own pattern would —
- * without compiling three patterns for every field of every class.
+ * without compiling four patterns for every field of every class.
  */
 const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)/y, valueType: true },
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)/y, valueType: false },
   { re: /(?<![\w$#])[\w$#]+\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false },
+  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*this\.(?:([\w$#]+)\.)?([\w$#]+)\(\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false, wrapped: true },
 ];
 
+/** A declaration `pattern` matched (`m`) on `line`: its type, and its wrapper when it has one. */
+function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string): TsFieldOnLine | null {
+  const type = pattern.wrapped ? m[3] : m[1];
+  if (!type) return null;
+  const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
+  if (pattern.wrapped) {
+    decl.via = { holder: m[1], method: m[2]! };
+    decl.open = m.index! + m[0].indexOf('(');
+  }
+  return decl;
+}
+
 /** The first declaration of `field` on one line, as `line.match` of its patterns in order would find it. */
-function tsFieldOnLine(line: string, field: string): TsFieldDecl | null {
+function tsFieldOnLine(line: string, field: string): TsFieldOnLine | null {
   let at: number[] | null = null;
   for (let i = line.indexOf(field); i !== -1; i = line.indexOf(field, i + 1)) {
     const end = i + field.length;
@@ -15670,11 +15692,12 @@ function tsFieldOnLine(line: string, field: string): TsFieldDecl | null {
     (at ??= []).push(i);
   }
   if (!at) return null;
-  for (const { re, valueType } of TS_FIELD_PATTERNS_AT) {
+  for (const pattern of TS_FIELD_PATTERNS_AT) {
     for (const i of at) {
-      re.lastIndex = i;
-      const m = re.exec(line);
-      if (m && m[1]) return { valueType, type: m[1], array: TS_ARRAY_SUFFIX.test(line.slice(re.lastIndex)) };
+      pattern.re.lastIndex = i;
+      const m = pattern.re.exec(line);
+      const decl = m && tsFieldMatch(pattern, m, line);
+      if (decl) return decl;
     }
   }
   return null;
@@ -15696,7 +15719,8 @@ function tsClassLinesWithToken(decl: TsClassDecl, token: string): readonly numbe
   return decl.linesByToken.get(token) ?? [];
 }
 
-type TsFieldPattern = { re: RegExp; valueType: boolean };
+/** A field declaration pattern; a wrapped one captures its wrapper's holder and method before the type. */
+type TsFieldPattern = { re: RegExp; valueType: boolean; wrapped?: true };
 /** Compiled declaration patterns by field name — fields recur across classes. */
 const TS_FIELD_PATTERNS = new Map<string, TsFieldPattern[]>();
 const TS_FIELD_PATTERNS_CAP = 4096;
@@ -15727,6 +15751,13 @@ function tsFieldPatterns(field: string): TsFieldPattern[] {
     },
     // `mailer = new Mailer()` / `this.mailer = new Mailer()`
     { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
+    // `_onDidChange = this._register(new Emitter())`, `x = this._store.add(new X())`:
+    // an X only when the wrapper returns its argument (tsFieldRead).
+    {
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*this\\.(?:([\\w$#]+)\\.)?([\\w$#]+)\\(\\s*new\\s+([A-Za-z_$][\\w.$]*)`),
+      valueType: false,
+      wrapped: true,
+    },
   ];
   if (TS_FIELD_PATTERNS.size >= TS_FIELD_PATTERNS_CAP) TS_FIELD_PATTERNS.delete(TS_FIELD_PATTERNS.keys().next().value!);
   TS_FIELD_PATTERNS.set(field, patterns);
@@ -15746,6 +15777,8 @@ function tsFieldDeclaration(
   const key = cls.id + '\0' + field;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
+  // Unread while it is being read: a wrapper's holder field can lead back here.
+  memo.set(key, null);
   let found: TsFieldDecl | null = null;
   const decl = tsClassDecl(cls, context);
   if (decl && TS_FIELD_TOKEN.test(field)) {
@@ -15756,25 +15789,149 @@ function tsFieldDeclaration(
     const rows = ++decl.lookups > 1 ? tsClassLinesWithToken(decl, field) : null;
     const count = rows ? rows.length : decl.lines.length;
     for (let k = 0; k < count && !found; k++) {
-      const line = decl.lines[rows ? rows[k]! : k]!;
+      const row = rows ? rows[k]! : k;
+      const line = decl.lines[row]!;
       // Every pattern spells the field literally, so only a line that contains
       // it can match — and most of a class's lines never mention a given field.
-      if (line.includes(field)) found = tsFieldOnLine(line, field);
+      if (line.includes(field)) found = tsFieldRead(tsFieldOnLine(line, field), cls, decl.lines, row, context);
     }
   } else if (decl) {
     const patterns = tsFieldPatterns(field);
-    scan: for (const line of decl.lines) {
+    scan: for (let row = 0; row < decl.lines.length; row++) {
+      const line = decl.lines[row]!;
       if (!line.includes(field)) continue;
-      for (const { re, valueType } of patterns) {
-        const m = line.match(re);
-        if (!m || !m[1]) continue;
-        found = { valueType, type: m[1], array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
-        break scan;
+      for (const pattern of patterns) {
+        const m = line.match(pattern.re);
+        const onLine = m && tsFieldMatch(pattern, m, line);
+        if (!onLine) continue;
+        found = tsFieldRead(onLine, cls, decl.lines, row, context);
+        if (found) break scan;
+        continue scan;
       }
     }
   }
   memo.set(key, found);
   return found;
+}
+
+/**
+ * The declaration `onLine` reads, on line `row` of class `cls`'s `lines`. A
+ * wrapped `new X(…)` is an X only when the wrapper's call ends the statement
+ * and the wrapper returns its argument: `this._register(new Emitter())` is an
+ * Emitter, `this._register(new DomEmitter(el, 'keydown')).event` is not, and
+ * nor is what `constObservable(value)` or `Promise.resolve(value)` returns.
+ * Otherwise the line declares nothing the reader can use, as before.
+ */
+function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
+  if (!onLine?.via) return onLine;
+  if (!tsCallEndsStatement(lines, row, onLine.open!) || !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
+  return { valueType: onLine.valueType, type: onLine.type, array: onLine.array };
+}
+
+/**
+ * Does the call whose `(` is at `open` on `lines[row]` end its statement, so
+ * that what it returns is what the statement assigns? Nothing but `;` (and
+ * whatever follows it) may come after its `)`, nor start the next line —
+ * `.event`, `?.x` or `[0]` would take a member of what it returns. Strings
+ * are skipped; an unclosed one, or a call still open after 12 lines, isn't
+ * read.
+ */
+function tsCallEndsStatement(lines: readonly string[], row: number, open: number): boolean {
+  let depth = 0;
+  for (let r = row, from = open; r < lines.length && r < row + 12; r++, from = 0) {
+    const line = lines[r]!;
+    for (let i = from; i < line.length; i++) {
+      const c = line[i]!;
+      if (c === '"' || c === "'" || c === '`') {
+        let close = i + 1;
+        while (close < line.length && line[close] !== c) close += line[close] === '\\' ? 2 : 1;
+        if (close >= line.length) return false;
+        i = close;
+      } else if (c === '(') {
+        depth++;
+      } else if (c === ')' && --depth === 0) {
+        const rest = line.slice(i + 1);
+        if (!/^\s*(?:;.*)?$/.test(rest)) return false;
+        if (rest.trim()) return true;
+        const next = lines.slice(r + 1, r + 4).find((l) => l.trim());
+        return !next || !/^\s*(?:[.?[(!,:|&+*\/%<>=-]|as\b|satisfies\b)/.test(next);
+      }
+    }
+  }
+  return false;
+}
+
+/** Per-context memo: `<class id>\0<holder>\0<method>` → tsWrapperReturnsArgument's answer. */
+const TS_PASS_THROUGH_WRAPPERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Does the wrapper a field initializer of class `cls` calls return its
+ * argument? `this.<method>` is the method `cls` declares or inherits, and
+ * `this.<holder>.<method>` that method of the class the holder field is
+ * declared as (its file imports or declares it). Each declaration of it that
+ * the nearest declaring class has must be tsReturnsItsArgument.
+ */
+function tsWrapperReturnsArgument(cls: Node, via: TsFieldWrapper, context: ResolutionContext): boolean {
+  let memo = TS_PASS_THROUGH_WRAPPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_PASS_THROUGH_WRAPPERS.set(context, memo);
+  }
+  const key = `${cls.id}\0${via.holder ?? ''}\0${via.method}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const at: UnresolvedRef = {
+    fromNodeId: cls.id, referenceName: via.method, referenceKind: 'calls',
+    line: cls.startLine, column: cls.startColumn, filePath: cls.filePath, language: cls.language,
+  };
+  const returns = nmTimedT('mc-thisfield-wrapper', at, () => {
+    let owner: Node | null = cls;
+    if (via.holder) {
+      const held = tsFieldThroughBases(cls, via.holder, at, context, 0);
+      owner = held && !held.decl.valueType && !held.decl.array ? tsNamedClass(held.decl.type, held.cls, at, context) : null;
+    }
+    const methods = owner ? tsClassMethods(owner, via.method, at, context, 0) : [];
+    return methods.length > 0 && methods.every((m) => tsReturnsItsArgument(m, context));
+  });
+  memo.set(key, returns);
+  return returns;
+}
+
+/**
+ * The TS methods named `name` that class `cls` declares, or else the nearest
+ * class it extends that declares one does (each base the class its
+ * subclass's file names, as tsFieldThroughBases walks them).
+ */
+function tsClassMethods(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth: number): Node[] {
+  const own = context.getNodesInFile(cls.filePath).filter((n) =>
+    n.kind === 'method' && n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
+    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
+  if (own.length > 0 || depth >= 4) return own;
+  for (const sup of declaredSupertypes(cls, context)) {
+    const base = tsNamedClass(sup, cls, at, context);
+    if (!base || base.id === cls.id) continue;
+    const found = tsClassMethods(base, name, at, context, depth + 1);
+    if (found.length > 0) return found;
+  }
+  return [];
+}
+
+/** `(o: T): T` as the TS extractor writes a signature: one parameter, of the type returned. */
+const TS_PASS_THROUGH_SIGNATURE = /^\(\s*[\w$]+\s*:\s*([A-Za-z_$][\w$]*)\s*\)\s*:\s*([A-Za-z_$][\w$]*)$/;
+
+/**
+ * Does the TS method `fn` return its argument, as far as its declaration
+ * says: one parameter, typed by a type parameter of the method's own, which
+ * it returns — vscode's `_register<T extends IDisposable>(o: T): T` and
+ * `DisposableStore.add`?
+ */
+function tsReturnsItsArgument(fn: Node, context: ResolutionContext): boolean {
+  const sig = TS_PASS_THROUGH_SIGNATURE.exec(fn.signature?.trim() ?? '');
+  if (!sig || sig[1] !== sig[2]) return false;
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(fn.startLine - 1, fn.startLine + 2).join(' ');
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\w$#])${esc(fn.name)}\\s*<\\s*(?:const\\s+)?${esc(sig[1]!)}\\b`).test(head);
 }
 
 /**
@@ -15842,7 +15999,8 @@ function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContex
  * a class it extends (tsFieldThroughBases): a field or constructor-parameter
  * property (`private mailer: Mailer`, `mailer?: Mailer`, `readonly mailer:
  * Mailer`) or an initializer (`mailer = new Mailer()`, `this.mailer = new
- * Mailer()`). The method is then VALIDATED on that type by
+ * Mailer()`, or one a wrapper hands back: `this._register(new Mailer())`,
+ * tsFieldRead). The method is then VALIDATED on that type by
  * resolveMethodOnType. Null — never a bare-name fallback — when the field is
  * not declared there or its type is external, a builtin
  * (`this.items.push()`) or not spelled out.
@@ -15881,9 +16039,9 @@ function matchTsThisFieldCall(
   });
   if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
   // Else a same-named class elsewhere may declare it, read for a calling
-  // class whose own declaration isn't (`this._register(new Emitter())`),
-  // but only with a type the call's file imports or declares: another app's
-  // class of that name says nothing about this one's field.
+  // class whose own declaration isn't (a wrapper the reader can't vouch
+  // for), but only with a type the call's file imports or declares: another
+  // app's class of that name says nothing about this one's field.
   const namesake = nmTimedT('mc-thisfield-namesakes', ref, () => {
     for (const cls of owners) {
       if (cls.filePath === ref.filePath) continue;
