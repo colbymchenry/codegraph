@@ -245,6 +245,8 @@ export const reactResolver: FrameworkResolver = {
 const LAZY_ROUTE_PREFIX = 'lazy-import:';
 const ROUTE_PARTS_PREFIX = 'route-parts:';
 const LAYOUT_PREFIX = 'layout:';
+/** React Router's `<Outlet />`: what a route with no element of its own renders, the routes inside it. */
+const OUTLET = 'Outlet';
 
 /**
  * The export a lazy route's loader picks, named the way Vue Router and
@@ -915,6 +917,14 @@ interface RouteScope {
   /** A `<Route>` element: a route even with nothing to render (a `<Route path>` that only groups others). */
   jsx?: boolean;
   /**
+   * A route object that renders React Router's `<Outlet />` — `element:
+   * <Outlet />`, `Component: Outlet`, a loader handing back `{ Component:
+   * Outlet }` — as a route with no element does: a route at its address with
+   * nothing of its own, like a `<Route path>` that only groups others, and no
+   * layout around the routes inside it.
+   */
+  outlet?: boolean;
+  /**
    * A layout at no address of its own: `{ element: <Shell/>, children }`, with
    * neither `path` nor `index`, or a `<Route element={<RequireAuth/>}>` (no
    * `path`, or `path=""`) around other `<Route>`s.
@@ -1026,8 +1036,10 @@ function scanRoutes(
     // then the innermost wrapper: `<RequireAuth><Outlet /></RequireAuth>` renders the guard.
     return own.find(content) ?? props.find(content) ?? [...own].reverse().find((t) => t !== 'Outlet') ?? own[0];
   };
+  // The component an `element` shows, `Outlet` included.
+  const elementTag = (value: string | undefined): string | undefined => componentName(value, true);
   // The page an `element` shows: `element={<Outlet />}` renders the route inside it and nothing of its own.
-  const elementPage = (value: string | undefined): string | undefined => componentName(value, true)?.replace(/^Outlet$/, '') || undefined;
+  const elementPage = (value: string | undefined): string | undefined => elementTag(value)?.replace(/^Outlet$/, '') || undefined;
   // The few characters before `at`, trailing whitespace skipped: enough for the
   // end-anchored checks below without copying the whole prefix per `/` or `<`.
   const tokenBefore = (at: number): string => {
@@ -1167,12 +1179,18 @@ function scanRoutes(
       const pathField = fields.get('path');
       const path = pathField && literal(pathField.value);
       const expr = pathField && path === undefined && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(pathField.value) ? pathField.value : undefined;
-      const component = componentName(fields.get('element')?.value, true)
-        ?? componentName(fields.get('Component')?.value, false);
-      const lazy = lazyRouteReference(fields.get('lazy')?.value, elementPage);
+      const shown = elementTag(fields.get('element')?.value) ?? componentName(fields.get('Component')?.value, false);
+      const loaded = lazyRouteReference(fields.get('lazy')?.value, elementTag);
+      // A route with no element renders an `<Outlet />`, so one written with
+      // it renders nothing of its own either: a route at its address, and no
+      // layout around the routes inside it. At its parent's address (`path:
+      // ''`) it only groups them, the parent's page staying the one there.
+      const outlet = (shown ?? loaded) === OUTLET && path !== '';
+      const component = shown === OUTLET ? undefined : shown;
+      const lazy = loaded === OUTLET ? undefined : loaded;
       const index = fields.get('index');
       if (pathField && (path !== undefined || expr)) {
-        scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, start: at, end: i, component, lazy });
+        scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, start: at, end: i, component, lazy, outlet });
       } else if (!pathField && index?.value === 'true') {
         // `{ index: true, element: <Home /> }` is the page at its parent's address.
         scopes.push({ part: { lit: '' }, at: index.at, start: at, end: i, component, lazy });
@@ -1223,7 +1241,9 @@ function scanRoutes(
       routeTags.push({ at, spreads, path: expression('path')?.trim() });
       const element = elementPage(expression('element'));
       const component = componentName(expression('component'), false) ?? element;
-      const lazy = lazyRouteReference(expression('lazy'), elementPage);
+      const loaded = lazyRouteReference(expression('lazy'), elementTag);
+      // A `<Route>` is a route with nothing of its own to render already.
+      const lazy = loaded === OUTLET ? undefined : loaded;
       const route: RouteScope = { part: { lit: path ?? '' }, at, start: at, end: source.length, component, lazy, jsx: true };
       if (path) scope = route;
       else if (pathText === undefined || path === '') {
@@ -1301,7 +1321,7 @@ function scanRoutes(
     const outer = around(s.start, s.end);
     return !outer.some((c) => c.opaque) && (outer.some((c) => Boolean(c.part.lit || c.part.expr)) || inRouter(s));
   };
-  const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || renders(s)) && addressed(s)));
+  const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || s.outlet || renders(s)) && addressed(s)));
   const layout = (c: RouteScope): boolean => renders(c) && !c.opaque;
   const routes: RouteDeclaration[] = [];
   for (const scope of pages) {
@@ -1481,14 +1501,17 @@ const FIRST_IMPORT = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/;
  * - A component of the route's own file it returns is named as written:
  *   `return { loader, Component: SettingsPage }`.
  *
- * Undefined when it renders nothing, handing over only a `loader`. A loader
- * this does not read, such as a helper's (`lazyPage(() => import('./x'))`)
- * or `.then(convert)`, loads the module its first import names, as before.
+ * `Outlet` when it hands back React Router's (`return { Component: Outlet,
+ * loader }`, which Medusa's `:id` routes write to load a breadcrumb): the
+ * routes inside it render in its place. Undefined when it renders nothing,
+ * handing over only a `loader`. A loader this does not read, such as a
+ * helper's (`lazyPage(() => import('./x'))`) or `.then(convert)`, loads the
+ * module its first import names, as before.
  */
-function lazyRouteReference(loader: string | undefined, elementPage: (jsx: string) => string | undefined): string | undefined {
+function lazyRouteReference(loader: string | undefined, elementTag: (jsx: string) => string | undefined): string | undefined {
   if (!loader) return undefined;
   const code = stripCommentsForRegex(loader, 'typescript').trim();
-  const rendered = code.startsWith('{') ? lazyPropertiesRender(code) : routeRender(loaderValue(code, new Map()), elementPage);
+  const rendered = code.startsWith('{') ? lazyPropertiesRender(code) : routeRender(loaderValue(code, new Map()), elementTag);
   if (rendered === null) return undefined;
   if (rendered !== undefined) return rendered;
   const spec = FIRST_IMPORT.exec(code)?.[1];
@@ -1497,9 +1520,10 @@ function lazyRouteReference(loader: string | undefined, elementPage: (jsx: strin
 
 /**
  * What route properties a loader resolves to render: the reference for its
- * page, null for none, undefined for properties this does not read.
+ * page, `Outlet` for React Router's, null for none, undefined for properties
+ * this does not read.
  */
-function routeRender(value: Loaded | null, elementPage: (jsx: string) => string | undefined): string | null | undefined {
+function routeRender(value: Loaded | null, elementTag: (jsx: string) => string | undefined): string | null | undefined {
   if (value?.kind === 'module') return LAZY_ROUTE_PREFIX + value.spec;
   if (value?.kind !== 'object') return undefined;
   const { props, spreads } = objectEntries(value.text);
@@ -1507,14 +1531,17 @@ function routeRender(value: Loaded | null, elementPage: (jsx: string) => string 
   const element = props.get('element');
   const shown = component ?? element;
   if (shown !== undefined) {
-    const named = component !== undefined ? pageReference(valueOf(component, value.scope)) : undefined;
+    const held = component !== undefined ? valueOf(component, value.scope) : null;
+    const named = pageReference(held);
     if (named) return named;
     // The one export the loader imported that it shows, past a guard of the
     // route file's own: `<AgeGate><FireworksPage /></AgeGate>`, `() =>
     // <PrivateRoute component={<Favorites />} />`, `withAuth(Page)`.
     const loaded = loadedExports(shown, value.scope);
     if (loaded.length === 1) return pageReference(loaded[0]!);
-    const tag = component === undefined && loaded.length === 0 ? elementPage(element!) : undefined;
+    const tag = component === undefined && loaded.length === 0 ? elementTag(element!) : undefined;
+    // `Component: Outlet`, `element: <Outlet />`: the routes inside render in its place.
+    if ((held?.kind === 'name' && held.name === OUTLET) || tag === OUTLET) return OUTLET;
     return tag ? pageReference(nameValue(tag, value.scope)) : undefined;
   }
   // `{ ...module }`: the module's exports are the route's properties.
