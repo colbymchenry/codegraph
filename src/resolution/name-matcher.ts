@@ -13106,6 +13106,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_QUALIFIERS.delete(context);
   GO_SCOPE_INDEXES.delete(context);
+  GO_PACKAGE_CLAUSES.delete(context);
   GO_EMBEDS.delete(context);
   GO_ALIAS_TARGETS.delete(context);
   GO_DOT_IMPORTS.delete(context);
@@ -14277,6 +14278,13 @@ export function matchMethodCall(
     if (value !== undefined) return value && matchGoStdlibNamedLocalCall(objectOrClass!, methodName!, value, ref, context);
   }
 
+  // A Go call through a variable or constant its package declares at the top
+  // level, in this file or another, is read by that declaration.
+  if (ref.language === 'go' && dotMatch && !objectOrClass!.includes('.')) {
+    const packageValue = matchGoPackageValueCall(objectOrClass!, methodName!, ref, context);
+    if (packageValue !== undefined) return packageValue;
+  }
+
   // A Dart call through a type's name is to that type's own member, or to
   // nothing in the project.
   if (ref.language === 'dart' && dotMatch) {
@@ -15349,6 +15357,143 @@ function matchGoStdlibNamedLocalCall(
   }
   return methods.length === 1 && !isStdMethodName('go', method)
     ? { original: ref, targetNodeId: methods[0]!.id, confidence: 0.7, resolvedBy: 'instance-method' } : null;
+}
+
+/**
+ * A Go call through a variable or constant its package declares at the top
+ * level — `lg.Panic(…)` after `var lg *zap.Logger`, `RoleEndpoint.String()`
+ * after `RoleEndpoint Role = "endpoints"`, in this file or another of the
+ * package — read by that declaration, as a local's is: the method of the
+ * project type it is declared as, or nothing for a type from outside the
+ * project, a predeclared type, a type literal or a value a package from
+ * outside the project hands out. etcd's `var lg *zap.Logger` made each
+ * `lg.Panic(…)` a project logger's `Panic`, and prometheus's
+ * `RoleEndpoint.String()` reached another package's `Role`. Undefined, for
+ * the strategies below, when the name is no such declaration where the call
+ * is — a local or parameter binds it, the file imports a package by it — when
+ * the declaration says no type (a value a project function returns), or when
+ * no method of the project type it names is found.
+ */
+function matchGoPackageValueCall(receiver: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const dir = goPackageDir(ref.filePath);
+  const decls = context.getNodesByName(receiver).filter((n) =>
+    n.language === 'go' && (n.kind === 'variable' || n.kind === 'constant') && goPackageDir(n.filePath) === dir);
+  if (decls.length === 0) return undefined;
+  if (context.getImportMappings(ref.filePath, 'go').some((m) => m.localName === receiver)) return undefined;
+  if (goLocalDecl(receiver, ref, context)) return undefined;
+  // A package's external tests (`package foo_test`) share its directory.
+  const pkg = goPackageClause(ref.filePath, context);
+  let type: GoPackageValueType | undefined;
+  for (const d of decls) {
+    if (goPackageClause(d.filePath, context) !== pkg) continue;
+    const t = goPackageValueType(d, context);
+    // Files for other build targets may declare it differently.
+    if (t === undefined || (type !== undefined && (type?.written.replace(/\s/g, '') ?? null) !== (t?.written.replace(/\s/g, '') ?? null))) {
+      return undefined;
+    }
+    type = t;
+  }
+  if (type === undefined) return undefined;
+  if (type === null) return null;
+  const named = goNamedType(type.written);
+  if (!named || isGoOutsideType(named, type.file, context)) return null;
+  const dot = named.indexOf('.');
+  const name = named.slice(dot + 1);
+  if (dot < 0 && GO_BUILTIN_FIELD_TYPES.has(name)) return null;
+  const pkgDir = dot < 0 ? goPackageDir(type.file) : goImportPackageDir(named.slice(0, dot), type.file, context);
+  if (!pkgDir || goPackageTypes(name, pkgDir, context).length === 0) return undefined;
+  // A project type whose methods aren't found is left to the strategies
+  // below: kubernetes' `var UnstructuredJSONScheme runtime.Codec =
+  // unstructuredJSONScheme{}` is a `Codec`, defined over an interface whose
+  // methods its node doesn't carry.
+  return resolveMethodOnType(name, method, ref, context, 0.9, 'instance-method', pkgDir) ?? undefined;
+}
+
+/** A Go package-level value's type as its declaration writes it, with the declaring file; null for one with no project method. */
+type GoPackageValueType = { written: string; file: string } | null;
+
+/**
+ * The type a Go package-level variable or constant `n` is declared with,
+ * read from its spec: `*zap.Logger` in `var lg *zap.Logger`, `Role` in
+ * `RoleEndpoint Role = "endpoints"`, the type of a composite literal (`var r
+ * = &Registry{}`) or of a conversion (`var p = Role("pod")`) it is set to,
+ * and for a constant written alone in a `const ( … )` group, what the spec
+ * above it says, which Go repeats. Null for a value a package from outside
+ * the project hands out (`var errX = errors.New(…)`). Undefined when the
+ * spec says no type — a value a project function returns, an untyped
+ * constant — or can't be read.
+ */
+function goPackageValueType(n: Node, context: ResolutionContext): GoPackageValueType | undefined {
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/);
+  if (!lines) return undefined;
+  for (let i = n.startLine - 1; i >= 0 && i > n.startLine - 200; i--) {
+    const line = (lines[i] ?? '').replace(/\/\/.*$/, '');
+    const own = i === n.startLine - 1;
+    if (!own && /^\s*(?:$|\/\*|\*)/.test(line)) continue;
+    // `var name T = v`, `const ( name T = v`, a group's `name, other = v`.
+    const spec = /^\s*(?:(?:var|const)\s*(?:\(\s*)?)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)(.*)$/.exec(line);
+    if (!spec || (own && !spec[1]!.split(/\s*,\s*/).includes(n.name))) return undefined;
+    const rest = spec[2]!.trim();
+    if (!rest) {
+      // A constant written alone in its group repeats the spec above it.
+      if (n.kind !== 'constant' || /^\s*(?:var|const)\b/.test(line)) return undefined;
+      continue;
+    }
+    const eq = rest.search(/=(?!=)/);
+    const written = (eq < 0 ? rest : rest.slice(0, eq)).trim();
+    if (/[:"'`]/.test(written)) return undefined;
+    if (written) return { written, file: n.filePath };
+    return goValueType(rest.slice(eq + 1), n.filePath, context);
+  }
+  return undefined;
+}
+
+/**
+ * The type a Go value gives a declaration that writes none: a composite
+ * literal's (`&Registry{…}`, `pkg.T{…}`) or a conversion's (`Role("pod")`,
+ * `pkg.T(x)`). Null for what a package from outside the project hands out
+ * (`errors.New(…)`), and for an anonymous struct; undefined otherwise.
+ */
+function goValueType(value: string, filePath: string, context: ResolutionContext): GoPackageValueType | undefined {
+  const m = /^\s*&?\s*(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]\n]*\]\s*)?([({])/.exec(value);
+  if (!m) return undefined;
+  const [, qualifier, name, open] = m;
+  if (qualifier !== undefined && isGoOutsidePackage(qualifier, filePath, context)) return null;
+  const written = qualifier !== undefined ? `${qualifier}.${name}` : name!;
+  if (open === '{') return GO_TYPE_KEYWORDS.has(name!) ? null : { written, file: filePath };
+  // A call is a conversion when it names a type of its package.
+  const dir = qualifier !== undefined ? goImportPackageDir(qualifier, filePath, context) : goPackageDir(filePath);
+  return dir && goPackageTypes(name!, dir, context).length > 0 ? { written, file: filePath } : undefined;
+}
+
+const GO_PACKAGE_CLAUSES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/** The name a Go file's `package` clause gives its package, or null. */
+function goPackageClause(filePath: string, context: ResolutionContext): string | null {
+  let memo = GO_PACKAGE_CLAUSES.get(context);
+  if (!memo) GO_PACKAGE_CLAUSES.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+  let name: string | null = null;
+  let comment = false;
+  for (const line of lines.slice(0, 500)) {
+    if (comment) {
+      if (line.includes('*/')) comment = false;
+      continue;
+    }
+    if (/^\s*\/\*/.test(line) && !line.includes('*/')) {
+      comment = true;
+      continue;
+    }
+    const m = /^\s*package\s+([A-Za-z_]\w*)/.exec(line);
+    if (m) {
+      name = m[1]!;
+      break;
+    }
+  }
+  memo.set(filePath, name);
+  return name;
 }
 
 /**
