@@ -16023,7 +16023,10 @@ function tsNamedType(written: string, from: Node, at: UnresolvedRef, context: Re
   } else if (mapping) {
     const imported = context.resolveImport?.({ ...ref, referenceName: written, referenceKind: 'references' });
     const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-    found = node && TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : null;
+    // vscode's `ILogService` is also a constant, its dependency-injection
+    // decorator, which the import may name first: the type is the interface
+    // of that name beside it.
+    found = !node ? null : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
   } else if (!written.includes('.')) {
     found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
   }
