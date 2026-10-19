@@ -145,13 +145,19 @@ function cleanCommentMarkers(comment: string): string {
  * a blank line ends the docstring, and a comment that ends on the
  * declaration's own line documents nothing. That is Go's doc comment, the one
  * go doc shows. Default: off.
+ *
+ * `skipDirectives` leaves the comment directives Go tools read, like
+ * `//go:embed static` or `//nolint:errcheck`, out of the docstring's text, as
+ * go doc does. They still count as comments when the other options decide
+ * where the docstring starts. Default: off.
  */
 export function getPrecedingDocstring(
   node: SyntaxNode,
   source: string,
   stepOver: readonly string[] = [],
   skipTrailing = false,
-  skipDetached = false
+  skipDetached = false,
+  skipDirectives = false
 ): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
@@ -206,14 +212,29 @@ export function getPrecedingDocstring(
     }
     first = start;
   }
-  if (first === comments.length) return undefined;
+  const docComments = comments
+    .slice(first)
+    .filter((c) => !skipDirectives || !isDirective(getNodeText(c, source)));
+  if (docComments.length === 0) return undefined;
 
   // Strip each comment's syntax markers (language-aware), then join.
-  return comments
-    .slice(first)
+  return docComments
     .map((c) => cleanCommentMarkers(getNodeText(c, source)))
     .join('\n')
     .trim();
+}
+
+/**
+ * Whether a comment is a directive Go tools read, which go doc leaves out of a
+ * doc comment's text (go/ast's isDirective): a `//` comment with no space
+ * after the slashes that is `//line `, `//extern ` or `//export ` followed by
+ * text, or that opens with a lowercase word, a colon and a lowercase letter or
+ * digit, like `//go:embed static` or `//nolint:errcheck`.
+ */
+function isDirective(comment: string): boolean {
+  if (!comment.startsWith('//')) return false;
+  const text = comment.slice(2);
+  return /^(?:line|extern|export) /.test(text) || /^[a-z0-9]+:[a-z0-9]/.test(text);
 }
 
 /** Whether code comes before `node` on the line it starts on. */

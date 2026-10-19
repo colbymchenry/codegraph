@@ -199,6 +199,12 @@ export interface LanguageExtractor {
    */
   docstringSkipsDetachedComments?: boolean;
   /**
+   * Leave out of a docstring's text the comment directives Go tools read, like
+   * `//go:embed static`, `//nolint:errcheck` or `//export F`, as go doc does:
+   * a declaration whose only comment is a directive has no doc.
+   */
+  docstringSkipsDirectives?: boolean;
+  /**
    * Node types that may stand between a declaration and the decorators written
    * before it without ending the scan for them. Dart writes comments there
    * (`@override` `// ignore: must_call_super` `void f()`), and an annotation

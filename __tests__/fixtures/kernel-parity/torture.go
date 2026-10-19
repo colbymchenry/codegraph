@@ -172,6 +172,8 @@ func shadowed() {
 	fmt.Println(MAX_ITEMS)
 }
 
+// reads is documented above a directive, which is no part of its doc.
+//go:noinline
 func reads() int {
 	return MAX_ITEMS
 }

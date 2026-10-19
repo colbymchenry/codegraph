@@ -261,4 +261,7 @@ export const goExtractor: LanguageExtractor = {
   // line ends it, as go doc reads it: a banner or a note above that blank line
   // documents nothing.
   docstringSkipsDetachedComments: true,
+  // A directive Go tools read, like `//go:embed static` or
+  // `//nolint:errcheck`, is not part of the doc comment go doc shows.
+  docstringSkipsDirectives: true,
 };

@@ -16,7 +16,7 @@ use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
     RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FUNCTION_REF_CODE, NONE, NONE_STR,
 };
-use crate::docstring::preceding_docstring_skipping_trailing_and_detached;
+use crate::docstring::preceding_go_doc_comment;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
@@ -402,12 +402,10 @@ impl<'t> Walker<'t> {
     /// from the declaration wrapper when there is one, without the comments
     /// that trail the code above it (docstringSkipsTrailingComments) or that
     /// don't end on the line right above it, past a blank line
-    /// (docstringSkipsDetachedComments).
+    /// (docstringSkipsDetachedComments), and without directives like
+    /// `//go:embed` in its text (docstringSkipsDirectives).
     fn docstring_of(&self, node: Node<'t>) -> Option<String> {
-        preceding_docstring_skipping_trailing_and_detached(
-            self.declaration_wrapper(node).unwrap_or(node),
-            self.src,
-        )
+        preceding_go_doc_comment(self.declaration_wrapper(node).unwrap_or(node), self.src)
     }
 
     // --- visitNode ------------------------------------------------------------
