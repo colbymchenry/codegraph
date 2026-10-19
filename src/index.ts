@@ -1064,8 +1064,9 @@ export class CodeGraph {
             // to an added file (`@excalidraw/common` to `packages/common/src/
             // index.ts`) waits under its last segment, which that file's keys
             // never give: look its failed imports up by the specifier itself.
-            // An import of the importer's own folder or the one above (`.`,
-            // `..`) waits under no key at all, so each is tried where written.
+            // An import of the importer's own folder or one above it (`.`,
+            // `..`, `../..`) waits under no key at all, so each is tried
+            // where written.
             const addedFiles = new Set(result.addedFilePaths ?? []);
             const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
               const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
@@ -1078,11 +1079,16 @@ export class CodeGraph {
               .filter((ref) => ref.filePath !== undefined && ref.language !== undefined &&
                 resolvesToAdded(ref.referenceName, ref.filePath, ref.language));
             const retryRows = new Set(retryable.map((ref) => ref.rowId));
+            // A key a popular import shares (`utils`, `react`, `assert`) is
+            // past the ceiling, and is still looked through for the imports
+            // that could name an added file.
             const importRetry = this.queries.getRetryableFailedImports(
               (result.addedFilePaths ?? []).flatMap(importPathKeys),
               this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module']),
               undefined,
-              resolvedModules
+              resolvedModules,
+              undefined,
+              this.resolver.couldNameAnyOf([...addedFiles])
             );
             for (const ref of [...importRetry, ...folderImports]) {
               if (!retryRows.has(ref.rowId)) {

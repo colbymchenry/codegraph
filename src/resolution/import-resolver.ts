@@ -520,7 +520,7 @@ const C_CPP_STDLIB_HEADERS = new Set([
  * same syntax, and leaving them out made `isExternalImport` answer "not
  * external" for every npm specifier in an SFC.
  */
-const ESM_IMPORT_LANGUAGES = new Set<Language>([
+export const ESM_IMPORT_LANGUAGES: ReadonlySet<Language> = new Set<Language>([
   'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
 ]);
 
@@ -1841,6 +1841,19 @@ function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): bool
   return imports.some((m) => m.source === ref.referenceName) && !imports.some((m) => m.localName === ref.referenceName);
 }
 
+/**
+ * The file a JS/TS module reference names, the way resolveViaImport reads it:
+ * a path (`../lib/a`, `@/lib/x`), a scoped package a `tsconfig` path or a
+ * workspace member maps to the project, or a bare module under a `baseUrl`.
+ * Null for any other reference, and for one that names no file of the project
+ * but its own.
+ */
+export function jsModuleFile(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!isJsPathImportRef(ref) && !isJsBareModuleRef(ref, context)) return null;
+  const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+  return file && file !== ref.filePath ? file : null;
+}
+
 /** PHP reference kinds whose name is a class name, written as in the source. */
 const PHP_CLASS_NAME_REFS: ReadonlySet<string> = new Set(['instantiates', 'extends', 'implements', 'references']);
 
@@ -1917,9 +1930,9 @@ export function resolveViaImport(
   // found the way the runtime finds it: extensions, `index` files, path
   // aliases. Matching the basename instead missed every extensionless one
   // (the common spelling) and could land on a same-named file elsewhere.
-  if (isJsPathImportRef(ref) || isJsBareModuleRef(ref, context)) {
-    const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
-    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+  const moduleFile = jsModuleFile(ref, context);
+  if (moduleFile) {
+    const fileNode = context.getNodesInFile(moduleFile).find((n) => n.kind === 'file');
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
   }
   // A Dart `import` / `export` URI names a library file, and a `part` URI one
