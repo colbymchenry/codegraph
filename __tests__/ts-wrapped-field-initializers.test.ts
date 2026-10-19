@@ -122,13 +122,15 @@ describe('a this.<field> call on a field a wrapper initializes', () => {
         'export class Model extends Disposable {\n' +
         '  private readonly _onDidChange = this._register(new Emitter<string>());\n' +
         '  private readonly _onDidShow = this._store.add(new Emitter<void>());\n' +
+        '  private readonly _onDidHide = this._register(new Emitter<void>())\n' +
         '  private readonly onKeyDown = this._register(new DomEmitter()).event;\n' +
-        "  change() {\n    this._onDidChange.fire('a');\n    this._onDidShow.fire();\n    this.onKeyDown.dispose();\n  }\n" +
+        "  change() {\n    this._onDidChange.fire('a');\n    this._onDidShow.fire();\n    this._onDidHide.fire();\n    this.onKeyDown.dispose();\n  }\n" +
         '}\n',
     };
     const calls = await callsOf(Object.fromEntries(Object.entries(files).map(([file, text]) => [file, text.replace(/\n/g, '\r\n')])));
     expect(calls.filter((c) => c.includes('.fire') || c.includes('.dispose'))).toEqual([
       'src/app/model.ts: this._onDidChange.fire -> src/base/event.ts::Emitter::fire',
+      'src/app/model.ts: this._onDidHide.fire -> src/base/event.ts::Emitter::fire',
       'src/app/model.ts: this._onDidShow.fire -> src/base/event.ts::Emitter::fire',
     ]);
   }, 60_000);
