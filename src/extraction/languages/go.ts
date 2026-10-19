@@ -70,9 +70,15 @@ export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: 
  * its own name, which in a recursive type is the declaration itself.
  */
 function goDeclaredNames(decl: SyntaxNode, source: string): Set<string> {
-  const names = new Set<string>();
+  const names = goTypeParameterNames(decl, source);
   const nameNode = getChildByField(decl, 'name');
   if (nameNode) names.add(getNodeText(nameNode, source));
+  return names;
+}
+
+/** The type parameters a Go type declaration declares: `T` and `K` in `type Store[T any, K comparable] …`. */
+function goTypeParameterNames(decl: SyntaxNode, source: string): Set<string> {
+  const names = new Set<string>();
   for (const param of getChildByField(decl, 'type_parameters')?.namedChildren ?? []) {
     for (const c of param.namedChildren) {
       if (c.type === 'identifier') names.add(getNodeText(c, source));
@@ -146,6 +152,25 @@ export function goStructFieldTypeNames(node: SyntaxNode, source: string): Syntax
       type = type.type === 'generic_type' ? getChildByField(type, 'type_arguments') : null;
     }
     if (type) collectGoTypeNames(type, declared, source, names);
+  }
+  return names;
+}
+
+/**
+ * The name nodes of the types a Go interface method's signature names, in
+ * source order: `OpOption` and `PutResponse` in etcd's `Put(ctx
+ * context.Context, key, val string, opts ...OpOption) (*PutResponse, error)`,
+ * and `Context`, whose package stays in the source. `decl` declares the
+ * interface. Skipped: Go's predeclared types and, written bare, the
+ * interface's own type parameters (`T` in `type Store[T any] interface`). Its
+ * own name is a type the method names (`Children() []Node`).
+ */
+export function goInterfaceMethodTypeNames(method: SyntaxNode, decl: SyntaxNode, source: string): SyntaxNode[] {
+  const params = goTypeParameterNames(decl, source);
+  const names: SyntaxNode[] = [];
+  for (const field of ['parameters', 'result']) {
+    const part = getChildByField(method, field);
+    if (part) collectGoTypeNames(part, params, source, names);
   }
   return names;
 }

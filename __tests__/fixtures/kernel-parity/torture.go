@@ -78,6 +78,14 @@ type Core interface {
 	Unmarshal(data []byte) error
 }
 
+// An interface method references the types its signature names, but the
+// interface's own type parameters and the predeclared types.
+type Repo[T any] interface {
+	Find(ctx pkga.Context, id Dur) (*Widget, error)
+	Each(fn func(T, *Stack[int]) bool) []pkga.Item
+	Self() Repo[T]
+}
+
 type Number interface {
 	~int | ~float64
 }

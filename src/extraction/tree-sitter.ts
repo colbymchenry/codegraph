@@ -25,7 +25,7 @@ import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifie
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplTypeName } from './languages/rust';
-import { goAliasTypeNames, goEmbeddedTypeName, goStructFieldTypeNames } from './languages/go';
+import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -3909,7 +3909,7 @@ export class TreeSitterExtractor {
       // impl-navigation can see the contract. Go has no `implements` keyword, so
       // without the interface's method set there's nothing to match against.
       if (this.language === 'go' && typeChild) {
-        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id, node);
       }
       return true;
     }
@@ -3959,8 +3959,11 @@ export class TreeSitterExtractor {
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
    * are `type_elem`s, not methods, and are left to inheritance extraction.
+   * Each method references the types its signature names, as a function does
+   * (`decl` declares the interface): a call through the interface reaches the
+   * method, so impact on a type reaches its callers.
    */
-  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string, decl: SyntaxNode): void {
     this.nodeStack.push(ifaceId);
     for (let i = 0; i < interfaceType.namedChildCount; i++) {
       const m = interfaceType.namedChild(i);
@@ -3969,9 +3972,20 @@ export class TreeSitterExtractor {
       if (!nameNode) continue;
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
-        this.createNode('method', mname, m, {
+        const methodNode = this.createNode('method', mname, m, {
           signature: this.extractor?.getSignature?.(m, this.source),
         });
+        if (methodNode) {
+          for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: methodNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
     }
     this.nodeStack.pop();

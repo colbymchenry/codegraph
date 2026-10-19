@@ -610,7 +610,7 @@ impl<'t> Walker<'t> {
             };
             if let Some(type_child) = type_child {
                 self.extract_inheritance(type_child, row);
-                self.extract_go_interface_methods(type_child, row, &name);
+                self.extract_go_interface_methods(type_child, row, &name, node);
             }
             return true;
         }
@@ -634,9 +634,12 @@ impl<'t> Walker<'t> {
         false
     }
 
-    /// extractGoInterfaceMethods: method_elem/method_spec → method nodes.
-    fn extract_go_interface_methods(&mut self, interface_type: Node<'t>, iface_row: u32, iface_name: &str) {
+    /// extractGoInterfaceMethods: method_elem/method_spec → method nodes, each
+    /// referencing the types its signature names (`decl` declares the
+    /// interface).
+    fn extract_go_interface_methods(&mut self, interface_type: Node<'t>, iface_row: u32, iface_name: &str, decl: Node<'t>) {
         self.stack.push(Scope { row: iface_row, kind: "interface", name: iface_name.to_string() });
+        let references = edge_kind_index("references").unwrap();
         for i in 0..interface_type.named_child_count() {
             let Some(m) = interface_type.named_child(i) else { continue };
             if !matches!(m.kind(), "method_elem" | "method_spec") {
@@ -647,10 +650,28 @@ impl<'t> Walker<'t> {
             let mname = self.text(name_node).to_string();
             if !mname.is_empty() {
                 let signature = self.signature_of(m);
-                self.create_node("method", &mname, m, Extra { signature, ..Extra::default() });
+                let Some(row) = self.create_node("method", &mname, m, Extra { signature, ..Extra::default() }) else { continue };
+                for ty in self.interface_method_type_names(m, decl) {
+                    let text = self.text(ty).to_string();
+                    self.push_ref_at(row, &text, references, ty);
+                }
             }
         }
         self.stack.pop();
+    }
+
+    /// goInterfaceMethodTypeNames (languages/go.ts): the name nodes of the
+    /// types an interface method's parameters and results name, but the
+    /// predeclared types and the interface's own type parameters.
+    fn interface_method_type_names(&self, method: Node<'t>, decl: Node<'t>) -> Vec<Node<'t>> {
+        let mut names = Vec::new();
+        let params = self.type_parameter_names(decl);
+        for field in ["parameters", "result"] {
+            if let Some(part) = method.child_by_field_name(field) {
+                self.collect_type_names(part, &params, false, &mut names);
+            }
+        }
+        names
     }
 
     /// extractVariable's Go branch: var/const specs + short_var_declaration.
@@ -909,10 +930,17 @@ impl<'t> Walker<'t> {
     /// declaration's own type parameters, and its own name, which in a
     /// recursive type is the declaration itself.
     fn declared_names(&self, decl: Node<'t>) -> HashSet<&'t str> {
-        let mut names = HashSet::new();
+        let mut names = self.type_parameter_names(decl);
         if let Some(name) = decl.child_by_field_name("name") {
             names.insert(self.text(name));
         }
+        names
+    }
+
+    /// goTypeParameterNames (languages/go.ts): the type parameters a type
+    /// declaration declares.
+    fn type_parameter_names(&self, decl: Node<'t>) -> HashSet<&'t str> {
+        let mut names = HashSet::new();
         if let Some(list) = decl.child_by_field_name("type_parameters") {
             for param in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
                 for c in (0..param.named_child_count()).filter_map(|j| param.named_child(j)) {
