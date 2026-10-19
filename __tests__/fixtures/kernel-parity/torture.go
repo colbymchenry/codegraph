@@ -8,6 +8,13 @@ import (
 
 const MAX_ITEMS = 128 // the line's own comment, not DefaultRegistry's doc
 
+// Limits: the group's comment, for a member without its own.
+const (
+	// MinItems is documented inside its group.
+	MinItems = 1
+	MaxSlots = 64
+)
+
 var DefaultRegistry = NewRegistry()
 
 var handlerTable = map[string]func(int){

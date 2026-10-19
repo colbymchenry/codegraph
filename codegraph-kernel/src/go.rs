@@ -697,11 +697,15 @@ impl<'t> Walker<'t> {
                         None
                     };
                     let signature = value_node.map(|v| util::init_signature(self.text(v)));
+                    // A member of a `const ( … )` group has its own doc
+                    // comment beside it in the parentheses; one without keeps
+                    // the group's.
+                    let doc = self.docstring_of(spec).or_else(|| docstring.clone());
                     var_row = self.create_node(
                         if is_const_decl { "constant" } else { "variable" },
                         &name,
                         spec,
-                        Extra { docstring: docstring.clone(), signature, ..Extra::default() },
+                        Extra { docstring: doc, signature, ..Extra::default() },
                     );
                 }
             }

@@ -3572,8 +3572,10 @@ export class TreeSitterExtractor {
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
+          // A member of a `const ( … )` group has its own doc comment beside
+          // it in the parentheses; one without keeps the group's.
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
-            docstring,
+            docstring: this.docstringFor(spec) ?? docstring,
             signature: initSignature,
           });
         }
