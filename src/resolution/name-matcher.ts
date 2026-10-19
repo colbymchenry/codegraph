@@ -12788,7 +12788,7 @@ function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: Resolu
   if (file === undefined) {
     file = null;
     const binding = name.split('.')[0]!;
-    if (context.getImportMappings(ref.filePath, ref.language).some((i) => i.localName === binding)) {
+    if (context.getImportMappings?.(ref.filePath, ref.language)?.some((i) => i.localName === binding)) {
       const imported = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
       const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
       if (node && node.kind !== 'file' && node.filePath !== ref.filePath) file = node.filePath;
