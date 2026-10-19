@@ -29,6 +29,39 @@ type Stack[T any] struct {
 	items []T
 }
 
+// A struct references the types its fields are declared with, but the types
+// it embeds (supertypes), its own type parameters, predeclared types and its
+// own name written bare.
+type Server struct {
+	handlers HandlersChain
+	byKey    map[Dur][]*Widget `json:"by_key"`
+	events   <-chan pkga.Item
+	grid     [MAX_ITEMS]Widget
+	cb       func(ctx pkga.Context, w *Widget) (*Stack[int], error)
+	a, b     Widget
+	nested   struct {
+		w Widget
+		*Base
+	}
+	codec interface {
+		Encode(pkga.Item) ([]byte, error)
+	}
+	*pkga.Lister[*Widget, pkga.Item]
+	next *Server
+	n    int
+}
+
+type Pool[T any] struct {
+	items []T
+	next  *Pool[T]
+	Stack[T]
+	extra Widget
+}
+
+type AnonFields = struct {
+	w Widget
+}
+
 // Units of time: the group's comment, no member's doc.
 type (
 	Seconds int

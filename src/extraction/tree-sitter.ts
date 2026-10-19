@@ -25,7 +25,7 @@ import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifie
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplTypeName } from './languages/rust';
-import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
+import { goAliasTypeNames, goEmbeddedTypeName, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -3845,6 +3845,20 @@ export class TreeSitterExtractor {
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, aggregateNode.id);
+        // A Go struct references the types its fields are declared with, as
+        // the struct: Go fields mint no nodes, and impact never climbs from a
+        // member to its container (Dart's fields are the same, #2327).
+        if (this.language === 'go') {
+          for (const type of goStructFieldTypeNames(node, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: aggregateNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
