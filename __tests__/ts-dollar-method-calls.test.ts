@@ -78,6 +78,41 @@ describe('a call to a method whose name has a $', () => {
     ]);
   }, 60_000);
 
+  it('is linked by a sync that adds the class after the caller', async () => {
+    const caller = {
+      'package.json': JSON.stringify({ name: 'app' }),
+      'src/app/vault.component.ts':
+        "import { OrganizationService } from '../common/organization.service';\n" +
+        "export function load(service: OrganizationService) {\n  return service.organizations$('u');\n}\n",
+    };
+    const service = {
+      'src/common/organization.service.ts':
+        'export abstract class OrganizationService {\n  abstract organizations$(userId: string): string[];\n}\n',
+    };
+    const write = (root: string, files: Record<string, string>) => {
+      for (const [file, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), text);
+      }
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ts-dollar-sync-'));
+    roots.push(root);
+    write(root, caller);
+    const graph = await CodeGraph.init(root, { index: true });
+    graphs.push(graph);
+    const links = () => {
+      const nodes = graph.getFiles().flatMap((f) => graph.getNodesInFile(f.path));
+      return graph.getOutgoingEdgesFrom(nodes.map((n) => n.id), ['calls'])
+        .map((e) => `${e.metadata?.refName} -> ${graph.getNode(e.target)?.qualifiedName}`);
+    };
+    expect(links()).toEqual([]);
+
+    write(root, service);
+    expect((await graph.sync()).filesAdded).toBe(1);
+    expect(links()).toEqual(['service.organizations$ -> OrganizationService::organizations$']);
+    expect(graph.getPendingReferenceCount()).toBe(0);
+  }, 120_000);
+
   it("links nothing when the field's class and its bases don't declare it", async () => {
     const calls = await callsOf({
       'package.json': JSON.stringify({ name: 'app' }),
