@@ -1608,14 +1608,122 @@ const fileStem = (filePath: string): string => {
 function isIncludedCppTestSuite(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if ((candidate.language !== 'c' && candidate.language !== 'cpp') || (ref.language !== 'c' && ref.language !== 'cpp')) return false;
   if (cppIncluders(candidate.filePath, context).has(ref.filePath)) return true;
-  const stem = fileStem(candidate.filePath);
-  for (const include of context.getNodesInFile(candidate.filePath)) {
-    if (include.kind !== 'import' || fileStem(include.name) !== stem) continue;
-    const header = cppIncludedFile(include, context);
-    if (header && header !== candidate.filePath && fileStem(header) === stem && isTestSuitePath(header) &&
-        cppIncluders(header, context).has(ref.filePath)) return true;
+  return cppSameStemHeaders(candidate.filePath, context)
+    .some((header) => isTestSuiteFile(header, context) && cppIncluders(header, context).has(ref.filePath));
+}
+
+const CPP_STEM_HEADERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * The headers a C or C++ file includes under its own name
+ * (`conformance_test.cc` → `conformance_test.h`): the declarations its
+ * definitions implement.
+ */
+function cppSameStemHeaders(filePath: string, context: ResolutionContext): string[] {
+  let memo = CPP_STEM_HEADERS.get(context);
+  if (!memo) CPP_STEM_HEADERS.set(context, (memo = new Map()));
+  let headers = memo.get(filePath);
+  if (!headers) {
+    headers = [];
+    const stem = fileStem(filePath);
+    for (const include of context.getNodesInFile(filePath)) {
+      if (include.kind !== 'import' || fileStem(include.name) !== stem) continue;
+      const header = cppIncludedFile(include, context);
+      if (header && header !== filePath && fileStem(header) === stem) headers.push(header);
+    }
+    memo.set(filePath, headers);
   }
-  return false;
+  return headers;
+}
+
+const TEST_FILES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+const TEST_SUITE_FILES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** isTestPath, memoized: it is asked of every reference with an ambiguous C or C++ name. */
+function isTestFile(filePath: string, context: ResolutionContext): boolean {
+  let memo = TEST_FILES.get(context);
+  if (!memo) TEST_FILES.set(context, (memo = new Map()));
+  let hit = memo.get(filePath);
+  if (hit === undefined) memo.set(filePath, (hit = isTestPath(filePath)));
+  return hit;
+}
+
+/** isTestSuitePath, memoized: it is asked of every candidate of such a name. */
+function isTestSuiteFile(filePath: string, context: ResolutionContext): boolean {
+  let memo = TEST_SUITE_FILES.get(context);
+  if (!memo) TEST_SUITE_FILES.set(context, (memo = new Map()));
+  let hit = memo.get(filePath);
+  if (hit === undefined) memo.set(filePath, (hit = isTestSuitePath(filePath)));
+  return hit;
+}
+
+/**
+ * Whether a C or C++ definition is in `ref`'s translation unit, as its
+ * includes show it: in the reference's own file, in a file the reference's
+ * file includes, directly or through other includes, or in the source file
+ * that implements such a header — the one named like it that includes it
+ * (`googletest.cc` for `googletest.h`) — unless the source keeps it to
+ * itself (a `static`, or what isCppTranslationUnitLocal finds). A test
+ * suite's source implements only a test suite's header, as in
+ * isIncludedCppTestSuite.
+ */
+function isInCppTranslationUnit(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (candidate.filePath === ref.filePath) return true;
+  if (candidate.language !== 'c' && candidate.language !== 'cpp') return false;
+  if (cppIncluders(candidate.filePath, context).has(ref.filePath)) return true;
+  if (!C_SOURCE_EXT.test(candidate.filePath) || isCppTranslationUnitLocal(candidate, ref, context) ||
+      ((candidate.kind === 'function' || candidate.kind === 'variable' || candidate.kind === 'constant') &&
+        isStaticCFunction(candidate, context))) return false;
+  const suite = isTestSuiteFile(candidate.filePath, context);
+  return cppSameStemHeaders(candidate.filePath, context)
+    .some((header) => (!suite || isTestSuiteFile(header, context)) && cppIncluders(header, context).has(ref.filePath));
+}
+
+/**
+ * What a C or C++ name written alone can mean outside a class, by its kind:
+ * a call reaches a function, or a type and its constructor (`Foo(…)`); a
+ * construction makes a type (`std::string buffer(n, c)` is no enum's
+ * `string`); any other reference names anything but a member. Nothing a
+ * class declares is in reach — its methods, its nested types, their
+ * constructors: only an object, a qualified name or the class's own code
+ * reaches them. gmock's `Value(result, …)` matcher is no
+ * `RepeatedFieldAccessor::Value`, breakpad's `EXPECT_CALL(handler, Entry(…))`
+ * no `CallFrameInfo::Entry` struct.
+ */
+function isCppNameAloneTarget(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const constructor = n.kind === 'method' && n.qualifiedName.endsWith(`${n.name}::${n.name}`);
+  const fits = ref.referenceKind === 'calls' ? n.kind === 'function' || constructor || CPP_TYPE_KINDS.has(n.kind)
+    : ref.referenceKind === 'instantiates' ? constructor || CPP_TYPE_KINDS.has(n.kind)
+    : constructor || (n.kind !== 'method' && n.kind !== 'field' && n.kind !== 'property');
+  if (!fits) return false;
+  const scope = cppParentScope(constructor ? cppParentScope(n.qualifiedName) : n.qualifiedName);
+  return !cppTypeDecls(scope, context).some((d) => CPP_CLASS_KINDS.has(d.kind));
+}
+
+/**
+ * Same-named candidates for a C or C++ reference in a test, narrowed to the
+ * ones its translation unit declares, when there are any. A test is a
+ * program of its own, so the name it uses is the one its includes declare:
+ * protobuf's csharp generator tests call `TestSourceDir()`, which
+ * googletest.h, an include of theirs, declares, and test_util2.h's
+ * `TestUtil::TestSourceDir`, a test suite none of them includes, took the
+ * calls; a test of the hpb backend calls upb's `upb_Arena_New()` from
+ * upb/mem/arena.h, not the copies php-upb.h and ruby-upb.h bundle. For a
+ * name the reference writes alone (`byName`), only what the name alone can
+ * mean counts (isCppNameAloneTarget), and a call the extractor recorded
+ * without the receiver it is written on (`columns()[0].value()`) is left to
+ * the name strategies. When the unit declares none of them — a test whose
+ * includes don't resolve — the candidates stay as they are. Not for an
+ * `#include`, which names a file, nor for production code, which
+ * isVisibleAcrossFiles keeps from test suites.
+ */
+function inCppTestTranslationUnit(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext, byName = false): Node[] {
+  if (candidates.length < 2 || (ref.language !== 'c' && ref.language !== 'cpp') ||
+      ref.referenceKind === 'imports' || !isTestFile(ref.filePath, context)) return candidates;
+  if (byName && ref.referenceKind === 'calls' && cppImplicitReceiver(ref, context) !== 'bare') return candidates;
+  const within = candidates.filter((n) => isInCppTranslationUnit(n, ref, context) &&
+    (!byName || n.filePath === ref.filePath || isCppNameAloneTarget(n, ref, context)));
+  return within.length > 0 ? within : candidates;
 }
 
 const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -8033,10 +8141,12 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
-  const candidates = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
+  const ranked = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
+  // (Above the ceiling below nothing is picked, so no translation unit is read.)
+  const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? inCppTestTranslationUnit(ranked, ref, context, true) : ranked;
 
   if (candidates.length === 0) {
     return null;
@@ -9130,7 +9240,7 @@ export function resolveMethodOnType(
   // intentionally in ANOTHER file (#314) — is unaffected: those blocks return
   // early whenever an import pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(cppVisibleFirst(matches, ref, context), ref.filePath);
+  const ordered = preferCallSiteFile(inCppTestTranslationUnit(cppVisibleFirst(matches, ref, context), ref, context), ref.filePath);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -13074,6 +13184,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   clearCppNamespaceMemos(context);
   clearCppRawStringMemos(context);
   CPP_CLASSES_IN_FILE.delete(context);
+  CPP_STEM_HEADERS.delete(context);
+  TEST_FILES.delete(context);
+  TEST_SUITE_FILES.delete(context);
   CPP_BASE_SPECS.delete(context);
   CPP_USING_MEMBERS.delete(context);
   CPP_MEMBER_MACRO_ARGS.delete(context);
@@ -14671,7 +14784,7 @@ export function matchMethodCall(
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
     let classCandidates = preferCallSiteFile(
-      context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind),
+      inCppTestTranslationUnit(context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind), ref, context),
       ref.filePath,
     );
     // A C# class the call's namespaces can see before one they can't:
@@ -14774,7 +14887,7 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
       const fuzzyClassCandidates = preferCallSiteFile(
-        context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind),
+        inCppTestTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {
@@ -14909,7 +15022,7 @@ export function matchMethodCall(
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
       const std = isStdMethodName(ref.language, methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
-      for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
+      for (const method of preferCallSiteFile(inCppTestTranslationUnit(targetMethods, ref, context), ref.filePath)) {
         if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
