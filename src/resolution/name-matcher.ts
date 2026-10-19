@@ -1367,6 +1367,13 @@ function lexicalScopeOf(candidate: Node, context: ResolutionContext): { start: n
 const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
 
 /**
+ * The ES-module family with single-file components' script blocks: a file
+ * declaring the class an import names (tsImportedTypeFile) is the same
+ * signal in each.
+ */
+const ES_IMPORT_LANGUAGES = new Set<string>([...ESM_FAMILY, 'vue', 'svelte', 'astro']);
+
+/**
  * A line-initial `import` statement — the marker that a JS/TS file is a MODULE
  * rather than a classic script. Line-anchored and followed by a name, brace,
  * star or quote, so a dynamic `import(` and the word inside a comment or string
@@ -8960,7 +8967,9 @@ export function resolveMethodOnType(
    * For Go it is the project-relative directory of the package that
    * declares `typeName`, when that is known (resolveGoMethodInPackage).
    * For TS/JS it is the file declaring the class the caller's file
-   * imports under that name (tsImportedTypeFile).
+   * imports under that name (tsImportedTypeFile), or, for a type written
+   * in another file (an imported value's), the class that file imports or
+   * declares.
    */
   preferredFqn?: string,
   /** Recursion guard for the supertype/conformance walk. */
@@ -9026,11 +9035,11 @@ export function resolveMethodOnType(
     return null;
   }
 
-  if (matches.length > 1 && preferredFqn && ESM_FAMILY.has(ref.language)) {
+  if (matches.length > 1 && preferredFqn && ES_IMPORT_LANGUAGES.has(ref.language)) {
     const chosen = matches.find((m) => m.filePath === preferredFqn);
     if (chosen) return { original: ref, targetNodeId: chosen.id, confidence, resolvedBy };
   }
-  if (matches.length > 1 && preferredFqn && ref.language !== 'go' && !ESM_FAMILY.has(ref.language)) {
+  if (matches.length > 1 && preferredFqn && ref.language !== 'go' && !ES_IMPORT_LANGUAGES.has(ref.language)) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
@@ -12775,7 +12784,7 @@ const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string
  * copilot's vendored copy of that file, the first declaration indexed, and
  * a call whose first declaration was a test fixture's linked to nothing.
  */
-function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+export function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
   const name = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/.exec(written.trim())?.[0];
   if (!name) return undefined;
   let memo = TS_IMPORTED_TYPE_FILES.get(context);

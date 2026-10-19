@@ -178,3 +178,58 @@ describe('a call on a TypeScript value whose type the file imports', () => {
     expect(calls.filter((c) => c.includes('s.add'))).toEqual(['src/own.ts: s.add -> src/own.ts::Store::add']);
   }, 60_000);
 });
+
+describe('a call on a value another file exports, whose class that file imports', () => {
+  it("links to the class the value's file imports, whichever of the same-named classes it is", async () => {
+    // `import { store } from './state'; store.add(…)` with
+    // `export const store = new Store()` in `state.ts`.
+    const calls = await callsOf({
+      ...STORES,
+      'src/state-one.ts': "import { Store } from './one/store';\nexport const store = new Store();\n",
+      'src/state-two.ts': "import { Store } from './two/store';\nexport const store: Store = new Store();\n",
+      'src/use-one.ts': "import { store } from './state-one';\nexport function a() {\n  return store.add(1);\n}\n",
+      'src/use-two.ts': "import { store } from './state-two';\nexport function b() {\n  return store.add(2);\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('store.add'))).toEqual([
+      'src/use-one.ts: store.add -> src/one/store.ts::Store::add',
+      'src/use-two.ts: store.add -> src/two/store.ts::Store::add',
+    ]);
+  }, 60_000);
+
+  it('links to the class the value\'s own file declares', async () => {
+    const own = (n: number) =>
+      `export class Store {\n  add(v: number) { return v * ${n}; }\n}\n` +
+      'export const store = new Store();\n';
+    const calls = await callsOf({
+      ...STORES,
+      'src/own-a.ts': own(3),
+      'src/own-b.ts': own(4),
+      'src/use-a.ts': "import { store } from './own-a';\nexport function a() {\n  return store.add(1);\n}\n",
+      'src/use-b.ts': "import { store } from './own-b';\nexport function b() {\n  return store.add(2);\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('store.add'))).toEqual([
+      'src/use-a.ts: store.add -> src/own-a.ts::Store::add',
+      'src/use-b.ts: store.add -> src/own-b.ts::Store::add',
+    ]);
+  }, 60_000);
+});
+
+describe('a call in a Vue component on a value another file exports', () => {
+  it("links to the class the value's file imports", async () => {
+    const vue = (state: string) =>
+      '<template><button @click="go">go</button></template>\n' +
+      `<script setup lang="ts">\nimport { store } from './${state}';\nfunction go() {\n  return store.add(1);\n}\n</script>\n`;
+    const calls = await callsOf({
+      ...STORES,
+      'package.json': JSON.stringify({ name: 'app', dependencies: { vue: '^3.4.0' } }),
+      'src/state-one.ts': "import { Store } from './one/store';\nexport const store = new Store();\n",
+      'src/state-two.ts': "import { Store } from './two/store';\nexport const store = new Store();\n",
+      'src/One.vue': vue('state-one'),
+      'src/Two.vue': vue('state-two'),
+    });
+    expect(calls.filter((c) => c.includes('store.add'))).toEqual([
+      'src/One.vue: store.add -> src/one/store.ts::Store::add',
+      'src/Two.vue: store.add -> src/two/store.ts::Store::add',
+    ]);
+  }, 60_000);
+});

@@ -24,6 +24,7 @@ import {
   goRefQualifier,
   inferLocalReceiverType,
   arrayElementType,
+  tsImportedTypeFile,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -2959,7 +2960,12 @@ function resolveImportedInstanceMember(
     if (!m || !m[1]) continue;
     const typeName = normalizeInferredTypeName(m[1]);
     if (!typeName) continue;
-    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method');
+    // Several classes may share the name. The value's file says which one:
+    // the class it imports under that name, or else the one it declares.
+    const declaring = ESM_IMPORT_LANGUAGES.has(value.language)
+      ? tsImportedTypeFile(m[1], { ...ref, filePath: value.filePath, language: value.language }, context) ?? value.filePath
+      : undefined;
+    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method', declaring);
     if (resolved) return resolved;
   }
   return null;
