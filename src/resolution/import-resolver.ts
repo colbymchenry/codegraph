@@ -42,9 +42,14 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
+  // A JavaScript file imports TypeScript modules too, as the bundler and
+  // tsc's `allowJs` read it: mastodon's `modal_root.jsx` imports
+  // `./audio_modal`, which is `audio_modal.tsx`. JavaScript comes first, so a
+  // `helpers.ts` beside `helpers.js` doesn't take its importers. Never `.d.ts`:
+  // a declaration file is not the module a JavaScript file runs.
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '.ts', '.tsx', '/index.js', '/index.jsx', '/index.ts', '/index.tsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js', '/index.jsx'],
-  jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
+  jsx: ['.jsx', '.js', '.tsx', '.ts', '/index.jsx', '/index.js', '/index.tsx', '/index.ts'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
   // (`./lib` → `./lib/index.ts`). Without a list, relative imports from a
   // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).

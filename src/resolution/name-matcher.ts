@@ -1194,9 +1194,15 @@ export function matchFunctionRef(
   // Cross-file (imported names the import resolver didn't already claim):
   // only an unambiguous match resolves — or, in Python, the one in reach of
   // a name the file imports (netbox's `sender=CustomField` beside a test's
-  // own nested `CustomField`).
+  // own nested `CustomField`). Never a name the file imports from a package
+  // outside the repository, which no project function is: outline's
+  // `styled(Link)`, with `Link` from react-router-dom, is not an email
+  // template's `Link`, nor is cord-field's lodash `noop` a test's own stub.
+  // Nor a name a project import binds to something else (importBindsOther).
   if (candidates.length === 1 && (named.length === 1 ||
-      (ref.language === 'python' && pythonFromImports(ref.filePath, context).has(ref.referenceName)))) {
+      (ref.language === 'python' && pythonFromImports(ref.filePath, context).has(ref.referenceName))) &&
+      !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
+      !(JS_FAMILY.has(ref.language) && importBindsOther(candidates[0]!, ref, context))) {
     return {
       original: ref,
       targetNodeId: candidates[0]!.id,
@@ -15103,6 +15109,33 @@ function isImportBinding(receiver: string, ref: UnresolvedRef, context: Resoluti
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
   return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** A module a bundler loads as data, not code: a stylesheet, an image, a GraphQL document, JSON, a font. */
+const ASSET_MODULE = /\.(?:css|scss|sass|less|styl|stylus|pcss|graphql|gql|png|jpe?g|gif|svg|webp|avif|ico|bmp|tiff?|json5?|ya?ml|toml|md|mdx|txt|html?|xml|csv|woff2?|ttf|otf|eot|mp3|mp4|webm|ogg|wav|flac|pdf|wasm)$/i;
+
+/**
+ * Does a project import bind `ref`'s name to something other than `candidate`,
+ * a function of that name in another file? A namespace import is the module
+ * object, and an asset import is what the bundler makes of the file: topcoder's
+ * `import TCO21 from './themes/TCO21.scss'` is no `TCO21()` route. An import
+ * the import resolver binds to a constant, class or component names that:
+ * outline's `isCloudHosted` constant is not the server's `isCloudHosted()`.
+ * Two bindings still lead to the namesake: a wrapper declared beside it
+ * (`export default styled(Disclosure)`), and a lazy loader (signoz's
+ * `Loadable(() => import('pages/Home'))`), which loads the page it is named
+ * after. An import the resolver can't follow at all says nothing.
+ */
+function importBindsOther(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return false;
+  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === ref.referenceName);
+  if (!binding) return false;
+  if (binding.isNamespace || ASSET_MODULE.test(binding.source.replace(/[?#].*$/, ''))) return true;
+  const bound = context.resolveImport?.(ref);
+  const node = bound ? context.getNodeById?.(bound.targetNodeId) : null;
+  if (!node || node.kind === 'function' || node.kind === 'method' || node.filePath === candidate.filePath) return false;
+  const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/)) ?? [];
+  return !/\bimport\s*\(/.test(lines.slice(node.startLine - 1, Math.min(node.endLine, node.startLine + 15)).join('\n'));
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
