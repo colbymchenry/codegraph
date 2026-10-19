@@ -13137,9 +13137,11 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
         // = inject(Logger) / = this.instantiationService.createInstance(Logger, …):
         // a dependency-injection call that hands back an instance of the class
-        // it is given. A key that isn't a class (Vue's `inject(KEY)`) names no
-        // type with the method, so it links nothing.
-        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
+        // it is given — unless a member of it is taken (`createInstance(
+        // TestServiceAccessor).filesConfigurationService`). A key that isn't a
+        // class (Vue's `inject(KEY)`) names no type with the method, so it
+        // links nothing.
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)(?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
         // No keyword requirement, so this matches BOTH a local annotation
         // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
         // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`

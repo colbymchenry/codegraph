@@ -118,12 +118,20 @@ describe('a TypeScript receiver a dependency-injection call sets up', () => {
         '  private readonly plain = this.instantiationService.createInstance(Widget);\n' +
         '  constructor(private readonly instantiationService: IInstantiationService) {\n    super();\n  }\n' +
         '  run() {\n    this.widget.layout();\n    this.plain.layout();\n    const local = this.instantiationService.createInstance(Widget);\n    local.layout();\n  }\n' +
+        '}\n' +
+        // A member of what it hands back is that member's type, not the class's.
+        'class Accessor {\n  widget!: Widget;\n}\n' +
+        'export function check(instantiationService: IInstantiationService) {\n' +
+        '  let widget: Widget;\n' +
+        '  widget = instantiationService.createInstance(Accessor).widget;\n' +
+        '  return widget.dispose();\n' +
         '}\n',
     });
-    expect(calls.filter((c) => c.includes('layout'))).toEqual([
+    expect(calls.filter((c) => c.includes('layout') || c.includes('widget.dispose'))).toEqual([
       'src/browser/parts/view.ts: local.layout -> src/browser/widget.ts::Widget::layout',
       'src/browser/parts/view.ts: this.plain.layout -> src/browser/widget.ts::Widget::layout',
       'src/browser/parts/view.ts: this.widget.layout -> src/browser/widget.ts::Widget::layout',
+      'src/browser/parts/view.ts: widget.dispose -> src/browser/widget.ts::Widget::dispose',
     ]);
   }, 60_000);
 
