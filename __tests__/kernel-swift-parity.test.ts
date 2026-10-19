@@ -17,7 +17,8 @@
  * breaking, value-ref targets incl. the declared-then-assigned
  * assignment-prune case the swift-nio sweep caught, SWIFT_SPEC fn-refs with
  * the label-forward skip and #selector shapes) and its CRLF variant (derived
- * in-memory — #1329).
+ * in-memory — #1329); TortureTry.swift: calls written after `try!`, `try?`
+ * and `try`, which the Windows kernels' grammar build misparsed.
  *
  * The full-repo sweep lives in scripts/kernel-parity.mjs (Alamofire/vapor/
  * swift-nio, --max-deferral 0.3 — swift error incidence is structurally
@@ -132,6 +133,43 @@ describe.skipIf(!kernelBuilt)('kernel Swift extraction parity', () => {
     ].join('\n');
     assertParity('src/EditorStore.swift', source, 5);
     assertParity('src/EditorStore.swift (crlf)', source.replace(/\n/g, '\r\n'), 5);
+  });
+
+  // `try!` before a call. The grammar's scanner keeps the `!` for `try!` with
+  // a bit mask built as `1UL << 32`, which overflows where `unsigned long` is
+  // 32 bits: the MSVC-built Windows kernels read the `!` as a logical not, so
+  // `try! Message2(data: d)` was a call of `! Message2` (at the `!`) and
+  // `try! Settings.Defaults.load()` lost its receiver. The kernel now compiles
+  // the grammar with `1ULL`. Fails on the old Windows kernel only — macOS and
+  // Linux have 64-bit longs.
+  it('a call after try!, try? or try: same refs on both arms, LF and CRLF', () => {
+    const source = fs.readFileSync(path.join(FIXTURE_DIR, 'TortureTry.swift'), 'utf8');
+    assertParity('fixtures/TortureTry.swift', source, 10);
+    assertParity('fixtures/TortureTry.swift (crlf)', source.replace(/(?<!\r)\n/g, '\r\n'), 10);
+
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    const refs = tryKernelExtract('fixtures/TortureTry.swift', source, 'swift')!.unresolvedReferences;
+    const lines = source.split(/\r?\n/);
+    // Where `token` starts on the first line containing `text`.
+    const at = (text: string, token: string): { line: number; column: number } => {
+      const i = lines.findIndex((l) => l.includes(text));
+      expect(i, `fixture line "${text}"`).toBeGreaterThanOrEqual(0);
+      return { line: i + 1, column: lines[i]!.indexOf(token, lines[i]!.indexOf(text)) };
+    };
+    const expectRef = (referenceName: string, referenceKind: string, where: { line: number; column: number }) =>
+      expect(refs).toContainEqual(expect.objectContaining({ referenceName, referenceKind, ...where }));
+
+    expectRef('Message2', 'calls', at('let msg2 = try! Message2(data: data!)', 'Message2'));
+    expectRef('Realm', 'calls', at('try! Realm()', 'Realm'));
+    expectRef('Repository', 'calls', at('static let shared = try! Repository', 'Repository'));
+    expectRef('JSONDecoder.make', 'calls', at('try! JSONDecoder.make(', 'JSONDecoder'));
+    expectRef('Settings.Defaults.load', 'calls', at('try! Settings.Defaults.load', 'Settings'));
+    expectRef('Settings', 'references', at('try! Settings.Defaults.load', 'Settings'));
+    expectRef('FileManager', 'references', at('try! FileManager.default', 'FileManager'));
+    expectRef('Item', 'calls', at('try! Item(raw: $0)', 'Item'));
+    // No callee on a `try!` line keeps the `!`.
+    const tryBangLines = new Set(lines.flatMap((l, i) => (l.includes('try!') ? [i + 1] : [])));
+    expect(refs.filter((r) => tryBangLines.has(r.line) && r.referenceName.includes('!'))).toEqual([]);
   });
 
   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
