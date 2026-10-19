@@ -82,6 +82,17 @@ const CASES: Case[] = [
     expected: ['file side.js', 'file def.js', 'file req.js', 'file lib/index.js'],
   },
   {
+    // A folder further up than the one above names it only through where it
+    // is written, so it waits under no key of the file that appears.
+    name: 'TypeScript (a folder further up)',
+    initial: {
+      'src/a/b/c/m.ts': "import { x } from '../..';\nimport { y } from '../../';\nimport { z } from '../../..';\nexport const v = [x, y, z];\n",
+    },
+    added: { 'src/a/index.ts': 'export const x = 1;\nexport const y = 2;\n', 'src/index.ts': 'export const z = 3;\n' },
+    from: 'src/a/b/c/m.ts',
+    expected: ['file src/a/index.ts', 'file src/index.ts'],
+  },
+  {
     name: 'C',
     initial: { 'src/main.c': '#include "a/b.h"\n#include "c.h"\n#include <stdio.h>\nint main(void) { return 0; }\n' },
     added: { 'src/a/b.h': 'int b(void);\n', 'src/c.h': 'int c(void);\n' },

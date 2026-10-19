@@ -45,6 +45,20 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
+/**
+ * How an import names a folder only through where it is written: `.`, or a
+ * folder up to twelve levels above (`..`, `../..`, with or without the
+ * trailing `/`).
+ */
+const FOLDER_SPECIFIERS: readonly string[] = (() => {
+  const names = ['.', './'];
+  for (let levels = 1; levels <= 12; levels++) {
+    const up = Array.from({ length: levels }, () => '..').join('/');
+    names.push(up, `${up}/`);
+  }
+  return names;
+})();
+
 /** A name a member reference's receiver can be: not a file's name, nor a `module:` key. */
 const RECEIVER_NAME = /^[A-Za-z_$][\w$]*$/;
 
@@ -4222,16 +4236,17 @@ export class QueryBuilder {
 
   /**
    * Failed imports of the folder the importing file is in or under (`.`,
-   * `..`). Their tail is empty, since they name a folder only through where
-   * they are written, so no added file's keys find them.
+   * `..`, `../..`). Their tail is empty, since they name a folder only
+   * through where they are written, so no added file's keys find them.
    */
   getFailedFolderImports(): UnresolvedReference[] {
+    const placeholders = FOLDER_SPECIFIERS.map(() => '?').join(',');
     return (this.db
       .prepare(
         `SELECT * FROM unresolved_refs
-          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN ('.', './', '..', '../')`
+          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN (${placeholders})`
       )
-      .all() as UnresolvedRefRow[])
+      .all(...FOLDER_SPECIFIERS) as UnresolvedRefRow[])
       .map((row) => ({
         fromNodeId: row.from_node_id,
         referenceName: row.reference_name,

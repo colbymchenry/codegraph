@@ -1064,8 +1064,9 @@ export class CodeGraph {
             // to an added file (`@excalidraw/common` to `packages/common/src/
             // index.ts`) waits under its last segment, which that file's keys
             // never give: look its failed imports up by the specifier itself.
-            // An import of the importer's own folder or the one above (`.`,
-            // `..`) waits under no key at all, so each is tried where written.
+            // An import of the importer's own folder or one above it (`.`,
+            // `..`, `../..`) waits under no key at all, so each is tried
+            // where written.
             const addedFiles = new Set(result.addedFilePaths ?? []);
             const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
               const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
