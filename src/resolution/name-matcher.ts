@@ -12967,6 +12967,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
   TS_IMPORTED_TYPE_FILES.delete(context);
+  TS_NAMED_CLASSES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -15757,60 +15758,154 @@ function matchTsThisFieldCall(
   const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
+  // The calling class declares the field, or a class it extends does: each
+  // base is the one its subclass's file names (tsFieldThroughBases), so
+  // vscode's browser `FileDialogService` finds `AbstractFileDialogService`'s
+  // `openerService`.
   for (const cls of owners) {
+    if (cls.filePath !== ref.filePath) continue;
+    const found = tsFieldThroughBases(cls, field, ref, context, 0);
+    if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
+  }
+  // Else a same-named class elsewhere may declare it, read for a calling
+  // class whose own declaration isn't (`this._register(new Emitter())`),
+  // but only with a type the call's file imports or declares: another app's
+  // class of that name says nothing about this one's field.
+  for (const cls of owners) {
+    if (cls.filePath === ref.filePath) continue;
     const decl = tsFieldDeclaration(cls, field, context);
-    if (!decl) continue;
-    if (decl.valueType) {
-      // The value's declaration may live in another file (it is imported);
-      // the call site's file is preferred when several share the name.
-      const holderName = decl.type.split('.').pop()!;
-      const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
-        (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
-      );
-      for (const holder of holders) {
-        const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
-        if (hit) return hit;
-      }
-      return null;
-    }
-    // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
-    const typeName = decl.type.split('.').pop()!;
-    if (!/^[A-Z]/.test(typeName)) return null;
-    // Two apps in one repo may each declare a `UserService`. The call's file
-    // imports the one its field holds, so that one's method is the call's.
-    // Only the call's file: a field read off a same-named class elsewhere
-    // follows that file's imports, not this one's (vscode's two
-    // `MethodContextProvider`s import two `Symbols`). Without an import, the
-    // bare-name path this replaces broke the tie by directory proximity, so
-    // keep the same signal: among the type's declarations of the method,
-    // prefer the one closest to the call site's directory (its own app),
-    // never index order. resolveMethodOnType still answers the
-    // single-declaration and supertype cases.
-    const imported = tsImportedTypeFile(decl.type, ref, context);
-    const declared = context
-      .getNodesByName(methodName)
-      .filter(
-        (n) =>
-          n.kind === 'method' &&
-          sameLanguageFamily(n.language, ref.language) &&
-          (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
-      );
-    if (declared.length > 1) {
-      const own = imported !== undefined ? declared.find((n) => n.filePath === imported) : undefined;
-      if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
-      const callDirs = ref.filePath.split('/').slice(0, -1);
-      const shared = (fp: string) => {
-        const dirs = fp.split('/').slice(0, -1);
-        let i = 0;
-        while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
-        return i;
-      };
-      const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
-      return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
-    }
-    return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
+    if (!decl || !tsTypeVisibleIn(decl.type, ref, context)) continue;
+    return tsFieldCall(decl, null, methodName, ref, context);
   }
   return null;
+}
+
+/** A TS field's declared type, as tsFieldDeclaration reads it. */
+type TsFieldRead = NonNullable<ReturnType<typeof tsFieldDeclaration>>;
+
+/**
+ * `field`'s declaration on `cls` or on the classes it extends, nearest
+ * first, with the class it is written in: each base is the class its
+ * subclass's file names (tsNamedClass), and the field's type is the class
+ * that class's file imports or declares.
+ */
+function tsFieldThroughBases(
+  cls: Node,
+  field: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth: number,
+): { decl: TsFieldRead; cls: Node } | null {
+  const decl = tsFieldDeclaration(cls, field, context);
+  if (decl) return { decl, cls };
+  if (depth >= 4) return null;
+  for (const name of declaredSupertypes(cls, context)) {
+    const base = tsNamedClass(name, cls, ref, context);
+    if (!base || base.id === cls.id) continue;
+    const found = tsFieldThroughBases(base, field, ref, context, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Per-context memo: `<file>\0<name>` → tsNamedClass's answer. */
+const TS_NAMED_CLASSES = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/**
+ * The class `name` names in `from`'s file: the one that file imports under
+ * it, followed through re-exports and aliases (`import { EditorPart as
+ * BaseEditorPart }`), or else a class the file declares.
+ */
+function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  let memo = TS_NAMED_CLASSES.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_NAMED_CLASSES.set(context, memo);
+  }
+  const key = from.filePath + '\0' + name;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let found: Node | null = null;
+  if (context.getImportMappings?.(from.filePath, from.language)?.some((i) => i.localName === name)) {
+    const imported = context.resolveImport?.({ ...ref, filePath: from.filePath, language: from.language, referenceName: name, referenceKind: 'references' });
+    const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
+    if (node && (node.kind === 'class' || node.kind === 'component')) found = node;
+  } else {
+    found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/** Does the call's file import a type named `type` from the project, or declare one? */
+function tsTypeVisibleIn(type: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (tsImportedTypeFile(type, ref, context) !== undefined) return true;
+  const head = type.split('.')[0]!;
+  return context.getNodesInFile(ref.filePath).some((n) =>
+    n.name === head && (n.kind === 'class' || n.kind === 'interface' || n.kind === 'type_alias' || n.kind === 'constant' || n.kind === 'variable'));
+}
+
+/**
+ * Resolve `this.<field>.<method>()` through a declaration of the field on
+ * `declaring`, the calling class or a base, or on a same-named class
+ * elsewhere (null), whose type the call's file names.
+ */
+function tsFieldCall(
+  decl: TsFieldRead,
+  declaring: Node | null,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  if (decl.valueType) {
+    // The value's declaration may live in another file (it is imported);
+    // the call site's file is preferred when several share the name.
+    const holderName = decl.type.split('.').pop()!;
+    const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
+      (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
+    );
+    for (const holder of holders) {
+      const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
+      if (hit) return hit;
+    }
+    return null;
+  }
+  // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
+  const typeName = decl.type.split('.').pop()!;
+  if (!/^[A-Z]/.test(typeName)) return null;
+  // Two apps in one repo may each declare a `UserService`. The file the
+  // field is written in imports the one it holds, or declares it, so that
+  // one's method is the call's. Without an import, the bare-name path this
+  // replaces broke the tie by directory proximity, so keep the same signal:
+  // among the type's declarations of the method, prefer the one closest to
+  // the call site's directory (its own app), never index order.
+  // resolveMethodOnType still answers the single-declaration and supertype
+  // cases.
+  const imported = !declaring || declaring.filePath === ref.filePath
+    ? tsImportedTypeFile(decl.type, ref, context)
+    : tsImportedTypeFile(decl.type, { ...ref, filePath: declaring.filePath, language: declaring.language }, context) ?? declaring.filePath;
+  const declared = context
+    .getNodesByName(methodName)
+    .filter(
+      (n) =>
+        n.kind === 'method' &&
+        sameLanguageFamily(n.language, ref.language) &&
+        (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
+    );
+  if (declared.length > 1) {
+    const own = imported !== undefined ? declared.find((n) => n.filePath === imported) : undefined;
+    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
+    const callDirs = ref.filePath.split('/').slice(0, -1);
+    const shared = (fp: string) => {
+      const dirs = fp.split('/').slice(0, -1);
+      let i = 0;
+      while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
+      return i;
+    };
+    const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+    return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  }
+  return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
 }
 
 /**

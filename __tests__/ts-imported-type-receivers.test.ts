@@ -178,3 +178,52 @@ describe('a call on a TypeScript value whose type the file imports', () => {
     expect(calls.filter((c) => c.includes('s.add'))).toEqual(['src/own.ts: s.add -> src/own.ts::Store::add']);
   }, 60_000);
 });
+
+describe('a this.<field> call on a field a class it extends declares', () => {
+  it('reads the field off the base its file imports, and its type off the import there', async () => {
+    const calls = await callsOf({
+      ...STORES,
+      'src/base.ts': "import { Store } from './two/store';\nexport class Base {\n  protected readonly store = new Store();\n}\n",
+      'src/child.ts':
+        "import { Base } from './base';\n" +
+        'export class Child extends Base {\n  run() {\n    return this.store.add(1);\n  }\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/child.ts: this.store.add -> src/two/store.ts::Store::add']);
+  }, 60_000);
+
+  it("reads the field's type off a class the base's own file declares", async () => {
+    const calls = await callsOf({
+      ...STORES,
+      'src/base.ts':
+        'export class Store {\n  add(v: number) { return v * 10; }\n}\n' +
+        'export class Base {\n  protected readonly store = new Store();\n}\n',
+      'src/child.ts':
+        "import { Base } from './base';\n" +
+        'export class Child extends Base {\n  run() {\n    return this.store.add(1);\n  }\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/child.ts: this.store.add -> src/base.ts::Store::add']);
+  }, 60_000);
+
+  it('follows an aliased import to a base of the same name', async () => {
+    // vscode's sessions `EditorPart extends` the workbench's `EditorPart`.
+    const calls = await callsOf({
+      ...STORES,
+      'src/workbench/part.ts': "import { Store } from '../two/store';\nexport class Part {\n  protected readonly store: Store = new Store();\n}\n",
+      'src/sessions/part.ts':
+        "import { Part as BasePart } from '../workbench/part';\n" +
+        'export class Part extends BasePart {\n  run() {\n    return this.store.add(2);\n  }\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/sessions/part.ts: this.store.add -> src/two/store.ts::Store::add']);
+  }, 60_000);
+
+  it("doesn't read the field off an unrelated class of the same name whose type the call's file doesn't name", async () => {
+    const calls = await callsOf({
+      ...STORES,
+      'src/app-a/service.ts': "import { Store } from '../one/store';\nexport class Service {\n  private readonly store = new Store();\n}\n",
+      'src/app-b/service.ts':
+        'const makeStore = () => ({ add: (v: number) => v });\n' +
+        'export class Service {\n  private readonly store = makeStore();\n  run() {\n    return this.store.add(3);\n  }\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual([]);
+  }, 60_000);
+});
