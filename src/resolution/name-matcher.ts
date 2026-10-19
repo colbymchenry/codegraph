@@ -16036,14 +16036,20 @@ function tsNamedType(written: string, from: Node, at: UnresolvedRef, context: Re
  * the nearest supertype's up its head's `extends` (then `implements`), each
  * found the way its subtype's file names it (tsNamedType). `complete` when
  * every supertype was found in the project or is a package's class, so a
- * missing method has no project declaration; a supertype that can't be found
- * leaves the answer incomplete.
+ * missing method has no project declaration; a supertype that can't be found,
+ * or a property of that name (a function-typed field), leaves the answer
+ * incomplete.
  */
 function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): { method: Node | null; complete: boolean } {
-  const own = context.getNodesInFile(cls.filePath).find((n) =>
-    n.kind === 'method' && n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
+  const members = context.getNodesInFile(cls.filePath).filter((n) =>
+    n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
     n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
+  const own = members.find((n) => n.kind === 'method');
   if (own) return { method: own, complete: true };
+  // A property of that name is what the call calls — bitwarden's `abstract
+  // getAuthStatus: (userId?: string) => Promise<…>` — but no method to link,
+  // so the answer is left to the lookups that follow.
+  if (members.some((n) => n.kind === 'property' || n.kind === 'field')) return { method: null, complete: false };
   if (depth >= TS_BASE_WALK_DEPTH) return { method: null, complete: false };
   const supers = tsHeadSupertypes(cls, context);
   if (supers === null) return { method: null, complete: false };
