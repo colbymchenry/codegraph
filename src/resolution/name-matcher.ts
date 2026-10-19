@@ -15596,10 +15596,11 @@ function matchRustSelfFieldCall(
  * Per-context memo for matchTsThisFieldCall's declaration scan: `classId\0field`
  * → the first line of the class that declares the field (as `: typeof X`,
  * `: X`, `= new X`, or `= this.<wrapper>(new X`, tried in that order per
- * line) with its captured type, or null. The scan depends only on the class and the field, but ran for every
- * `this.<field>.<method>()` call — re-splitting the file and compiling three
- * patterns each time, a third of all method-call matching on vscode. Derived
- * from file source: drops with clearNameMatcherMemos.
+ * line) with its captured type, or null. The scan depends only on the class
+ * and the field, but ran for every `this.<field>.<method>()` call —
+ * re-splitting the file and compiling three patterns each time, a third of
+ * all method-call matching on vscode. Derived from file source: drops with
+ * clearNameMatcherMemos.
  */
 const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDecl | null>>();
 /**
