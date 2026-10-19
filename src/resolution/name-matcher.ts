@@ -13102,6 +13102,13 @@ export function arrayElementType(type: string): string | undefined {
 const TYPE_ARGS = '(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*(?:\\[[\\s,]*\\]\\s*)*';
 
 /**
+ * A Swift constructor call's argument list that no member follows: closed on
+ * the line (two levels of nested parentheses) with no `.`/`?.` after it, or
+ * left open at the line's end — its arguments go on below.
+ */
+const SWIFT_UNCHAINED_CALL = '(?:\\((?:[^()]|\\((?:[^()]|\\([^()]*\\))*\\))*\\)(?!\\s*\\??\\.)|\\([^)]*$)';
+
+/**
  * Per-language patterns that recover a local variable's (or typed parameter's)
  * type from its declaration/initializer. Each regex captures the type in group
  * 1; `r` is the already-escaped receiver name. Ordered most-specific first.
@@ -13375,7 +13382,16 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       ];
     case 'swift':
       return [
-        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // let lg = Logger(...)
+        // let lg = Logger(...), also with type arguments: `let p = Pool<String>(…)`
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\(`),
+        // ...and through `try` / `try!` / `try?` / `await` when it declares the
+        // local: `let storage = try! DiskStorage.Backend<String>(…)`. Not in a
+        // bare assignment — `channel = try ServerBootstrap(…)` goes on into
+        // `.bind(…).wait()` on the lines below, a value of another type, and
+        // must not hide what `var channel: Channel?` declared — nor when a
+        // member follows the call (`try! Realm().write { … }` is a value of
+        // what `write` returns).
+        new RegExp(`\\b(?:let|var)\\s+${r}\\b\\s*=\\s*(?:try[!?]\\s*|(?:try|await)\\s+)+([A-Z][\\w.]*)\\s*${TYPE_ARGS}${SWIFT_UNCHAINED_CALL}`),
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // let lg: Logger  / param
       ];
     case 'rust':
