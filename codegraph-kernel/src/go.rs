@@ -682,8 +682,18 @@ impl<'t> Walker<'t> {
         let docstring = self.docstring_of(node);
         let is_const_decl = node.kind() == "const_declaration";
 
+        // A `var ( … )` group wraps its specs in a `var_spec_list`; a
+        // `const ( … )` group holds them directly.
+        let mut specs: Vec<Node<'t>> = Vec::new();
         for i in 0..node.named_child_count() {
-            let Some(spec) = node.named_child(i) else { continue };
+            let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "var_spec_list" {
+                specs.extend((0..child.named_child_count()).filter_map(|j| child.named_child(j)));
+            } else {
+                specs.push(child);
+            }
+        }
+        for spec in specs {
             if !matches!(spec.kind(), "var_spec" | "const_spec") {
                 continue;
             }
@@ -697,9 +707,9 @@ impl<'t> Walker<'t> {
                         None
                     };
                     let signature = value_node.map(|v| util::init_signature(self.text(v)));
-                    // A member of a `const ( … )` group has its own doc
-                    // comment beside it in the parentheses; one without keeps
-                    // the group's.
+                    // A member of a `const ( … )` or `var ( … )` group has its
+                    // own doc comment beside it in the parentheses; one without
+                    // keeps the group's.
                     let doc = self.docstring_of(spec).or_else(|| docstring.clone());
                     var_row = self.create_node(
                         if is_const_decl { "constant" } else { "variable" },

@@ -21,6 +21,13 @@ var handlerTable = map[string]func(int){
 	"recv": TargetCb,
 }
 
+// Registries: the group's comment, for a member without its own.
+var (
+	// handlersByName is documented inside its group.
+	handlersByName = map[string]func(int){"recv": TargetCb}
+	DefaultWidget  = NewRegistry()
+)
+
 // Widget is documented above its own type declaration.
 type Widget struct {
 	*Base

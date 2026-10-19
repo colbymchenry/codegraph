@@ -3558,10 +3558,12 @@ export class TreeSitterExtractor {
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
-      // These can have multiple identifiers on the left
-      const specs = node.namedChildren.filter(c =>
-        c.type === 'var_spec' || c.type === 'const_spec'
-      );
+      // These can have multiple identifiers on the left. A `var ( … )` group
+      // wraps its specs in a `var_spec_list`; a `const ( … )` group holds them
+      // directly.
+      const specs = node.namedChildren
+        .flatMap((c) => (c.type === 'var_spec_list' ? c.namedChildren : [c]))
+        .filter((c) => c.type === 'var_spec' || c.type === 'const_spec');
 
       for (const spec of specs) {
         const nameNode = spec.namedChild(0);
@@ -3572,8 +3574,8 @@ export class TreeSitterExtractor {
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-          // A member of a `const ( … )` group has its own doc comment beside
-          // it in the parentheses; one without keeps the group's.
+          // A member of a `const ( … )` or `var ( … )` group has its own doc
+          // comment beside it in the parentheses; one without keeps the group's.
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
             docstring: this.docstringFor(spec) ?? docstring,
             signature: initSignature,
