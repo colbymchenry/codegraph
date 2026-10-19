@@ -14156,7 +14156,11 @@ export function matchMethodCall(
   // operator form requires at least one non-word char after `operator`, and
   // every downstream strategy compares the method part by exact string
   // equality, so a stray match can't invent an edge.
+  // A JS/TS method name may carry `$`, which `\w` doesn't: an RxJS-style
+  // `this.organizationService.organizations$()`, vscode's RPC
+  // `this._proxy.$acceptModelChanged()`.
   const dotMatch =
+    (JS_FAMILY.has(ref.language) ? ref.referenceName.match(/^([\w.]+)\.([\w$]+)$/) : null) ??
     ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
     (ref.language === 'cpp'
       ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
