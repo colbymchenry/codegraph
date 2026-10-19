@@ -2366,6 +2366,15 @@ function goLocalDecl(name: string, ref: UnresolvedRef, context: ResolutionContex
   return found?.[2];
 }
 
+/**
+ * Whether a Go reference's name is a parameter or local of the function
+ * around it, which shadows every declaration of its package: client-go's
+ * `init := func(t *testing.T) {…}` then `init(t)`.
+ */
+export function isGoLocallyBound(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return goLocalDecl(ref.referenceName, ref, context) !== undefined;
+}
+
 function goScopeIndex(filePath: string, context: ResolutionContext): GoScopeIndex | null {
   let memo = GO_SCOPE_INDEXES.get(context);
   if (!memo) GO_SCOPE_INDEXES.set(context, (memo = new Map()));
@@ -2939,6 +2948,16 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
 }
 
 /**
+ * Whether Go lets `ref`'s file name the Go declaration `candidate`: an
+ * exported name from anywhere, an unexported one only inside its own package,
+ * which is a directory. By the name's first letter, not the extractor's flag:
+ * the flag is unset for every Go method, exported or not.
+ */
+function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
+  return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+}
+
+/**
  * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
  * given what its language says about the definition's visibility. A
  * definition the language makes file-local is not a candidate for a
@@ -3022,11 +3041,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
         !cppIncluders(candidate.filePath, context).has(ref.filePath)) return false;
     return !isCppTranslationUnitLocal(candidate, ref, context);
   }
-  if (lang === 'go') {
-    // By the name's first letter, not the extractor's flag: the flag is unset
-    // for every Go method, exported or not.
-    return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
-  }
+  if (lang === 'go') return isGoNameVisible(candidate, ref);
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
     if (isRustTraitImplMethod(candidate, context)) return true;
@@ -7953,6 +7968,10 @@ export function matchByExactName(
     // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
     // a wire converter test's nested `CrashingPhone.Builder`.
     isJavaTypeVisible(n, ref, context) &&
+    // And a Go name that isn't exported, only its own package's: prometheus
+    // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
+    // same (a child package's directory shares as much of the path) and won.
+    (n.language !== 'go' || isGoNameVisible(n, ref)) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
