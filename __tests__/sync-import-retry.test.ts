@@ -362,6 +362,20 @@ describe('getRetryableFailedImports', () => {
     expect(names(queries.getRetryableFailedImports(['b', 'b.dart'], [], 2))).toEqual(['b.dart']);
     expect(queries.getRetryableFailedImports(['b'], [], 3)).toHaveLength(3);
   });
+
+  it('looks a key past the ceiling through for the imports that could name an added file', () => {
+    const queries = setup();
+    const only = (...accepted: string[]) => (ref: { referenceName: string }) => accepted.includes(ref.referenceName);
+    // Three imports wait under `b`, one more than the ceiling.
+    expect(names(queries.getRetryableFailedImports(['b'], [], 2, [], undefined, only('../b.dart')))).toEqual(['../b.dart']);
+    // What the test accepts is no noise: the module ceiling holds it.
+    expect(names(queries.getRetryableFailedImports(['b'], [], 1, [], 2, only('../b.dart', 'src/b.dart')))).toEqual(['../b.dart', 'src/b.dart']);
+    expect(queries.getRetryableFailedImports(['b'], [], 1, [], 1, only('../b.dart', 'src/b.dart'))).toEqual([]);
+    // A key within the ceiling is retried whole, whatever the test says.
+    expect(queries.getRetryableFailedImports(['b'], [], 3, [], undefined, only())).toHaveLength(3);
+    // A namespace waits for its node, not a file: the test is not asked.
+    expect(names(queries.getRetryableFailedImports([], ['Foo.Bar'], 0, [], undefined, only('Foo.Bar')))).toEqual([]);
+  });
 });
 
 describe('schema v12', () => {
@@ -420,6 +434,9 @@ describe('schema v12', () => {
     const prepare = vi.spyOn(db!.getDb(), 'prepare');
     // The fixture's tails are old ones: `dart` finds a row by tail, `c.h` by name.
     expect(queries.getRetryableFailedImports(['dart', 'c.h'], ['Foo.Bar'])).toHaveLength(2);
+    // A key past the ceiling is read whole for `couldName` to look through: at
+    // a ceiling of 0 both keys are, and what it accepts is retried.
+    expect(queries.getRetryableFailedImports(['dart', 'c.h'], [], 0, [], undefined, () => true)).toHaveLength(2);
     const lookups = prepare.mock.calls.map(([sql]) => sql as string).filter((sql) => sql.includes("reference_kind = 'imports'"));
     prepare.mockRestore();
     expect(lookups.length).toBeGreaterThan(0);

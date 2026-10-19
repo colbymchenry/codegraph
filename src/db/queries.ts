@@ -4126,6 +4126,13 @@ export class QueryBuilder {
    * The other lookups share the per-name ceiling of
    * {@link getRetryableFailedReferences}, counted per key; this one has the
    * module ceiling, since a specifier that resolves to the file is no noise.
+   *
+   * A path key past the ceiling is not all noise, though: `utils` is the stem
+   * of a project's own `./utils` and of every `jotai/utils` and
+   * `@scope/pkg/utils` alike, and `assert` the name of every binding of
+   * `import * as assert from 'assert'`. Such a key is retried for the
+   * imports `couldName` accepts, the ones that could name a file the sync
+   * added: no noise either, so within the module ceiling.
    */
   getRetryableFailedImports(
     pathKeys: string[],
@@ -4133,21 +4140,34 @@ export class QueryBuilder {
     perNameCeiling: number = 500,
     resolvedModules: string[] = [],
     perModuleCeiling: number = 5000,
+    couldName?: (ref: UnresolvedReference) => boolean,
   ): UnresolvedReference[] {
     const failedImports = "status = 'failed' AND reference_kind = 'imports'";
     const lookups = [
-      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling },
-      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling },
+      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling, couldName },
+      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling, couldName },
       { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name`, ceiling: perNameCeiling },
       // A module specifier that now resolves to an added file: no noise, so
       // the module ceiling, as for a module key.
       { keys: resolvedModules, column: 'reference_name', where: failedImports, ceiling: perModuleCeiling },
     ];
+    const toReference = (row: UnresolvedRefRow): UnresolvedReference => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    });
     const rows = new Map<number, UnresolvedRefRow>();
-    for (const { keys, column, where, ceiling } of lookups) {
+    for (const { keys, column, where, ceiling, couldName } of lookups) {
       const unique = [...new Set(keys)].filter((key) => key.length > 0);
       // Pass 1: per-key counts, chunked under the SQLite parameter limit.
       const retryKeys: string[] = [];
+      const crowdedKeys: string[] = [];
       for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
         const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');
@@ -4156,6 +4176,7 @@ export class QueryBuilder {
           .all(...chunk) as Array<{ key: string; count: number }>;
         for (const row of counts) {
           if (row.count <= ceiling) retryKeys.push(row.key);
+          else if (couldName) crowdedKeys.push(row.key);
         }
       }
       // Pass 2: load the surviving rows; a row two lookups find is kept once.
@@ -4167,19 +4188,18 @@ export class QueryBuilder {
           .all(...chunk) as UnresolvedRefRow[];
         for (const row of chunkRows) rows.set(row.id, row);
       }
+      // A key past the ceiling: only the imports that could name an added file.
+      for (const key of crowdedKeys) {
+        const keyRows = this.db
+          .prepare(`SELECT * FROM unresolved_refs WHERE ${where} AND ${column} IN (?)`)
+          .all(key) as UnresolvedRefRow[];
+        const named = keyRows.filter((row) => couldName!(toReference(row)));
+        if (named.length > perModuleCeiling) continue;
+        for (const row of named) rows.set(row.id, row);
+      }
     }
 
-    return [...rows.values()].map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return [...rows.values()].map(toReference);
   }
 
   /**

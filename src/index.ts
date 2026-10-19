@@ -1078,11 +1078,16 @@ export class CodeGraph {
               .filter((ref) => ref.filePath !== undefined && ref.language !== undefined &&
                 resolvesToAdded(ref.referenceName, ref.filePath, ref.language));
             const retryRows = new Set(retryable.map((ref) => ref.rowId));
+            // A key a popular import shares (`utils`, `react`, `assert`) is
+            // past the ceiling, and is still looked through for the imports
+            // that could name an added file.
             const importRetry = this.queries.getRetryableFailedImports(
               (result.addedFilePaths ?? []).flatMap(importPathKeys),
               this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module']),
               undefined,
-              resolvedModules
+              resolvedModules,
+              undefined,
+              this.resolver.couldNameAnyOf([...addedFiles])
             );
             for (const ref of [...importRetry, ...folderImports]) {
               if (!retryRows.has(ref.rowId)) {
