@@ -15776,15 +15776,17 @@ function matchTsThisFieldCall(
     // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
     const typeName = decl.type.split('.').pop()!;
     if (!/^[A-Z]/.test(typeName)) return null;
-    // Two apps in one repo may each declare a `UserService`. The class's
-    // file imports the one its field holds, so that one's method is the
-    // call's. Without an import, the bare-name path this replaces broke the
-    // tie by directory proximity, so keep the same signal: among the type's
-    // declarations of the method, prefer the one closest to the call site's
-    // directory (its own app), never index order. resolveMethodOnType still
-    // answers the single-declaration and supertype cases.
-    const imported = tsImportedTypeFile(decl.type,
-      cls.filePath === ref.filePath ? ref : { ...ref, filePath: cls.filePath, language: cls.language }, context);
+    // Two apps in one repo may each declare a `UserService`. The call's file
+    // imports the one its field holds, so that one's method is the call's.
+    // Only the call's file: a field read off a same-named class elsewhere
+    // follows that file's imports, not this one's (vscode's two
+    // `MethodContextProvider`s import two `Symbols`). Without an import, the
+    // bare-name path this replaces broke the tie by directory proximity, so
+    // keep the same signal: among the type's declarations of the method,
+    // prefer the one closest to the call site's directory (its own app),
+    // never index order. resolveMethodOnType still answers the
+    // single-declaration and supertype cases.
+    const imported = tsImportedTypeFile(decl.type, ref, context);
     const declared = context
       .getNodesByName(methodName)
       .filter(

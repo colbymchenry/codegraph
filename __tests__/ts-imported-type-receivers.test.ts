@@ -107,7 +107,7 @@ describe('a call on a TypeScript value whose type the file imports', () => {
     expect(calls.filter((c) => c.includes('s.reset'))).toEqual(['src/use-two.ts: s.reset -> src/two/store.ts::Base::reset']);
   }, 60_000);
 
-  it("links a `this.<field>` call to the method of the class the field's file imports", async () => {
+  it("links a `this.<field>` call to the method of the class its file imports", async () => {
     // Both stores are as near the caller's directory, so nearness alone
     // picks the first path, `src/one`.
     const calls = await callsOf({
@@ -120,6 +120,33 @@ describe('a call on a TypeScript value whose type the file imports', () => {
         '}\n',
     });
     expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/user.ts: this.store.add -> src/two/store.ts::Store::add']);
+  }, 60_000);
+
+  it("follows the call's own file's import when the field is read off a same-named class elsewhere", async () => {
+    // vscode's copilot `MockPromptsService` declares its emitter as
+    // `this._register(new Emitter<void>())`, which isn't read, so its field
+    // is read off the workbench's `MockPromptsService`, which imports the
+    // other `Emitter`.
+    const calls = await callsOf({
+      ...STORES,
+      'src/app/mock.ts':
+        "import { Store } from '../two/store';\n" +
+        'const wrap = <T>(value: T) => value;\n' +
+        'export class Mock {\n' +
+        '  private readonly store = wrap(new Store());\n' +
+        '  run() {\n    return this.store.add(1);\n  }\n' +
+        '}\n',
+      'src/other/mock.ts':
+        "import { Store } from '../one/store';\n" +
+        'export class Mock {\n' +
+        '  private readonly store = new Store();\n' +
+        '  run() {\n    return this.store.add(2);\n  }\n' +
+        '}\n',
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual([
+      'src/app/mock.ts: this.store.add -> src/two/store.ts::Store::add',
+      'src/other/mock.ts: this.store.add -> src/one/store.ts::Store::add',
+    ]);
   }, 60_000);
 
   it('does the same in JavaScript, for `new` of an imported or required class', async () => {
