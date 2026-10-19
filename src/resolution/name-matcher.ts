@@ -13467,10 +13467,35 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
     case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
-    case 'php': case 'typescript': case 'tsx': case 'javascript': case 'jsx':
-      return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
+    case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
+    case 'typescript': case 'tsx': case 'javascript': case 'jsx':
+      return names(/\bextends\s+([\w.\\]+)/.exec(tsClassHead(lines, cls))?.[1]);
     default: return [];
   }
+}
+
+/**
+ * A TS/JS class's head, from its `class` keyword to its body, with type
+ * parameter lists and type arguments left out: the first `extends` in
+ * `class EditorPane<M extends object = object> extends Composite<M>` is a
+ * constraint, not the class it extends. Decorators above the keyword are
+ * skipped, and the head may run over several lines.
+ */
+function tsClassHead(lines: readonly string[], cls: Node): string {
+  const text = lines.slice(cls.startLine - 1, cls.startLine + 7).join(' ');
+  const named = new RegExp(`\\bclass\\s+${cls.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).exec(text);
+  let head = '';
+  let angles = 0;
+  for (let i = named?.index ?? /\bclass\b/.exec(text)?.index ?? 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '<') angles++;
+    else if (c === '>' && angles > 0 && text[i - 1] !== '=') angles--;
+    else if (angles === 0) {
+      if (c === '{') break;
+      head += c;
+    }
+  }
+  return head;
 }
 
 /** A method named `name` on a supertype of the given classes, nearest first. */
