@@ -148,4 +148,22 @@ describe('a call on a value whose type a package outside the project gives', () 
     });
     expect(calls.filter((c) => c.includes('sendTelemetryEvent'))).toEqual([]);
   }, 60_000);
+
+  it('still links to the declaration a project file gives the package', async () => {
+    // vscode's `src/typings/copilot-api.d.ts` declares `@vscode/copilot-api`.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'ext-api': '^1.0.0' } }),
+      'src/typings/ext-api.d.ts': "declare module 'ext-api' {\n  export class ApiClient {\n    update(): void;\n  }\n}\n",
+      'src/other.ts': 'export class ApiClient {\n  update() { return 1; }\n}\n',
+      'src/use.ts':
+        "import { ApiClient } from 'ext-api';\n" +
+        'export class Service {\n  private readonly client: ApiClient = new ApiClient();\n' +
+        '  run() {\n    return this.client.update();\n  }\n}\n' +
+        'export function f() {\n  const api = new ApiClient();\n  return api.update();\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('.update'))).toEqual([
+      'src/use.ts: api.update -> src/typings/ext-api.d.ts::ApiClient::update',
+      'src/use.ts: this.client.update -> src/typings/ext-api.d.ts::ApiClient::update',
+    ]);
+  }, 60_000);
 });

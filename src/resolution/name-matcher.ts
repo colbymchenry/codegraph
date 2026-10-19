@@ -12968,6 +12968,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   AWAITED_FILES.delete(context);
   TS_IMPORTED_TYPE_FILES.delete(context);
   TS_NAMED_CLASSES.delete(context);
+  TS_AMBIENT_MODULE_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -14274,15 +14275,11 @@ export function matchMethodCall(
       if (decl.asserted !== undefined) {
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
-      // A TS/JS type the file imports from a package outside the project has
-      // no project method, whatever project class shares its name.
-      if (ESM_FAMILY.has(ref.language) && !awaited &&
-          isOutOfRepoBinding(/^[A-Za-z_$][\w$]*/.exec((decl.raw ?? inferredType).trim())?.[0] ?? '', ref, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
       // Other languages disambiguate by call-site file.
-      const importedFqn =
+      let importedFqn =
         ref.language === 'java' || ref.language === 'kotlin'
           ? context
               .getImportMappings(ref.filePath, ref.language)
@@ -14292,6 +14289,14 @@ export function matchMethodCall(
             : ESM_FAMILY.has(ref.language) && !awaited
               ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
               : undefined;
+      // A TS/JS type the file imports from a package outside the project has
+      // no project method, whatever project class shares its name, unless a
+      // project file declares the package (tsOutsideTypeDeclaration).
+      if (ESM_FAMILY.has(ref.language) && !awaited && importedFqn === undefined) {
+        const outside = tsOutsideTypeDeclaration(decl.raw ?? inferredType, inferredType, ref, context);
+        if (outside === null) return null;
+        importedFqn = outside;
+      }
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
@@ -15841,6 +15846,43 @@ function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: Res
   return found;
 }
 
+/** Per-context memo: `<package>\0<type name>` → tsOutsideTypeDeclaration's ambient file. */
+const TS_AMBIENT_MODULE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * For a TS/JS type the file `at` names imports under the head of `written`
+ * from a package outside the project: the project file that declares that
+ * package with a `typeName` in it (`declare module 'pkg' { … }`, as
+ * vscode's `src/typings/copilot-api.d.ts` does), or null when none does.
+ * Undefined when the type isn't imported from outside the project.
+ */
+function tsOutsideTypeDeclaration(written: string, typeName: string, at: UnresolvedRef, context: ResolutionContext): string | null | undefined {
+  const head = /^[A-Za-z_$][\w$]*/.exec(written.trim())?.[0];
+  if (!head) return undefined;
+  const binding = context.getImportMappings?.(at.filePath, at.language)?.find((m) => m.localName === head);
+  if (!binding || context.isOutOfRepoImport?.(binding.source, at.filePath, at.language) !== true) return undefined;
+  let memo = TS_AMBIENT_MODULE_FILES.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_AMBIENT_MODULE_FILES.set(context, memo);
+  }
+  const key = binding.source + '\0' + typeName;
+  let file = memo.get(key);
+  if (file === undefined) {
+    file = null;
+    const declares = new RegExp(`\\bdeclare\\s+module\\s+(['"])${binding.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\1`);
+    for (const n of context.getNodesByName(typeName)) {
+      if (!/\.d\.[cm]?ts$/.test(n.filePath) || !sameLanguageFamily(n.language, at.language)) continue;
+      if (declares.test(context.readFile(n.filePath) ?? '')) {
+        file = n.filePath;
+        break;
+      }
+    }
+    memo.set(key, file);
+  }
+  return file;
+}
+
 /** Does the call's file import a type named `type` from the project, or declare one? */
 function tsTypeVisibleIn(type: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (tsImportedTypeFile(type, ref, context) !== undefined) return true;
@@ -15877,25 +15919,27 @@ function tsFieldCall(
   // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
   const typeName = decl.type.split('.').pop()!;
   if (!/^[A-Z]/.test(typeName)) return null;
-  // The file the field is written in names its type. One it imports from a
-  // package outside the project has no project method: microsoft-
-  // authentication's `TelemetryReporter` from `@vscode/extension-telemetry`
-  // reached another extension's interface of that name.
+  // The file the field is written in names its type. Two apps in one repo
+  // may each declare a `UserService`: that file imports the one the field
+  // holds, or declares it, so that one's method is the call's. One it
+  // imports from a package outside the project, which no project file
+  // declares (as `src/typings/*.d.ts` may), has no project method:
+  // microsoft-authentication's `TelemetryReporter` from
+  // `@vscode/extension-telemetry` reached another extension's interface of
+  // that name. Without an import, the bare-name path this replaces broke
+  // the tie by directory proximity, so keep the same signal: among the
+  // type's declarations of the method, prefer the one closest to the call
+  // site's directory (its own app), never index order. resolveMethodOnType
+  // still answers the single-declaration and supertype cases.
   const at = !declaring || declaring.filePath === ref.filePath
     ? ref
     : { ...ref, filePath: declaring.filePath, language: declaring.language };
-  if (isOutOfRepoBinding(decl.type.split('.')[0]!, at, context)) return null;
-  // Two apps in one repo may each declare a `UserService`. That file
-  // imports the one the field holds, or declares it, so that one's method
-  // is the call's. Without an import, the bare-name path this replaces
-  // broke the tie by directory proximity, so keep the same signal: among
-  // the type's declarations of the method, prefer the one closest to the
-  // call site's directory (its own app), never index order.
-  // resolveMethodOnType still answers the single-declaration and supertype
-  // cases.
-  const imported = at === ref
-    ? tsImportedTypeFile(decl.type, ref, context)
-    : tsImportedTypeFile(decl.type, at, context) ?? at.filePath;
+  let imported = tsImportedTypeFile(decl.type, at, context);
+  if (imported === undefined) {
+    const outside = tsOutsideTypeDeclaration(decl.type, typeName, at, context);
+    if (outside === null) return null;
+    imported = outside ?? (at === ref ? undefined : at.filePath);
+  }
   const declared = context
     .getNodesByName(methodName)
     .filter(
