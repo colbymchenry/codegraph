@@ -57,29 +57,36 @@ function getClaudeMcpServerConfig() {
 }
 
 /**
- * Root of the global Claude Code profile. Settings and instructions follow
- * CLAUDE_CONFIG_DIR; local installs stay anchored to the project (#1627).
+ * Root of the global Claude Code profile: a non-blank CLAUDE_CONFIG_DIR, else
+ * `~/.claude`. Settings and instructions live inside it; local installs stay
+ * anchored to the project (#1627).
  */
-function globalConfigDir(): string {
+export function claudeGlobalConfigDir(): string {
+  return claudeConfigDirOverride() ?? path.join(os.homedir(), '.claude');
+}
+function claudeConfigDirOverride(): string | null {
   const override = process.env.CLAUDE_CONFIG_DIR;
-  return override && override.trim().length > 0
-    ? path.resolve(override)
-    : path.join(os.homedir(), '.claude');
+  return override && override.trim().length > 0 ? path.resolve(override) : null;
 }
 function configDir(loc: Location): string {
   return loc === 'global'
-    ? globalConfigDir()
+    ? claudeGlobalConfigDir()
     : path.join(process.cwd(), '.claude');
 }
-function mcpJsonPath(loc: Location): string {
+/**
+ * The MCP JSON Claude Code reads for `loc`. The single source for every
+ * caller (install, uninstall, detect/--refresh, --print-config and the
+ * `config-writer` shims).
+ */
+export function claudeMcpJsonPath(loc: Location): string {
   // global → $CLAUDE_CONFIG_DIR/.claude.json for a custom profile, else
   // ~/.claude.json (beside ~/.claude, not inside it). User scope: every project.
   // local  → ./.mcp.json (project scope: the ONLY project-level MCP
   // file Claude Code reads — NOT ./.claude.json, which it ignores).
   if (loc !== 'global') return path.join(process.cwd(), '.mcp.json');
-  const override = process.env.CLAUDE_CONFIG_DIR;
-  return override && override.trim().length > 0
-    ? path.join(path.resolve(override), '.claude.json')
+  const override = claudeConfigDirOverride();
+  return override
+    ? path.join(override, '.claude.json')
     : path.join(os.homedir(), '.claude.json');
 }
 /**
@@ -92,7 +99,7 @@ function mcpJsonPath(loc: Location): string {
 function legacyLocalMcpPath(): string {
   return path.join(process.cwd(), '.claude.json');
 }
-function settingsJsonPath(loc: Location): string {
+export function claudeSettingsJsonPath(loc: Location): string {
   return path.join(configDir(loc), 'settings.json');
 }
 function instructionsPath(loc: Location): string {
@@ -109,7 +116,7 @@ class ClaudeCodeTarget implements AgentTarget {
   }
 
   detect(loc: Location): DetectionResult {
-    const mcpPath = mcpJsonPath(loc);
+    const mcpPath = claudeMcpJsonPath(loc);
     const config = readJsonFile(mcpPath);
     const alreadyConfigured = !!config.mcpServers?.codegraph;
     // For "installed" we infer from the existence of either the dir
@@ -175,7 +182,7 @@ class ClaudeCodeTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
 
     // 1. MCP server entry
-    const mcpPath = mcpJsonPath(loc);
+    const mcpPath = claudeMcpJsonPath(loc);
     const config = readJsonFile(mcpPath);
     if (config.mcpServers?.codegraph) {
       delete config.mcpServers.codegraph;
@@ -196,7 +203,7 @@ class ClaudeCodeTarget implements AgentTarget {
     }
 
     // 2. Permissions
-    const settingsPath = settingsJsonPath(loc);
+    const settingsPath = claudeSettingsJsonPath(loc);
     const settings = readJsonFile(settingsPath);
     if (Array.isArray(settings.permissions?.allow)) {
       const before = settings.permissions.allow.length;
@@ -238,13 +245,13 @@ class ClaudeCodeTarget implements AgentTarget {
   }
 
   printConfig(loc: Location): string {
-    const target = mcpJsonPath(loc);
+    const target = claudeMcpJsonPath(loc);
     const snippet = JSON.stringify({ mcpServers: { codegraph: getClaudeMcpServerConfig() } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
   describePaths(loc: Location): string[] {
-    return [mcpJsonPath(loc), settingsJsonPath(loc), instructionsPath(loc)];
+    return [claudeMcpJsonPath(loc), claudeSettingsJsonPath(loc), instructionsPath(loc)];
   }
 }
 
@@ -256,7 +263,7 @@ class ClaudeCodeTarget implements AgentTarget {
  * cause side effects callers don't expect.
  */
 export function writeMcpEntry(loc: Location): WriteResult['files'][number] {
-  const file = mcpJsonPath(loc);
+  const file = claudeMcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
   const after = getClaudeMcpServerConfig();
@@ -363,7 +370,7 @@ function removeHookCommandsMatching(
   loc: Location,
   match: (command: unknown) => boolean,
 ): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+  const file = claudeSettingsJsonPath(loc);
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
 
   const settings = readJsonFile(file);
@@ -424,7 +431,7 @@ export function removePromptHookEntry(loc: Location): WriteResult['files'][numbe
 }
 
 export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+  const file = claudeSettingsJsonPath(loc);
   const settings = readJsonFile(file);
   const created = !fs.existsSync(file);
 
@@ -455,7 +462,7 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
  * only calls this when the user accepts the prompt (default-yes).
  */
 export function writePromptHookEntry(loc: Location): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+  const file = claudeSettingsJsonPath(loc);
   const created = !fs.existsSync(file);
   const settings = readJsonFile(file);
 
