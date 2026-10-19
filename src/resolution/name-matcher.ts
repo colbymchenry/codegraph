@@ -2281,9 +2281,44 @@ export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, co
 function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const { imported, typePackage } = goRefQualification(ref, context);
   const pkg = imported ?? typePackage;
-  if (!pkg) return false;
-  return !(pkg.source.startsWith('.') || pkg.source.includes('/internal/') ||
-    context.getGoPackageDir?.(pkg.source, ref.filePath) != null);
+  return !!pkg && isGoOutsideImport(pkg, ref.filePath, context);
+}
+
+/**
+ * Whether a Go import is of a package from outside the project's modules. A
+ * relative or `/internal/` path is the project's own, mapped or not: Go lets
+ * only its own module tree import an internal package.
+ */
+function isGoOutsideImport(imp: ImportMapping, filePath: string, context: ResolutionContext): boolean {
+  return !(imp.source.startsWith('.') || imp.source.includes('/internal/') ||
+    context.getGoPackageDir?.(imp.source, filePath) != null);
+}
+
+/**
+ * Whether a Go type as a declaration writes it — `sync.Mutex`, `*testing.T`
+ * — comes through an import of a package from outside the project.
+ */
+function isGoOutsideType(written: string | undefined, filePath: string, context: ResolutionContext): boolean {
+  const qualifier = written && /^[*&\s]*([A-Za-z_]\w*)\s*\./.exec(written)?.[1];
+  return !!qualifier && isGoOutsidePackage(qualifier, filePath, context);
+}
+
+/** Whether `name` is the file's import of a package from outside the project: `context` in `context.WithTimeout(…)`. */
+function isGoOutsidePackage(name: string, filePath: string, context: ResolutionContext): boolean {
+  const imp = context.getImportMappings(filePath, 'go').find((m) => m.localName === name);
+  return !!imp && isGoOutsideImport(imp, filePath, context);
+}
+
+/**
+ * The named type a Go declaration writes, as `T` or `pkg.T`, its pointer and
+ * type arguments dropped: `types.ID` for `*types.ID`, `sets.Set` for
+ * `sets.Set[string]`. Null for a type literal — a slice, map, channel,
+ * function, struct or interface — or a variadic `...T`.
+ */
+function goNamedType(written: string): string | null {
+  const m = /^\*?\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?$/.exec(written.trim());
+  if (!m || GO_TYPE_KEYWORDS.has(m[1]!)) return null;
+  return m[2] ? `${m[1]}.${m[2]}` : m[1]!;
 }
 
 /**
@@ -5389,9 +5424,13 @@ const DART_STD_METHODS: ReadonlySet<string> = new Set([
 /**
  * Whether a receiver is named after the owner of `method` — for a Dart
  * extension, after the type it is `on`: getx's `ext.endsWith(".avi")` on a
- * String shares a word with `RxStringExt`, none with its `Rx<String>`.
+ * String shares a word with `RxStringExt`, none with its `Rx<String>`. A Go
+ * receiver must name the owner type itself, case and a trailing number
+ * aside (`id` an `ID`, `urlsMap` a `URLsMap`): a shared word is what every
+ * `err` has with an `…Err` type, every `ctx` with a `valCtx`.
  */
 function receiverNamesOwner(receiver: string, method: Node, context: ResolutionContext): boolean {
+  if (method.language === 'go') return namesOwnerType(receiver, method);
   if (method.language === 'dart') {
     const cut = method.qualifiedName.lastIndexOf('::');
     const owner = cut > 0 ? method.qualifiedName.slice(0, cut).split('::').pop()! : '';
@@ -14225,6 +14264,10 @@ export function matchMethodCall(
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  // A Go call of a standard method name — `String`, `Error`, `Len`, `Lock` —
+  // on a plain variable: a name nearly every type carries, so the call says
+  // nothing of the receiver's type.
+  const goStd = ref.language === 'go' && !!dotMatch && !objectOrClass!.includes('.') && isStdMethodName('go', methodName!);
 
   // A Go variable named like a standard-library package resolves by its
   // declaration alone (isGoProjectLocalCall let it past the package list).
@@ -14307,6 +14350,30 @@ export function matchMethodCall(
         decl.raw = declared;
       }
     }
+    // A Go standard method name says nothing of its receiver, so the
+    // receiver's declaration in scope, which the scope reader finds, decides:
+    // etcd's parameter `id types.ID` makes `id.String()` `ID::String`,
+    // prometheus's `iter chunks.Iterator` makes `iter.Err()` that interface's
+    // rather than `StringIter::Err`, and a value a package from outside the
+    // project hands out (`ctx, cancel := context.WithTimeout(…)`) has no
+    // project method. It overrides the patterns above, which scan back for
+    // the name without block scope and can read another declaration of it:
+    // prometheus's `var ( query promql.Query )` came out as its test table's
+    // `query string`. Only a type read here rules a call out below.
+    let goDeclared: string | undefined;
+    if (goStd && decl.asserted === undefined) {
+      const local = goLocalDecl(objectOrClass!, ref, context);
+      if (local?.type) {
+        const named = goNamedType(local.type);
+        // A slice, map, channel, function or interface literal type has no
+        // project method.
+        if (!named) return null;
+        inferredType = named.split('.').pop()!;
+        decl.raw = goDeclared = named;
+      } else if (local?.from && isGoOutsidePackage(local.from, ref.filePath, context)) {
+        return null;
+      }
+    }
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
       inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
       // A field of a built-in type (`string _name`, `int count`) has no project method.
@@ -14367,6 +14434,12 @@ export function matchMethodCall(
       if (decl.asserted !== undefined) {
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
+      // A standard method name on a Go receiver declared as a type from a
+      // package outside the project (`var mu sync.Mutex`, `tb testing.TB`) is
+      // that type's own method, never a same-named project type's: etcd's
+      // `pendingMu.Lock()` went to its concurrency `Mutex`, kubernetes'
+      // `tb.Error(…)` to a feature-gate test helper's `TB`.
+      if (goDeclared !== undefined && isGoOutsideType(goDeclared, ref.filePath, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
@@ -14434,6 +14507,15 @@ export function matchMethodCall(
       ) {
         return null;
       }
+      // A Go standard method name the declared type lacks is no other
+      // type's: in kubernetes' `func …(err error)`, `err.Error()` is the error
+      // interface's, not `notRegisteredErr::Error` by the shared word, and a
+      // struct's `Lock` comes from an embedded `sync.Mutex`. (Valid Go calls
+      // no other method on a predeclared type, so a predeclared type the
+      // patterns read for another name's declaration, like a test table's
+      // `version string` above kubernetes' `version, _ := parse(…)`, rules
+      // nothing out.)
+      if (goDeclared !== undefined) return null;
       // The receiver's declared type is one the project doesn't declare —
       // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
       // method is that outside type's. gson's `list.add(…)` went to a project
@@ -14686,7 +14768,11 @@ export function matchMethodCall(
         if (classNode.language !== ref.language) continue;
 
         const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!) &&
+          // A Go standard method name is the type's own, not one of another
+          // type its name is part of: kubernetes' `status.String()` is no
+          // `RuntimeStatus::String` beside a `Status` type.
+          (!goStd || n.qualifiedName === `${classNode.name}::${methodName}`));
 
         if (methodNode) {
           return {
@@ -17090,14 +17176,24 @@ function isLuaLibraryCall(receiver: string, method: string, ref: UnresolvedRef, 
  * WebPushRequest, `executor1` → Executor, `decodedImage` → UIImage).
  */
 function sharesReceiverWord(receiver: string, method: Node): boolean {
+  if (namesOwnerType(receiver, method)) return true;
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return false;
-  const ownerQn = method.qualifiedName.slice(0, cut);
-  const flat = (w: string) => w.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '').toLowerCase();
-  if (flat(receiver.split('.').pop()!) === flat(ownerQn.split(/::|\./).pop()!)) return true;
   // Two-letter words are class prefixes (`SD`, `NS`, `UI`), not names.
-  const owner = new Set(splitCamelCase(ownerQn).map(flat).filter((w) => w.length > 2));
-  return splitCamelCase(receiver).some((w) => owner.has(flat(w)));
+  const owner = new Set(splitCamelCase(method.qualifiedName.slice(0, cut)).map(flatWord).filter((w) => w.length > 2));
+  return splitCamelCase(receiver).some((w) => owner.has(flatWord(w)));
+}
+
+/** Whether a receiver's last segment is the name of `method`'s owner, case and a trailing number aside (`cbsecurity` a CBSecurity). */
+function namesOwnerType(receiver: string, method: Node): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  return flatWord(receiver.split('.').pop()!) === flatWord(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!);
+}
+
+/** A name's letters and digits, lowercased, a trailing number dropped: `executor1` → `executor`. */
+function flatWord(w: string): string {
+  return w.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '').toLowerCase();
 }
 
 function splitCamelCase(str: string): string[] {

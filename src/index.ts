@@ -1134,13 +1134,17 @@ export class CodeGraph {
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
             }
 
-            // A failed reference that waits for a module through a barrel —
-            // React Router's `import:@/pages#HomePage`, parked under
-            // `module:pages` — waits for a file below the barrel too
-            // (`pages/Home/index.tsx`), whose own keys name its folder and
-            // stem. Those parked under the keys of the barrels that pass on a
-            // file this sync adds, or one whose definitions it changed, go
-            // back to pending for the sweep; a body-only edit satisfies none.
+            // A reference that reaches a module through a barrel waits for a
+            // file below it: React Router's `import:@/pages#HomePage`, parked
+            // under `module:pages`, for `pages/Home/index.tsx`, whose own keys
+            // name its folder and stem; `import { MatxLoading } from
+            // './components'` for the `MatxLoading.jsx` the barrel passes on
+            // as `default as MatxLoading`, a name that file never declares.
+            // Those that reach a file this sync adds, or one whose definitions
+            // it changed, go back to pending for the sweep: the failed ones,
+            // and the edges bound before this sync resolved anything, which a
+            // name match may have taken elsewhere while the file lacked the
+            // name. A body-only edit satisfies none.
             const tBarrels = Date.now();
             const delta = new Set(result.definitionDelta ?? []);
             const seeds = new Map<string, Language>(added.map((file) => [file.path, file.language]));
@@ -1151,7 +1155,7 @@ export class CodeGraph {
               }
             }
             const throughBarrels = reopenReferencesThroughBarrels(
-              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language }))
+              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language })), edgesBeforeResolution
             );
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-barrel-modules: ${Date.now() - tBarrels}ms (${throughBarrels} refs re-opened)`);
           } else {
