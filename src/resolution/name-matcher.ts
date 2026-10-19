@@ -13086,6 +13086,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TS_PASS_THROUGH_WRAPPERS.delete(context);
+  TS_NAMED_TYPES.delete(context);
   TARGET_LANGUAGE.delete(context);
 }
 
@@ -13475,15 +13476,15 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
 }
 
 /**
- * A TS/JS class's head, from its `class` keyword to its body, with type
- * parameter lists and type arguments left out: the first `extends` in
- * `class EditorPane<M extends object = object> extends Composite<M>` is a
- * constraint, not the class it extends. Decorators above the keyword are
- * skipped, and the head may run over several lines.
+ * A TS/JS class's (or interface's) head, from its `class` keyword to its
+ * body, with type parameter lists and type arguments left out: the first
+ * `extends` in `class EditorPane<M extends object = object> extends
+ * Composite<M>` is a constraint, not the class it extends. Decorators above
+ * the keyword are skipped, and the head may run over several lines.
  */
 function tsClassHead(lines: readonly string[], cls: Node): string {
   const text = lines.slice(cls.startLine - 1, cls.startLine + 7).join(' ');
-  const named = new RegExp(`\\bclass\\s+${cls.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).exec(text);
+  const named = new RegExp(`\\b(?:class|interface)\\s+${cls.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).exec(text);
   let head = '';
   let angles = 0;
   for (let i = named?.index ?? /\bclass\b/.exec(text)?.index ?? 0; i < text.length; i++) {
@@ -14354,6 +14355,12 @@ export function matchMethodCall(
         const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.raw ?? inferredType!, inferredType!, ref, context));
         if (outside === null) return null;
         importedFqn = outside;
+      }
+      // The class the file names decides, through its own supertypes
+      // (tsKnownTypeCall), before any same-named class elsewhere.
+      if (ESM_FAMILY.has(ref.language) && !awaited) {
+        const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, ref, context, 0.9);
+        if (known !== undefined) return known;
       }
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
@@ -15952,6 +15959,131 @@ function tsClassMethods(cls: Node, name: string, at: UnresolvedRef, context: Res
   return [];
 }
 
+/** The kinds of node a TS/JS type name can name for a member call: classes and interfaces. */
+const TS_MEMBER_OWNER_KINDS = new Set<string>(['class', 'interface']);
+
+/** The class or interface named `name` that `file` declares. */
+function tsTypeDeclaredIn(file: string, name: string, context: ResolutionContext): Node | undefined {
+  return context.getNodesInFile(file).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
+}
+
+/**
+ * The supertypes a TS/JS class or interface head names, as written
+ * (`Disposable`, `lsp.Emitter`): what it extends (an interface may extend
+ * several), then what it implements. Null when the head extends something
+ * that isn't a name, like a mixin call.
+ */
+function tsHeadSupertypes(cls: Node, context: ResolutionContext): string[] | null {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = tsClassHead(lines, cls);
+  const out: string[] = [];
+  for (const keyword of ['extends', 'implements']) {
+    const clause = new RegExp(`\\b${keyword}\\b([\\s\\S]*?)(?:\\b(?:extends|implements)\\b|$)`).exec(head)?.[1];
+    if (clause === undefined) continue;
+    for (const part of clause.split(',')) {
+      const name = part.trim();
+      if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(name)) {
+        if (keyword === 'extends') return null;
+        continue;
+      }
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/** Per-context memo: `<file>\0<name as written>` → tsNamedType's answer. */
+const TS_NAMED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | 'outside' | null>>();
+
+/**
+ * The class or interface `written` names in `from`'s file: the one an import
+ * leads to (aliases, re-exports, a namespace import's member), or one the
+ * file declares. 'outside' when the file imports it from a package outside
+ * the project that no project file declares; null when it can't be found.
+ */
+function tsNamedType(written: string, from: Node, at: UnresolvedRef, context: ResolutionContext): Node | 'outside' | null {
+  let memo = TS_NAMED_TYPES.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_NAMED_TYPES.set(context, memo);
+  }
+  const key = from.filePath + '\0' + written;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const last = written.split('.').pop()!;
+  const ref: UnresolvedRef = { ...at, filePath: from.filePath, language: from.language };
+  const mapping = context.getImportMappings?.(from.filePath, from.language)?.find((i) => i.localName === written.split('.')[0]);
+  let found: Node | 'outside' | null = null;
+  if (mapping && context.isOutOfRepoImport?.(mapping.source, from.filePath, from.language) === true) {
+    const ambient = tsOutsideTypeDeclaration(written, last, ref, context);
+    found = ambient === null ? 'outside' : ambient === undefined ? null : tsTypeDeclaredIn(ambient, last, context) ?? null;
+  } else if (mapping) {
+    const imported = context.resolveImport?.({ ...ref, referenceName: written, referenceKind: 'references' });
+    const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
+    found = node && TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : null;
+  } else if (!written.includes('.')) {
+    found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * The method `name` of the TS/JS class or interface `cls`: its own, or else
+ * the nearest supertype's up its head's `extends` (then `implements`), each
+ * found the way its subtype's file names it (tsNamedType). `complete` when
+ * every supertype was found in the project or is a package's class, so a
+ * missing method has no project declaration; a supertype that can't be found
+ * leaves the answer incomplete.
+ */
+function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): { method: Node | null; complete: boolean } {
+  const own = context.getNodesInFile(cls.filePath).find((n) =>
+    n.kind === 'method' && n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
+    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
+  if (own) return { method: own, complete: true };
+  if (depth >= TS_BASE_WALK_DEPTH) return { method: null, complete: false };
+  const supers = tsHeadSupertypes(cls, context);
+  if (supers === null) return { method: null, complete: false };
+  let complete = true;
+  for (const written of supers) {
+    const base = tsNamedType(written, cls, at, context);
+    if (base === 'outside') continue;
+    if (!base || base.id === cls.id) {
+      complete = false;
+      continue;
+    }
+    const up = tsMethodUpChain(base, name, at, context, depth + 1);
+    if (up.method) return up;
+    if (!up.complete) complete = false;
+  }
+  return { method: null, complete };
+}
+
+/**
+ * A TS/JS member call on a value of the class or interface `typeName` that
+ * `file` declares: that type's method or its nearest supertype's
+ * (tsMethodUpChain); null when the whole chain is known and has none, as
+ * when the method is a package's: `Emitter extends lsp.Emitter` has no
+ * project `fire`, whatever other `Emitter` declares one. Undefined when
+ * `file` doesn't declare the type or a supertype can't be found, for the
+ * caller's own fallback.
+ */
+function tsKnownTypeCall(
+  typeName: string,
+  file: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  at: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+): ResolvedRef | null | undefined {
+  const known = tsTypeDeclaredIn(file, typeName, context);
+  if (!known) return undefined;
+  const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context));
+  if (up.method) return { original: ref, targetNodeId: up.method.id, confidence, resolvedBy: 'instance-method' };
+  return up.complete ? null : undefined;
+}
+
 /** `(o: T): T` as the TS extractor writes a signature: one parameter, of the type returned. */
 const TS_PASS_THROUGH_SIGNATURE = /^\(\s*[\w$]+\s*:\s*([A-Za-z_$][\w$]*)\s*\)\s*:\s*([A-Za-z_$][\w$]*)$/;
 
@@ -16243,6 +16375,12 @@ function tsFieldCall(
     if (outside === null) return null;
     imported = outside ?? (at === ref ? undefined : at.filePath);
   }
+  // That class decides, through its own supertypes: a same-named class
+  // elsewhere answered when it didn't declare the method itself, as vscode's
+  // `Storage`, which inherits `dispose` from `Disposable`, reached a test
+  // fixture's `Disposable`.
+  const known = tsKnownTypeCall(typeName, imported ?? at.filePath, methodName, ref, at, context, 0.85);
+  if (known !== undefined) return known;
   const declared = context
     .getNodesByName(methodName)
     .filter(
