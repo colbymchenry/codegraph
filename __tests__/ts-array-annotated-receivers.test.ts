@@ -266,13 +266,14 @@ describe("a call on a TypeScript local annotated as one of a type's properties",
   it("reads one whose property's type isn't written there, a getter's, as the type it indexes, as before", async () => {
     // vscode's `let mockPty: { onCommandExecuted: Emitter<E>['event'] }`
     // sits nearer `onCommandExecuted.fire(…)` than the local's own `let
-    // onCommandExecuted: Emitter<E>`; `event` is a getter of `Emitter`.
+    // onCommandExecuted: Emitter<E>`; `event` is a getter of `Emitter`, and
+    // the `event: T` of its `fire(event: T)` names no type.
     const calls = await callsOf({
       ...CLASSES,
       'src/emitter.ts':
         'export class Emitter<T> {\n' +
         '  get event() { return (listener: (e: T) => void) => listener; }\n' +
-        '  fire(value: T) { return value; }\n' +
+        '  fire(event: T) { return event; }\n' +
         '}\n',
       'src/use.test.ts':
         "import { Emitter } from './emitter';\n" +
