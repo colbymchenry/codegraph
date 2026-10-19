@@ -291,6 +291,7 @@ export class QueryBuilder {
     getFileNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
+    hasNodesByLowerNamePrefix?: SqliteStatement;
     hasFilesOfLanguage?: SqliteStatement;
     getCobolIncludesByMember?: SqliteStatement;
     getCobolFilesByStem?: SqliteStatement;
@@ -316,6 +317,13 @@ export class QueryBuilder {
   // correctness backstop. Bounded so a pathological repo can't grow it forever.
   private segmentedNames: Set<string> = new Set();
   private static readonly MAX_SEGMENTED_NAMES = 65536;
+
+  // getAllNodeNames() result, tagged with the database change stamp it was
+  // computed under (see getChangeStamp). The fuzzy fallback scans it on every
+  // miss query, so it is memoized the same way getDominantFile() is —
+  // recomputed only after something wrote to the database, by this connection
+  // or another (a CLI `codegraph index` beside a running MCP server, #1864).
+  private allNodeNamesMemo: { stamp: string; value: string[] } | undefined;
 
   // Multi-row INSERT statements, cached per (statement kind × row count). The
   // bulk write path decomposes N rows into a few fixed batch sizes so each
@@ -394,6 +402,7 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.allNodeNamesMemo = undefined;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -1484,6 +1493,21 @@ export class QueryBuilder {
     return rows.map(rowToNode);
   }
 
+  /**
+   * Check if any node name starts with `prefix` (case-insensitive).
+   * Seeks idx_nodes_lower_name via a range predicate; stops at the first match.
+   * Used by findRelevantContext Step 2b to skip `searchNodes` on terms that
+   * provably have zero prefix matches, avoiding the LIKE full-table scan.
+   */
+  hasNodesByLowerNamePrefix(prefix: string): boolean {
+    if (!this.stmts.hasNodesByLowerNamePrefix) {
+      this.stmts.hasNodesByLowerNamePrefix = this.db.prepare(
+        'SELECT 1 FROM nodes WHERE lower(name) >= lower(?) AND lower(name) < lower(?) || char(65535) LIMIT 1'
+      );
+    }
+    return this.stmts.hasNodesByLowerNamePrefix.get(prefix, prefix) !== undefined;
+  }
+
   /** Does the index hold any file of this language? One seek on idx_files_language. */
   hasFilesOfLanguage(language: string): boolean {
     if (!this.stmts.hasFilesOfLanguage) {
@@ -1573,15 +1597,19 @@ export class QueryBuilder {
       // results despite the DB having plenty of matches.
       : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
 
-    // If no FTS results, try LIKE-based substring search
-    if (results.length === 0 && text.length >= 2) {
+    // If no FTS results, try LIKE-based substring search (unless exactMode,
+    // which skips the LIKE full-table scan when the caller has already proven
+    // via a cheap index seek that the name does not exist).
+    if (results.length === 0 && text.length >= 2 && !options.exactMode) {
       results = this.searchNodesLike(text, { kinds, languages, limit, offset });
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
     // a tight Levenshtein distance. Only fires when both FTS and LIKE
     // returned nothing AND there's a text portion long enough to be
-    // worth fuzzing (1-char queries would match too much).
+    // worth fuzzing (1-char queries would match too much). exactMode keeps
+    // fuzzy to preserve "Did you mean" suggestions for typos; getAllNodeNames()
+    // is now cached so repeated miss queries amortize the scan cost.
     if (results.length === 0 && text.length >= 3) {
       results = this.searchNodesFuzzy(text, { kinds, languages, limit });
     }
@@ -3795,9 +3823,29 @@ export class QueryBuilder {
   }
 
   /**
-   * Get all distinct node names (lightweight — just name strings for pre-filtering)
+   * Get all distinct node names (lightweight — just name strings for pre-filtering).
+   *
+   * Memoized per database change stamp, like getDominantFile(): the fuzzy
+   * fallback scans this on every miss query, and recomputing it only after a
+   * write is what lets repeated "not found" lookups stay cheap without going
+   * stale behind an external `codegraph index` (#1864).
    */
   getAllNodeNames(): string[] {
+    // total_changes() counts writes later rolled back, so a result read inside
+    // a transaction could outlive a ROLLBACK under an unchanged stamp — never
+    // keep one (same reasoning as getDominantFile).
+    if (this.db.inTransaction !== false) {
+      this.allNodeNamesMemo = undefined;
+      return this.computeAllNodeNames();
+    }
+    const stamp = this.getChangeStamp();
+    if (this.allNodeNamesMemo?.stamp === stamp) return this.allNodeNamesMemo.value;
+    const value = this.computeAllNodeNames();
+    this.allNodeNamesMemo = { stamp, value };
+    return value;
+  }
+
+  private computeAllNodeNames(): string[] {
     if (!this.stmts.getAllNodeNames) {
       this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
     }

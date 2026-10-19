@@ -8323,8 +8323,16 @@ export class ToolHandler {
         const isGen = cg.generatedFilePredicate(exact.map((n) => n.filePath));
         return [...exact].sort((a, b) => (isGen(a.filePath) ? 1 : 0) - (isGen(b.filePath) ? 1 : 0));
       }
+      // Case-insensitive fallback: try case-insensitive lookup before fuzzy.
+      // Handles "CallOibs" → "callOibs" typos without a slow scan.
+      const caseInsensitive = cg.getNodesByLowerName(symbol);
+      if (caseInsensitive.length > 0) {
+        const isGen = cg.generatedFilePredicate(caseInsensitive.map((n) => n.filePath));
+        return [...caseInsensitive].sort((a, b) => (isGen(a.filePath) ? 1 : 0) - (isGen(b.filePath) ? 1 : 0));
+      }
       // No exact match — use the single top fuzzy result (e.g. a file basename).
-      const fuzzy = cg.searchNodes(symbol, { limit: 10 });
+      // exactMode skips LIKE full-table scan but keeps fuzzy for "Did you mean".
+      const fuzzy = cg.searchNodes(symbol, { limit: 10, exactMode: true });
       return fuzzy[0] ? [fuzzy[0].node] : [];
     }
 

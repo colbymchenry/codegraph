@@ -78,6 +78,12 @@ export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; 
     // Direct index — every exact-name overload, case-sensitive. Avoids FTS
     // ranking a differently-cased sibling above the real node (#1473 Fetch).
     exactNodes = cg.getNodesByName(symbol);
+    // Case-insensitive fallback: if exact match failed, try case-insensitive.
+    // Preserves #1473's case-sensitive priority while tolerating typos like
+    // "CallOibs" → "callOibs". Only for bare names; qualified lookups rely on FTS.
+    if (exactNodes.length === 0) {
+      exactNodes = cg.getNodesByLowerName(symbol);
+    }
   } else {
     let results = cg.searchNodes(symbol, { limit: 50 });
     // Mirror findSymbolMatches — FTS strips colons, so re-search by bare tail.
@@ -91,7 +97,7 @@ export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; 
   }
 
   if (exactNodes.length === 0) {
-    const fuzzy = cg.searchNodes(symbol, { limit: 5 });
+    const fuzzy = cg.searchNodes(symbol, { limit: 5, exactMode: true });
     const suggestions = [
       ...new Set(fuzzy.map((r) => r.node.name).filter((n) => n !== symbol)),
     ].slice(0, 3);

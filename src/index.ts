@@ -1942,6 +1942,16 @@ export class CodeGraph {
     return this.queries.getNodesByName(name);
   }
 
+  /** Nodes by name, case-insensitively (seeks idx_nodes_lower_name). */
+  getNodesByLowerName(name: string): Node[] {
+    return this.queries.getNodesByLowerName(name);
+  }
+
+  /** Check if any node name starts with `prefix` (case-insensitive, index seek). */
+  hasNodesByLowerNamePrefix(prefix: string): boolean {
+    return this.queries.hasNodesByLowerNamePrefix(prefix);
+  }
+
   /** Nodes whose name starts with `prefix` (index range scan, capped). */
   getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
     return this.queries.getNodesByNamePrefix(prefix, limit);
