@@ -14293,7 +14293,7 @@ export function matchMethodCall(
       // no project method, whatever project class shares its name, unless a
       // project file declares the package (tsOutsideTypeDeclaration).
       if (ESM_FAMILY.has(ref.language) && !awaited && importedFqn === undefined) {
-        const outside = tsOutsideTypeDeclaration(decl.raw ?? inferredType, inferredType, ref, context);
+        const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.raw ?? inferredType!, inferredType!, ref, context));
         if (outside === null) return null;
         importedFqn = outside;
       }
@@ -15772,22 +15772,28 @@ function matchTsThisFieldCall(
   // base is the one its subclass's file names (tsFieldThroughBases), so
   // vscode's browser `FileDialogService` finds `AbstractFileDialogService`'s
   // `openerService`.
-  for (const cls of owners) {
-    if (cls.filePath !== ref.filePath) continue;
-    const found = tsFieldThroughBases(cls, field, ref, context, 0);
-    if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
-  }
+  const found = nmTimedT('mc-thisfield-bases', ref, () => {
+    for (const cls of owners) {
+      if (cls.filePath !== ref.filePath) continue;
+      const hit = tsFieldThroughBases(cls, field, ref, context, 0);
+      if (hit) return hit;
+    }
+    return null;
+  });
+  if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
   // Else a same-named class elsewhere may declare it, read for a calling
   // class whose own declaration isn't (`this._register(new Emitter())`),
   // but only with a type the call's file imports or declares: another app's
   // class of that name says nothing about this one's field.
-  for (const cls of owners) {
-    if (cls.filePath === ref.filePath) continue;
-    const decl = tsFieldDeclaration(cls, field, context);
-    if (!decl || !tsTypeVisibleIn(decl.type, ref, context)) continue;
-    return tsFieldCall(decl, null, methodName, ref, context);
-  }
-  return null;
+  const namesake = nmTimedT('mc-thisfield-namesakes', ref, () => {
+    for (const cls of owners) {
+      if (cls.filePath === ref.filePath) continue;
+      const decl = tsFieldDeclaration(cls, field, context);
+      if (decl && tsTypeVisibleIn(decl.type, ref, context)) return decl;
+    }
+    return null;
+  });
+  return namesake ? tsFieldCall(namesake, null, methodName, ref, context) : null;
 }
 
 /** A TS field's declared type, as tsFieldDeclaration reads it. */
@@ -15937,7 +15943,7 @@ function tsFieldCall(
     : { ...ref, filePath: declaring.filePath, language: declaring.language };
   let imported = tsImportedTypeFile(decl.type, at, context);
   if (imported === undefined) {
-    const outside = tsOutsideTypeDeclaration(decl.type, typeName, at, context);
+    const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.type, typeName, at, context));
     if (outside === null) return null;
     imported = outside ?? (at === ref ? undefined : at.filePath);
   }
