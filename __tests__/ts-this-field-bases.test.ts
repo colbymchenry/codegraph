@@ -166,4 +166,25 @@ describe('a call on a value whose type a package outside the project gives', () 
       'src/use.ts: this.client.update -> src/typings/ext-api.d.ts::ApiClient::update',
     ]);
   }, 60_000);
+
+  it('does the same for a Flow libdef, and for a `node:` import of the module a libdef declares', async () => {
+    // react-native's `flow-typed/npm/tinybench_v4.1.x.js` declares
+    // `tinybench`, and `flow-typed/environment/node.js` Node's modules.
+    const calls = await callsOf({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'ext-bench': '^1.0.0' } }),
+      'flow-typed/npm/ext-bench.js': "/**\n * @flow strict\n */\ndeclare module 'ext-bench' {\n  declare export class Bench {\n    run(): void;\n  }\n}\n",
+      'flow-typed/environment/node.d.ts': "declare module 'timers' {\n  export class Timeout {\n    refresh(): Timeout;\n  }\n}\n",
+      'src/other.js': 'export class Bench {\n  run() { return 1; }\n}\nexport class Timeout {\n  refresh() { return this; }\n}\n',
+      'src/use.js':
+        "import { Bench } from 'ext-bench';\n" +
+        'export function b() {\n  const bench = new Bench();\n  return bench.run();\n}\n',
+      'src/timer.ts':
+        "import { Timeout } from 'node:timers';\n" +
+        'export function t(timeout: Timeout) {\n  return timeout.refresh();\n}\n',
+    });
+    expect(calls.filter((c) => c.includes('bench.run') || c.includes('timeout.refresh'))).toEqual([
+      'src/timer.ts: timeout.refresh -> flow-typed/environment/node.d.ts::Timeout::refresh',
+      'src/use.js: bench.run -> flow-typed/npm/ext-bench.js::Bench::run',
+    ]);
+  }, 60_000);
 });

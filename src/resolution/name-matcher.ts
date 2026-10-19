@@ -15860,8 +15860,10 @@ const TS_AMBIENT_MODULE_FILES = new WeakMap<ResolutionContext, Map<string, strin
  * For a TS/JS type the file `at` names imports under the head of `written`
  * from a package outside the project: the project file that declares that
  * package with a `typeName` in it (`declare module 'pkg' { … }`, as
- * vscode's `src/typings/copilot-api.d.ts` does), or null when none does.
- * Undefined when the type isn't imported from outside the project.
+ * vscode's `src/typings/copilot-api.d.ts` and react-native's Flow
+ * `flow-typed/npm/*.js` libdefs do; a `node:` import is its bare module's),
+ * or null when none does. Undefined when the type isn't imported from
+ * outside the project.
  */
 function tsOutsideTypeDeclaration(written: string, typeName: string, at: UnresolvedRef, context: ResolutionContext): string | null | undefined {
   const head = /^[A-Za-z_$][\w$]*/.exec(written.trim())?.[0];
@@ -15877,9 +15879,10 @@ function tsOutsideTypeDeclaration(written: string, typeName: string, at: Unresol
   let file = memo.get(key);
   if (file === undefined) {
     file = null;
-    const declares = new RegExp(`\\bdeclare\\s+module\\s+(['"])${binding.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\1`);
+    const pkg = binding.source.replace(/^node:/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declares = new RegExp(`\\bdeclare\\s+module\\s+(['"])(?:node:)?${pkg}\\1`);
     for (const n of context.getNodesByName(typeName)) {
-      if (!/\.d\.[cm]?ts$/.test(n.filePath) || !sameLanguageFamily(n.language, at.language)) continue;
+      if (!sameLanguageFamily(n.language, at.language)) continue;
       if (declares.test(context.readFile(n.filePath) ?? '')) {
         file = n.filePath;
         break;
