@@ -13105,6 +13105,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TS_PASS_THROUGH_WRAPPERS.delete(context);
+  TS_CREATE_INSTANCE_DECLARED.delete(context);
   TS_NAMED_TYPES.delete(context);
   TARGET_LANGUAGE.delete(context);
 }
@@ -13134,6 +13135,11 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'arkts':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
+        // = inject(Logger) / = this.instantiationService.createInstance(Logger, …):
+        // a dependency-injection call that hands back an instance of the class
+        // it is given. A key that isn't a class (Vue's `inject(KEY)`) names no
+        // type with the method, so it links nothing.
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
         // No keyword requirement, so this matches BOTH a local annotation
         // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
         // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`
@@ -15669,8 +15675,17 @@ type TsFieldDecl = { valueType: boolean; type: string; array?: boolean };
  * `this._store.add(new Emitter())`.
  */
 type TsFieldWrapper = { holder?: string; method: string };
-/** A declaration found on one line; a wrapped one names its wrapper and where the wrapper's `(` is. */
-type TsFieldOnLine = TsFieldDecl & { via?: TsFieldWrapper; open?: number };
+/**
+ * A dependency-injection call that hands back an instance of the class it
+ * is given: Angular's `inject(X)`, vscode's `instantiationService
+ * .createInstance(X, …)`.
+ */
+type TsInjector = 'inject' | 'createInstance';
+/**
+ * A declaration found on one line; a wrapped one names its wrapper, an
+ * injected one its injector, and either where its call's `(` is.
+ */
+type TsFieldOnLine = TsFieldDecl & { via?: TsFieldWrapper; injector?: TsInjector; open?: number };
 /** What follows a field's type when the field holds an array of it: `[]`, after any type arguments. */
 const TS_ARRAY_SUFFIX = /^\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*\[\s*\]/;
 /** A class's comment-stripped lines, and which of them hold each `[\w$#]` token. */
@@ -15723,18 +15738,24 @@ const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)/y, valueType: true },
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)/y, valueType: false },
   { re: /(?<![\w$#])[\w$#]+\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false },
-  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*this\.(?:([\w$#]+)\.)?([\w$#]+)\(\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false, wrapped: true },
+  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*this\.(?:([\w$#]+)\.)?([\w$#]+)\(\s*(?:new\s+|((?:this\.)?(?:[\w$#]+\.)*createInstance)\s*\(\s*)([A-Za-z_$][\w.$]*)/y, valueType: false, wrapped: true },
+  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*(inject|(?:this\.)?(?:[\w$#]+\.)*createInstance)\s*(?:<[^;=(){}]*>)?\s*\(\s*([A-Z][\w.$]*)/y, valueType: false, injected: true },
 ];
 
-/** A declaration `pattern` matched (`m`) on `line`: its type, and its wrapper when it has one. */
+/** A declaration `pattern` matched (`m`) on `line`: its type, and its wrapper or injector when it has one. */
 function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string): TsFieldOnLine | null {
-  const type = pattern.wrapped ? m[3] : m[1];
+  const type = pattern.wrapped ? m[4] : pattern.injected ? m[2] : m[1];
   if (!type) return null;
   const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
   if (pattern.wrapped) {
     decl.via = { holder: m[1], method: m[2]! };
-    decl.open = m.index! + m[0].indexOf('(');
+    if (m[3]) decl.injector = 'createInstance';
+  } else if (pattern.injected) {
+    decl.injector = m[1] === 'inject' ? 'inject' : 'createInstance';
   }
+  // The first `(` after the field is the wrapper's, or the injector's: a
+  // type argument list (`inject<Foo>(`) holds none.
+  if (pattern.wrapped || pattern.injected) decl.open = m.index! + m[0].indexOf('(');
   return decl;
 }
 
@@ -15774,8 +15795,12 @@ function tsClassLinesWithToken(decl: TsClassDecl, token: string): readonly numbe
   return decl.linesByToken.get(token) ?? [];
 }
 
-/** A field declaration pattern; a wrapped one captures its wrapper's holder and method before the type. */
-type TsFieldPattern = { re: RegExp; valueType: boolean; wrapped?: true };
+/**
+ * A field declaration pattern. A wrapped one captures its wrapper's holder
+ * and method, and an injector inside it, before the type; an injected one
+ * its injector before the type.
+ */
+type TsFieldPattern = { re: RegExp; valueType: boolean; wrapped?: true; injected?: true };
 /** Compiled declaration patterns by field name — fields recur across classes. */
 const TS_FIELD_PATTERNS = new Map<string, TsFieldPattern[]>();
 const TS_FIELD_PATTERNS_CAP = 4096;
@@ -15809,9 +15834,16 @@ function tsFieldPatterns(field: string): TsFieldPattern[] {
     // `_onDidChange = this._register(new Emitter())`, `x = this._store.add(new X())`:
     // an X only when the wrapper returns its argument (tsFieldRead).
     {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*this\\.(?:([\\w$#]+)\\.)?([\\w$#]+)\\(\\s*new\\s+([A-Za-z_$][\\w.$]*)`),
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*this\\.(?:([\\w$#]+)\\.)?([\\w$#]+)\\(\\s*(?:new\\s+|((?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*\\(\\s*)([A-Za-z_$][\\w.$]*)`),
       valueType: false,
       wrapped: true,
+    },
+    // `http = inject(HttpClient)`, `filter = this._instaService.createInstance(DocumentFilter)`:
+    // an X when the injector is one that hands back an instance (tsFieldRead).
+    {
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*(inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
+      valueType: false,
+      injected: true,
     },
   ];
   if (TS_FIELD_PATTERNS.size >= TS_FIELD_PATTERNS_CAP) TS_FIELD_PATTERNS.delete(TS_FIELD_PATTERNS.keys().next().value!);
@@ -15879,9 +15911,38 @@ function tsFieldDeclaration(
  * before.
  */
 function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
-  if (!onLine?.via) return onLine;
-  if (!tsCallEndsStatement(lines, row, onLine.open!) || !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
+  if (!onLine?.via && !onLine?.injector) return onLine;
+  if (!tsCallEndsStatement(lines, row, onLine.open!)) return null;
+  if (onLine.via && !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
+  if (onLine.injector && !tsInjectsInstance(cls, onLine.injector, context)) return null;
   return { valueType: onLine.valueType, type: onLine.type, array: onLine.array };
+}
+
+/** Per-context memo: does the project declare a `createInstance` that returns an instance of its constructor argument? */
+const TS_CREATE_INSTANCE_DECLARED = new WeakMap<ResolutionContext, boolean>();
+
+/**
+ * Does `injector`, as class `cls`'s file calls it, hand back an instance of
+ * the class it is given? Angular's `inject(X)` when the file imports
+ * `inject` from `@angular/core` (Vue's `inject(key)` returns whatever was
+ * provided under the key); `createInstance(X, …)` when the project declares
+ * one that returns an `InstanceType` of its constructor argument, as
+ * vscode's `IInstantiationService` does.
+ */
+function tsInjectsInstance(cls: Node, injector: TsInjector, context: ResolutionContext): boolean {
+  if (injector === 'inject') {
+    return context.getImportMappings?.(cls.filePath, cls.language)?.some((i) => i.localName === 'inject' && i.source === '@angular/core') === true;
+  }
+  let declared = TS_CREATE_INSTANCE_DECLARED.get(context);
+  if (declared === undefined) {
+    declared = context.getNodesByName('createInstance').some((n) => {
+      if ((n.kind !== 'method' && n.kind !== 'function') || !ESM_FAMILY.has(n.language)) return false;
+      const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+      return /\bInstanceType\s*</.test(lines.slice(n.startLine - 1, n.startLine + 2).join(' '));
+    });
+    TS_CREATE_INSTANCE_DECLARED.set(context, declared);
+  }
+  return declared;
 }
 
 /**
