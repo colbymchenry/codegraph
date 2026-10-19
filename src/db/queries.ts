@@ -2126,10 +2126,11 @@ export class QueryBuilder {
     return !!this.db.prepare('SELECT 1 FROM synthesis_inputs WHERE file_path = ?').get(filePath);
   }
 
+  /** Record the files synthesis read; a path the index doesn't hold as a file (a package directory) is not one (#2565). */
   replaceSynthesisInputs(files: string[]): void {
     this.db.transaction(() => {
       this.db.exec('DELETE FROM synthesis_inputs');
-      const insert = this.db.prepare('INSERT INTO synthesis_inputs(file_path) VALUES (?)');
+      const insert = this.db.prepare('INSERT OR IGNORE INTO synthesis_inputs(file_path) SELECT path FROM files WHERE path = ?');
       for (const file of files) insert.run(file);
     })();
   }
