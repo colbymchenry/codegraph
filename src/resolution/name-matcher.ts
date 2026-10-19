@@ -15899,6 +15899,15 @@ function tsWrapperReturnsArgument(cls: Node, via: TsFieldWrapper, context: Resol
 }
 
 /**
+ * How many classes up its `extends` chain a TS class's fields and wrapper
+ * methods are looked for: vscode's editors declare emitters through
+ * `_register`, which `Disposable` declares up to eight classes above them
+ * (`… extends EditorPane extends Composite extends Component extends
+ * Themable extends Disposable`).
+ */
+const TS_BASE_WALK_DEPTH = 10;
+
+/**
  * The TS methods named `name` that class `cls` declares, or else the nearest
  * class it extends that declares one does (each base the class its
  * subclass's file names, as tsFieldThroughBases walks them).
@@ -15907,7 +15916,7 @@ function tsClassMethods(cls: Node, name: string, at: UnresolvedRef, context: Res
   const own = context.getNodesInFile(cls.filePath).filter((n) =>
     n.kind === 'method' && n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
     n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
-  if (own.length > 0 || depth >= 4) return own;
+  if (own.length > 0 || depth >= TS_BASE_WALK_DEPTH) return own;
   for (const sup of declaredSupertypes(cls, context)) {
     const base = tsNamedClass(sup, cls, at, context);
     if (!base || base.id === cls.id) continue;
@@ -16072,7 +16081,7 @@ function tsFieldThroughBases(
 ): { decl: TsFieldRead; cls: Node } | null {
   const decl = tsFieldDeclaration(cls, field, context);
   if (decl) return { decl, cls };
-  if (depth >= 4) return null;
+  if (depth >= TS_BASE_WALK_DEPTH) return null;
   for (const name of declaredSupertypes(cls, context)) {
     const base = tsNamedClass(name, cls, ref, context);
     if (!base || base.id === cls.id) continue;

@@ -97,6 +97,23 @@ describe('a this.<field> call on a field a class it extends declares', () => {
     expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/sessions/part.ts: this.store.add -> src/two/store.ts::Store::add']);
   }, 60_000);
 
+  it('reads it off a base many classes up, as vscode editors inherit `_store` from `Disposable`', async () => {
+    const files: Record<string, string> = {
+      ...STORES,
+      'src/base.ts': "import { Store } from './two/store';\nexport class Base {\n  protected readonly store = new Store();\n}\n",
+    };
+    let parent = ['Base', './base'];
+    for (const name of ['L1', 'L2', 'L3', 'L4', 'L5']) {
+      files[`src/${name.toLowerCase()}.ts`] = `import { ${parent[0]} } from '${parent[1]}';\nexport class ${name} extends ${parent[0]} {}\n`;
+      parent = [name, `./${name.toLowerCase()}`];
+    }
+    const calls = await callsOf({
+      ...files,
+      'src/child.ts': "import { L5 } from './l5';\nexport class Child extends L5 {\n  run() {\n    return this.store.add(1);\n  }\n}\n",
+    });
+    expect(calls.filter((c) => c.includes('this.store.add'))).toEqual(['src/child.ts: this.store.add -> src/two/store.ts::Store::add']);
+  }, 60_000);
+
   it("doesn't read the field off an unrelated class of the same name whose type the call's file doesn't name", async () => {
     const calls = await callsOf({
       ...STORES,

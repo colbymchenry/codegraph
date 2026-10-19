@@ -113,6 +113,31 @@ describe('a this.<field> call on a field a wrapper initializes', () => {
     ]);
   }, 60_000);
 
+  it('finds the wrapper and the store as many classes up as vscode editors inherit them from `Disposable`', async () => {
+    // `… extends EditorPane extends Composite extends Component extends Themable extends Disposable`
+    const chain = ['Themable', 'Component', 'Composite', 'Pane', 'EditorPane'];
+    const files: Record<string, string> = { ...LIFECYCLE };
+    chain.forEach((name, i) => {
+      const base = i === 0 ? ['Disposable', '../base/lifecycle'] : [chain[i - 1]!, `./${chain[i - 1]!.toLowerCase()}`];
+      files[`src/app/${name.toLowerCase()}.ts`] = `import { ${base[0]} } from '${base[1]}';\nexport class ${name} extends ${base[0]} {}\n`;
+    });
+    const calls = await callsOf({
+      ...files,
+      'src/app/editor.ts':
+        "import { EditorPane } from './editorpane';\nimport { Emitter } from '../base/event';\n" +
+        'export class Editor extends EditorPane {\n' +
+        '  private readonly _onDidChange = this._register(new Emitter<void>());\n' +
+        '  private readonly _onDidShow = this._store.add(new Emitter<void>());\n' +
+        '  run() {\n    this._onDidChange.fire();\n    this._onDidShow.fire();\n  }\n' +
+        '}\n',
+    });
+    // `_onDidShow` needs `_store` found on `Disposable` too.
+    expect(calls.filter((c) => c.includes('.fire'))).toEqual([
+      'src/app/editor.ts: this._onDidChange.fire -> src/base/event.ts::Emitter::fire',
+      'src/app/editor.ts: this._onDidShow.fire -> src/base/event.ts::Emitter::fire',
+    ]);
+  }, 60_000);
+
   it('reads them in files with CRLF line endings, as a Windows checkout has', async () => {
     const files: Record<string, string> = {
       ...LIFECYCLE,
