@@ -119,14 +119,19 @@ describe('a this.<field> call on a field a wrapper initializes', () => {
       'src/app/box.ts':
         IMPORTS +
         'class Box<T> {\n  constructor(readonly value: T) {}\n}\n' +
+        'class Widget {\n  fire() {}\n}\n' +
+        'class FancyWidget extends Widget {\n  fire() {}\n}\n' +
         'export class Holder extends Disposable {\n' +
         '  private readonly _boxed = this.box(new Emitter<string>());\n' +
         '  private readonly _kept = this.keep(new Emitter<string>());\n' +
+        '  private readonly _widget = this.replace(new FancyWidget());\n' +
         '  private readonly items = new Set<Emitter<string>>();\n' +
         '  private readonly _set = this.items.add(new Emitter<string>());\n' +
         '  private box<T>(value: T): Box<T> {\n    return new Box(value);\n  }\n' +
         '  private keep<T>(value: T) {\n    return value;\n  }\n' +
-        "  run() {\n    this._boxed.fire('a');\n    this._kept.fire('b');\n    this._set.fire('c');\n  }\n" +
+        // Typed with a class, not a type parameter of its own: another Widget may come back.
+        '  private replace(widget: Widget): Widget {\n    return widget instanceof FancyWidget ? new Widget() : widget;\n  }\n' +
+        "  run() {\n    this._boxed.fire('a');\n    this._kept.fire('b');\n    this._widget.fire();\n    this._set.fire('c');\n  }\n" +
         '}\n',
       'src/app/plain.ts':
         "import { Emitter } from '../base/event';\n" +
