@@ -18,7 +18,7 @@ import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclares
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
-import { cppIncludedFile, cppIncluders } from './cpp-includers';
+import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
@@ -1620,7 +1620,10 @@ const CPP_STEM_HEADERS = new WeakMap<ResolutionContext, Map<string, string[]>>()
  * definitions implement. One beside it, when it includes one, is the only
  * such header: protobuf's pyext/message.cc implements pyext/message.h, not
  * the google/protobuf/message.h it also includes; fmt's src/format.cc, with
- * none beside it, implements include/fmt/format.h.
+ * none beside it, implements include/fmt/format.h. It may include that one
+ * through other headers only: upb's reflection/field_def.c includes
+ * reflection/internal/field_def.h, which reaches reflection/field_def.h
+ * through def.h (cppIncludedHeadersBeside).
  */
 function cppSameStemHeaders(filePath: string, context: ResolutionContext): string[] {
   let memo = CPP_STEM_HEADERS.get(context);
@@ -1635,7 +1638,8 @@ function cppSameStemHeaders(filePath: string, context: ResolutionContext): strin
       if (header && header !== filePath && fileStem(header) === stem) found.push(header);
     }
     const dir = filePath.slice(0, filePath.lastIndexOf('/') + 1);
-    const beside = found.filter((header) => header.slice(0, header.lastIndexOf('/') + 1) === dir);
+    let beside = found.filter((header) => header.slice(0, header.lastIndexOf('/') + 1) === dir);
+    if (beside.length === 0) beside = cppIncludedHeadersBeside(filePath, context);
     headers = beside.length > 0 ? beside : found;
     memo.set(filePath, headers);
   }

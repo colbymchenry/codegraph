@@ -7,7 +7,10 @@
  * helpers.h declares, not `ImmutableFieldGenerator::HasHasbit`, a method
  * beside the caller. A source implements the header beside it (the
  * Python extension's pyext/message.cc is no implementation of
- * google/protobuf/message.h), a header's inline overload reaches the
+ * google/protobuf/message.h), even one it reaches only through other
+ * headers (upb's reflection/field_def.c includes
+ * reflection/internal/field_def.h, which reaches reflection/field_def.h
+ * through def.h), a header's inline overload reaches the
  * definition its own source holds, and a call keeps a function outside the
  * unit that takes its arguments over one inside that can't (glog's
  * three-argument `GetStackTrace(…)` is not utilities.h's `GetStackTrace()`).
@@ -44,12 +47,37 @@ int upb_Encode(const void* msg, int options, char** buf, size_t* size) {
     'php/ext/google/protobuf/php-upb.h': `#include <stddef.h>
 
 int upb_Encode(const void* msg, int options, char** buf, size_t* size);
+int upb_FieldDef_Number(const void* f);
 `,
     'php/ext/google/protobuf/php-upb.c': `#include "php-upb.h"
 
 int upb_Encode(const void* msg, int options, char** buf, size_t* size) {
   *size = 0;
   return 0;
+}
+
+int upb_FieldDef_Number(const void* f) { return 0; }
+`,
+    // upb's reflection/field_def.c implements reflection/field_def.h, which
+    // it reaches only through its internal header and def.h.
+    'upb/reflection/field_def.h': `typedef struct upb_FieldDef upb_FieldDef;
+
+int upb_FieldDef_Number(const upb_FieldDef* f);
+`,
+    'upb/reflection/def.h': `#include "upb/reflection/field_def.h"
+`,
+    'upb/reflection/internal/field_def.h': `#include "upb/reflection/def.h"
+
+int _upb_FieldDef_Index(const upb_FieldDef* f);
+`,
+    'upb/reflection/field_def.c': `#include "upb/reflection/internal/field_def.h"
+
+int upb_FieldDef_Number(const upb_FieldDef* f) { return 1; }
+`,
+    'python/convert.c': `#include "upb/reflection/def.h"
+
+int PyUpb_FieldNumber(const upb_FieldDef* f) {
+  return upb_FieldDef_Number(f);
 }
 `,
     'python/message.c': `#include "upb/wire/encode.h"
@@ -341,6 +369,12 @@ describe('a C/C++ reference links what its translation unit declares', () => {
   it('calls the C function its includes declare, not a bundled copy', () => {
     const calls = callsFrom('python/message.c');
     expect(calls).toContain('upb_Encode (upb/wire/encode.c)');
+    expect(calls.some((c) => c.includes('php-upb'))).toBe(false);
+  });
+
+  it('reads a source as implementing the header beside it that it reaches through others', () => {
+    const calls = callsFrom('python/convert.c');
+    expect(calls).toContain('upb_FieldDef_Number (upb/reflection/field_def.c)');
     expect(calls.some((c) => c.includes('php-upb'))).toBe(false);
   });
 
