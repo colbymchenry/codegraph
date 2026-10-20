@@ -8952,6 +8952,8 @@ interface RustImplHeader {
   self: string;
   /** The type names its arguments write (`Arc<Handle>` → `Handle`, `Pin<P>` → `P`). */
   selfArgs: string[];
+  /** The implementing type as written, path and arguments: `pubgrub::Range<Version>`. */
+  selfText: string;
   /** The impl's own type parameters (`impl<'a, P: DerefMut>` → `P`). */
   params: string[];
 }
@@ -9002,6 +9004,7 @@ function parseRustImplHeader(text: string): RustImplHeader | null {
     traitArgs: args(traitPart),
     self: head(selfPart),
     selfArgs: args(selfPart.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '')),
+    selfText: selfPart.replace(/\{[\s\S]*$/, '').replace(/\bwhere\b[\s\S]*$/, '').trim(),
     params: params.map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined),
   };
 }
@@ -9409,6 +9412,12 @@ interface RustWrittenType {
    * value that is one of them is unread, whatever its bound.
    */
   opaque?: string[];
+  /**
+   * What a declaration's own parameters are known by where the type is
+   * reached: through `self` in `impl<S: Store> Worker<S>`, the struct's `S`
+   * is the impl's, a `Store`. The traits are read where the impl is.
+   */
+  bounds?: ReadonlyMap<string, { traits: string[]; file: string; at: number }>;
 }
 
 /**
@@ -9787,6 +9796,12 @@ function rustReadType(written: RustWrittenType, ref: UnresolvedRef, context: Res
   }
   if (segments.length === 0) {
     if (written.opaque?.includes(name)) return { kind: 'unread' };
+    const known = written.bounds?.get(name);
+    if (known) {
+      const traits = known.traits.filter((b) => !/^['?]/.test(b.trim()) && !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
+      if (traits.length === 0) return { kind: 'unread' };
+      return { kind: 'traits', traits, wrappers, byRef, written: { text: written.text, file: known.file, at: known.at } };
+    }
     const bounds = rustGenericBounds(name, written, context);
     if (bounds !== undefined) {
       const traits = bounds.filter((b) => !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
@@ -10181,7 +10196,56 @@ function rustFieldValue(
   const fields = rustDeclaredFields(decl, context);
   const text = /^\d+$/.test(field) ? fields?.tuple?.[Number(field)] : fields?.named?.get(field);
   if (!fields || !text) return null;
-  return { text, file: decl.filePath, at: rustNodeOffset(decl, context), self: decl.name, generics: fields.generics };
+  const value: RustWrittenType = { text, file: decl.filePath, at: rustNodeOffset(decl, context), self: decl.name, generics: fields.generics };
+  if (recv === 'self') {
+    const bounds = rustSelfParamBounds(fields.generics, scopes, at, ref.filePath);
+    if (bounds) value.bounds = bounds;
+  }
+  return value;
+}
+
+/**
+ * What the struct's own type parameters are known by inside the impl around
+ * `at`: the bounds of the impl's parameter each one is instantiated with,
+ * by position — `struct Worker<S>` under `impl<S: Store> Worker<S>` gives
+ * `S` → `Store`. Undefined where the impl's type arguments don't line up
+ * with the struct's parameters, or none is a bounded parameter of the impl.
+ */
+function rustSelfParamBounds(structGenerics: string, scopes: RustScopes, at: number, file: string): Map<string, { traits: string[]; file: string; at: number }> | undefined {
+  if (structGenerics.trim() === '') return undefined;
+  const block = rustImplAt(scopes, at);
+  if (!block || block.kind !== 'impl') return undefined;
+  // `impl<S: Store> [Trait for] Worker<S>`: the type after the impl's generics and a top-level ` for `.
+  let header = scopes.code.slice(block.at, block.from).replace(/^impl\b/, '').trim();
+  if (header.startsWith('<')) {
+    const end = rustAngleEnd(header, 0);
+    if (end < 0) return undefined;
+    header = header.slice(end + 1).trim();
+  }
+  let depth = 0;
+  for (let i = 0; i < header.length; i++) {
+    const c = header[i];
+    if (c === '<') depth++;
+    else if (c === '>' && header[i - 1] !== '-') depth--;
+    else if (depth === 0 && /\s/.test(c!) && /^for\s/.test(header.slice(i + 1))) {
+      header = header.slice(i + 4).trim();
+      break;
+    }
+  }
+  const self = rustPathHead(header.replace(/\bwhere\b[\s\S]*$/, '').trim());
+  if (!self) return undefined;
+  const args = splitRustTopLevel(self.args, ',').map((a) => a.trim()).filter((a) => a !== '');
+  const params = splitRustTopLevel(structGenerics, ',').map((p) => /^\s*(?:const\s+)?('?[A-Za-z_]\w*)/.exec(p)?.[1] ?? '');
+  if (params.length !== args.length) return undefined;
+  const own = new Set(splitRustTopLevel(block.generics, ',').map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]));
+  const bounds = new Map<string, { traits: string[]; file: string; at: number }>();
+  params.forEach((p, i) => {
+    const arg = args[i]!;
+    if (p === '' || p.startsWith("'") || !own.has(arg)) return;
+    const traits = rustBoundsOf(arg, [{ generics: block.generics, where: block.where }]);
+    if (traits && traits.length > 0) bounds.set(p, { traits, file, at });
+  });
+  return bounds.size > 0 ? bounds : undefined;
 }
 
 /** The `index`th field of a Rust tuple type as written — `(K, V)` → `V` for 1 — through `&`; null for any other type. */
@@ -10715,10 +10779,21 @@ function rustOutsideTypeCall(name: string, args: string, byRef: boolean, method:
   // its name (`fn local_addr(&self) { Self::local_addr(self) }` in axum's
   // `impl Listener for TcpListener`) shows the type has that method itself,
   // which a call reaches first.
+  // An impl for a project type of the name is that type's, not the outside
+  // one's: tokio's `impl Kill for Child` in process/windows.rs is for its own
+  // `struct Child`, never `std::process::Child`. Its type is read as the impl
+  // writes it: hexpm's `impl LowestVersion for pubgrub::Range<Version>` is
+  // pubgrub's `Range`'s.
+  const forOutside = (m: Node): boolean => {
+    const written = rustTraitImplHeader(m, context)?.selfText.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '') ?? '';
+    const head = rustPathHead(written);
+    const lookup = rustTypeLookup(head?.name ?? name, head?.segments ?? [], m.filePath, context, rustNodeOffset(m, context));
+    return lookup.outside || !lookup.nodes.some((n) => RUST_OWNER_KINDS.has(n.kind));
+  };
   const impls = rustSpecialized(rustMethodsNamed(name, method, context).filter((m) => {
     const impl = rustTraitImplHeader(m, context);
     return impl !== null && impl.self === name && isRustProjectNamed(impl.trait, RUST_TRAIT_KIND, context) &&
-      isRustTraitInScope(impl.trait, ref, m, context) && !rustDelegatesToOwn(m, name, context);
+      isRustTraitInScope(impl.trait, ref, m, context) && !rustDelegatesToOwn(m, name, context) && forOutside(m);
   }), args, context);
   if (impls.length === 1) return { original: ref, targetNodeId: impls[0]!.id, confidence: 0.85, resolvedBy: 'instance-method' };
   if (impls.length > 1) {
@@ -10887,6 +10962,32 @@ function matchRustTypedReceiverCall(receiver: string, method: string, ref: Unres
 
 /** The refs matchRustTypedReceiverCall resolved: through a typed receiver, a trait's own method is in reach. */
 const RUST_TYPED_REFS = new WeakMap<ResolutionContext, WeakSet<UnresolvedRef>>();
+
+/**
+ * A Rust call on a field of the enclosing impl's type — `self.inner.run()`,
+ * `self.0.len()` — as a call on the type the struct declares for the field:
+ * through `Arc`, `Box`, `Pin` and the lock guards, by a bounded generic's
+ * traits or a trait object's, with the struct's `use`s naming the type
+ * (rustFieldValue, rustTypedMethodCall). Undefined where the field's type
+ * can't be told: an enum's `self`, a trait's default method, a struct the
+ * index doesn't hold.
+ */
+function matchRustTypedSelfFieldCall(field: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (!/^(?:[A-Za-z_]\w*|\d+)$/.test(field)) return undefined;
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return undefined;
+  const at = (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column);
+  const written = rustFieldValue('self', field, at, scopes, ref, context, 0);
+  if (!written) return undefined;
+  const result = rustTypedMethodCall(rustReadType(written, ref, context), method, ref, context);
+  if (result === 'unread') return undefined;
+  if (result) {
+    let typed = RUST_TYPED_REFS.get(context);
+    if (!typed) RUST_TYPED_REFS.set(context, (typed = new WeakSet()));
+    typed.add(ref);
+  }
+  return result;
+}
 
 function rustTypedReceiverCall(receiver: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | { unread: number } | undefined {
   const scopes = rustScopesOf(ref.filePath, context);
@@ -18525,7 +18626,13 @@ export function matchMethodCall(
   // contain — whenever the field's type was external or merely shared a
   // method name with something nearby.
   if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
-    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+    // The field's type as the impl's struct declares it, read as any written
+    // type is (matchRustTypedSelfFieldCall); the plain-name reading below
+    // only where that can't be told.
+    const field = objectOrClass!.slice('self.'.length);
+    const typed = nmTimedT('mc-rustselffield', ref, () => matchRustTypedSelfFieldCall(field, methodName!, ref, context));
+    if (typed !== undefined) return typed;
+    return matchRustSelfFieldCall(field, methodName!, ref, context);
   }
 
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
