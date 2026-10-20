@@ -688,6 +688,9 @@ impl<'t> Walker<'t> {
         }
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            // Private unless `pub` (any form), as the wasm walker reads it:
+            // the resolver keeps a private alias to its own module.
+            visibility: Some(self.visibility_of(node)),
             ..Extra::default()
         };
         self.create_node("type_alias", &name, node, extra);

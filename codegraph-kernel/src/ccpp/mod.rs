@@ -659,6 +659,9 @@ impl<'t> Walker<'t> {
             if let Some(mut parts) = self.cpp_written_class_parts(node) {
                 return parts.pop().unwrap_or_default();
             }
+            if let Some(name) = self.cpp_specialized_function_name(node) {
+                return name;
+            }
         }
         if let Some(name_node) = node.child_by_field_name("declarator") {
             let mut resolved = name_node;
@@ -764,16 +767,50 @@ impl<'t> Walker<'t> {
         Some(self.text(identifier).to_string())
     }
 
-    /// extractCppQualifiedMethodName (languages/c-cpp.ts:75).
+    /// extractCppQualifiedMethodName (languages/c-cpp.ts): the name the
+    /// declarator's qualified id ends in, an explicit specialization's without
+    /// its template arguments (cppDefinedName).
     fn extract_cpp_qualified_method_name(&self, node: Node) -> Option<String> {
         if let Some(n) = self.recover_cpp_macro_defined_name(node) {
             return Some(n);
         }
         let declarator = node.child_by_field_name("declarator")?;
         let qid = find_declarator_qualified_id(declarator)?;
+        if let Some(name) = cpp_qualified_id_name(qid) {
+            return Some(self.cpp_defined_name(name));
+        }
         let text = self.text(qid).trim();
         let parts: Vec<&str> = text.split("::").filter(|p| !p.is_empty()).collect();
         parts.last().map(|s| s.to_string())
+    }
+
+    /// cppDefinedName (languages/c-cpp.ts): a definition's name node as
+    /// named, a `template_function`'s without its template arguments
+    /// (`ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` is `ReadPrimitive`).
+    fn cpp_defined_name(&self, name: Node) -> String {
+        let own = if name.kind() == "template_function" { name.child_by_field_name("name") } else { None };
+        self.text(own.unwrap_or(name)).trim().to_string()
+    }
+
+    /// cppSpecializedFunctionName (languages/c-cpp.ts): the name of a
+    /// function an explicit specialization defines, without its template
+    /// arguments (`Swap` for `template <> void Swap<Foo>(Foo& a, Foo& b)`).
+    fn cpp_specialized_function_name(&self, node: Node) -> Option<String> {
+        if node.kind() != "function_definition" {
+            return None;
+        }
+        let mut declarator = node.child_by_field_name("declarator")?;
+        while matches!(declarator.kind(), "pointer_declarator" | "reference_declarator") {
+            declarator = declarator.child_by_field_name("declarator").or_else(|| declarator.named_child(0))?;
+        }
+        if declarator.kind() != "function_declarator" {
+            return None;
+        }
+        let inner = declarator.child_by_field_name("declarator")?;
+        if inner.kind() != "template_function" {
+            return None;
+        }
+        Some(self.cpp_defined_name(inner))
     }
 
     /// recoverSingleArgMacroDefinedName: only a local macro definition proves
@@ -899,16 +936,32 @@ impl<'t> Walker<'t> {
         Some(name.to_string())
     }
 
-    /// extractCppReceiverType (languages/c-cpp.ts:86).
+    /// extractCppReceiverType (languages/c-cpp.ts): the scopes are what the
+    /// qualified id writes before its name, so a specialization's arguments
+    /// (`ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>`) are no scope.
     fn receiver_type_of(&self, node: Node) -> Option<String> {
         let declarator = node.child_by_field_name("declarator")?;
         let qid = find_declarator_qualified_id(declarator)?;
-        let text = self.text(qid).trim();
-        let parts: Vec<&str> = text.split("::").filter(|p| !p.is_empty()).collect();
-        if parts.len() <= 1 {
+        let scopes = match cpp_qualified_id_name(qid) {
+            Some(name) => {
+                let written = self.src[qid.start_byte()..name.start_byte()].trim_end();
+                // A `::` the parser supplied in recovery writes nothing: Metal's
+                // `vertex VertexOut vertexShader(…)` reads as `VertexOut::vertexShader`.
+                if !written.ends_with("::") {
+                    return None;
+                }
+                written.to_string()
+            }
+            None => {
+                let parts: Vec<&str> = self.text(qid).trim().split("::").filter(|p| !p.is_empty()).collect();
+                parts[..parts.len().saturating_sub(1)].join("::")
+            }
+        };
+        let parts: Vec<&str> = scopes.split("::").filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
             return None;
         }
-        let receiver = strip_cpp_template_args(&parts[..parts.len() - 1].join("::"));
+        let receiver = strip_cpp_template_args(&parts.join("::"));
         if receiver.is_empty() {
             None
         } else {
@@ -2390,6 +2443,16 @@ impl<'t> Walker<'t> {
 }
 
 // --- free helpers ------------------------------------------------------------
+
+/// cppQualifiedIdName (languages/c-cpp.ts): the name a `qualified_identifier`
+/// ends in, past its scopes. None when the tree lacks one.
+fn cpp_qualified_id_name(qid: Node) -> Option<Node> {
+    let mut name = qid;
+    while name.kind() == "qualified_identifier" {
+        name = name.child_by_field_name("name")?;
+    }
+    Some(name)
+}
 
 /// findDeclaratorQualifiedId (languages/c-cpp.ts:13): BFS for the declarator's
 /// `qualified_identifier`, skipping parameter_list + trailing_return_type so a
