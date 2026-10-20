@@ -450,8 +450,8 @@ describe('a Rust call through `self: Pin<&mut Self>`', () => {
 });
 
 describe('a Rust call on a value declared `Pin<&mut T>`', () => {
-  it('is never a blanket impl\'s method taking `self: Pin<&mut Self>`', () => {
-    expect(callsAt('src/copy.rs', 8)).toEqual([]);
+  it('is the bound\'s method, never a blanket impl\'s taking `self: Pin<&mut Self>`', () => {
+    expect(callsAt('src/copy.rs', 8)).toEqual(['AsyncRead::poll_read@src/io.rs:16']);
   });
 
   it('keeps a blanket impl\'s `&self` method, which `Pin` answers first', () => {
