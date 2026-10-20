@@ -5252,6 +5252,10 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    // Where the call's reference sits: the call itself, or the callee an
+    // `await` was peeled off (`await f<T>(x)` starts at `await`; the call to
+    // `f` starts where `f` does, as in `await f(x)`).
+    let refStart = node.startPosition;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -5433,7 +5437,9 @@ export class TreeSitterExtractor {
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
       if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
-        func = peelTsAwaitCallee(func);
+        const peeled = peelTsAwaitCallee(func);
+        if (peeled !== func) refStart = peeled.startPosition;
+        func = peeled;
       }
 
       if (func && this.language === 'swift') {
@@ -5848,8 +5854,8 @@ export class TreeSitterExtractor {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
+        line: refStart.row + 1,
+        column: refStart.column,
       });
     }
   }

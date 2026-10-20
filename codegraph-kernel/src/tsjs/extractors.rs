@@ -1398,10 +1398,15 @@ impl<'t> Walker<'t> {
         if self.stack.is_empty() {
             return;
         }
-        let func = node
-            .child_by_field_name("function")
-            .or_else(|| node.named_child(0))
-            .map(|f| self.peel_await_callee(f));
+        let raw = node.child_by_field_name("function").or_else(|| node.named_child(0));
+        let func = raw.map(|f| self.peel_await_callee(f));
+        // Where the reference sits: the call, or the callee an `await` was
+        // peeled off (`await f<T>(x)` starts at `await`; the call to `f`
+        // starts where `f` does, as in `await f(x)`). Mirrors refStart.
+        let at = match (raw, func) {
+            (Some(r), Some(f)) if r.id() != f.id() => f,
+            _ => node,
+        };
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1477,7 +1482,7 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_call_ref(&callee_name.clone(), node);
+            self.push_call_ref(&callee_name.clone(), at);
         }
     }
 
