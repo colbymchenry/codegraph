@@ -446,6 +446,26 @@ impl<'t> Walker<'t> {
         None
     }
 
+    /// rustImplItemOwner (languages/rust.ts) — the type an item written
+    /// directly in an impl block belongs to: `ValueHint` for the `type Err`
+    /// of `impl FromStr for ValueHint`, then `ValueHint::Err`, as the impl's
+    /// methods are. A type no single name stands for (`()`, `(A, B)`, `[u8]`,
+    /// `u32`) is written as the impl writes it. Mirrored byte-for-byte —
+    /// change both.
+    fn impl_item_owner(&self, node: Node) -> Option<String> {
+        let list = node.parent().filter(|p| p.kind() == "declaration_list")?;
+        let imp = list.parent().filter(|p| p.kind() == "impl_item")?;
+        let mut ty = imp.child_by_field_name("type")?;
+        while ty.kind() == "reference_type" {
+            ty = ty.child_by_field_name("type")?;
+        }
+        self.impl_type_name(Some(ty)).or_else(|| {
+            let words: Vec<&str> =
+                self.text(ty).split([' ', '\t', '\r', '\n']).filter(|w| !w.is_empty()).collect();
+            Some(words.join(" "))
+        })
+    }
+
     // --- visitNode ------------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
@@ -688,6 +708,12 @@ impl<'t> Walker<'t> {
         }
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            // Private unless `pub` (any form), as the wasm walker reads it:
+            // the resolver keeps a private alias to its own module.
+            visibility: Some(self.visibility_of(node)),
+            // An impl's associated type is its type's (`ValueHint::Err`),
+            // named only through a path, never bare.
+            qualified_name: self.impl_item_owner(node).map(|o| format!("{o}::{name}")),
             ..Extra::default()
         };
         self.create_node("type_alias", &name, node, extra);
@@ -700,6 +726,8 @@ impl<'t> Walker<'t> {
     fn extract_variable(&mut self, node: Node<'t>) {
         let docstring = preceding_docstring(node, self.src);
         let name_field = node.child_by_field_name("name");
+        // An impl's associated const is its type's (`Limits::MAX`), as its methods are.
+        let owner = self.impl_item_owner(node);
         let mut declared: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
@@ -715,6 +743,7 @@ impl<'t> Walker<'t> {
                     Extra {
                         docstring: docstring.clone(),
                         is_exported: Some(false),
+                        qualified_name: owner.as_ref().map(|o| format!("{o}::{name}")),
                         ..Extra::default()
                     },
                 );

@@ -70,8 +70,14 @@ export class SynthesisStage {
         insert.run(i, i + 2000);
         await yieldToLoop();
       }
+      // Only indexed files: an input names a file the passes read, but a lazy
+      // value's module can resolve to a workspace package's directory
+      // (`import('icons')`), and a file can leave the index while the passes
+      // run. Either broke the foreign key into files(path) and rolled the whole
+      // sync back (#2565).
       this.db.exec(`DELETE FROM main.synthesis_inputs;
-        INSERT INTO main.synthesis_inputs SELECT * FROM temp.synthesis_inputs`);
+        INSERT INTO main.synthesis_inputs (file_path)
+          SELECT file_path FROM temp.synthesis_inputs WHERE file_path IN (SELECT path FROM main.files)`);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
