@@ -7057,6 +7057,212 @@ function objcPropertyTypes(name: string, context: ResolutionContext): string[] {
   return [...types];
 }
 
+/**
+ * What one file declares of an Objective-C class: instance variables (an
+ * `@interface`'s ivar block, which subclasses see, or a class extension's or
+ * an `@implementation`'s, which they don't), properties (a category's can't
+ * be synthesized), and the ivar each `@synthesize` names for a property.
+ */
+interface ObjcClassMembers {
+  ivars: Map<string, string>;
+  ownIvars: Map<string, string>;
+  properties: Map<string, { type: string; category: boolean }>;
+  synthesized: Map<string, string>;
+}
+
+/** Per context: an Objective-C file → each class it declares → what it declares of it. */
+const OBJC_MEMBER_TABLES = new WeakMap<ResolutionContext, Map<string, Map<string, ObjcClassMembers>>>();
+/** Per context: class name + the calling file's directory → the files declaring that class. */
+const OBJC_CLASS_FILES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+// A declared class as a member declaration writes it, past qualifiers, with
+// its type arguments, protocol list or ObjFW's `OF_GENERIC(…)` after it, up to
+// the `*`: `OFObject <OFHTTPClientDelegate> *`, `OFArray OF_GENERIC(OFString *) *`,
+// `IBOutlet UIImageView *`.
+const OBJC_MEMBER_TYPE = String.raw`(?:(?:__strong|__weak|__unsafe_unretained|__block|const|volatile|IBOutlet|IBInspectable)\s+)*([A-Z]\w*)\s*(?:<[^;{}]*?>\s*|[A-Z][A-Z0-9_]*\s*\([^;{}]*?\)\s*)?\*`;
+// An instance variable, alone or listed: `OFDictionary *_headers;`, `OFString *_host, *_path;`.
+const OBJC_IVAR_RE = new RegExp(String.raw`^\s*${OBJC_MEMBER_TYPE}\s*((?:(?:_Nullable|_Nonnull|const)\s+)*\w+(?:\s*,\s*\*\s*(?:(?:_Nullable|_Nonnull|const)\s+)*\w+)*)\s*;`);
+// A property, past attribute macros and its attribute list:
+// `@property OF_NULLABLE_PROPERTY (readonly, nonatomic) OFString *host;`.
+const OBJC_PROPERTY_RE = new RegExp(String.raw`^\s*@property\b\s*(?:[A-Z][A-Z0-9_]+\s*)*(?:\([^)]*\)\s*)?(?:(?:nullable|nonnull|null_unspecified|__kindof)\s+)*${OBJC_MEMBER_TYPE}\s*(?:(?:_Nullable|_Nonnull|const)\s+)*(\w+)`);
+
+/**
+ * What each Objective-C class `filePath` declares has, by name, with the
+ * class each is declared as (ObjcClassMembers): read from `@interface`s (a
+ * header's, a class extension's or a category's: the ivar block right after
+ * the head, then `@property` declarations, which may run over several lines)
+ * and from an `@implementation`'s ivar block and `@synthesize` lines, never a
+ * method body.
+ */
+function objcFileMembers(filePath: string, context: ResolutionContext): Map<string, ObjcClassMembers> {
+  let memo = OBJC_MEMBER_TABLES.get(context);
+  if (!memo) OBJC_MEMBER_TABLES.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const tables = new Map<string, ObjcClassMembers>();
+  memo.set(filePath, tables);
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+  const count = (text: string, re: RegExp): number => (text.match(re) ?? []).length;
+  let members: ObjcClassMembers | null = null;
+  let inInterface = false;
+  // `@interface Name (Category)`, or a class extension `@interface Name ()`.
+  let category: string | null = null;
+  // A class declares ivars only in a block that is the first code after its
+  // head: 'head' until that code (`open` counts the head's unclosed `<` and
+  // `(`, as in a protocol list over several lines), 'ivars' inside the block
+  // (`depth` braces deep), 'body' past it.
+  let state: 'head' | 'ivars' | 'body' = 'body';
+  let open = 0;
+  let depth = 0;
+  // A `@property` declaration read so far, until its `;`.
+  let property: string | null = null;
+  for (const raw of lines) {
+    let line = raw.replace(/\/\/.*$/, '');
+    const head = /^\s*(?:[A-Z][A-Z0-9_]*(?:\([^)]*\))?\s+)*@(interface|implementation)\s+(\w+)\s*(?:<[^>]*>\s*|[A-Z][A-Z0-9_]*\([^)]*\)\s*)?(?:\(\s*(\w*)\s*\))?/.exec(line);
+    if (head) {
+      const cls = head[2]!;
+      members = tables.get(cls) ?? { ivars: new Map(), ownIvars: new Map(), properties: new Map(), synthesized: new Map() };
+      tables.set(cls, members);
+      inInterface = head[1] === 'interface';
+      category = head[3] ?? null;
+      state = 'head';
+      open = 0;
+      property = null;
+      line = line.slice(head.index + head[0].length);
+    } else if (/^\s*@end\b/.test(line)) {
+      members = null;
+      continue;
+    }
+    if (!members) continue;
+    if (state === 'head') {
+      // The head may go on with its superclass or protocol list on the next
+      // lines: ObjFW's `@interface OFKernelEventObserverTests: OTTestCase`
+      // over `    <OFKernelEventObserverDelegate>`.
+      const inHead = head !== null || open > 0 || /^\s*[<:]/.test(line);
+      open += count(line, /[<(]/g) - count(line, /[>)]/g);
+      const brace = line.indexOf('{');
+      if (brace >= 0) {
+        state = 'ivars';
+        depth = 0;
+        line = line.slice(brace);
+      } else if (inHead || open > 0 || /^\s*(?:$|\/\*|\*|#)/.test(line)) {
+        continue;
+      } else {
+        state = 'body';
+      }
+    }
+    if (state === 'ivars') {
+      depth += count(line, /\{/g) - count(line, /\}/g);
+      if (depth <= 0) state = 'body';
+      const ivar = OBJC_IVAR_RE.exec(line.replace(/^[^{]*\{/, '').replace(/\}.*$/, ''));
+      const ivars = inInterface && category === null ? members.ivars : members.ownIvars;
+      for (const name of ivar?.[2]!.split(',') ?? []) {
+        const bare = name.replace(/\*|_Nullable|_Nonnull|\bconst\b/g, '').trim();
+        if (/^\w+$/.test(bare) && !ivars.has(bare)) ivars.set(bare, ivar![1]!);
+      }
+      continue;
+    }
+    if (!inInterface) {
+      const synthesize = /^\s*@synthesize\s+([^;]+);/.exec(line);
+      for (const item of synthesize?.[1]!.split(',') ?? []) {
+        const [name, ivar] = item.split('=').map((s) => s.trim());
+        if (name && /^\w+$/.test(ivar ?? name)) members.synthesized.set(ivar ?? name, name);
+      }
+      continue;
+    }
+    if (property === null && !/^\s*@property\b/.test(line)) continue;
+    property = property === null ? line : `${property} ${line}`;
+    if (!property.includes(';') && property.length < 400) continue;
+    const declared = OBJC_PROPERTY_RE.exec(property);
+    property = null;
+    if (declared && !members.properties.has(declared[2]!)) {
+      members.properties.set(declared[2]!, { type: declared[1]!, category: !!category });
+    }
+  }
+  return tables;
+}
+
+/**
+ * The files declaring the Objective-C class `name`, the calling file first.
+ * When more than one file declares the class itself (`@interface Name`, not a
+ * category or an extension), they are namesakes in separate targets, like
+ * each SDWebImage demo app's `ViewController`, and only the declarations in
+ * the calling file's directory are the one the call means.
+ */
+function objcClassFiles(name: string, ref: UnresolvedRef, context: ResolutionContext): string[] {
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  let memo = OBJC_CLASS_FILES.get(context);
+  if (!memo) OBJC_CLASS_FILES.set(context, (memo = new Map()));
+  const key = `${name}\u0000${dir}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  const decls = context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'objc');
+  const primary = new Set<string>();
+  const own = new RegExp(`@interface\\s+${name}\\b(?!\\s*\\()`);
+  for (const decl of decls) {
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    if (lines.slice(decl.startLine - 1, decl.endLine).some((l) => own.test(l))) primary.add(decl.filePath);
+  }
+  const inDir = (file: string) => file.startsWith(dir) && !file.includes('/', dir.length);
+  const files = [...new Set(decls.map((n) => n.filePath))]
+    .filter((file) => primary.size < 2 || inDir(file))
+    .sort((a, b) => Number(b === ref.filePath) - Number(a === ref.filePath));
+  memo.set(key, files);
+  return files;
+}
+
+/**
+ * The class an Objective-C receiver is declared as when it is an instance
+ * variable of the class around the call, or a property read through `self.`:
+ * ObjFW's `[_headers mutableCopy]` on an `OFMutableDictionary *_headers;`
+ * ivar, the ivar a property synthesizes (`_name`, or the one `@synthesize`
+ * names), or `[self.weakCache objectForKey:]` on an `NSMapTable` property. A
+ * class it inherits from lends the ivars its `@interface` declares and its
+ * properties. A local or a parameter, which the shared inferrer reads first,
+ * shadows an ivar, and a bare name is never a property's: `arcs` in
+ * `initWithArcs:` is the parameter. Null when nothing declares it.
+ */
+function objcMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const viaSelf = receiver.startsWith('self.');
+  const name = viaSelf ? receiver.slice(5) : receiver;
+  if (!/^[A-Za-z_]\w*$/.test(name) || name === 'self' || name === 'super') return null;
+  // A capitalized name is a class (`[OFString stringWithFormat:]`), not an
+  // ivar, and `self.name` needs a property of that name.
+  if (viaSelf ? !context.getNodesByName(name).some((n) => n.kind === 'property' && n.language === 'objc') : /^[A-Z]/.test(name)) {
+    return null;
+  }
+  const hierarchy = objcHierarchyAt(ref, context);
+  if (!hierarchy) return null;
+  // What each class of the hierarchy declares, the calling one first.
+  const levels = [...hierarchy].map((cls) => objcClassFiles(cls, ref, context)
+    .map((file) => objcFileMembers(file, context).get(cls))
+    .filter((t): t is ObjcClassMembers => t !== undefined));
+  // A property's type, from the calling class up; `own`: only one the calling
+  // class declares and may synthesize, never a category's.
+  const propertyType = (key: string, own: boolean): string | undefined => {
+    for (const level of own ? levels.slice(0, 1) : levels) {
+      for (const t of level) {
+        const p = t.properties.get(key);
+        if (p && !(own && p.category)) return p.type;
+      }
+    }
+    return undefined;
+  };
+  if (viaSelf) return propertyType(name, false) ?? null;
+  for (const [i, level] of levels.entries()) {
+    for (const t of level) {
+      const type = t.ivars.get(name) ?? (i === 0 ? t.ownIvars.get(name) : undefined);
+      if (type) return type;
+    }
+    if (i > 0) continue;
+    const synthesized = level.map((t) => t.synthesized.get(name)).find((p) => p !== undefined);
+    const type = synthesized !== undefined ? propertyType(synthesized, false)
+      : name.startsWith('_') ? propertyType(name.slice(1), true) : undefined;
+    if (type) return type;
+  }
+  return null;
+}
+
 /** The superclasses an Objective-C class's `@interface` declarations name. */
 function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   let memo = OBJC_SUPERS.get(context);
@@ -14124,9 +14330,10 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'objc':
       return [
         // FMResultSet *rs = …  /  NSString * _Nullable name;  /  a block's ^(FMResultSet *rs)
-        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
+        // ObjFW writes type arguments with a macro: `OFArray OF_GENERIC(OFString *) *names`.
+        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*|[A-Z][A-Z0-9_]*\\s*\\([^;{}]*?\\)\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
         // a method parameter: - (void)read:(nullable FMResultSet *)rs
-        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
+        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*|[A-Z][A-Z0-9_]*\\s*\\([^()]*\\)\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
       ];
     case 'swift':
       return [
@@ -15243,6 +15450,11 @@ export function matchMethodCall(
         if (/^[A-Z]/.test(inferredType) && (cppDecl.pointer || cppMemberOperator(objectOrClass!, ref, context) !== '->')) return null;
         inferredType = null;
       }
+    }
+    // An Objective-C receiver the calling method doesn't declare may be an
+    // instance variable or a property of its class (objcMemberReceiverType).
+    if (!inferredType && ref.language === 'objc' && dotMatch) {
+      inferredType = nmTimedT('mc-objcmember', ref, () => objcMemberReceiverType(objectOrClass!, ref, context));
     }
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
