@@ -18689,10 +18689,14 @@ export function matchMethodCall(
     // Multiple methods: score by receiver name word overlap with class name
     if (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed)) {
       // What the receiver is named after is its last link: `builder.tokeniser`
-      // is a Tokeniser, `table.Columns` no kind of table.
-      const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
+      // is a Tokeniser, `table.Columns` no kind of table. In a python chain the
+      // last link as written: Django's `request.META` and `request.GET` are
+      // dicts, not constants of `request`'s type.
+      const link = pythonChain ? objectOrClass!.slice(objectOrClass!.lastIndexOf('.') + 1) : receiverLink(objectOrClass!);
+      const receiverWords = splitCamelCase(link);
       const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
-      const wholeReceiver = receiverLink(objectOrClass!).replace(/_/g, '').toLowerCase();
+      const wholeReceiver = link.replace(/_/g, '').toLowerCase();
+      const singular = (w: string): string => w.toLowerCase().replace(/s$/, '');
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
       let tied: typeof targetMethods = [];
@@ -18707,6 +18711,12 @@ export function matchMethodCall(
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');
         const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
+        // An untyped python attribute chain is a guess only through its head
+        // noun: `self.session` names a `SessionBase` and `self.client` a
+        // `ClientMixin`, but mealie's `database.group_shopping_lists` no
+        // `GroupRepositoryAIProvider`, which only shares its `group`.
+        if (pythonChain && head !== undefined && !classWords.some((cw) => singular(cw) === singular(head)) &&
+            wholeReceiver !== classWords.join('').toLowerCase()) continue;
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
@@ -18743,11 +18753,7 @@ export function matchMethodCall(
       // `$storage->delete($path)`, `CommentRepo::delete` doing
       // `$comment->delete()` — names the caller's own class only by a shared
       // word. The guess is the caller itself, so there is no guess.
-      // An untyped python attribute chain needs more than one shared word: an
-      // attribute name is compound, and fastapi's `request.headers.get()` is
-      // no `_HeadersGetter`, mealie's `database.group_shopping_lists` no
-      // `GroupRepositoryAIProvider`.
-      if (bestMatch && bestScore >= (pythonChain ? 3 : 2) && bestMatch.id !== ref.fromNodeId) {
+      if (bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId) {
         return {
           original: ref,
           targetNodeId: bestMatch.id,

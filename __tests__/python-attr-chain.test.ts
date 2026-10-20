@@ -95,16 +95,23 @@ describe('python attribute-chain receivers', () => {
     expect(callsFrom('method', 'run').sort()).toEqual(['method:get@client.py', 'method:render@nodes.py']);
   });
 
-  it('needs more than one shared word to guess an untyped chain', async () => {
+  it('guesses an untyped chain only through its head noun', async () => {
     // mealie's `database.group_shopping_lists` shares only `group` with the AI
-    // providers' repository; `group_ai_providers` shares `group` and `ai`.
+    // providers' repository; its head noun is `lists`. `group_ai_providers`
+    // names a provider, and `client` the mixin Django's test client gets
+    // `force_login` from. Django's `request.META` is a dict, not a `request`.
     writeTree({
       'repos.py': 'class GroupRepositoryAIProvider:\n    def create(self):\n        pass\n\n\nclass Other:\n    def create(self):\n        pass\n',
-      'use.py': 'def lists(database):\n    database.group_shopping_lists.create()\n\n\ndef providers(database):\n    database.group_ai_providers.create()\n',
+      'client.py': 'class ClientMixin:\n    def force_login(self, u):\n        return u\n\n\nclass OtherMixin:\n    def force_login(self, u):\n        return u\n',
+      'factory.py': 'class RequestFactory:\n    def get(self, path):\n        return path\n',
+      'use.py': 'def lists(database):\n    database.group_shopping_lists.create()\n\n\ndef providers(database):\n    database.group_ai_providers.create()\n\n\n'
+        + 'def login(case):\n    case.client.force_login(1)\n\n\ndef meta(request):\n    return request.META.get("HTTP_HOST")\n',
     });
     cg = await CodeGraph.init(tempDir, { index: true });
     expect(callsFrom('function', 'lists')).toEqual([]);
     expect(callsFrom('function', 'providers')).toEqual(['method:create@repos.py']);
+    expect(callsFrom('function', 'login')).toEqual(['method:force_login@client.py']);
+    expect(callsFrom('function', 'meta')).toEqual([]);
   });
 
   it('leaves a chain through a module to the module', async () => {
