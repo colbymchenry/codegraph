@@ -335,10 +335,9 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
       type = pythonFieldType(receiver, owner, ref, context);
     } else {
       type = pythonLocalType(receiver, ref, context);
-      const global = type === null
-        ? context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) : undefined;
-      if (global && !pythonBindsLocally(receiver, ref, context, true)) {
-        return result(pythonGlobalMembers(global, member, ref, context));
+      const viaGlobal = type === null ? pythonGlobalReceiverTarget(receiver, member, ref, context) : undefined;
+      if (viaGlobal !== undefined) {
+        return viaGlobal ? { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'function-ref' } : null;
       }
     }
     // A type name used directly (`Store.fetch`) is scoped just like an annotation.
@@ -929,6 +928,44 @@ function pythonDynamicGlobalWrite(name: string, filePath: string, context: Resol
     if (uses > safe) return true;
   }
   return false;
+}
+
+/**
+ * What `receiver.member` reaches through a module-level instance of this
+ * file — `_svc = SceneService()` at module scope, then `_svc.delete` (#2074)
+ * or `_svc.delete(obj)` (#2582). Undefined when `receiver` is not that global
+ * where the ref is: a parameter, a local, or a `def`/`class` written directly
+ * in an enclosing function shadows it. Otherwise the one method or function every class the global
+ * may hold has or inherits — never a property, an attribute or the referring
+ * node itself (allowed for a `call`: recursion) — or null when there is none.
+ */
+function pythonGlobalReceiverTarget(
+  receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext, call = false,
+): Node | null | undefined {
+  const global = pythonNameScan(context, `global\0${ref.filePath}\0${receiver}`, () =>
+    context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
+  if (!global || pythonBindsLocally(receiver, ref, context, true)) return undefined;
+  // A `def _svc` / `class _svc` nested in an enclosing function binds the name there.
+  const nodes = context.getNodesInFile(ref.filePath);
+  const scopes = nodes.filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
+  const innermost = (n: Node) => nodes
+    .filter(c => c.id !== n.id && (c.kind === 'function' || c.kind === 'method' || c.kind === 'class') &&
+      c.startLine < n.startLine && c.endLine >= n.startLine)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  if (nodes.some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
+      scopes.some(f => f.id === innermost(n)?.id))) return undefined;
+  if (!pythonOwnGlobalWrites(global, context) || pythonExternalWrites(global, context).writers.has(ref.filePath)) {
+    return null;
+  }
+  const classes = pythonGlobalClasses(global, ref, context);
+  if (!classes) return null;
+  // A class without the member (a base from outside the project may supply it) leaves it unknown.
+  if (classes.some(cls => pythonMembers(cls, member, ref, context).length === 0)) return null;
+  const pool = pythonGlobalMembers(global, member, ref, context).filter(n => sameLanguageFamily(n.language, ref.language));
+  const target = pool.length === 1 ? pool[0]! : undefined;
+  // A method value naming its own method is no reference; a call through the global is recursion.
+  return target && (target.kind === 'function' || target.kind === 'method') && (call || target.id !== ref.fromNodeId) &&
+    !isPythonProperty(target, context) ? target : null;
 }
 
 /**
@@ -3825,6 +3862,11 @@ function pythonFromImports(filePath: string, context: ResolutionContext): Map<st
 function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const module = pythonFromImports(ref.filePath, context).get(name);
   if (!module || module.startsWith('.')) return false;
+  return !isPythonProjectModule(module, context);
+}
+
+/** Whether some project file is the module `a.b` (`a/b.py` or `a/b/__init__.py`). */
+function isPythonProjectModule(module: string, context: ResolutionContext): boolean {
   let memo = PY_MODULE_LOCAL.get(context);
   if (!memo) {
     memo = new Map();
@@ -3837,7 +3879,42 @@ function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, conte
       f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
     memo.set(module, local);
   }
-  return !local;
+  return local;
+}
+
+/**
+ * A receiver the file binds only by importing a module from outside the
+ * project — `import subprocess`, `import numpy as np` — never rebinding it at
+ * module scope (an assignment, a `for`/`with`/tuple target, a `global` write
+ * in a function, a fallback `class`/`def` of that name) nor in the calling
+ * function. A call on it is that module's function, never a project class's
+ * method of the same name (#2599).
+ */
+export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
+  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, ref.filePath, context);
+    if (keys.size === 0) return false;
+    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
+    // the module `a` tells that `x` comes from outside.
+    return [...keys].every((key) => {
+      const module = key.slice(0, key.indexOf(':'));
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, context);
+    });
+  });
+  return outside && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * Whether `a.b.c` is a project module from some import root: `a/b/c.py`, or —
+ * with the package itself indexed as the root — `b/c.py` or `c.py`. Erring
+ * toward "project" only leaves a call to the name strategies, as before.
+ */
+function isPythonProjectModuleAnyRoot(module: string, context: ResolutionContext): boolean {
+  const parts = module.split('.');
+  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), context));
 }
 
 const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
@@ -15938,6 +16015,17 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // `subprocess.run(…)` after `import subprocess`: a function of a module
+    // from outside the project, not a same-named project method (#2599).
+    if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
+    // A module-level instance of this file — `_svc = SceneService()` — called
+    // from a function: the method its class has or inherits (#2582), as for a
+    // method value through the same global (#2074). Otherwise the call goes on
+    // to the strategies below, as before.
+    if (!inferredType && ref.language === 'python' && dotMatch && /^\w+$/.test(objectOrClass!)) {
+      const viaGlobal = pythonGlobalReceiverTarget(objectOrClass!, methodName!, ref, context, true);
+      if (viaGlobal) return { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    }
     // A Go receiver's declaration in scope, as the scope reader finds it
     // (`declared`), decides over the patterns, which scan back for the name
     // without block scope and can read another declaration of it:
