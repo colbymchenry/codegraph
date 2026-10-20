@@ -16988,7 +16988,7 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
+      const methodNode = classStrategyMethod(classNode, methodName!, context);
 
       if (methodNode) {
         return {
@@ -17068,7 +17068,7 @@ export function matchMethodCall(
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
-        const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
+        const methodNode = classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode) {
           return {
@@ -19453,6 +19453,18 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string)
     methods.find((n) => n.qualifiedName === exact) ??
     methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
   );
+}
+
+/**
+ * The method a class-name or capitalized-receiver call reaches on `classNode`:
+ * its own (findOwnMethod), else the nearest one a declared supertype has, as a
+ * call on an instance of the class finds it. Django's `form.is_valid()` on
+ * `Form` reaches `BaseForm::is_valid`, which the substring test this replaced
+ * only found because `BaseForm` contains `Form`.
+ */
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext): Node | undefined {
+  return findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName) ??
+    inheritedClassMethod([classNode], methodName, context) ?? undefined;
 }
 
 /**

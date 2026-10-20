@@ -66,6 +66,41 @@ class Box:
 def top_has_none():
     Plain.log()
 `);
+  // A class that declares no method of the name reaches the one it inherits,
+  // as Django's `form.is_valid()` on `Form(BaseForm)` does — not a method of
+  // another class whose name merely contains the receiver's (`AdminForm`,
+  // declared first so a name test would pick it).
+  fs.writeFileSync(path.join(dir, 'forms.py'), `class AdminForm:
+    def is_valid(self):
+        pass
+
+class BaseForm:
+    def is_valid(self):
+        pass
+
+class Form(BaseForm):
+    pass
+
+def submit(form):
+    form.is_valid()
+
+def submit_class():
+    Form.is_valid()
+`);
+  fs.writeFileSync(path.join(dir, 'stores.ts'), `export class AdminStore {
+  static create(): void {}
+}
+
+export class BaseStore {
+  static create(): void {}
+}
+
+export class Store extends BaseStore {}
+
+export function makeStore(): void {
+  Store.create();
+}
+`);
   // R allows dots in a class name: the owner is `Bank.Account`, whole.
   fs.writeFileSync(path.join(dir, 'account.R'), `Bank.Account <- R6::R6Class("Bank.Account",
   public = list(
@@ -115,6 +150,20 @@ describe('method call binds to the receiver class itself, not a class whose name
     const callees = calleesOf('viaStatic', 'log.ts');
     expect(callees).toContain('log.ts#Logger::log');
     expect(callees).not.toContain('log.ts#FileLogger::log');
+  });
+
+  it('Python: a method the class inherits is reached through its base, not a namesake class', () => {
+    for (const fn of ['submit', 'submit_class']) {
+      const callees = calleesOf(fn, 'forms.py');
+      expect(callees).toContain('forms.py#BaseForm::is_valid');
+      expect(callees).not.toContain('forms.py#AdminForm::is_valid');
+    }
+  });
+
+  it('TypeScript: a static method the class inherits is reached through its base', () => {
+    const callees = calleesOf('makeStore', 'stores.ts');
+    expect(callees).toContain('stores.ts#BaseStore::create');
+    expect(callees).not.toContain('stores.ts#AdminStore::create');
   });
 
   it('R: a dotted class name is the owner as a whole', () => {
