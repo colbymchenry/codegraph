@@ -32,6 +32,17 @@ export function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | nul
   return null;
 }
 
+/**
+ * Whether a C or Objective-C declaration is a constant: a `const` or
+ * `static const` file-scope declaration carries a `type_qualifier` child
+ * reading "const". Extracted as `constant`, plain globals as `variable`. A
+ * `const` inside a pointer declarator (`char *const p`) qualifies the
+ * pointer, and the declaration stays a variable.
+ */
+export function isConstDeclaration(node: SyntaxNode): boolean {
+  return node.namedChildren.some((c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const');
+}
+
 /** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
 const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
@@ -46,9 +57,9 @@ export function isClassLikeDefinition(node: SyntaxNode): boolean {
 /**
  * The `declaration` a class, struct, union or enum is defined in the type of —
  * `struct Foo { … } foo;` — or null for one written on its own, in a typedef or
- * in a member's type.
+ * in a member's type. Objective-C shares it (objc.ts).
  */
-function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
+export function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
   if (!isClassLikeDefinition(node)) return null;
   const parent = node.parent;
   return parent?.type === 'declaration' && getChildByField(parent, 'type')?.id === node.id ? parent : null;
@@ -60,9 +71,10 @@ function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
  * type of `static struct { … } SPT;` (only `SPT`), so the struct is indexed as
  * `SPT`, the way `typedef struct { … } Name;` is indexed as `Name`. Undefined
  * for a named type, and when the declaration declares no variable (a
- * function's return type). Mirrored in the kernel (ccpp/mod.rs).
+ * function's return type). Mirrored in the kernel (ccpp/mod.rs). Objective-C
+ * shares it (objc.ts), and has no kernel walker.
  */
-function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
+export function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
   if (getChildByField(node, 'name')) return undefined;
   const declaration = definingDeclaration(node);
   if (!declaration) return undefined;
@@ -217,6 +229,29 @@ function cppWrittenClassParts(node: SyntaxNode, source: string): string[] | unde
   return parts.length > 0 && parts.every((p) => /^[A-Za-z_]\w*$/.test(p)) ? parts : undefined;
 }
 
+/**
+ * The name a C++ `qualified_identifier` ends in, past its scopes: the
+ * `template_function` `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` for
+ * `WireFormatLite::ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>`. Null
+ * when the tree lacks one.
+ */
+function cppQualifiedIdName(qid: SyntaxNode): SyntaxNode | null {
+  let name: SyntaxNode | null = qid;
+  while (name?.type === 'qualified_identifier') name = getChildByField(name, 'name');
+  return name;
+}
+
+/**
+ * A C++ definition's name node, as named: an explicit specialization's
+ * (`template_function`) without its template arguments, so
+ * `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` is `ReadPrimitive`,
+ * the name every call to it writes. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppDefinedName(name: SyntaxNode, source: string): string {
+  const own = name.type === 'template_function' ? getChildByField(name, 'name') : null;
+  return getNodeText(own ?? name, source).trim();
+}
+
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
   const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
@@ -224,8 +259,26 @@ function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
+  const name = cppQualifiedIdName(qid);
+  if (name) return cppDefinedName(name, source);
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
   return parts[parts.length - 1];
+}
+
+/**
+ * The name of a C++ function an explicit specialization defines, without its
+ * template arguments: `Swap` for `template <> void Swap<Foo>(Foo& a, Foo& b)`.
+ * Undefined for any other definition. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppSpecializedFunctionName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  let declarator = getChildByField(node, 'declarator');
+  while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
+    declarator = getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+  }
+  if (declarator?.type !== 'function_declarator') return undefined;
+  const inner = getChildByField(declarator, 'declarator');
+  return inner?.type === 'template_function' ? cppDefinedName(inner, source) : undefined;
 }
 
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
@@ -233,15 +286,26 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  if (parts.length <= 1) return undefined;
+  // The scopes are what the qualified id writes before its name: a
+  // specialization's arguments (`ReadPrimitive<int32_t,
+  // WireFormatLite::TYPE_INT32>`) are no scope, though they may write `::`.
+  const name = cppQualifiedIdName(qid);
+  let scopes = getNodeText(qid, source).trim().split('::').filter(Boolean).slice(0, -1).join('::');
+  if (name) {
+    scopes = source.slice(qid.startIndex, name.startIndex).trimEnd();
+    // A `::` the parser supplied in recovery writes nothing: Metal's `vertex
+    // VertexOut vertexShader(…)` reads as `VertexOut::vertexShader`.
+    if (!scopes.endsWith('::')) return undefined;
+  }
+  const parts = scopes.split('::').filter(Boolean);
+  if (parts.length === 0) return undefined;
   // An out-of-line template method definition carries the class's template
   // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
   // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
   // matches it, the same normalization #1043 applies to base-class refs.
   // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
   // included) into qualified_name, which can exceed NAME_MAX (#1286).
-  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  const receiver = stripCppTemplateArgs(parts.join('::'));
   return receiver || undefined;
 }
 
@@ -378,13 +442,7 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  // A `const`/`static const` file-scope declaration carries a `type_qualifier`
-  // child reading "const" — extract those as `constant`, plain globals as
-  // `variable`.
-  isConst: (node) =>
-    node.namedChildren.some(
-      (c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const'
-    ),
+  isConst: isConstDeclaration,
   getReturnType: extractCppReturnType,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
@@ -1161,11 +1219,41 @@ export function blankCppAnnotationMacroCalls(source: string): string {
  *    string literal, or `;` continuation rejects the match. Comments in
  *    between are skipped: {fmt}'s `FMT_BEGIN_EXPORT` sits above `// A
  *    generic formatting context …` and then the class it opens.
- * Shared by C and C++ (the idiom is identical in both).
+ * Shared by C and C++ (the idiom is identical in both), and by Objective-C
+ * through OBJC_LONE_MACROS.
  */
 const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
 const LONE_MACRO_CONTINUATION_END_RE = /[=+\-*/%&|^<>?:,(\\]$/;
-export function blankLoneMacroLines(source: string): string {
+
+/** How a language's code reads around a macro alone on its line. */
+interface LoneMacroRules {
+  /** What the code after the macro may start with. */
+  nextCode: RegExp;
+  /** Whether a preprocessor directive above the macro ends at its own line. */
+  directivesEnd: boolean;
+  /** Whether a macro that is a body's only statement, between `{` and `}`, stays. */
+  keepsSoleStatement: boolean;
+}
+
+const C_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~]/, directivesEnd: false, keepsSoleStatement: false };
+
+/**
+ * Objective-C's: the code after the macro may be a directive, like the
+ * `@interface` below `NS_ASSUME_NONNULL_BEGIN` or the `@end` below
+ * `OF_SINGLETON_METHODS`. A preprocessor line above it continues nothing,
+ * even one that ends in `>`, like the `#import <Foundation/Foundation.h>`
+ * above most headers' `NS_ASSUME_NONNULL_BEGIN`. Blanking that macro but not
+ * another before the same `@interface` (`OF_SUBCLASSING_RESTRICTED`) left
+ * `OF_ASSUME_NONNULL_BEGIN @interface …`, which reads as a function.
+ *
+ * A macro that is a method's whole body, like ObjFW's `{
+ * OF_UNRECOGNIZED_SELECTOR }`, stays: the parser's error there stays inside
+ * that body, but blanking it changed how the parser recovered from an
+ * earlier misread, and OFMutableString.m lost 11 calls in the methods below.
+ */
+export const OBJC_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~@]/, directivesEnd: true, keepsSoleStatement: true };
+
+export function blankLoneMacroLines(source: string, rules: LoneMacroRules = C_LONE_MACROS): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{3,}[ \t]*\r?$/m.test(source)) return source;
   const lines = source.split('\n');
   const content = (l: string): string => l.replace(/\r$/, '').trim();
@@ -1186,9 +1274,11 @@ export function blankLoneMacroLines(source: string): string {
     // continues nothing either.
     const prevText = prev >= 0 ? content(lines[prev] as string) : '';
     const prevCode = /^(?:\/\/|\/\*|\*)/.test(prevText) ? '' : prevText.replace(/\/\*.*?\*\/|\/\/.*$/g, '').trim();
-    if (prevCode !== '' && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
+    const directiveEnds = rules.directivesEnd && prevCode.startsWith('#') && !prevCode.endsWith('\\');
+    if (prevCode !== '' && !directiveEnds && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
     const first = firstCodeCharAfter(lines, i + 1);
-    if (first !== undefined && !/[A-Za-z_#{}~]/.test(first)) continue;
+    if (first !== undefined && !rules.nextCode.test(first)) continue;
+    if (rules.keepsSoleStatement && prevCode.endsWith('{') && first === '}') continue;
     const start = line.indexOf(m[1] as string);
     lines[i] =
       line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
@@ -1553,9 +1643,51 @@ export function flattenMidStatementConditionals(source: string): string {
   return changed ? lines.join('\n') : source;
 }
 
+// Foundation's enum macros and their CoreFoundation forms, with an optional
+// `typedef` before them: `typedef NS_ENUM(NSInteger, SDImageCacheType)`.
+const FOUNDATION_ENUM_MACRO_RE =
+  /\b(?:(typedef)(\s+))?(NS_ENUM|NS_OPTIONS|NS_CLOSED_ENUM|NS_ERROR_ENUM|CF_ENUM|CF_OPTIONS|CF_CLOSED_ENUM)(\s*)\(([^(),]*),(\s*)([A-Za-z_]\w*)(\s*)\)/g;
+
+/**
+ * Rewrite a Foundation enum macro as the enum it declares, in place:
+ * `typedef NS_ENUM(NSInteger, SDImageCacheType) {` becomes
+ * `        enum               SDImageCacheType  {`. The parser reads the
+ * macro as a broken typedef, so the enum and every value in it were missing
+ * (SDWebImage had no enum at all). The `typedef`, the rest of the macro's
+ * name, its parentheses and its first argument (the underlying type, or an
+ * NS_ERROR_ENUM's domain) become spaces, so every offset stays. Matched on
+ * the code with comments, literals and directives masked: the `#define` of
+ * the macro itself is left alone. Shared by Objective-C, C and C++, whose
+ * headers all use the macros.
+ */
+export function rewriteFoundationEnumMacros(source: string): string {
+  if (!/\b(?:NS|CF)_[A-Z_]*(?:ENUM|OPTIONS)\s*\(/.test(source)) return source;
+  let out: string[] | null = null;
+  for (const m of maskCppCode(source).matchAll(FOUNDATION_ENUM_MACRO_RE)) {
+    out ??= source.split('');
+    const blank = (from: number, to: number): void => {
+      for (let k = from; k < to; k++) if (out![k] !== '\n' && out![k] !== '\r') out![k] = ' ';
+    };
+    let at = m.index;
+    if (m[1]) {
+      blank(at, at + m[1].length);
+      at += m[1].length + (m[2] as string).length;
+    }
+    const macro = m[3] as string;
+    out.splice(at, 4, 'e', 'n', 'u', 'm');
+    blank(at + 4, at + macro.length);
+    at += macro.length + (m[4] as string).length;
+    // `(`, the first argument and the `,`.
+    blank(at, at + 1 + (m[5] as string).length + 1);
+    at += 1 + (m[5] as string).length + 1 + (m[6] as string).length + (m[7] as string).length + (m[8] as string).length;
+    blank(at, at + 1); // `)`
+  }
+  return out ? out.join('') : source;
+}
+
 function preParseCppSource(source: string, filePath?: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = flattenMidStatementConditionals(rewriteCppAccessMacros(rawStrings.source));
+  source = flattenMidStatementConditionals(rewriteCppAccessMacros(rewriteFoundationEnumMacros(rawStrings.source)));
   // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
   // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
   // it matches (the _API token is already spaces by then). The C++ leading
@@ -2345,7 +2477,7 @@ export function blankCDesignatedMacroArgs(source: string): string {
 
 function preParseCSource(source: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = rawStrings.source;
+  source = rewriteFoundationEnumMacros(rawStrings.source);
   const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
@@ -2425,7 +2557,8 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   resolveName: (node, source) =>
-    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1),
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1) ??
+    cppSpecializedFunctionName(node, source),
   getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
   getClassScope: (node, source) => cppWrittenClassParts(node, source)?.slice(0, -1).join('::') || undefined,

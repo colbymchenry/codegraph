@@ -25,7 +25,7 @@ import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifie
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplTypeName } from './languages/rust';
-import { goAliasTypeNames, goEmbeddedTypeName } from './languages/go';
+import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -67,9 +67,10 @@ const REACT_COMPONENT_HOCS = new Set(['forwardRef', 'memo', 'React.forwardRef', 
  * inside a type literal (`type Handle = { stop(): void }`), whose members
  * `extractTypeAlias` already extracts and attaches to the alias (#359) — take
  * the fallback and the file gains a phantom top-level `function stop` beside
- * the real `Handle::stop`.
+ * the real `Handle::stop`. An abstract class's `abstract send(): void` is
+ * one too.
  */
-const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature']);
+const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature', 'abstract_method_signature']);
 
 /** Vue store collections whose object-literal members are the symbols an agent
  *  looks for. Extracted as function nodes so `actions`/`mutations`/`getters` are
@@ -455,6 +456,57 @@ const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_prope
 const SWIFT_TYPE_PATH_RECEIVER = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+$/;
 
 /**
+ * Swift wrappers that leave a call's target the same. tree-sitter-swift binds
+ * a prefix operator to the leftmost operand, so `!isReady()` parses as
+ * `(!isReady)()` and `!store.contains(x)` as `(!store).contains(x)`; and
+ * `try`/`await` before a chain bind to the part before its last call, so
+ * `try! A().b()` parses as `(try! A()).b()`. An implicit member's leading `.`
+ * (`.success(x)`) is part of the name, not a wrapper. Mirrored in the kernel's
+ * swift.rs.
+ */
+function isSwiftCallWrapper(node: SyntaxNode, source: string): boolean {
+  if (node.type === 'try_expression' || node.type === 'await_expression') return true;
+  return node.type === 'prefix_expression' && !getNodeText(node, source).startsWith('.');
+}
+
+/** The operand a {@link isSwiftCallWrapper} wraps. */
+function swiftWrappedOperand(node: SyntaxNode): SyntaxNode | null {
+  return getChildByField(node, node.type === 'prefix_expression' ? 'target' : 'expr');
+}
+
+/** Strip {@link isSwiftCallWrapper} wrappers off a Swift callee or receiver. */
+function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
+  let cur = node;
+  while (isSwiftCallWrapper(cur, source)) {
+    const inner = swiftWrappedOperand(cur);
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * A Swift receiver's text from its innermost wrapped operand on: the wrappers
+ * sit on the chain's left edge, so `!Settings.Defaults` reads
+ * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
+ */
+function swiftUnwrappedText(node: SyntaxNode, source: string): string {
+  let start = node.startIndex;
+  let cur: SyntaxNode | null = node;
+  while (cur) {
+    if (isSwiftCallWrapper(cur, source)) {
+      cur = swiftWrappedOperand(cur);
+      if (cur) start = cur.startIndex;
+    } else if (cur.type === 'navigation_expression' || cur.type === 'call_expression') {
+      cur = cur.namedChild(0);
+    } else {
+      break;
+    }
+  }
+  return source.substring(start, node.endIndex);
+}
+
+/**
  * Identifier-rooted member chains have no inferred property type (#1566),
  * including host API chains (#1707). Keep the existing `window.MyNamespace`
  * escape for project globals; call-result and `this` receivers have their own
@@ -540,7 +592,9 @@ export class TreeSitterExtractor {
       anchor,
       this.source,
       this.extractor?.docstringStepOverTypes,
-      this.extractor?.docstringSkipsTrailingComments
+      this.extractor?.docstringSkipsTrailingComments,
+      this.extractor?.docstringSkipsDetachedComments,
+      this.extractor?.docstringSkipsDirectives
     );
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
@@ -582,12 +636,16 @@ export class TreeSitterExtractor {
   private cppBraceScopes: CppBraceScopes | null = null;
   private cppClassScopes = new NestedIntervals<string>();
   private cppClassScopeIds = new Set<string>();
-  // C/C++: whether a class, struct, union or enum defined in the type of a
-  // declaration outside any body is walked (see visitNode). Not in a C++ file
-  // whose tree has errors and whose braces don't balance: error recovery can
-  // close a namespace or a class at the wrong `}`, or run a class past its
-  // own, and with no brace scopes to correct it the walked class would land
-  // in the wrong scope.
+  // C, C++ and Objective-C: whether a class, struct, union or enum defined in
+  // the type of a declaration outside any body is walked (see visitNode). Not
+  // in a C++ file whose tree has errors and whose braces don't balance: error
+  // recovery can close a namespace or a class at the wrong `}`, or run a class
+  // past its own, and with no brace scopes to correct it the walked class
+  // would land in the wrong scope. C and Objective-C files take the walk even
+  // with errors: neither grammar has a namespace or a class written as a type
+  // (an @interface or @implementation is not one), and a struct, union or
+  // enum body holds fields and enumerators, not functions. Most Objective-C
+  // trees have errors; a macro such as `NS_ASSUME_NONNULL_BEGIN` is enough.
   private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
@@ -690,6 +748,7 @@ export class TreeSitterExtractor {
       }
       this.walkDeclaredTypes =
         this.language === 'c' ||
+        this.language === 'objc' ||
         (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
@@ -1456,18 +1515,24 @@ export class TreeSitterExtractor {
     // languages) keep almost exclusively inside a class/module. A Ruby `CONST =
     // …` has a `constant`-typed LHS; other languages don't put one here, so this
     // is effectively Ruby-only and doesn't disturb their class-internal locals.
+    // An Objective-C declaration written in an `@implementation`
+    // (`static NSString *const kKey = @"…";`) is file-scope C, though it sits
+    // between `@implementation` and `@end`.
     else if (
       this.extractor.variableTypes.includes(nodeType) &&
-      (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
+      (!this.isInsideClassLikeNode() ||
+        this.isClassScopeConstantAssignment(node) ||
+        (this.language === 'objc' && node.parent?.type === 'implementation_definition'))
     ) {
-      // C/C++: a class, struct, union or enum defined in the declaration's
-      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
-      // definition like one written on its own, and the variables keep their
-      // nodes beside it. So is a class the tree reads as a declaration's type
-      // in a file walked in brace scopes (`class X {…}` glued to the tokens
-      // after it by error recovery). In a class or function body the children
-      // walk reaches it; here, this branch skips that walk. Mirrored in the
-      // kernel (ccpp/mod.rs visit_node).
+      // C, C++ and Objective-C: a class, struct, union or enum defined in the
+      // declaration's type (`struct Foo { … } foo;`, `static struct { … }
+      // SPT;`) is a definition like one written on its own, and the variables
+      // keep their nodes beside it. So is a class the tree reads as a
+      // declaration's type in a file walked in brace scopes (`class X {…}`
+      // glued to the tokens after it by error recovery). In a class or
+      // function body the children walk reaches it; here, this branch skips
+      // that walk. Mirrored in the kernel (ccpp/mod.rs visit_node), which has
+      // no Objective-C walker.
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
@@ -3555,10 +3620,12 @@ export class TreeSitterExtractor {
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
-      // These can have multiple identifiers on the left
-      const specs = node.namedChildren.filter(c =>
-        c.type === 'var_spec' || c.type === 'const_spec'
-      );
+      // These can have multiple identifiers on the left. A `var ( … )` group
+      // wraps its specs in a `var_spec_list`; a `const ( … )` group holds them
+      // directly.
+      const specs = node.namedChildren
+        .flatMap((c) => (c.type === 'var_spec_list' ? c.namedChildren : [c]))
+        .filter((c) => c.type === 'var_spec' || c.type === 'const_spec');
 
       for (const spec of specs) {
         const nameNode = spec.namedChild(0);
@@ -3569,8 +3636,10 @@ export class TreeSitterExtractor {
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
+          // A member of a `const ( … )` or `var ( … )` group has its own doc
+          // comment beside it in the parentheses; one without keeps the group's.
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
-            docstring,
+            docstring: this.docstringFor(spec) ?? docstring,
             signature: initSignature,
           });
         }
@@ -3645,8 +3714,8 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, target.name, nameNode, { docstring, signature: initSignature, isExported });
       });
-    } else if (this.language === 'c') {
-      // C: a `declaration` node's name nests inside the `declarator` field —
+    } else if (this.language === 'c' || this.language === 'objc') {
+      // C and Objective-C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
       // value); a `function_declarator` is a prototype, not a variable. The
       // generic fallback below only finds a *direct* identifier child, which C
@@ -3669,11 +3738,15 @@ export class TreeSitterExtractor {
           // a spurious type-named global for every macro-prefixed prototype in a
           // header. Those misparses are always bare identifiers; real
           // consts/tables always carry an initializer. The only legit loss is
-          // uninitialized scalar globals (`static int g;`).
+          // uninitialized scalar globals (`static int g;`). Objective-C keeps
+          // them, as it did before it shared this branch: until then it read
+          // nothing but bare identifiers, and missed every
+          // `NSString *const kKey = @"…";`.
           if (
             child.type !== 'init_declarator' &&
             child.type !== 'pointer_declarator' &&
-            child.type !== 'array_declarator'
+            child.type !== 'array_declarator' &&
+            !(this.language === 'objc' && child.type === 'identifier')
           ) {
             continue;
           }
@@ -3845,6 +3918,20 @@ export class TreeSitterExtractor {
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, aggregateNode.id);
+        // A Go struct references the types its fields are declared with, as
+        // the struct: Go fields mint no nodes, and impact never climbs from a
+        // member to its container (Dart's fields are the same, #2327).
+        if (this.language === 'go') {
+          for (const type of goStructFieldTypeNames(node, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: aggregateNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
@@ -3894,7 +3981,7 @@ export class TreeSitterExtractor {
       // impl-navigation can see the contract. Go has no `implements` keyword, so
       // without the interface's method set there's nothing to match against.
       if (this.language === 'go' && typeChild) {
-        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id, node);
       }
       return true;
     }
@@ -3902,6 +3989,9 @@ export class TreeSitterExtractor {
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
+      // A Rust alias is private to its module unless `pub` (any form): the
+      // resolver keeps a private one to its own module (isRustNameInScope).
+      ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
@@ -3944,8 +4034,11 @@ export class TreeSitterExtractor {
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
    * are `type_elem`s, not methods, and are left to inheritance extraction.
+   * Each method references the types its signature names, as a function does
+   * (`decl` declares the interface): a call through the interface reaches the
+   * method, so impact on a type reaches its callers.
    */
-  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string, decl: SyntaxNode): void {
     this.nodeStack.push(ifaceId);
     for (let i = 0; i < interfaceType.namedChildCount; i++) {
       const m = interfaceType.namedChild(i);
@@ -3954,9 +4047,20 @@ export class TreeSitterExtractor {
       if (!nameNode) continue;
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
-        this.createNode('method', mname, m, {
+        const methodNode = this.createNode('method', mname, m, {
           signature: this.extractor?.getSignature?.(m, this.source),
         });
+        if (methodNode) {
+          for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: methodNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
     }
     this.nodeStack.pop();
@@ -5312,7 +5416,17 @@ export class TreeSitterExtractor {
         }
       }
     } else {
-      const func = getChildByField(node, 'function') || node.namedChild(0);
+      let func = getChildByField(node, 'function') || node.namedChild(0);
+
+      if (func && this.language === 'swift') {
+        // `-(a + b)`: an operator token applied to a parenthesized value
+        // leaves the call with no callee node, only its arguments — which
+        // must not be read as a callee name. (`!(x)` keeps its `bang` callee:
+        // a project may declare a `prefix func !` for its own types.)
+        // Mirrored in the kernel's extract_call (swift.rs).
+        if (func.type === 'call_suffix') return;
+        func = peelSwiftCallWrappers(func, this.source);
+      }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the
@@ -5392,10 +5506,13 @@ export class TreeSitterExtractor {
             // TS/JS: look through wrappers that keep the receiver the same
             // object (`(x).m()`, `x!.m()`, `(x as T).m()`, `(await f()).m()`),
             // so the branches below see the identifier / call / chain the
-            // call is really made on.
+            // call is really made on. Swift: through a prefix operator, `try`
+            // and `await` (`(!store).contains(x)`, `(try! A()).b()`).
             const receiver = rawReceiver && TS_JS_CHAIN_LANGUAGES.has(this.language)
               ? peelTsJsReceiver(rawReceiver)
-              : rawReceiver;
+              : rawReceiver && this.language === 'swift'
+                ? peelSwiftCallWrappers(rawReceiver, this.source)
+                : rawReceiver;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -5471,7 +5588,12 @@ export class TreeSitterExtractor {
                 // call_expression's first named child (a navigation_expression
                 // `Foo.getInstance`, or a bare identifier for a free/constructor call).
                 const innerNav = receiver.namedChild(0);
-                innerCallee = innerNav ? getNodeText(innerNav, this.source).replace(/\s+/g, '') : '';
+                // Swift: without a `try`/`await`/prefix operator on its left
+                // edge (`try! Foo.make().bar().baz()`).
+                const innerText = !innerNav ? ''
+                  : this.language === 'swift' ? swiftUnwrappedText(innerNav, this.source)
+                  : getNodeText(innerNav, this.source);
+                innerCallee = innerText.replace(/\s+/g, '');
                 // Only re-encode a CLASS / companion-factory / constructor chain,
                 // whose receiver chain starts with a capitalized type
                 // (`Foo.getInstance().bar()`, `Foo().bar()`). An instance chain
@@ -5506,7 +5628,7 @@ export class TreeSitterExtractor {
               this.language === 'swift' &&
               receiver &&
               receiver.type === 'navigation_expression' &&
-              SWIFT_TYPE_PATH_RECEIVER.test(getNodeText(receiver, this.source).replace(/\s+/g, ''))
+              SWIFT_TYPE_PATH_RECEIVER.test(swiftUnwrappedText(receiver, this.source).replace(/\s+/g, ''))
             ) {
               // Swift call through a type path — `API.PackageController.GetRoute.query(on:)`,
               // on one line or split before the `.query`. Keep the path: the
@@ -5514,9 +5636,11 @@ export class TreeSitterExtractor {
               // type's `query` came first (every route in a Vapor app has one).
               // The resolver finds the member on the type the path names, or
               // leaves the call unresolved. An instance chain (`self.store.load()`,
-              // `viewModel.state.reset()`) is not a type path and stays bare.
-              // Mirrored in the kernel's extract_call (swift.rs).
-              calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+              // `viewModel.state.reset()`) is not a type path and stays bare. A
+              // prefix operator on the path's head is not part of it
+              // (`!Settings.Defaults.isOn()`). Mirrored in the kernel's
+              // extract_call (swift.rs).
+              calleeName = `${swiftUnwrappedText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
             } else if (
               this.language === 'cfscript' &&
               receiver &&
@@ -6000,12 +6124,15 @@ export class TreeSitterExtractor {
     // The receiver must be a SIMPLE capitalized identifier — `Type.X`, not the
     // nested `a.B.c` (whose own head member-access is visited separately) nor a
     // lowercase `obj.field` / `pkg.func`.
-    const recv =
+    const rawRecv =
       getChildByField(node, 'object') ??
       getChildByField(node, 'expression') ??
       getChildByField(node, 'scope') ??
       node.namedChild(0);
-    if (!recv) return;
+    if (!rawRecv) return;
+    // Swift binds a prefix operator to the head: `!Config.shared.isOn` is
+    // `(!Config).shared.isOn`. Mirrored in the kernel (swift.rs).
+    const recv = this.language === 'swift' ? peelSwiftCallWrappers(rawRecv, this.source) : rawRecv;
     const t = recv.type;
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
