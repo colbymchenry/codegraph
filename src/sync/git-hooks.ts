@@ -229,6 +229,13 @@ export function installGitSyncHook(
   projectRoot: string,
   hooks: GitHookName[] = DEFAULT_SYNC_HOOKS,
 ): GitHookResult {
+  // The block names its root on a comment line; a line break in the path
+  // would end that comment and run the rest of the path as a command.
+  const root = rootKey(projectRoot);
+  if (/[\r\n]/.test(root)) {
+    return { installed: [], hooksDir: null, skipped: 'the project path contains a line break' };
+  }
+
   const hooksDir = gitHooksDir(projectRoot);
   if (!hooksDir) {
     return { installed: [], hooksDir: null, skipped: 'not a git repository' };
@@ -240,7 +247,7 @@ export function installGitSyncHook(
     return { installed: [], hooksDir, skipped: 'could not access the git hooks directory' };
   }
 
-  const block = markerBlock(rootKey(projectRoot));
+  const block = markerBlock(root);
   const owns = ownerFor(projectRoot);
   const installed: GitHookName[] = [];
   const unsupported: GitHookName[] = [];

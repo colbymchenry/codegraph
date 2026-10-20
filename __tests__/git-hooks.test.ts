@@ -251,6 +251,14 @@ describe('git sync hooks — project roots and existing hooks', () => {
     expect(isSyncHookInstalled(repo, ['post-commit'])).toBe(false);
   });
 
+  it('installs nothing for a project path with a line break, which would end the root comment', () => {
+    const result = installGitSyncHook(path.join(repo, 'app\ntouch pwned'), ['post-commit']);
+
+    expect(result.installed).toEqual([]);
+    expect(result.skipped).toBe('the project path contains a line break');
+    expect(fs.existsSync(hookFile())).toBe(false);
+  });
+
   it.runIf(process.platform !== 'win32')('still syncs when the existing shell hook ends with exit', () => {
     fs.writeFileSync(hookFile(), '#!/bin/sh\necho "my hook"\nexit 0\n', { mode: 0o755 });
 
