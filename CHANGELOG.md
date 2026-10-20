@@ -21,6 +21,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Haskell and DAML, a function written with guards (`| n < 0 = … | otherwise = …`) now links the calls of every guard. Before, only the first guard's calls were linked, so a function like `addBusinessDays` looked as if it called nothing it reaches through its later guards.
 - Indexing a Scala project with an overloaded operator method, such as `++`, no longer stops resolving references part way, which left most of a large project like Canton unlinked.
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
