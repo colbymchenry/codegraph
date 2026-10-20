@@ -4,8 +4,8 @@
  * `invocation_page/index.ts`, whose `export * from './invocation_page'`
  * forwards the `Component` that `invocation_page.tsx` declares. The route
  * renders that component; before, the barrel was read for an export of its
- * own, found none, and the route linked nothing. (The fixture's folder is
- * `builds/`: a `build/` folder is skipped as build output.)
+ * own, found none, and the route linked nothing. (milo's own folder is
+ * `src/build/`; src-build-folders.test.ts covers routes into it.)
  */
 import { describe, it, expect, afterAll, afterEach, beforeAll } from 'vitest';
 import * as fs from 'fs';
