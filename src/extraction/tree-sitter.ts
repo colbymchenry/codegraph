@@ -213,6 +213,24 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
 }
 
 /**
+ * The type a Java or TypeScript supertype clause names, without its type
+ * arguments: `Store` for `implements Store<String>`, `a.Base` for `extends
+ * a.Base<Integer>`, `ns.Other` for TypeScript's `implements ns.Other<number>`.
+ * The grammars wrap a parameterized supertype in a `generic_type` whose first
+ * child is the name; the index holds the interface or class under that name,
+ * so the full text (`Store<String>`) matched nothing and a class implementing
+ * a generic interface had no `implements` edge, nor the interface-impl links
+ * that follow from it. Any other node is its own text, as before.
+ */
+function supertypeName(node: SyntaxNode, source: string): string {
+  if (node.type === 'generic_type') {
+    const named = node.namedChildren.find((c: SyntaxNode) => c.type !== 'type_arguments');
+    if (named) return getNodeText(named, source);
+  }
+  return getNodeText(node, source);
+}
+
+/**
  * Resolve a Scala type node to its base type NAME for name-matching — unwrapping
  * `generic_type` (`Monoid[Int]` → `Monoid`), taking the last segment of a
  * qualified `stable_type_identifier` (`cats.Functor` → `Functor`), and falling
@@ -7484,7 +7502,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
         for (const target of targets) {
           if (target) {
-            const name = getNodeText(target, this.source);
+            const name = supertypeName(target, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -7551,7 +7569,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : child.namedChildren;
         for (const iface of targets) {
           if (iface) {
-            const name = getNodeText(iface, this.source);
+            const name = supertypeName(iface, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
