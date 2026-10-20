@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Cangjie** (仓颉, `.cj`), the HarmonyOS application language: functions, classes, structs, interfaces, enums, `extend` blocks, properties, fields and type aliases, with call, import and inheritance edges. Imports resolve through each file's `package` (organization-qualified `org::pkg` names included), and a call through an interface reaches every class that implements it, so `codegraph_explore` can follow a Cangjie flow end to end.
+- Cangjie apps built with ArkUI are understood as UI code: annotations like `@Component`, `@State` and `@Builder` are recorded on symbols, a method that changes `@State` data is linked to the component's `build()`, and chained view attributes such as `.width(100)` or `.fontSize(16)` only ever link to your own `@Builder` helpers instead of unrelated methods that share the name.
+- A Cangjie `foreign func` now links to the C function that implements it, so a flow that goes through FFI (for example a TLS handshake into its native code) can be followed from the Cangjie call all the way into C.
+
 ### Fixes
 
 - In JavaScript and TypeScript, a call written as the body of an `if`, `while`, `for` or `do` without braces, like `if (e.key === "Escape") setOpen(false);`, no longer links to a same-named property or method in another file when the name is the file's own, such as a `setOpen` from `useState` (#2585).

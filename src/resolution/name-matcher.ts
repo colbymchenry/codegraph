@@ -5573,6 +5573,7 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'csharp': return CSHARP_STD_METHODS;
     case 'vbnet': return VBNET_STD_METHODS;
     case 'dart': return DART_STD_METHODS;
+    case 'cangjie': return CANGJIE_STD_METHODS;
     default: return null;
   }
 }
@@ -5581,6 +5582,24 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
 export function isStdMethodName(language: string, name: string): boolean {
   return stdMethodNames(language)?.has(language === 'vbnet' ? name.toLowerCase() : name) ?? false;
 }
+
+/**
+ * Methods of Cangjie's String, Array/ArrayList, HashMap/HashSet, Iterator,
+ * Option, the atomics and Future — what `list.add(x)`, `iter.next()`,
+ * `opt.getOrThrow()` on an untyped receiver almost always call.
+ */
+const CANGJIE_STD_METHODS: ReadonlySet<string> = new Set([
+  'add', 'addAll', 'append', 'appendAll', 'prepend', 'prependAll', 'insert', 'insertAll', 'remove', 'removeAll',
+  'removeIf', 'removeFirst', 'removeLast', 'clear', 'contains', 'containsAll', 'get', 'set', 'put', 'putAll',
+  'getOrThrow', 'getOrDefault', 'isSome', 'isNone', 'isEmpty', 'iterator', 'next', 'toArray', 'toString',
+  'hashCode', 'clone', 'reserve', 'capacity', 'slice', 'reverse', 'sort', 'sortBy', 'sortDescending', 'keys',
+  'values', 'entryView', 'retain', 'first', 'last', 'map', 'filter', 'forEach', 'reduce', 'fold', 'flatMap',
+  'enumerate', 'zip', 'skip', 'limit', 'count', 'any', 'all', 'none', 'collect', 'concat', 'join', 'split',
+  'trim', 'trimStart', 'trimEnd', 'trimAscii', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'replace',
+  'toLower', 'toUpper', 'toAsciiLower', 'toAsciiUpper', 'toRuneArray', 'lines', 'runes', 'isAsciiBlank',
+  'compare', 'load', 'store', 'swap', 'compareAndSwap', 'fetchAdd', 'fetchSub', 'lock', 'unlock', 'tryLock',
+  'notify', 'notifyAll', 'waitUntil', 'cancel', 'tryGet', 'unsafeBytes', 'toUtf8Array', 'parse', 'tryParse',
+]);
 
 /** Methods of Dart's String, List, Iterable, Map and Set — names a project type rarely carries itself. */
 const DART_STD_METHODS: ReadonlySet<string> = new Set([
@@ -13579,7 +13598,7 @@ export function matchScopedCallChain(
  * a `TFoo(x)` is a TYPECAST whose result is a `TFoo`, so `TFoo(x).method()` resolves
  * the method on `TFoo` — same shape, same validation.
  */
-const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart', 'pascal']);
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart', 'pascal', 'cangjie']);
 
 /**
  * Resolve a dotted chained call whose receiver is a static factory / fluent call —
@@ -13603,8 +13622,9 @@ export function matchDottedCallChain(
 
   if (lastDot <= 0) {
     // Go: bare package-level factory FUNCTION `New().method()` — the receiver's
-    // type is what `New` returns; resolve the method on that.
-    if (ref.language === 'go') {
+    // type is what `New` returns; resolve the method on that. Cangjie's
+    // singleton accessors read the same way: `getAuthService().sendCode(…)`.
+    if (ref.language === 'go' || (ref.language === 'cangjie' && /^[a-z_]/.test(inner))) {
       const ret = lookupCalleeReturnType(inner, ref, context);
       if (ret) {
         return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
@@ -14142,6 +14162,11 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         new RegExp(`\\b(?:let|var)\\s+${r}\\b\\s*=\\s*(?:try[!?]\\s*|(?:try|await)\\s+)+([A-Z][\\w.]*)\\s*${TYPE_ARGS}${SWIFT_UNCHAINED_CALL}`),
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // let lg: Logger  / param
       ];
+    case 'cangjie':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\s*\\(`), // let list = ArrayList<T>(...)
+        new RegExp(`\\b${r}\\b\\s*:\\s*\\?*([A-Z][\\w.]*)`), // let lg: ?Logger  / param
+      ];
     case 'rust':
       return [
         new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\b(?:\\s*:[^=]+)?=\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg = Logger::new()/Logger{}/Logger
@@ -14256,7 +14281,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
 }
 
 /** Languages whose fields and properties declare their type where the class declares them. */
-const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift']);
+const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift', 'cangjie']);
 const MEMBER_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'record']);
 const MEMBER_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, string | null>>();
 /** Words that can stand where a declaration's type does without being one. */
@@ -14533,8 +14558,8 @@ function classMemberType(cls: Node, name: string, context: ResolutionContext): s
   const key = `${cls.id}|${name}`;
   if (memo.has(key)) return memo.get(key)!;
   const r = name.replace(/\$/g, '\\$');
-  const pattern = cls.language === 'kotlin' || cls.language === 'swift'
-    ? new RegExp(`\\b(?:val|var|let)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
+  const pattern = cls.language === 'kotlin' || cls.language === 'swift' || cls.language === 'cangjie'
+    ? new RegExp(`\\b(?:val|var|let)\\s+${r}\\s*:\\s*\\??([A-Z][\\w.]*)`)
     : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
   let found: string | null = null;
   for (const { text, depth } of classMemberLines(cls, context)) {
@@ -14635,6 +14660,40 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
     }
   }
   return start;
+}
+
+/**
+ * The type of a Cangjie local bound from a call — `let svc = getAuthService()`,
+ * `let stream = context.createStream(socket)`, `let c = Conf.load()` — read
+ * off the called function's or method's declared return type. Scanned
+ * backwards from the call within its enclosing scope. A method is matched by
+ * name: every project method of that name must declare the same return type,
+ * else null (so does an unknown callee or a callee returning nothing nameable).
+ */
+function cangjieFactoryLocalType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!/^[A-Za-z_]\w*$/.test(receiver)) return null;
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines) return null;
+  const re = new RegExp(`\\b(?:let|var)\\s+${receiver}\\s*=\\s*(?:([\\w.]+)\\.)?([A-Za-z_]\\w*)\\s*(?:<[^=;()]*>)?\\s*\\(`);
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const m = lines[i]?.match(re);
+    if (!m) continue;
+    const viaReceiver = m[1] !== undefined;
+    const callee = m[2]!;
+    // `Foo(…)` constructs a Foo — the local-pattern scan already typed that.
+    if (!viaReceiver && /^[A-Z]/.test(callee)) return null;
+    const returns = new Set(
+      context.getNodesByName(callee)
+        .filter((n) => n.language === 'cangjie' && n.returnType &&
+          (viaReceiver ? n.kind === 'method' || n.kind === 'function' : n.kind === 'function'))
+        .map((n) => n.returnType!),
+    );
+    return returns.size === 1 ? [...returns][0]! : null;
+  }
+  return null;
 }
 
 /**
@@ -15247,6 +15306,9 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // A Cangjie local bound from a call (`let svc = getAuthService()`,
+    // `let s = ctx.createStream(x)`) has the type the callee declares it returns.
+    if (!inferredType && ref.language === 'cangjie' && dotMatch) inferredType = cangjieFactoryLocalType(objectOrClass!, ref, context);
     // A Go parameter named like an import is declared through a package as
     // often as not (`logger logger.Interface`), which the patterns above
     // don't read; the scope reader kept its type. Not a field's: in
@@ -18844,14 +18906,16 @@ function matchReferenceInner(
   // same-named properties thousands of false callers. Ambiguity rule matches
   // the rest of the file: several same-named helpers → prefer the call-site
   // file, still ambiguous → drop the ref rather than guess.
-  if (ref.language === 'arkts' && ref.referenceName.startsWith('.')) {
+  // Cangjie's ArkUI view code chains attributes the same way (`Text("x")
+  // .fontSize(16)`); its `@Builder` helpers may also be component members.
+  if ((ref.language === 'arkts' || ref.language === 'cangjie') && ref.referenceName.startsWith('.')) {
     const base = ref.referenceName.slice(1);
     const candidates = context
       .getNodesByName(base)
       .filter(
         (n) =>
-          n.language === 'arkts' &&
-          n.kind === 'function' &&
+          n.language === ref.language &&
+          (n.kind === 'function' || (ref.language === 'cangjie' && n.kind === 'method')) &&
           (n.decorators ?? []).some((d) => ARKUI_ATTRIBUTE_DECORATORS.has(d))
       );
     const chosen =

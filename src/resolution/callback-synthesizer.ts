@@ -544,6 +544,100 @@ async function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContex
   return edges;
 }
 
+/**
+ * ArkUI-in-Cangjie state → build: HarmonyOS apps written in Cangjie use the
+ * same declarative model — an `@Component class` with `@State`/`@Link`/…
+ * member variables and a `build()`. Same precision line as the ArkTS pass: the
+ * class must carry a component annotation, own `build()` and at least one
+ * reactive member, and a sibling method links only when its body ASSIGNS (or
+ * mutates through a collection method) one of those members. Cangjie reads a
+ * member without `this.`, so the bare name counts too — but never a
+ * `let`/`var` declaring a local of that name, nor `other.name`.
+ */
+const CANGJIE_COMPONENT_ANNOTATIONS = new Set([
+  'Component', 'ComponentV2', 'Entry', 'CustomDialog', 'Reusable', 'HybridComponentEntry',
+]);
+const CANGJIE_COLLECTION_MUTATORS = 'append|appendAll|add|addAll|remove|removeAt|removeIf|insert|insertAll|prepend|clear|set';
+
+async function cangjieStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned = 0;
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const kind of ['class', 'struct'] as const) {
+    for (const comp of queries.iterateNodesByKindIn(kind, ['cangjie'])) {
+      if ((++scanned & 63) === 0) await onYield();
+      if (!(comp.decorators ?? []).some((d) => CANGJIE_COMPONENT_ANNOTATIONS.has(d))) continue;
+      const children = queries.getOutgoingEdges(comp.id, ['contains'])
+        .map((e) => queries.getNodeById(e.target))
+        .filter((n): n is Node => !!n);
+      const build = children.find((n) => n.kind === 'method' && n.name === 'build');
+      if (!build) continue;
+      const reactive = children.filter(
+        (n) => (n.kind === 'field' || n.kind === 'property') &&
+          (n.decorators ?? []).some((d) => ARKUI_REACTIVE_DECORATORS.has(d))
+      );
+      if (reactive.length === 0) continue;
+      const names = reactive.map((p) => p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+      const mutationRe = new RegExp(
+        `(?<![\\w.])(?<!\\b(?:let|var)\\s+)(?:this\\.)?(?:${names})\\s*` +
+        `(?:=(?!=)|\\+\\+|--|[+\\-*/%&|^]=|\\.(?:${CANGJIE_COLLECTION_MUTATORS})\\s*\\()`
+      );
+      let added = 0;
+      for (const m of children) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        if (m.kind !== 'method' || m.id === build.id) continue;
+        const content = ctx.readFile(m.filePath);
+        const src = content && sliceLines(content, m.startLine, m.endLine);
+        // Past the declaration line: a parameter named like the member is not it.
+        const body = src ? src.slice(src.indexOf('{') + 1) : '';
+        if (!body || !mutationRe.test(stripCommentsForRegex(body, 'typescript'))) continue;
+        const key = `${m.id}>${build.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: m.id, target: build.id, kind: 'calls', line: m.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'arkui-state', via: 'state assignment', registeredAt: `${build.filePath}:${build.startLine}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Cangjie FFI: a `foreign func CJ_TLS_SslHandshake(…)` declares a C function
+ * the Cangjie side calls through `unsafe { … }`. Calls resolve to that
+ * declaration, which has no body — the flow continues in the C function of the
+ * same name (`int CJ_TLS_SslHandshake(…) { … }`), which nothing linked. Bridge
+ * each foreign declaration to the C/C++ definitions bearing its exact name:
+ * the C ABI has no overloading or namespaces, so the name IS the symbol.
+ * Definitions in source files win over prototypes in headers; a name defined
+ * per platform (`_unix.c` / `_windows.c`) links each, capped.
+ */
+const CANGJIE_FFI_MAX_TARGETS = 4;
+
+async function cangjieForeignEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned = 0;
+  const edges: Edge[] = [];
+  for (const decl of queries.iterateNodesByKindIn('function', ['cangjie'])) {
+    if ((++scanned & 255) === 0) await onYield();
+    if (!(decl.decorators ?? []).includes('foreign')) continue;
+    const natives = queries.getNodesByName(decl.name)
+      .filter((n) => (n.language === 'c' || n.language === 'cpp') && n.kind === 'function');
+    const defined = natives.filter((n) => !/\.(?:h|hh|hpp|hxx)$/i.test(n.filePath));
+    for (const target of (defined.length > 0 ? defined : natives).slice(0, CANGJIE_FFI_MAX_TARGETS)) {
+      edges.push({
+        source: decl.id, target: target.id, kind: 'calls', line: decl.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'cangjie-ffi', via: decl.name, registeredAt: `${decl.filePath}:${decl.startLine}` },
+      });
+    }
+  }
+  return edges;
+}
+
 /** Emit/subscribe call sites of HarmonyOS's `@ohos.events.emitter` bus. */
 const ARKUI_EMITTER_CALL_RE = /\bemitter\s*\.\s*(emit|on|once)\s*\(\s*([A-Za-z_$][\w$.]*|\{[^)]{0,120}?\beventId\s*:\s*[^,}]+[^)]*?\})/g;
 
@@ -811,7 +905,7 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
-  'arkts',
+  'arkts', 'cangjie',
 ]);
 /**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
@@ -4831,12 +4925,14 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
   { name: 'flutterEdges', gate: (has) => has('dart'), run: (q, c, y) => flutterBuildEdges(q, c, y) },
   { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
+  { name: 'cangjieStateEdges', gate: (has) => has('cangjie'), run: (q, c, y) => cangjieStateBuildEdges(q, c, y) },
+  { name: 'cangjieFfiEdges', gate: (has) => has('cangjie') && has('c', 'cpp'), run: (q, _c, y) => cangjieForeignEdges(q, y) },
   { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
   { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
   { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppOverrideEdges(q, c, y) },
   {
     name: 'ifaceEdges',
-    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', 'cangjie', ...JS_FAMILY),
     run: (q, _c, y) => interfaceOverrideEdges(q, y),
   },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },

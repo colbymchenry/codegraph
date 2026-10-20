@@ -73,6 +73,8 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       return hop(`runs ${quoted(m.field, 'a collection')} handlers`);
     case 'fn-pointer-dispatch':
       return hop(`fn-pointer ${m.via ? String(m.via) : ''}`);
+    case 'cangjie-ffi':
+      return hop('foreign → C implementation');
     case 'goframe-route':
       return hop(`GoFrame route ${m.route ? String(m.route) : ''}`);
     default:
