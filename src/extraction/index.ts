@@ -268,6 +268,17 @@ const ANDROID_RES_TYPES: readonly string[] = [
   'menu', 'mipmap', 'navigation', 'transition', 'values', 'xml',
 ];
 
+/**
+ * `build` is also a legal JVM package segment: directories named `build` under
+ * a conventional source root (any source set: main, test, androidTest, ...) are
+ * packages, not module/build output (#1642).
+ */
+const JVM_BUILD_PACKAGE_DIRS: readonly string[] = [
+  '**/src/*/java/**/build/',
+  '**/src/*/kotlin/**/build/',
+  '**/src/*/scala/**/build/',
+];
+
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
 const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
@@ -276,14 +287,93 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
-  // `build` is also a legal JVM package segment. Keep it under conventional
-  // source roots (any source set: main, test, androidTest, ...) while continuing
-  // to exclude module/build output (#1642). Unignore only the directory, not its
-  // subtree: other defaults still apply.
-  '!**/src/*/java/**/build/',
-  '!**/src/*/kotlin/**/build/',
-  '!**/src/*/scala/**/build/',
+  // Keep JVM packages named `build` (#1642). Unignore only the directory, not
+  // its subtree: other defaults still apply.
+  ...JVM_BUILD_PACKAGE_DIRS.map((d) => `!${d}`),
+  // Walk a `build` folder below `src/` too: a project can keep a whole
+  // feature or module there. Only its hand-written source files are indexed
+  // — see buildOutputFolderUnderSrc. Other defaults still apply inside it.
+  '!**/src/**/build/',
 ];
+
+/**
+ * Source files no compiler or bundler writes into a build folder: TypeScript
+ * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
+ * components, whose builds emit JavaScript, declarations, CSS, HTML and
+ * source maps instead; and Go, C# and Rust, whose toolchains write elsewhere
+ * (Go's binaries, .NET's `bin/` and `obj/`, Cargo's `target/`). Python, C and
+ * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
+ * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
+ */
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
+/** TypeScript declarations, which `tsc` writes beside its JavaScript. */
+const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
+/** Matches the JVM packages named `build`, whose whole subtree stays indexed. */
+const jvmBuildPackages = ignore().add(JVM_BUILD_PACKAGE_DIRS);
+
+/**
+ * The `build` folder below a `src/` folder that file `rel` sits in, with a
+ * trailing slash (`src/build/` for `src/build/legacy/page.tsx`), or null. A JVM
+ * package named `build` (#1642) does not count.
+ */
+function srcBuildFolderOf(rel: string): string | null {
+  if (!/(?:^|\/)build\//i.test(rel)) return null;
+  const parts = rel.split('/');
+  let inSrc = false;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]!.toLowerCase();
+    if (part === 'src') {
+      inSrc = true;
+    } else if (part === 'build' && inSrc) {
+      const folder = parts.slice(0, i + 1).join('/') + '/';
+      return jvmBuildPackages.ignores(folder) ? null : folder;
+    }
+  }
+  return null;
+}
+
+/**
+ * When `rel` is a file in a `build` folder below `src/` that a build step could
+ * have written, that folder (see {@link srcBuildFolderOf}); otherwise null.
+ *
+ * The folder itself is walked: projects keep real source there (luci-go
+ * milo's whole `src/build/` feature, Go's `src/go/build`, a .NET solution's
+ * `src/Build/` project). But an output tree built or copied into `src/` — a
+ * nested CRA app's `build/`, a vendored pdf.js, a Laravel `public/build` —
+ * holds JavaScript, CSS, HTML and maps, never {@link HAND_WRITTEN_SOURCE}, so
+ * only those hand-written types are indexed from it. Paths
+ * without an extension are left alone: they are directories (a watcher event
+ * for a removed folder carries no trailing slash), never files a build writes.
+ */
+function buildOutputFolderUnderSrc(rel: string): string | null {
+  const name = rel.slice(rel.lastIndexOf('/') + 1);
+  if (!name.includes('.')) return null;
+  if (HAND_WRITTEN_SOURCE.test(name) && !DECLARATION_FILE.test(name)) return null;
+  return srcBuildFolderOf(rel);
+}
+
+/**
+ * `ig` with {@link buildOutputFolderUnderSrc} applied on top of its patterns,
+ * for every caller of the defaults alike. `projectRules` are the project's own
+ * root ignore rules: a file they re-include by name, or whose folder they
+ * re-include from the `build` folder down (`!src/build/`, the documented
+ * opt-in), keeps every type, as it did before this rule.
+ */
+function excludeBuildOutputUnderSrc(ig: Ignore, projectRules: Ignore | null): Ignore {
+  const ignoredByPatterns = ig.ignores.bind(ig);
+  ig.ignores = (rel: string): boolean => {
+    if (ignoredByPatterns(rel)) return true;
+    const folder = buildOutputFolderUnderSrc(rel);
+    if (folder === null) return false;
+    if (!projectRules) return true;
+    // The file, then each folder above it up to the `build` folder.
+    for (let end = rel.length; end >= folder.length; end = rel.lastIndexOf('/', end - 2) + 1) {
+      if (projectRules.test(rel.slice(0, end)).unignored) return false;
+    }
+    return true;
+  };
+  return ig;
+}
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
 function isValidUtf8(buf: Buffer): boolean {
@@ -465,11 +555,19 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  const projectRules = ignore();
   const rootGitignore = path.join(rootDir, '.gitignore');
-  if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  if (fs.existsSync(rootGitignore)) {
+    const patterns = readGitignorePatterns(rootGitignore);
+    ig.add(patterns);
+    projectRules.add(patterns);
+  }
   const extra = readGitExcludeExtraPatterns(rootDir);
-  if (extra) ig.add(extra);
-  return ig;
+  if (extra) {
+    ig.add(extra);
+    projectRules.add(extra);
+  }
+  return excludeBuildOutputUnderSrc(ig, projectRules);
 }
 
 /**
@@ -478,7 +576,7 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * whose gitignore semantics their own `git ls-files` already enforced (#514).
  */
 function defaultsOnlyIgnore(): Ignore {
-  return ignore().add(DEFAULT_IGNORE_PATTERNS);
+  return excludeBuildOutputUnderSrc(ignore().add(DEFAULT_IGNORE_PATTERNS), null);
 }
 
 /**
