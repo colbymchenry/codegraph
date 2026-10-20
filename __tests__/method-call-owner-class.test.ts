@@ -138,6 +138,10 @@ class Manager(Model):
     def filter(self):
         pass
 
+class CurrentSiteManager:
+    def get_queryset(self):
+        pass
+
 class BaseManager:
     def check(self):
         pass
