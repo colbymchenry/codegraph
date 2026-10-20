@@ -81,6 +81,11 @@ export interface CppBraceScopes {
   closeOf(open: number): number | undefined;
   /** The named namespaces whose braces hold `offset`, outermost first, as written (`a::b`). */
   namespacesAt(offset: number): string[];
+  /**
+   * Whether `offset` is at namespace scope: every brace around it opens a
+   * namespace, named or not, and none a class, a function or a linkage block.
+   */
+  atNamespaceScope(offset: number): boolean;
   /** The 1-based line and the column of `offset`. */
   positionOf(offset: number): { line: number; column: number };
 }
@@ -204,6 +209,7 @@ export function scanCppBraceScopes(source: string): CppBraceScopes | null {
   // first branch (null until a second branch starts).
   const branches: Array<{ atIf: number[]; afterFirst: number[] | null }> = [];
   const namespaceAt = new Map<number, string>(); // `{` offset → name, for named namespaces
+  const namespaceBraces = new Set<number>(); // `{` offsets of every namespace, named or not
   let pendingNamespace: { name: string; brace: number } | null = null;
   let balanced = true;
   let lineStart = true;
@@ -322,6 +328,7 @@ export function scanCppBraceScopes(source: string): CppBraceScopes | null {
       open.push(i);
       if (pendingNamespace && pendingNamespace.brace === i) {
         if (pendingNamespace.name) namespaceAt.set(i, pendingNamespace.name);
+        namespaceBraces.add(i);
         pendingNamespace = null;
       }
     } else if (c === 125) {
@@ -339,9 +346,17 @@ export function scanCppBraceScopes(source: string): CppBraceScopes | null {
     if (close !== undefined) namespaces.add(brace, close, name);
   }
   let lineStarts: number[] | null = null;
+  let scopes: NestedIntervals<boolean> | null = null;
   return {
     closeOf: (at) => closes.get(at),
     namespacesAt: (offset) => namespaces.at(offset),
+    atNamespaceScope: (offset) => {
+      if (!scopes) {
+        scopes = new NestedIntervals<boolean>();
+        for (const [brace, close] of [...closes].sort((a, b) => a[0] - b[0])) scopes.add(brace, close, namespaceBraces.has(brace));
+      }
+      return scopes.at(offset).every((isNamespace) => isNamespace);
+    },
     positionOf: (offset) => {
       if (!lineStarts) {
         lineStarts = [0];
