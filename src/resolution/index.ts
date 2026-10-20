@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoShadowedBareName } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound, isGoShadowedBareName } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -32,8 +32,9 @@ import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
+import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -306,7 +307,7 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
-  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
+  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
   // Per project-relative directory ('' = the root): the module of the nearest
   // go.mod at or above it, up to the project root. Same lazy/immutable
@@ -575,6 +576,7 @@ export class ReferenceResolver {
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
+      clearCFeatureVariantMemos(this.context);
     }
   }
 
@@ -668,7 +670,15 @@ export class ReferenceResolver {
    */
   private createContext(): ResolutionContext {
     return {
-      resolveImport: (ref) => resolveViaImport(ref, this.context),
+      // A C or C++ `#include` the import resolver can't place is linked by the
+      // end of its path, as resolveOneInner's name matching does: protobuf's
+      // `google/protobuf/descriptor.upb.h`, which two generated copies end in.
+      // cppIncluders reads includes through this, so it sees the include edges
+      // a reader sees. A standard header is never the project's: `<math.h>`
+      // is not jemalloc's test/math.h, which only its includers may see.
+      resolveImport: (ref) => resolveViaImport(ref, this.context) ??
+        ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports' &&
+          !isExternalImport(ref.referenceName, ref.language, this.context) ? matchByFilePath(ref, this.context) : null),
       // A path alias makes an import the project's only when it maps the
       // import to a file the index holds. Matching its prefix is not enough:
       // cord-field's `"*": ["./typings/*"]` matches every package, and
@@ -682,6 +692,8 @@ export class ReferenceResolver {
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
       },
+      isDeclaredPackage: (source, fromFile) => this.isDeclaredOutsidePackage(source, fromFile),
+      isIndexedFile: (filePath) => this.isIndexedFile(filePath),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -2733,6 +2745,57 @@ export class ReferenceResolver {
   }
 
   /**
+   * Whether a failed import could name one of `files`, the files a sync just
+   * added: the test the import retry puts a crowded key's imports to
+   * (`QueryBuilder.getRetryableFailedImports`). `utils` is the path stem of a
+   * project's own `./utils` and of every `jotai/utils` and `@scope/pkg/utils`
+   * import alike, and `assert` the name of every binding of `import * as
+   * assert from 'assert'`, so past the retry's ceiling a key holds the few
+   * imports an added `utils.ts` or `assert.ts` is for among hundreds that no
+   * file of the project is.
+   *
+   * A JavaScript or TypeScript import reaches a file by the module it is
+   * written as (a path, a tsconfig alias or a workspace package, an `index`
+   * file and the emitted `.js` of a `.ts` included), by a framework's alias
+   * (SvelteKit's `$lib/…`) or by the file's own name (`…/utils.js`). One that
+   * none of those lead to an added file — a package, an import binding, a
+   * workspace package's subpath only its `exports` map resolves — names none
+   * of them. Of an import written in another language this knows nothing, so
+   * a crowded key skips it, as it always has.
+   */
+  couldNameAnyOf(files: readonly string[]): (reference: UnresolvedReference) => boolean {
+    const added = new Set(files);
+    const names = new Set(files.map((file) => file.slice(file.lastIndexOf('/') + 1)));
+    return (reference) => {
+      const language = reference.language || this.getLanguageFromNodeId(reference.fromNodeId);
+      if (!ESM_IMPORT_LANGUAGES.has(language)) return false;
+      const ref: UnresolvedRef = {
+        fromNodeId: reference.fromNodeId,
+        referenceName: reference.referenceName,
+        referenceKind: reference.referenceKind,
+        line: reference.line,
+        column: reference.column,
+        filePath: reference.filePath || this.getFilePathFromNodeId(reference.fromNodeId),
+        language,
+        rowId: reference.rowId,
+      };
+      const name = ref.referenceName;
+      if (names.has(name.slice(name.lastIndexOf('/') + 1))) return true;
+      // Where the specifier leads first: a package's leads nowhere, and only
+      // then is it worth asking whether the resolver reads the reference as a
+      // module, which for a bare name means reading the file's imports.
+      const target = resolveImportPath(name, ref.filePath, language, this.context);
+      if (target !== null && added.has(target) && jsModuleFile(ref, this.context) === target) return true;
+      // A framework's alias is a path (`$lib/x`, `~/x`); a bare name, which
+      // every binding is, is no alias, and asking reads the file.
+      return name.includes('/') && this.frameworksFor(language).some((framework) => {
+        const result = framework.resolve(ref, this.context);
+        return result !== null && added.has(this.nodeById(result.targetNodeId)?.filePath ?? '');
+      });
+    };
+  }
+
+  /**
    * True when `receiver` is a local name bound by an import that resolves to a
    * file IN THIS PROJECT — the only case where letting a python
    * built-in-method name through the filter is safe (#1681).
@@ -3288,6 +3351,13 @@ export class ReferenceResolver {
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
 
+    // A Go name called or passed bare that the function around it binds
+    // itself — a parameter, a `:=`, a `var` — is that binding, never a
+    // declaration of the package: client-go's `init := func(…)` then
+    // `init(t)` calls no `func init()`.
+    if (ref.language === 'go' && (ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref') &&
+        isGoBareName(ref, this.context) && isGoLocallyBound(ref, this.context)) return null;
+
     // A `#define` is a value, never a callee (#1838): a macro defined only in
     // an unrelated file is not what `NAME(x)` here expands to either.
     if (ref.referenceKind === 'calls') {
@@ -3313,11 +3383,13 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
-    // A Go alias names its type as an embedding does (below): written through
-    // a package that is none of the file's imports as indexed, the type found
-    // by its bare name is another package's namesake, or the alias itself.
+    // A Go type declaration — an alias, a defined type, a struct's fields —
+    // names its types as an embedding does (below): written through a package
+    // that is none of the file's imports as indexed, the type found by its
+    // bare name is another package's namesake, or the declaration itself
+    // (`op clientv3.Op` beside the file's own `Op`).
     if (ref.language === 'go' && ref.referenceKind === 'references' &&
-        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+        GO_TYPE_KINDS.has(this.nodeById(ref.fromNodeId)?.kind ?? '') && isGoUnknownQualified(ref, this.context)) return null;
 
     // A Go type position — a parameter or result type, a composite literal's
     // type — names a type of the package Go reads it from (route handlers are
@@ -3370,12 +3442,17 @@ export class ReferenceResolver {
   /**
    * A bare Rust name reaches only what is in scope — every strategy's result,
    * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
-   * isRustNameInScope).
+   * isRustNameInScope). And a call, however written, reaches a project impl
+   * on a std type only as Rust would pick it (isRustForeignImplCallable).
    */
   private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
-    if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
+    if (!result || ref.language !== 'rust') return result;
+    const bare = /^[A-Za-z_]\w*$/.test(ref.referenceName);
+    if (!bare && ref.referenceKind !== 'calls') return result;
     const target = this.nodeById(result.targetNodeId);
-    return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+    if (!target) return result;
+    if (bare && !isRustNameInScope(target, ref, this.context)) return null;
+    return ref.referenceKind === 'calls' && !isRustForeignImplCallable(target, ref, this.context) ? null : result;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */

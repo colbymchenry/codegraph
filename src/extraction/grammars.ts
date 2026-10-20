@@ -422,11 +422,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
   // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
   // generated files off main and the 0.7.3-with-generated-files tag ships an
-  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
-  // tarball is byte-for-byte what the kernel's cargo build compiles — table
-  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
-  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
-  // classified list in the swift checklist doc.
+  // older ABI-14 generation; grammar.json rules are JSON-equal, and the
+  // kernel compiles the same tarball's src/ (codegraph-kernel/grammars/swift)
+  // — table identity by construction). Replaces the ^0.4.0 tree-sitter-wasms
+  // build (ABI 13 → 15). NOT graph-neutral — delta is error-set membership
+  // only; classified list in the swift checklist doc. The kernel's copy
+  // carries docs/grammars/tree-sitter-swift.patch (`try!` on Windows); this
+  // wasm doesn't need it — see that doc's .md.
   'swift',
   // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
   // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL

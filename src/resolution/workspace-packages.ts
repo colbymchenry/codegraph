@@ -17,7 +17,9 @@
  * Scope deliberately small for v1 (mirrors path-aliases.ts):
  *   - reads `workspaces` (array OR `{ packages: [...] }`) from package.json,
  *     plus a minimal `pnpm-workspace.yaml` `packages:` list
- *   - expands one level of `*` / `**` globs (`packages/*`, `apps/*`)
+ *   - expands `*`, `?` and `{a,b}` within a folder name and `**` across
+ *     folders (`packages/*`, pnpm's nested `packages/**\/*`), and leaves out
+ *     what a negated glob (`!**\/example`) matches
  *   - subpath resolution is directory-based (`@scope/ui/sub` → `<ui>/sub`);
  *     it does NOT yet honour a member's `exports` map or `main` field
  *   - returns null when the project declares no workspaces, so single-
@@ -56,8 +58,13 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   const byName = new Map<string, string>();
 
   const patterns = readWorkspaceGlobs(projectRoot);
+  // What a negated glob matches (`!examples/with-nx`, pnpm's `!**/example`) is
+  // no member, wherever the glob is listed.
+  const excluded = patterns.filter((p) => p.startsWith('!')).map((p) => p.slice(1));
   for (const pattern of patterns) {
+    if (pattern.startsWith('!')) continue;
     for (const dir of expandWorkspaceGlob(projectRoot, pattern)) {
+      if (excluded.some((x) => workspaceGlobMatches(x, dir))) continue;
       const pkgName = readPackageName(path.join(projectRoot, dir));
       // First declaration wins — workspace patterns are tried in order.
       if (pkgName && !byName.has(pkgName)) byName.set(pkgName, dir);
@@ -291,26 +298,124 @@ function parsePnpmPackages(yaml: string): string[] {
   return out;
 }
 
-/** Expand one level of a `packages/*` / `apps/**` glob to member dirs. */
+/** Folders no wildcard matches: installed packages. */
+const GLOB_SKIP_DIRS = new Set(['node_modules', 'bower_components']);
+/**
+ * Folders a `**` doesn't descend into either, as pnpm's default ignores
+ * don't: their fixture packages are no members, and their names (`react`,
+ * `lodash`) would make imports of the real package the project's.
+ */
+const GLOBSTAR_SKIP_DIRS = new Set(['test', 'tests']);
+/** How far a `**` reaches below the glob's literal prefix, and how many folders one glob reads. */
+const GLOBSTAR_MAX_DEPTH = 8;
+const GLOB_DIR_BUDGET = 10_000;
+
+/**
+ * Expand a workspace glob to the member directories it matches, nearest
+ * first: `packages/*`, `packages/plugin-*`, `apps/*\/web`, `{apps,libs}/*`,
+ * and the nested members of pnpm's `packages/**\/*` or npm's `libs/**\/*`
+ * (folo's `@follow/utils` is `packages/internal/utils`, two levels down).
+ * A wildcard never matches a dot-folder or one of GLOB_SKIP_DIRS, and a `**`
+ * none of GLOBSTAR_SKIP_DIRS; a folder the glob names literally is always
+ * entered. Breadth-first with sorted names, so a member nearer the root wins
+ * a package name a deeper copy also declares.
+ */
 function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
   const norm = pattern.replace(/\\/g, '/').replace(/\/+$/, '');
-  const star = norm.indexOf('*');
-  if (star === -1) return [norm]; // exact directory
+  const glob = compileGlob(norm);
+  const first = glob.findIndex((seg) => seg.wildcard);
+  if (first === -1) return [norm]; // exact directory
 
-  // Everything before the wildcard segment is the base to enumerate.
-  const base = norm.slice(0, star).replace(/\/+$/, '');
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(path.join(projectRoot, base), { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const out: string[] = [];
-  for (const e of entries) {
-    if (!e.isDirectory() || e.name.startsWith('.') || e.name === 'node_modules') continue;
-    out.push(base ? `${base}/${e.name}` : e.name);
+  const base = glob.slice(0, first).map((seg) => seg.text).join('/');
+  const start = globClosure(glob, new Set([first]));
+  // `tools/**` is `tools` too, as npm and pnpm match `tools/**/package.json`.
+  const out: string[] = start.has(glob.length) ? [base || '.'] : [];
+  let level = [{ rel: base, states: start }];
+  let read = 0;
+  for (let depth = 0; level.length > 0 && depth <= GLOBSTAR_MAX_DEPTH; depth++) {
+    const next: typeof level = [];
+    for (const { rel, states } of level) {
+      if (++read > GLOB_DIR_BUDGET) {
+        logDebug('workspace glob stopped at its folder budget', { pattern, read });
+        return out;
+      }
+      let names: string[];
+      try {
+        names = fs.readdirSync(path.join(projectRoot, rel), { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name)
+          .sort();
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        const advanced = globStep(glob, states, name, true);
+        if (advanced.size === 0) continue;
+        const child = rel ? `${rel}/${name}` : name;
+        if (advanced.has(glob.length)) out.push(child);
+        if ([...advanced].some((state) => state < glob.length)) next.push({ rel: child, states: advanced });
+      }
+    }
+    level = next;
   }
   return out;
+}
+
+/** Whether a negated workspace glob's pattern (`**\/example`, `examples/with-*`) matches a member directory. */
+function workspaceGlobMatches(pattern: string, dir: string): boolean {
+  const glob = compileGlob(pattern.replace(/\\/g, '/').replace(/\/+$/, ''));
+  let states = globClosure(glob, new Set([0]));
+  for (const name of dir.split('/').filter((s) => s !== '' && s !== '.')) {
+    states = globStep(glob, states, name, false);
+    if (states.size === 0) return false;
+  }
+  return states.has(glob.length);
+}
+
+interface GlobSegment {
+  text: string;
+  /** `**`: any number of folders, none included. */
+  globstar: boolean;
+  wildcard: boolean;
+  re: RegExp | null;
+}
+
+/** A glob's folder segments: `*`, `?` and `{a,b}` within one, `**` across them. */
+function compileGlob(pattern: string): GlobSegment[] {
+  return pattern.split('/').filter((s) => s !== '' && s !== '.').map((text) => {
+    if (text === '**') return { text, globstar: true, wildcard: true, re: null };
+    if (!/[*?{]/.test(text)) return { text, globstar: false, wildcard: false, re: null };
+    const source = text
+      .replace(/[.+^$()|[\]\\]/g, '\\$&')
+      .replace(/\*+/g, '[^/]*')
+      .replace(/\?/g, '[^/]')
+      .replace(/\{([^{}]*)\}/g, (_, alts: string) => `(?:${alts.split(',').join('|')})`);
+    return { text, globstar: false, wildcard: true, re: new RegExp(`^${source}$`) };
+  });
+}
+
+/** The states a folder named `name` leads to from `states`; `walking` skips what pnpm's walk skips. */
+function globStep(glob: GlobSegment[], states: Set<number>, name: string, walking: boolean): Set<number> {
+  const next = new Set<number>();
+  const hidden = walking && (name.startsWith('.') || GLOB_SKIP_DIRS.has(name));
+  for (const i of states) {
+    const seg = glob[i];
+    if (!seg) continue;
+    if (seg.globstar) {
+      if (!hidden && !(walking && GLOBSTAR_SKIP_DIRS.has(name))) next.add(i);
+    } else if (seg.re ? !hidden && seg.re.test(name) : seg.text === name) {
+      next.add(i + 1);
+    }
+  }
+  return globClosure(glob, next);
+}
+
+/** `states` with every `**` that can match no folder at all stepped over. */
+function globClosure(glob: GlobSegment[], states: Set<number>): Set<number> {
+  for (const i of [...states]) {
+    for (let j = i; glob[j]?.globstar; j++) states.add(j + 1);
+  }
+  return states;
 }
 
 /** Read the `name` field from a member directory's package.json. */

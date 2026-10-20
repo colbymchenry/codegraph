@@ -1,6 +1,14 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import {
+  blankLoneMacroLines,
+  definingDeclaration,
+  isConstDeclaration,
+  OBJC_LONE_MACROS,
+  rewriteFoundationEnumMacros,
+  unnamedTypeVariableName,
+} from './c-cpp';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -96,6 +104,12 @@ function extractObjcPropertyName(node: SyntaxNode, source: string): string | nul
 }
 
 export const objcExtractor: LanguageExtractor = {
+  // A macro alone on its line, like `NS_ASSUME_NONNULL_BEGIN` or
+  // `RCT_EXTERN_C_BEGIN`, reads to the parser as the start of a declaration:
+  // it swallowed the `typedef` below it, and an `@interface` below it lost
+  // its class to error recovery. Blanked as in C, offsets kept. A
+  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`.
+  preParse: (source) => blankLoneMacroLines(rewriteFoundationEnumMacros(source), OBJC_LONE_MACROS),
   functionTypes: ['function_definition'],
   // Only @interface emits a class node; @implementation reuses it via visitNode.
   classTypes: ['class_interface'],
@@ -116,7 +130,16 @@ export const objcExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   getReturnType: extractObjcReturnType,
-  resolveName: extractObjcMethodName,
+  // `static const NSInteger kMaxRetries = 3;` is a constant, as in C.
+  isConst: isConstDeclaration,
+  // A method is named by its selector. An unnamed struct, union or enum
+  // defined in a declaration's type takes the first variable's name, as in C:
+  // `static struct { … } placeholder;` is the struct `placeholder`.
+  resolveName: (node, source) =>
+    extractObjcMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+  // A struct, union or enum defined in a declaration's type is documented by
+  // the comment above the declaration.
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   extractPropertyName: extractObjcPropertyName,
   resolveBody: (node, bodyField) => {
     const fromField = getChildByField(node, bodyField);
