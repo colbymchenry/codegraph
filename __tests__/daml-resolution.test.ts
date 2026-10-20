@@ -44,7 +44,7 @@ function node(graph: CodeGraph, qualifiedName: string, filePrefix = ''): Node {
 }
 
 /** Target qualified names (with file) of `from`'s outgoing edges of `kind`. */
-function targets(graph: CodeGraph, from: Node, kind: 'calls' | 'instantiates' | 'implements' | 'extends'): string[] {
+function targets(graph: CodeGraph, from: Node, kind: 'calls' | 'references' | 'instantiates' | 'implements' | 'extends'): string[] {
   const edges = graph.getOutgoingEdgesFrom([from.id], [kind]);
   const byId = graph.getNodesByIds(edges.map((e) => e.target));
   return edges.map((e) => `${byId.get(e.target)!.qualifiedName} @ ${byId.get(e.target)!.filePath}`);
@@ -123,8 +123,8 @@ prepare = Tok.Give with to = alice
 
   it('picks the candidate module of a shared alias that declares the name', async () => {
     const graph = await index({
-      'A.daml': 'module A where\n\nfromA : Int\nfromA = 1\n',
-      'B.daml': 'module B where\n\nfromB : Int\nfromB = 2\n',
+      'A.daml': 'module A where\n\nfromA : Int -> Int\nfromA x = x\n',
+      'B.daml': 'module B where\n\nfromB : Int -> Int\nfromB x = x\n',
       'Main.daml': 'module Main where\n\nimport A qualified as X\nimport B qualified as X\n\nf = X.fromB\ng = X.fromA 1\nh = X.fromB 2\n',
     });
     expect(targets(graph, node(graph, 'Main::g'), 'calls')).toEqual(['A::fromA @ A.daml']);
@@ -178,6 +178,24 @@ describe('Haskell scoping for bare names', () => {
     expect(targets(graph, node(graph, 'Uses::g'), 'calls')).toEqual([]);
   });
 
+  it('never binds a standard-library class method to a project instance of it', async () => {
+    const graph = await index({
+      'Types.daml': 'module Types where\n\nnewtype Id = Id Text\n\ninstance Show Id where\n  show (Id t) = t\n',
+      'Main.daml': 'module Main where\n\nimport Types\n\nf i = show i\n',
+    });
+    expect(targets(graph, node(graph, 'Main::f'), 'calls')).toEqual([]);
+  });
+
+  it('imports only a type\'s constructors, fields and methods with `T(..)`, not other names', async () => {
+    const graph = await index({
+      'Observation.daml': OBSERVATION,
+      'Claim.daml': 'module Claim (Inequality(..), lte) where\n\nimport Observation\n\ndata Inequality = Lte Int\n\nlte : Int -> Inequality\nlte = Lte\n',
+      'Main.daml': 'module Main where\n\nimport Claim (Inequality(..), lte)\nimport Observation qualified as O\n\nf = pure 1\ng = lte 1\n',
+    });
+    expect(targets(graph, node(graph, 'Main::f'), 'calls')).toEqual([]);
+    expect(targets(graph, node(graph, 'Main::g'), 'calls')).toEqual(['Claim::lte @ Claim.daml']);
+  });
+
   it('never binds a call to one instance implementation of a class method', async () => {
     const graph = await index({
       'Pretty.daml': `module Pretty where
@@ -191,5 +209,105 @@ instance Pretty Int where
       'Main.daml': 'module Main where\n\nimport Pretty\n\nf = pretty 1\n',
     });
     expect(targets(graph, node(graph, 'Main::f'), 'calls')).toEqual(['Pretty::pretty @ Pretty.daml']);
+  });
+});
+
+const HOLDING = `module Iface.Holding where
+
+interface Holding where
+  viewtype V
+  transferImpl : Party -> Update (ContractId Holding)
+
+  choice Transfer : ContractId Holding
+    with
+      to : Party
+    controller (view this).owner
+    do transferImpl this to
+
+data V = V with owner : Party
+`;
+
+const TOKEN = `module Token where
+
+import Iface.Holding qualified as Holding
+
+type T = Token
+
+template Token
+  with
+    owner : Party
+  where
+    signatory owner
+    key owner : Party
+    maintainer key
+
+    interface instance Holding.Holding for Token where
+      view = Holding.V with owner
+      transferImpl to = toInterfaceContractId <$> create this with owner = to
+`;
+
+describe('DAML ledger actions and interface dispatch', () => {
+  it('calls the template a ledger action names: imported, through a type alias, or `this`', async () => {
+    const graph = await index({
+      'Iface/Holding.daml': HOLDING,
+      'Token.daml': TOKEN,
+      'Bank.daml': `module Bank where
+
+import Token (Token(..))
+import Token qualified as Tok
+
+open : Party -> Update (ContractId Token)
+open p = create Token with owner = p
+
+look : Party -> Update (ContractId Token)
+look p = fst <$> fetchByKey @Tok.T p
+`,
+    });
+    const token = 'Token::Token @ Token.daml';
+    expect(targets(graph, node(graph, 'Bank::open'), 'calls')).toEqual([token]);
+    expect(targets(graph, node(graph, 'Bank::look'), 'calls')).toEqual([token]);
+    expect(targets(graph, node(graph, 'Token::Token::transferImpl'), 'calls')).toEqual([token]);
+    expect(targets(graph, node(graph, 'Bank::open'), 'instantiates')).toEqual([]);
+  });
+
+  it('links an interface method to every template implementing it', async () => {
+    const graph = await index({ 'Iface/Holding.daml': HOLDING, 'Token.daml': TOKEN });
+    expect(targets(graph, node(graph, 'Iface.Holding::Transfer'), 'calls'))
+      .toEqual(['Iface.Holding::transferImpl @ Iface/Holding.daml']);
+    expect(targets(graph, node(graph, 'Iface.Holding::transferImpl'), 'calls'))
+      .toEqual(['Token::Token::transferImpl @ Token.daml']);
+  });
+
+  it('reads a top-level value rather than calling it, unless it is an action', async () => {
+    const graph = await index({
+      'Fees.daml': `module Fees where
+
+fee : Decimal
+fee = 0.1
+
+setup : Update ()
+setup = pure ()
+
+charge : Decimal -> Update Decimal
+charge x = do
+  setup
+  pure (x * fee)
+`,
+    });
+    expect(targets(graph, node(graph, 'Fees::charge'), 'calls')).toEqual(['Fees::setup @ Fees.daml']);
+    expect(targets(graph, node(graph, 'Fees::charge'), 'references')).toEqual(['Fees::fee @ Fees.daml']);
+  });
+
+  it('calls a local function passed as a value', async () => {
+    const graph = await index({
+      'Batch.daml': `module Batch where
+
+settleAll : [Int] -> Update [Int]
+settleAll steps = mapA settleOne steps
+  where
+    settleOne step = pure step
+`,
+    });
+    expect(targets(graph, node(graph, 'Batch::settleAll'), 'calls')).toEqual(['Batch::settleAll::settleOne @ Batch.daml']);
   });
 });

@@ -87,6 +87,61 @@ function isDamlChoice(n: Node): boolean {
   return n.language === 'daml' && n.kind === 'method' && !!n.decorators?.includes('choice');
 }
 
+/** `name : Type` (DAML) / `name :: Type` (Haskell), as a function's signature is stored. */
+const SIGNATURE_TYPE = /^[\w']+\s*::?\s*(.+)$/;
+
+/** A type whose values are actions, which run when evaluated: `Update ()`, `Script ()`, `m a`. */
+const ACTION_TYPE = /^(?:Update|Script|Scenario|Commands|[a-z][\w']*)\b/;
+
+/**
+ * A top-level value (`fee : Decimal`, `_ROLE : Text`) is read, not called: its
+ * declared type is neither a function nor an action. Without a signature (a
+ * local `let` value) it may hold calls, so it stays a callee.
+ */
+export function isHaskellValue(n: Node): boolean {
+  if (!HASKELL_FAMILY.has(n.language) || n.kind !== 'function') return false;
+  const type = SIGNATURE_TYPE.exec(n.signature ?? '')?.[1]?.replace(/^.*=>\s*/, '');
+  return !!type && !type.includes('->') && !ACTION_TYPE.test(type);
+}
+
+/** `type I = Account`: DAML names an interface through a same-module alias. */
+const DAML_TYPE_ALIAS = /^type\s+\S+\s*=\s*([A-Z][\w']*)\s*$/;
+
+/** What a DAML ledger action (`create T with ..`, `fetchByKey @T`) can name: a template or an interface. */
+function isLedgerContract(n: Node): boolean {
+  return n.language === 'daml' && ((n.kind === 'class' && !!n.decorators?.includes('template')) || n.kind === 'interface');
+}
+
+/** A ledger reference names a type: `Account`, `Account.I` (the extractor emits it as a call). */
+export function isDamlLedgerRef(ref: UnresolvedRef): boolean {
+  const member = splitQualified(ref.referenceName)?.member ?? ref.referenceName;
+  return ref.language === 'daml' && ref.referenceKind === 'calls' && /^[A-Z]/.test(member);
+}
+
+/** A template or interface, or the one a same-file `type I = X` alias names. */
+function ledgerContract(n: Node, context: ResolutionContext): Node | null {
+  if (isLedgerContract(n)) return n;
+  if (n.kind !== 'type_alias' || n.language !== 'daml') return null;
+  const named = DAML_TYPE_ALIAS.exec(n.signature ?? '')?.[1];
+  const targets = named ? context.getNodesByName(named).filter((t) => t.filePath === n.filePath && isLedgerContract(t)) : [];
+  return targets.length === 1 ? targets[0]! : null;
+}
+
+/**
+ * `create Batch with ..` / `fetchByKey @Instruction` / `@Account.I`: the
+ * template or interface the name means where it is written — qualified by its
+ * module, or a bare name the file declares or imports.
+ */
+export function resolveDamlLedgerRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const qualified = (ref.candidates?.length ? ref.candidates : [ref.referenceName]).filter((n) => n.includes('::'));
+  const found = qualified.length > 0
+    ? qualified.flatMap((q) => context.getNodesByQualifiedName(q))
+    : context.getNodesByName(ref.referenceName).filter((n) => isVisible(n, ref.referenceName, ref, context));
+  const contracts = [...new Set(found.map((n) => ledgerContract(n, context)).filter((n): n is Node => n !== null))];
+  const target = nearest(contracts, ref.filePath);
+  return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
+}
+
 export function resolveHaskellModuleRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   if (!ref.language || !HASKELL_FAMILY.has(ref.language)) return null;
   const kinds = TARGET_KINDS[ref.referenceKind];
@@ -132,6 +187,8 @@ interface ImportScope {
   module: string;
   /** null = every name; otherwise the names the import list brings in. */
   names: Set<string> | null;
+  /** The list brings in some type's constructors, fields or class methods wholesale (`T(..)`). */
+  allChildren: boolean;
   hiding: Set<string>;
 }
 
@@ -158,10 +215,17 @@ function stripHaskellComments(src: string): string {
   return src.replace(/\{-[\s\S]*?-\}/g, ' ').replace(/--.*$/gm, '');
 }
 
-/** Names an import list mentions; null when it brings in all of a type's members (`T(..)`). */
-function listedNames(list: string): Set<string> | null {
-  if (/\(\s*\.\.\s*\)/.test(list.slice(1, -1))) return null;
+/** Names an import list mentions. */
+function listedNames(list: string): Set<string> {
   return new Set(list.slice(1, -1).match(/[A-Za-z_][\w']*/g) ?? []);
+}
+
+/** `T(..)` in an import or export list: all of some type's constructors, fields or class methods. */
+const ALL_CHILDREN = /\(\s*\.\.\s*\)/;
+
+/** What `T(..)` brings in: a constructor, a record field, or a class method — never a top-level function. */
+function isTypeChild(n: Node): boolean {
+  return n.kind === 'enum_member' || n.kind === 'field' || n.kind === 'method';
 }
 
 function fileScope(filePath: string, context: ResolutionContext): FileScope {
@@ -180,7 +244,7 @@ function fileScope(filePath: string, context: ResolutionContext): FileScope {
     imports: [],
     reexports: new Set(exportList?.match(/\bmodule\s+([\w.']+)/g)?.map((m) => m.replace(/^module\s+/, '')) ?? []),
     exportNames: exportList ? new Set(exportList.match(/[A-Za-z_][\w']*/g) ?? []) : null,
-    exportsAllChildren: !!exportList && /\(\s*\.\.\s*\)/.test(exportList),
+    exportsAllChildren: !!exportList && ALL_CHILDREN.test(exportList),
     importedModules: new Set(),
   };
   for (const m of src.matchAll(IMPORT_RE)) {
@@ -188,8 +252,8 @@ function fileScope(filePath: string, context: ResolutionContext): FileScope {
     if (m[1] || m[3]) continue; // qualified-only: brings in no bare names
     const list = m[5];
     const names = list && !m[4] ? listedNames(list) : null;
-    const hiding = list && m[4] ? new Set(list.slice(1, -1).match(/[A-Za-z_][\w']*/g) ?? []) : new Set<string>();
-    scope.imports.push({ module: m[2]!, names, hiding });
+    const hiding = list && m[4] ? listedNames(list) : new Set<string>();
+    scope.imports.push({ module: m[2]!, names, allChildren: !!names && ALL_CHILDREN.test(list!.slice(1, -1)), hiding });
   }
   cache.set(filePath, scope);
   return scope;
@@ -201,19 +265,27 @@ function moduleFile(module: string, fromFile: string, context: ResolutionContext
   return nearest(decls, fromFile)?.filePath ?? null;
 }
 
-function isInstanceImplementation(n: Node): boolean {
-  return n.kind === 'method' && !n.decorators?.includes('choice') && n.qualifiedName.split('::').length >= 3;
+/**
+ * A method of a class `instance` (`Show.Id::show`, stored as a function) or of
+ * an `interface instance` (a template's method).
+ */
+function isInstanceImplementation(n: Node, context: ResolutionContext): boolean {
+  if (n.kind === 'method') return !n.decorators?.includes('choice') && n.qualifiedName.split('::').length >= 3;
+  if (n.kind !== 'function') return false;
+  const owner = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::')));
+  return context.getNodesByQualifiedName(owner).some((o) => o.kind === 'class' && !!o.signature?.startsWith('instance '));
 }
 
 function isVisible(target: Node, name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (isInstanceImplementation(target)) return false;
+  if (isInstanceImplementation(target, context)) return false;
   if (!ref.filePath || target.filePath === ref.filePath) return true;
   const targetModule = fileScope(target.filePath, context).module;
   if (!targetModule) return false;
   const scope = fileScope(ref.filePath, context);
   if (scope.module === targetModule) return true;
   return scope.imports.some((imp) => {
-    if (imp.hiding.has(name) || (imp.names && !imp.names.has(name))) return false;
+    if (imp.hiding.has(name)) return false;
+    if (imp.names && !imp.names.has(name) && !(imp.allChildren && isTypeChild(target))) return false;
     if (imp.module === targetModule) return true;
     const file = moduleFile(imp.module, ref.filePath!, context);
     if (!file) return false;
@@ -221,7 +293,7 @@ function isVisible(target: Node, name: string, ref: UnresolvedRef, context: Reso
     if (reexporter.reexports.has(targetModule)) return true;
     // `module M (basicAccount, Inequality(..)) where import M.Internal ...`
     // `T(..)` / `C(..)` re-export constructors, fields and class methods.
-    const named = reexporter.exportNames?.has(name) || reexporter.exportsAllChildren;
+    const named = reexporter.exportNames?.has(name) || (reexporter.exportsAllChildren && isTypeChild(target));
     return !!named && reexporter.importedModules.has(targetModule);
   });
 }

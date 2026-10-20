@@ -43,9 +43,17 @@ import {
 //
 // Ledger actions become edges: `exercise cid C with ...` (and every
 // `exercise*` / `createAndExercise*` helper, whose last argument is the choice
-// argument record) calls choice C; `T with ...` / `T {..}` instantiates T. A
-// choice-argument record built ahead of its exercise
-// (`let arg = Transfer with ...`) instantiates the choice.
+// argument record) calls choice C; `create T with ...` calls template T, and
+// `create this ...` the template it is written in; `fetchByKey @T k` (and the
+// other by-key actions and `fetchFromInterface`) calls T. Any other
+// `T with ...` / `T {..}` instantiates T. A choice-argument record built ahead
+// of its exercise (`let arg = Transfer with ...`) instantiates the choice.
+//
+// A function named as a value — composed (`f . g $ x`), applied with `$` or
+// `<$>`, or passed to another function (`mapA settle steps`) — is called by the
+// expression it is part of, so it is a call too. Names the code binds itself
+// (parameters, patterns, `<-` and `let` values, template and choice fields,
+// `this` / `self` / `arg`) are not references.
 
 const DEFAULT_CONSUMPTION = 'consuming';
 const CHOICE_DECORATOR = 'choice';
@@ -57,13 +65,48 @@ const MAX_SIGNATURE = 400;
  */
 const EXERCISE_FN = /(?:^e|E)xercise/;
 
+/** Ledger actions whose first argument is the contract to create: `create T with ..`, `create this`. */
+const CREATE_FNS = new Set(['create', 'createAndExercise']);
+
+/** Ledger actions whose type application names the template or interface: `fetchByKey @T key`. */
+const TYPE_APPLIED_LEDGER_FNS = new Set(['fetchByKey', 'lookupByKey', 'exerciseByKey', 'visibleByKey', 'fetchFromInterface']);
+
+/** The contract value a template's clauses and choices see. */
+const THIS = 'this';
+
+/** Names DAML binds in every template body and choice. */
+const IMPLICIT_BINDERS = new Set([THIS, 'self', 'arg']);
+
+/** A record pattern binding every field (`Transfer{..}`): its names are not known here. */
+const RECORD_WILDCARD = '..';
+
+/** Child fields holding patterns, whose variables are binders. */
+const PATTERN_FIELDS = new Set(['pattern', 'patterns']);
+
+/** Child fields below which a variable is never a value: patterns, and types (`cid : ContractId t`). */
+const NON_VALUE_FIELDS = new Set([...PATTERN_FIELDS, 'type']);
+
+/** Nodes below which a variable is a binder, a field label or a type, never a value reference. */
+const NON_VALUE_ANCESTORS = new Set(['field_name', 'projection_selector', 'signature', 'type_application', 'patterns', 'import', 'header']);
+
 /** Clause nodes whose expressions run when the contract is created or a key is looked up. */
 const TEMPLATE_CLAUSES = new Set(['signatory', 'observer', 'ensure', 'agreement', 'contract_key', 'maintainer']);
 
-/** Choice arguments (records, positional applications) already linked as an exercised choice — not also an instantiation. */
-const exercisedChoiceArgs = new Set<number>();
+/**
+ * Records (and positional applications) already linked as a ledger action — an
+ * exercised choice's argument, a created contract — and so not also an instantiation.
+ */
+const linkedRecords = new Set<number>();
 /** The parse tree the set belongs to (node ids repeat across trees). */
-let exercisedChoiceArgsTree: unknown = null;
+let linkedRecordsTree: unknown = null;
+
+/** The templates being walked, innermost last, as `Module::Template` (what `this` creates). */
+const templateStack: string[] = [];
+
+/** Names each scope node binds, by node id; `null` when a record wildcard binds unknown names. */
+const scopeBinders = new Map<number, Set<string> | null>();
+/** The parse tree the memo belongs to. */
+let scopeBindersTree: unknown = null;
 
 function callerId(ctx: ExtractorContext): string | undefined {
   return ctx.nodeStack[ctx.nodeStack.length - 1];
@@ -113,10 +156,10 @@ function applicationHead(node: SyntaxNode, source: string): string | null {
   return null;
 }
 
-function resetExercisedChoiceArgs(node: SyntaxNode): void {
-  if (exercisedChoiceArgsTree !== node.tree) {
-    exercisedChoiceArgs.clear();
-    exercisedChoiceArgsTree = node.tree;
+function resetLinkedRecords(node: SyntaxNode): void {
+  if (linkedRecordsTree !== node.tree) {
+    linkedRecords.clear();
+    linkedRecordsTree = node.tree;
   }
 }
 
@@ -133,8 +176,8 @@ function linkExercisedChoice(node: SyntaxNode, ctx: ExtractorContext): void {
   const choice = arg ? constructedRef(arg, ctx.source) : null;
   const from = callerId(ctx);
   if (!choice || !from) return;
-  resetExercisedChoiceArgs(node);
-  if (choice.record) exercisedChoiceArgs.add(choice.record.id);
+  resetLinkedRecords(node);
+  if (choice.record) linkedRecords.add(choice.record.id);
   ctx.addUnresolvedReference({
     fromNodeId: from,
     ...choice.ref,
@@ -146,8 +189,8 @@ function linkExercisedChoice(node: SyntaxNode, ctx: ExtractorContext): void {
 
 /** `T with ...` / `T {..}` → `instantiates T` (a record update `this with ...` has no constructor). */
 function linkRecordConstruction(node: SyntaxNode, ctx: ExtractorContext): void {
-  resetExercisedChoiceArgs(node);
-  if (exercisedChoiceArgs.has(node.id)) return;
+  resetLinkedRecords(node);
+  if (linkedRecords.has(node.id)) return;
   const head = getChildByField(node, 'expression');
   const ref = head ? constructorRef(head, ctx.source) : null;
   const from = callerId(ctx);
@@ -156,6 +199,194 @@ function linkRecordConstruction(node: SyntaxNode, ctx: ExtractorContext): void {
     fromNodeId: from,
     ...ref,
     referenceKind: 'instantiates',
+    line: node.startPosition.row + 1,
+    column: node.startPosition.column,
+  });
+}
+
+/** `f a b` → `[a, b]`: an application spine's arguments in order. */
+function spineArguments(node: SyntaxNode): SyntaxNode[] {
+  const args: SyntaxNode[] = [];
+  let cur: SyntaxNode | null = node;
+  while (cur?.type === 'apply') {
+    const arg = getChildByField(cur, 'argument');
+    if (arg) args.unshift(arg);
+    cur = getChildByField(cur, 'function');
+  }
+  return args;
+}
+
+function unparenthesized(node: SyntaxNode): SyntaxNode | null {
+  let cur: SyntaxNode | null = node;
+  while (cur?.type === 'parens') cur = getChildByField(cur, 'expression');
+  return cur;
+}
+
+/** The template a `create` argument makes: `T with ..`, `(T a b)`, or `this` / `this with ..` in a template. */
+function createdTemplate(arg: SyntaxNode, source: string): QualifiedRef | null {
+  const value = unparenthesized(arg);
+  if (!value) return null;
+  const base = value.type === 'record' ? getChildByField(value, 'expression') : value;
+  if (base?.type === 'variable' && getNodeText(base, source) === THIS) {
+    const template = templateStack[templateStack.length - 1];
+    if (!template) return null;
+    if (value.type === 'record') linkedRecords.add(value.id);
+    return { referenceName: template };
+  }
+  const built = constructedRef(value, source);
+  if (!built) return null;
+  if (built.record) linkedRecords.add(built.record.id);
+  return built.ref;
+}
+
+/** `@T` / `@M.T` → T; a type variable (`@t`) names no template. */
+function appliedType(arg: SyntaxNode, source: string): QualifiedRef | null {
+  if (arg.type !== 'type_application') return null;
+  const type = getChildByField(arg, 'type');
+  if (type?.type === 'name') return { referenceName: getNodeText(type, source) };
+  return type?.type === 'qualified' ? qualifiedRef(type, source) : null;
+}
+
+/** `create T with ..` / `create this` / `fetchByKey @T k` → `calls T`, on the outermost application. */
+function linkLedgerAction(node: SyntaxNode, ctx: ExtractorContext): void {
+  const parent = node.parent;
+  if (parent?.type === 'apply' && getChildByField(parent, 'function')?.id === node.id) return;
+  const head = applicationHead(node, ctx.source);
+  const first = spineArguments(node)[0];
+  const from = callerId(ctx);
+  if (!head || !first || !from) return;
+  resetLinkedRecords(node);
+  const target = CREATE_FNS.has(head)
+    ? createdTemplate(first, ctx.source)
+    : TYPE_APPLIED_LEDGER_FNS.has(head) ? appliedType(first, ctx.source) : null;
+  if (!target) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: from,
+    ...target,
+    referenceKind: 'calls',
+    line: node.startPosition.row + 1,
+    column: node.startPosition.column,
+  });
+}
+
+/** The field a node fills in its parent (`function`, `argument`, `pattern`, …). */
+function fieldOf(node: SyntaxNode): string | null {
+  const parent = node.parent;
+  if (!parent) return null;
+  for (let i = 0; i < parent.childCount; i++) {
+    if (parent.child(i)?.id === node.id) return parent.fieldNameForChild(i);
+  }
+  return null;
+}
+
+function collectVariables(node: SyntaxNode, source: string, into: Set<string>): boolean {
+  if (node.type === 'wildcard' && getNodeText(node, source) === RECORD_WILDCARD) return false;
+  if (node.type === 'variable') into.add(getNodeText(node, source));
+  for (const child of node.namedChildren) {
+    if (child && !collectVariables(child, source, into)) return false;
+  }
+  return true;
+}
+
+function fieldNames(fields: SyntaxNode | null, source: string, into: Set<string>): void {
+  for (const field of fields?.namedChildren ?? []) {
+    if (field?.type !== 'field') continue;
+    for (const name of field.childrenForFieldName('name')) {
+      if (name) into.add(getNodeText(name, source));
+    }
+  }
+}
+
+/** Names a `let` / `where` block binds without a node of their own: pattern bindings (`(a, b) = ..`). */
+function patternBindBinders(binds: SyntaxNode | null, source: string, into: Set<string>): boolean {
+  for (const bind of binds?.namedChildren ?? []) {
+    const pattern = bind?.type === 'bind' && !getChildByField(bind, 'name') ? getChildByField(bind, 'pattern') : null;
+    if (pattern && !collectVariables(pattern, source, into)) return false;
+  }
+  return true;
+}
+
+/** A `do` block's `x <- ..` patterns and `let` values (a `let` function is a node of its own). */
+function doBinders(node: SyntaxNode, source: string, into: Set<string>): boolean {
+  for (const statement of node.namedChildren) {
+    if (statement?.type === 'bind') {
+      const pattern = getChildByField(statement, 'pattern');
+      if (pattern && !collectVariables(pattern, source, into)) return false;
+    } else if (statement?.type === 'let') {
+      const binds = getChildByField(statement, 'binds');
+      for (const bind of binds?.namedChildren ?? []) {
+        const name = bind?.type === 'bind' ? getChildByField(bind, 'name') : null;
+        if (name) into.add(getNodeText(name, source));
+      }
+      if (!patternBindBinders(binds, source, into)) return false;
+    }
+  }
+  return true;
+}
+
+/** The names a scope node binds for the expressions below it; null when a record wildcard hides them. */
+function bindersOf(node: SyntaxNode, source: string): Set<string> | null {
+  if (scopeBindersTree !== node.tree) {
+    scopeBinders.clear();
+    scopeBindersTree = node.tree;
+  }
+  if (scopeBinders.has(node.id)) return scopeBinders.get(node.id)!;
+  const names = new Set<string>();
+  let known = true;
+  for (let i = 0; i < node.childCount && known; i++) {
+    const child = node.child(i);
+    if (child && PATTERN_FIELDS.has(node.fieldNameForChild(i) ?? '')) known = collectVariables(child, source, names);
+  }
+  if (known && node.type === 'do') known = doBinders(node, source, names);
+  if (known && node.type !== 'do') known = patternBindBinders(getChildByField(node, 'binds'), source, names);
+  if (node.type === 'template' || node.type === 'template_choice') fieldNames(getChildByField(node, 'fields'), source, names);
+  const result = known ? names : null;
+  scopeBinders.set(node.id, result);
+  return result;
+}
+
+/** A variable the code binds itself between it and the module top. */
+function isBound(node: SyntaxNode, name: string, source: string): boolean {
+  if (IMPLICIT_BINDERS.has(name)) return true;
+  for (let cur = node.parent; cur; cur = cur.parent) {
+    const binders = bindersOf(cur, source);
+    if (!binders || binders.has(name)) return true;
+  }
+  return false;
+}
+
+/**
+ * Not a binder, a field label, a type, a declaration's name or an application
+ * head (a call already). Above a clause's `match` is its header, which only
+ * binds, so the walk stops there.
+ */
+function isValuePosition(node: SyntaxNode): boolean {
+  const field = fieldOf(node);
+  if (field === 'name' || field === 'id') return false;
+  if (field === 'function' && node.parent?.type === 'apply') return false;
+  for (let cur: SyntaxNode | null = node; cur?.parent && cur.type !== 'match'; cur = cur.parent) {
+    if (NON_VALUE_ANCESTORS.has(cur.type) || NON_VALUE_FIELDS.has(fieldOf(cur) ?? '')) return false;
+  }
+  return true;
+}
+
+/** A function named as a value (`f . g`, `mapA f xs`) → `calls f`. */
+function linkValueReference(node: SyntaxNode, ctx: ExtractorContext): void {
+  const from = callerId(ctx);
+  if (!from || !isValuePosition(node)) return;
+  let ref: QualifiedRef | null;
+  if (node.type === 'qualified') {
+    if (getChildByField(node, 'id')?.type !== 'variable') return;
+    ref = qualifiedRef(node, ctx.source);
+  } else {
+    const name = getNodeText(node, ctx.source);
+    ref = isBound(node, name, ctx.source) ? null : { referenceName: name };
+  }
+  if (!ref) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: from,
+    ...ref,
+    referenceKind: 'calls',
     line: node.startPosition.row + 1,
     column: node.startPosition.column,
   });
@@ -315,12 +546,18 @@ function handleTemplate(node: SyntaxNode, ctx: ExtractorContext): boolean {
   });
   if (!cls) return true;
 
+  const module = fileModuleName(node, ctx.source);
+  templateStack.push(module ? `${module}::${name}` : name);
   ctx.pushScope(cls.id);
-  createFields(getChildByField(node, 'fields'), ctx);
-  for (const decl of body?.namedChildren ?? []) {
-    if (decl) handleTemplateDecl(decl, ctx);
+  try {
+    createFields(getChildByField(node, 'fields'), ctx);
+    for (const decl of body?.namedChildren ?? []) {
+      if (decl) handleTemplateDecl(decl, ctx);
+    }
+  } finally {
+    ctx.popScope();
+    templateStack.pop();
   }
-  ctx.popScope();
   return true;
 }
 
@@ -423,8 +660,8 @@ export const damlExtractor: LanguageExtractor = {
       case 'exception':
         return handleException(node, ctx);
       case 'apply':
-        resetExercisedChoiceArgs(node);
-        if (exercisedChoiceArgs.has(node.id)) {
+        resetLinkedRecords(node);
+        if (linkedRecords.has(node.id)) {
           // `exercise cid (C a b)`: already a call to C; only its arguments remain.
           for (const child of node.namedChildren) {
             if (child) ctx.visitNode(child);
@@ -433,9 +670,14 @@ export const damlExtractor: LanguageExtractor = {
         }
         // Pre-hook: the generic call extraction still runs for the application.
         linkExercisedChoice(node, ctx);
+        linkLedgerAction(node, ctx);
         return false;
       case 'record':
         linkRecordConstruction(node, ctx);
+        return false;
+      case 'variable':
+      case 'qualified':
+        linkValueReference(node, ctx);
         return false;
       default:
         return haskellExtractor.visitNode!(node, ctx);

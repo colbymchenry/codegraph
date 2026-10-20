@@ -112,8 +112,11 @@ describe('DAML templates and choices', () => {
   it('records template clauses and choice bodies as references from their owner', () => {
     const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Token/Asset.daml', ASSET);
     expect(refsFrom(refs, find(nodes, 'class', 'Asset'), 'calls')).toContain('Token.Util::checkPositive');
-    expect(refsFrom(refs, find(nodes, 'method', 'Transfer'), 'instantiates')).toEqual(['TransferProposal']);
-    // `create asset with owner = ...` updates a record: nothing is constructed by name.
+    // `create T with ...` creates a contract: a call to the template, not a record construction.
+    expect(refsFrom(refs, find(nodes, 'method', 'Transfer'), 'calls')).toContain('TransferProposal');
+    expect(refsFrom(refs, find(nodes, 'method', 'Transfer'), 'instantiates')).toEqual([]);
+    // `create asset with owner = ...` updates a template field's record: no template is named.
+    expect(refsFrom(refs, find(nodes, 'method', 'Accept'), 'calls')).toEqual(['create']);
     expect(refsFrom(refs, find(nodes, 'method', 'Accept'), 'instantiates')).toEqual([]);
   });
 
@@ -214,5 +217,110 @@ setup = script do
     expect(calls.filter((c) => c === 'computeFee')).toHaveLength(1);
     // A curried call `allocateParty "Alice"` yields its callee, never the partial application.
     expect(calls.some((c) => c.includes(' '))).toBe(false);
+  });
+});
+
+const LEDGER = `module Settle.Batch where
+
+import Settle.Instruction (Instruction(..))
+import Iface.Account qualified as Account
+
+template Batch
+  with
+    instructor : Party
+    keys : [InstructionKey]
+  where
+    signatory instructor
+
+    choice Settle : [ContractId Instruction]
+      controller instructor
+      do mapA settleOne keys
+
+    choice Renew : ContractId Batch
+      controller instructor
+      do create this with keys = []
+
+settleOne : InstructionKey -> Update (ContractId Instruction)
+settleOne key = do
+  (cid, instruction) <- fetchByKey @Instruction key
+  account <- lookupByKey @Account.R instruction.accountKey
+  archive cid
+  pure cid
+
+reopen : (HasFetch t) => ContractId t -> Update t
+reopen cid = fetchFromInterface @t cid
+`;
+
+describe('DAML ledger actions on templates', () => {
+  it('calls the template a by-key action names, and the template `create this` is written in', () => {
+    const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Settle/Batch.daml', LEDGER);
+    expect(refsFrom(refs, find(nodes, 'function', 'settleOne'), 'calls')).toEqual(expect.arrayContaining(['Instruction', 'Iface.Account::R']));
+    expect(refsFrom(refs, find(nodes, 'method', 'Renew'), 'calls')).toContain('Settle.Batch::Batch');
+    expect(refsFrom(refs, find(nodes, 'method', 'Renew'), 'instantiates')).toEqual([]);
+    // A type variable names no template.
+    expect(refsFrom(refs, find(nodes, 'function', 'reopen'), 'calls')).toEqual(['fetchFromInterface']);
+  });
+});
+
+const VALUES = `module Pay where
+
+import Pay.Util (Step(..), price)
+
+total : [Step] -> Decimal
+total steps = sum . map price $ filter isOpen steps
+  where
+    isOpen step = step.open
+
+settle : Party -> [Step] -> Update [Step]
+settle owner steps = do
+  paid <- mapA (pay owner) steps
+  let fee = feeOf owner
+  forA_ paid \\s -> case s of
+    Step{open} -> assertMsg "open" (open && fee > 0.0)
+  pure $ map (.amount) paid
+
+wild : Step -> Decimal
+wild Step{..} = amount + bonus
+`;
+
+describe('DAML functions named as values', () => {
+  it('calls a function composed, applied with `$`, or passed to another function', () => {
+    const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Pay.daml', VALUES);
+    const total = refsFrom(refs, find(nodes, 'function', 'total'), 'calls');
+    expect(total).toEqual(expect.arrayContaining(['sum', 'map', 'price', 'filter', 'isOpen']));
+  });
+
+  it('does not reference what the code binds itself, field labels, selectors or import lists', () => {
+    const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Pay.daml', VALUES);
+    const settle = refsFrom(refs, find(nodes, 'function', 'settle'), 'calls');
+    expect(settle).toEqual(expect.arrayContaining(['mapA', 'pay', 'feeOf', 'forA_', 'assertMsg', 'pure', 'map']));
+    for (const bound of ['owner', 'steps', 'paid', 'fee', 's', 'open', 'amount']) expect(settle).not.toContain(bound);
+    const module = nodes.find((n) => n.kind === 'namespace')!;
+    expect(refsFrom(refs, module, 'calls')).toEqual([]);
+    // A record wildcard binds names this file can't see.
+    expect(refsFrom(refs, find(nodes, 'function', 'wild'), 'calls')).toEqual([]);
+  });
+
+  it('keeps the calls of a pattern binding and binds its variables', () => {
+    const source = `module P where
+
+f x = do
+  let cid : ContractId T = coerceContractId (g x)
+      (a, b) = split x
+  h cid a b
+
+k y = total + 1
+  where
+    (total, _) = split y
+`;
+    const { nodes, unresolvedReferences: refs } = extractFromSource('daml/P.daml', source);
+    expect(refsFrom(refs, find(nodes, 'function', 'f'), 'calls').sort()).toEqual(['coerceContractId', 'g', 'h', 'split']);
+    expect(refsFrom(refs, find(nodes, 'function', 'k'), 'calls')).toEqual(['split']);
+  });
+
+  it('treats template and choice fields and `this` as bound inside a template', () => {
+    const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Token/Asset.daml', ASSET);
+    expect(refsFrom(refs, find(nodes, 'method', 'Peek'), 'calls')).toEqual(['pure']);
+    expect(refsFrom(refs, find(nodes, 'method', 'Transfer'), 'calls').sort()).toEqual(['TransferProposal', 'create']);
   });
 });

@@ -37,7 +37,7 @@ import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClas
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
-import { gateHaskellNearestCopy, gateHaskellScope, resolveHaskellModuleRef } from './haskell-modules';
+import { gateHaskellNearestCopy, gateHaskellScope, isDamlLedgerRef, isHaskellValue, resolveDamlLedgerRef, resolveHaskellModuleRef } from './haskell-modules';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -1189,10 +1189,16 @@ export class ReferenceResolver {
     // A name a declaration around the reference declares as a type parameter
     // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters),
     // and a Dart call to a parameter or local calls that (./dart-local-scope).
-    // A Haskell/DAML reference also resolves through its module scope
-    // (see ./haskell-modules).
+    // A Haskell/DAML reference also resolves through its module scope, and a
+    // DAML ledger action's template first of all (see ./haskell-modules).
     const inner = gateHaskellScope(
-      gateHaskellNearestCopy(this.resolveOneInner(ref) ?? resolveHaskellModuleRef(ref, this.context), ref, this.context),
+      gateHaskellNearestCopy(
+        (isDamlLedgerRef(ref) ? resolveDamlLedgerRef(ref, this.context) : null) ??
+          this.resolveOneInner(ref) ??
+          resolveHaskellModuleRef(ref, this.context),
+        ref,
+        this.context,
+      ),
       ref,
       this.context,
     );
@@ -1580,14 +1586,19 @@ export class ReferenceResolver {
       // express instantiation as `Foo()` — extraction can't tell that
       // apart from a function call without symbol info, but resolution
       // can: if `Foo` resolves to a class, the call IS an instantiation.
+      // A DAML template is the exception: `create T with ..` and `fetchByKey @T`
+      // are ledger actions that run the template's clauses, so they stay calls.
+      // A Haskell / DAML top-level value (`fee : Decimal`) is read, not called.
       if (kind === 'calls') {
         const targetNode = this.nodeById(ref.targetNodeId);
         if (
           targetNode &&
-          (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union')
+          (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union') &&
+          !(targetNode.language === 'daml' && targetNode.decorators?.includes('template'))
         ) {
           kind = 'instantiates';
         }
+        if (targetNode && isHaskellValue(targetNode)) kind = 'references';
       }
 
       // One reference can name several targets — a navigation whose

@@ -331,6 +331,8 @@ export function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext, kind
  *
  * - a `do` statement or guard `pat <- e` (no `match`), whose expression runs in
  *   the enclosing function;
+ * - a pattern binding (`(a, b) = split x`, or a value with its type,
+ *   `cid : ContractId T = coerce x`), which binds no name of its own;
  * - a value binding in a `do` block's `let` (`let fee = computeFee amount`),
  *   which is part of the enclosing function's body rather than a callable of
  *   its own. Without this, calls in it hang off a nested node that nothing
@@ -352,7 +354,10 @@ function handleStatementBind(node: SyntaxNode, ctx: ExtractorContext): boolean {
     localBinds.parent?.type === 'let' &&
     localBinds.parent.parent?.type === 'do' &&
     !!getChildByField(node, 'name');
-  if (!isDoLetValue) return false;
+  // A pattern binding (`(a, b) = split x`, `cid : ContractId T = coerce x`)
+  // names no function: its expression runs in the enclosing one.
+  const isPatternBind = !getChildByField(node, 'name') && !!getChildByField(node, 'pattern');
+  if (!isDoLetValue && !isPatternBind) return false;
   for (const child of match.namedChildren) {
     if (child) ctx.visitNode(child);
   }

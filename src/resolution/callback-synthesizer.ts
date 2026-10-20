@@ -800,7 +800,7 @@ async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Pro
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
-  'arkts',
+  'arkts', 'daml',
 ]);
 /**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
@@ -4399,7 +4399,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
   {
     name: 'ifaceEdges',
-    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', 'daml', ...JS_FAMILY),
     run: (q, _c, y) => interfaceOverrideEdges(q, y),
   },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
