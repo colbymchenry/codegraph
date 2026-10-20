@@ -8076,6 +8076,110 @@ function rustEnclosingImplLine(ref: UnresolvedRef, context: ResolutionContext): 
   return 0;
 }
 
+interface RustSelfType {
+  /** Its name (`TcpListener`), or the trait's in a trait's own body. */
+  type: string;
+  /** The first segment of the path it is written with (`tokio` of `tokio::net::TcpListener`), if any. */
+  root: string | null;
+  /** The trait a trait impl implements. */
+  trait: string | null;
+  /** Inside a trait's own body. */
+  isTrait: boolean;
+}
+
+/** The type `Self` is where `ref` is written: its `impl`'s implementing type (and trait), or the trait it sits in. */
+function rustSelfType(ref: UnresolvedRef, context: ResolutionContext): RustSelfType | null {
+  const header = rustEnclosingImplLine(ref, context);
+  if (header === 0) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  let text = (lines[header - 1] ?? '').replace(/\/\/.*$/, '');
+  for (let j = header; !text.includes('{') && j < Math.min(lines.length, header + 8); j++) text += ` ${(lines[j] ?? '').replace(/\/\/.*$/, '')}`;
+  const trait = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Za-z_]\w*)/.exec(text)?.[1];
+  if (trait) return { type: trait, root: null, trait: null, isTrait: true };
+  const impl = parseRustImplHeader(text);
+  // The type as written: `tokio::net::TcpListener` after a trait impl's `for`,
+  // or right after an inherent impl's `impl<T: Into<U>>`.
+  const written = (impl
+    ? /\sfor\s+(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/.exec(text)
+    : /\bimpl\b\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/.exec(text))?.[1]?.split('::').map((s) => s.trim()) ?? [];
+  const type = impl ? impl.self : written[written.length - 1];
+  if (!type) return null;
+  return { type, root: written.length > 1 ? written[0]! : null, trait: impl?.trait || null, isTrait: false };
+}
+
+/**
+ * Whether `Self`'s type comes from outside the project: written through std's
+ * or a dependency's path, brought in by an outside `use`, or a std type the
+ * project doesn't declare. Its own functions are then nothing the index holds.
+ */
+function isRustOutsideSelf(self: RustSelfType, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (self.root !== null) return self.root === 'std' || self.root === 'core' || self.root === 'alloc' || rustDependencyCrates(context).has(self.root);
+  const uses = rustUsesOf(ref.filePath, context);
+  if (uses.external.has(self.type) && !uses.bound.has(self.type)) return true;
+  return RUST_STD_TYPES.has(self.type) && !isRustProjectNamed(self.type, RUST_DECLARED_TYPE_KINDS, context);
+}
+
+const RUST_SELF_PATH_KINDS = new Set(['method', 'function', 'enum_member']);
+
+/**
+ * A Rust `Self::x(…)` call is `x` of the type `Self` is where it is written:
+ * `Self::new(…)` in `impl Error` is `Error::new`, `Self::Text(…)` in `impl
+ * Message` its variant, and in a trait impl or a trait's own body the trait's
+ * method when the type has none. The receiver names no type of its own, so a
+ * guess by the name alone took such a call only when nothing else shared the
+ * name: clap's 118 `Self::new(…)`-style calls stayed unresolved, tokio's 56.
+ * The type's own file first — where its impls are — then the nearest. Null
+ * when the type has no such function the index holds — the call is then no
+ * other type's — and undefined when there is no `impl` or `trait` around it.
+ */
+function matchRustSelfPath(name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const self = rustSelfType(ref, context);
+  if (!self) return undefined;
+  // An outside type (axum's `impl Listener for tokio::net::TcpListener`) has
+  // only the project's impls on it, written beside the call: another type of
+  // its name elsewhere is not it.
+  const outside = !self.isTrait && isRustOutsideSelf(self, ref, context);
+  // A trait's method is one its own body declares: clap's `impl<T: Parser>
+  // Parser for Box<T>` calls `Self::new`, which is `Box::new`, not the
+  // `new` of a struct also named `Parser`.
+  const inTrait = (n: Node, trait: string): boolean => (context.getNodesInFileNamed?.(n.filePath, trait) ?? context.getNodesInFile(n.filePath))
+    .some((t) => t.kind === 'trait' && t.name === trait && t.startLine <= n.startLine && (t.endLine ?? 0) >= n.startLine);
+  const pick = (owner: string, trait = false): Node | null => {
+    const all = context.getNodesByName(name).filter((n) => n.language === 'rust' && RUST_SELF_PATH_KINDS.has(n.kind) &&
+      (n.qualifiedName === `${owner}::${name}` || n.qualifiedName.endsWith(`::${owner}::${name}`)) && (!trait || inTrait(n, owner)) &&
+      (trait || !outside || n.filePath === ref.filePath) &&
+      // `fn local_addr(&self) { Self::local_addr(self) }` in a trait impl hands
+      // the call on to the type's own function of that name, never to itself;
+      // in the type's own impl it is a recursion (gleam's `resolve_type_var_id`).
+      (self.trait === null || n.id !== ref.fromNodeId));
+    // Rust looks up the type's own (inherent) function first, `#[cfg]` twins
+    // of it standing for one another; a trait impl's only when there is none,
+    // and several trait impls of one name (`From<A>`, `From<B>`) can't be told apart.
+    const inherent = all.filter((n) => !isRustTraitImplMethod(n, context));
+    const candidates = inherent.length > 0 ? inherent : all.length === 1 ? all : [];
+    if (candidates.length === 0) return null;
+    const own = candidates.find((n) => n.filePath === ref.filePath);
+    if (own) return own;
+    let best = candidates[0]!;
+    let score = computePathProximity(ref.filePath, best.filePath);
+    for (const c of candidates.slice(1)) {
+      const s = computePathProximity(ref.filePath, c.filePath);
+      if (s > score) {
+        score = s;
+        best = c;
+      }
+    }
+    return best;
+  };
+  // The trait's own method only where nothing could shadow it: an outside
+  // type may have an inherent one of the name, and `fn local_addr(&self) {
+  // Self::local_addr(self) }` hands the call on to the type's own.
+  const delegates = context.getNodeById?.(ref.fromNodeId)?.name === name;
+  const target = pick(self.type, self.isTrait) ?? (self.trait && !outside && !delegates ? pick(self.trait, true) : null);
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.id, confidence: target.filePath === ref.filePath ? 0.9 : 0.8, resolvedBy: 'qualified-name' };
+}
+
 /** Whether `candidate` is declared in the same `impl` / `trait` block as `ref`, above it. */
 function isInEnclosingRustImpl(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const header = rustEnclosingImplLine(ref, context);
@@ -15448,6 +15552,12 @@ export function matchMethodCall(
     const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null =>
       resolveObjectPathMember(objectOrClass!, methodName!, ref, context, null) ?? null);
     if (literalMatch) return literalMatch;
+  }
+
+  // A Rust `Self::x(…)`: `x` of the impl's own type (matchRustSelfPath).
+  if (ref.language === 'rust' && match === colonMatch && objectOrClass === 'Self') {
+    const own = matchRustSelfPath(methodName!, ref, context);
+    if (own !== undefined) return own;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
