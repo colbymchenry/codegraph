@@ -45,8 +45,8 @@ done
 # before the type-and-verify loop or keystrokes land on the menu.
 for _ in $(seq 1 20); do
   cap | grep -q "trust this folder" || break
-  if cap | grep -qE "❯ *(1\. *)?No, exit"; then tmux send-keys -t "$SESSION" Down; sleep 0.5; fi
-  cap | grep -qE "❯ *(2\. *)?Yes, I trust" && tmux send-keys -t "$SESSION" Enter
+  if cap | grep -qE "❯ *([0-9]\. *)?No, exit"; then tmux send-keys -t "$SESSION" Down; sleep 0.5; fi
+  cap | grep -qE "❯ *([0-9]\. *)?Yes, I trust" && tmux send-keys -t "$SESSION" Enter
   sleep 1
 done
 
