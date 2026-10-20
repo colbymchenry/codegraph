@@ -18692,6 +18692,7 @@ export function matchMethodCall(
       // is a Tokeniser, `table.Columns` no kind of table.
       const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
       const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
+      const wholeReceiver = receiverLink(objectOrClass!).replace(/_/g, '').toLowerCase();
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
       let tied: typeof targetMethods = [];
@@ -18717,6 +18718,11 @@ export function matchMethodCall(
         // The receiver's head noun naming the owner's: `bookPage` is a Page
         // before it is anything of a Book's.
         if (head !== undefined && head === classWords[classWords.length - 1]?.toLowerCase()) score += 1;
+        // The receiver spelling the owner's whole name: Django's
+        // `self.client` is a `Client` before a `RedisCacheClient`, which only
+        // ends in the word, and `self.nodelist` a `NodeList`, though no one
+        // word of it matches.
+        if (classWords.length > 0 && wholeReceiver === classWords.join('').toLowerCase()) score += 2;
         // Bonus for same language
         if (method.language === ref.language) score += 1;
         if (score > bestScore) {
@@ -20448,6 +20454,15 @@ function matchPythonAttrCall(
   read: Set<string> = new Set(),
 ): ResolvedRef | null | undefined {
   const segs = receiver.split('.');
+  // A chain through a module — `os.path.exists()`, `np.linalg.norm()`, an
+  // `import utils` of the project's — is the module's: import resolution
+  // answers the project's own members, and no class method of the project's
+  // is a guess for one, not even `PathNotImplementedStorage.exists` by its
+  // shared word.
+  const root = segs[0]!;
+  if (isPythonOutsideModuleReceiver(root, ref, context) ||
+      (context.getImportMappings(ref.filePath, 'python').some((m) => m.isNamespace && m.localName === root) &&
+        !pythonBindsLocally(root, ref, context, false))) return null;
   if (segs.length !== 2) return undefined;
   const [head, attr] = segs as [string, string];
 

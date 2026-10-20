@@ -80,6 +80,32 @@ describe('python attribute-chain receivers', () => {
     expect(callsFrom('method', 'run')).toEqual([]);
   });
 
+  it('guesses the class the last link spells whole before one that only shares its word', async () => {
+    // Django's test `Client` and the cache's `RedisCacheClient` both have a
+    // `get`; `self.client` is the one it is named after. `self.nodelist` is a
+    // `NodeList` though no single word of it matches.
+    writeTree({
+      'cache.py': 'class RedisCacheClient:\n    def get(self, k):\n        return k\n',
+      'client.py': 'class Client:\n    def get(self, k):\n        return k\n',
+      'nodes.py': 'class NodeList:\n    def render(self, c):\n        return c\n\n\nclass Other:\n    def render(self, c):\n        return c\n',
+      'tests.py': 'class Tests:\n    def setUp(self, client, nodelist):\n        self.client = client\n        self.nodelist = nodelist\n\n'
+        + '    def run(self):\n        self.client.get(1)\n        self.nodelist.render(2)\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(callsFrom('method', 'run').sort()).toEqual(['method:get@client.py', 'method:render@nodes.py']);
+  });
+
+  it('leaves a chain through a module to the module', async () => {
+    // `os.path.exists()` is the stdlib's, not a project storage's `exists`
+    // whose class shares the word `Path`.
+    writeTree({
+      'storage.py': 'class PathNotImplementedStorage:\n    def exists(self, p):\n        return p\n\n\nclass Storage:\n    def exists(self, p):\n        return p\n',
+      'use.py': 'import os\n\n\ndef has(p):\n    return os.path.exists(p)\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(callsFrom('function', 'has')).toEqual([]);
+  });
+
   it('guesses an untyped chain only by the name of its last link, as any receiver', async () => {
     // Nothing types `cfg`, so the type reader has no answer. `cfg.client` is
     // then guessed as a `Client` by its name — the guess every untyped
