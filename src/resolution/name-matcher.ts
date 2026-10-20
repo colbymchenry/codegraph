@@ -16815,6 +16815,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_FACTORY_MEMO.delete(context);
   PY_STATEMENTS_MEMO.delete(context);
   PY_BASES_MEMO.delete(context);
+  PY_FILE_CLASSES.delete(context);
+  PY_ATTR_CALL_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -20493,8 +20495,8 @@ function matchPythonAttrCall(
   let owner: Node | null = null;
   if (head === 'self' || head === 'cls') {
     // The innermost class whose extent holds the call.
-    for (const n of context.getNodesInFile(ref.filePath)) {
-      if (n.kind !== 'class' || n.startLine > ref.line || n.endLine < ref.line) continue;
+    for (const n of pythonFileClasses(ref.filePath, context)) {
+      if (n.startLine > ref.line || n.endLine < ref.line) continue;
       if (!owner || n.startLine > owner.startLine) owner = n;
     }
   } else if (/^[A-Z]/.test(head)) {
@@ -20507,16 +20509,64 @@ function matchPythonAttrCall(
   }
   if (!owner) return undefined;
 
-  const cls = pythonAttrClass(owner, attr, context, read);
-  if (cls === 'runtime') return null;
-  if (!cls || cls === 'absent') return undefined;
-  const hit = pythonMethodOnClass(cls, methodName, ref, context, read) ?? pythonSubclassMethod(cls, methodName, ref, context);
-  // The class has no such method of the project's — unless a base the reader
-  // cannot find holds it: Django's `ComplexField(MultiValueField)`, its base
-  // imported from a package that re-exports it.
-  if (!hit) return pythonHierarchyKnown(cls, context) ? null : undefined;
+  const hit = pythonAttrCallOn(owner, attr, methodName, ref, context, read);
+  if (!hit) return hit;
   read.delete(ref.filePath);
   return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
+/** Per context: a python file's classes, for the class around a `self.x.m()` call. */
+const PY_FILE_CLASSES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+function pythonFileClasses(filePath: string, context: ResolutionContext): Node[] {
+  const memo = pyMemo(PY_FILE_CLASSES, context);
+  let hit = memo.get(filePath);
+  if (!hit) {
+    hit = context.getNodesInFile(filePath).filter((n) => n.kind === 'class');
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(filePath, hit);
+  }
+  return hit;
+}
+
+/** Per context: owner + attribute + method → matchPythonAttrCall's answer for that class, and the files it read. */
+const PY_ATTR_CALL_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: ResolvedRef | null | undefined; read: string[] }>>();
+
+/**
+ * matchPythonAttrCall's answer once the owner class is known: the same for
+ * every call of `methodName` through `attr` of that class — Django's
+ * thousand `self.client.get()`s in one test class read it once.
+ */
+function pythonAttrCallOn(
+  owner: Node,
+  attr: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): ResolvedRef | null | undefined {
+  const memo = pyMemo(PY_ATTR_CALL_MEMO, context);
+  const key = `${owner.id}\0${attr}\0${methodName}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    const cls = pythonAttrClass(owner, attr, context, own);
+    let answer: ResolvedRef | null | undefined;
+    if (cls === 'runtime') answer = null;
+    else if (!cls || cls === 'absent') answer = undefined;
+    else {
+      // The class has no such method of the project's — unless a base the
+      // reader cannot find holds it: Django's `ComplexField(MultiValueField)`,
+      // its base imported from a package that re-exports it.
+      answer = pythonMethodOnClass(cls, methodName, ref, context, own) ?? pythonSubclassMethod(cls, methodName, ref, context) ??
+        (pythonHierarchyKnown(cls, context) ? null : undefined);
+    }
+    hit = { answer, read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer ? { ...hit.answer, original: ref } : hit.answer;
 }
 
 /**
