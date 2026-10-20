@@ -313,6 +313,9 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     if (decl.asserted !== undefined) {
       return decl.asserted && resolveMethodOnType(decl.asserted.name, member, ref, context, 0.9, 'function-ref', decl.asserted.dir);
     }
+    // One declared as a type literal, a type from outside the project or an
+    // alias of one holds no project method to take.
+    if (decl.declared === null || (decl.declared !== undefined && goHasNoProjectMethods(decl.declared, ref, context))) return null;
     if (type) {
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
         goDeclaredTypePackage(decl.raw, ref.filePath, context));
@@ -2294,13 +2297,11 @@ interface GoQualification {
   imported?: ImportMapping;
   /**
    * For a call through a parameter or local that takes an import's name, the
-   * type it is declared as, when its declaration writes one (`*tokenJWT`,
-   * `clock.PassiveClock`), and the import that type is written through —
-   * `clock` in a parameter `clock clock.PassiveClock`, `atomic` in
-   * `cache := &atomic.Bool{}` — or its value comes from: `reflect` in
-   * `value := reflect.New(t)`.
+   * import the type its declaration writes is written through — `clock` in a
+   * parameter `clock clock.PassiveClock`, `atomic` in `cache :=
+   * &atomic.Bool{}` — or its value comes from: `reflect` in `value :=
+   * reflect.New(t)`.
    */
-  declaredType?: string;
   typePackage?: ImportMapping;
 }
 
@@ -2337,7 +2338,6 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   }
   const imports = context.getImportMappings(ref.filePath, 'go');
   let imported = written ? imports.find((m) => m.localName === written) : undefined;
-  let declaredType: string | undefined;
   let typePackage: ImportMapping | undefined;
   // A call through a parameter or local that takes the import's name is a
   // call on that variable: etcd's `jwt, err := newTokenProviderJWT(…)`, then
@@ -2347,16 +2347,15 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   // (`quota.Name`) is no call.
   const local = imported && dot >= 0 && ref.referenceKind === 'calls' ? goLocalDecl(written!, ref, context) : undefined;
   if (local) {
-    declaredType = local.type;
     // A value a package outside the project hands out is of a type it
     // declares: kubernetes' `clock := clocktesting.NewFakePassiveClock(…)`
     // has no project method `Now`.
-    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(declaredType ?? '')?.[1] ?? local.from;
+    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(local.type ?? '')?.[1] ?? local.from;
     typePackage = qualifier ? imports.find((m) => m.localName === qualifier) : undefined;
     written = undefined;
     imported = undefined;
   }
-  const found = { written, imported, declaredType, typePackage };
+  const found = { written, imported, typePackage };
   memo.set(key, found);
   return found;
 }
@@ -2455,6 +2454,21 @@ function isGoOutsideImport(imp: ImportMapping, filePath: string, context: Resolu
 function isGoOutsideType(written: string | undefined, filePath: string, context: ResolutionContext): boolean {
   const qualifier = written && /^[*&\s]*([A-Za-z_]\w*)\s*\./.exec(written)?.[1];
   return !!qualifier && isGoOutsidePackage(qualifier, filePath, context);
+}
+
+/**
+ * Whether a Go named type a declaration at `ref` writes (`goNamedType`) has
+ * none of the project's methods: a type from outside the project
+ * (`http.ResponseWriter`), a predeclared one, or an alias of such a type
+ * (`type Ctx = context.Context`). Not one written through a qualifier none
+ * of the file's imports names as indexed, or an unmapped internal package,
+ * which can't be told.
+ */
+function goHasNoProjectMethods(named: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (isGoOutsideType(named, ref.filePath, context)) return true;
+  const dot = named.indexOf('.');
+  if (dot >= 0 && !goImportPackageDir(named.slice(0, dot), ref.filePath, context)) return false;
+  return goWrittenType(named, ref, context) === null;
 }
 
 /** Whether `name` is the file's import of a package from outside the project: `context` in `context.WithTimeout(…)`. */
@@ -3473,6 +3487,10 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   let end = Math.min(ref.column, line.length);
   while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
   if (end === 0 || !RECEIVER_TAIL_CHAR.test(line[end - 1]!)) return true;
+  // In JS/TS a receiver ends in `.` or `?.`, so a `)` right before the name
+  // closes a statement header — `if (open) setOpen()`, `for (…) f()`, a header
+  // that wraps lines or holds a `)` in a string — and the call is bare (#2585).
+  if (line[end - 1] === ')' && JS_FAMILY.has(ref.language)) return true;
   let start = end;
   while (start > 0 && WORD_CHAR.test(line[start - 1]!)) start--;
   return BARE_CALL_KEYWORDS.has(line.slice(start, end));
@@ -3490,7 +3508,7 @@ const RECEIVER_TAIL_CHAR = /[.\w$\])]/;
  */
 const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
-  'if', 'switch', 'for', 'range',
+  'if', 'switch', 'for', 'range', 'do',
 ]);
 
 /**
@@ -5415,7 +5433,28 @@ function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shap
   const before = line.slice(0, start);
   if (/::\s*$/.test(before)) return { shape: 'path' };
   if (!/\.\s*$/.test(before)) return { shape: 'bare' };
-  return { shape: 'chained', receiver: rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '')) };
+  const receiver = before.replace(/\?\s*\.\s*$/, '');
+  return { shape: 'chained', receiver: isTupleReceiver(receiver) ? '()' : rustGoReceiverName(receiver) };
+}
+
+/**
+ * Whether a receiver's text ends in a tuple, `(self.ip(), self.port()).`: a
+ * parenthesized list with a comma of its own, no callee or macro before it.
+ */
+function isTupleReceiver(text: string): boolean {
+  const src = text.replace(/\s*\.\s*$/, '');
+  if (!src.endsWith(')')) return false;
+  let depth = 0;
+  let comma = false;
+  let i = src.length - 1;
+  for (; i >= 0; i--) {
+    const ch = src[i]!;
+    if (ch === ')' || ch === ']' || ch === '}') depth++;
+    else if (ch === '(' || ch === '[' || ch === '{') {
+      if (--depth === 0) break;
+    } else if (ch === ',' && depth === 1) comma = true;
+  }
+  return i >= 0 && comma && !/[\w$>\])!?]\s*$/.test(src.slice(0, i));
 }
 
 /**
@@ -5465,6 +5504,9 @@ function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>):
   if (!shape || shape.shape === 'path') return true;
   const member = n.kind === 'method';
   if (shape.shape === 'bare') return !member;
+  // A tuple's method is no named type's: serde's `(self.ip(),
+  // self.port()).serialize(s)` went to the `impl Serialize for Path` below it.
+  if (shape.receiver === '()') return false;
   if (!member) return n.kind !== 'function';
   // A name the standard library's own types all carry (`unwrap`, `clone`,
   // `iter`, Go's `String` / `Get`) needs a receiver named after the owner; a
@@ -7053,6 +7095,212 @@ function objcPropertyTypes(name: string, context: ResolutionContext): string[] {
   return [...types];
 }
 
+/**
+ * What one file declares of an Objective-C class: instance variables (an
+ * `@interface`'s ivar block, which subclasses see, or a class extension's or
+ * an `@implementation`'s, which they don't), properties (a category's can't
+ * be synthesized), and the ivar each `@synthesize` names for a property.
+ */
+interface ObjcClassMembers {
+  ivars: Map<string, string>;
+  ownIvars: Map<string, string>;
+  properties: Map<string, { type: string; category: boolean }>;
+  synthesized: Map<string, string>;
+}
+
+/** Per context: an Objective-C file → each class it declares → what it declares of it. */
+const OBJC_MEMBER_TABLES = new WeakMap<ResolutionContext, Map<string, Map<string, ObjcClassMembers>>>();
+/** Per context: class name + the calling file's directory → the files declaring that class. */
+const OBJC_CLASS_FILES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+// A declared class as a member declaration writes it, past qualifiers, with
+// its type arguments, protocol list or ObjFW's `OF_GENERIC(…)` after it, up to
+// the `*`: `OFObject <OFHTTPClientDelegate> *`, `OFArray OF_GENERIC(OFString *) *`,
+// `IBOutlet UIImageView *`.
+const OBJC_MEMBER_TYPE = String.raw`(?:(?:__strong|__weak|__unsafe_unretained|__block|const|volatile|IBOutlet|IBInspectable)\s+)*([A-Z]\w*)\s*(?:<[^;{}]*?>\s*|[A-Z][A-Z0-9_]*\s*\([^;{}]*?\)\s*)?\*`;
+// An instance variable, alone or listed: `OFDictionary *_headers;`, `OFString *_host, *_path;`.
+const OBJC_IVAR_RE = new RegExp(String.raw`^\s*${OBJC_MEMBER_TYPE}\s*((?:(?:_Nullable|_Nonnull|const)\s+)*\w+(?:\s*,\s*\*\s*(?:(?:_Nullable|_Nonnull|const)\s+)*\w+)*)\s*;`);
+// A property, past attribute macros and its attribute list:
+// `@property OF_NULLABLE_PROPERTY (readonly, nonatomic) OFString *host;`.
+const OBJC_PROPERTY_RE = new RegExp(String.raw`^\s*@property\b\s*(?:[A-Z][A-Z0-9_]+\s*)*(?:\([^)]*\)\s*)?(?:(?:nullable|nonnull|null_unspecified|__kindof)\s+)*${OBJC_MEMBER_TYPE}\s*(?:(?:_Nullable|_Nonnull|const)\s+)*(\w+)`);
+
+/**
+ * What each Objective-C class `filePath` declares has, by name, with the
+ * class each is declared as (ObjcClassMembers): read from `@interface`s (a
+ * header's, a class extension's or a category's: the ivar block right after
+ * the head, then `@property` declarations, which may run over several lines)
+ * and from an `@implementation`'s ivar block and `@synthesize` lines, never a
+ * method body.
+ */
+function objcFileMembers(filePath: string, context: ResolutionContext): Map<string, ObjcClassMembers> {
+  let memo = OBJC_MEMBER_TABLES.get(context);
+  if (!memo) OBJC_MEMBER_TABLES.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const tables = new Map<string, ObjcClassMembers>();
+  memo.set(filePath, tables);
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+  const count = (text: string, re: RegExp): number => (text.match(re) ?? []).length;
+  let members: ObjcClassMembers | null = null;
+  let inInterface = false;
+  // `@interface Name (Category)`, or a class extension `@interface Name ()`.
+  let category: string | null = null;
+  // A class declares ivars only in a block that is the first code after its
+  // head: 'head' until that code (`open` counts the head's unclosed `<` and
+  // `(`, as in a protocol list over several lines), 'ivars' inside the block
+  // (`depth` braces deep), 'body' past it.
+  let state: 'head' | 'ivars' | 'body' = 'body';
+  let open = 0;
+  let depth = 0;
+  // A `@property` declaration read so far, until its `;`.
+  let property: string | null = null;
+  for (const raw of lines) {
+    let line = raw.replace(/\/\/.*$/, '');
+    const head = /^\s*(?:[A-Z][A-Z0-9_]*(?:\([^)]*\))?\s+)*@(interface|implementation)\s+(\w+)\s*(?:<[^>]*>\s*|[A-Z][A-Z0-9_]*\([^)]*\)\s*)?(?:\(\s*(\w*)\s*\))?/.exec(line);
+    if (head) {
+      const cls = head[2]!;
+      members = tables.get(cls) ?? { ivars: new Map(), ownIvars: new Map(), properties: new Map(), synthesized: new Map() };
+      tables.set(cls, members);
+      inInterface = head[1] === 'interface';
+      category = head[3] ?? null;
+      state = 'head';
+      open = 0;
+      property = null;
+      line = line.slice(head.index + head[0].length);
+    } else if (/^\s*@end\b/.test(line)) {
+      members = null;
+      continue;
+    }
+    if (!members) continue;
+    if (state === 'head') {
+      // The head may go on with its superclass or protocol list on the next
+      // lines: ObjFW's `@interface OFKernelEventObserverTests: OTTestCase`
+      // over `    <OFKernelEventObserverDelegate>`.
+      const inHead = head !== null || open > 0 || /^\s*[<:]/.test(line);
+      open += count(line, /[<(]/g) - count(line, /[>)]/g);
+      const brace = line.indexOf('{');
+      if (brace >= 0) {
+        state = 'ivars';
+        depth = 0;
+        line = line.slice(brace);
+      } else if (inHead || open > 0 || /^\s*(?:$|\/\*|\*|#)/.test(line)) {
+        continue;
+      } else {
+        state = 'body';
+      }
+    }
+    if (state === 'ivars') {
+      depth += count(line, /\{/g) - count(line, /\}/g);
+      if (depth <= 0) state = 'body';
+      const ivar = OBJC_IVAR_RE.exec(line.replace(/^[^{]*\{/, '').replace(/\}.*$/, ''));
+      const ivars = inInterface && category === null ? members.ivars : members.ownIvars;
+      for (const name of ivar?.[2]!.split(',') ?? []) {
+        const bare = name.replace(/\*|_Nullable|_Nonnull|\bconst\b/g, '').trim();
+        if (/^\w+$/.test(bare) && !ivars.has(bare)) ivars.set(bare, ivar![1]!);
+      }
+      continue;
+    }
+    if (!inInterface) {
+      const synthesize = /^\s*@synthesize\s+([^;]+);/.exec(line);
+      for (const item of synthesize?.[1]!.split(',') ?? []) {
+        const [name, ivar] = item.split('=').map((s) => s.trim());
+        if (name && /^\w+$/.test(ivar ?? name)) members.synthesized.set(ivar ?? name, name);
+      }
+      continue;
+    }
+    if (property === null && !/^\s*@property\b/.test(line)) continue;
+    property = property === null ? line : `${property} ${line}`;
+    if (!property.includes(';') && property.length < 400) continue;
+    const declared = OBJC_PROPERTY_RE.exec(property);
+    property = null;
+    if (declared && !members.properties.has(declared[2]!)) {
+      members.properties.set(declared[2]!, { type: declared[1]!, category: !!category });
+    }
+  }
+  return tables;
+}
+
+/**
+ * The files declaring the Objective-C class `name`, the calling file first.
+ * When more than one file declares the class itself (`@interface Name`, not a
+ * category or an extension), they are namesakes in separate targets, like
+ * each SDWebImage demo app's `ViewController`, and only the declarations in
+ * the calling file's directory are the one the call means.
+ */
+function objcClassFiles(name: string, ref: UnresolvedRef, context: ResolutionContext): string[] {
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  let memo = OBJC_CLASS_FILES.get(context);
+  if (!memo) OBJC_CLASS_FILES.set(context, (memo = new Map()));
+  const key = `${name}\u0000${dir}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  const decls = context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'objc');
+  const primary = new Set<string>();
+  const own = new RegExp(`@interface\\s+${name}\\b(?!\\s*\\()`);
+  for (const decl of decls) {
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    if (lines.slice(decl.startLine - 1, decl.endLine).some((l) => own.test(l))) primary.add(decl.filePath);
+  }
+  const inDir = (file: string) => file.startsWith(dir) && !file.includes('/', dir.length);
+  const files = [...new Set(decls.map((n) => n.filePath))]
+    .filter((file) => primary.size < 2 || inDir(file))
+    .sort((a, b) => Number(b === ref.filePath) - Number(a === ref.filePath));
+  memo.set(key, files);
+  return files;
+}
+
+/**
+ * The class an Objective-C receiver is declared as when it is an instance
+ * variable of the class around the call, or a property read through `self.`:
+ * ObjFW's `[_headers mutableCopy]` on an `OFMutableDictionary *_headers;`
+ * ivar, the ivar a property synthesizes (`_name`, or the one `@synthesize`
+ * names), or `[self.weakCache objectForKey:]` on an `NSMapTable` property. A
+ * class it inherits from lends the ivars its `@interface` declares and its
+ * properties. A local or a parameter, which the shared inferrer reads first,
+ * shadows an ivar, and a bare name is never a property's: `arcs` in
+ * `initWithArcs:` is the parameter. Null when nothing declares it.
+ */
+function objcMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const viaSelf = receiver.startsWith('self.');
+  const name = viaSelf ? receiver.slice(5) : receiver;
+  if (!/^[A-Za-z_]\w*$/.test(name) || name === 'self' || name === 'super') return null;
+  // A capitalized name is a class (`[OFString stringWithFormat:]`), not an
+  // ivar, and `self.name` needs a property of that name.
+  if (viaSelf ? !context.getNodesByName(name).some((n) => n.kind === 'property' && n.language === 'objc') : /^[A-Z]/.test(name)) {
+    return null;
+  }
+  const hierarchy = objcHierarchyAt(ref, context);
+  if (!hierarchy) return null;
+  // What each class of the hierarchy declares, the calling one first.
+  const levels = [...hierarchy].map((cls) => objcClassFiles(cls, ref, context)
+    .map((file) => objcFileMembers(file, context).get(cls))
+    .filter((t): t is ObjcClassMembers => t !== undefined));
+  // A property's type, from the calling class up; `own`: only one the calling
+  // class declares and may synthesize, never a category's.
+  const propertyType = (key: string, own: boolean): string | undefined => {
+    for (const level of own ? levels.slice(0, 1) : levels) {
+      for (const t of level) {
+        const p = t.properties.get(key);
+        if (p && !(own && p.category)) return p.type;
+      }
+    }
+    return undefined;
+  };
+  if (viaSelf) return propertyType(name, false) ?? null;
+  for (const [i, level] of levels.entries()) {
+    for (const t of level) {
+      const type = t.ivars.get(name) ?? (i === 0 ? t.ownIvars.get(name) : undefined);
+      if (type) return type;
+    }
+    if (i > 0) continue;
+    const synthesized = level.map((t) => t.synthesized.get(name)).find((p) => p !== undefined);
+    const type = synthesized !== undefined ? propertyType(synthesized, false)
+      : name.startsWith('_') ? propertyType(name.slice(1), true) : undefined;
+    if (type) return type;
+  }
+  return null;
+}
+
 /** The superclasses an Objective-C class's `@interface` declarations name. */
 function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   let memo = OBJC_SUPERS.get(context);
@@ -7911,6 +8159,84 @@ const RUST_STD_TYPES = new Set([
 ]);
 const RUST_DECLARED_TYPE_KINDS = new Set(['struct', 'enum', 'union', 'type_alias', 'trait']);
 
+const rustNameSets = (lists: Record<string, string>): ReadonlyMap<string, ReadonlySet<string>> =>
+  new Map(Object.entries(lists).map(([type, names]) => [type, new Set(names.split(' '))]));
+
+const RUST_RC_INHERENT = 'new new_cyclic new_uninit new_uninit_slice new_zeroed pin try_new try_unwrap into_inner unwrap_or_clone ' +
+  'into_raw as_ptr from_raw increment_strong_count decrement_strong_count downgrade weak_count strong_count get_mut make_mut ptr_eq ' +
+  'downcast assume_init';
+/** `Pin`'s methods; its other functions (`Pin::new`, `Pin::into_inner`) are reached by path alone. */
+const RUST_PIN_METHODS = 'as_ref as_mut as_deref_mut set get_ref get_mut get_unchecked_mut into_ref map_unchecked map_unchecked_mut';
+
+/**
+ * What std declares on its own types, which Rust picks before any trait's
+ * function of the same name, on a path (`Arc::from_raw(ptr)`) as on a value
+ * (`v.len()`): tokio's `Arc::from_raw(…)` is std's own, never its `impl Link
+ * for Arc<ScheduledIo>`'s. Only what the type itself declares: a slice's
+ * `iter`, which a `Vec` reaches by deref, comes after a trait impl on the
+ * `Vec`. A name missing here leaves the trait's function in reach.
+ */
+const RUST_STD_INHERENT = rustNameSets({
+  Arc: RUST_RC_INHERENT,
+  Rc: RUST_RC_INHERENT,
+  Weak: 'new upgrade strong_count weak_count as_ptr into_raw from_raw ptr_eq',
+  Box: 'new new_uninit new_uninit_slice new_zeroed pin try_new from_raw into_raw from_non_null into_non_null leak into_pin ' +
+    'into_boxed_slice into_inner as_ptr as_mut_ptr downcast assume_init write',
+  NonNull: 'new new_unchecked dangling as_ptr as_ref as_mut cast add sub offset byte_add byte_sub byte_offset offset_from read ' +
+    'read_unaligned read_volatile write write_bytes write_unaligned write_volatile replace swap copy_to copy_from ' +
+    'copy_to_nonoverlapping copy_from_nonoverlapping drop_in_place from_ref from_mut slice_from_raw_parts len addr with_addr ' +
+    'map_addr align_offset is_aligned',
+  Pin: `new new_unchecked into_inner into_inner_unchecked static_ref static_mut ${RUST_PIN_METHODS}`,
+  Cell: 'new set swap replace into_inner get update as_ptr get_mut from_mut take',
+  RefCell: 'new into_inner replace replace_with swap borrow try_borrow borrow_mut try_borrow_mut as_ptr get_mut take',
+  Mutex: 'new lock try_lock is_poisoned clear_poison into_inner get_mut',
+  RwLock: 'new read try_read write try_write is_poisoned clear_poison into_inner get_mut',
+  Vec: 'new with_capacity from_raw_parts capacity reserve reserve_exact try_reserve try_reserve_exact shrink_to_fit shrink_to ' +
+    'into_boxed_slice truncate as_slice as_mut_slice as_ptr as_mut_ptr set_len swap_remove insert remove retain retain_mut ' +
+    'dedup_by_key dedup_by dedup push pop pop_if append drain clear len is_empty split_off resize_with resize leak ' +
+    'spare_capacity_mut extend_from_slice extend_from_within splice extract_if into_flattened',
+  String: 'new with_capacity from_utf8 from_utf8_lossy from_utf8_unchecked from_utf16 from_utf16_lossy from_raw_parts into_bytes ' +
+    'as_str as_mut_str push_str extend_from_within capacity reserve reserve_exact try_reserve try_reserve_exact shrink_to_fit ' +
+    'shrink_to push as_bytes truncate pop remove retain insert insert_str as_mut_vec len is_empty split_off clear drain ' +
+    'replace_range into_boxed_str leak',
+  Option: 'is_some is_some_and is_none is_none_or as_ref as_mut as_pin_ref as_pin_mut as_slice as_mut_slice expect unwrap ' +
+    'unwrap_or unwrap_or_else unwrap_or_default unwrap_unchecked map inspect map_or map_or_else ok_or ok_or_else as_deref ' +
+    'as_deref_mut iter iter_mut and and_then filter or or_else xor insert get_or_insert get_or_insert_default ' +
+    'get_or_insert_with take take_if replace zip unzip copied cloned transpose flatten',
+  Result: 'is_ok is_ok_and is_err is_err_and ok err as_ref as_mut map map_or map_or_else map_err inspect inspect_err as_deref ' +
+    'as_deref_mut iter iter_mut expect unwrap unwrap_or_default expect_err unwrap_err into_ok into_err and and_then or or_else ' +
+    'unwrap_or unwrap_or_else unwrap_unchecked unwrap_err_unchecked copied cloned transpose flatten',
+});
+
+/** What the std traits a smart pointer implements answer through it: `Clone`, `AsRef`, `Deref`, `Debug`, `PartialEq`, … */
+const RUST_POINTER_TRAIT_METHODS = 'clone clone_from as_ref borrow deref fmt eq ne partial_cmp lt le gt ge cmp max min clamp hash ' +
+  'into try_into to_string';
+
+/**
+ * What a std wrapper a value is reached through answers itself, ahead of the
+ * type it wraps — Rust tries the wrapper before dereferencing it: `Pin`'s own
+ * methods, and the std traits it implements (`Rc`'s `clone`, `Deref`,
+ * `Debug`). tokio's `self.get_mut()` through `self: Pin<&mut Self>` is
+ * `Pin::get_mut`, not its own `BufReader::get_mut`. (`Pin<&mut T>` is no
+ * `Clone`: `self.clone()` through one is the type's.)
+ */
+const RUST_WRAPPER_OWN_METHODS = rustNameSets({
+  Pin: `${RUST_PIN_METHODS} deref deref_mut fmt eq ne partial_cmp lt le gt ge cmp max min clamp hash into try_into to_string`,
+  Box: `${RUST_POINTER_TRAIT_METHODS} as_mut borrow_mut deref_mut downcast`,
+  Rc: `${RUST_POINTER_TRAIT_METHODS} downcast`,
+  Arc: `${RUST_POINTER_TRAIT_METHODS} downcast`,
+});
+
+/**
+ * The std wrapper a Rust method's `self` is declared through — `self:
+ * Pin<&mut Self>` → `Pin`, `self: &Arc<Self>` → `Arc` — read off its
+ * signature; null for `self`, `&self`, `&mut self` or `self: &Self`.
+ */
+function rustSelfWrapper(method: Node): string | null {
+  return /^\(\s*(?:mut\s+)?self\s*:\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core|alloc)\s*::\s*\w+\s*::\s*)?(Pin|Box|Rc|Arc)\s*</
+    .exec(method.signature ?? '')?.[1] ?? null;
+}
+
 interface RustImplHeader {
   /** The trait's name, the last segment of its path (`linked_list::Link` → `Link`). */
   trait: string;
@@ -7918,6 +8244,10 @@ interface RustImplHeader {
   traitArgs: string[];
   /** The implementing type's name (`NonNull<Entry>` → `NonNull`). */
   self: string;
+  /** The type names its arguments write (`Arc<Handle>` → `Handle`, `Pin<P>` → `P`). */
+  selfArgs: string[];
+  /** The impl's own type parameters (`impl<'a, P: DerefMut>` → `P`). */
+  params: string[];
 }
 
 const RUST_IMPL_HEADERS = new WeakMap<ResolutionContext, Map<string, RustImplHeader | null>>();
@@ -7926,13 +8256,20 @@ const RUST_IMPL_HEADERS = new WeakMap<ResolutionContext, Map<string, RustImplHea
 function parseRustImplHeader(text: string): RustImplHeader | null {
   let rest = text.replace(/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/, '').replace(/\{[\s\S]*$/, '').replace(/\bwhere\b[\s\S]*$/, '').trim();
   // The impl's own generics, `<'a, T: Into<U>>`.
+  const params: string[] = [];
   if (rest.startsWith('<')) {
     let depth = 0;
     let i = 0;
+    let from = 1;
     for (; i < rest.length; i++) {
       if (rest[i] === '<') depth++;
       else if (rest[i] === '>' && --depth === 0) break;
+      else if (rest[i] === ',' && depth === 1) {
+        params.push(rest.slice(from, i));
+        from = i + 1;
+      }
     }
+    params.push(rest.slice(from, i));
     rest = rest.slice(i + 1).trim();
   }
   // ` for ` outside the angle brackets parts the trait from the type.
@@ -7947,10 +8284,20 @@ function parseRustImplHeader(text: string): RustImplHeader | null {
   const traitPart = rest.slice(0, split).trim().replace(/^!/, '');
   const head = (part: string): string =>
     /([A-Za-z_]\w*)\s*(?:<|$)/.exec(part.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '').trim())?.[1] ?? '';
+  const args = (part: string): string[] => {
+    const open = part.indexOf('<');
+    return open < 0 ? [] : [...part.slice(open + 1).matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)]
+      .map((m) => m[1]!).filter((id) => id !== 'mut' && id !== 'dyn');
+  };
   const open = traitPart.indexOf('<');
-  const traitArgs = open < 0 ? [] : [...traitPart.slice(open + 1).matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)]
-    .map((m) => m[1]!).filter((id) => id !== 'mut' && id !== 'dyn');
-  return { trait: head(open < 0 ? traitPart : traitPart.slice(0, open)), traitArgs, self: head(rest.slice(split + 5)) };
+  const selfPart = rest.slice(split + 5);
+  return {
+    trait: head(open < 0 ? traitPart : traitPart.slice(0, open)),
+    traitArgs: args(traitPart),
+    self: head(selfPart),
+    selfArgs: args(selfPart.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '')),
+    params: params.map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined),
+  };
 }
 
 /** The `impl Trait<…> for Type<…>` a Rust method is declared in: null for an inherent impl, or none. */
@@ -8054,6 +8401,8 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
   if (!RUST_STD_TYPES.has(owner) || isRustProjectNamed(owner, RUST_DECLARED_TYPE_KINDS, context)) return true;
   const impl = rustTraitImplHeader(target, context);
   if (!impl || impl.self !== owner || impl.trait === '') return true;
+  // The type's own function of the name, std's, comes first (RUST_STD_INHERENT).
+  if (RUST_STD_INHERENT.get(owner)?.has(target.name)) return false;
   if (isRustProjectNamed(impl.trait, RUST_TRAIT_KIND, context)) return isRustTraitInScope(impl.trait, ref, target, context);
   const local = impl.traitArgs.find((t) => isRustProjectNamed(t, RUST_DECLARED_TYPE_KINDS, context));
   return local === undefined || rustFirstArgIs(local, ref, context);
@@ -8069,8 +8418,13 @@ function declaresRustVariant(type: Node, variant: string, context: ResolutionCon
 
 /** The line of the `impl` / `trait` header above `ref` in its file (0 for none). */
 function rustEnclosingImplLine(ref: UnresolvedRef, context: ResolutionContext): number {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  for (let i = ref.line - 1; i >= 0; i--) {
+  return rustImplLineAt(ref.filePath, ref.line, context);
+}
+
+/** The line of the `impl` / `trait` header at or above `line` of `filePath` (0 for none). */
+function rustImplLineAt(filePath: string, line: number, context: ResolutionContext): number {
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+  for (let i = line - 1; i >= 0; i--) {
     if (/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|trait)\b/.test(lines[i] ?? '')) return i + 1;
   }
   return 0;
@@ -8193,6 +8547,39 @@ function isRustGenericParam(name: string, ref: UnresolvedRef, context: Resolutio
   const from = Math.max(0, rustEnclosingImplLine(ref, context) - 1);
   const text = lines.slice(from, ref.line).join('\n');
   return new RegExp(`<[^<>]*(?:<[^<>]*>[^<>]*)*\\b${name}\\b\\s*(?:[:,>=])`).test(text);
+}
+
+/**
+ * Whether `name` is a type parameter the `fn` or the `impl` around `ref`
+ * declares in its own generics (`fn read<R: AsyncRead>(…)`, `impl<T> …`) —
+ * not a type its arguments merely name, as `Pin<&mut File>` names `File`.
+ */
+function isRustTypeParam(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const headerAt = (line: number): string => {
+    let text = '';
+    for (let j = line - 1; j >= 0 && j < Math.min(lines.length, line + 7) && !/[{;]/.test(text); j++) text += ` ${(lines[j] ?? '').replace(/\/\/.*$/, '')}`;
+    return text;
+  };
+  return [enclosingScopeStartLine(ref, context), rustEnclosingImplLine(ref, context)].some((line) => {
+    if (line === 0) return false;
+    const header = headerAt(line);
+    const open = /\b(?:fn\s+[A-Za-z_]\w*|impl)\s*</.exec(header);
+    if (!open) return false;
+    let depth = 0;
+    let from = open.index + open[0].length;
+    for (let i = from - 1; i < header.length; i++) {
+      const ch = header[i];
+      const param = (): boolean => new RegExp(`^\\s*(?:const\\s+)?${name}\\b`).test(header.slice(from, i));
+      if (ch === '<') depth++;
+      else if (ch === '>' && header[i - 1] !== '-' && --depth === 0) return param();
+      else if (ch === ',' && depth === 1) {
+        if (param()) return true;
+        from = i + 1;
+      }
+    }
+    return false;
+  });
 }
 
 /** What only exists inside a type, reachable through a receiver alone. */
@@ -9721,6 +10108,16 @@ export function resolveMethodOnType(
       if (viaExtension) return { original: ref, targetNodeId: viaExtension.id, confidence, resolvedBy };
     }
     return null;
+  }
+
+  // Rust picks a type's inherent method before a trait's of the same name —
+  // where one type has the name: two types of it each keep their own.
+  if (ref.language === 'rust' && matches.length > 1) {
+    const inherent = matches.filter((m) => !isRustTraitImplMethod(m, context));
+    if (inherent.length > 0 && inherent.length < matches.length &&
+        context.getNodesByName(typeName).filter((n) => n.language === 'rust' && RUST_DECLARED_TYPE_KINDS.has(n.kind)).length <= 1) {
+      matches = inherent;
+    }
   }
 
   if (matches.length > 1 && preferredFqn && ES_IMPORT_LANGUAGES.has(ref.language)) {
@@ -14120,9 +14517,10 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'objc':
       return [
         // FMResultSet *rs = …  /  NSString * _Nullable name;  /  a block's ^(FMResultSet *rs)
-        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
+        // ObjFW writes type arguments with a macro: `OFArray OF_GENERIC(OFString *) *names`.
+        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*|[A-Z][A-Z0-9_]*\\s*\\([^;{}]*?\\)\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
         // a method parameter: - (void)read:(nullable FMResultSet *)rs
-        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
+        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*|[A-Z][A-Z0-9_]*\\s*\\([^()]*\\)\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
       ];
     case 'swift':
       return [
@@ -14703,6 +15101,19 @@ export function inferLocalReceiverType(
       decl.asserted = asserted;
       return normalizeInferredTypeName(written!) ?? written!;
     }
+    // A Go parameter or local whose declaration in scope writes its type has
+    // that type: one declared through a package (`c clock.PassiveClock`, `pod
+    // *v1.Pod`), which the patterns below don't read, each name of `a, b
+    // rest.Interface`, a `var (…)` spec. The patterns scan back for the name
+    // with no block scope, so they can also read another declaration of it.
+    const type = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDecl(scanReceiver, ref, context)?.type : undefined;
+    if (type !== undefined) {
+      const named = goNamedType(type);
+      decl.declared = named;
+      if (!named) return null;
+      decl.raw = named;
+      return named.slice(named.indexOf('.') + 1);
+    }
   }
 
   const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -15188,6 +15599,18 @@ export function matchMethodCall(
     if (typeMember !== undefined) return typeMember;
   }
 
+  // Rust call on the enclosing type itself — `self.reset()`, emitted as
+  // `self.reset` (#1861). EXCLUSIVE: the owner is written on the `impl` line
+  // and carried in the calling method's qualified name, so it is not a guess.
+  // Letting this shape reach the bare-name strategies below is how
+  // `self.reset()` resolved to a same-named method on an unrelated type
+  // whenever that type's method happened to sit nearer the call site. Ahead
+  // of the local declarations below, which read `self: Pin<&mut Self>` as a
+  // `Pin` (matchRustSelfCall looks through it).
+  if (ref.language === 'rust' && dotMatch && objectOrClass === 'self') {
+    return matchRustSelfCall(methodName!, ref, context);
+  }
+
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
   // dedicated inferrer (header scan + `auto`); every other language uses the
@@ -15240,43 +15663,31 @@ export function matchMethodCall(
         inferredType = null;
       }
     }
+    // An Objective-C receiver the calling method doesn't declare may be an
+    // instance variable or a property of its class (objcMemberReceiverType).
+    if (!inferredType && ref.language === 'objc' && dotMatch) {
+      inferredType = nmTimedT('mc-objcmember', ref, () => objcMemberReceiverType(objectOrClass!, ref, context));
+    }
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
-    // A Go parameter named like an import is declared through a package as
-    // often as not (`logger logger.Interface`), which the patterns above
-    // don't read; the scope reader kept its type. Not a field's: in
-    // `metadata.Type.String()` that is the type of `metadata`.
-    if (!inferredType && ref.language === 'go' && dotMatch && !objectOrClass!.includes('.')) {
-      const declared = goRefQualification(ref, context).declaredType;
-      if (declared) {
-        inferredType = normalizeInferredTypeName(declared);
-        decl.raw = declared;
-      }
-    }
-    // A Go standard method name says nothing of its receiver, so the
-    // receiver's declaration in scope, which the scope reader finds, decides:
-    // etcd's parameter `id types.ID` makes `id.String()` `ID::String`,
-    // prometheus's `iter chunks.Iterator` makes `iter.Err()` that interface's
-    // rather than `StringIter::Err`, and a value a package from outside the
-    // project hands out (`ctx, cancel := context.WithTimeout(…)`) has no
-    // project method. It overrides the patterns above, which scan back for
-    // the name without block scope and can read another declaration of it:
+    // A Go receiver's declaration in scope, as the scope reader finds it
+    // (`declared`), decides over the patterns, which scan back for the name
+    // without block scope and can read another declaration of it:
     // prometheus's `var ( query promql.Query )` came out as its test table's
-    // `query string`. Only a type read here rules a call out below.
-    let goDeclared: string | undefined;
-    if (goStd && decl.asserted === undefined) {
-      const local = goLocalDecl(objectOrClass!, ref, context);
-      if (local?.type) {
-        const named = goNamedType(local.type);
-        // A slice, map, channel, function or interface literal type has no
-        // project method.
-        if (!named) return null;
-        inferredType = named.split('.').pop()!;
-        decl.raw = goDeclared = named;
-      } else if (local?.from && isGoOutsidePackage(local.from, ref.filePath, context)) {
-        return null;
-      }
+    // `query string`. Only a type read there rules a call out below. A slice,
+    // map, channel, function or interface literal type has no project method.
+    if (decl.declared === null) return null;
+    const goDeclared = decl.declared;
+    // A Go standard method name says nothing of its receiver, so its
+    // declaration decides: etcd's parameter `id types.ID` makes `id.String()`
+    // `ID::String`, prometheus's `iter chunks.Iterator` makes `iter.Err()`
+    // that interface's rather than `StringIter::Err`, and a value a package
+    // from outside the project hands out (`ctx, cancel :=
+    // context.WithTimeout(…)`) has no project method.
+    if (goStd && goDeclared === undefined && decl.asserted === undefined) {
+      const from = goLocalDecl(objectOrClass!, ref, context)?.from;
+      if (from && isGoOutsidePackage(from, ref.filePath, context)) return null;
     }
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
       inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
@@ -15331,6 +15742,11 @@ export function matchMethodCall(
         if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method', declared.file);
       }
     }
+    // A Rust value declared `Pin<…>` is looked up through the `Pin`, on the
+    // type it pins (matchRustPinnedCall) — unless `Pin` is the project's own.
+    if (ref.language === 'rust' && inferredType === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+      return matchRustPinnedCall(objectOrClass!, methodName!, ref, context);
+    }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
       // finds for it, or nothing the project declares: `flusher.Flush()` after
@@ -15338,12 +15754,13 @@ export function matchMethodCall(
       if (decl.asserted !== undefined) {
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
-      // A standard method name on a Go receiver declared as a type from a
-      // package outside the project (`var mu sync.Mutex`, `tb testing.TB`) is
-      // that type's own method, never a same-named project type's: etcd's
-      // `pendingMu.Lock()` went to its concurrency `Mutex`, kubernetes'
-      // `tb.Error(…)` to a feature-gate test helper's `TB`.
-      if (goDeclared !== undefined && isGoOutsideType(goDeclared, ref.filePath, context)) return null;
+      // A Go receiver declared as a type from a package outside the project
+      // (`var mu sync.Mutex`, `w http.ResponseWriter`), or as an alias of
+      // one, calls that type's own method, never a same-named project type's:
+      // etcd's `pendingMu.Lock()` went to its concurrency `Mutex`, kubernetes'
+      // `c.Now()` on a `clock.PassiveClock` to apimachinery's `Clock`, and gin
+      // declares a `ResponseWriter` of its own.
+      if (goDeclared !== undefined && goHasNoProjectMethods(goDeclared, ref, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
@@ -15418,8 +15835,11 @@ export function matchMethodCall(
       // no other method on a predeclared type, so a predeclared type the
       // patterns read for another name's declaration, like a test table's
       // `version string` above kubernetes' `version, _ := parse(…)`, rules
-      // nothing out.)
-      if (goDeclared !== undefined) return null;
+      // nothing out.) Any other name the declared type lacks goes on to the
+      // strategies below, as one on a receiver of unread type does: a type
+      // defined over an interface (`type Codec Serializer`) has methods the
+      // index doesn't give it.
+      if (goStd && goDeclared !== undefined) return null;
       // The receiver's declared type is one the project doesn't declare —
       // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
       // method is that outside type's. gson's `list.add(…)` went to a project
@@ -15483,17 +15903,6 @@ export function matchMethodCall(
   // method name with something nearby.
   if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
     return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
-  }
-
-  // Rust call on the enclosing type itself — `self.reset()`, emitted as
-  // `self.reset` (#1861). Same discipline as the field branch above, and
-  // EXCLUSIVE for the same reason: the owner is written on the `impl` line and
-  // carried in the calling method's qualified name, so it is not a guess.
-  // Letting this shape reach the bare-name strategies below is how
-  // `self.reset()` resolved to a same-named method on an unrelated type
-  // whenever that type's method happened to sit nearer the call site.
-  if (ref.language === 'rust' && dotMatch && objectOrClass === 'self') {
-    return matchRustSelfCall(methodName!, ref, context);
   }
 
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
@@ -16182,10 +16591,14 @@ interface GoProjectType {
  * assertion, the type goWrittenType finds for it (`asserted`; null for one
  * with no method the project declares). `asserted` is unset when the local
  * is declared some other way, or goWrittenType can't tell its type.
+ * `declared` is the named type a Go parameter or local's declaration in
+ * scope writes, as the scope reader finds it (`clock.PassiveClock`, `Store`),
+ * or null for a type literal; unset when that declaration writes no type.
  */
 interface GoReceiverDecl {
   raw?: string;
   asserted?: GoProjectType | null;
+  declared?: string | null;
 }
 
 const GO_ASSERTION_BINDINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
@@ -16627,9 +17040,12 @@ function matchGoFieldChainCall(
   const baseType = inferLocalReceiverType(base!, ref, context, decl);
   if (!baseType) return null;
   // A base bound from a type assertion has the type Go finds for it, or one
-  // whose fields the project doesn't declare.
+  // whose fields the project doesn't declare, as does one declared as a type
+  // from outside the project: `req.URL.Query()` on an `*http.Request` is no
+  // project `Request`'s.
   const asserted = decl.asserted;
   if (asserted === null) return null;
+  if (decl.declared && goHasNoProjectMethods(decl.declared, ref, context)) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
@@ -16680,6 +17096,8 @@ function matchGoFieldChainCall(
       // validated `<type>::<method>` match.
       const fieldType = rawType.split('.').pop();
       if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
+      // Nor is an alias of an outside type (`ctx Ctx` with `type Ctx = context.Context`).
+      if (goHasNoProjectMethods(rawType, { ...ref, filePath: s.filePath }, context)) continue;
       const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method', pkgDir);
       if (resolved) return resolved;
     }
@@ -16736,9 +17154,10 @@ export function rustFieldTypeName(raw: string): string | null {
  * The owner is the calling method's qualified-name prefix (`Target::run` →
  * `Target`), which is where the `impl` block's type ends up. A free function
  * has no `self`, so a caller whose qualified name carries no owner declines.
- * Exactly one candidate must belong to that owner: a project with two `impl`
- * blocks for the same type is normal, two same-named methods on it is not, and
- * guessing between them is the failure this replaces.
+ * Among the owner's methods of the name, the one Rust picks
+ * (pickRustOwnMethod): a project with two `impl` blocks for the same type is
+ * normal, and guessing between same-named methods by proximity is the failure
+ * this replaces.
  */
 function matchRustSelfCall(
   methodName: string,
@@ -16770,14 +17189,135 @@ function matchRustSelfCall(
     if (owners.filter((n) => n.filePath === caller.filePath).length !== 1) return null;
     owned = owned.filter((n) => n.filePath === caller.filePath);
   }
-  if (owned.length !== 1) return null;
+  // `(self.into_route)(state)` calls what a field holds, no method: axum's
+  // `MakeErasedHandler::into_route` went to itself.
+  const at = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1]?.slice(ref.column);
+  if (at?.startsWith('(') && new RegExp(`^\\(\\s*self\\s*\\.\\s*${methodName}\\s*\\)`).test(at)) return null;
+  // In a trait impl, `fn wake(self) { self.wake() }` hands the call on to the
+  // type's own `wake`: its inherent one, or for a type from outside the
+  // project one the index doesn't hold (tokio's `impl WakerRef for Waker`) —
+  // never back to the impl, unless the type is the project's and has none (a
+  // `poll` that polls itself again).
+  if (caller.name === methodName && isRustTraitImplMethod(caller, context)) {
+    const inherent = owned.filter((n) => !isRustTraitImplMethod(n, context));
+    if (inherent.length > 0) owned = inherent;
+    else {
+      const self = rustSelfType(ref, context);
+      if (!self || isRustOutsideSelf(self, ref, context)) return null;
+    }
+  }
+  // `self` declared through a wrapper — `self: Pin<&mut Self>`, `self:
+  // Rc<Self>` — is looked up through it (rustThroughWrapper).
+  const wrapper = rustSelfWrapper(caller);
+  if (wrapper && !isRustProjectNamed(wrapper, RUST_DECLARED_TYPE_KINDS, context)) {
+    const through = rustThroughWrapper(wrapper, methodName, owned, owner.split('::').pop()!, ref, context);
+    if (!Array.isArray(through)) return through && { original: ref, targetNodeId: through.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    owned = through;
+  }
+  const target = pickRustOwnMethod(owned, ref, context);
+  if (!target) return null;
 
   return {
     original: ref,
-    targetNodeId: owned[0]!.id,
+    targetNodeId: target.id,
     confidence: 0.9,
     resolvedBy: 'qualified-name',
   };
+}
+
+/**
+ * Which of a Rust type's methods of one name a call on the type reaches, as
+ * Rust picks: its inherent one; else the one of the trait impl the call is
+ * written in (each of tokio's `impl AsyncWrite for io::Cursor<…>` blocks calls
+ * its own `poll_flush`), or the only one. Several inherent ones (`#[cfg]`
+ * twins) or trait impls of the name are past telling apart.
+ */
+function pickRustOwnMethod(owned: Node[], ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  if (owned.length <= 1) return owned[0] ?? null;
+  const inherent = owned.filter((n) => !isRustTraitImplMethod(n, context));
+  if (inherent.length > 0) return inherent.length === 1 ? inherent[0]! : null;
+  const header = rustEnclosingImplLine(ref, context);
+  const block = owned.filter((n) => n.filePath === ref.filePath && rustImplLineAt(n.filePath, n.startLine, context) === header);
+  return block.length === 1 ? block[0]! : null;
+}
+
+/**
+ * Rust's method lookup on a value reached through a std wrapper — `self:
+ * Pin<&mut Self>`, `read: Pin<&mut R>`, `self: Rc<Self>` — where `own` are
+ * the wrapped type's methods of the name and `inner` that type (null for a
+ * type parameter or one not known). Rust tries the wrapper before
+ * dereferencing it:
+ * - the wrapped type's method taking `self` through that wrapper (`fn
+ *   poll_flush(self: Pin<&mut Self>, …)`) is a method of the wrapper's type;
+ * - then the wrapper's own: std's (RUST_WRAPPER_OWN_METHODS), which the index
+ *   doesn't hold, or a project impl on the wrapper, blanket or for `inner`,
+ *   taking `self`, `&self` or `&mut self` (tokio's `impl AsyncWrite for
+ *   Pin<P>`'s `is_write_vectored`). Its methods taking `self: Pin<&mut Self>`
+ *   would need a `Pin<&mut Pin<…>>`: tokio's `self.poll_flush(cx)` in `impl
+ *   AsyncWrite for File` went to that impl's;
+ * - then the wrapped type's other methods, by deref.
+ * The candidates to pick from, or the target itself (null for std's).
+ */
+function rustThroughWrapper(
+  wrapper: string, name: string, own: Node[], inner: string | null, ref: UnresolvedRef, context: ResolutionContext,
+): Node[] | Node | null {
+  const through = own.filter((n) => rustSelfWrapper(n) === wrapper);
+  if (through.length > 0) return through;
+  if (RUST_WRAPPER_OWN_METHODS.get(wrapper)?.has(name)) return null;
+  const onWrapper = context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
+    (n.qualifiedName === `${wrapper}::${name}` || n.qualifiedName.endsWith(`::${wrapper}::${name}`)) &&
+    rustSelfWrapper(n) === null && rustImplFor(n, inner, context));
+  if (onWrapper.length > 0) return preferCallSiteFile(onWrapper, ref.filePath)[0]!;
+  return own;
+}
+
+/** Whether `method`'s impl on a wrapper applies to one of `inner`: a blanket impl (`impl<P> AsyncWrite for Pin<P>`), or one naming it (`impl Schedule for Arc<Handle>`). */
+function rustImplFor(method: Node, inner: string | null, context: ResolutionContext): boolean {
+  const impl = rustTraitImplHeader(method, context);
+  return impl !== null && impl.selfArgs.some((a) => impl.params.includes(a) || a === inner);
+}
+
+/**
+ * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
+ * `fut: Pin<Box<dyn Future>>` → `Future`, `this: Pin<&mut Self>` → the impl's
+ * type — read off its nearest declaration in the calling function; null when
+ * that names none (`let fut = Pin::new(&mut f)`).
+ */
+function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declared = new RegExp(`\\b${escaped}\\s*:(?!:)\\s*(.*)$|\\blet\\s+(?:mut\\s+)?${escaped}\\b`);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const m = declared.exec(lines[i] ?? '');
+    if (!m) continue;
+    const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
+      .exec(m[1] ?? '');
+    const type = pinned?.[1]!.split('::').pop()!.trim() ?? null;
+    if (type !== 'Self') return type;
+    return rustSelfType(ref, context)?.type ?? null;
+  }
+  return null;
+}
+
+/**
+ * A Rust call on a value declared `Pin<…>`: Rust's lookup through the `Pin`
+ * (rustThroughWrapper) on the type it pins. A type parameter's own methods
+ * are its bound's, which the call doesn't name: tokio's `read.poll_read(…)`
+ * on `read: Pin<&mut R>` went to its `impl AsyncRead for Pin<P>`.
+ */
+function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const pinned = rustPinnedType(receiver, ref, context);
+  const inner = pinned !== null && !isRustTypeParam(pinned, ref, context) ? pinned : null;
+  const own = inner === null ? [] : context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
+    (n.qualifiedName === `${inner}::${name}` || n.qualifiedName.endsWith(`::${inner}::${name}`)));
+  const through = rustThroughWrapper('Pin', name, own, inner, ref, context);
+  let target = through as Node | null;
+  if (Array.isArray(through)) {
+    const inherent = through.filter((n) => !isRustTraitImplMethod(n, context));
+    target = preferCallSiteFile(inherent.length > 0 ? inherent : through, ref.filePath)[0] ?? null;
+  }
+  return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
 }
 
 /**
