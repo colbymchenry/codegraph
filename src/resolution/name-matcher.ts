@@ -7036,7 +7036,11 @@ function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   const supers: string[] = [];
   for (const decl of context.getNodesByName(name)) {
     if (decl.kind !== 'class' || decl.language !== 'objc') continue;
-    const line = context.getFileLines?.(decl.filePath)?.[decl.startLine - 1] ?? context.readFile(decl.filePath)?.split('\n')[decl.startLine - 1] ?? '';
+    // The class may open with an attribute macro on a line of its own, like
+    // `NS_SWIFT_NAME(CrashInstallationStandard)` above KSCrash's
+    // `@interface KSCrashInstallationStandard : KSCrashInstallation`.
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split('\n') ?? [];
+    const line = lines.slice(decl.startLine - 1, decl.endLine).find((l) => l.includes('@interface')) ?? '';
     const sup = /@interface\s+\w+\s*:\s*(\w+)/.exec(line)?.[1];
     if (sup && !supers.includes(sup)) supers.push(sup);
   }

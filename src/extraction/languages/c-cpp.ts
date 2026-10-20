@@ -1214,11 +1214,41 @@ export function blankCppAnnotationMacroCalls(source: string): string {
  *    string literal, or `;` continuation rejects the match. Comments in
  *    between are skipped: {fmt}'s `FMT_BEGIN_EXPORT` sits above `// A
  *    generic formatting context …` and then the class it opens.
- * Shared by C and C++ (the idiom is identical in both).
+ * Shared by C and C++ (the idiom is identical in both), and by Objective-C
+ * through OBJC_LONE_MACROS.
  */
 const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
 const LONE_MACRO_CONTINUATION_END_RE = /[=+\-*/%&|^<>?:,(\\]$/;
-export function blankLoneMacroLines(source: string): string {
+
+/** How a language's code reads around a macro alone on its line. */
+interface LoneMacroRules {
+  /** What the code after the macro may start with. */
+  nextCode: RegExp;
+  /** Whether a preprocessor directive above the macro ends at its own line. */
+  directivesEnd: boolean;
+  /** Whether a macro that is a body's only statement, between `{` and `}`, stays. */
+  keepsSoleStatement: boolean;
+}
+
+const C_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~]/, directivesEnd: false, keepsSoleStatement: false };
+
+/**
+ * Objective-C's: the code after the macro may be a directive, like the
+ * `@interface` below `NS_ASSUME_NONNULL_BEGIN` or the `@end` below
+ * `OF_SINGLETON_METHODS`. A preprocessor line above it continues nothing,
+ * even one that ends in `>`, like the `#import <Foundation/Foundation.h>`
+ * above most headers' `NS_ASSUME_NONNULL_BEGIN`. Blanking that macro but not
+ * another before the same `@interface` (`OF_SUBCLASSING_RESTRICTED`) left
+ * `OF_ASSUME_NONNULL_BEGIN @interface …`, which reads as a function.
+ *
+ * A macro that is a method's whole body, like ObjFW's `{
+ * OF_UNRECOGNIZED_SELECTOR }`, stays: the parser's error there stays inside
+ * that body, but blanking it changed how the parser recovered from an
+ * earlier misread, and OFMutableString.m lost 11 calls in the methods below.
+ */
+export const OBJC_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~@]/, directivesEnd: true, keepsSoleStatement: true };
+
+export function blankLoneMacroLines(source: string, rules: LoneMacroRules = C_LONE_MACROS): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{3,}[ \t]*\r?$/m.test(source)) return source;
   const lines = source.split('\n');
   const content = (l: string): string => l.replace(/\r$/, '').trim();
@@ -1239,9 +1269,11 @@ export function blankLoneMacroLines(source: string): string {
     // continues nothing either.
     const prevText = prev >= 0 ? content(lines[prev] as string) : '';
     const prevCode = /^(?:\/\/|\/\*|\*)/.test(prevText) ? '' : prevText.replace(/\/\*.*?\*\/|\/\/.*$/g, '').trim();
-    if (prevCode !== '' && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
+    const directiveEnds = rules.directivesEnd && prevCode.startsWith('#') && !prevCode.endsWith('\\');
+    if (prevCode !== '' && !directiveEnds && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
     const first = firstCodeCharAfter(lines, i + 1);
-    if (first !== undefined && !/[A-Za-z_#{}~]/.test(first)) continue;
+    if (first !== undefined && !rules.nextCode.test(first)) continue;
+    if (rules.keepsSoleStatement && prevCode.endsWith('{') && first === '}') continue;
     const start = line.indexOf(m[1] as string);
     lines[i] =
       line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
