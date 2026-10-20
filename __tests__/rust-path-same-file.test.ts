@@ -105,6 +105,27 @@ describe('a Rust path into another module, type or crate', () => {
         '    inner::Cell',
         '}',
         '',
+        // Braces, not indentation, say what a module holds.
+        'mod flat {',
+        'pub struct Flat;',
+        '}',
+        '',
+        'pub fn flat() -> flat::Flat {',
+        '    flat::Flat',
+        '}',
+        '',
+        // `outer::Shell` is `outer`'s own, not the one in `outer::deep`.
+        'mod outer {',
+        '    pub struct Shell;',
+        '    pub mod deep {',
+        '        pub struct Shell;',
+        '    }',
+        '}',
+        '',
+        'pub fn shell() -> outer::Shell {',
+        '    todo!()',
+        '}',
+        '',
       ].join('\n'),
     };
     for (const [rel, content] of Object.entries(files)) {
@@ -141,6 +162,11 @@ describe('a Rust path into another module, type or crate', () => {
 
   it('still names an inline module\'s item', () => {
     expect(targetsOn(cg, 'src/position.rs', 17, 'Cell')).toEqual(['struct Cell src/position.rs@14']);
+  });
+
+  it('reads an inline module from its braces: an item at any indentation, and not one in a module inside it', () => {
+    expect(targetsOn(cg, 'src/position.rs', 25, 'Flat')).toEqual(['struct Flat src/position.rs@22']);
+    expect(targetsOn(cg, 'src/position.rs', 36, 'Shell')).toEqual(['struct Shell src/position.rs@30']);
   });
 });
 
