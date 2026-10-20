@@ -3862,6 +3862,11 @@ function pythonFromImports(filePath: string, context: ResolutionContext): Map<st
 function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const module = pythonFromImports(ref.filePath, context).get(name);
   if (!module || module.startsWith('.')) return false;
+  return !isPythonProjectModule(module, context);
+}
+
+/** Whether some project file is the module `a.b` (`a/b.py` or `a/b/__init__.py`). */
+function isPythonProjectModule(module: string, context: ResolutionContext): boolean {
   let memo = PY_MODULE_LOCAL.get(context);
   if (!memo) {
     memo = new Map();
@@ -3874,7 +3879,42 @@ function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, conte
       f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
     memo.set(module, local);
   }
-  return !local;
+  return local;
+}
+
+/**
+ * A receiver the file binds only by importing a module from outside the
+ * project — `import subprocess`, `import numpy as np` — never rebinding it at
+ * module scope (an assignment, a `for`/`with`/tuple target, a `global` write
+ * in a function, a fallback `class`/`def` of that name) nor in the calling
+ * function. A call on it is that module's function, never a project class's
+ * method of the same name (#2599).
+ */
+export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
+  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, ref.filePath, context);
+    if (keys.size === 0) return false;
+    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
+    // the module `a` tells that `x` comes from outside.
+    return [...keys].every((key) => {
+      const module = key.slice(0, key.indexOf(':'));
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, context);
+    });
+  });
+  return outside && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * Whether `a.b.c` is a project module from some import root: `a/b/c.py`, or —
+ * with the package itself indexed as the root — `b/c.py` or `c.py`. Erring
+ * toward "project" only leaves a call to the name strategies, as before.
+ */
+function isPythonProjectModuleAnyRoot(module: string, context: ResolutionContext): boolean {
+  const parts = module.split('.');
+  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), context));
 }
 
 const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
@@ -8084,6 +8124,22 @@ function isRustItemVisibleFrom(candidate: Node, ref: UnresolvedRef): boolean {
   return candidate.filePath === ref.filePath || ref.filePath.startsWith(`${rustModuleDir(candidate.filePath)}/`);
 }
 
+/** What a Rust `impl` declares besides its functions: `type Err = …;`, `const MAX: usize = …;`. */
+const RUST_ASSOCIATED_KINDS = new Set(['type_alias', 'variable', 'constant']);
+
+/**
+ * Whether a Rust item is an associated one: a `type` or `const` written in an
+ * `impl` or a trait. It belongs to the type, not to the module, so Rust reaches
+ * it only through a path — `Self::Err`, `<T as FromStr>::Err`, `T::Err` —
+ * never by its name alone, and no module path (`std::error::Error`) or `use`
+ * names it. The extractors qualify it by the impl's type (`ValueHint::Err`) or
+ * its trait, as they do the methods; a module's own type alias or const is
+ * qualified by nothing.
+ */
+export function isRustAssociatedItem(n: Node): boolean {
+  return n.language === 'rust' && RUST_ASSOCIATED_KINDS.has(n.kind) && n.qualifiedName.includes('::');
+}
+
 /** Does one of the file's globs bring in this candidate's module (or, for `use super::*`, its parent's)? */
 function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): boolean {
   if (uses.globs.has(rustModuleName(candidate.filePath))) return true;
@@ -8142,6 +8198,10 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
       if (seg === 'Self') return candidate.kind === 'type_alias' && isInEnclosingRustImpl(candidate, ref, context);
       if (isRustGenericParam(seg, ref, context)) return false;
     }
+    // An associated item, only through its type: `Self::Err` in its impl,
+    // `<T as FromStr>::Err`. No module path names one: axum-core's
+    // `std::error::Error` is std's, not its file's `impl IntoResponseParts`'s `type Error`.
+    if (isRustAssociatedItem(candidate)) return seg === '' || (seg === 'Self' && isInEnclosingRustImpl(candidate, ref, context));
     if ((root === 'std' || root === 'core' || root === 'alloc') && candidate.filePath !== ref.filePath) return false;
     // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
     if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || candidate.filePath === ref.filePath ||
@@ -8152,6 +8212,10 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     return rustModuleName(candidate.filePath) === seg || candidate.filePath.includes(`/${seg}/`) ||
       candidate.qualifiedName.split('::').includes(seg);
   }
+  // Nor does its name alone: clap's `Err(…)` calls went to the `type Err` of
+  // a `FromStr` impl in the same file, axum's routing tests' `Response`s to
+  // the `type Response` of `routing/mod.rs`'s `impl Service`.
+  if (isRustAssociatedItem(candidate)) return false;
   if (candidate.kind === 'enum_member') {
     if (ref.referenceKind === 'references') return false;
     const uses = rustUsesOf(ref.filePath, context);
@@ -15708,6 +15772,9 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // `subprocess.run(…)` after `import subprocess`: a function of a module
+    // from outside the project, not a same-named project method (#2599).
+    if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
     // A module-level instance of this file — `_svc = SceneService()` — called
     // from a function: the method its class has or inherits (#2582), as for a
     // method value through the same global (#2074). Otherwise the call goes on

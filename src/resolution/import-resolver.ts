@@ -26,6 +26,7 @@ import {
   arrayElementType,
   tsImportedTypeFile,
   reExportSource,
+  isRustAssociatedItem,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -2620,9 +2621,12 @@ function resolveRustPathReference(
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
   if (!file || file === ref.filePath) return null;
 
+  // A module's item, never an impl's associated one: serde's `use
+  // crate::de::Error` is not `de/mod.rs`'s `impl SeqAccess`'s `type Error`.
   const target = context.getNodesInFile(file).find(
     (n) =>
       n.name === leaf &&
+      !isRustAssociatedItem(n) &&
       (n.kind === 'function' ||
         n.kind === 'struct' ||
         n.kind === 'union' ||
