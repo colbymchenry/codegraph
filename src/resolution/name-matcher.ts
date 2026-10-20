@@ -21,6 +21,7 @@ import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestPath } from '../search/query-utils';
+import { isMergedAmbientDeclaration } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
@@ -16675,7 +16676,9 @@ export function tsImportedTypeFile(written: string, ref: UnresolvedRef, context:
     if (context.getImportMappings?.(ref.filePath, ref.language)?.some((i) => i.localName === binding)) {
       const imported = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
       const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-      if (node && node.kind !== 'file' && node.filePath !== ref.filePath) file = node.filePath;
+      // A type the blocks declaring one module merge (vscode's proposed API files add
+      // members to `vscode.d.ts`'s interfaces) has no one file that holds every member.
+      if (node && node.kind !== 'file' && node.filePath !== ref.filePath && !isMergedAmbientDeclaration(node, context)) file = node.filePath;
     }
     memo.set(key, file);
   }
@@ -17965,7 +17968,9 @@ function resolveAwaitedCallType(
     referenceName: returned, referenceKind: 'references' as const };
   const typeImport = context.getImportMappings(declaring.filePath, declaring.language).some(m => m.localName === returned);
   const resolved = typeImport ? context.resolveImport?.(typeRef) : null;
-  const typeNode = resolved ? context.getNodeById?.(resolved.targetNodeId) :
+  const importedType = resolved ? context.getNodeById?.(resolved.targetNodeId) : null;
+  // A type the files declaring one module merge is no one declaration (see tsImportedTypeFile).
+  const typeNode = resolved ? (importedType && !isMergedAmbientDeclaration(importedType, context) ? importedType : null) :
     context.getNodesByName(returned).find(n => n.filePath === declaring.filePath &&
       ESM_FAMILY.has(n.language) && (n.kind === 'class' || n.kind === 'interface'));
   if (!typeNode || (typeNode.kind !== 'class' && typeNode.kind !== 'interface')) return unknown;
@@ -21831,7 +21836,11 @@ function tsNamedType(
     // vscode's `ILogService` is also a constant, its dependency-injection
     // decorator, which the import may name first: the type is the interface
     // of that name beside it.
-    found = !node ? null : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
+    // A type the files declaring one module merge is no one declaration
+    // (see tsImportedTypeFile): copilot's `ChatResponseStream` methods are in
+    // vscode's proposed API files, not `vscode.d.ts`.
+    found = !node || isMergedAmbientDeclaration(node, context) ? null
+      : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
   } else if (!written.includes('.')) {
     found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
   }
@@ -22093,7 +22102,7 @@ function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: Res
   if (context.getImportMappings?.(from.filePath, from.language)?.some((i) => i.localName === name)) {
     const imported = context.resolveImport?.({ ...ref, filePath: from.filePath, language: from.language, referenceName: name, referenceKind: 'references' });
     const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-    if (node && (node.kind === 'class' || node.kind === 'component')) found = node;
+    if (node && (node.kind === 'class' || node.kind === 'component') && !isMergedAmbientDeclaration(node, context)) found = node;
   } else {
     found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
   }

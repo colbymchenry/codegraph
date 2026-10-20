@@ -33,6 +33,7 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
+import { clearAmbientModuleMemos, ambientModuleFunctionIds } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
@@ -578,6 +579,7 @@ export class ReferenceResolver {
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
       clearCFeatureVariantMemos(this.context);
+      clearAmbientModuleMemos(this.context);
     }
   }
 
@@ -1354,6 +1356,11 @@ export class ReferenceResolver {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
+    // A function a declaration file's `declare module 'x'` declares is reached
+    // only through an import of `x`, never by its bare name from another file
+    // (see ./ambient-modules).
+    if (resolved && resolved.resolvedBy !== 'import' && ambientModuleFunctionIds(this.context).has(resolved.targetNodeId) &&
+        this.nodeById(resolved.targetNodeId)?.filePath !== ref.filePath) return null;
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);

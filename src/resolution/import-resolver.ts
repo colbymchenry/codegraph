@@ -15,6 +15,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
+import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile } from './ambient-modules';
 import { moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
@@ -2552,6 +2553,12 @@ function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): bool
  */
 export function jsModuleFile(ref: UnresolvedRef, context: ResolutionContext): string | null {
   if (!isJsPathImportRef(ref) && !isJsBareModuleRef(ref, context)) return null;
+  // A package the repository declares itself is the file that declares it,
+  // whatever file its specifier resolves to (see ./ambient-modules).
+  if (isBareModuleSpecifier(ref.referenceName, ref.language)) {
+    const declaring = findAmbientModuleFile(ref.referenceName, ref.filePath, context);
+    if (declaring) return declaring.filePath;
+  }
   const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
   return file && file !== ref.filePath ? file : null;
 }
@@ -2859,19 +2866,20 @@ export function resolveViaImport(
         context
       );
 
-      if (resolvedPath) {
+      // A package the repository declares itself, as cord-field's
+      // `typings/mammoth/index.d.ts` declares `declare module 'mammoth'`:
+      // TypeScript takes that declaration before any file the specifier
+      // resolves to (see ./ambient-modules).
+      const bare = isBareModuleSpecifier(imp.source, ref.language);
+      if (resolvedPath || bare) {
         const exportedName = imp.isDefault ? 'default' : imp.exportedName;
         const memberName = imp.isNamespace
           ? ref.referenceName.replace(imp.localName + '.', '')
           : null;
+        const want = { isDefault: imp.isDefault, isNamespace: imp.isNamespace, exportedName, memberName };
 
-        const targetNode = findExportedSymbol(
-          resolvedPath,
-          { isDefault: imp.isDefault, isNamespace: imp.isNamespace, exportedName, memberName },
-          ref.language,
-          context,
-          new Set()
-        );
+        const targetNode = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
+          (resolvedPath ? findExportedSymbol(resolvedPath, want, ref.language, context, new Set()) : undefined);
 
         if (targetNode) {
           // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
@@ -2958,6 +2966,11 @@ export function resolveViaImport(
   }
 
   return null;
+}
+
+/** Whether `source`, imported in a file of `language`, is an ES module specifier written as a name, not a path. */
+function isBareModuleSpecifier(source: string, language: Language): boolean {
+  return ESM_IMPORT_LANGUAGES.has(language) && !source.startsWith('.') && !source.startsWith('/');
 }
 
 /**
@@ -3228,6 +3241,13 @@ function resolveModuleImportToFile(
     } else {
       // A named TS/JS import binds a symbol, not a module — leave it alone.
       continue;
+    }
+
+    // A package the repository declares itself in a script `.d.ts`: that file
+    // is the module, whatever file the specifier resolves to (see ./ambient-modules).
+    if (isBareModuleSpecifier(modulePath, ref.language)) {
+      const declaring = findAmbientModuleFile(modulePath, ref.filePath, context);
+      if (declaring) return { original: ref, targetNodeId: declaring.id, confidence: 0.9, resolvedBy: 'import' };
     }
 
     const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
@@ -3916,8 +3936,11 @@ export function isBoundToOutOfRepoImport(
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
   for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
     if (imp.localName !== name) continue;
+    // A package the repository declares itself (`declare module 'x'`) has
+    // its declarations in the repository.
     return isExternalImport(imp.source, ref.language, context) &&
-      resolveImportPath(imp.source, ref.filePath, ref.language, context) === null;
+      resolveImportPath(imp.source, ref.filePath, ref.language, context) === null &&
+      !ambientModuleDeclares(imp.source, imp.exportedName, imp.isDefault, ref, context);
   }
   return false;
 }

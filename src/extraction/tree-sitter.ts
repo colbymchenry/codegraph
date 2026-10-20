@@ -1403,6 +1403,12 @@ export class TreeSitterExtractor {
         skipChildren = true; // extractFunction visits children via visitFunctionBody
       }
     }
+    // A bodiless function that no implementation follows: a TypeScript
+    // `declare function`, a `.d.ts` file's own or its `declare module` body's.
+    else if (nodeType === 'function_signature' && this.extractor.isAmbientFunction?.(node, this.filePath)) {
+      this.extractFunction(node);
+      skipChildren = true;
+    }
     // Check for class declarations
     else if (this.extractor.classTypes.includes(nodeType)) {
       // Some languages reuse class_declaration for structs/enums (e.g. Swift)

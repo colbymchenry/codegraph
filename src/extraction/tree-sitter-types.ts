@@ -101,6 +101,14 @@ export interface LanguageExtractor {
 
   /** Node types that represent functions */
   functionTypes: string[];
+  /**
+   * A bodiless function that is the function's whole declaration, not one
+   * overload of an implementation that follows it: TypeScript's
+   * `function_signature` in an ambient context (`declare function f(): void;`,
+   * a declaration file's own or its `declare module` body's), never in a
+   * namespace. Extracted as a function, like a `functionTypes` node.
+   */
+  isAmbientFunction?: (node: SyntaxNode, filePath: string) => boolean;
   /** Node types that represent classes */
   classTypes: string[];
   /** Node types that represent methods */

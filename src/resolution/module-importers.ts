@@ -25,6 +25,7 @@ import type { ImportMapping, ReExport } from './types';
 import { extractImportMappings, extractReExports, pythonModulePath, REEXPORT_MAX_DEPTH } from './import-resolver';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { defaultExportBinding, extractLocalExportAliases } from './alias-binding';
+import { isDeclarationFile, scanAmbientModules } from './ambient-modules';
 import { moduleReferenceKeys } from '../db/reference-tail';
 
 /**
@@ -184,6 +185,56 @@ export function reopenReferencesThroughAddedFiles(
   const failed = [...bindings].flatMap(([file, { modules, names }]) => queries.getFailedReferencesThrough(file, modules, names));
   return reopenModuleEdges(queries, outranked) +
     reopenEdges(queries, bindings, (e) => e.edgeId <= resolvedUpToEdgeId) + queries.reopenFailedReferences(failed);
+}
+
+/**
+ * The way in for the files importing a package that a declaration file this
+ * sync adds or edits declares itself: `declare module 'mammoth' { … }` in
+ * `typings/mammoth/index.d.ts` (see ./ambient-modules). They import the
+ * package by its name, which no import edge into the file records, so the
+ * pass over an added file's importers never finds them, and an aliased,
+ * default or namespace binding waits under a name the file never declares.
+ * What each importer reaches through those bindings goes back to pending for
+ * the sweep: the references that failed, and the edges bound before this sync
+ * resolved anything (up to `resolvedUpToEdgeId`), which a name match may have
+ * made while nothing declared the package. A removed declaration needs
+ * nothing of its own: the edges into its declarations are resurrected with
+ * them. Returns the number re-opened.
+ */
+export function reopenReferencesThroughDeclaredPackages(
+  queries: QueryBuilder,
+  reader: ImportReader,
+  rootDir: string,
+  changed: readonly string[],
+  resolvedUpToEdgeId: number,
+): number {
+  const specifiers = new Set<string>();
+  for (const file of changed) {
+    if (!isDeclarationFile(file)) continue;
+    let content = '';
+    try {
+      content = fs.readFileSync(path.join(rootDir, file), 'utf8');
+    } catch {
+      continue;
+    }
+    if (!content.includes('declare')) continue;
+    for (const block of scanAmbientModules(content).blocks) if (!block.pattern) specifiers.add(block.specifier);
+  }
+  if (specifiers.size === 0) return 0;
+  const changedFiles = new Set(changed);
+  const importers: Importers = new Map();
+  for (const specifier of specifiers) {
+    // An import statement's node is named by the specifier it imports.
+    for (const node of queries.getNodesByName(specifier)) {
+      if (node.kind !== 'import' || !BINDING_LANGUAGES.has(node.language) || changedFiles.has(node.filePath)) continue;
+      const entry = importers.get(node.filePath) ?? { language: node.language, sources: new Map<string, Set<string> | null>() };
+      entry.sources.set(specifier, null);
+      importers.set(node.filePath, entry);
+    }
+  }
+  const bindings = bindingsOf(importers, reader);
+  const failed = [...bindings].flatMap(([file, { modules, names }]) => queries.getFailedReferencesThrough(file, modules, names));
+  return reopenEdges(queries, bindings, (e) => e.edgeId <= resolvedUpToEdgeId) + queries.reopenFailedReferences(failed);
 }
 
 /** The languages a barrel a lazy route reads through is written in: the ES-module family. */

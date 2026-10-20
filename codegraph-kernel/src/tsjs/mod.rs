@@ -681,6 +681,11 @@ impl<'t> Walker<'t> {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
             self.extract_function(node, None);
             skip_children = true;
+        } else if kind == "function_signature" && self.variant.is_ts() && is_ambient_function_signature(node, self.file_path) {
+            // A bodiless function that no implementation follows: a
+            // `declare function`, a function in a `declare module` body or a `.d.ts`.
+            self.extract_function(node, None);
+            skip_children = true;
         } else if is_class_type(self.variant, kind) {
             self.extract_class(node);
             skip_children = true;
@@ -1160,6 +1165,37 @@ fn is_ambient_export(node: Node) -> bool {
         cur = p.parent();
     }
     false
+}
+
+/// isAmbientFunctionSignature (languages/typescript.ts): a bodiless
+/// `function_signature` that is a function's declaration, not an overload of
+/// an implementation that follows it — a `declare function`, one in a
+/// `declare global` body, a declaration file's (`.d.ts`, `.d.mts`, `.d.cts`)
+/// own, and one a declaration file's `declare module 'x'` body declares.
+/// Never a namespace's (`declare namespace`, `module Foo {}`), nor one in an
+/// ordinary module file's `declare module` body, an augmentation.
+fn is_ambient_function_signature(node: Node, file_path: &str) -> bool {
+    if node.kind() != "function_signature" {
+        return false;
+    }
+    let lower = file_path.to_ascii_lowercase();
+    let declaration_file = lower.ends_with(".d.ts") || lower.ends_with(".d.mts") || lower.ends_with(".d.cts");
+    let mut ambient = false;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "internal_module" => return false,
+            // `declare module 'x'`; `module Foo {}` is a namespace.
+            "module" => {
+                return declaration_file
+                    && p.child_by_field_name("name").is_some_and(|n| n.kind() == "string");
+            }
+            "ambient_declaration" => ambient = true,
+            _ => {}
+        }
+        cur = p.parent();
+    }
+    ambient || declaration_file
 }
 
 /// hasExportDeclaration: a statement that exports by name or by assignment
