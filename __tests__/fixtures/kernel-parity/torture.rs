@@ -182,6 +182,22 @@ impl Render for dyn Base {
 
 impl Base for u32 {}
 
+// Associated items are qualified by the impl's type; one no single name
+// stands for keeps the impl's spelling, whitespace collapsed.
+impl Render for (u32,
+                 u32) {
+    type Out = u8;
+    const PAIR: usize = 2;
+}
+
+impl<'a> Render for &'a [u8] {
+    type Out = u16;
+}
+
+impl Render for u64 {
+    const WIDTH: usize = 8;
+}
+
 impl Later {
     fn touch(&self) {}
 }
