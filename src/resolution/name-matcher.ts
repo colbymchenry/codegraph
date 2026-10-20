@@ -9132,26 +9132,17 @@ function matchRustSelfPath(name: string, ref: UnresolvedRef, context: Resolution
 }
 
 /**
- * Whether `candidate` sits in an inline `mod <name> { … }` of its own file —
- * the only way a path through `name` reaches it, since an inline module adds
- * nothing to its items' qualified names. rustfmt closes the block at the
- * indentation it opens at.
+ * Whether `candidate` is declared directly in an inline `mod <name> { … }` of
+ * its own file — the only way a path through `name` reaches it, since an
+ * inline module adds nothing to its items' qualified names. The module is the
+ * innermost block rustModBlocks finds around it; a file whose braces don't
+ * all close says nothing.
  */
 function isInRustInlineModule(candidate: Node, name: string, context: ResolutionContext): boolean {
-  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split(/\r?\n/) ?? [];
-  const head = new RegExp(`^(\\s*)(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+${name}\\s*\\{`);
-  for (let i = candidate.startLine - 2; i >= 0; i--) {
-    const open = head.exec(lines[i] ?? '');
-    if (!open) continue;
-    const indent = open[1]!.length;
-    if (candidate.startColumn <= indent) return false;
-    for (let j = i + 1; j < candidate.startLine - 1; j++) {
-      const closer = /^(\s*)\}/.exec(lines[j] ?? '');
-      if (closer && closer[1]!.length <= indent) return false;
-    }
-    return true;
-  }
-  return false;
+  const layout = rustUsesOf(candidate.filePath, context);
+  if (!layout.balanced) return false;
+  const at = (layout.lineStarts[candidate.startLine - 1] ?? 0) + Math.max(0, candidate.startColumn ?? 0);
+  return rustBlockAt(layout.blocks, at)?.name === name;
 }
 
 /** Whether `candidate` is declared in the same `impl` / `trait` block as `ref`, above it. */
