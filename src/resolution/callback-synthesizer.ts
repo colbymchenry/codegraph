@@ -1563,6 +1563,80 @@ function goPromotions(
   };
 }
 
+/**
+ * Languages where an override repeats the parameter list of what it
+ * overrides, so an interface overload is implemented by the same-named
+ * method with the same parameters: Java, Kotlin, C# and Scala. TypeScript is
+ * not one — an implementation may take fewer parameters than its interface
+ * declares.
+ */
+const PARAMETER_PAIRED_LANGS = new Set(['java', 'kotlin', 'csharp', 'scala']);
+
+/**
+ * The parameter types a stored method signature lists, as written and with
+ * whitespace dropped — `(String tairKey)` and `Object (List<String> tairKey,
+ * double count)` (Java), `(keys: List<String>, count: Double = 1.0): Any?`
+ * (Kotlin), `(keys: List[String], count: Double): Any` (Scala). Null when the
+ * signature is missing or takes a variable number of arguments, which a
+ * parameter count cannot pair.
+ */
+function signatureParameterTypes(signature: string | undefined): string[] | null {
+  if (!signature) return null;
+  const open = signature.indexOf('(');
+  if (open < 0) return null;
+  const params: string[] = [];
+  let depth = 0;
+  let start = open + 1;
+  for (let i = open; i < signature.length; i++) {
+    const ch = signature[i]!;
+    if (ch === '(' || ch === '<' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === '>' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) {
+        params.push(signature.slice(start, i));
+        break;
+      }
+    } else if (ch === ',' && depth === 1) {
+      params.push(signature.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (depth !== 0) return null;
+  const types: string[] = [];
+  for (const raw of params) {
+    const param = raw.replace(/@\w+(?:\.\w+)*(?:\([^()]*\))?/g, '').trim();
+    if (param === '') continue;
+    if (/\.\.\.|\bvararg\b|\bparams\b|\*\s*$/.test(param)) return null;
+    const colon = param.indexOf(':');
+    const type = colon >= 0
+      ? param.slice(colon + 1).replace(/=.*$/, '')
+      : param.replace(/\bfinal\b/g, '').replace(/[A-Za-z_$][\w$]*\s*$/, '');
+    types.push(type.replace(/\s+/g, ''));
+  }
+  return types;
+}
+
+/**
+ * The implementation overloads an interface method `base` pairs with, among
+ * `impls` of its name (#2663): in Java, Kotlin, C# and Scala the ones with as
+ * many parameters as `base`, and of those the ones whose parameter types are
+ * written alike when there are any — a generic interface's `save(T entity)`
+ * is implemented as `save(User entity)`, so types that differ do not rule an
+ * overload out. Every one, as before, when a signature can't be read, takes
+ * varargs, or no overload has `base`'s parameter count.
+ */
+function pairedOverloads(base: Node, impls: Node[]): Node[] {
+  if (impls.length < 2 || !PARAMETER_PAIRED_LANGS.has(base.language)) return impls;
+  const want = signatureParameterTypes(base.signature);
+  if (!want) return impls;
+  const typed = impls.map((m) => ({ m, types: signatureParameterTypes(m.signature) }));
+  if (typed.some((t) => t.types === null)) return impls;
+  const sameArity = typed.filter((t) => t.types!.length === want.length);
+  if (sameArity.length === 0) return impls;
+  const exact = sameArity.filter((t) => t.types!.every((type, i) => type === want[i]));
+  return (exact.length > 0 ? exact : sameArity).map((t) => t.m);
+}
+
 async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
@@ -1644,8 +1718,10 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
       const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
-      // link every base overload → every same-name impl overload (keying by name
-      // alone would drop all but one and miss the resolved overload). A Go
+      // each base overload links the impl overloads it pairs with
+      // (pairedOverloads) — by parameters where the language makes an override
+      // repeat them, else every same-name one (keying by name alone would drop
+      // all but one and miss the resolved overload). A Go
       // interface's unexported method is matched in its own package only
       // (goMethodKey): a namesake the type declares elsewhere is another
       // method, and the one the interface asks for is promoted.
@@ -1665,7 +1741,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
           if (promotes) unmatched.push(bm);
           continue;
         }
-        for (const m of impls) {
+        for (const m of pairedOverloads(bm, impls)) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
           const key = `${bm.id}>${m.id}`;
