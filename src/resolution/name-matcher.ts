@@ -5419,7 +5419,28 @@ function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shap
   const before = line.slice(0, start);
   if (/::\s*$/.test(before)) return { shape: 'path' };
   if (!/\.\s*$/.test(before)) return { shape: 'bare' };
-  return { shape: 'chained', receiver: rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '')) };
+  const receiver = before.replace(/\?\s*\.\s*$/, '');
+  return { shape: 'chained', receiver: isTupleReceiver(receiver) ? '()' : rustGoReceiverName(receiver) };
+}
+
+/**
+ * Whether a receiver's text ends in a tuple, `(self.ip(), self.port()).`: a
+ * parenthesized list with a comma of its own, no callee or macro before it.
+ */
+function isTupleReceiver(text: string): boolean {
+  const src = text.replace(/\s*\.\s*$/, '');
+  if (!src.endsWith(')')) return false;
+  let depth = 0;
+  let comma = false;
+  let i = src.length - 1;
+  for (; i >= 0; i--) {
+    const ch = src[i]!;
+    if (ch === ')' || ch === ']' || ch === '}') depth++;
+    else if (ch === '(' || ch === '[' || ch === '{') {
+      if (--depth === 0) break;
+    } else if (ch === ',' && depth === 1) comma = true;
+  }
+  return i >= 0 && comma && !/[\w$>\])!?]\s*$/.test(src.slice(0, i));
 }
 
 /**
@@ -5469,6 +5490,9 @@ function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>):
   if (!shape || shape.shape === 'path') return true;
   const member = n.kind === 'method';
   if (shape.shape === 'bare') return !member;
+  // A tuple's method is no named type's: serde's `(self.ip(),
+  // self.port()).serialize(s)` went to the `impl Serialize for Path` below it.
+  if (shape.receiver === '()') return false;
   if (!member) return n.kind !== 'function';
   // A name the standard library's own types all carry (`unwrap`, `clone`,
   // `iter`, Go's `String` / `Get`) needs a receiver named after the owner; a
@@ -8121,6 +8145,84 @@ const RUST_STD_TYPES = new Set([
 ]);
 const RUST_DECLARED_TYPE_KINDS = new Set(['struct', 'enum', 'union', 'type_alias', 'trait']);
 
+const rustNameSets = (lists: Record<string, string>): ReadonlyMap<string, ReadonlySet<string>> =>
+  new Map(Object.entries(lists).map(([type, names]) => [type, new Set(names.split(' '))]));
+
+const RUST_RC_INHERENT = 'new new_cyclic new_uninit new_uninit_slice new_zeroed pin try_new try_unwrap into_inner unwrap_or_clone ' +
+  'into_raw as_ptr from_raw increment_strong_count decrement_strong_count downgrade weak_count strong_count get_mut make_mut ptr_eq ' +
+  'downcast assume_init';
+/** `Pin`'s methods; its other functions (`Pin::new`, `Pin::into_inner`) are reached by path alone. */
+const RUST_PIN_METHODS = 'as_ref as_mut as_deref_mut set get_ref get_mut get_unchecked_mut into_ref map_unchecked map_unchecked_mut';
+
+/**
+ * What std declares on its own types, which Rust picks before any trait's
+ * function of the same name, on a path (`Arc::from_raw(ptr)`) as on a value
+ * (`v.len()`): tokio's `Arc::from_raw(…)` is std's own, never its `impl Link
+ * for Arc<ScheduledIo>`'s. Only what the type itself declares: a slice's
+ * `iter`, which a `Vec` reaches by deref, comes after a trait impl on the
+ * `Vec`. A name missing here leaves the trait's function in reach.
+ */
+const RUST_STD_INHERENT = rustNameSets({
+  Arc: RUST_RC_INHERENT,
+  Rc: RUST_RC_INHERENT,
+  Weak: 'new upgrade strong_count weak_count as_ptr into_raw from_raw ptr_eq',
+  Box: 'new new_uninit new_uninit_slice new_zeroed pin try_new from_raw into_raw from_non_null into_non_null leak into_pin ' +
+    'into_boxed_slice into_inner as_ptr as_mut_ptr downcast assume_init write',
+  NonNull: 'new new_unchecked dangling as_ptr as_ref as_mut cast add sub offset byte_add byte_sub byte_offset offset_from read ' +
+    'read_unaligned read_volatile write write_bytes write_unaligned write_volatile replace swap copy_to copy_from ' +
+    'copy_to_nonoverlapping copy_from_nonoverlapping drop_in_place from_ref from_mut slice_from_raw_parts len addr with_addr ' +
+    'map_addr align_offset is_aligned',
+  Pin: `new new_unchecked into_inner into_inner_unchecked static_ref static_mut ${RUST_PIN_METHODS}`,
+  Cell: 'new set swap replace into_inner get update as_ptr get_mut from_mut take',
+  RefCell: 'new into_inner replace replace_with swap borrow try_borrow borrow_mut try_borrow_mut as_ptr get_mut take',
+  Mutex: 'new lock try_lock is_poisoned clear_poison into_inner get_mut',
+  RwLock: 'new read try_read write try_write is_poisoned clear_poison into_inner get_mut',
+  Vec: 'new with_capacity from_raw_parts capacity reserve reserve_exact try_reserve try_reserve_exact shrink_to_fit shrink_to ' +
+    'into_boxed_slice truncate as_slice as_mut_slice as_ptr as_mut_ptr set_len swap_remove insert remove retain retain_mut ' +
+    'dedup_by_key dedup_by dedup push pop pop_if append drain clear len is_empty split_off resize_with resize leak ' +
+    'spare_capacity_mut extend_from_slice extend_from_within splice extract_if into_flattened',
+  String: 'new with_capacity from_utf8 from_utf8_lossy from_utf8_unchecked from_utf16 from_utf16_lossy from_raw_parts into_bytes ' +
+    'as_str as_mut_str push_str extend_from_within capacity reserve reserve_exact try_reserve try_reserve_exact shrink_to_fit ' +
+    'shrink_to push as_bytes truncate pop remove retain insert insert_str as_mut_vec len is_empty split_off clear drain ' +
+    'replace_range into_boxed_str leak',
+  Option: 'is_some is_some_and is_none is_none_or as_ref as_mut as_pin_ref as_pin_mut as_slice as_mut_slice expect unwrap ' +
+    'unwrap_or unwrap_or_else unwrap_or_default unwrap_unchecked map inspect map_or map_or_else ok_or ok_or_else as_deref ' +
+    'as_deref_mut iter iter_mut and and_then filter or or_else xor insert get_or_insert get_or_insert_default ' +
+    'get_or_insert_with take take_if replace zip unzip copied cloned transpose flatten',
+  Result: 'is_ok is_ok_and is_err is_err_and ok err as_ref as_mut map map_or map_or_else map_err inspect inspect_err as_deref ' +
+    'as_deref_mut iter iter_mut expect unwrap unwrap_or_default expect_err unwrap_err into_ok into_err and and_then or or_else ' +
+    'unwrap_or unwrap_or_else unwrap_unchecked unwrap_err_unchecked copied cloned transpose flatten',
+});
+
+/** What the std traits a smart pointer implements answer through it: `Clone`, `AsRef`, `Deref`, `Debug`, `PartialEq`, … */
+const RUST_POINTER_TRAIT_METHODS = 'clone clone_from as_ref borrow deref fmt eq ne partial_cmp lt le gt ge cmp max min clamp hash ' +
+  'into try_into to_string';
+
+/**
+ * What a std wrapper a value is reached through answers itself, ahead of the
+ * type it wraps — Rust tries the wrapper before dereferencing it: `Pin`'s own
+ * methods, and the std traits it implements (`Rc`'s `clone`, `Deref`,
+ * `Debug`). tokio's `self.get_mut()` through `self: Pin<&mut Self>` is
+ * `Pin::get_mut`, not its own `BufReader::get_mut`. (`Pin<&mut T>` is no
+ * `Clone`: `self.clone()` through one is the type's.)
+ */
+const RUST_WRAPPER_OWN_METHODS = rustNameSets({
+  Pin: `${RUST_PIN_METHODS} deref deref_mut fmt eq ne partial_cmp lt le gt ge cmp max min clamp hash into try_into to_string`,
+  Box: `${RUST_POINTER_TRAIT_METHODS} as_mut borrow_mut deref_mut downcast`,
+  Rc: `${RUST_POINTER_TRAIT_METHODS} downcast`,
+  Arc: `${RUST_POINTER_TRAIT_METHODS} downcast`,
+});
+
+/**
+ * The std wrapper a Rust method's `self` is declared through — `self:
+ * Pin<&mut Self>` → `Pin`, `self: &Arc<Self>` → `Arc` — read off its
+ * signature; null for `self`, `&self`, `&mut self` or `self: &Self`.
+ */
+function rustSelfWrapper(method: Node): string | null {
+  return /^\(\s*(?:mut\s+)?self\s*:\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core|alloc)\s*::\s*\w+\s*::\s*)?(Pin|Box|Rc|Arc)\s*</
+    .exec(method.signature ?? '')?.[1] ?? null;
+}
+
 interface RustImplHeader {
   /** The trait's name, the last segment of its path (`linked_list::Link` → `Link`). */
   trait: string;
@@ -8128,6 +8230,10 @@ interface RustImplHeader {
   traitArgs: string[];
   /** The implementing type's name (`NonNull<Entry>` → `NonNull`). */
   self: string;
+  /** The type names its arguments write (`Arc<Handle>` → `Handle`, `Pin<P>` → `P`). */
+  selfArgs: string[];
+  /** The impl's own type parameters (`impl<'a, P: DerefMut>` → `P`). */
+  params: string[];
 }
 
 const RUST_IMPL_HEADERS = new WeakMap<ResolutionContext, Map<string, RustImplHeader | null>>();
@@ -8136,13 +8242,20 @@ const RUST_IMPL_HEADERS = new WeakMap<ResolutionContext, Map<string, RustImplHea
 function parseRustImplHeader(text: string): RustImplHeader | null {
   let rest = text.replace(/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/, '').replace(/\{[\s\S]*$/, '').replace(/\bwhere\b[\s\S]*$/, '').trim();
   // The impl's own generics, `<'a, T: Into<U>>`.
+  const params: string[] = [];
   if (rest.startsWith('<')) {
     let depth = 0;
     let i = 0;
+    let from = 1;
     for (; i < rest.length; i++) {
       if (rest[i] === '<') depth++;
       else if (rest[i] === '>' && --depth === 0) break;
+      else if (rest[i] === ',' && depth === 1) {
+        params.push(rest.slice(from, i));
+        from = i + 1;
+      }
     }
+    params.push(rest.slice(from, i));
     rest = rest.slice(i + 1).trim();
   }
   // ` for ` outside the angle brackets parts the trait from the type.
@@ -8157,10 +8270,20 @@ function parseRustImplHeader(text: string): RustImplHeader | null {
   const traitPart = rest.slice(0, split).trim().replace(/^!/, '');
   const head = (part: string): string =>
     /([A-Za-z_]\w*)\s*(?:<|$)/.exec(part.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '').trim())?.[1] ?? '';
+  const args = (part: string): string[] => {
+    const open = part.indexOf('<');
+    return open < 0 ? [] : [...part.slice(open + 1).matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)]
+      .map((m) => m[1]!).filter((id) => id !== 'mut' && id !== 'dyn');
+  };
   const open = traitPart.indexOf('<');
-  const traitArgs = open < 0 ? [] : [...traitPart.slice(open + 1).matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)]
-    .map((m) => m[1]!).filter((id) => id !== 'mut' && id !== 'dyn');
-  return { trait: head(open < 0 ? traitPart : traitPart.slice(0, open)), traitArgs, self: head(rest.slice(split + 5)) };
+  const selfPart = rest.slice(split + 5);
+  return {
+    trait: head(open < 0 ? traitPart : traitPart.slice(0, open)),
+    traitArgs: args(traitPart),
+    self: head(selfPart),
+    selfArgs: args(selfPart.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '')),
+    params: params.map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined),
+  };
 }
 
 /** The `impl Trait<…> for Type<…>` a Rust method is declared in: null for an inherent impl, or none. */
@@ -8264,6 +8387,8 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
   if (!RUST_STD_TYPES.has(owner) || isRustProjectNamed(owner, RUST_DECLARED_TYPE_KINDS, context)) return true;
   const impl = rustTraitImplHeader(target, context);
   if (!impl || impl.self !== owner || impl.trait === '') return true;
+  // The type's own function of the name, std's, comes first (RUST_STD_INHERENT).
+  if (RUST_STD_INHERENT.get(owner)?.has(target.name)) return false;
   if (isRustProjectNamed(impl.trait, RUST_TRAIT_KIND, context)) return isRustTraitInScope(impl.trait, ref, target, context);
   const local = impl.traitArgs.find((t) => isRustProjectNamed(t, RUST_DECLARED_TYPE_KINDS, context));
   return local === undefined || rustFirstArgIs(local, ref, context);
@@ -8279,8 +8404,13 @@ function declaresRustVariant(type: Node, variant: string, context: ResolutionCon
 
 /** The line of the `impl` / `trait` header above `ref` in its file (0 for none). */
 function rustEnclosingImplLine(ref: UnresolvedRef, context: ResolutionContext): number {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  for (let i = ref.line - 1; i >= 0; i--) {
+  return rustImplLineAt(ref.filePath, ref.line, context);
+}
+
+/** The line of the `impl` / `trait` header at or above `line` of `filePath` (0 for none). */
+function rustImplLineAt(filePath: string, line: number, context: ResolutionContext): number {
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? [];
+  for (let i = line - 1; i >= 0; i--) {
     if (/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|trait)\b/.test(lines[i] ?? '')) return i + 1;
   }
   return 0;
@@ -8403,6 +8533,39 @@ function isRustGenericParam(name: string, ref: UnresolvedRef, context: Resolutio
   const from = Math.max(0, rustEnclosingImplLine(ref, context) - 1);
   const text = lines.slice(from, ref.line).join('\n');
   return new RegExp(`<[^<>]*(?:<[^<>]*>[^<>]*)*\\b${name}\\b\\s*(?:[:,>=])`).test(text);
+}
+
+/**
+ * Whether `name` is a type parameter the `fn` or the `impl` around `ref`
+ * declares in its own generics (`fn read<R: AsyncRead>(…)`, `impl<T> …`) —
+ * not a type its arguments merely name, as `Pin<&mut File>` names `File`.
+ */
+function isRustTypeParam(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const headerAt = (line: number): string => {
+    let text = '';
+    for (let j = line - 1; j >= 0 && j < Math.min(lines.length, line + 7) && !/[{;]/.test(text); j++) text += ` ${(lines[j] ?? '').replace(/\/\/.*$/, '')}`;
+    return text;
+  };
+  return [enclosingScopeStartLine(ref, context), rustEnclosingImplLine(ref, context)].some((line) => {
+    if (line === 0) return false;
+    const header = headerAt(line);
+    const open = /\b(?:fn\s+[A-Za-z_]\w*|impl)\s*</.exec(header);
+    if (!open) return false;
+    let depth = 0;
+    let from = open.index + open[0].length;
+    for (let i = from - 1; i < header.length; i++) {
+      const ch = header[i];
+      const param = (): boolean => new RegExp(`^\\s*(?:const\\s+)?${name}\\b`).test(header.slice(from, i));
+      if (ch === '<') depth++;
+      else if (ch === '>' && header[i - 1] !== '-' && --depth === 0) return param();
+      else if (ch === ',' && depth === 1) {
+        if (param()) return true;
+        from = i + 1;
+      }
+    }
+    return false;
+  });
 }
 
 /** What only exists inside a type, reachable through a receiver alone. */
@@ -9931,6 +10094,16 @@ export function resolveMethodOnType(
       if (viaExtension) return { original: ref, targetNodeId: viaExtension.id, confidence, resolvedBy };
     }
     return null;
+  }
+
+  // Rust picks a type's inherent method before a trait's of the same name —
+  // where one type has the name: two types of it each keep their own.
+  if (ref.language === 'rust' && matches.length > 1) {
+    const inherent = matches.filter((m) => !isRustTraitImplMethod(m, context));
+    if (inherent.length > 0 && inherent.length < matches.length &&
+        context.getNodesByName(typeName).filter((n) => n.language === 'rust' && RUST_DECLARED_TYPE_KINDS.has(n.kind)).length <= 1) {
+      matches = inherent;
+    }
   }
 
   if (matches.length > 1 && preferredFqn && ES_IMPORT_LANGUAGES.has(ref.language)) {
@@ -15399,6 +15572,18 @@ export function matchMethodCall(
     if (typeMember !== undefined) return typeMember;
   }
 
+  // Rust call on the enclosing type itself — `self.reset()`, emitted as
+  // `self.reset` (#1861). EXCLUSIVE: the owner is written on the `impl` line
+  // and carried in the calling method's qualified name, so it is not a guess.
+  // Letting this shape reach the bare-name strategies below is how
+  // `self.reset()` resolved to a same-named method on an unrelated type
+  // whenever that type's method happened to sit nearer the call site. Ahead
+  // of the local declarations below, which read `self: Pin<&mut Self>` as a
+  // `Pin` (matchRustSelfCall looks through it).
+  if (ref.language === 'rust' && dotMatch && objectOrClass === 'self') {
+    return matchRustSelfCall(methodName!, ref, context);
+  }
+
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
   // dedicated inferrer (header scan + `auto`); every other language uses the
@@ -15546,6 +15731,11 @@ export function matchMethodCall(
         if (!inferredType) return null;
         if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method', declared.file);
       }
+    }
+    // A Rust value declared `Pin<…>` is looked up through the `Pin`, on the
+    // type it pins (matchRustPinnedCall) — unless `Pin` is the project's own.
+    if (ref.language === 'rust' && inferredType === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+      return matchRustPinnedCall(objectOrClass!, methodName!, ref, context);
     }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
@@ -15699,17 +15889,6 @@ export function matchMethodCall(
   // method name with something nearby.
   if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
     return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
-  }
-
-  // Rust call on the enclosing type itself — `self.reset()`, emitted as
-  // `self.reset` (#1861). Same discipline as the field branch above, and
-  // EXCLUSIVE for the same reason: the owner is written on the `impl` line and
-  // carried in the calling method's qualified name, so it is not a guess.
-  // Letting this shape reach the bare-name strategies below is how
-  // `self.reset()` resolved to a same-named method on an unrelated type
-  // whenever that type's method happened to sit nearer the call site.
-  if (ref.language === 'rust' && dotMatch && objectOrClass === 'self') {
-    return matchRustSelfCall(methodName!, ref, context);
   }
 
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
@@ -16952,9 +17131,10 @@ export function rustFieldTypeName(raw: string): string | null {
  * The owner is the calling method's qualified-name prefix (`Target::run` →
  * `Target`), which is where the `impl` block's type ends up. A free function
  * has no `self`, so a caller whose qualified name carries no owner declines.
- * Exactly one candidate must belong to that owner: a project with two `impl`
- * blocks for the same type is normal, two same-named methods on it is not, and
- * guessing between them is the failure this replaces.
+ * Among the owner's methods of the name, the one Rust picks
+ * (pickRustOwnMethod): a project with two `impl` blocks for the same type is
+ * normal, and guessing between same-named methods by proximity is the failure
+ * this replaces.
  */
 function matchRustSelfCall(
   methodName: string,
@@ -16986,14 +17166,135 @@ function matchRustSelfCall(
     if (owners.filter((n) => n.filePath === caller.filePath).length !== 1) return null;
     owned = owned.filter((n) => n.filePath === caller.filePath);
   }
-  if (owned.length !== 1) return null;
+  // `(self.into_route)(state)` calls what a field holds, no method: axum's
+  // `MakeErasedHandler::into_route` went to itself.
+  const at = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1]?.slice(ref.column);
+  if (at?.startsWith('(') && new RegExp(`^\\(\\s*self\\s*\\.\\s*${methodName}\\s*\\)`).test(at)) return null;
+  // In a trait impl, `fn wake(self) { self.wake() }` hands the call on to the
+  // type's own `wake`: its inherent one, or for a type from outside the
+  // project one the index doesn't hold (tokio's `impl WakerRef for Waker`) —
+  // never back to the impl, unless the type is the project's and has none (a
+  // `poll` that polls itself again).
+  if (caller.name === methodName && isRustTraitImplMethod(caller, context)) {
+    const inherent = owned.filter((n) => !isRustTraitImplMethod(n, context));
+    if (inherent.length > 0) owned = inherent;
+    else {
+      const self = rustSelfType(ref, context);
+      if (!self || isRustOutsideSelf(self, ref, context)) return null;
+    }
+  }
+  // `self` declared through a wrapper — `self: Pin<&mut Self>`, `self:
+  // Rc<Self>` — is looked up through it (rustThroughWrapper).
+  const wrapper = rustSelfWrapper(caller);
+  if (wrapper && !isRustProjectNamed(wrapper, RUST_DECLARED_TYPE_KINDS, context)) {
+    const through = rustThroughWrapper(wrapper, methodName, owned, owner.split('::').pop()!, ref, context);
+    if (!Array.isArray(through)) return through && { original: ref, targetNodeId: through.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    owned = through;
+  }
+  const target = pickRustOwnMethod(owned, ref, context);
+  if (!target) return null;
 
   return {
     original: ref,
-    targetNodeId: owned[0]!.id,
+    targetNodeId: target.id,
     confidence: 0.9,
     resolvedBy: 'qualified-name',
   };
+}
+
+/**
+ * Which of a Rust type's methods of one name a call on the type reaches, as
+ * Rust picks: its inherent one; else the one of the trait impl the call is
+ * written in (each of tokio's `impl AsyncWrite for io::Cursor<…>` blocks calls
+ * its own `poll_flush`), or the only one. Several inherent ones (`#[cfg]`
+ * twins) or trait impls of the name are past telling apart.
+ */
+function pickRustOwnMethod(owned: Node[], ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  if (owned.length <= 1) return owned[0] ?? null;
+  const inherent = owned.filter((n) => !isRustTraitImplMethod(n, context));
+  if (inherent.length > 0) return inherent.length === 1 ? inherent[0]! : null;
+  const header = rustEnclosingImplLine(ref, context);
+  const block = owned.filter((n) => n.filePath === ref.filePath && rustImplLineAt(n.filePath, n.startLine, context) === header);
+  return block.length === 1 ? block[0]! : null;
+}
+
+/**
+ * Rust's method lookup on a value reached through a std wrapper — `self:
+ * Pin<&mut Self>`, `read: Pin<&mut R>`, `self: Rc<Self>` — where `own` are
+ * the wrapped type's methods of the name and `inner` that type (null for a
+ * type parameter or one not known). Rust tries the wrapper before
+ * dereferencing it:
+ * - the wrapped type's method taking `self` through that wrapper (`fn
+ *   poll_flush(self: Pin<&mut Self>, …)`) is a method of the wrapper's type;
+ * - then the wrapper's own: std's (RUST_WRAPPER_OWN_METHODS), which the index
+ *   doesn't hold, or a project impl on the wrapper, blanket or for `inner`,
+ *   taking `self`, `&self` or `&mut self` (tokio's `impl AsyncWrite for
+ *   Pin<P>`'s `is_write_vectored`). Its methods taking `self: Pin<&mut Self>`
+ *   would need a `Pin<&mut Pin<…>>`: tokio's `self.poll_flush(cx)` in `impl
+ *   AsyncWrite for File` went to that impl's;
+ * - then the wrapped type's other methods, by deref.
+ * The candidates to pick from, or the target itself (null for std's).
+ */
+function rustThroughWrapper(
+  wrapper: string, name: string, own: Node[], inner: string | null, ref: UnresolvedRef, context: ResolutionContext,
+): Node[] | Node | null {
+  const through = own.filter((n) => rustSelfWrapper(n) === wrapper);
+  if (through.length > 0) return through;
+  if (RUST_WRAPPER_OWN_METHODS.get(wrapper)?.has(name)) return null;
+  const onWrapper = context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
+    (n.qualifiedName === `${wrapper}::${name}` || n.qualifiedName.endsWith(`::${wrapper}::${name}`)) &&
+    rustSelfWrapper(n) === null && rustImplFor(n, inner, context));
+  if (onWrapper.length > 0) return preferCallSiteFile(onWrapper, ref.filePath)[0]!;
+  return own;
+}
+
+/** Whether `method`'s impl on a wrapper applies to one of `inner`: a blanket impl (`impl<P> AsyncWrite for Pin<P>`), or one naming it (`impl Schedule for Arc<Handle>`). */
+function rustImplFor(method: Node, inner: string | null, context: ResolutionContext): boolean {
+  const impl = rustTraitImplHeader(method, context);
+  return impl !== null && impl.selfArgs.some((a) => impl.params.includes(a) || a === inner);
+}
+
+/**
+ * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
+ * `fut: Pin<Box<dyn Future>>` → `Future`, `this: Pin<&mut Self>` → the impl's
+ * type — read off its nearest declaration in the calling function; null when
+ * that names none (`let fut = Pin::new(&mut f)`).
+ */
+function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declared = new RegExp(`\\b${escaped}\\s*:(?!:)\\s*(.*)$|\\blet\\s+(?:mut\\s+)?${escaped}\\b`);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const m = declared.exec(lines[i] ?? '');
+    if (!m) continue;
+    const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
+      .exec(m[1] ?? '');
+    const type = pinned?.[1]!.split('::').pop()!.trim() ?? null;
+    if (type !== 'Self') return type;
+    return rustSelfType(ref, context)?.type ?? null;
+  }
+  return null;
+}
+
+/**
+ * A Rust call on a value declared `Pin<…>`: Rust's lookup through the `Pin`
+ * (rustThroughWrapper) on the type it pins. A type parameter's own methods
+ * are its bound's, which the call doesn't name: tokio's `read.poll_read(…)`
+ * on `read: Pin<&mut R>` went to its `impl AsyncRead for Pin<P>`.
+ */
+function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const pinned = rustPinnedType(receiver, ref, context);
+  const inner = pinned !== null && !isRustTypeParam(pinned, ref, context) ? pinned : null;
+  const own = inner === null ? [] : context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
+    (n.qualifiedName === `${inner}::${name}` || n.qualifiedName.endsWith(`::${inner}::${name}`)));
+  const through = rustThroughWrapper('Pin', name, own, inner, ref, context);
+  let target = through as Node | null;
+  if (Array.isArray(through)) {
+    const inherent = through.filter((n) => !isRustTraitImplMethod(n, context));
+    target = preferCallSiteFile(inherent.length > 0 ? inherent : through, ref.filePath)[0] ?? null;
+  }
+  return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
 }
 
 /**
