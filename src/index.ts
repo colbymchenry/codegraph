@@ -1060,9 +1060,12 @@ export class CodeGraph {
             // `lazy-import:./pages/Team`), as does a reference through an
             // import binding the module declares under another name
             // (`module:tag` for `import tagsController from
-            // './tag/tag.controller'`): each resolves through the module, so
-            // an edit can satisfy it as well as an added file. On a sync
-            // where no failed ref matches, this is one indexed lookup.
+            // './tag/tag.controller'`) and a direct member reference through
+            // any binding (`module:constants` for `LIST.includes(x)` after
+            // `import { LIST } from './constants'`): each resolves through the
+            // module, so an edit can satisfy it as well as an added file. On
+            // a sync where no failed ref matches, this is a few indexed
+            // lookups.
             const tRetry = Date.now();
             edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
@@ -1079,8 +1082,9 @@ export class CodeGraph {
             // to an added file (`@excalidraw/common` to `packages/common/src/
             // index.ts`) waits under its last segment, which that file's keys
             // never give: look its failed imports up by the specifier itself.
-            // An import of the importer's own folder or the one above (`.`,
-            // `..`) waits under no key at all, so each is tried where written.
+            // An import of the importer's own folder or one above it (`.`,
+            // `..`, `../..`) waits under no key at all, so each is tried
+            // where written.
             const addedFiles = new Set(result.addedFilePaths ?? []);
             const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
               const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
@@ -1093,11 +1097,16 @@ export class CodeGraph {
               .filter((ref) => ref.filePath !== undefined && ref.language !== undefined &&
                 resolvesToAdded(ref.referenceName, ref.filePath, ref.language));
             const retryRows = new Set(retryable.map((ref) => ref.rowId));
+            // A key a popular import shares (`utils`, `react`, `assert`) is
+            // past the ceiling, and is still looked through for the imports
+            // that could name an added file.
             const importRetry = this.queries.getRetryableFailedImports(
               (result.addedFilePaths ?? []).flatMap(importPathKeys),
               this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module']),
               undefined,
-              resolvedModules
+              resolvedModules,
+              undefined,
+              this.resolver.couldNameAnyOf([...addedFiles])
             );
             for (const ref of [...importRetry, ...folderImports]) {
               if (!retryRows.has(ref.rowId)) {
@@ -1144,13 +1153,17 @@ export class CodeGraph {
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
             }
 
-            // A failed reference that waits for a module through a barrel —
-            // React Router's `import:@/pages#HomePage`, parked under
-            // `module:pages` — waits for a file below the barrel too
-            // (`pages/Home/index.tsx`), whose own keys name its folder and
-            // stem. Those parked under the keys of the barrels that pass on a
-            // file this sync adds, or one whose definitions it changed, go
-            // back to pending for the sweep; a body-only edit satisfies none.
+            // A reference that reaches a module through a barrel waits for a
+            // file below it: React Router's `import:@/pages#HomePage`, parked
+            // under `module:pages`, for `pages/Home/index.tsx`, whose own keys
+            // name its folder and stem; `import { MatxLoading } from
+            // './components'` for the `MatxLoading.jsx` the barrel passes on
+            // as `default as MatxLoading`, a name that file never declares.
+            // Those that reach a file this sync adds, or one whose definitions
+            // it changed, go back to pending for the sweep: the failed ones,
+            // and the edges bound before this sync resolved anything, which a
+            // name match may have taken elsewhere while the file lacked the
+            // name. A body-only edit satisfies none.
             const tBarrels = Date.now();
             const delta = new Set(result.definitionDelta ?? []);
             const seeds = new Map<string, Language>(added.map((file) => [file.path, file.language]));
@@ -1161,7 +1174,7 @@ export class CodeGraph {
               }
             }
             const throughBarrels = reopenReferencesThroughBarrels(
-              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language }))
+              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language })), edgesBeforeResolution
             );
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-barrel-modules: ${Date.now() - tBarrels}ms (${throughBarrels} refs re-opened)`);
           } else {

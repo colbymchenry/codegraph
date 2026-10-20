@@ -22,7 +22,7 @@ import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../se
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
-import { isModuleKey, referenceNameTail } from './reference-tail';
+import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
 
 /**
  * Files that should not be candidates for "dominant file" detection: tests,
@@ -44,6 +44,23 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+
+/**
+ * How an import names a folder only through where it is written: `.`, or a
+ * folder up to twelve levels above (`..`, `../..`, with or without the
+ * trailing `/`).
+ */
+const FOLDER_SPECIFIERS: readonly string[] = (() => {
+  const names = ['.', './'];
+  for (let levels = 1; levels <= 12; levels++) {
+    const up = Array.from({ length: levels }, () => '..').join('/');
+    names.push(up, `${up}/`);
+  }
+  return names;
+})();
+
+/** A name a member reference's receiver can be: not a file's name, nor a `module:` key. */
+const RECEIVER_NAME = /^[A-Za-z_$][\w$]*$/;
 
 /**
  * A SQL predicate: is the node aliased `alias` a member an INTERFACE declares?
@@ -2109,10 +2126,11 @@ export class QueryBuilder {
     return !!this.db.prepare('SELECT 1 FROM synthesis_inputs WHERE file_path = ?').get(filePath);
   }
 
+  /** Record the files synthesis read; a path the index doesn't hold as a file (a package directory) is not one (#2565). */
   replaceSynthesisInputs(files: string[]): void {
     this.db.transaction(() => {
       this.db.exec('DELETE FROM synthesis_inputs');
-      const insert = this.db.prepare('INSERT INTO synthesis_inputs(file_path) VALUES (?)');
+      const insert = this.db.prepare('INSERT OR IGNORE INTO synthesis_inputs(file_path) SELECT path FROM files WHERE path = ?');
       for (const file of files) insert.run(file);
     })();
   }
@@ -2394,11 +2412,13 @@ export class QueryBuilder {
    * called unreferenced, whatever the edge table says. It is deliberately
    * matched loosely, on the reference name AND on its tail (`util.greet` →
    * `greet`), because the question being asked is "could this name be the one
-   * we failed to follow", and a maybe has to count as a yes.
+   * we failed to follow", and a maybe has to count as a yes. A reference
+   * parked under its module (`store.get` → 'module:store') is matched on the
+   * tail its name gives.
    *
    * Bounded-lookup like {@link getGeneratedPathsAmong}: the caller holds a
-   * candidate list, so this is a chunked probe over `idx_unresolved_name`, not
-   * a scan of the table.
+   * candidate list, so this is a chunked probe over `idx_unresolved_name`
+   * (and the module-member index), not a scan of the table.
    */
   getUnresolvedNamesAmong(names: Iterable<string>): Set<string> {
     const unique = [...new Set(names)].filter((name) => name.length > 0);
@@ -2414,9 +2434,12 @@ export class QueryBuilder {
             WHERE reference_name IN (${placeholders})
             UNION
            SELECT DISTINCT name_tail AS name FROM unresolved_refs
-            WHERE name_tail IN (${placeholders})`
+            WHERE name_tail IN (${placeholders})
+            UNION
+           SELECT DISTINCT ${MEMBER_TAIL_SQL} AS name FROM unresolved_refs
+            WHERE ${MODULE_PARKED_SQL} AND ${MEMBER_TAIL_SQL} IN (${placeholders})`
         )
-        .all(...chunk, ...chunk) as Array<{ name: string }>;
+        .all(...chunk, ...chunk, ...chunk) as Array<{ name: string }>;
       for (const row of rows) found.add(row.name);
     }
     return found;
@@ -4009,7 +4032,11 @@ export class QueryBuilder {
    * is a reference through an import binding of the module. Such a binding's
    * reference still waits for its own name too, looked up by its whole name:
    * a fresh index links a binding whose module never resolves it by that
-   * name alone, to whichever declaration carries it.
+   * name alone, to whichever declaration carries it. A member reference
+   * through a binding (`store.get`) waits for its member's name, the tail its
+   * name gives, under that name's ceiling, and for its receiver's, looked up
+   * as the prefix `store.`: the declaration of a name a barrel forwards is in
+   * a file of another name.
    *
    * A module key has a ceiling of its own, `perModuleCeiling`. What waits
    * under it imports a module of that name, so a large population is not
@@ -4025,25 +4052,39 @@ export class QueryBuilder {
       // idx_unresolved_failed_module_name; its leading `status` is the
       // equality term that keeps the planner off idx_unresolved_status and
       // idx_unresolved_name, which read hundreds of thousands of rows here.
-      { column: 'reference_name', where: "status = 'failed' AND name_tail GLOB 'module:*'" },
+      { column: 'reference_name', where: MODULE_PARKED_SQL },
+      // A member reference's member: idx_unresolved_failed_module_member, for
+      // the same reason. A whole name is the lookup above's.
+      { column: MEMBER_TAIL_SQL, where: `${MODULE_PARKED_SQL} AND instr(reference_name, '.') > 0` },
     ];
-    const rows = new Map<number, UnresolvedRefRow>();
-    for (const { column, where } of lookups) {
-      // Pass 1: per-key counts, chunked under the SQLite parameter limit.
-      const retryKeys: string[] = [];
+    // Pass 1: per-key counts, chunked under the SQLite parameter limit.
+    const counts = lookups.map(({ column, where }) => {
+      const byKey = new Map<string, number>();
       for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
         const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');
-        const counts = this.db
+        const found = this.db
           .prepare(`SELECT ${column} AS key, COUNT(*) AS count FROM unresolved_refs WHERE ${where} AND ${column} IN (${placeholders}) GROUP BY ${column}`)
           .all(...chunk) as Array<{ key: string; count: number }>;
-        for (const row of counts) {
-          const ceiling = column === 'name_tail' && isModuleKey(row.key) ? perModuleCeiling : perNameCeiling;
-          if (row.count <= ceiling) retryKeys.push(row.key);
-        }
+        for (const row of found) byKey.set(row.key, row.count);
       }
+      return byKey;
+    });
+    // A member reference parked under its module had its member's name as its
+    // tail before, so the two lookups by that name share one ceiling: a name
+    // too common to look up stays so wherever its references are parked, and
+    // the references still under it are not retried more for it.
+    const [byTail, , byMember] = counts;
+    const population = (lookup: number, key: string, count: number): number =>
+      lookup === 1 ? count : (byTail!.get(key) ?? 0) + (byMember!.get(key) ?? 0);
 
-      // Pass 2: load the surviving rows; a row both lookups find is kept once.
+    const rows = new Map<number, UnresolvedRefRow>();
+    for (const [lookup, { column, where }] of lookups.entries()) {
+      const retryKeys = [...counts[lookup]!]
+        .filter(([key, count]) => (lookup === 0 && isModuleKey(key) ? count <= perModuleCeiling : population(lookup, key, count) <= perNameCeiling))
+        .map(([key]) => key);
+
+      // Pass 2: load the surviving rows; a row two lookups find is kept once.
       for (let i = 0; i < retryKeys.length; i += SQLITE_PARAM_CHUNK_SIZE) {
         const chunk = retryKeys.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');
@@ -4055,6 +4096,18 @@ export class QueryBuilder {
         // select an unbounded number of failed rows per chunk.
         for (const row of chunkRows) rows.set(row.id, row);
       }
+    }
+
+    // By receiver: one range of idx_unresolved_failed_module_name per name,
+    // `store.` up to `store/` ('/' follows '.'), read one past the ceiling.
+    const byReceiver = this.db.prepare(
+      `SELECT * FROM unresolved_refs WHERE ${MODULE_PARKED_SQL} AND reference_name >= ? AND reference_name < ? LIMIT ?`
+    );
+    for (const name of names) {
+      if (!RECEIVER_NAME.test(name)) continue;
+      const found = byReceiver.all(`${name}.`, `${name}/`, perNameCeiling + 1) as UnresolvedRefRow[];
+      if (found.length > perNameCeiling) continue;
+      for (const row of found) rows.set(row.id, row);
     }
 
     return [...rows.values()].map((row) => ({
@@ -4088,6 +4141,13 @@ export class QueryBuilder {
    * The other lookups share the per-name ceiling of
    * {@link getRetryableFailedReferences}, counted per key; this one has the
    * module ceiling, since a specifier that resolves to the file is no noise.
+   *
+   * A path key past the ceiling is not all noise, though: `utils` is the stem
+   * of a project's own `./utils` and of every `jotai/utils` and
+   * `@scope/pkg/utils` alike, and `assert` the name of every binding of
+   * `import * as assert from 'assert'`. Such a key is retried for the
+   * imports `couldName` accepts, the ones that could name a file the sync
+   * added: no noise either, so within the module ceiling.
    */
   getRetryableFailedImports(
     pathKeys: string[],
@@ -4095,21 +4155,34 @@ export class QueryBuilder {
     perNameCeiling: number = 500,
     resolvedModules: string[] = [],
     perModuleCeiling: number = 5000,
+    couldName?: (ref: UnresolvedReference) => boolean,
   ): UnresolvedReference[] {
     const failedImports = "status = 'failed' AND reference_kind = 'imports'";
     const lookups = [
-      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling },
-      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling },
+      { keys: pathKeys, column: 'name_tail', where: failedImports, ceiling: perNameCeiling, couldName },
+      { keys: pathKeys, column: 'reference_name', where: failedImports, ceiling: perNameCeiling, couldName },
       { keys: names, column: 'reference_name', where: `${failedImports} AND name_tail != reference_name`, ceiling: perNameCeiling },
       // A module specifier that now resolves to an added file: no noise, so
       // the module ceiling, as for a module key.
       { keys: resolvedModules, column: 'reference_name', where: failedImports, ceiling: perModuleCeiling },
     ];
+    const toReference = (row: UnresolvedRefRow): UnresolvedReference => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    });
     const rows = new Map<number, UnresolvedRefRow>();
-    for (const { keys, column, where, ceiling } of lookups) {
+    for (const { keys, column, where, ceiling, couldName } of lookups) {
       const unique = [...new Set(keys)].filter((key) => key.length > 0);
       // Pass 1: per-key counts, chunked under the SQLite parameter limit.
       const retryKeys: string[] = [];
+      const crowdedKeys: string[] = [];
       for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
         const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');
@@ -4118,6 +4191,7 @@ export class QueryBuilder {
           .all(...chunk) as Array<{ key: string; count: number }>;
         for (const row of counts) {
           if (row.count <= ceiling) retryKeys.push(row.key);
+          else if (couldName) crowdedKeys.push(row.key);
         }
       }
       // Pass 2: load the surviving rows; a row two lookups find is kept once.
@@ -4129,19 +4203,18 @@ export class QueryBuilder {
           .all(...chunk) as UnresolvedRefRow[];
         for (const row of chunkRows) rows.set(row.id, row);
       }
+      // A key past the ceiling: only the imports that could name an added file.
+      for (const key of crowdedKeys) {
+        const keyRows = this.db
+          .prepare(`SELECT * FROM unresolved_refs WHERE ${where} AND ${column} IN (?)`)
+          .all(key) as UnresolvedRefRow[];
+        const named = keyRows.filter((row) => couldName!(toReference(row)));
+        if (named.length > perModuleCeiling) continue;
+        for (const row of named) rows.set(row.id, row);
+      }
     }
 
-    return [...rows.values()].map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return [...rows.values()].map(toReference);
   }
 
   /**
@@ -4164,16 +4237,17 @@ export class QueryBuilder {
 
   /**
    * Failed imports of the folder the importing file is in or under (`.`,
-   * `..`). Their tail is empty, since they name a folder only through where
-   * they are written, so no added file's keys find them.
+   * `..`, `../..`). Their tail is empty, since they name a folder only
+   * through where they are written, so no added file's keys find them.
    */
   getFailedFolderImports(): UnresolvedReference[] {
+    const placeholders = FOLDER_SPECIFIERS.map(() => '?').join(',');
     return (this.db
       .prepare(
         `SELECT * FROM unresolved_refs
-          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN ('.', './', '..', '../')`
+          WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name IN (${placeholders})`
       )
-      .all() as UnresolvedRefRow[])
+      .all(...FOLDER_SPECIFIERS) as UnresolvedRefRow[])
       .map((row) => ({
         fromNodeId: row.from_node_id,
         referenceName: row.reference_name,
@@ -4190,8 +4264,10 @@ export class QueryBuilder {
   /**
    * Failed `calls` refs whose name tail is one of `tails` — the navigation
    * calls (`history.push`, `navigate`) a sync looks through after a route
-   * appeared or went away. Read through the failed-tail index; the caller
-   * decides on each whole name.
+   * appeared or went away. Read through the failed-tail index, and a call
+   * through an import binding, parked under its module (`router.push` →
+   * 'module:router'), through the module-member index; the caller decides on
+   * each whole name.
    */
   getFailedCallsByTail(tails: string[]): Array<{ rowId: number; referenceName: string; filePath: string }> {
     const out: Array<{ rowId: number; referenceName: string; filePath: string }> = [];
@@ -4202,9 +4278,12 @@ export class QueryBuilder {
       const rows = this.db
         .prepare(
           `SELECT id, reference_name, file_path FROM unresolved_refs
-            WHERE status = 'failed' AND reference_kind = 'calls' AND name_tail IN (${placeholders})`
+            WHERE status = 'failed' AND reference_kind = 'calls' AND name_tail IN (${placeholders})
+           UNION ALL
+           SELECT id, reference_name, file_path FROM unresolved_refs
+            WHERE ${MODULE_PARKED_SQL} AND reference_kind = 'calls' AND ${MEMBER_TAIL_SQL} IN (${placeholders})`
         )
-        .all(...chunk) as Array<{ id: number; reference_name: string; file_path: string }>;
+        .all(...chunk, ...chunk) as Array<{ id: number; reference_name: string; file_path: string }>;
       for (const row of rows) out.push({ rowId: row.id, referenceName: row.reference_name, filePath: row.file_path });
     }
     return out;
