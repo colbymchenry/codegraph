@@ -224,8 +224,9 @@ describe('a failed reference through an import binding', () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
-      // A package's binding, an unaliased named import and a member of a
-      // namespace import wait for the name they use.
+      // A package's binding and an unaliased named import wait for the name
+      // they use; a member of a namespace import waits for its module too
+      // (sync-import-member-retry.test.ts).
       'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, NS.make()];\n",
     });
     (await CodeGraph.init(root, { index: true })).close();
@@ -251,7 +252,7 @@ describe('a failed reference through an import binding', () => {
 
       expect(tailOf('src/other.ts', 'express', 'imports')).toBe('express');
       expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('helper');
-      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('make');
+      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('module:ns');
 
       // Each module's file is one of the keys its references wait under.
       for (const [file, module] of [
