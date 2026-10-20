@@ -17042,7 +17042,11 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
   switch (cls.language) {
     case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
-    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
+    // A base built by a class's factory — Django's `class Manager(
+    // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
+    // qualifier is the supertype, not the method called on it.
+    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, '')
+      .replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
     case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
     case 'typescript': case 'tsx': case 'javascript': case 'jsx':
@@ -18245,12 +18249,17 @@ export function matchMethodCall(
     // staxrip's `FrameServerFactory.Create(…)` went to its AutoCrop tool's copy.
     if (ref.language === 'vbnet') classCandidates = preferVbProject(classCandidates, ref, context);
 
+    const productionCaller = !isTestPath(ref.filePath);
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
       // A class declared inside a function is named only in there: a
       // `File.write(…)` elsewhere is not the `File` a Django test declares.
       if (!isLexicallyReachable(classNode, ref, context)) continue;
+      // Production code never names a test suite's class: Django's
+      // `manager.check()` in `Model._check_managers` is no test app's
+      // `Manager` model (whose `check` it inherits from `Model`).
+      if (productionCaller && isTestPath(classNode.filePath)) continue;
 
       // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
       // own, else one a base declares (cppMethodOf), never one of a class
@@ -18338,11 +18347,14 @@ export function matchMethodCall(
         withinCppTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
+      const productionCaller = !isTestPath(ref.filePath);
       for (const classNode of fuzzyClassCandidates) {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
-        // Nor a class declared inside another function (see Strategy 1).
+        // Nor a class declared inside another function, nor a test suite's
+        // class from production code (see Strategy 1).
         if (!isLexicallyReachable(classNode, ref, context)) continue;
+        if (productionCaller && isTestPath(classNode.filePath)) continue;
 
         const methodNode = classStrategyMethod(classNode, methodName!, context);
 
@@ -18416,12 +18428,9 @@ export function matchMethodCall(
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
     // Nor is it a method of a class another function declares: Django's
     // `file.write(…)` in one test is not the `File` a serializer test
-    // declares in its body.
-    {
-      const kept = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
-      narrowed ||= kept.length !== targetMethods.length;
-      targetMethods = kept;
-    }
+    // declares in its body. Like the test suite's, such a method was never
+    // in the running, so ruling it out narrows nothing.
+    targetMethods = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref

@@ -121,6 +121,42 @@ def save(file):
 def save_class(f):
     File.write(f, "data")
 `);
+  // Production code never names a test suite's class: a test app's `Manager`
+  // model (which inherits `check`) is not what `manager.check()` in the
+  // library means. The library's own `Manager` is built by a factory on
+  // `BaseManager` — Django's `BaseManager.from_queryset(QuerySet)` — so it
+  // has BaseManager's methods, and the QuerySet's the factory copies on.
+  fs.mkdirSync(path.join(dir, 'tests'));
+  fs.writeFileSync(path.join(dir, 'tests', 'models.py'), `class Model:
+    def check(self):
+        pass
+
+class Manager(Model):
+    pass
+`);
+  fs.writeFileSync(path.join(dir, 'managers.py'), `class QuerySet:
+    def filter(self):
+        pass
+
+class BaseManager:
+    def check(self):
+        pass
+
+    def get_queryset(self):
+        pass
+
+    @classmethod
+    def from_queryset(cls, queryset_class):
+        return cls
+
+class Manager(BaseManager.from_queryset(QuerySet)):
+    pass
+
+def check_managers(manager):
+    manager.check()
+    manager.get_queryset()
+    manager.filter()
+`);
   // A Kotlin companion object's members are the class's own: `Foo.create()`
   // is Foo's, not that of `FooBar`, declared first.
   fs.writeFileSync(path.join(dir, 'Factory.kt'), `package app
@@ -211,6 +247,18 @@ describe('method call binds to the receiver class itself, not a class whose name
     expect(calleesOf('save_class', 'storage.py')).not.toContain('streams.py#SerializerTests::test_stream::File::write');
     // Inside the function that declares it, the name is that class.
     expect(calleesOf('test_stream', 'streams.py')).toContain('streams.py#SerializerTests::test_stream::File::write');
+  });
+
+  it("Python: production code reaches the library's class, not a test suite's namesake", () => {
+    const callees = calleesOf('check_managers', 'managers.py');
+    expect(callees).toContain('managers.py#BaseManager::check');
+    expect(callees).not.toContain('tests/models.py#Model::check');
+  });
+
+  it("Python: a base built by a class's factory gives that class's methods, and the factory's argument's", () => {
+    const callees = calleesOf('check_managers', 'managers.py');
+    expect(callees).toContain('managers.py#BaseManager::get_queryset');
+    expect(callees).toContain('managers.py#QuerySet::filter');
   });
 
   it("Kotlin: a companion object's method is its own class's", () => {
