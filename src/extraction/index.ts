@@ -300,16 +300,12 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
  * Source files no compiler or bundler writes into a build folder: TypeScript
  * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
  * components, whose builds emit JavaScript, declarations, CSS, HTML and
- * source maps instead; and Go and C#, whose toolchains write elsewhere (Go's
- * binaries, .NET's `bin/` and `obj/`). Python, C and C++, PHP and Java are
- * left out: setuptools and frozen apps copy `.py` into `build/`, CMake
- * generates C and C++ there, WordPress builds `build/*.php`. Rust waits too,
- * though Cargo writes to `target/`: its name matching doesn't yet keep a
- * private item to its own module, so dioxus's `src/build/patch.rs`, with a
- * private `type Result`, took 158 `Result` references the crate's own
- * `pub(crate) type Result` should keep.
+ * source maps instead; and Go, C# and Rust, whose toolchains write elsewhere
+ * (Go's binaries, .NET's `bin/` and `obj/`, Cargo's `target/`). Python, C and
+ * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
+ * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
  */
-const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs)$/i;
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
 /** TypeScript declarations, which `tsc` writes beside its JavaScript. */
 const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
 /** Matches the JVM packages named `build`, whose whole subtree stays indexed. */

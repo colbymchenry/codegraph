@@ -6,12 +6,12 @@
  * was indexed and those routes linked nothing.
  *
  * Such a folder is now walked and its hand-written source (TypeScript, JSX,
- * Vue, Svelte, Astro, and Go and C#, as in Go's `src/go/build` or a .NET
- * solution's `src/Build/` project) indexed, while what a build step writes there —
- * JavaScript, declarations, CSS, HTML, maps, a frozen app's Python, CMake's
- * C — stays out, as does every `build/` folder outside `src/`. Both
- * enumeration paths, the git-status sync and the watcher share the rule
- * (#1728).
+ * Vue, Svelte, Astro, and Go, C# and Rust, as in Go's `src/go/build`, a .NET
+ * solution's `src/Build/` project or dioxus's `src/build/`) indexed, while
+ * what a build step writes there — JavaScript, declarations, CSS, HTML, maps,
+ * a frozen app's Python, CMake's C — stays out, as does every `build/` folder
+ * outside `src/`. Both enumeration paths, the git-status sync and the watcher
+ * share the rule (#1728).
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { execFileSync } from 'child_process';
@@ -71,9 +71,10 @@ describe('the scope of a build folder below src', () => {
     'src/routes/build/+page.svelte',
     'src/pages/build/BuildPage.jsx',
     'src/content/build/Card.astro',
-    // Go and C# toolchains write their output elsewhere.
+    // Go, C# and Rust toolchains write their output elsewhere.
     'src/go/build/build.go',
     'tools/src/Build/BuildManager.cs',
+    'crates/cli/src/build/mod.rs',
     // A JVM package named `build` keeps every file, as before (#1642).
     'src/main/java/com/acme/build/Script.js',
   ];
@@ -94,8 +95,6 @@ describe('the scope of a build folder below src', () => {
     'src/build/CMakeFiles/feature_tests.c',
     'src/build/CMakeFiles/feature_tests.cxx',
     'src/build/routes.php',
-    // Rust waits until its name matching keeps a private item to its module.
-    'crates/cli/src/build/mod.rs',
     // The other defaults still apply inside such a folder.
     'src/build/node_modules/pkg/index.ts',
     'src/build/dist/index.ts',
@@ -179,17 +178,21 @@ describe('the scope of a build folder below src', () => {
 });
 
 describe('a module kept in a build folder below src', () => {
-  it('is indexed for Go and C#', async () => {
+  it('is indexed for Go, C# and Rust', async () => {
     const root = tempDir();
     write(root, {
       'src/go/build/build.go': 'package build\n\nfunc Import(path string) error {\n\treturn nil\n}\n',
       'tools/src/Build/BuildManager.cs': 'namespace Tools.Build\n{\n    public class BuildManager\n    {\n        public void Run() { }\n    }\n}\n',
+      'crates/cli/Cargo.toml': '[package]\nname = "cli"\nversion = "0.1.0"\n',
+      'crates/cli/src/main.rs': 'mod build;\n\nfn main() {\n    build::BuildRequest::new().run();\n}\n',
+      'crates/cli/src/build/mod.rs': 'pub struct BuildRequest;\n\nimpl BuildRequest {\n    pub fn new() -> Self {\n        BuildRequest\n    }\n\n    pub fn run(&self) {}\n}\n',
     });
     const cg = await CodeGraph.init(root, { index: true });
     graphs.push(cg);
     const names = (file: string) => cg.getNodesInFile(file).map((n) => n.name);
     expect(names('src/go/build/build.go')).toContain('Import');
     expect(names('tools/src/Build/BuildManager.cs')).toEqual(expect.arrayContaining(['BuildManager', 'Run']));
+    expect(names('crates/cli/src/build/mod.rs')).toEqual(expect.arrayContaining(['BuildRequest', 'new', 'run']));
   }, 60_000);
 });
 
