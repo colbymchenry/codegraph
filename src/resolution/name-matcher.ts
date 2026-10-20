@@ -8229,15 +8229,29 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     // `<T as FromStr>::Err`. No module path names one: axum-core's
     // `std::error::Error` is std's, not its file's `impl IntoResponseParts`'s `type Error`.
     if (isRustAssociatedItem(candidate)) return seg === '' || (seg === 'Self' && isInEnclosingRustImpl(candidate, ref, context));
-    if ((root === 'std' || root === 'core' || root === 'alloc') && candidate.filePath !== ref.filePath) return false;
-    // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
-    if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || candidate.filePath === ref.filePath ||
-        rustProjectCrates(context).has(seg)) return true;
-    // `io::Error` under `use std::io;` is std's, whatever `io/` directory the project has.
+    const projectCrates = rustProjectCrates(context);
     const pathUses = rustUsesOf(ref.filePath, context);
+    // A path from std or a crate the manifests depend on is that crate's, in
+    // the file of a namesake too: clap's `std::ffi::OsStr` is not its own
+    // `struct OsStr`, tokio's `mio::Interest` not its own `Interest`.
+    if ((root === 'std' || root === 'core' || root === 'alloc' || rustDependencyCrates(context).has(root)) &&
+        !projectCrates.has(root) && !pathUses.bound.has(root)) return false;
+    // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
+    if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || projectCrates.has(seg)) return true;
+    // `io::Error` under `use std::io;` is std's, whatever `io/` directory the project has.
     if (pathUses.external.has(seg) && !pathUses.bound.has(seg)) return false;
+    // Through a module a `use` binds, an item of a crate that `use`'s path can
+    // reach: tokio's `io::Handle` under `use crate::runtime::io` is tokio's,
+    // not tokio-test's `io.rs` `Handle`.
+    const from = pathUses.boundFrom.get(root);
+    if (from && !rustUseCanReach(from, candidate, ref, context)) return false;
+    // Otherwise the module or type the path names, wherever it is written:
+    // gleam's `ast::Pattern` is `ast.rs`'s, not the `enum Pattern` beside it,
+    // and `Source::Record { … }` `Source`'s variant, not another enum's. The
+    // file's own items are reached so only from an inline `mod` of the file.
     return rustModuleName(candidate.filePath) === seg || candidate.filePath.includes(`/${seg}/`) ||
-      candidate.qualifiedName.split('::').includes(seg);
+      candidate.qualifiedName.split('::').includes(seg) ||
+      (candidate.filePath === ref.filePath && isInRustInlineModule(candidate, seg, context));
   }
   // Nor does its name alone: clap's `Err(…)` calls went to the `type Err` of
   // a `FromStr` impl in the same file, axum's routing tests' `Response`s to
@@ -8660,6 +8674,29 @@ function matchRustSelfPath(name: string, ref: UnresolvedRef, context: Resolution
   const target = pick(self.type, self.isTrait) ?? (self.trait && !outside && !delegates ? pick(self.trait, true) : null);
   if (!target) return null;
   return { original: ref, targetNodeId: target.id, confidence: target.filePath === ref.filePath ? 0.9 : 0.8, resolvedBy: 'qualified-name' };
+}
+
+/**
+ * Whether `candidate` sits in an inline `mod <name> { … }` of its own file —
+ * the only way a path through `name` reaches it, since an inline module adds
+ * nothing to its items' qualified names. rustfmt closes the block at the
+ * indentation it opens at.
+ */
+function isInRustInlineModule(candidate: Node, name: string, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split(/\r?\n/) ?? [];
+  const head = new RegExp(`^(\\s*)(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+${name}\\s*\\{`);
+  for (let i = candidate.startLine - 2; i >= 0; i--) {
+    const open = head.exec(lines[i] ?? '');
+    if (!open) continue;
+    const indent = open[1]!.length;
+    if (candidate.startColumn <= indent) return false;
+    for (let j = i + 1; j < candidate.startLine - 1; j++) {
+      const closer = /^(\s*)\}/.exec(lines[j] ?? '');
+      if (closer && closer[1]!.length <= indent) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Whether `candidate` is declared in the same `impl` / `trait` block as `ref`, above it. */
