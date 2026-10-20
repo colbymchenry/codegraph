@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -3441,12 +3441,17 @@ export class ReferenceResolver {
   /**
    * A bare Rust name reaches only what is in scope — every strategy's result,
    * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
-   * isRustNameInScope).
+   * isRustNameInScope). And a call, however written, reaches a project impl
+   * on a std type only as Rust would pick it (isRustForeignImplCallable).
    */
   private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
-    if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
+    if (!result || ref.language !== 'rust') return result;
+    const bare = /^[A-Za-z_]\w*$/.test(ref.referenceName);
+    if (!bare && ref.referenceKind !== 'calls') return result;
     const target = this.nodeById(result.targetNodeId);
-    return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+    if (!target) return result;
+    if (bare && !isRustNameInScope(target, ref, this.context)) return null;
+    return ref.referenceKind === 'calls' && !isRustForeignImplCallable(target, ref, this.context) ? null : result;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */
