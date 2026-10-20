@@ -87,8 +87,10 @@ export const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
  * inner node, so before looking for its preceding comment we climb out through
  * these. Examples: `export class X {}` (export_statement), `@dec\ndef f()`
  * (decorated_definition), `const f = () => {}` (lexical_declaration →
- * variable_declarator). Each wraps exactly one declaration, so climbing can't
- * mis-attribute a comment to a sibling. (#780)
+ * variable_declarator), and each method, function or declaration of an
+ * Objective-C `@implementation` (implementation_definition). Each wraps
+ * exactly one declaration, so climbing can't mis-attribute a comment to a
+ * sibling. (#780)
  */
 const DOCSTRING_WRAPPER_TYPES = new Set([
   'export_statement', // JS/TS: export class/function/const ...
@@ -97,6 +99,7 @@ const DOCSTRING_WRAPPER_TYPES = new Set([
   'variable_declaration', // JS/TS: var x = ...
   'variable_declarator', // JS/TS: the `x = () => {}` inside the declaration
   'ambient_declaration', // TS: declare ...
+  'implementation_definition', // ObjC: each method, function or declaration of an @implementation
 ]);
 
 /**

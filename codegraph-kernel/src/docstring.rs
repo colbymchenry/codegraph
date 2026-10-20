@@ -15,6 +15,8 @@ fn is_wrapper(kind: &str) -> bool {
             | "variable_declaration"
             | "variable_declarator"
             | "ambient_declaration"
+            // Objective-C, which the kernel does not walk: kept for parity.
+            | "implementation_definition"
     )
 }
 
