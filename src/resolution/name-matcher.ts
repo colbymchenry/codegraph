@@ -18743,7 +18743,11 @@ export function matchMethodCall(
       // `$storage->delete($path)`, `CommentRepo::delete` doing
       // `$comment->delete()` — names the caller's own class only by a shared
       // word. The guess is the caller itself, so there is no guess.
-      if (bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId) {
+      // An untyped python attribute chain needs more than one shared word: an
+      // attribute name is compound, and fastapi's `request.headers.get()` is
+      // no `_HeadersGetter`, mealie's `database.group_shopping_lists` no
+      // `GroupRepositoryAIProvider`.
+      if (bestMatch && bestScore >= (pythonChain ? 3 : 2) && bestMatch.id !== ref.fromNodeId) {
         return {
           original: ref,
           targetNodeId: bestMatch.id,

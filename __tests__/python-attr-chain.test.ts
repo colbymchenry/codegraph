@@ -95,6 +95,18 @@ describe('python attribute-chain receivers', () => {
     expect(callsFrom('method', 'run').sort()).toEqual(['method:get@client.py', 'method:render@nodes.py']);
   });
 
+  it('needs more than one shared word to guess an untyped chain', async () => {
+    // mealie's `database.group_shopping_lists` shares only `group` with the AI
+    // providers' repository; `group_ai_providers` shares `group` and `ai`.
+    writeTree({
+      'repos.py': 'class GroupRepositoryAIProvider:\n    def create(self):\n        pass\n\n\nclass Other:\n    def create(self):\n        pass\n',
+      'use.py': 'def lists(database):\n    database.group_shopping_lists.create()\n\n\ndef providers(database):\n    database.group_ai_providers.create()\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(callsFrom('function', 'lists')).toEqual([]);
+    expect(callsFrom('function', 'providers')).toEqual(['method:create@repos.py']);
+  });
+
   it('leaves a chain through a module to the module', async () => {
     // `os.path.exists()` is the stdlib's, not a project storage's `exists`
     // whose class shares the word `Path`.
