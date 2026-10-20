@@ -8629,6 +8629,11 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
   // segment, and a path is not a prelude lookup.
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  // A trait's associated type bound in its arguments — `Iterator<Item = &str>`,
+  // `Readable<Storage = S>` — is that trait's, which no node stands for: never
+  // a module item or an impl's. axum's `Iterator<Item = &str>` went to a
+  // same-file `enum Item`, dioxus's `Storage = UnsyncStorage` to a `Storage` trait.
+  if (ref.referenceKind === 'references' && line !== undefined && isRustAssocBinding(line, ref.column, name)) return false;
   // A variant path — `Mode::A`, `mode::Mode::B`, a `Mode::C(x)` pattern, or
   // `Self::A` in an impl, where the reference names the impl's type (#2328) —
   // reads the enum that declares that variant, and nothing else: ripgrep's
@@ -8664,7 +8669,19 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     // An associated item, only through its type: `Self::Err` in its impl,
     // `<T as FromStr>::Err`. No module path names one: axum-core's
     // `std::error::Error` is std's, not its file's `impl IntoResponseParts`'s `type Error`.
-    if (isRustAssociatedItem(candidate)) return seg === '' || (seg === 'Self' && isInEnclosingRustImpl(candidate, ref, context));
+    if (isRustAssociatedItem(candidate)) {
+      if (seg === 'Self') return isInEnclosingRustImpl(candidate, ref, context);
+      if (seg !== '' || line === undefined) return false;
+      // A qualified self reads as its type: `<Self as Handler>::Future` is
+      // `Self::Future` — in a trait's own body, the trait's, no impl's — a
+      // generic's (`<L as Listener>::Io`) no impl's, and `<Ready as
+      // Listener>::Io` that type's impl of that trait.
+      const qself = rustQualifiedSelf(line.slice(0, ref.column));
+      if (!qself) return true;
+      if (qself.self === 'Self') return isInEnclosingRustImpl(candidate, ref, context);
+      if (isRustGenericParam(qself.self, ref, context) || candidate.qualifiedName !== `${qself.self}::${candidate.name}`) return false;
+      return qself.trait === null || rustTraitImplHeader(candidate, context)?.trait === qself.trait;
+    }
     const projectCrates = rustProjectCrates(context);
     const pathUses = rustUsesOf(ref.filePath, context);
     // A path from std or a crate the manifests depend on is that crate's, in
@@ -9144,6 +9161,54 @@ function isInEnclosingRustImpl(candidate: Node, ref: UnresolvedRef, context: Res
 }
 
 /** Whether `name` is a generic type parameter of the function or impl around `ref` (`fn f<V: Visitor>`, `impl<'de, E>`). */
+/**
+ * Whether `name`, at `column` of `line`, is a trait's associated type bound
+ * in that trait's arguments: `Iterator<Item = &str>`, `Writable<M: 'static>`.
+ * An unclosed `<` before it on the line says it is inside them.
+ */
+function isRustAssocBinding(line: string, column: number, name: string): boolean {
+  if (!line.startsWith(name, column) || !/^\s*(?:=(?![=>])|:(?!:))/.test(line.slice(column + name.length))) return false;
+  let angles = 0;
+  let parens = 0;
+  for (let i = column - 1; i >= 0; i--) {
+    const c = line[i];
+    if (c === '>' && line[i - 1] !== '-') angles++;
+    else if (c === '<') {
+      if (angles === 0) return parens === 0;
+      angles--;
+    } else if (c === ')') parens++;
+    else if (c === '(') {
+      if (parens === 0) return false;
+      parens--;
+    } else if (c === '{' || c === '}' || c === ';') return false;
+  }
+  return false;
+}
+
+/**
+ * The qualified self a path ends in, written right before `::X`: `<T as
+ * Trait<A>>::X` gives `T` and `Trait`, `<T>::X` gives `T` and no trait —
+ * each as the last segment of its path, without generics. Null when the text
+ * is no qualified self (a turbofish, `Vec::<T>::new`, is not one).
+ */
+function rustQualifiedSelf(before: string): { self: string; trait: string | null } | null {
+  const text = before.replace(/\s*::\s*$/, '');
+  if (!text.endsWith('>')) return null;
+  let depth = 0;
+  let open = -1;
+  for (let i = text.length - 1; i >= 0 && open < 0; i--) {
+    if (text[i] === '>' && text[i - 1] !== '-') depth++;
+    else if (text[i] === '<' && --depth === 0) open = i;
+  }
+  if (open < 0 || /::\s*$/.test(text.slice(0, open))) return null;
+  const inner = text.slice(open + 1, -1).trim();
+  const head = (part: string): string =>
+    /((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*(?:<[\s\S]*)?$/.exec(part.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '').trim())?.[2] ?? '';
+  const as = /\s+as\s+/.exec(inner);
+  const self = head(as ? inner.slice(0, as.index) : inner);
+  return self ? { self, trait: as ? head(inner.slice(as.index + as[0].length)) || null : null } : null;
+}
+
 function isRustGenericParam(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (!/^[A-Z]\w*$/.test(name)) return false;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
