@@ -618,6 +618,31 @@ function pythonBindsLocally(name: string, ref: UnresolvedRef, context: Resolutio
   return false;
 }
 
+/**
+ * The module `name` is bound to by an `import a.b as name` written in the
+ * function around `ref` — the innermost one that binds `name` at all (#2600).
+ * Import mappings are per file and read only module-level `import` lines, so
+ * such a function-local alias has none. Null when that function binds `name`
+ * any other way, binds it to several modules, or imports an undotted module
+ * (an optional dependency's name can match any project file's basename).
+ */
+export function pythonFunctionModuleAlias(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return null;
+  const lines = pythonMemberLines(ref.filePath, context);
+  const statements = pythonStatementStarts(ref.filePath, context);
+  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const scope of scopes) {
+    const bindings = pythonOwnLines(scope, ref.filePath, context).flatMap(i => pythonLineBindings(lines, i, statements, name));
+    if (bindings.length === 0) continue;
+    const modules = new Set(bindings.map(b => b.kind === 'import' && b.key.endsWith(':*') ? b.key.slice(0, -2) : ''));
+    const [module] = modules;
+    return modules.size === 1 && module && module.includes('.') && !pythonBindsLocally(name, ref, context, false) ? module : null;
+  }
+  return null;
+}
+
 /** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
 function pythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
   return pythonNameScan(context, `imports\0${filePath}\0${name}`, () => scanPythonImportKeys(name, filePath, context));
@@ -2718,9 +2743,10 @@ function readGoScopes(code: string): GoScopeIndex {
     }
   }
   // Each `func`'s receiver, parameters and results, bound in its body. A
-  // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it.
+  // `[]func(…)` or `chan func(…)` is a type, whatever brace follows it, and
+  // so is a `func(…)` result type after a signature's `)` (#2580).
   for (const m of code.matchAll(/(?<![\w.])func\b/g)) {
-    if (/(?:\]|\bchan)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    if (/(?:[\]*)]|\bchan(?:[ \t]*<-)?)[ \t]*$/.test(code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
     const sig = goSignature(code, m.index! + 4);
     if (!sig) continue;
     for (const [from, to] of sig.groups) {
@@ -2903,7 +2929,8 @@ function goScopesOf(index: GoScopeIndex, name: string): Array<[number, number, G
     }
     const from = goStatementEnd(index.code, d.at);
     let to = block[1];
-    if (d.kind === 'case') {
+    // A `case` clause's names, header or body, end at the next clause.
+    {
       const clause = /\n[ \t]*(?:case\b|default[ \t]*:)/g;
       clause.lastIndex = from;
       for (let m = clause.exec(index.code); m && m.index < to; m = clause.exec(index.code)) {
