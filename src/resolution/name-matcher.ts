@@ -313,6 +313,9 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     if (decl.asserted !== undefined) {
       return decl.asserted && resolveMethodOnType(decl.asserted.name, member, ref, context, 0.9, 'function-ref', decl.asserted.dir);
     }
+    // One declared as a type literal, a type from outside the project or an
+    // alias of one holds no project method to take.
+    if (decl.declared === null || (decl.declared !== undefined && goHasNoProjectMethods(decl.declared, ref, context))) return null;
     if (type) {
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
         goDeclaredTypePackage(decl.raw, ref.filePath, context));
@@ -2294,13 +2297,11 @@ interface GoQualification {
   imported?: ImportMapping;
   /**
    * For a call through a parameter or local that takes an import's name, the
-   * type it is declared as, when its declaration writes one (`*tokenJWT`,
-   * `clock.PassiveClock`), and the import that type is written through —
-   * `clock` in a parameter `clock clock.PassiveClock`, `atomic` in
-   * `cache := &atomic.Bool{}` — or its value comes from: `reflect` in
-   * `value := reflect.New(t)`.
+   * import the type its declaration writes is written through — `clock` in a
+   * parameter `clock clock.PassiveClock`, `atomic` in `cache :=
+   * &atomic.Bool{}` — or its value comes from: `reflect` in `value :=
+   * reflect.New(t)`.
    */
-  declaredType?: string;
   typePackage?: ImportMapping;
 }
 
@@ -2337,7 +2338,6 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   }
   const imports = context.getImportMappings(ref.filePath, 'go');
   let imported = written ? imports.find((m) => m.localName === written) : undefined;
-  let declaredType: string | undefined;
   let typePackage: ImportMapping | undefined;
   // A call through a parameter or local that takes the import's name is a
   // call on that variable: etcd's `jwt, err := newTokenProviderJWT(…)`, then
@@ -2347,16 +2347,15 @@ function goRefQualification(ref: UnresolvedRef, context: ResolutionContext): GoQ
   // (`quota.Name`) is no call.
   const local = imported && dot >= 0 && ref.referenceKind === 'calls' ? goLocalDecl(written!, ref, context) : undefined;
   if (local) {
-    declaredType = local.type;
     // A value a package outside the project hands out is of a type it
     // declares: kubernetes' `clock := clocktesting.NewFakePassiveClock(…)`
     // has no project method `Now`.
-    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(declaredType ?? '')?.[1] ?? local.from;
+    const qualifier = /^[*&\s]*([A-Za-z_]\w*)\.[A-Za-z_]\w*$/.exec(local.type ?? '')?.[1] ?? local.from;
     typePackage = qualifier ? imports.find((m) => m.localName === qualifier) : undefined;
     written = undefined;
     imported = undefined;
   }
-  const found = { written, imported, declaredType, typePackage };
+  const found = { written, imported, typePackage };
   memo.set(key, found);
   return found;
 }
@@ -2455,6 +2454,21 @@ function isGoOutsideImport(imp: ImportMapping, filePath: string, context: Resolu
 function isGoOutsideType(written: string | undefined, filePath: string, context: ResolutionContext): boolean {
   const qualifier = written && /^[*&\s]*([A-Za-z_]\w*)\s*\./.exec(written)?.[1];
   return !!qualifier && isGoOutsidePackage(qualifier, filePath, context);
+}
+
+/**
+ * Whether a Go named type a declaration at `ref` writes (`goNamedType`) has
+ * none of the project's methods: a type from outside the project
+ * (`http.ResponseWriter`), a predeclared one, or an alias of such a type
+ * (`type Ctx = context.Context`). Not one written through a qualifier none
+ * of the file's imports names as indexed, or an unmapped internal package,
+ * which can't be told.
+ */
+function goHasNoProjectMethods(named: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (isGoOutsideType(named, ref.filePath, context)) return true;
+  const dot = named.indexOf('.');
+  if (dot >= 0 && !goImportPackageDir(named.slice(0, dot), ref.filePath, context)) return false;
+  return goWrittenType(named, ref, context) === null;
 }
 
 /** Whether `name` is the file's import of a package from outside the project: `context` in `context.WithTimeout(…)`. */
@@ -14703,6 +14717,19 @@ export function inferLocalReceiverType(
       decl.asserted = asserted;
       return normalizeInferredTypeName(written!) ?? written!;
     }
+    // A Go parameter or local whose declaration in scope writes its type has
+    // that type: one declared through a package (`c clock.PassiveClock`, `pod
+    // *v1.Pod`), which the patterns below don't read, each name of `a, b
+    // rest.Interface`, a `var (…)` spec. The patterns scan back for the name
+    // with no block scope, so they can also read another declaration of it.
+    const type = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDecl(scanReceiver, ref, context)?.type : undefined;
+    if (type !== undefined) {
+      const named = goNamedType(type);
+      decl.declared = named;
+      if (!named) return null;
+      decl.raw = named;
+      return named.slice(named.indexOf('.') + 1);
+    }
   }
 
   const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -15243,40 +15270,23 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
-    // A Go parameter named like an import is declared through a package as
-    // often as not (`logger logger.Interface`), which the patterns above
-    // don't read; the scope reader kept its type. Not a field's: in
-    // `metadata.Type.String()` that is the type of `metadata`.
-    if (!inferredType && ref.language === 'go' && dotMatch && !objectOrClass!.includes('.')) {
-      const declared = goRefQualification(ref, context).declaredType;
-      if (declared) {
-        inferredType = normalizeInferredTypeName(declared);
-        decl.raw = declared;
-      }
-    }
-    // A Go standard method name says nothing of its receiver, so the
-    // receiver's declaration in scope, which the scope reader finds, decides:
-    // etcd's parameter `id types.ID` makes `id.String()` `ID::String`,
-    // prometheus's `iter chunks.Iterator` makes `iter.Err()` that interface's
-    // rather than `StringIter::Err`, and a value a package from outside the
-    // project hands out (`ctx, cancel := context.WithTimeout(…)`) has no
-    // project method. It overrides the patterns above, which scan back for
-    // the name without block scope and can read another declaration of it:
+    // A Go receiver's declaration in scope, as the scope reader finds it
+    // (`declared`), decides over the patterns, which scan back for the name
+    // without block scope and can read another declaration of it:
     // prometheus's `var ( query promql.Query )` came out as its test table's
-    // `query string`. Only a type read here rules a call out below.
-    let goDeclared: string | undefined;
-    if (goStd && decl.asserted === undefined) {
-      const local = goLocalDecl(objectOrClass!, ref, context);
-      if (local?.type) {
-        const named = goNamedType(local.type);
-        // A slice, map, channel, function or interface literal type has no
-        // project method.
-        if (!named) return null;
-        inferredType = named.split('.').pop()!;
-        decl.raw = goDeclared = named;
-      } else if (local?.from && isGoOutsidePackage(local.from, ref.filePath, context)) {
-        return null;
-      }
+    // `query string`. Only a type read there rules a call out below. A slice,
+    // map, channel, function or interface literal type has no project method.
+    if (decl.declared === null) return null;
+    const goDeclared = decl.declared;
+    // A Go standard method name says nothing of its receiver, so its
+    // declaration decides: etcd's parameter `id types.ID` makes `id.String()`
+    // `ID::String`, prometheus's `iter chunks.Iterator` makes `iter.Err()`
+    // that interface's rather than `StringIter::Err`, and a value a package
+    // from outside the project hands out (`ctx, cancel :=
+    // context.WithTimeout(…)`) has no project method.
+    if (goStd && goDeclared === undefined && decl.asserted === undefined) {
+      const from = goLocalDecl(objectOrClass!, ref, context)?.from;
+      if (from && isGoOutsidePackage(from, ref.filePath, context)) return null;
     }
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
       inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
@@ -15338,12 +15348,13 @@ export function matchMethodCall(
       if (decl.asserted !== undefined) {
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
-      // A standard method name on a Go receiver declared as a type from a
-      // package outside the project (`var mu sync.Mutex`, `tb testing.TB`) is
-      // that type's own method, never a same-named project type's: etcd's
-      // `pendingMu.Lock()` went to its concurrency `Mutex`, kubernetes'
-      // `tb.Error(…)` to a feature-gate test helper's `TB`.
-      if (goDeclared !== undefined && isGoOutsideType(goDeclared, ref.filePath, context)) return null;
+      // A Go receiver declared as a type from a package outside the project
+      // (`var mu sync.Mutex`, `w http.ResponseWriter`), or as an alias of
+      // one, calls that type's own method, never a same-named project type's:
+      // etcd's `pendingMu.Lock()` went to its concurrency `Mutex`, kubernetes'
+      // `c.Now()` on a `clock.PassiveClock` to apimachinery's `Clock`, and gin
+      // declares a `ResponseWriter` of its own.
+      if (goDeclared !== undefined && goHasNoProjectMethods(goDeclared, ref, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
@@ -15418,8 +15429,11 @@ export function matchMethodCall(
       // no other method on a predeclared type, so a predeclared type the
       // patterns read for another name's declaration, like a test table's
       // `version string` above kubernetes' `version, _ := parse(…)`, rules
-      // nothing out.)
-      if (goDeclared !== undefined) return null;
+      // nothing out.) Any other name the declared type lacks goes on to the
+      // strategies below, as one on a receiver of unread type does: a type
+      // defined over an interface (`type Codec Serializer`) has methods the
+      // index doesn't give it.
+      if (goStd && goDeclared !== undefined) return null;
       // The receiver's declared type is one the project doesn't declare —
       // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
       // method is that outside type's. gson's `list.add(…)` went to a project
@@ -16182,10 +16196,14 @@ interface GoProjectType {
  * assertion, the type goWrittenType finds for it (`asserted`; null for one
  * with no method the project declares). `asserted` is unset when the local
  * is declared some other way, or goWrittenType can't tell its type.
+ * `declared` is the named type a Go parameter or local's declaration in
+ * scope writes, as the scope reader finds it (`clock.PassiveClock`, `Store`),
+ * or null for a type literal; unset when that declaration writes no type.
  */
 interface GoReceiverDecl {
   raw?: string;
   asserted?: GoProjectType | null;
+  declared?: string | null;
 }
 
 const GO_ASSERTION_BINDINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
@@ -16627,9 +16645,12 @@ function matchGoFieldChainCall(
   const baseType = inferLocalReceiverType(base!, ref, context, decl);
   if (!baseType) return null;
   // A base bound from a type assertion has the type Go finds for it, or one
-  // whose fields the project doesn't declare.
+  // whose fields the project doesn't declare, as does one declared as a type
+  // from outside the project: `req.URL.Query()` on an `*http.Request` is no
+  // project `Request`'s.
   const asserted = decl.asserted;
   if (asserted === null) return null;
+  if (decl.declared && goHasNoProjectMethods(decl.declared, ref, context)) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
@@ -16680,6 +16701,8 @@ function matchGoFieldChainCall(
       // validated `<type>::<method>` match.
       const fieldType = rawType.split('.').pop();
       if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
+      // Nor is an alias of an outside type (`ctx Ctx` with `type Ctx = context.Context`).
+      if (goHasNoProjectMethods(rawType, { ...ref, filePath: s.filePath }, context)) continue;
       const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method', pkgDir);
       if (resolved) return resolved;
     }
