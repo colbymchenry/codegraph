@@ -9817,6 +9817,12 @@ function rustGenericBounds(name: string, written: RustWrittenType, context: Reso
 /** What the binding a Rust receiver names writes of its type, if it writes it. */
 function rustBindingType(binding: RustBinding, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
   if (binding.type !== undefined) return { text: binding.type, file: ref.filePath, at: binding.at };
+  if (binding.kind === 'for') {
+    // `for x in …`: an element of what the loop iterates; `for (k, v) in …` a field of that element.
+    const element = binding.scrutinee === undefined ? null : rustIteratedElement(binding.scrutinee, binding.at, scopes, ref, context, depth);
+    if (!element || !binding.site) return element;
+    return binding.site.path === '' && binding.site.index !== undefined ? rustTupleField(element, binding.site.index) : null;
+  }
   if (binding.init !== undefined) return rustValueType(binding.init, binding.at, scopes, ref, context, depth);
   if (binding.site) return rustSiteType(binding.site, binding.scrutinee, binding.at, scopes, ref, context, depth);
   return null;
@@ -9905,6 +9911,9 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
     const method = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*(?:::\s*<([^()]*)>)?$/.exec(call.callee);
     return method ? rustMethodReturn(method[1]!, method[2]!, method[3], unwraps, awaits, at, scopes, ref, context, depth) : null;
   }
+  // `self.items`, `opts.config.port`, `pair.0`: the field's type as its struct declares it.
+  const access = /^([\s\S]+?)\s*\.\s*([A-Za-z_]\w*|\d+)$/.exec(v);
+  if (access && !/^\d/.test(v)) return unwrapped(rustFieldValue(access[1]!, access[2]!, at, scopes, ref, context, depth));
   const literal = /^((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)\s*(?:::\s*<[^{}]*>\s*)?\{/.exec(v);
   if (literal) {
     if (!rustGroupIsWhole(v.slice(v.indexOf('{')))) return null;
@@ -9986,10 +9995,27 @@ function rustFunctionReturn(modules: string[], fn: string, unwraps: number, at: 
   if (same.length > 0 && modules.length === 0) {
     fns = same;
   } else {
-    const used = modules.length > 0 ? undefined : rustUsePath(fn, ref.filePath, at, context);
-    if (modules.length === 0 && !used) return null;
-    const walked = (used ? used.slice(0, -1) : modules).filter((s) => s !== 'crate' && s !== 'self' && s !== 'super' && !rustProjectCrates(context).has(s));
-    if (walked.length > 0) fns = fns.filter((n) => rustModulesLead(walked, n));
+    // The path the call writes, its head as a `use` binds it (`oneshot::channel()`
+    // under tokio's `use crate::runtime::tests::loom_oneshot as oneshot`), or
+    // the one a `use` binds the bare name to.
+    let path: string[];
+    if (modules.length === 0) {
+      const used = rustUsePath(fn, ref.filePath, at, context);
+      if (!used) return null;
+      path = used;
+    } else {
+      const head = rustUsePath(modules[0]!, ref.filePath, at, context);
+      path = [...(head && head.length > 0 ? head : [modules[0]!]), ...modules.slice(1), fn];
+    }
+    // The function the project's modules walk to, else the one whose file's modules the path names.
+    const walked = rustWalkedItems(path, ref.filePath, at, context);
+    const named = walked === null ? [] : fns.filter((n) => walked.has(n.id));
+    if (named.length > 0) {
+      fns = named;
+    } else {
+      const segments = path.slice(0, -1).filter((s) => s !== 'crate' && s !== 'self' && s !== 'super' && !rustProjectCrates(context).has(s));
+      if (segments.length > 0) fns = fns.filter((n) => rustModulesLead(segments, n));
+    }
   }
   const returns = new Set(fns.map((f) => rustReturnText(f.signature) ?? ''));
   if (fns.length === 0 || returns.size !== 1) return null;
@@ -10033,7 +10059,7 @@ function readRustMethodReturn(
   let written: RustWrittenType | null;
   if (recv === 'self') written = { text: 'Self', file: ref.filePath, at };
   else if (/^[a-z_]\w*$/.test(recv)) written = rustLocalType(recv, at, scopes, ref, context, depth);
-  else if (/[)?]$/.test(recv)) written = rustValueType(recv, at, scopes, ref, context, depth + 1);
+  else if (/[)?]$|\.\s*(?:[A-Za-z_]\w*|\d+)$/.test(recv)) written = rustValueType(recv, at, scopes, ref, context, depth + 1);
   else return null;
   if (!written) return null;
   const read = rustReadType(written, ref, context);
@@ -10131,12 +10157,165 @@ function rustFutureOutput(written: RustWrittenType): RustWrittenType | null {
 }
 
 /**
+ * What a Rust field access is — `self.items`, `opts.config`, `pair.0` — as
+ * the receiver's struct declares the field, read where the struct is written
+ * (its own generics opaque, the field's type being whatever a value of it
+ * makes them). Null when the receiver isn't one struct of the project's.
+ */
+function rustFieldValue(
+  receiver: string, field: string, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  const recv = receiver.trim();
+  let written: RustWrittenType | null;
+  if (recv === 'self') written = { text: 'Self', file: ref.filePath, at };
+  else if (/^[a-z_]\w*$/.test(recv)) written = rustLocalType(recv, at, scopes, ref, context, depth);
+  else written = rustValueType(recv, at, scopes, ref, context, depth + 1);
+  if (!written) return null;
+  const read = rustReadType(written, ref, context);
+  if (read.kind !== 'named') return null;
+  const lookup = rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at);
+  const structs = lookup.outside ? [] : lookup.nodes.filter((n) => n.kind === 'struct' || n.kind === 'union');
+  if (structs.length !== 1) return null;
+  const decl = structs[0]!;
+  const fields = rustDeclaredFields(decl, context);
+  const text = /^\d+$/.test(field) ? fields?.tuple?.[Number(field)] : fields?.named?.get(field);
+  if (!fields || !text) return null;
+  return { text, file: decl.filePath, at: rustNodeOffset(decl, context), self: decl.name, generics: fields.generics };
+}
+
+/** The `index`th field of a Rust tuple type as written — `(K, V)` → `V` for 1 — through `&`; null for any other type. */
+function rustTupleField(written: RustWrittenType, index: number): RustWrittenType | null {
+  const t = written.text.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '');
+  if (!t.startsWith('(') || !rustGroupIsWhole(t)) return null;
+  const fields = splitRustTopLevel(t.slice(1, -1), ',').map((f) => f.trim()).filter((f) => f !== '');
+  return index < fields.length ? { ...written, text: fields[index]!, wrappers: undefined } : null;
+}
+
+/** Std adapters that hand on the items of what they are called on. */
+const RUST_ITEM_ADAPTERS: ReadonlySet<string> = new Set([
+  'iter', 'iter_mut', 'into_iter', 'drain', 'rev', 'copied', 'cloned', 'skip', 'take', 'step_by', 'peekable', 'by_ref', 'fuse',
+]);
+/** Std adapters that pick a map's keys or values, or number the items. */
+const RUST_ITEM_PROJECTIONS: ReadonlyMap<string, 'key' | 'value' | 'enumerate'> = new Map([
+  ['keys', 'key'], ['into_keys', 'key'], ['values', 'value'], ['values_mut', 'value'], ['into_values', 'value'], ['enumerate', 'enumerate'],
+]);
+
+/**
+ * What a Rust `for` loop binds, an item of what it iterates: `for a in
+ * cmd.get_arguments()` with `-> impl Iterator<Item = &Arg>` an `Arg`, `for x
+ * in &self.items` with `items: Vec<Item>` an `Item`, `for (i, v) in
+ * map.values().enumerate()` a `(usize, V)`. The std adapters that keep the
+ * items (`.iter()`, `.rev()`, `.skip(n)`) or project them (`.values()`,
+ * `.enumerate()`) are looked through only where the value they are called on
+ * is read: a project method of the name is read from its own signature.
+ */
+function rustIteratedElement(iter: string, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
+  let v = iter.trim();
+  const steps: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const value = rustValueType(v.replace(/^&\s*(?:mut\s+)?/, ''), at, scopes, ref, context, depth + 1);
+    if (value) return rustStepItems(value, steps.reverse(), context);
+    const call = rustTrailingCall(v);
+    const m = call ? /^([\s\S]+?)\s*\.\s*([a-z_]\w*)$/.exec(call.callee) : null;
+    if (!m || !(RUST_ITEM_ADAPTERS.has(m[2]!) || RUST_ITEM_PROJECTIONS.has(m[2]!))) return null;
+    steps.push(m[2]!);
+    v = m[1]!;
+  }
+  return null;
+}
+
+/** The items a value hands out through std adapters, innermost first. */
+function rustStepItems(value: RustWrittenType, steps: string[], context: ResolutionContext): RustWrittenType | null {
+  let projection: 'key' | 'value' | undefined;
+  let numbered = false;
+  for (const step of steps) {
+    const p = RUST_ITEM_PROJECTIONS.get(step);
+    if (p === 'enumerate') {
+      if (numbered) return null;
+      numbered = true;
+    } else if (p) {
+      if (numbered || projection) return null;
+      projection = p;
+    }
+  }
+  const item = rustItemOf(value, projection, context);
+  return item && numbered ? { ...item, text: `(usize, ${item.text})` } : item;
+}
+
+/** Std collections whose items are their one type argument. */
+const RUST_STD_SEQUENCES: ReadonlySet<string> = new Set([
+  'Vec', 'VecDeque', 'HashSet', 'BTreeSet', 'BinaryHeap', 'LinkedList', 'Option', 'IndexSet', 'SmallVec',
+]);
+const RUST_STD_MAPS: ReadonlySet<string> = new Set(['HashMap', 'BTreeMap', 'IndexMap']);
+/** Std iterator types by what they hand out: an item, a map's entry, key or value. */
+const RUST_STD_ITERATORS: ReadonlyMap<string, 'item' | 'entry' | 'key' | 'value'> = new Map([
+  ['Iter', 'entry'], ['IterMut', 'entry'], ['IntoIter', 'entry'], ['Drain', 'entry'],
+  ['Keys', 'key'], ['IntoKeys', 'key'], ['Values', 'value'], ['ValuesMut', 'value'], ['IntoValues', 'value'],
+]);
+const RUST_ITERATOR_TRAITS: ReadonlySet<string> = new Set(['Iterator', 'IntoIterator', 'DoubleEndedIterator', 'ExactSizeIterator']);
+
+/**
+ * The item type a value of a Rust type hands out when iterated: a std
+ * sequence's or a slice's element, a std map's `(K, V)` (its key or value
+ * through `.keys()` / `.values()`), a std iterator's item, an `impl Iterator<Item
+ * = T>`'s `T`, through `&` and the pointers that deref to what they hold.
+ * Read where the type is written. Null for any other type.
+ */
+function rustItemOf(written: RustWrittenType, projection: 'key' | 'value' | undefined, context: ResolutionContext): RustWrittenType | null {
+  let t = written.text.trim();
+  for (let i = 0; i < 6; i++) {
+    const before = t;
+    t = t.replace(/^&\s*(?:'\w+\s+)?(?:mut\s+)?/, '').trim();
+    const pointer = /^(?:(?:std|alloc|core)\s*::\s*(?:\w+\s*::\s*)*)?(?:Box|Rc|Arc|Cow|Ref|RefMut|MutexGuard|RwLockReadGuard|RwLockWriteGuard)\s*</.exec(t);
+    if (pointer && rustAngleEnd(t, pointer[0].length - 1) === t.length - 1) t = t.slice(pointer[0].length, -1).replace(/^\s*'\w+\s*,/, '').trim();
+    if (t === before) break;
+  }
+  const as = (text: string | undefined): RustWrittenType | null => (text ? { ...written, text: text.trim(), wrappers: undefined } : null);
+  const typeArgs = (args: string): string[] => splitRustTopLevel(args, ',').map((a) => a.trim()).filter((a) => a !== '' && !a.startsWith("'"));
+  const std = (name: string): boolean => !isRustProjectNamed(name, RUST_DECLARED_TYPE_KINDS, context);
+  if (t.startsWith('[')) {
+    if (!rustGroupIsWhole(t) || projection) return null;
+    return as(splitRustTopLevel(t.slice(1, -1), ';')[0]);
+  }
+  const object = /^(?:impl|dyn)\s+([\s\S]+)$/.exec(t);
+  if (object) {
+    if (projection) return null;
+    for (const bound of splitRustTopLevel(object[1]!, '+')) {
+      const head = rustPathHead(bound.trim());
+      if (!head || !RUST_ITERATOR_TRAITS.has(head.name)) continue;
+      return as(typeArgs(head.args).map((a) => /^Item\s*=\s*([\s\S]+)$/.exec(a)?.[1]).find((a) => a !== undefined));
+    }
+    return null;
+  }
+  const head = rustPathHead(t);
+  if (!head || !std(head.name)) return null;
+  const args = typeArgs(head.args);
+  if (RUST_STD_SEQUENCES.has(head.name)) return projection || args.length !== 1 ? null : as(args[0]);
+  if (RUST_STD_MAPS.has(head.name)) {
+    if (args.length < 2) return null;
+    return projection === 'key' ? as(args[0]) : projection === 'value' ? as(args[1]) : as(`(${args[0]}, ${args[1]})`);
+  }
+  const iterator = RUST_STD_ITERATORS.get(head.name);
+  if (!iterator) return null;
+  if (iterator === 'key' || iterator === 'value') return projection || args.length !== 2 ? null : as(args[iterator === 'key' ? 0 : 1]);
+  if (args.length === 1) return projection ? null : as(args[0]);
+  if (args.length === 2) return projection === 'key' ? as(args[0]) : projection === 'value' ? as(args[1]) : as(`(${args[0]}, ${args[1]})`);
+  return null;
+}
+
+/**
  * The type a name a pattern binds is: in `Some(x)` / `Ok(x)` / `Err(e)` what
  * the matched value's `Option` or `Result` holds; in a variant's or a
  * struct's pattern (`Commands::Build(opts)`, `Point { x, .. }`) the field's
  * type its declaration writes.
  */
 function rustSiteType(site: RustPatternSite, scrutinee: string | undefined, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
+  // `let (a, b) = …`, `(k, v) =>`: the matched tuple's field at the name's place.
+  if (site.path === '') {
+    if (site.index === undefined || !scrutinee) return null;
+    const value = rustValueType(scrutinee, at, scopes, ref, context, depth + 1);
+    return value ? rustTupleField(value, site.index) : null;
+  }
   const segments = site.path.split('::');
   const last = segments[segments.length - 1]!;
   if (segments.length === 1 && (last === 'Some' || last === 'Ok' || last === 'Err')) {

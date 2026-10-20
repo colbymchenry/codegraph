@@ -15,7 +15,7 @@
 
 /** Where a name sits in a tuple-struct, variant or struct pattern: `Commands::Build(opts)`, `Point { x, .. }`. */
 export interface RustPatternSite {
-  /** The pattern's path as written: `Commands::Build`, `Self::Text`, `Some`. */
+  /** The pattern's path as written: `Commands::Build`, `Self::Text`, `Some`; '' for a tuple's own `(a, b)`. */
   path: string;
   /** The name's position among a tuple pattern's fields. */
   index?: number;
@@ -36,7 +36,7 @@ export interface RustBinding {
   init?: string;
   /** The pattern around the name, when it is bound inside a tuple-struct, variant or struct pattern. */
   site?: RustPatternSite;
-  /** What an `if let`, `while let`, `let … else` or `match` pattern is matched against. */
+  /** What an `if let`, `while let`, `let … else` or `match` pattern is matched against, or what a `for` iterates. */
   scrutinee?: string;
 }
 
@@ -513,8 +513,23 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
     else bindings.set(name, [binding]);
   };
   const bindPattern = (from: number, to: number, kind: RustBinding['kind'], scopeFrom: number, scopeTo: number, scrutinee?: string): void => {
-    walkPattern(code, from, to, close, undefined, (name, at, site) =>
-      add(name, { at, kind, from: scopeFrom, to: scopeTo, site, scrutinee }));
+    const emit: Emit = (name, at, site) => add(name, { at, kind, from: scopeFrom, to: scopeTo, site, scrutinee });
+    // A tuple pattern, `(k, v)` or `(i, mut x)`: a name alone at its top is
+    // the tuple's field at its place (a site with no path).
+    const open = skipSpace(code, from);
+    const end = code[open] === '(' ? close.get(open) : undefined;
+    if (end !== undefined && end < to && skipSpace(code, end + 1) >= to) {
+      let index = 0;
+      for (const [a, b] of splitTop(code, open + 1, end, close, false)) {
+        const text = code.slice(a, b);
+        const simple = /^\s*(?:ref\s+)?(?:mut\s+)?([A-Za-z_]\w*)\s*$/.exec(text);
+        if (simple && isBindingName(simple[1]!)) emit(simple[1]!, a + text.lastIndexOf(simple[1]!), { path: '', index });
+        else walkPattern(code, a, b, close, undefined, emit);
+        index++;
+      }
+      return;
+    }
+    walkPattern(code, from, to, close, undefined, emit);
   };
   // A parameter `pattern: Type`, or a closure's `pattern`.
   const param = (from: number, to: number, kind: 'param' | 'closure', scopeFrom: number, scopeTo: number): void => {
@@ -650,7 +665,8 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
     if (code[inAt] !== 'i') continue;
     const open = walkTop(code, inAt + 2, n, close, false, (i) => code[i] === '{' || code[i] === ';');
     if (code[open] !== '{') continue;
-    bindPattern(p, inAt, 'for', open, close.get(open) ?? n);
+    // What the loop iterates is its bindings' scrutinee.
+    bindPattern(p, inAt, 'for', open, close.get(open) ?? n, code.slice(inAt + 2, open).trim());
   }
 
   for (const m of code.matchAll(/\bmatch\b/g)) {
