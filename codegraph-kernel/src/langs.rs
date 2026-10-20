@@ -33,6 +33,12 @@ extern "C" {
 extern "C" {
     fn tree_sitter_dart() -> *const ();
 }
+// Vendored swift grammar (build.rs-compiled C — crate 0.7.3's src/ with a
+// one-line scanner fix the crate's own build lacks on Windows; see
+// grammars/swift and docs/grammars/tree-sitter-swift.md).
+extern "C" {
+    fn tree_sitter_swift() -> *const ();
+}
 
 /// Languages this kernel binary can extract (reported by contractInfo;
 /// TS-side routing policy decides what actually routes).
@@ -65,9 +71,12 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         // R7b: v0.24.2, the full HTML-interleaving variant — LANGUAGE_PHP,
         // NEVER LANGUAGE_PHP_ONLY (which errors on leading HTML).
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
-        // R7b: crate 0.7.3 — the vendored wasm is built from this crate's own
-        // tarball src/ (table identity by construction; see grammars.ts).
-        "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+        // R7b: crate 0.7.3's src/, the sources the vendored wasm is built
+        // from (table identity by construction; see grammars.ts), compiled in
+        // build.rs with the scanner's `try!` fix (`1ULL << FAKE_TRY_BANG`).
+        "swift" => {
+            Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
+        }
         // R7b: fwcd 0.3.8, vendored C compiled in build.rs (crate unusable).
         "kotlin" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())

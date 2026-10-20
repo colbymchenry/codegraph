@@ -79,6 +79,21 @@ export function isModuleKey(key: string): boolean {
 }
 
 /**
+ * SQL for the tail a reference parked under its module (`module:*`) has by its
+ * own name: what follows the name's last dot — `store.get` → 'get' — or the
+ * whole name. A member reference through an import binding still waits for
+ * its member (see
+ * `importBindingTail`), so the retry, the navigation retry and the dead-code
+ * check look it up by that. idx_unresolved_failed_module_member indexes the
+ * expression, and SQLite uses an expression index only for a query that
+ * spells the expression exactly so: schema.sql and the v16 migration do.
+ */
+export const MEMBER_TAIL_SQL = "substr(reference_name, length(rtrim(reference_name, replace(reference_name, '.', ''))) + 1)";
+
+/** The rows parked under a module: the partial WHERE of the indexes that find them. */
+export const MODULE_PARKED_SQL = "status = 'failed' AND name_tail GLOB 'module:*'";
+
+/**
  * The tail of a reference that waits for a module rather than for a name: the
  * module path's stem behind 'module:' — `./pages/Team` → 'module:Team',
  * `@/views/error/404.vue` → 'module:404' — the key
@@ -129,7 +144,8 @@ export function importPathKeys(filePath: string): string[] {
  * AND the ones it changes: a route renders the component its module exports,
  * so an edit that gives the module one is what the route waited for. So does
  * a reference through an import binding the module declares under another
- * name (`importBindingTail`), which is parked under the same keys.
+ * name, and a direct member reference through any binding
+ * (`importBindingTail`), which are parked under the same keys.
  */
 export function moduleReferenceKeys(filePath: string): string[] {
   const keys = importPathKeys(filePath);
