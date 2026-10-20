@@ -20121,6 +20121,11 @@ function pythonClassBases(cls: Node, context: ResolutionContext): Array<Node | n
 }
 
 function pythonClassBasesUncached(cls: Node, context: ResolutionContext): Array<Node | null> {
+  return pythonClassBaseNames(cls, context).map((b) => pythonClassNamed(b, cls.filePath, context));
+}
+
+/** The bases `cls`'s own `class` line names, as written (`Base`, `models.Model`). */
+function pythonClassBaseNames(cls: Node, context: ResolutionContext): string[] {
   const lines = pythonLines(context, cls.filePath);
   if (!lines) return [];
   const header = lines.slice(cls.startLine - 1, cls.startLine + 4).join(' ');
@@ -20128,8 +20133,23 @@ function pythonClassBasesUncached(cls: Node, context: ResolutionContext): Array<
   return (bases ?? '')
     .split(',')
     .map((b) => b.trim())
-    .filter((b) => /^[A-Za-z_][\w.]*$/.test(b) && b !== 'object') // `metaclass=...`, generics
-    .map((b) => pythonClassNamed(b, cls.filePath, context));
+    .filter((b) => /^[A-Za-z_][\w.]*$/.test(b) && b !== 'object'); // `metaclass=...`, generics
+}
+
+/**
+ * Whether every base in `cls`'s hierarchy is known — a project class, whose
+ * bases are known in turn, or a class from outside the project. A base the
+ * reader cannot find (a name a package re-exports from elsewhere) may hold a
+ * method, so a class with one is no evidence that a method is missing.
+ */
+function pythonHierarchyKnown(cls: Node, context: ResolutionContext, seen: Set<string> = new Set()): boolean {
+  if (seen.has(cls.id) || seen.size >= 5) return true;
+  seen.add(cls.id);
+  const bases = pythonClassBases(cls, context);
+  return pythonClassBaseNames(cls, context).every((name, i) => {
+    const base = bases[i];
+    return base ? pythonHierarchyKnown(base, context, seen) : isPythonOutsideModuleName(name.split('.')[0]!, cls.filePath, context);
+  });
 }
 
 /**
@@ -20415,14 +20435,8 @@ const PYTHON_ATTRLESS_BASE = /^(?:ABC|Protocol|NamedTuple|TypedDict|Enum|IntEnum
 
 /** Whether `cls`'s own `class` line names a base from outside the project that could give it attributes. */
 function pythonHasOutsideBase(cls: Node, context: ResolutionContext): boolean {
-  const lines = pythonLines(context, cls.filePath);
-  if (!lines) return false;
-  const header = lines.slice(cls.startLine - 1, cls.startLine + 4).join(' ');
-  const bases = new RegExp(`\\bclass\\s+${cls.name}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
-  return (bases ?? '')
-    .split(',')
-    .map((b) => b.trim())
-    .filter((b) => /^[A-Za-z_][\w.]*$/.test(b) && b !== 'object' && !PYTHON_ATTRLESS_BASE.test(b.split('.').pop()!))
+  return pythonClassBaseNames(cls, context)
+    .filter((b) => !PYTHON_ATTRLESS_BASE.test(b.split('.').pop()!))
     .some((b) => isPythonOutsideModuleName(b.split('.')[0]!, cls.filePath, context));
 }
 
@@ -20487,7 +20501,10 @@ function matchPythonAttrCall(
   if (cls === 'runtime') return null;
   if (!cls || cls === 'absent') return undefined;
   const hit = pythonMethodOnClass(cls, methodName, ref, context, read) ?? pythonSubclassMethod(cls, methodName, ref, context);
-  if (!hit) return null;
+  // The class has no such method of the project's — unless a base the reader
+  // cannot find holds it: Django's `ComplexField(MultiValueField)`, its base
+  // imported from a package that re-exports it.
+  if (!hit) return pythonHierarchyKnown(cls, context) ? null : undefined;
   read.delete(ref.filePath);
   return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
 }

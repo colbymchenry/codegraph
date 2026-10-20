@@ -322,6 +322,21 @@ describe('python attribute types from factories and base classes', () => {
       expect(callsFrom('run')).toEqual([]);
     });
 
+    it('does not rule a method out of a class whose base the reader cannot find', async () => {
+      // `MultiValueField` reaches `forms.py` through a package that star-imports
+      // it, which the reader does not follow: `ComplexField` may inherit
+      // `clean`, so the call is guessed by name rather than left unresolved.
+      write({
+        'fields/__init__.py': 'from .impl import *\n',
+        'fields/impl.py': 'class MultiValueField:\n    def clean(self, v):\n        return v\n',
+        'forms.py': 'from fields import MultiValueField\n\nclass ComplexField(MultiValueField):\n    pass\n',
+        'other.py': 'class Other:\n    def clean(self, v):\n        return v\n',
+        'tests.py': 'from forms import ComplexField\n\nclass T:\n    def setUp(self):\n        self.field = ComplexField()\n\n    def run(self):\n        self.field.clean(1)\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual(['MultiValueField::clean@fields/impl.py']);
+    });
+
     it("guesses by name an attribute whose only outside base is one that gives none, like ABC", async () => {
       write({
         'repo.py': 'class Repo:\n    def save(self):\n        pass\n',
