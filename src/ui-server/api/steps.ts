@@ -1621,7 +1621,10 @@ function renderParents(cg: CodeGraph, node: Node, memo: Map<string, number>): nu
     const incoming = cg.getIncomingEdgesTo([node.id], ['calls']);
     const sources = new Set<string>();
     for (const e of incoming) {
-      if ((e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'jsx-render') sources.add(e.source);
+      // A file renders at module scope — an entry's root, a test's subject
+      // (#2587) — and is no parent a screen shares chrome with.
+      if ((e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'jsx-render' &&
+          cg.getNode(e.source)?.kind !== 'file') sources.add(e.source);
     }
     parents = sources.size;
     memo.set(node.id, parents);

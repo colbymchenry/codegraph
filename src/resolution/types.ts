@@ -185,6 +185,12 @@ export interface ResolutionContext {
    */
   isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
   /**
+   * The project file a module specifier, written in `fromFile`, names — the
+   * import resolver's own answer (for Python: from the package roots), or null
+   * when no project file provides it. Supplied by the coordinator.
+   */
+  resolveModuleFile?(source: string, fromFile: string, language: Language): string | null;
+  /**
    * Whether `source`, imported from `fromFile`, is a package: one the file's
    * package.json or an enclosing one declares, a Node built-in, or a
    * runtime's virtual module (`node:`, `bun:`, `astro:`…). Such an import
