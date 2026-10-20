@@ -3932,20 +3932,29 @@ function isPythonProjectModule(module: string, fromFile: string, context: Resolu
  * method of the same name (#2599).
  */
 export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
-  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
-    const keys = pythonImportKeys(name, ref.filePath, context);
+  if (ref.language !== 'python') return false;
+  return isPythonOutsideModuleName(name, ref.filePath, context) && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * The module-scope half of isPythonOutsideModuleReceiver: `filePath` binds
+ * `name` only by importing it from outside the project, and never rebinds it
+ * at module scope.
+ */
+function isPythonOutsideModuleName(name: string, filePath: string, context: ResolutionContext): boolean {
+  if (!/^\w+$/.test(name)) return false;
+  return pythonNameScan(context, `outside\0${filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, filePath, context);
     if (keys.size === 0) return false;
-    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
-    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    if (pythonGlobalBindings(name, filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
     // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
     // the module `a` tells that `x` comes from outside.
     return [...keys].every((key) => {
       const module = key.slice(0, key.indexOf(':'));
-      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, ref.filePath, context);
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, filePath, context);
     });
   });
-  return outside && !pythonBindsLocally(name, ref, context, false);
 }
 
 /**
@@ -17723,6 +17732,9 @@ function inferPhpAssignedPropertyType(
   return null;
 }
 
+/** Python attribute-chain refs being guessed by name after the type reader found nothing. */
+const PY_CHAIN_GUESSING = new WeakSet<UnresolvedRef>();
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -18203,15 +18215,29 @@ export function matchMethodCall(
 
   // Python call through an attribute — `self.data.append(x)`,
   // `cls.registry.lookup(k)`, `cfg.client.send(x)` — which the extractor emits
-  // with its receiver (`self.data.append`) instead of a bare method name.
-  // EXCLUSIVE, for the same reason as the Go, Rust and TS branches above:
-  // everything past this point is name matching, and a bare-name match is how
-  // `self.data.append(1)` bound to an unrelated class's `append`. The evidence
-  // this path accepts is the type the class body gives the attribute. A dotted
-  // MODULE path (`pkg.mod.func()`) never gets here: import resolution claims it
-  // first, through the module the import names.
-  if (pythonAttrReceiver) {
-    return matchPythonAttrCall(objectOrClass!, methodName!, ref, context);
+  // with its receiver (`self.data.append`) instead of a bare method name. The
+  // type the class body gives the attribute decides when there is one: its
+  // method, or no edge for a builtin or outside type (a bare-name match is how
+  // `self.data.append(1)` bound to an unrelated class's `append`). With no
+  // such evidence the call is guessed by name below, as any receiver is. A
+  // dotted MODULE path (`pkg.mod.func()`) never gets here: import resolution
+  // claims it first, through the module the import names.
+  if (pythonAttrReceiver && !PY_CHAIN_GUESSING.has(ref)) {
+    const read = new Set<string>();
+    const typed = matchPythonAttrCall(objectOrClass!, methodName!, ref, context, read);
+    if (typed !== undefined) return typed;
+    // The guess records the files the type reader looked at, as a typed answer
+    // does (`typeFrom`): a sync that makes one of them type the attribute —
+    // a factory gaining `-> Client` — re-opens it.
+    PY_CHAIN_GUESSING.add(ref);
+    let guess: ResolvedRef | null;
+    try {
+      guess = matchMethodCall(ref, context);
+    } finally {
+      PY_CHAIN_GUESSING.delete(ref);
+    }
+    read.delete(ref.filePath);
+    return guess && read.size > 0 ? { ...guess, metadata: { ...guess.metadata, typeFrom: [...read].sort() } } : guess;
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -18465,13 +18491,19 @@ export function matchMethodCall(
       targetMethods = kept;
     }
 
+    // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
+    // only by the name of its last link, in the scoring below — Django's
+    // `self.client.get()` is its test `Client`'s — never as the one method of
+    // the name: `self.a.b.go()` is no `Leaf.go` the receiver says nothing of.
+    const pythonChain = ref.language === 'python' && objectOrClass!.includes('.');
+
     // If only one same-language method with this name exists, use it —
     // except in Ruby, where nothing types a receiver: there the one method
     // must also belong to something the receiver is named after
     // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
-    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+    if (targetMethods.length === 1 && !narrowed && !pythonChain && targetMethods[0]!.language === ref.language &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -18495,7 +18527,7 @@ export function matchMethodCall(
     }
 
     // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1) {
+    if (targetMethods.length > 1 || (targetMethods.length === 1 && pythonChain && !narrowed)) {
       // What the receiver is named after is its last link: `builder.tokeniser`
       // is a Tokeniser, `table.Columns` no kind of table.
       const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
@@ -19377,7 +19409,9 @@ function pythonLines(context: ResolutionContext, filePath: string): string[] | n
  * nothing usable (null).
  */
 type PythonAttrEvidence =
-  | { type: string }
+  // `classLevel`: assigned in the class body (`author = ForeignKey(Author)`),
+  // where a framework's descriptor may hand instances something else.
+  | { type: string; classLevel?: boolean }
   | { factory: string; awaited: boolean }
   | { arms: [PythonEvidence, PythonEvidence] }
   | 'runtime'
@@ -19814,7 +19848,7 @@ function pythonAttrStatementsUncached(
     const ev = m[1]
       ? pythonAnnotationEvidence(m[1])
       : pythonValueEvidence(value!, inDef ? signature : null);
-    if (ev) evidence.push(ev);
+    if (ev) evidence.push(!m[1] && !inDef && typeof ev === 'object' && 'type' in ev ? { ...ev, classLevel: true } : ev);
   }
   return { mentioned, evidence };
 }
@@ -20024,7 +20058,14 @@ function pythonEvidenceClass(
   if ('arms' in ev) {
     return pythonAgree(ev.arms.map((arm) => pythonEvidenceClass(arm, fromFile, context, read, depth, clsIs)));
   }
-  if ('type' in ev) return pythonClassNamed(ev.type, fromFile, context);
+  // A class from outside the project (`requests.Session()`, a `Session` from
+  // `from requests import Session`) is no project class either: like a
+  // builtin, none of its methods is the project's. Not in a class body, where
+  // Django's `author = models.ForeignKey(Author)` hands instances an Author.
+  if ('type' in ev) {
+    return pythonClassNamed(ev.type, fromFile, context) ??
+      (!ev.classLevel && isPythonOutsideModuleName(ev.type.split('.')[0]!, fromFile, context) ? 'runtime' : null);
+  }
   if (ev.factory === 'cls') return ev.awaited ? null : clsIs;
   return pythonFactoryType(ev.factory, ev.awaited, fromFile, context, read, depth);
 }
@@ -20195,7 +20236,28 @@ function pythonAttrClassWalk(
     const got = pythonAttrClassWalk(base, attr, context, read, seen);
     if (got !== 'absent') fromBases.push(got);
   }
-  return fromBases.length === 0 ? 'absent' : pythonAgree(fromBases);
+  if (fromBases.length > 0) return pythonAgree(fromBases);
+  // No class of the project's in the hierarchy assigns it: a base from
+  // outside — Django's `TestCase` or `View` in an app — is where it comes
+  // from (`self.client`, `self.request`), and none of its methods is the
+  // project's.
+  return pythonHasOutsideBase(owner, context) ? 'runtime' : 'absent';
+}
+
+/** Bases that give a subclass no attributes: `ABC`, `Protocol`, an enum, an exception. */
+const PYTHON_ATTRLESS_BASE = /^(?:ABC|Protocol|NamedTuple|TypedDict|Enum|IntEnum|StrEnum|Flag|IntFlag|\w*(?:Error|Exception|Warning))$/;
+
+/** Whether `cls`'s own `class` line names a base from outside the project that could give it attributes. */
+function pythonHasOutsideBase(cls: Node, context: ResolutionContext): boolean {
+  const lines = pythonLines(context, cls.filePath);
+  if (!lines) return false;
+  const header = lines.slice(cls.startLine - 1, cls.startLine + 4).join(' ');
+  const bases = new RegExp(`\\bclass\\s+${cls.name}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
+  return (bases ?? '')
+    .split(',')
+    .map((b) => b.trim())
+    .filter((b) => /^[A-Za-z_][\w.]*$/.test(b) && b !== 'object' && !PYTHON_ATTRLESS_BASE.test(b.split('.').pop()!))
+    .some((b) => isPythonOutsideModuleName(b.split('.')[0]!, cls.filePath, context));
 }
 
 /**
@@ -20206,20 +20268,27 @@ function pythonAttrClassWalk(
  * class's body — directly, through a factory it calls, or from a base class
  * that assigns it; the method is looked up on that type.
  *
- * Anything that does not type the attribute — a builtin container, a factory
- * whose result is unknowable, bases that disagree, an untyped local, a deeper
- * chain — resolves to nothing rather than to a same-named method somewhere
- * else. The edge records the other files the answer was read from
- * (`typeFrom`), so a sync that edits one of them re-opens it.
+ * Three answers. The method, when the attribute's type is a project class
+ * that has it. Null — no edge — when the evidence rules every project method
+ * out: the attribute holds a builtin (`self.data = []`) or a class from
+ * outside the project (`requests.Session()`), or the class it holds has no
+ * such method. Undefined when nothing here types the attribute — an untyped
+ * local, a factory whose result is unknowable, bases that disagree, an
+ * attribute no class body mentions, a deeper chain: the caller then guesses
+ * by name as for any other receiver, which is how Django's
+ * `self.client.get()` reaches its test `Client`. The edge records the other
+ * files the answer was read from (`typeFrom`), so a sync that edits one of
+ * them re-opens it.
  */
 function matchPythonAttrCall(
   receiver: string,
   methodName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
-): ResolvedRef | null {
+  read: Set<string> = new Set(),
+): ResolvedRef | null | undefined {
   const segs = receiver.split('.');
-  if (segs.length !== 2) return null;
+  if (segs.length !== 2) return undefined;
   const [head, attr] = segs as [string, string];
 
   let owner: Node | null = null;
@@ -20237,11 +20306,11 @@ function matchPythonAttrCall(
     const headType = inferLocalReceiverType(head, ref, context);
     if (headType) owner = pythonClassNamed(headType, ref.filePath, context);
   }
-  if (!owner) return null;
+  if (!owner) return undefined;
 
-  const read = new Set<string>();
   const cls = pythonAttrClass(owner, attr, context, read);
-  if (!cls || cls === 'runtime' || cls === 'absent') return null;
+  if (cls === 'runtime') return null;
+  if (!cls || cls === 'absent') return undefined;
   const hit = pythonMethodOnClass(cls, methodName, ref, context, read) ?? pythonSubclassMethod(cls, methodName, ref, context);
   if (!hit) return null;
   read.delete(ref.filePath);
@@ -20294,7 +20363,7 @@ export function pythonAttrRefResolves(ref: UnresolvedRef, context: ResolutionCon
   const dot = ref.referenceName.lastIndexOf('.');
   const receiver = dot > 0 ? ref.referenceName.slice(0, dot) : '';
   if (!receiver.includes('.')) return false;
-  return matchPythonAttrCall(receiver, ref.referenceName.slice(dot + 1), ref, context) !== null;
+  return !!matchPythonAttrCall(receiver, ref.referenceName.slice(dot + 1), ref, context);
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */

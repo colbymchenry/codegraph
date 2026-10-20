@@ -120,7 +120,9 @@ describe('python attribute types from factories and base classes', () => {
       write({
         'client.py': 'REGISTRY = {}\n\nclass Client:\n    def send(self):\n        pass\n\ndef make_client(kind):\n    return REGISTRY[kind]()\n',
         'other.py': DISTRACTOR,
-        'svc.py': 'from client import make_client\n\nclass Svc:\n    def __init__(self):\n        self.client = make_client("x")\n\n    def run(self):\n        self.client.send()\n',
+        // `conn`, named after no class: what is tested is the type reader,
+        // not the guess by name an untyped `self.client` would get.
+        'svc.py': 'from client import make_client\n\nclass Svc:\n    def __init__(self):\n        self.conn = make_client("x")\n\n    def run(self):\n        self.conn.send()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(callsFrom('run')).toEqual([]);
@@ -159,7 +161,7 @@ describe('python attribute types from factories and base classes', () => {
     it('stays silent when the factory returns two different classes', async () => {
       write({
         'client.py': 'class Client:\n    def send(self):\n        pass\n\nclass Fake:\n    def send(self):\n        pass\n\ndef make_client(test):\n    if test:\n        return Fake()\n    return Client()\n',
-        'svc.py': 'from client import make_client\n\nclass Svc:\n    def __init__(self):\n        self.client = make_client(False)\n\n    def run(self):\n        self.client.send()\n',
+        'svc.py': 'from client import make_client\n\nclass Svc:\n    def __init__(self):\n        self.conn = make_client(False)\n\n    def run(self):\n        self.conn.send()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(callsFrom('run')).toEqual([]);
@@ -290,9 +292,9 @@ describe('python attribute types from factories and base classes', () => {
     it('stays silent when an untyped subclass assignment shadows a typed base', async () => {
       write({
         'repo.py': 'class Repo:\n    def save(self):\n        pass\n',
-        'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self):\n        self.repo = Repo()\n',
+        'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self):\n        self.store = Repo()\n',
         'other.py': DISTRACTOR,
-        'child.py': 'from base import Base\n\nclass Child(Base):\n    def __init__(self, repo):\n        super().__init__()\n        self.repo = repo\n\n    def run(self):\n        self.repo.save()\n',
+        'child.py': 'from base import Base\n\nclass Child(Base):\n    def __init__(self, repo):\n        super().__init__()\n        self.store = repo\n\n    def run(self):\n        self.store.save()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(callsFrom('run')).toEqual([]);
@@ -313,6 +315,38 @@ describe('python attribute types from factories and base classes', () => {
         'repo.py': 'class Repo:\n    def save(self):\n        pass\n',
         'other.py': DISTRACTOR,
         'child.py': 'from django.views import View\n\nclass Child(View):\n    def run(self):\n        self.repo.save()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Nothing of the project's assigns `self.repo`, so it is the outside
+      // base's — not even guessed as the project's `Repo` by its name.
+      expect(callsFrom('run')).toEqual([]);
+    });
+
+    it("guesses by name an attribute whose only outside base is one that gives none, like ABC", async () => {
+      write({
+        'repo.py': 'class Repo:\n    def save(self):\n        pass\n',
+        'other.py': DISTRACTOR,
+        'child.py': 'from abc import ABC\n\nclass Child(ABC):\n    def run(self):\n        self.repo.save()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual(['Repo::save@repo.py']);
+    });
+
+    it('guesses by name a class-body field an outside class builds, which a descriptor may hand something else', async () => {
+      // Django's `author = models.ForeignKey(Author)`: instances hold an Author.
+      write({
+        'models.py': 'from django.db import models\n\nclass Author(models.Model):\n    def save(self):\n        pass\n\n'
+          + 'class Book(models.Model):\n    author = models.ForeignKey(Author, on_delete=models.CASCADE)\n\n    def run(self):\n        self.author.save()\n',
+        'other.py': DISTRACTOR,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual(['Author::save@models.py']);
+    });
+
+    it('leaves an attribute an outside class builds in a method unresolved', async () => {
+      write({
+        'session.py': 'class Session:\n    def get(self):\n        pass\n',
+        'api.py': 'import requests\n\nclass Api:\n    def __init__(self):\n        self.session = requests.Session()\n\n    def run(self):\n        self.session.get()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(callsFrom('run')).toEqual([]);
@@ -380,13 +414,28 @@ describe('python attribute types from factories and base classes', () => {
         'client.py': 'class Client:\n    def send(self):\n        pass\n',
         'other.py': DISTRACTOR,
         'factory.py': 'from client import Client\n\ndef make(kind):\n    return kind()\n',
-        'svc.py': 'from factory import make\n\nclass Svc:\n    def __init__(self):\n        self.client = make(1)\n\n    def run(self):\n        self.client.send()\n',
+        'svc.py': 'from factory import make\n\nclass Svc:\n    def __init__(self):\n        self.conn = make(1)\n\n    def run(self):\n        self.conn.send()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(edgesOf(cg)).toEqual([]);
       const edit = { 'factory.py': 'from client import Client\n\ndef make(kind) -> Client:\n    return kind()\n' };
       write(edit);
       expect(await convergeAfter(edit)).toEqual(['Client::send@client.py']);
+    });
+
+    it('re-types a guess by name once the factory gains an annotation', async () => {
+      // Untyped, `self.client` is guessed by its name as a `Client`. The guess
+      // records the factory's file, so annotating it `-> Fake` re-opens it.
+      write({
+        'client.py': 'class Client:\n    def send(self):\n        pass\n\nclass Fake:\n    def send(self):\n        pass\n',
+        'factory.py': 'from client import Client, Fake\n\ndef make(kind):\n    return kind()\n',
+        'svc.py': 'from factory import make\n\nclass Svc:\n    def __init__(self):\n        self.client = make(1)\n\n    def run(self):\n        self.client.send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(edgesOf(cg)).toEqual(['Client::send@client.py']);
+      const edit = { 'factory.py': 'from client import Client, Fake\n\ndef make(kind) -> Fake:\n    return kind()\n' };
+      write(edit);
+      expect(await convergeAfter(edit)).toEqual(['Fake::send@client.py']);
     });
 
     it('re-types an inherited attribute when the base __init__ changes', async () => {
@@ -482,15 +531,16 @@ describe('python attribute types from factories and base classes', () => {
     });
 
     it('drops an inherited edge when the base stops typing the attribute', async () => {
+      // `store`, named after no class, so no guess by name replaces the edge.
       write({
         'repo.py': 'class Repo:\n    def save(self):\n        pass\n',
         'other.py': DISTRACTOR,
-        'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self):\n        self.repo = Repo()\n',
-        'child.py': 'from base import Base\n\nclass Child(Base):\n    def run(self):\n        self.repo.save()\n',
+        'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self):\n        self.store = Repo()\n',
+        'child.py': 'from base import Base\n\nclass Child(Base):\n    def run(self):\n        self.store.save()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(edgesOf(cg)).toEqual(['Repo::save@repo.py']);
-      const edit = { 'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self, repo):\n        self.repo = repo\n' };
+      const edit = { 'base.py': 'from repo import Repo\n\nclass Base:\n    def __init__(self, repo):\n        self.store = repo\n' };
       write(edit);
       expect(await convergeAfter(edit)).toEqual([]);
     });

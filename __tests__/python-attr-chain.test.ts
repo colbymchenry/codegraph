@@ -80,20 +80,22 @@ describe('python attribute-chain receivers', () => {
     expect(callsFrom('method', 'run')).toEqual([]);
   });
 
-  it('does not bind a non-self chain to a same-named method', async () => {
-    // The distractor matters: `Other.send` exists too, so a resolution here
-    // could only ever be a guess between them.
-    fs.writeFileSync(
-      path.join(tempDir, 'kinds.py'),
-      'class Client:\n    def send(self, x):\n        return x\n\n\nclass Other:\n    def send(self, x):\n        return x\n'
-    );
+  it('guesses an untyped chain only by the name of its last link, as any receiver', async () => {
+    // Nothing types `cfg`, so the type reader has no answer. `cfg.client` is
+    // then guessed as a `Client` by its name — the guess every untyped
+    // receiver gets (`client.send()`), and how Django's `self.client.get()`
+    // reaches its test client — while `cfg.conn` names neither class: no
+    // edge, rather than one of the two `send`s.
+    fs.writeFileSync(path.join(tempDir, 'client.py'), 'class Client:\n    def send(self, x):\n        return x\n');
+    fs.writeFileSync(path.join(tempDir, 'other.py'), 'class Other:\n    def send(self, x):\n        return x\n');
     fs.writeFileSync(
       path.join(tempDir, 'use.py'),
-      'def run(cfg, x):\n    return cfg.client.send(x)\n'
+      'def run(cfg, x):\n    return cfg.client.send(x)\n\n\ndef run_conn(cfg, x):\n    return cfg.conn.send(x)\n'
     );
 
     cg = await CodeGraph.init(tempDir, { index: true });
-    expect(callsFrom('function', 'run')).toEqual([]);
+    expect(callsFrom('function', 'run')).toEqual(['method:send@client.py']);
+    expect(callsFrom('function', 'run_conn')).toEqual([]);
   });
 
   // --- boundaries the gate must NOT cross -----------------------------------
@@ -223,8 +225,9 @@ describe('python attribute-chain receivers', () => {
     });
     cg = await CodeGraph.init(tempDir, { index: true });
     expect(callsFrom('function', 'by_param')).toEqual(['method:rebuild@models.py']);
-    // Two attribute hops is a deeper chain than the class body answers.
-    expect(callsFrom('function', 'by_local')).toEqual([]);
+    // Two attribute hops is a deeper chain than the class body answers: it is
+    // guessed by the name of its last link, `llm`, as an untyped one is.
+    expect(callsFrom('function', 'by_local')).toEqual(['method:rebuild@models.py']);
   });
 
   it('leaves an attribute typed as an external class unresolved', async () => {
@@ -326,7 +329,9 @@ describe('python attribute-chain receivers', () => {
 
     it('a parameter rebound before the assignment no longer carries its annotation', async () => {
       write('box.py', 'class Box:\n    def run(self):\n        return 1\n');
-      write('svc.py', 'from box import Box\n\ndef wrap(b):\n    return b\n\nclass Svc:\n    def __init__(self, box: Box):\n        box = wrap(box)\n        self.box = box\n\n    def go(self):\n        return self.box.run()\n');
+      // `held`, named after no class, so no guess by name stands in for the
+      // annotation this must not carry.
+      write('svc.py', 'from box import Box\n\ndef wrap(b):\n    return b\n\nclass Svc:\n    def __init__(self, box: Box):\n        box = wrap(box)\n        self.held = box\n\n    def go(self):\n        return self.held.run()\n');
       cg = await CodeGraph.init(tempDir, { index: true });
       expect(callsFrom('method', 'go')).not.toContain('method:run@box.py');
     });

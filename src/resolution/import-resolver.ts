@@ -3745,8 +3745,10 @@ function resolveImportedInstanceMember(
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'calls') return null;
   if (value.kind !== 'constant' && value.kind !== 'variable') return null;
-  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
-  if (!member) return null;
+  // The method called on the value itself: `app.jinja_env.filters.keys()`
+  // calls `keys`, no method of the app's type — never `jinja_env`.
+  const member = ref.referenceName.slice(localName.length + 1);
+  if (!member || member.includes('.')) return null;
 
   const source = context.readFile(value.filePath);
   if (!source) return null;
