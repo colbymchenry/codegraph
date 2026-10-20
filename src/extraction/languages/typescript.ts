@@ -102,7 +102,7 @@ export const typescriptExtractor: LanguageExtractor = {
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need
   // an equivalent — their grammars reuse `method_declaration`.
-  methodTypes: ['method_definition', 'public_field_definition', 'method_signature'],
+  methodTypes: ['method_definition', 'public_field_definition', 'method_signature', 'abstract_method_signature'],
   classifyMethodNode: classifyTsClassMember,
   // The interface counterpart of `public_field_definition`. It carries no value,
   // so it is always a property and never needs classifyMethodNode.
