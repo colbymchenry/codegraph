@@ -18428,9 +18428,13 @@ export function matchMethodCall(
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
     // Nor is it a method of a class another function declares: Django's
     // `file.write(…)` in one test is not the `File` a serializer test
-    // declares in its body. Like the test suite's, such a method was never
-    // in the running, so ruling it out narrows nothing.
-    targetMethods = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
+    // declares in its body. The one method such a filter may leave is still
+    // only a guess by the receiver's name (the scoring below), never the
+    // only method of the name: `cache.aadd()` is `BaseCache`'s, while
+    // `value.split()` is no test model's `split`.
+    const reachable = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
+    const scopedOut = reachable.length !== targetMethods.length;
+    targetMethods = reachable;
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref
@@ -18447,7 +18451,7 @@ export function matchMethodCall(
     // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
-    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+    if (targetMethods.length === 1 && !narrowed && !scopedOut && targetMethods[0]!.language === ref.language &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -18471,7 +18475,7 @@ export function matchMethodCall(
     }
 
     // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1) {
+    if (targetMethods.length > 1 || (targetMethods.length === 1 && scopedOut && !narrowed)) {
       // What the receiver is named after is its last link: `builder.tokeniser`
       // is a Tokeniser, `table.Columns` no kind of table.
       const receiverWords = splitCamelCase(receiverLink(objectOrClass!));

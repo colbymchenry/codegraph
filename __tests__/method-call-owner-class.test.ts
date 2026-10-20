@@ -161,6 +161,30 @@ def check_managers(manager):
     manager.get_queryset()
     manager.filter()
 `);
+  // A method of a class another function declares is out of reach, but what
+  // it leaves is still a guess by the receiver's name: `cache.aadd()` is
+  // BaseCache's, and `value.split()` is not the one other `split` there is.
+  fs.writeFileSync(path.join(dir, 'cachelib.py'), `class BaseCache:
+    def aadd(self):
+        pass
+
+class BadModelWithSplit:
+    def split(self):
+        pass
+`);
+  fs.writeFileSync(path.join(dir, 'local_fakes.py'), `def make_fakes():
+    class Fake:
+        def aadd(self):
+            pass
+
+        def split(self):
+            pass
+    return Fake()
+`);
+  fs.writeFileSync(path.join(dir, 'cache_use.py'), `def use_cache(cache, value):
+    cache.aadd()
+    value.split()
+`);
   // A Kotlin companion object's members are the class's own: `Foo.create()`
   // is Foo's, not that of `FooBar`, declared first.
   fs.writeFileSync(path.join(dir, 'Factory.kt'), `package app
@@ -263,6 +287,12 @@ describe('method call binds to the receiver class itself, not a class whose name
     const callees = calleesOf('check_managers', 'managers.py');
     expect(callees).toContain('managers.py#BaseManager::get_queryset');
     expect(callees).toContain('managers.py#QuerySet::filter');
+  });
+
+  it('Python: with a local class out of reach, the method left is still a guess by the receiver name', () => {
+    const callees = calleesOf('use_cache', 'cache_use.py');
+    expect(callees).toContain('cachelib.py#BaseCache::aadd');
+    expect(callees).not.toContain('cachelib.py#BadModelWithSplit::split');
   });
 
   it("Kotlin: a companion object's method is its own class's", () => {
