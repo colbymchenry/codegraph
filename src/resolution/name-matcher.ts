@@ -335,10 +335,9 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
       type = pythonFieldType(receiver, owner, ref, context);
     } else {
       type = pythonLocalType(receiver, ref, context);
-      const global = type === null
-        ? context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) : undefined;
-      if (global && !pythonBindsLocally(receiver, ref, context, true)) {
-        return result(pythonGlobalMembers(global, member, ref, context));
+      const viaGlobal = type === null ? pythonGlobalReceiverTarget(receiver, member, ref, context) : undefined;
+      if (viaGlobal !== undefined) {
+        return viaGlobal ? { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'function-ref' } : null;
       }
     }
     // A type name used directly (`Store.fetch`) is scoped just like an annotation.
@@ -617,6 +616,31 @@ function pythonBindsLocally(name: string, ref: UnresolvedRef, context: Resolutio
     if (bindings.some(b => b.kind !== 'global' && (b.kind !== 'import' || importsBind))) return true;
   }
   return false;
+}
+
+/**
+ * The module `name` is bound to by an `import a.b as name` written in the
+ * function around `ref` — the innermost one that binds `name` at all (#2600).
+ * Import mappings are per file and read only module-level `import` lines, so
+ * such a function-local alias has none. Null when that function binds `name`
+ * any other way, binds it to several modules, or imports an undotted module
+ * (an optional dependency's name can match any project file's basename).
+ */
+export function pythonFunctionModuleAlias(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return null;
+  const lines = pythonMemberLines(ref.filePath, context);
+  const statements = pythonStatementStarts(ref.filePath, context);
+  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const scope of scopes) {
+    const bindings = pythonOwnLines(scope, ref.filePath, context).flatMap(i => pythonLineBindings(lines, i, statements, name));
+    if (bindings.length === 0) continue;
+    const modules = new Set(bindings.map(b => b.kind === 'import' && b.key.endsWith(':*') ? b.key.slice(0, -2) : ''));
+    const [module] = modules;
+    return modules.size === 1 && module && module.includes('.') && !pythonBindsLocally(name, ref, context, false) ? module : null;
+  }
+  return null;
 }
 
 /** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
@@ -929,6 +953,44 @@ function pythonDynamicGlobalWrite(name: string, filePath: string, context: Resol
     if (uses > safe) return true;
   }
   return false;
+}
+
+/**
+ * What `receiver.member` reaches through a module-level instance of this
+ * file — `_svc = SceneService()` at module scope, then `_svc.delete` (#2074)
+ * or `_svc.delete(obj)` (#2582). Undefined when `receiver` is not that global
+ * where the ref is: a parameter, a local, or a `def`/`class` written directly
+ * in an enclosing function shadows it. Otherwise the one method or function every class the global
+ * may hold has or inherits — never a property, an attribute or the referring
+ * node itself (allowed for a `call`: recursion) — or null when there is none.
+ */
+function pythonGlobalReceiverTarget(
+  receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext, call = false,
+): Node | null | undefined {
+  const global = pythonNameScan(context, `global\0${ref.filePath}\0${receiver}`, () =>
+    context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
+  if (!global || pythonBindsLocally(receiver, ref, context, true)) return undefined;
+  // A `def _svc` / `class _svc` nested in an enclosing function binds the name there.
+  const nodes = context.getNodesInFile(ref.filePath);
+  const scopes = nodes.filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
+  const innermost = (n: Node) => nodes
+    .filter(c => c.id !== n.id && (c.kind === 'function' || c.kind === 'method' || c.kind === 'class') &&
+      c.startLine < n.startLine && c.endLine >= n.startLine)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  if (nodes.some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
+      scopes.some(f => f.id === innermost(n)?.id))) return undefined;
+  if (!pythonOwnGlobalWrites(global, context) || pythonExternalWrites(global, context).writers.has(ref.filePath)) {
+    return null;
+  }
+  const classes = pythonGlobalClasses(global, ref, context);
+  if (!classes) return null;
+  // A class without the member (a base from outside the project may supply it) leaves it unknown.
+  if (classes.some(cls => pythonMembers(cls, member, ref, context).length === 0)) return null;
+  const pool = pythonGlobalMembers(global, member, ref, context).filter(n => sameLanguageFamily(n.language, ref.language));
+  const target = pool.length === 1 ? pool[0]! : undefined;
+  // A method value naming its own method is no reference; a call through the global is recursion.
+  return target && (target.kind === 'function' || target.kind === 'method') && (call || target.id !== ref.fromNodeId) &&
+    !isPythonProperty(target, context) ? target : null;
 }
 
 /**
@@ -3827,6 +3889,11 @@ function pythonFromImports(filePath: string, context: ResolutionContext): Map<st
 function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const module = pythonFromImports(ref.filePath, context).get(name);
   if (!module || module.startsWith('.')) return false;
+  return !isPythonProjectModule(module, context);
+}
+
+/** Whether some project file is the module `a.b` (`a/b.py` or `a/b/__init__.py`). */
+function isPythonProjectModule(module: string, context: ResolutionContext): boolean {
   let memo = PY_MODULE_LOCAL.get(context);
   if (!memo) {
     memo = new Map();
@@ -3839,7 +3906,42 @@ function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, conte
       f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
     memo.set(module, local);
   }
-  return !local;
+  return local;
+}
+
+/**
+ * A receiver the file binds only by importing a module from outside the
+ * project — `import subprocess`, `import numpy as np` — never rebinding it at
+ * module scope (an assignment, a `for`/`with`/tuple target, a `global` write
+ * in a function, a fallback `class`/`def` of that name) nor in the calling
+ * function. A call on it is that module's function, never a project class's
+ * method of the same name (#2599).
+ */
+export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
+  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, ref.filePath, context);
+    if (keys.size === 0) return false;
+    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
+    // the module `a` tells that `x` comes from outside.
+    return [...keys].every((key) => {
+      const module = key.slice(0, key.indexOf(':'));
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, context);
+    });
+  });
+  return outside && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * Whether `a.b.c` is a project module from some import root: `a/b/c.py`, or —
+ * with the package itself indexed as the root — `b/c.py` or `c.py`. Erring
+ * toward "project" only leaves a call to the name strategies, as before.
+ */
+function isPythonProjectModuleAnyRoot(module: string, context: ResolutionContext): boolean {
+  const parts = module.split('.');
+  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), context));
 }
 
 const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
@@ -8049,6 +8151,22 @@ function isRustItemVisibleFrom(candidate: Node, ref: UnresolvedRef): boolean {
   return candidate.filePath === ref.filePath || ref.filePath.startsWith(`${rustModuleDir(candidate.filePath)}/`);
 }
 
+/** What a Rust `impl` declares besides its functions: `type Err = …;`, `const MAX: usize = …;`. */
+const RUST_ASSOCIATED_KINDS = new Set(['type_alias', 'variable', 'constant']);
+
+/**
+ * Whether a Rust item is an associated one: a `type` or `const` written in an
+ * `impl` or a trait. It belongs to the type, not to the module, so Rust reaches
+ * it only through a path — `Self::Err`, `<T as FromStr>::Err`, `T::Err` —
+ * never by its name alone, and no module path (`std::error::Error`) or `use`
+ * names it. The extractors qualify it by the impl's type (`ValueHint::Err`) or
+ * its trait, as they do the methods; a module's own type alias or const is
+ * qualified by nothing.
+ */
+export function isRustAssociatedItem(n: Node): boolean {
+  return n.language === 'rust' && RUST_ASSOCIATED_KINDS.has(n.kind) && n.qualifiedName.includes('::');
+}
+
 /** Does one of the file's globs bring in this candidate's module (or, for `use super::*`, its parent's)? */
 function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): boolean {
   if (uses.globs.has(rustModuleName(candidate.filePath))) return true;
@@ -8107,6 +8225,10 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
       if (seg === 'Self') return candidate.kind === 'type_alias' && isInEnclosingRustImpl(candidate, ref, context);
       if (isRustGenericParam(seg, ref, context)) return false;
     }
+    // An associated item, only through its type: `Self::Err` in its impl,
+    // `<T as FromStr>::Err`. No module path names one: axum-core's
+    // `std::error::Error` is std's, not its file's `impl IntoResponseParts`'s `type Error`.
+    if (isRustAssociatedItem(candidate)) return seg === '' || (seg === 'Self' && isInEnclosingRustImpl(candidate, ref, context));
     if ((root === 'std' || root === 'core' || root === 'alloc') && candidate.filePath !== ref.filePath) return false;
     // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
     if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || candidate.filePath === ref.filePath ||
@@ -8117,6 +8239,10 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     return rustModuleName(candidate.filePath) === seg || candidate.filePath.includes(`/${seg}/`) ||
       candidate.qualifiedName.split('::').includes(seg);
   }
+  // Nor does its name alone: clap's `Err(…)` calls went to the `type Err` of
+  // a `FromStr` impl in the same file, axum's routing tests' `Response`s to
+  // the `type Response` of `routing/mod.rs`'s `impl Service`.
+  if (isRustAssociatedItem(candidate)) return false;
   if (candidate.kind === 'enum_member') {
     if (ref.referenceKind === 'references') return false;
     const uses = rustUsesOf(ref.filePath, context);
@@ -15673,6 +15799,17 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // `subprocess.run(…)` after `import subprocess`: a function of a module
+    // from outside the project, not a same-named project method (#2599).
+    if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
+    // A module-level instance of this file — `_svc = SceneService()` — called
+    // from a function: the method its class has or inherits (#2582), as for a
+    // method value through the same global (#2074). Otherwise the call goes on
+    // to the strategies below, as before.
+    if (!inferredType && ref.language === 'python' && dotMatch && /^\w+$/.test(objectOrClass!)) {
+      const viaGlobal = pythonGlobalReceiverTarget(objectOrClass!, methodName!, ref, context, true);
+      if (viaGlobal) return { original: ref, targetNodeId: viaGlobal.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    }
     // A Go receiver's declaration in scope, as the scope reader finds it
     // (`declared`), decides over the patterns, which scan back for the name
     // without block scope and can read another declaration of it:
@@ -16525,6 +16662,26 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
   }
   memo.set(typeNode.id, embedded);
   return embedded;
+}
+
+/**
+ * The module of a Python `from X import …`, which the extractor refs at the
+ * statement's start. It names a module or package, never a symbol: `from app
+ * import email` is not a use of a variable named `app` (#2584).
+ */
+export function isPythonFromImportModule(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || ref.referenceKind !== 'imports') return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  if (line === undefined || !line.startsWith('from', ref.column)) return false;
+  // `from app \` continues the statement on the next line.
+  let text = line.slice(ref.column + 4);
+  for (let next = ref.line; /\\\s*$/.test(text) && next < ref.line + 3; next++) {
+    text = text.replace(/\\\s*$/, ' ') + (lines![next] ?? '');
+  }
+  const name = text.trimStart();
+  return name.length < text.length && name.startsWith(ref.referenceName) &&
+    /^\s+import\b/.test(name.slice(ref.referenceName.length));
 }
 
 /**
