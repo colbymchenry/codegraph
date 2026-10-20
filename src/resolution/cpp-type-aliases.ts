@@ -375,7 +375,8 @@ export function clearCppTypeAliasMemos(context: ResolutionContext): void {
 
 /** Add the parameter names of the `template <…>` header that ends right where a declaration starts. */
 function collectTemplateHeader(lines: readonly string[], startLine: number, startColumn: number, names: Set<string>): void {
-  const before = [...lines.slice(Math.max(0, startLine - 4), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
+  // (A header can take several lines: fmt's `join` spends four on its parameters' defaults.)
+  const before = [...lines.slice(Math.max(0, startLine - 9), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
   const at = before.lastIndexOf('template');
   // Specifiers, attributes and macros may come between the header and where
   // the declaration starts: protobuf's `template <typename T, typename...
