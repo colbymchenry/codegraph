@@ -24,7 +24,7 @@ import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
-import { rustImplTypeName } from './languages/rust';
+import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
@@ -529,6 +529,21 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
   'parenthesized_expression', 'non_null_expression', 'as_expression',
   'satisfies_expression', 'type_assertion', 'await_expression',
 ]);
+
+/**
+ * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+ * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
+ * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ */
+function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (cur.type === 'await_expression') {
+    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
 
 /**
  * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
@@ -3779,6 +3794,8 @@ export class TreeSitterExtractor {
       // Generic fallback for other languages
       // Try to find identifier children
       const nameField = getChildByField(node, 'name');
+      // A Rust impl's associated const is its type's (`Limits::MAX`), as its methods are.
+      const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
       let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
@@ -3791,6 +3808,7 @@ export class TreeSitterExtractor {
             const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
+              ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
             });
             if (created && nameField && child.startIndex === nameField.startIndex) {
               declared = created;
@@ -3986,12 +4004,16 @@ export class TreeSitterExtractor {
       return true;
     }
 
+    const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
       // A Rust alias is private to its module unless `pub` (any form): the
       // resolver keeps a private one to its own module (isRustNameInScope).
       ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
+      // An impl's associated type is its type's (`ValueHint::Err`), named only
+      // through a path, never bare (isRustAssociatedItem).
+      ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
@@ -5237,6 +5259,10 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    // Where the call's reference sits: the call itself, or the callee an
+    // `await` was peeled off (`await f<T>(x)` starts at `await`; the call to
+    // `f` starts where `f` does, as in `await f(x)`).
+    let refStart = node.startPosition;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -5417,6 +5443,11 @@ export class TreeSitterExtractor {
       }
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
+      if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
+        const peeled = peelTsAwaitCallee(func);
+        if (peeled !== func) refStart = peeled.startPosition;
+        func = peeled;
+      }
 
       if (func && this.language === 'swift') {
         // `-(a + b)`: an operator token applied to a parenthesized value
@@ -5703,7 +5734,8 @@ export class TreeSitterExtractor {
               // static receiver at all — emit nothing: a silent miss, never a
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
-              const innerFn = getChildByField(receiver, 'function');
+              let innerFn = getChildByField(receiver, 'function');
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -5829,8 +5861,8 @@ export class TreeSitterExtractor {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
+        line: refStart.row + 1,
+        column: refStart.column,
       });
     }
   }
