@@ -9693,6 +9693,243 @@ function cppDeclaratorType(text: string): string {
   return dropped ? out.replace(/\s+/g, ' ').trim() : text;
 }
 
+// The receiver after a comma, as a name later in a declaration's list is:
+// `ByteBuffer symbols_found, strings_found;`, `Foo *a, *const b;`. The
+// declarator regex wants the type right before the name, and a list writes
+// it once, before the first name; matchCppListedDeclarator reads the others.
+function buildListedDeclaratorRegex(escapedReceiver: string): RegExp {
+  return new RegExp(String.raw`,(?:\s|[*&]|${CPP_DECLARATOR_CV}|${CPP_DECLARATOR_ANNOTATION})*\b${escapedReceiver}\b`);
+}
+
+// Words a C++ declaration may open with before its type.
+const CPP_DECL_SPECIFIERS: ReadonlySet<string> = new Set([
+  'static', 'extern', 'inline', 'constexpr', 'constinit', 'thread_local', 'register', 'mutable',
+  'const', 'volatile', 'typename', 'struct', 'class', 'union', 'enum',
+]);
+
+// Words that never are the type a declaration of variables opens with.
+const CPP_NOT_A_DECLARED_TYPE: ReadonlySet<string> = new Set([
+  ...CPP_NON_TYPE_TOKENS, 'typedef', 'using', 'namespace', 'template', 'friend', 'operator',
+  'public', 'private', 'protected', 'virtual', 'explicit', 'static_assert', 'asm', 'try', 'catch',
+  'this', 'true', 'false', 'nullptr',
+]);
+
+// Nor a declared variable's name: those, the specifiers and the built-in
+// types. `const Message& message, int, int)` ends a parameter list.
+const CPP_NOT_A_DECLARED_NAME: ReadonlySet<string> = new Set([
+  ...CPP_NOT_A_DECLARED_TYPE, ...CPP_DECL_SPECIFIERS, 'auto', 'void', 'bool', 'char', 'wchar_t',
+  'char8_t', 'char16_t', 'char32_t', 'short', 'int', 'long', 'signed', 'unsigned', 'float', 'double',
+]);
+
+const CPP_DECLARATOR_CV_WORD = new RegExp(`^${CPP_DECLARATOR_CV}$`);
+const CPP_TRAILING_ANNOTATION_AT = new RegExp(CPP_TRAILING_ANNOTATION, 'y');
+
+/** The identifier at `code[i]`, or null. */
+function cppWordAt(code: string, i: number): string | null {
+  CPP_WORD_AT.lastIndex = i;
+  return CPP_WORD_AT.exec(code)?.[0] ?? null;
+}
+
+/** Past the whitespace at `code[i]`. */
+function cppSkipSpace(code: string, i: number): number {
+  while (i < code.length && /\s/.test(code[i]!)) i++;
+  return i;
+}
+
+/** The word that ends where the spaces before `code[i]` begin (`for` before `for (`). */
+function cppWordBefore(code: string, i: number): string {
+  let end = i;
+  while (end > 0 && /\s/.test(code[end - 1]!)) end--;
+  let start = end;
+  while (start > 0 && /\w/.test(code[start - 1]!)) start--;
+  return code.slice(start, end);
+}
+
+/** Does a string or character literal open at `code[i]`? (A `'` after a digit separates digits: `1'000'000`.) */
+function cppOpensLiteral(code: string, i: number): boolean {
+  return code[i] === '"' || (code[i] === '\'' && !/\d/.test(code[i - 1] ?? ''));
+}
+
+/**
+ * Past the bracket that closes the `(`, `[` or `{` at `code[i]`, over what
+ * is nested or quoted inside: the line's length when the line ends first,
+ * -1 when a bracket closes out of turn.
+ */
+function cppPastBrackets(code: string, i: number): number {
+  const closers: string[] = [];
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '(') closers.push(')');
+    else if (c === '[') closers.push(']');
+    else if (c === '{') closers.push('}');
+    else if (c === ')' || c === ']' || c === '}') {
+      if (closers.pop() !== c) return -1;
+      if (closers.length === 0) return i + 1;
+    } else if (cppOpensLiteral(code, i)) i = cppLiteralEnd(code, i);
+  }
+  return code.length;
+}
+
+/**
+ * Where the initializer starting at `code[i]` ends: at the first `,`, `;`
+ * or closing bracket outside its own brackets, or the line's end; -1 when
+ * its brackets don't match. A `<` is not taken for a bracket — it may be
+ * `a < b` — so a comma in template arguments (`f<A, B>(x)`) ends it, and
+ * what follows then reads as no declarator.
+ */
+function cppPastInitializer(code: string, i: number): number {
+  while (i < code.length) {
+    const c = code[i]!;
+    if (c === ',' || c === ';' || c === ')' || c === ']' || c === '}') return i;
+    if (c === '(' || c === '[' || c === '{') {
+      i = cppPastBrackets(code, i);
+      if (i < 0) return -1;
+    } else if (cppOpensLiteral(code, i)) i = cppLiteralEnd(code, i) + 1;
+    else i++;
+  }
+  return i;
+}
+
+/** Past the template argument list opening at `code[i]` (`<`), or -1 when it doesn't close on the line. */
+function cppPastTemplateArguments(code: string, i: number): number {
+  let angles = 0;
+  let parens = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '(') parens++;
+    else if (c === ')') {
+      if (--parens < 0) return -1;
+    } else if (parens > 0) continue;
+    else if (c === '<') angles++;
+    else if (c === '>') {
+      if (--angles === 0) return i + 1;
+    } else if (c === ';' || c === '{' || c === '}') return -1;
+  }
+  return -1;
+}
+
+/** Past the type a C++ declaration opens with at `code[i]` — `ns::Table<int, Box<int>>`, `::Foo` — or -1. */
+function cppPastDeclaredType(code: string, i: number): number {
+  if (code.startsWith('::', i)) i = cppSkipSpace(code, i + 2);
+  for (let segment = 0; ; segment++) {
+    let word = cppWordAt(code, i);
+    // `typename Traits<T>::template Rebind<U>`
+    if (word === 'template' && segment > 0) {
+      i = cppSkipSpace(code, i + word.length);
+      word = cppWordAt(code, i);
+    }
+    if (word === null || CPP_NOT_A_DECLARED_TYPE.has(word)) return -1;
+    i += word.length;
+    let next = cppSkipSpace(code, i);
+    if (code[next] === '<') {
+      i = cppPastTemplateArguments(code, next);
+      if (i < 0) return -1;
+      next = cppSkipSpace(code, i);
+    }
+    if (!code.startsWith('::', next)) return i;
+    i = cppSkipSpace(code, next + 2);
+  }
+}
+
+/** A name a C++ declaration lists after its first, as cppDeclaratorsAfterFirst reads it. */
+interface CppListedName {
+  name: string;
+  /** The type the declaration opens with plus this name's own `*`s and `&`s. */
+  type: string;
+  /** Where the declaration's type starts. */
+  typeAt: number;
+  /** Where the name ends, an annotation after it (`GUARDED_BY(mu_)`) included. */
+  end: number;
+}
+
+/**
+ * The names after the first that the C++ declaration starting at
+ * `code[start]` lists, or null when no declaration starts there. In a `for`,
+ * `if` or `switch` header a `)` may end it; one that runs on past the line
+ * ends with it. A declarator's `*`s and `&`s are its own, and so are the
+ * cv-qualifiers and annotations the declarator regex reads past: `Arena*
+ * PROTOBUF_NULLABLE a, * PROTOBUF_NULLABLE b`.
+ */
+function cppDeclaratorsAfterFirst(code: string, start: number, inHeader: boolean): CppListedName[] | null {
+  let i = cppSkipSpace(code, start);
+  for (let word = cppWordAt(code, i); word !== null && CPP_DECL_SPECIFIERS.has(word); word = cppWordAt(code, i)) {
+    i = cppSkipSpace(code, i + word.length);
+  }
+  const typeAt = i;
+  i = cppPastDeclaredType(code, i);
+  if (i < 0) return null;
+  const type = code.slice(typeAt, i);
+  const listed: CppListedName[] = [];
+  for (let first = true; ; first = false) {
+    let pointer = '';
+    for (i = cppSkipSpace(code, i); ; i = cppSkipSpace(code, i)) {
+      const c = code[i];
+      if (c === '*' || c === '&') {
+        pointer += c;
+        i++;
+        continue;
+      }
+      const word = cppWordAt(code, i);
+      if (word === null) break;
+      // An annotation word after a `*` or `&` is one only when the name still follows it.
+      const after = cppSkipSpace(code, i + word.length);
+      if (!CPP_DECLARATOR_CV_WORD.test(word) &&
+          !(pointer && CPP_DECLARATOR_ANNOTATION_WORD.test(word) && (/[*&]/.test(code[after] ?? '') || cppWordAt(code, after) !== null))) break;
+      i += word.length;
+    }
+    // `Foo a,` with the rest of the list on the next line.
+    if (i >= code.length && !first && !pointer) return listed;
+    const name = cppWordAt(code, i);
+    if (name === null || CPP_NOT_A_DECLARED_NAME.has(name)) return null;
+    i = cppSkipSpace(code, i + name.length);
+    // `Foo Bar::baz` defines a member of Bar.
+    if (code.startsWith('::', i)) return null;
+    for (CPP_TRAILING_ANNOTATION_AT.lastIndex = i; CPP_TRAILING_ANNOTATION_AT.exec(code); CPP_TRAILING_ANNOTATION_AT.lastIndex = i) {
+      i = cppSkipSpace(code, CPP_TRAILING_ANNOTATION_AT.lastIndex);
+    }
+    if (!first) listed.push({ name, type: type + pointer, typeAt, end: i });
+    while (code[i] === '[') {
+      i = cppPastBrackets(code, i);
+      if (i < 0) return null;
+      i = cppSkipSpace(code, i);
+    }
+    if (code[i] === '(' || code[i] === '{') i = cppPastBrackets(code, i);
+    else if (code[i] === '=' && code[i + 1] !== '=') i = cppPastInitializer(code, i + 1);
+    if (i < 0) return null;
+    i = cppSkipSpace(code, i);
+    if (i >= code.length || code[i] === ';' || (inHeader && code[i] === ')')) return listed;
+    if (code[i] !== ',') return null;
+    i++;
+  }
+}
+
+/**
+ * The declaration of `receiverName` on the code `line` when the name follows
+ * another in the declaration's list — `ByteBuffer symbols_found,
+ * strings_found;`, `Foo* a = nullptr, *b;`, `Bar a{1}, b(2);` — shaped like
+ * matchCppDeclarator's match: the declaration's type from `index`, through
+ * the name at [0], and at [1] the type as the declarator regex reads one,
+ * this name's own `*`s and `&`s on the type the declaration opens with, since
+ * `Foo *a, b;` declares one pointer. A comma in template arguments
+ * (`std::map<K, V> m;`), in a call's or a constructor's arguments (`Writer
+ * w(log, table, 3);`, `: a_(x), b_(y)`) or in an expression (`x = f(a, b);`)
+ * lists no name. A declaration opens the line, follows a statement or a
+ * brace, or opens a `for`, `if` or `switch` header.
+ */
+function matchCppListedDeclarator(line: string, receiverName: string, listedRegex: RegExp): RegExpExecArray | null {
+  if (!listedRegex.test(line)) return null;
+  for (let i = -1; i < line.length; i++) {
+    const c = line[i];
+    const header = c === '(' && /^(?:for|if|switch)$/.test(cppWordBefore(line, i));
+    if (i >= 0 && c !== ';' && c !== '{' && c !== '}' && !header) continue;
+    const named = cppDeclaratorsAfterFirst(line, i + 1, header)?.find((d) => d.name === receiverName);
+    if (named) {
+      return Object.assign([line.slice(named.typeAt, named.end), named.type], { index: named.typeAt, input: line }) as RegExpExecArray;
+    }
+  }
+  return null;
+}
+
 // A range-based for's declaration, `for (const Foo& name :`, up to the single
 // colon (not `::`) that ends it. What may precede the type — `const`, a
 // global-scope `::` — is never an initializer, a call or a member access.
@@ -10068,6 +10305,10 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const word = new RegExp(`\\b${escaped}\\b`);
     const declarator = buildDeclaratorRegex(escaped);
+    const listed = buildListedDeclaratorRegex(escaped);
+    // `Table *index_, *data_;` declares both members.
+    const declared = (text: string): RegExpExecArray | null =>
+      matchCppDeclarator(text, declarator) ?? matchCppListedDeclarator(text, name, listed);
     const end = Math.min(decl.endLine ?? decl.startLine, lines.length);
     const nested = cppNestedSpans(decl, end, context);
     const rawLines = cppNonCodeLines(decl.filePath, context);
@@ -10081,13 +10322,13 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
       // above `cfh_iter_pairs_;`), so a default member initializer continued
       // on the next line (`bool ready_ = flag_ &&` above `it_;`) isn't one.
       let from = l;
-      let m = code ? matchCppDeclarator(code, declarator) : null;
+      let m = code ? declared(code) : null;
       if (!m && code && l > decl.startLine) {
         const above = cppCodeOf(cppLiteralsBlanked(lines[l - 2]!, l - 1, rawLines));
         if (above && CPP_TYPE_LINE.test(above)) {
           code = `${above} ${code}`;
           from = l - 1;
-          m = matchCppDeclarator(code, declarator);
+          m = declared(code);
         }
       }
       const rest = m ? code!.slice(m.index + m[0].length) : '';
@@ -12273,6 +12514,7 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const word = new RegExp(`\\b${escaped}\\b`);
   const declarator = buildDeclaratorRegex(escaped);
+  const listed = buildListedDeclaratorRegex(escaped);
   const nonCode = cppNonCodeLines(caller.filePath, context);
   for (let i = Math.max(0, caller.startLine - 1); i < Math.min(lines.length, ref.line); i++) {
     if (!word.test(lines[i]!)) continue;
@@ -12285,6 +12527,9 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
       // `Owner::name(` is a definition's own declarator; `return name(` no declaration.
       if (type !== undefined && !/::\s*$/.test(type) && normalizeCppTypeName(type) !== null) return true;
     }
+    // `std::function<void()> done, failed;` declares `failed` too.
+    const listedType = matchCppListedDeclarator(code, name, listed)?.[1];
+    if (listedType !== undefined && normalizeCppTypeName(listedType) !== null) return true;
   }
   return false;
 }
@@ -12359,6 +12604,7 @@ function inferCppReceiverType(
   const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
   const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
+  const listedRegex = buildListedDeclaratorRegex(escapedReceiver);
   // A declaration in a string literal is text: protobuf's upb generator
   // writes `upb_MiniTableField field = $field_init$;` in the raw string it
   // emits, above calls on its own `upb::FieldDefPtr field` parameter.
@@ -12380,7 +12626,7 @@ function inferCppReceiverType(
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
     if (!line || !receiverPattern.test(line)) continue;
 
-    let declaratorMatch = matchCppDeclarator(line, declaratorRegex);
+    let declaratorMatch = matchCppDeclarator(line, declaratorRegex) ?? matchCppListedDeclarator(line, receiverName, listedRegex);
     // A parameter named like the function it belongs to is declared after
     // the function's own name on its head: protobuf's `std::string
     // u64(uint64_t u64) {` gives `u64` a `uint64_t`, not a `std::string`.
@@ -12490,7 +12736,7 @@ function inferCppReceiverType(
       if (!receiverPattern.test(text)) continue;
       const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, headerRawLines));
       if (!line) continue;
-      const declaratorMatch = matchCppDeclarator(line, declaratorRegex);
+      const declaratorMatch = matchCppDeclarator(line, declaratorRegex) ?? matchCppListedDeclarator(line, receiverName, listedRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized && normalized !== 'auto') {
