@@ -3889,11 +3889,11 @@ function pythonFromImports(filePath: string, context: ResolutionContext): Map<st
 function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const module = pythonFromImports(ref.filePath, context).get(name);
   if (!module || module.startsWith('.')) return false;
-  return !isPythonProjectModule(module, context);
+  return !isPythonProjectModule(module, ref.filePath, context);
 }
 
-/** Whether some project file is the module `a.b` (`a/b.py` or `a/b/__init__.py`). */
-function isPythonProjectModule(module: string, context: ResolutionContext): boolean {
+/** Whether some project file is the module `a.b` as `fromFile` imports it (`a/b.py` or `a/b/__init__.py`). */
+function isPythonProjectModule(module: string, fromFile: string, context: ResolutionContext): boolean {
   let memo = PY_MODULE_LOCAL.get(context);
   if (!memo) {
     memo = new Map();
@@ -3903,11 +3903,11 @@ function isPythonProjectModule(module: string, context: ResolutionContext): bool
   // answer can depend on the importer (a monorepo service's own root), so key
   // by both. A file that merely ENDS in `requests/__init__.py` — a copy nested
   // in a test fixture — is not the `requests` an import names.
-  const key = `${ref.filePath}\0${module}`;
+  const key = `${fromFile}\0${module}`;
   let local = memo.get(key);
   if (local === undefined) {
     if (context.resolveModuleFile) {
-      local = context.resolveModuleFile(module, ref.filePath, 'python') !== null;
+      local = context.resolveModuleFile(module, fromFile, 'python') !== null;
     } else {
       const rel = module.replace(/\./g, '/');
       local = context.getAllFiles().some((f) =>
@@ -3937,7 +3937,7 @@ export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, 
     // the module `a` tells that `x` comes from outside.
     return [...keys].every((key) => {
       const module = key.slice(0, key.indexOf(':'));
-      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, context);
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, ref.filePath, context);
     });
   });
   return outside && !pythonBindsLocally(name, ref, context, false);
@@ -3948,9 +3948,9 @@ export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, 
  * with the package itself indexed as the root — `b/c.py` or `c.py`. Erring
  * toward "project" only leaves a call to the name strategies, as before.
  */
-function isPythonProjectModuleAnyRoot(module: string, context: ResolutionContext): boolean {
+function isPythonProjectModuleAnyRoot(module: string, fromFile: string, context: ResolutionContext): boolean {
   const parts = module.split('.');
-  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), context));
+  return parts.some((_, i) => isPythonProjectModule(parts.slice(i).join('.'), fromFile, context));
 }
 
 const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);

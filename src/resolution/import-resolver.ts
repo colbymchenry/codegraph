@@ -2991,9 +2991,12 @@ function resolvePythonModuleMember(
   // module-level binding of X, and the file's mappings don't hold it (#2600).
   const local = pythonFunctionModuleAlias(receiver, ref, context);
   if (local) {
-    const localPath = resolveImportPath(local, ref.filePath, ref.language, context) ??
-      findPythonModuleFile(local, context, ref.filePath)?.filePath ?? null;
-    const target = localPath && localPath !== ref.filePath ? pythonModuleSymbol(localPath, member, context, 0) : null;
+    // The module from the package roots, and its member as the module binds it,
+    // the same lookup as for a module-level binding below.
+    const localPath = resolveImportPath(local, ref.filePath, ref.language, context);
+    const target = localPath && localPath !== ref.filePath
+      ? findExportedSymbol(localPath, { isDefault: false, isNamespace: false, exportedName: member, memberName: null }, 'python', context, new Set())
+      : null;
     return target ? { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' } : null;
   }
 
