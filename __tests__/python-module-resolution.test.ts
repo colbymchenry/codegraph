@@ -987,13 +987,15 @@ def main():
       ]);
     });
 
-    it('reads backslash continuations and comma-separated plain imports, at any indentation', () => {
+    it('reads backslash continuations and comma-separated plain imports, at module level', () => {
+      // A function's own `import lazy` is not the file's: the mappings apply to
+      // every function, and a function-local `import a.b as X` binds X in its
+      // function only (python-local-import-alias.test.ts).
       expect(names('from a import b, \\\n    c\nimport os, pkg.sub as s\ndef f():\n    import lazy\n')).toEqual([
         'b<-a:b',
         'c<-a:c',
         'os<-os:*',
         's<-pkg.sub:*',
-        'lazy<-lazy:*',
       ]);
     });
 

@@ -2007,9 +2007,10 @@ function extractPythonImports(content: string): ImportMapping[] {
     }
   }
 
-  // import X [as Y], … — at any indentation: a function-local import binds
-  // the name for the calls in that function.
-  const importRe = /^[ \t]*import[ \t]+((?:[^\n\\;]|\\\r?\n)+)/gm;
+  // import X [as Y], … at module level. The mappings are the file's, so a
+  // function-local import is left to its function: `import a.b as X` there
+  // binds X in that function only (pythonFunctionModuleAlias).
+  const importRe = /^import[ \t]+((?:[^\n\\;]|\\\r?\n)+)/gm;
   let match: RegExpExecArray | null;
   while ((match = importRe.exec(code)) !== null) {
     for (const raw of match[1]!.replace(/\\\r?\n/g, ' ').split(',')) {
