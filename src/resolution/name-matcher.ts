@@ -11159,7 +11159,11 @@ function cppDeclaratorsAfterFirst(code: string, start: number, inHeader: boolean
  * brace, or opens a `for`, `if` or `switch` header.
  */
 function matchCppListedDeclarator(line: string, receiverName: string, listedRegex: RegExp): RegExpExecArray | null {
-  if (!listedRegex.test(line)) return null;
+  return listedRegex.test(line) ? cppListedDeclaratorOn(line, receiverName) : null;
+}
+
+/** matchCppListedDeclarator without its prefilter, for a line already known to name the receiver after a comma. */
+function cppListedDeclaratorOn(line: string, receiverName: string): RegExpExecArray | null {
   for (let i = -1; i < line.length; i++) {
     const c = line[i];
     const header = c === '(' && /^(?:for|if|switch)$/.test(cppWordBefore(line, i));
@@ -13776,6 +13780,243 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   return false;
 }
 
+// What may open a local declaration before its type or `auto`.
+const CPP_LOCAL_SPECIFIERS = String.raw`(?:(?:const|constexpr|static|volatile|thread_local|register)\s+)*`;
+// A type a local is declared with, as written: `ns::Formatter`, `std::function<void(int)>`, `::Foo`. Its
+// template arguments may hold a function type's parentheses, which CPP_TEMPLATE_ARGUMENTS leaves out.
+const CPP_LOCAL_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;={}]|<(?:[^<>;={}]|<[^<>;={}]*>)*>)*>`;
+const CPP_LOCAL_TYPE = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*${CPP_LOCAL_TEMPLATE_ARGUMENTS}(?:\s*::\s*[A-Za-z_]\w*)*)?`;
+// Where a statement starts on a line of code: the line's start, or after `;`, `{`, `}`, or a `for`/`if` header's `(`.
+const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if)\s*\()\s*`;
+// Declarations that start a statement, the declared name captured: `auto key = …`, `Formatter format(p);`,
+// `const Formatter& format = …`, and the local types `using V = …;`, `typedef … V;`, `struct Getter {`.
+const CPP_AUTO_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}auto(?:\s+|\s*[*&]+\s*)([A-Za-z_]\w*)\s*(?:=|\{|\()`, 'g');
+const CPP_TYPED_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}(${CPP_LOCAL_TYPE})(\s+|\s*[*&]+\s*)(?:const\s+)?([A-Za-z_]\w*)\s*([=({;[,])`, 'g');
+const CPP_LOCAL_TYPE_DECLARATION = new RegExp(String.raw`${CPP_STATEMENT_START}(?:using\s+([A-Za-z_]\w*)\s*=|typedef\b[^;]*?\b([A-Za-z_]\w*)\s*;|(?:struct|class|union|enum)(?:\s+class)?\s+([A-Za-z_]\w*)\b)`, 'g');
+// A lambda's head, its parameters captured: `[&](const Foo& f) mutable -> bool {`.
+const CPP_LAMBDA_HEAD = /\]\s*\(([^()]*)\)\s*(?:mutable\s*)?(?:->[^{;]*)?\{/g;
+
+/** Does `text` hold `name` as a whole word? */
+function cppHasWord(text: string, name: string): boolean {
+  for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
+    if (!/\w/.test(text[at - 1] ?? '') && !/\w/.test(text[at + name.length] ?? '')) return true;
+  }
+  return false;
+}
+
+/** A declaration of a name in a C++ function's own code, at a 0-based line. */
+interface CppLocalBinding {
+  line: number;
+  /**
+   * What the name is from there: a parameter (in scope in the whole body), a
+   * variable, or a type or a function the body declares, which a call
+   * constructs or calls instead.
+   */
+  kind: 'parameter' | 'variable' | 'type' | 'function';
+  /** Where its scope starts: the statement's column, or just inside the `{` of a lambda whose parameter it is. */
+  column: number;
+  /** For a range-`for` variable: the column of the loop header's `(`, whose body is its scope. */
+  loopParen?: number;
+}
+
+const CPP_LOCAL_BINDINGS = new WeakMap<ResolutionContext, Map<string, CppLocalBinding[]>>();
+const CPP_CALLER_HEADS = new WeakMap<ResolutionContext, Map<string, { parameters: Set<string>; body: number }>>();
+
+/**
+ * The names a C++ parameter list declares: `const Formatter& format, int n
+ * = 0` → `format`, `n`. A parameter without a name (`const Foo&`, `int`,
+ * `const Foo`) declares none.
+ */
+function cppParameterNames(list: string): string[] {
+  const names: string[] = [];
+  for (const parameter of splitCppTopLevel(list)) {
+    const declarator = parameter.replace(/=[^]*$/, '').trim();
+    const m = /([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*$/.exec(declarator);
+    if (!m) continue;
+    const before = declarator.slice(0, m.index).replace(/\b(?:const|volatile|struct|class|enum|union|typename|signed|unsigned)\b/g, '').trim();
+    if (before !== '' && !/::\s*$/.test(before)) names.push(m[1]!);
+  }
+  return names;
+}
+
+/** The text inside the balanced `(…)` opening at line `line`, column `column`, of `codeLine`'s lines, within a dozen lines; null when it doesn't close. */
+function cppParenTextFrom(codeLine: (line: number) => string, line: number, column: number): string | null {
+  let depth = 0;
+  let text = '';
+  for (let l = line; l < line + 12; l++) {
+    const code = codeLine(l);
+    for (let c = l === line ? column : 0; c < code.length; c++) {
+      const ch = code[c]!;
+      if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) return text.slice(1);
+      text += ch;
+    }
+    text += ' ';
+  }
+  return null;
+}
+
+/** Does a `T name(args)` local's argument list declare parameters — `void helper(int);`, `Foo make();`, `Foo bar(Baz qux);` — so it declares a function? */
+function cppDeclaresLocalFunction(type: string, args: string): boolean {
+  if (type === 'void' || args.trim() === '') return true;
+  return splitCppTopLevel(args).some((a) =>
+    /^(?:int|char|bool|float|double|long|short|unsigned|signed|void|size_t)$/.test(a) ||
+    (/^(?:(?:const|volatile|unsigned|signed)\s+)*[A-Za-z_][\w:]*(?:\s*<[^>]*>)?\s*[*&]*\s*(?:[A-Za-z_]\w*)?$/.test(a) && /\s|[*&]/.test(a)));
+}
+
+/**
+ * The C++ function `caller`'s parameter names, read from the list after its
+ * own name on its head, and the line (0-based) its head's name is on, where
+ * its body's code begins to be read.
+ */
+function cppCallerHead(caller: Node, codeLine: (line: number) => string, lineCount: number, context: ResolutionContext): { parameters: Set<string>; body: number } {
+  let memo = CPP_CALLER_HEADS.get(context);
+  if (!memo) CPP_CALLER_HEADS.set(context, (memo = new Map()));
+  const hit = memo.get(caller.id);
+  if (hit) return hit;
+  const first = caller.startLine - 1;
+  let head = { parameters: new Set<string>(), body: first };
+  const named = new RegExp(`\\b${caller.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`);
+  for (let l = first; l < Math.min(lineCount, first + 13); l++) {
+    const at = named.exec(codeLine(l));
+    if (!at) continue;
+    const list = cppParenTextFrom(codeLine, l, at.index + at[0].length - 1);
+    head = { parameters: new Set(list === null ? [] : cppParameterNames(list)), body: l };
+    break;
+  }
+  memo.set(caller.id, head);
+  return head;
+}
+
+/**
+ * The declarations of `name` in the C++ function `caller`'s own code, read
+ * through `codeLine` (a 0-based line as code): a parameter, then each
+ * statement that declares the name — `auto key = [](int i) {…};`,
+ * `Formatter format(p);`, `const Formatter& format = …`, a later name in a
+ * list, a range-`for` variable, a lambda's parameter. A local type (`using V
+ * = …;`, `struct Getter {`) or a function declared in the body (`void
+ * helper(int);`) is recorded as what the name is there. An expression that
+ * reads like a declaration — `a && f(x)`, `a * f(x)` — declares nothing, and
+ * neither does a line that continues one from the line above.
+ */
+function cppLocalBindings(
+  name: string,
+  caller: Node,
+  head: { parameters: Set<string>; body: number },
+  codeLine: (line: number) => string,
+  rawLines: readonly string[],
+): CppLocalBinding[] {
+  const first = caller.startLine - 1;
+  const last = Math.min(rawLines.length - 1, (caller.endLine ?? caller.startLine) - 1);
+  const bindings: CppLocalBinding[] = head.parameters.has(name) ? [{ line: head.body, column: 0, kind: 'parameter' }] : [];
+  // Whether the code above line `l` ends a statement, so a declaration may start the line.
+  const startsStatement = (l: number): boolean => {
+    for (let k = l - 1; k >= first; k--) {
+      const above = codeLine(k);
+      if (above.trim() !== '') return /[;{}:]\s*$/.test(above) || /^\s*#/.test(above) || k < head.body;
+    }
+    return true;
+  };
+  for (let l = head.body; l <= last; l++) {
+    // (Blanking literals and comments only takes text away: a line without the name raw has none as code.)
+    if (!cppHasWord(rawLines[l] ?? '', name)) continue;
+    const text = codeLine(l);
+    if (!cppHasWord(text, name)) continue;
+    const starts = (index: number): boolean => index > 0 || l === head.body || startsStatement(l);
+    for (const m of text.matchAll(CPP_LOCAL_TYPE_DECLARATION)) {
+      if ((m[1] ?? m[2] ?? m[3]) === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'type' });
+    }
+    for (const m of text.matchAll(CPP_AUTO_LOCAL)) {
+      if (m[1] === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+    }
+    for (const m of text.matchAll(CPP_TYPED_LOCAL)) {
+      const type = m[1]!;
+      if (m[3] !== name || !starts(m.index) || CPP_NOT_A_DECLARED_TYPE.has(type.split(/[\s<:]/)[0]!) ||
+          /^(?:using|typedef|struct|class|union|enum|auto)$/.test(type)) continue;
+      let kind: CppLocalBinding['kind'] = 'variable';
+      if (m[4] === '(') {
+        // `a && f(x)` and `a * f(x)` are expressions.
+        if (/[*&]/.test(m[2]!)) continue;
+        if (cppDeclaresLocalFunction(type, cppParenTextFrom(codeLine, l, m.index + m[0].length - 1) ?? '')) kind = 'function';
+      }
+      bindings.push({ line: l, column: m.index, kind });
+    }
+    if (text.includes(',')) {
+      const m = cppListedDeclaratorOn(text, name);
+      if (m && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+    }
+    const loop = cppRangeForDeclaration(text, name);
+    if (loop) bindings.push({ line: l, column: loop.paren, kind: 'variable', loopParen: loop.paren });
+    for (const m of text.matchAll(CPP_LAMBDA_HEAD)) {
+      if (cppParameterNames(m[1]!).includes(name)) bindings.push({ line: l, column: m.index + m[0].length, kind: 'variable' });
+    }
+  }
+  return bindings;
+}
+
+/** Is the code at (`toLine`, `toColumn`) inside the brace block open at (`line`, `column`) — no `}` between them closes it? */
+function cppBlockReaches(codeLine: (line: number) => string, line: number, column: number, toLine: number, toColumn: number): boolean {
+  let depth = 0;
+  for (let l = line; l <= toLine; l++) {
+    const text = codeLine(l);
+    const end = l === toLine ? Math.min(toColumn, text.length) : text.length;
+    for (let c = l === line ? column : 0; c < end; c++) {
+      if (text[c] === '{') depth++;
+      else if (text[c] === '}' && --depth < 0) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a C++ call written by its bare name calls a local of the calling
+ * function — a parameter, a lambda's parameter, a range-`for` variable, or a
+ * variable declared above the call in a block still open there — which C++
+ * lookup finds before any function or method of that name. protobuf's code
+ * generators call `format(…)` on a `const Formatter& format` parameter,
+ * which linked to the conformance suite's `TestResult::format`, and rocksdb's
+ * tests call local lambdas (`auto key = [](int i) {…};`) that linked to
+ * `ArenaWrappedDBIter::key`. A name the function declares as a type (`using
+ * V = std::vector<int>;`) or a function (`void helper(int);`) is not one:
+ * that call constructs the type or calls the function.
+ */
+function isCppLocalCallableCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name) || cppImplicitReceiver(ref, context) !== 'bare') return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || (caller.kind !== 'function' && caller.kind !== 'method') || caller.filePath !== ref.filePath ||
+      caller.name === name || ref.line < caller.startLine || ref.line > (caller.endLine ?? caller.startLine)) return false;
+  const rawLines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!rawLines) return false;
+  const nonCode = cppNonCodeLines(ref.filePath, context);
+  const codeLines = new Map<number, string>();
+  const codeLine = (l: number): string => {
+    let code = codeLines.get(l);
+    if (code === undefined) codeLines.set(l, (code = cppCodeOf(cppLiteralsBlanked(rawLines[l] ?? '', l + 1, nonCode)) ?? ''));
+    return code;
+  };
+  let memo = CPP_LOCAL_BINDINGS.get(context);
+  if (!memo) CPP_LOCAL_BINDINGS.set(context, (memo = new Map()));
+  const key = `${caller.id}\u0000${name}`;
+  let bindings = memo.get(key);
+  if (!bindings) {
+    const head = cppCallerHead(caller, codeLine, rawLines.length, context);
+    memo.set(key, (bindings = cppLocalBindings(name, caller, head, codeLine, rawLines)));
+  }
+  const callLine = ref.line - 1;
+  // The nearest declaration above the call whose scope holds it decides.
+  let decided: CppLocalBinding | null = null;
+  for (const b of bindings) {
+    if (b.line > callLine || (b.line === callLine && b.column >= ref.column)) continue;
+    const inScope = b.kind === 'parameter' ||
+      (b.loopParen !== undefined
+        ? cppForBodyEncloses(rawLines, b.line, b.loopParen, callLine, ref.column)
+        : cppBlockReaches(codeLine, b.line, b.column, callLine, ref.column));
+    if (inScope && (!decided || b.line > decided.line || (b.line === decided.line && b.column > decided.column))) decided = b;
+  }
+  return decided?.kind === 'parameter' || decided?.kind === 'variable';
+}
+
 /**
  * A C++ source line as code, for reading declarations: null for a `// …`
  * line, else the line with its comments blanked, columns kept. Receiver
@@ -14877,6 +15118,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
   CPP_UNNAMED_NAMESPACES.delete(context);
+  CPP_LOCAL_BINDINGS.delete(context);
+  CPP_CALLER_HEADS.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_USE_ITEMS.delete(context);
@@ -17866,38 +18109,80 @@ function rustImplFor(method: Node, inner: string | null, context: ResolutionCont
   return impl !== null && impl.selfArgs.some((a) => impl.params.includes(a) || a === inner);
 }
 
+/** The type written at the start of `text`, up to what ends it at its own depth: `Pin<&mut R>, cx: …` → `Pin<&mut R>`. */
+function rustTypeTextAt(text: string): string {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '<' || ch === '(' || ch === '[') depth++;
+    else if (ch === '>' && text[i - 1] !== '-') depth = Math.max(0, depth - 1);
+    else if (ch === ')' || ch === ']') {
+      if (depth === 0) return text.slice(0, i).trim();
+      depth--;
+    } else if (depth === 0 && (ch === ',' || ch === '=' || ch === ';' || ch === '{')) return text.slice(0, i).trim();
+  }
+  return text.trim();
+}
+
 /**
- * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
- * `fut: Pin<Box<dyn Future>>` → `Future`, `this: Pin<&mut Self>` → the impl's
- * type — read off its nearest declaration in the calling function; null when
- * that names none (`let fut = Pin::new(&mut f)`).
+ * The type a Rust local or parameter is written with — `reader: Pin<&mut
+ * R>`, `let timer: Option<Timer> = …` — read off its nearest declaration in
+ * the calling function; null when that declaration writes none (`let f =
+ * pin!(f)`).
  */
-function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+function rustDeclaredTypeText(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-  const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declared = new RegExp(`\\b${escaped}\\s*:(?!:)\\s*(.*)$|\\blet\\s+(?:mut\\s+)?${escaped}\\b`);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declared = new RegExp(`\\blet\\s+(?:mut\\s+)?${escaped}\\b(?:\\s*:(?!:)\\s*(.*))?|\\b${escaped}\\s*:(?!:)\\s*(.*)$`);
   for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
     const m = declared.exec(lines[i] ?? '');
     if (!m) continue;
-    const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
-      .exec(m[1] ?? '');
-    const type = pinned?.[1]!.split('::').pop()!.trim() ?? null;
-    if (type !== 'Self') return type;
-    return rustSelfType(ref, context)?.type ?? null;
+    const written = m[1] ?? m[2];
+    return written === undefined ? null : rustTypeTextAt(written);
   }
   return null;
 }
 
 /**
+ * What a Rust `Pin<…>` type pins — `Pin<&mut R>` → `R`, `Pin<Box<dyn
+ * Future>>` → `Future`, `Pin<&mut Self>` → the impl's type; null for a type
+ * that is no `Pin`.
+ */
+function rustPinnedPointee(type: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
+    .exec(type);
+  const name = pinned?.[1]!.split('::').pop()!.trim() ?? null;
+  return name === 'Self' ? rustSelfType(ref, context)?.type ?? null : name;
+}
+
+/**
+ * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
+ * `this: Pin<&mut Self>` → the impl's type — read off its nearest
+ * declaration in the calling function; null when that names none (`let fut
+ * = Pin::new(&mut f)`).
+ */
+function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const type = rustDeclaredTypeText(receiver, ref, context);
+  return type === null ? null : rustPinnedPointee(type, ref, context);
+}
+
+/**
  * A Rust call on a value declared `Pin<…>`: Rust's lookup through the `Pin`
- * (rustThroughWrapper) on the type it pins. A type parameter's own methods
- * are its bound's, which the call doesn't name: tokio's `read.poll_read(…)`
- * on `read: Pin<&mut R>` went to its `impl AsyncRead for Pin<P>`.
+ * (rustThroughWrapper) on the type it pins.
  */
 function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const pinned = rustPinnedType(receiver, ref, context);
-  const inner = pinned !== null && !isRustTypeParam(pinned, ref, context) ? pinned : null;
+  return rustPinnedCallOn(rustPinnedType(receiver, ref, context), name, ref, context);
+}
+
+/**
+ * Rust's lookup through a `Pin` (rustThroughWrapper) for `name`, on the type
+ * it pins. A type parameter's own methods are its bound's, which the call
+ * doesn't name: tokio's `read.poll_read(…)` on `read: Pin<&mut R>` went to
+ * its `impl AsyncRead for Pin<P>`.
+ */
+function rustPinnedCallOn(pointee: string | null, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const inner = pointee !== null && !isRustTypeParam(pointee, ref, context) ? pointee : null;
   const own = inner === null ? [] : context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
     (n.qualifiedName === `${inner}::${name}` || n.qualifiedName.endsWith(`::${inner}::${name}`)));
   const through = rustThroughWrapper('Pin', name, own, inner, ref, context);
@@ -17907,6 +18192,160 @@ function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef,
     target = preferCallSiteFile(inherent.length > 0 ? inherent : through, ref.filePath)[0] ?? null;
   }
   return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+}
+
+/**
+ * A Rust call on what `.as_mut()` or `.as_ref()` hands back — `self.delay
+ * .as_mut().reset(…)`, `this.timer.as_mut().as_pin_mut()`, `reader.as_mut()
+ * .poll_read(…)` — which the extractor records by its bare name: a call on
+ * the receiver's declared type as `as_mut` passes it on (rustLentCall). A
+ * field is read from its struct's declaration, through pin-project's `let
+ * me = self.project()` too, a local or a parameter from its own. By the name
+ * alone, tokio's `self.delay.as_mut().reset(now)` on a `Pin<Box<Sleep>>`
+ * field went to the calling `Interval::reset`, and dioxus's
+ * `self.child.as_mut().map(…)` on an `Option` to a `GenerationalRefMut::map`.
+ * Undefined, for the name strategies to decide as before, when the
+ * receiver's type isn't written where it can be read: a `pin!` local, a
+ * call's result.
+ */
+function matchRustAsMutChainCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (!line || !/\.\s*as_(?:mut|ref)\s*\(\s*\)/.test(line)) return undefined;
+  const name = ref.referenceName;
+  // The call's expression starts at its column with the whole chain:
+  // `self.delay.as_mut().reset(` — `?` after `as_mut()` taking what an
+  // `Option` / `Result` holds back out (`self.client.as_mut()?.next()`).
+  const lent = new RegExp(`^(self|[a-z_]\\w*)(?:\\s*\\.\\s*([a-z_]\\w*))?\\s*\\.\\s*as_(?:mut|ref)\\s*\\(\\s*\\)\\s*(\\?)?\\s*\\.\\s*${name}\\s*(?:\\(|::<)`)
+    .exec(line.slice(Math.max(0, ref.column)));
+  if (!lent) return undefined;
+  const [, base, field, question] = lent;
+  const tried = question !== undefined;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return undefined;
+  if (field === undefined) {
+    // `self.as_mut()` through `self: Pin<&mut Self>` is that same `Pin`.
+    if (base === 'self') return rustSelfWrapper(caller) === 'Pin' && !tried ? matchRustSelfCall(name, ref, context) : undefined;
+    const declared = rustDeclaredTypeText(base!, ref, context);
+    return declared === null ? undefined : rustLentCall(declared, name, ref, context, tried);
+  }
+  // A field of the type `self` is, or one pin-project hands out:
+  // `Pin<&mut T>` for a `#[pin]` field, `&mut T` for another.
+  const projected = base !== 'self';
+  if (projected && !rustProjectsSelf(base!, ref, context)) return undefined;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  const owner = sep > 0 ? caller.qualifiedName.slice(0, sep).split('::').pop() : undefined;
+  const decl = owner ? rustFieldDeclaration(owner, field, ref, context) : null;
+  if (!decl) return undefined;
+  return rustLentCall(projected && decl.pinned ? `Pin<&mut ${decl.type}>` : decl.type, name, ref, context, tried);
+}
+
+/** Std pointers whose `as_ref` / `as_mut` lend what they hold: `Box<T>`, `NonNull<T>` → `&mut T`. */
+const RUST_LENDING_POINTERS: ReadonlySet<string> = new Set(['Box', 'NonNull', 'Rc', 'Arc', 'Cow']);
+
+/** A Rust type as written, by its last name — `&'a mut std::pin::Pin<Box<T>>` → `Pin` with `Box<T>` — after `&`, `dyn` and `impl`. */
+function rustTypeHead(type: string): { outer: string; args: string; text: string } | null {
+  const text = type.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '').replace(/^(?:dyn|impl)\s+/, '').trim();
+  const m = /^(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)\s*(?:<([\s\S]*)>)?/.exec(text);
+  return m ? { outer: m[1]!, args: m[2] ?? '', text } : null;
+}
+
+/**
+ * What `name` called on `x.as_mut()` / `x.as_ref()` reaches for an `x` of
+ * the Rust type `type` as written: `as_mut` re-pins what a `Pin<P>` points
+ * at (rustPinnedCallOn), lends a `Box<T>`'s or a `NonNull<T>`'s `T`, and
+ * turns an `Option<T>` into an `Option` again, whose methods are std's —
+ * unless `?` takes the `T` back out (`tried`: `self.client.as_mut()?.next()`).
+ * A type parameter's lends what its bound says, another std type's a std
+ * type: nothing of the project's either. Undefined for a project type's own
+ * `as_mut`, whose return type isn't read here.
+ */
+function rustLentCall(type: string, name: string, ref: UnresolvedRef, context: ResolutionContext, tried: boolean): ResolvedRef | null | undefined {
+  const head = rustTypeHead(type);
+  if (!head) return undefined;
+  if (head.outer === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+    return tried ? undefined : rustPinnedCallOn(rustPinnedPointee(head.text, ref, context), name, ref, context);
+  }
+  if (isRustProjectNamed(head.outer, RUST_DECLARED_TYPE_KINDS, context)) return undefined;
+  if (RUST_LENDING_POINTERS.has(head.outer)) return tried ? undefined : rustCallOnType(rustTypeTextAt(head.args), name, ref, context);
+  if (head.outer === 'Option' || head.outer === 'Result') return tried ? rustCallOnType(rustTypeTextAt(head.args), name, ref, context) : null;
+  if (RUST_STD_TYPES.has(head.outer) || isRustTypeParam(head.outer, ref, context)) return null;
+  return undefined;
+}
+
+/**
+ * What `name` called on a value of the Rust type `type` as written reaches:
+ * through a `Pin` (rustPinnedCallOn), through a `Box` or another std pointer
+ * to what it holds unless the pointer has the method itself, a project
+ * type's (or trait's) own method. A type parameter, std's or a dependency's
+ * type: nothing of the project's. Undefined for a type no declaration names.
+ */
+function rustCallOnType(type: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const head = rustTypeHead(type);
+  if (!head) return undefined;
+  if (head.outer === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+    return rustPinnedCallOn(rustPinnedPointee(head.text, ref, context), name, ref, context);
+  }
+  const outer = head.outer === 'Self' ? rustSelfType(ref, context)?.type : head.outer;
+  if (!outer || isRustTypeParam(outer, ref, context)) return null;
+  if (RUST_LENDING_POINTERS.has(outer) && !isRustProjectNamed(outer, RUST_DECLARED_TYPE_KINDS, context)) {
+    return RUST_WRAPPER_OWN_METHODS.get(outer)?.has(name) ? null : rustCallOnType(rustTypeTextAt(head.args), name, ref, context);
+  }
+  if (isRustOutsideSelf({ type: outer, root: null, trait: null, isTrait: false }, ref, context)) return null;
+  if (!isRustProjectNamed(outer, RUST_DECLARED_TYPE_KINDS, context)) return undefined;
+  return resolveMethodOnType(outer, name, ref, context, 0.85, 'instance-method');
+}
+
+/** Whether a Rust local is bound by pin-project's `let me = self.project()` (or `self.as_mut().project()`) in the calling function. */
+function rustProjectsSelf(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const bound = new RegExp(`\\blet\\s+(?:mut\\s+)?${name}\\b\\s*=\\s*(.*)$`);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const m = bound.exec(lines[i] ?? '');
+    if (m) return /^self\s*(?:\.\s*as_mut\s*\(\s*\)\s*)?\.\s*project\s*\(\s*\)/.test(m[1]!);
+  }
+  return false;
+}
+
+/**
+ * How a field of the Rust type `owner` is declared: its type as written, and
+ * whether pin-project pins it (`#[pin]`). Read from the struct's own lines —
+ * the struct's node, or, for one a macro wraps (`pin_project! { struct
+ * Sleep { … } }`), which the index doesn't hold, its text in the calling
+ * file. Null when no declaration of the field is found.
+ */
+function rustFieldDeclaration(owner: string, field: string, ref: UnresolvedRef, context: ResolutionContext): { type: string; pinned: boolean } | null {
+  const fileLines = (file: string): string[] => context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+  const spans = preferCallSiteFile(context.getNodesByName(owner).filter((n) =>
+    n.language === 'rust' && (n.kind === 'struct' || n.kind === 'union')), ref.filePath)
+    .map((s) => fileLines(s.filePath).slice(s.startLine - 1, s.endLine));
+  if (spans.length === 0) {
+    const lines = fileLines(ref.filePath);
+    const header = new RegExp(`\\bstruct\\s+${owner}\\b`);
+    const at = lines.findIndex((l) => header.test(l.replace(/\/\/.*$/, '')));
+    if (at >= 0) {
+      let depth = 0;
+      let end = at;
+      for (let opened = false; end < lines.length; end++) {
+        for (const ch of (lines[end] ?? '').replace(/\/\/.*$/, '')) {
+          if (ch === '{') { depth++; opened = true; } else if (ch === '}') depth--;
+        }
+        if (opened && depth <= 0) break;
+      }
+      spans.push(lines.slice(at, end + 1));
+    }
+  }
+  const declared = new RegExp(`(?:^|[\\s{(,])(?:pub(?:\\([^)]*\\))?\\s+)?${field}\\s*:(?!:)\\s*(.*)$`);
+  for (const span of spans) {
+    for (let i = 0; i < span.length; i++) {
+      const line = (span[i] ?? '').replace(/\/\/.*$/, '');
+      const m = declared.exec(line);
+      if (!m) continue;
+      const pinned = /#\[pin\]/.test(line.slice(0, m.index + 1)) || /^\s*#\[pin\]\s*$/.test(span[i - 1] ?? '');
+      return { type: rustTypeTextAt(m[1]!), pinned };
+    }
+  }
+  return null;
 }
 
 /**
@@ -19778,6 +20217,17 @@ export function matchReference(
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
   }
+  // So does one a C++ function binds — a parameter, a lambda's parameter, a
+  // local lambda or functor: protobuf's generators' `format(…)` on a `const
+  // Formatter& format` is no `TestResult::format`. (Something the function
+  // itself declares, which the index may hold, is what the name is.)
+  if (result && ref.language === 'cpp' && ref.referenceKind === 'calls') {
+    const target = context.getNodeById?.(result.targetNodeId);
+    const caller = context.getNodeById?.(ref.fromNodeId);
+    const own = target && caller && target.filePath === caller.filePath &&
+      target.startLine >= caller.startLine && target.startLine <= (caller.endLine ?? caller.startLine);
+    if (!own && isCppLocalCallableCall(ref, context)) return null;
+  }
   // R looks a call's name up among FUNCTIONS only, skipping other bindings:
   // ggplot2's tests' `c <- data_frame(b = 3)` is never what `c(1, 2)` calls —
   // base R's `c` is. (A project binding made by a function factory, ggplot2's
@@ -20136,6 +20586,15 @@ function matchReferenceInner(
     // So is one on a member reached through a chain, `thread->rnd.Next()`.
     const chained = nmTimedT('cppMemberChain', ref, () => matchCppMemberChainCall(ref, context));
     if (chained !== undefined) return chained;
+  }
+
+  // A Rust call on what `.as_mut()` / `.as_ref()` hands back, which the
+  // extractor records by its bare name — `self.delay.as_mut().reset(…)` — is
+  // a call on the type the receiver is declared with, or on nothing of the
+  // project's (matchRustAsMutChainCall).
+  if (ref.language === 'rust' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const lent = nmTimedT('rustAsMut', ref, () => matchRustAsMutChainCall(ref, context));
+    if (lent !== undefined) return lent;
   }
 
   // Try strategies in order of confidence
