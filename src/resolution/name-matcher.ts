@@ -17679,38 +17679,80 @@ function rustImplFor(method: Node, inner: string | null, context: ResolutionCont
   return impl !== null && impl.selfArgs.some((a) => impl.params.includes(a) || a === inner);
 }
 
+/** The type written at the start of `text`, up to what ends it at its own depth: `Pin<&mut R>, cx: …` → `Pin<&mut R>`. */
+function rustTypeTextAt(text: string): string {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '<' || ch === '(' || ch === '[') depth++;
+    else if (ch === '>' && text[i - 1] !== '-') depth = Math.max(0, depth - 1);
+    else if (ch === ')' || ch === ']') {
+      if (depth === 0) return text.slice(0, i).trim();
+      depth--;
+    } else if (depth === 0 && (ch === ',' || ch === '=' || ch === ';' || ch === '{')) return text.slice(0, i).trim();
+  }
+  return text.trim();
+}
+
 /**
- * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
- * `fut: Pin<Box<dyn Future>>` → `Future`, `this: Pin<&mut Self>` → the impl's
- * type — read off its nearest declaration in the calling function; null when
- * that names none (`let fut = Pin::new(&mut f)`).
+ * The type a Rust local or parameter is written with — `reader: Pin<&mut
+ * R>`, `let timer: Option<Timer> = …` — read off its nearest declaration in
+ * the calling function; null when that declaration writes none (`let f =
+ * pin!(f)`).
  */
-function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+function rustDeclaredTypeText(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-  const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declared = new RegExp(`\\b${escaped}\\s*:(?!:)\\s*(.*)$|\\blet\\s+(?:mut\\s+)?${escaped}\\b`);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declared = new RegExp(`\\blet\\s+(?:mut\\s+)?${escaped}\\b(?:\\s*:(?!:)\\s*(.*))?|\\b${escaped}\\s*:(?!:)\\s*(.*)$`);
   for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
     const m = declared.exec(lines[i] ?? '');
     if (!m) continue;
-    const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
-      .exec(m[1] ?? '');
-    const type = pinned?.[1]!.split('::').pop()!.trim() ?? null;
-    if (type !== 'Self') return type;
-    return rustSelfType(ref, context)?.type ?? null;
+    const written = m[1] ?? m[2];
+    return written === undefined ? null : rustTypeTextAt(written);
   }
   return null;
 }
 
 /**
+ * What a Rust `Pin<…>` type pins — `Pin<&mut R>` → `R`, `Pin<Box<dyn
+ * Future>>` → `Future`, `Pin<&mut Self>` → the impl's type; null for a type
+ * that is no `Pin`.
+ */
+function rustPinnedPointee(type: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const pinned = /^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)?(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*<\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*<\s*)?(?:dyn\s+|impl\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)/
+    .exec(type);
+  const name = pinned?.[1]!.split('::').pop()!.trim() ?? null;
+  return name === 'Self' ? rustSelfType(ref, context)?.type ?? null : name;
+}
+
+/**
+ * The type a Rust value declared `Pin<…>` pins — `read: Pin<&mut R>` → `R`,
+ * `this: Pin<&mut Self>` → the impl's type — read off its nearest
+ * declaration in the calling function; null when that names none (`let fut
+ * = Pin::new(&mut f)`).
+ */
+function rustPinnedType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const type = rustDeclaredTypeText(receiver, ref, context);
+  return type === null ? null : rustPinnedPointee(type, ref, context);
+}
+
+/**
  * A Rust call on a value declared `Pin<…>`: Rust's lookup through the `Pin`
- * (rustThroughWrapper) on the type it pins. A type parameter's own methods
- * are its bound's, which the call doesn't name: tokio's `read.poll_read(…)`
- * on `read: Pin<&mut R>` went to its `impl AsyncRead for Pin<P>`.
+ * (rustThroughWrapper) on the type it pins.
  */
 function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const pinned = rustPinnedType(receiver, ref, context);
-  const inner = pinned !== null && !isRustTypeParam(pinned, ref, context) ? pinned : null;
+  return rustPinnedCallOn(rustPinnedType(receiver, ref, context), name, ref, context);
+}
+
+/**
+ * Rust's lookup through a `Pin` (rustThroughWrapper) for `name`, on the type
+ * it pins. A type parameter's own methods are its bound's, which the call
+ * doesn't name: tokio's `read.poll_read(…)` on `read: Pin<&mut R>` went to
+ * its `impl AsyncRead for Pin<P>`.
+ */
+function rustPinnedCallOn(pointee: string | null, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const inner = pointee !== null && !isRustTypeParam(pointee, ref, context) ? pointee : null;
   const own = inner === null ? [] : context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
     (n.qualifiedName === `${inner}::${name}` || n.qualifiedName.endsWith(`::${inner}::${name}`)));
   const through = rustThroughWrapper('Pin', name, own, inner, ref, context);
@@ -17720,6 +17762,160 @@ function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef,
     target = preferCallSiteFile(inherent.length > 0 ? inherent : through, ref.filePath)[0] ?? null;
   }
   return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+}
+
+/**
+ * A Rust call on what `.as_mut()` or `.as_ref()` hands back — `self.delay
+ * .as_mut().reset(…)`, `this.timer.as_mut().as_pin_mut()`, `reader.as_mut()
+ * .poll_read(…)` — which the extractor records by its bare name: a call on
+ * the receiver's declared type as `as_mut` passes it on (rustLentCall). A
+ * field is read from its struct's declaration, through pin-project's `let
+ * me = self.project()` too, a local or a parameter from its own. By the name
+ * alone, tokio's `self.delay.as_mut().reset(now)` on a `Pin<Box<Sleep>>`
+ * field went to the calling `Interval::reset`, and dioxus's
+ * `self.child.as_mut().map(…)` on an `Option` to a `GenerationalRefMut::map`.
+ * Undefined, for the name strategies to decide as before, when the
+ * receiver's type isn't written where it can be read: a `pin!` local, a
+ * call's result.
+ */
+function matchRustAsMutChainCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  if (!line || !/\.\s*as_(?:mut|ref)\s*\(\s*\)/.test(line)) return undefined;
+  const name = ref.referenceName;
+  // The call's expression starts at its column with the whole chain:
+  // `self.delay.as_mut().reset(` — `?` after `as_mut()` taking what an
+  // `Option` / `Result` holds back out (`self.client.as_mut()?.next()`).
+  const lent = new RegExp(`^(self|[a-z_]\\w*)(?:\\s*\\.\\s*([a-z_]\\w*))?\\s*\\.\\s*as_(?:mut|ref)\\s*\\(\\s*\\)\\s*(\\?)?\\s*\\.\\s*${name}\\s*(?:\\(|::<)`)
+    .exec(line.slice(Math.max(0, ref.column)));
+  if (!lent) return undefined;
+  const [, base, field, question] = lent;
+  const tried = question !== undefined;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return undefined;
+  if (field === undefined) {
+    // `self.as_mut()` through `self: Pin<&mut Self>` is that same `Pin`.
+    if (base === 'self') return rustSelfWrapper(caller) === 'Pin' && !tried ? matchRustSelfCall(name, ref, context) : undefined;
+    const declared = rustDeclaredTypeText(base!, ref, context);
+    return declared === null ? undefined : rustLentCall(declared, name, ref, context, tried);
+  }
+  // A field of the type `self` is, or one pin-project hands out:
+  // `Pin<&mut T>` for a `#[pin]` field, `&mut T` for another.
+  const projected = base !== 'self';
+  if (projected && !rustProjectsSelf(base!, ref, context)) return undefined;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  const owner = sep > 0 ? caller.qualifiedName.slice(0, sep).split('::').pop() : undefined;
+  const decl = owner ? rustFieldDeclaration(owner, field, ref, context) : null;
+  if (!decl) return undefined;
+  return rustLentCall(projected && decl.pinned ? `Pin<&mut ${decl.type}>` : decl.type, name, ref, context, tried);
+}
+
+/** Std pointers whose `as_ref` / `as_mut` lend what they hold: `Box<T>`, `NonNull<T>` → `&mut T`. */
+const RUST_LENDING_POINTERS: ReadonlySet<string> = new Set(['Box', 'NonNull', 'Rc', 'Arc', 'Cow']);
+
+/** A Rust type as written, by its last name — `&'a mut std::pin::Pin<Box<T>>` → `Pin` with `Box<T>` — after `&`, `dyn` and `impl`. */
+function rustTypeHead(type: string): { outer: string; args: string; text: string } | null {
+  const text = type.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '').replace(/^(?:dyn|impl)\s+/, '').trim();
+  const m = /^(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)\s*(?:<([\s\S]*)>)?/.exec(text);
+  return m ? { outer: m[1]!, args: m[2] ?? '', text } : null;
+}
+
+/**
+ * What `name` called on `x.as_mut()` / `x.as_ref()` reaches for an `x` of
+ * the Rust type `type` as written: `as_mut` re-pins what a `Pin<P>` points
+ * at (rustPinnedCallOn), lends a `Box<T>`'s or a `NonNull<T>`'s `T`, and
+ * turns an `Option<T>` into an `Option` again, whose methods are std's —
+ * unless `?` takes the `T` back out (`tried`: `self.client.as_mut()?.next()`).
+ * A type parameter's lends what its bound says, another std type's a std
+ * type: nothing of the project's either. Undefined for a project type's own
+ * `as_mut`, whose return type isn't read here.
+ */
+function rustLentCall(type: string, name: string, ref: UnresolvedRef, context: ResolutionContext, tried: boolean): ResolvedRef | null | undefined {
+  const head = rustTypeHead(type);
+  if (!head) return undefined;
+  if (head.outer === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+    return tried ? undefined : rustPinnedCallOn(rustPinnedPointee(head.text, ref, context), name, ref, context);
+  }
+  if (isRustProjectNamed(head.outer, RUST_DECLARED_TYPE_KINDS, context)) return undefined;
+  if (RUST_LENDING_POINTERS.has(head.outer)) return tried ? undefined : rustCallOnType(rustTypeTextAt(head.args), name, ref, context);
+  if (head.outer === 'Option' || head.outer === 'Result') return tried ? rustCallOnType(rustTypeTextAt(head.args), name, ref, context) : null;
+  if (RUST_STD_TYPES.has(head.outer) || isRustTypeParam(head.outer, ref, context)) return null;
+  return undefined;
+}
+
+/**
+ * What `name` called on a value of the Rust type `type` as written reaches:
+ * through a `Pin` (rustPinnedCallOn), through a `Box` or another std pointer
+ * to what it holds unless the pointer has the method itself, a project
+ * type's (or trait's) own method. A type parameter, std's or a dependency's
+ * type: nothing of the project's. Undefined for a type no declaration names.
+ */
+function rustCallOnType(type: string, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const head = rustTypeHead(type);
+  if (!head) return undefined;
+  if (head.outer === 'Pin' && !isRustProjectNamed('Pin', RUST_DECLARED_TYPE_KINDS, context)) {
+    return rustPinnedCallOn(rustPinnedPointee(head.text, ref, context), name, ref, context);
+  }
+  const outer = head.outer === 'Self' ? rustSelfType(ref, context)?.type : head.outer;
+  if (!outer || isRustTypeParam(outer, ref, context)) return null;
+  if (RUST_LENDING_POINTERS.has(outer) && !isRustProjectNamed(outer, RUST_DECLARED_TYPE_KINDS, context)) {
+    return RUST_WRAPPER_OWN_METHODS.get(outer)?.has(name) ? null : rustCallOnType(rustTypeTextAt(head.args), name, ref, context);
+  }
+  if (isRustOutsideSelf({ type: outer, root: null, trait: null, isTrait: false }, ref, context)) return null;
+  if (!isRustProjectNamed(outer, RUST_DECLARED_TYPE_KINDS, context)) return undefined;
+  return resolveMethodOnType(outer, name, ref, context, 0.85, 'instance-method');
+}
+
+/** Whether a Rust local is bound by pin-project's `let me = self.project()` (or `self.as_mut().project()`) in the calling function. */
+function rustProjectsSelf(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const bound = new RegExp(`\\blet\\s+(?:mut\\s+)?${name}\\b\\s*=\\s*(.*)$`);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const m = bound.exec(lines[i] ?? '');
+    if (m) return /^self\s*(?:\.\s*as_mut\s*\(\s*\)\s*)?\.\s*project\s*\(\s*\)/.test(m[1]!);
+  }
+  return false;
+}
+
+/**
+ * How a field of the Rust type `owner` is declared: its type as written, and
+ * whether pin-project pins it (`#[pin]`). Read from the struct's own lines —
+ * the struct's node, or, for one a macro wraps (`pin_project! { struct
+ * Sleep { … } }`), which the index doesn't hold, its text in the calling
+ * file. Null when no declaration of the field is found.
+ */
+function rustFieldDeclaration(owner: string, field: string, ref: UnresolvedRef, context: ResolutionContext): { type: string; pinned: boolean } | null {
+  const fileLines = (file: string): string[] => context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+  const spans = preferCallSiteFile(context.getNodesByName(owner).filter((n) =>
+    n.language === 'rust' && (n.kind === 'struct' || n.kind === 'union')), ref.filePath)
+    .map((s) => fileLines(s.filePath).slice(s.startLine - 1, s.endLine));
+  if (spans.length === 0) {
+    const lines = fileLines(ref.filePath);
+    const header = new RegExp(`\\bstruct\\s+${owner}\\b`);
+    const at = lines.findIndex((l) => header.test(l.replace(/\/\/.*$/, '')));
+    if (at >= 0) {
+      let depth = 0;
+      let end = at;
+      for (let opened = false; end < lines.length; end++) {
+        for (const ch of (lines[end] ?? '').replace(/\/\/.*$/, '')) {
+          if (ch === '{') { depth++; opened = true; } else if (ch === '}') depth--;
+        }
+        if (opened && depth <= 0) break;
+      }
+      spans.push(lines.slice(at, end + 1));
+    }
+  }
+  const declared = new RegExp(`(?:^|[\\s{(,])(?:pub(?:\\([^)]*\\))?\\s+)?${field}\\s*:(?!:)\\s*(.*)$`);
+  for (const span of spans) {
+    for (let i = 0; i < span.length; i++) {
+      const line = (span[i] ?? '').replace(/\/\/.*$/, '');
+      const m = declared.exec(line);
+      if (!m) continue;
+      const pinned = /#\[pin\]/.test(line.slice(0, m.index + 1)) || /^\s*#\[pin\]\s*$/.test(span[i - 1] ?? '');
+      return { type: rustTypeTextAt(m[1]!), pinned };
+    }
+  }
+  return null;
 }
 
 /**
@@ -19960,6 +20156,15 @@ function matchReferenceInner(
     // So is one on a member reached through a chain, `thread->rnd.Next()`.
     const chained = nmTimedT('cppMemberChain', ref, () => matchCppMemberChainCall(ref, context));
     if (chained !== undefined) return chained;
+  }
+
+  // A Rust call on what `.as_mut()` / `.as_ref()` hands back, which the
+  // extractor records by its bare name — `self.delay.as_mut().reset(…)` — is
+  // a call on the type the receiver is declared with, or on nothing of the
+  // project's (matchRustAsMutChainCall).
+  if (ref.language === 'rust' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const lent = nmTimedT('rustAsMut', ref, () => matchRustAsMutChainCall(ref, context));
+    if (lent !== undefined) return lent;
   }
 
   // Try strategies in order of confidence
