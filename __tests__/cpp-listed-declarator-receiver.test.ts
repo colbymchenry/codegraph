@@ -274,7 +274,7 @@ describe('a C++ receiver declared later in a list of names', () => {
 
   it('a bare call on a name declared later in a list is a local\'s, as on the first name', async () => {
     // C++ lookup finds the local, not a member of the method's class, so a
-    // bare call on either name is left to the name strategies: `failed()`
+    // bare call on either name calls the local and links nothing: `failed()`
     // reached Runner::failed as a call on `this`, while `done()` was a local's.
     const cg = await indexed({
       'jobs/runner.h': lines(
@@ -310,6 +310,7 @@ describe('a C++ receiver declared later in a list of names', () => {
         run.find((c) => c.startsWith(`jobs::Runner::${method} `))?.split('@')[1];
       expect(run).not.toContain('jobs::Runner::failed @0.9');
       expect(howLinked('failed')).toBe(howLinked('done'));
+      expect(run).toEqual([]);
     } finally {
       cg.close();
     }

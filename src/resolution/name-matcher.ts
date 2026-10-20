@@ -10209,7 +10209,11 @@ function cppDeclaratorsAfterFirst(code: string, start: number, inHeader: boolean
  * brace, or opens a `for`, `if` or `switch` header.
  */
 function matchCppListedDeclarator(line: string, receiverName: string, listedRegex: RegExp): RegExpExecArray | null {
-  if (!listedRegex.test(line)) return null;
+  return listedRegex.test(line) ? cppListedDeclaratorOn(line, receiverName) : null;
+}
+
+/** matchCppListedDeclarator without its prefilter, for a line already known to name the receiver after a comma. */
+function cppListedDeclaratorOn(line: string, receiverName: string): RegExpExecArray | null {
   for (let i = -1; i < line.length; i++) {
     const c = line[i];
     const header = c === '(' && /^(?:for|if|switch)$/.test(cppWordBefore(line, i));
@@ -12826,6 +12830,243 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   return false;
 }
 
+// What may open a local declaration before its type or `auto`.
+const CPP_LOCAL_SPECIFIERS = String.raw`(?:(?:const|constexpr|static|volatile|thread_local|register)\s+)*`;
+// A type a local is declared with, as written: `ns::Formatter`, `std::function<void(int)>`, `::Foo`. Its
+// template arguments may hold a function type's parentheses, which CPP_TEMPLATE_ARGUMENTS leaves out.
+const CPP_LOCAL_TEMPLATE_ARGUMENTS = String.raw`<(?:[^<>;={}]|<(?:[^<>;={}]|<[^<>;={}]*>)*>)*>`;
+const CPP_LOCAL_TYPE = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s*${CPP_LOCAL_TEMPLATE_ARGUMENTS}(?:\s*::\s*[A-Za-z_]\w*)*)?`;
+// Where a statement starts on a line of code: the line's start, or after `;`, `{`, `}`, or a `for`/`if` header's `(`.
+const CPP_STATEMENT_START = String.raw`(?:^|[;{}]|\b(?:for|if)\s*\()\s*`;
+// Declarations that start a statement, the declared name captured: `auto key = …`, `Formatter format(p);`,
+// `const Formatter& format = …`, and the local types `using V = …;`, `typedef … V;`, `struct Getter {`.
+const CPP_AUTO_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}auto(?:\s+|\s*[*&]+\s*)([A-Za-z_]\w*)\s*(?:=|\{|\()`, 'g');
+const CPP_TYPED_LOCAL = new RegExp(String.raw`${CPP_STATEMENT_START}${CPP_LOCAL_SPECIFIERS}(${CPP_LOCAL_TYPE})(\s+|\s*[*&]+\s*)(?:const\s+)?([A-Za-z_]\w*)\s*([=({;[,])`, 'g');
+const CPP_LOCAL_TYPE_DECLARATION = new RegExp(String.raw`${CPP_STATEMENT_START}(?:using\s+([A-Za-z_]\w*)\s*=|typedef\b[^;]*?\b([A-Za-z_]\w*)\s*;|(?:struct|class|union|enum)(?:\s+class)?\s+([A-Za-z_]\w*)\b)`, 'g');
+// A lambda's head, its parameters captured: `[&](const Foo& f) mutable -> bool {`.
+const CPP_LAMBDA_HEAD = /\]\s*\(([^()]*)\)\s*(?:mutable\s*)?(?:->[^{;]*)?\{/g;
+
+/** Does `text` hold `name` as a whole word? */
+function cppHasWord(text: string, name: string): boolean {
+  for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
+    if (!/\w/.test(text[at - 1] ?? '') && !/\w/.test(text[at + name.length] ?? '')) return true;
+  }
+  return false;
+}
+
+/** A declaration of a name in a C++ function's own code, at a 0-based line. */
+interface CppLocalBinding {
+  line: number;
+  /**
+   * What the name is from there: a parameter (in scope in the whole body), a
+   * variable, or a type or a function the body declares, which a call
+   * constructs or calls instead.
+   */
+  kind: 'parameter' | 'variable' | 'type' | 'function';
+  /** Where its scope starts: the statement's column, or just inside the `{` of a lambda whose parameter it is. */
+  column: number;
+  /** For a range-`for` variable: the column of the loop header's `(`, whose body is its scope. */
+  loopParen?: number;
+}
+
+const CPP_LOCAL_BINDINGS = new WeakMap<ResolutionContext, Map<string, CppLocalBinding[]>>();
+const CPP_CALLER_HEADS = new WeakMap<ResolutionContext, Map<string, { parameters: Set<string>; body: number }>>();
+
+/**
+ * The names a C++ parameter list declares: `const Formatter& format, int n
+ * = 0` → `format`, `n`. A parameter without a name (`const Foo&`, `int`,
+ * `const Foo`) declares none.
+ */
+function cppParameterNames(list: string): string[] {
+  const names: string[] = [];
+  for (const parameter of splitCppTopLevel(list)) {
+    const declarator = parameter.replace(/=[^]*$/, '').trim();
+    const m = /([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*$/.exec(declarator);
+    if (!m) continue;
+    const before = declarator.slice(0, m.index).replace(/\b(?:const|volatile|struct|class|enum|union|typename|signed|unsigned)\b/g, '').trim();
+    if (before !== '' && !/::\s*$/.test(before)) names.push(m[1]!);
+  }
+  return names;
+}
+
+/** The text inside the balanced `(…)` opening at line `line`, column `column`, of `codeLine`'s lines, within a dozen lines; null when it doesn't close. */
+function cppParenTextFrom(codeLine: (line: number) => string, line: number, column: number): string | null {
+  let depth = 0;
+  let text = '';
+  for (let l = line; l < line + 12; l++) {
+    const code = codeLine(l);
+    for (let c = l === line ? column : 0; c < code.length; c++) {
+      const ch = code[c]!;
+      if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) return text.slice(1);
+      text += ch;
+    }
+    text += ' ';
+  }
+  return null;
+}
+
+/** Does a `T name(args)` local's argument list declare parameters — `void helper(int);`, `Foo make();`, `Foo bar(Baz qux);` — so it declares a function? */
+function cppDeclaresLocalFunction(type: string, args: string): boolean {
+  if (type === 'void' || args.trim() === '') return true;
+  return splitCppTopLevel(args).some((a) =>
+    /^(?:int|char|bool|float|double|long|short|unsigned|signed|void|size_t)$/.test(a) ||
+    (/^(?:(?:const|volatile|unsigned|signed)\s+)*[A-Za-z_][\w:]*(?:\s*<[^>]*>)?\s*[*&]*\s*(?:[A-Za-z_]\w*)?$/.test(a) && /\s|[*&]/.test(a)));
+}
+
+/**
+ * The C++ function `caller`'s parameter names, read from the list after its
+ * own name on its head, and the line (0-based) its head's name is on, where
+ * its body's code begins to be read.
+ */
+function cppCallerHead(caller: Node, codeLine: (line: number) => string, lineCount: number, context: ResolutionContext): { parameters: Set<string>; body: number } {
+  let memo = CPP_CALLER_HEADS.get(context);
+  if (!memo) CPP_CALLER_HEADS.set(context, (memo = new Map()));
+  const hit = memo.get(caller.id);
+  if (hit) return hit;
+  const first = caller.startLine - 1;
+  let head = { parameters: new Set<string>(), body: first };
+  const named = new RegExp(`\\b${caller.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`);
+  for (let l = first; l < Math.min(lineCount, first + 13); l++) {
+    const at = named.exec(codeLine(l));
+    if (!at) continue;
+    const list = cppParenTextFrom(codeLine, l, at.index + at[0].length - 1);
+    head = { parameters: new Set(list === null ? [] : cppParameterNames(list)), body: l };
+    break;
+  }
+  memo.set(caller.id, head);
+  return head;
+}
+
+/**
+ * The declarations of `name` in the C++ function `caller`'s own code, read
+ * through `codeLine` (a 0-based line as code): a parameter, then each
+ * statement that declares the name — `auto key = [](int i) {…};`,
+ * `Formatter format(p);`, `const Formatter& format = …`, a later name in a
+ * list, a range-`for` variable, a lambda's parameter. A local type (`using V
+ * = …;`, `struct Getter {`) or a function declared in the body (`void
+ * helper(int);`) is recorded as what the name is there. An expression that
+ * reads like a declaration — `a && f(x)`, `a * f(x)` — declares nothing, and
+ * neither does a line that continues one from the line above.
+ */
+function cppLocalBindings(
+  name: string,
+  caller: Node,
+  head: { parameters: Set<string>; body: number },
+  codeLine: (line: number) => string,
+  rawLines: readonly string[],
+): CppLocalBinding[] {
+  const first = caller.startLine - 1;
+  const last = Math.min(rawLines.length - 1, (caller.endLine ?? caller.startLine) - 1);
+  const bindings: CppLocalBinding[] = head.parameters.has(name) ? [{ line: head.body, column: 0, kind: 'parameter' }] : [];
+  // Whether the code above line `l` ends a statement, so a declaration may start the line.
+  const startsStatement = (l: number): boolean => {
+    for (let k = l - 1; k >= first; k--) {
+      const above = codeLine(k);
+      if (above.trim() !== '') return /[;{}:]\s*$/.test(above) || /^\s*#/.test(above) || k < head.body;
+    }
+    return true;
+  };
+  for (let l = head.body; l <= last; l++) {
+    // (Blanking literals and comments only takes text away: a line without the name raw has none as code.)
+    if (!cppHasWord(rawLines[l] ?? '', name)) continue;
+    const text = codeLine(l);
+    if (!cppHasWord(text, name)) continue;
+    const starts = (index: number): boolean => index > 0 || l === head.body || startsStatement(l);
+    for (const m of text.matchAll(CPP_LOCAL_TYPE_DECLARATION)) {
+      if ((m[1] ?? m[2] ?? m[3]) === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'type' });
+    }
+    for (const m of text.matchAll(CPP_AUTO_LOCAL)) {
+      if (m[1] === name && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+    }
+    for (const m of text.matchAll(CPP_TYPED_LOCAL)) {
+      const type = m[1]!;
+      if (m[3] !== name || !starts(m.index) || CPP_NOT_A_DECLARED_TYPE.has(type.split(/[\s<:]/)[0]!) ||
+          /^(?:using|typedef|struct|class|union|enum|auto)$/.test(type)) continue;
+      let kind: CppLocalBinding['kind'] = 'variable';
+      if (m[4] === '(') {
+        // `a && f(x)` and `a * f(x)` are expressions.
+        if (/[*&]/.test(m[2]!)) continue;
+        if (cppDeclaresLocalFunction(type, cppParenTextFrom(codeLine, l, m.index + m[0].length - 1) ?? '')) kind = 'function';
+      }
+      bindings.push({ line: l, column: m.index, kind });
+    }
+    if (text.includes(',')) {
+      const m = cppListedDeclaratorOn(text, name);
+      if (m && starts(m.index)) bindings.push({ line: l, column: m.index, kind: 'variable' });
+    }
+    const loop = cppRangeForDeclaration(text, name);
+    if (loop) bindings.push({ line: l, column: loop.paren, kind: 'variable', loopParen: loop.paren });
+    for (const m of text.matchAll(CPP_LAMBDA_HEAD)) {
+      if (cppParameterNames(m[1]!).includes(name)) bindings.push({ line: l, column: m.index + m[0].length, kind: 'variable' });
+    }
+  }
+  return bindings;
+}
+
+/** Is the code at (`toLine`, `toColumn`) inside the brace block open at (`line`, `column`) — no `}` between them closes it? */
+function cppBlockReaches(codeLine: (line: number) => string, line: number, column: number, toLine: number, toColumn: number): boolean {
+  let depth = 0;
+  for (let l = line; l <= toLine; l++) {
+    const text = codeLine(l);
+    const end = l === toLine ? Math.min(toColumn, text.length) : text.length;
+    for (let c = l === line ? column : 0; c < end; c++) {
+      if (text[c] === '{') depth++;
+      else if (text[c] === '}' && --depth < 0) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a C++ call written by its bare name calls a local of the calling
+ * function — a parameter, a lambda's parameter, a range-`for` variable, or a
+ * variable declared above the call in a block still open there — which C++
+ * lookup finds before any function or method of that name. protobuf's code
+ * generators call `format(…)` on a `const Formatter& format` parameter,
+ * which linked to the conformance suite's `TestResult::format`, and rocksdb's
+ * tests call local lambdas (`auto key = [](int i) {…};`) that linked to
+ * `ArenaWrappedDBIter::key`. A name the function declares as a type (`using
+ * V = std::vector<int>;`) or a function (`void helper(int);`) is not one:
+ * that call constructs the type or calls the function.
+ */
+function isCppLocalCallableCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name) || cppImplicitReceiver(ref, context) !== 'bare') return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || (caller.kind !== 'function' && caller.kind !== 'method') || caller.filePath !== ref.filePath ||
+      caller.name === name || ref.line < caller.startLine || ref.line > (caller.endLine ?? caller.startLine)) return false;
+  const rawLines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!rawLines) return false;
+  const nonCode = cppNonCodeLines(ref.filePath, context);
+  const codeLines = new Map<number, string>();
+  const codeLine = (l: number): string => {
+    let code = codeLines.get(l);
+    if (code === undefined) codeLines.set(l, (code = cppCodeOf(cppLiteralsBlanked(rawLines[l] ?? '', l + 1, nonCode)) ?? ''));
+    return code;
+  };
+  let memo = CPP_LOCAL_BINDINGS.get(context);
+  if (!memo) CPP_LOCAL_BINDINGS.set(context, (memo = new Map()));
+  const key = `${caller.id}\u0000${name}`;
+  let bindings = memo.get(key);
+  if (!bindings) {
+    const head = cppCallerHead(caller, codeLine, rawLines.length, context);
+    memo.set(key, (bindings = cppLocalBindings(name, caller, head, codeLine, rawLines)));
+  }
+  const callLine = ref.line - 1;
+  // The nearest declaration above the call whose scope holds it decides.
+  let decided: CppLocalBinding | null = null;
+  for (const b of bindings) {
+    if (b.line > callLine || (b.line === callLine && b.column >= ref.column)) continue;
+    const inScope = b.kind === 'parameter' ||
+      (b.loopParen !== undefined
+        ? cppForBodyEncloses(rawLines, b.line, b.loopParen, callLine, ref.column)
+        : cppBlockReaches(codeLine, b.line, b.column, callLine, ref.column));
+    if (inScope && (!decided || b.line > decided.line || (b.line === decided.line && b.column > decided.column))) decided = b;
+  }
+  return decided?.kind === 'parameter' || decided?.kind === 'variable';
+}
+
 /**
  * A C++ source line as code, for reading declarations: null for a `// …`
  * line, else the line with its comments blanked, columns kept. Receiver
@@ -13927,6 +14168,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
   CPP_UNNAMED_NAMESPACES.delete(context);
+  CPP_LOCAL_BINDINGS.delete(context);
+  CPP_CALLER_HEADS.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_CRATES.delete(context);
@@ -18652,6 +18895,17 @@ export function matchReference(
     // (A target of another name is what the local was followed to: `const
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
+  }
+  // So does one a C++ function binds — a parameter, a lambda's parameter, a
+  // local lambda or functor: protobuf's generators' `format(…)` on a `const
+  // Formatter& format` is no `TestResult::format`. (Something the function
+  // itself declares, which the index may hold, is what the name is.)
+  if (result && ref.language === 'cpp' && ref.referenceKind === 'calls') {
+    const target = context.getNodeById?.(result.targetNodeId);
+    const caller = context.getNodeById?.(ref.fromNodeId);
+    const own = target && caller && target.filePath === caller.filePath &&
+      target.startLine >= caller.startLine && target.startLine <= (caller.endLine ?? caller.startLine);
+    if (!own && isCppLocalCallableCall(ref, context)) return null;
   }
   // R looks a call's name up among FUNCTIONS only, skipping other bindings:
   // ggplot2's tests' `c <- data_frame(b = 3)` is never what `c(1, 2)` calls —
