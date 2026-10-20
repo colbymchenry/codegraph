@@ -9402,6 +9402,12 @@ interface RustWrittenType {
   self?: string;
   generics?: string;
   wrappers?: string[];
+  /**
+   * Generic parameters the type names that a call's value fixes, which
+   * nothing here says: `W` in `build<W: WriteColor>(…) -> Standard<W>`. A
+   * value that is one of them is unread, whatever its bound.
+   */
+  opaque?: string[];
 }
 
 /**
@@ -9779,6 +9785,7 @@ function rustReadType(written: RustWrittenType, ref: UnresolvedRef, context: Res
     return { kind: 'named', name: self.type, path: self.root ? [self.root] : [], args: '', wrappers, byRef, written };
   }
   if (segments.length === 0) {
+    if (written.opaque?.includes(name)) return { kind: 'unread' };
     const bounds = rustGenericBounds(name, written, context);
     if (bounds !== undefined) {
       const traits = bounds.filter((b) => !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
@@ -9834,9 +9841,13 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
   if (depth > 3) return null;
   let v = value.trim();
   let unwraps = 0;
+  let awaits = 0;
   for (;;) {
     const before = v;
-    v = v.replace(/\s*\.\s*await$/, '');
+    if (/\.\s*await$/.test(v)) {
+      v = v.replace(/\s*\.\s*await$/, '');
+      awaits++;
+    }
     if (v.endsWith('?')) {
       v = v.slice(0, -1).trimEnd();
       unwraps++;
@@ -9886,13 +9897,14 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
     }
     return rustFunctionReturn(segments.slice(0, -1), last, unwraps, at, ref, context);
   }
-  // `x.clone()` is a value of `x`'s type.
-  if (call && call.args.trim() === '') {
-    const cloned = /^([a-z_]\w*)\s*\.\s*clone$/.exec(call.callee);
+  if (call) {
+    // `x.clone()` is a value of `x`'s type.
+    const cloned = call.args.trim() === '' ? /^([a-z_]\w*)\s*\.\s*clone$/.exec(call.callee) : null;
     if (cloned) return unwrapped(rustLocalType(cloned[1]!, at, scopes, ref, context, depth));
-    return null;
+    // `x.m(…)`, `self.m(…)`, `x.m(…)?.n(…)`: what the method it reaches returns.
+    const method = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*(?:::\s*<([^()]*)>)?$/.exec(call.callee);
+    return method ? rustMethodReturn(method[1]!, method[2]!, method[3], unwraps, awaits, at, scopes, ref, context, depth) : null;
   }
-  if (call) return null;
   const literal = /^((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)\s*(?:::\s*<[^{}]*>\s*)?\{/.exec(v);
   if (literal) {
     if (!rustGroupIsWhole(v.slice(v.indexOf('{')))) return null;
@@ -9985,6 +9997,137 @@ function rustFunctionReturn(modules: string[], fn: string, unwraps: number, at: 
   if (text === '') return null;
   const made: RustWrittenType = { text, file: fns[0]!.filePath, at: rustSignatureOffset(fns[0]!, context) };
   return unwraps > 0 ? rustUnwrapped(made, unwraps) : made;
+}
+
+/**
+ * What a method call's value is — `let b = builder.port(80)`, `let s =
+ * self.state()?`, `let n = conn.next_frame().await?` — read from the
+ * signature of the method the call reaches on its receiver's type
+ * (rustTypedMethodCall), where `Self` is that method's impl type. A receiver
+ * is a local, `self`, or another call's value. Null where any step can't be
+ * told: a receiver or a method from outside the project, a return type
+ * naming the impl's or the method's own generics, an `async fn` not awaited.
+ */
+function rustMethodReturn(
+  receiver: string, method: string, turbofish: string | undefined, unwraps: number, awaits: number, at: number,
+  scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  let memo = RUST_METHOD_RETURNS.get(context);
+  if (!memo) RUST_METHOD_RETURNS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${at}\0${receiver}\0${method}\0${turbofish ?? ''}\0${unwraps}\0${awaits}\0${depth}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const made = readRustMethodReturn(receiver, method, turbofish, unwraps, awaits, at, scopes, ref, context, depth);
+  if (memo.size >= 4096) memo.delete(memo.keys().next().value!);
+  memo.set(key, made);
+  return made;
+}
+
+const RUST_METHOD_RETURNS = new WeakMap<ResolutionContext, Map<string, RustWrittenType | null>>();
+
+function readRustMethodReturn(
+  receiver: string, method: string, turbofish: string | undefined, unwraps: number, awaits: number, at: number,
+  scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  const recv = receiver.trim();
+  let written: RustWrittenType | null;
+  if (recv === 'self') written = { text: 'Self', file: ref.filePath, at };
+  else if (/^[a-z_]\w*$/.test(recv)) written = rustLocalType(recv, at, scopes, ref, context, depth);
+  else if (/[)?]$/.test(recv)) written = rustValueType(recv, at, scopes, ref, context, depth + 1);
+  else return null;
+  if (!written) return null;
+  const read = rustReadType(written, ref, context);
+  const result = rustTypedMethodCall(read, method, ref, context);
+  if (!result || result === 'unread') return null;
+  const target = context.getNodeById?.(result.targetNodeId);
+  const text = target ? rustReturnText(target.signature) : null;
+  if (!target || !text) return null;
+  let made: RustWrittenType | null = { text, file: target.filePath, at: rustSignatureOffset(target, context) };
+  made = rustReturnInstance(made, target, turbofish, read, at, ref, context);
+  // An `async fn`'s value is a future of what it returns; `.await` hands that out.
+  const isAsync = rustIsAsyncFn(target, context);
+  if (awaits > 1 || (awaits === 0 && isAsync)) return null;
+  if (awaits === 1 && !isAsync) made = rustFutureOutput(made);
+  return made && unwraps > 0 ? rustUnwrapped(made, unwraps) : made;
+}
+
+/**
+ * A method's return type as the call makes it, where it names a generic or
+ * `Self`: the method's own type parameters are what the call's turbofish
+ * writes (clap's `arg.get::<ArgValueCompleter>()` on `fn get<T: ArgExt>(&self)
+ * -> Option<&T>`), read where the call is, when the rest of the type is std's;
+ * a trait's provided method's `Self` is the receiver's own type. A parameter
+ * the call doesn't write, or one of the impl's, stays opaque: the type is
+ * still the one its head names (`Standard<W>` is a `Standard`), but a value
+ * that is the parameter itself is unread, the bound alone not telling.
+ */
+function rustReturnInstance(
+  made: RustWrittenType, target: Node, turbofish: string | undefined, read: RustTypeRead, at: number,
+  ref: UnresolvedRef, context: ResolutionContext,
+): RustWrittenType {
+  const names = [...made.text.matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)].map((m) => m[1]!)
+    .filter((n) => !/^(?:mut|dyn|impl|const|for)$/.test(n));
+  const generics = names.filter((n) => n !== 'Self' && rustGenericBounds(n, made, context) !== undefined);
+  if (generics.length === 0) {
+    // `fn with_x(self) -> Self` in a trait: the value is the receiver's type, not the trait.
+    const bare = made.text.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '').trim();
+    if (bare === 'Self' && read.kind === 'named' && rustTraitOf(target, context) !== null) {
+      const typeText = [...read.path, read.name].join('::') + (read.args ? `<${read.args}>` : '');
+      return { text: made.text.replace(/Self\s*$/, typeText), file: read.written.file, at: read.written.at };
+    }
+    return made;
+  }
+  const opaque: RustWrittenType = { ...made, opaque: [...new Set(generics)] };
+  if (turbofish === undefined) return opaque;
+  const scopes = rustScopesOf(made.file, context);
+  const own = scopes ? rustFnAt(scopes, made.at) : undefined;
+  const params = own ? splitRustTopLevel(own.generics, ',').map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined) : [];
+  const args = splitRustTopLevel(turbofish, ',').map((a) => a.trim()).filter((a) => !a.startsWith("'"));
+  const bound = new Map<string, string>();
+  for (const g of new Set(generics)) {
+    const i = params.indexOf(g);
+    if (i < 0 || i >= args.length || args[i] === '_') return opaque;
+    bound.set(g, args[i]!);
+  }
+  // The type is then read where the call writes the turbofish: anything else it names must mean the same there.
+  if (names.some((n) => !bound.has(n) && (n === 'Self' || !(RUST_STD_TYPES.has(n) || RUST_PRELUDE.has(n) || RUST_PRIMITIVE_TYPES.has(n))))) return opaque;
+  const text = made.text.replace(/(?<!['\w])([A-Za-z_]\w*)/g, (n) => bound.get(n) ?? n);
+  return { text, file: ref.filePath, at };
+}
+
+/** Whether a Rust function is declared `async`, read off its source: the extractor's flag never says. */
+function rustIsAsyncFn(fn: Node, context: ResolutionContext): boolean {
+  const scopes = rustScopesOf(fn.filePath, context);
+  if (!scopes) return false;
+  const start = rustNodeOffset(fn, context);
+  const head = scopes.code.slice(start, start + 300);
+  const name = head.search(new RegExp(`\\bfn\\s+(?:r#)?${fn.name.replace(/^r#/, '')}\\b`));
+  return name >= 0 && /\basync\b/.test(head.slice(0, name));
+}
+
+/**
+ * What `.await` hands out of a value of a Rust future type: the `Output` of
+ * `impl Future<Output = T>` or a `Pin<Box<dyn Future<Output = T>>>`, the `T`
+ * of futures' `BoxFuture<'_, T>`. Null for any other type.
+ */
+function rustFutureOutput(written: RustWrittenType): RustWrittenType | null {
+  let t = written.text.trim();
+  for (const wrapper of [/^(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*</, /^(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*</]) {
+    const open = wrapper.exec(t);
+    if (open && rustAngleEnd(t, open[0].length - 1) === t.length - 1) t = t.slice(open[0].length, -1).trim();
+  }
+  const boxed = /^(?:[A-Za-z_]\w*\s*::\s*)*(?:BoxFuture|LocalBoxFuture)\s*</.exec(t);
+  if (boxed) {
+    if (rustAngleEnd(t, boxed[0].length - 1) !== t.length - 1) return null;
+    const args = splitRustTopLevel(t.slice(boxed[0].length, -1), ',').filter((a) => !/^'/.test(a.trim()));
+    return args.length === 1 ? { ...written, text: args[0]!.trim() } : null;
+  }
+  const future = /^(?:impl|dyn)\s+(?:(?:std|core)\s*::\s*future\s*::\s*)?(?:Future|IntoFuture)\s*</.exec(t);
+  if (!future) return null;
+  const end = rustAngleEnd(t, future[0].length - 1);
+  if (end < 0 || !/^\s*(?:\+[\s\S]*)?$/.test(t.slice(end + 1))) return null;
+  const output = splitRustTopLevel(t.slice(future[0].length, end), ',').map((a) => /^\s*Output\s*=\s*([\s\S]+)$/.exec(a)?.[1]).find((o) => o !== undefined);
+  return output ? { ...written, text: output.trim() } : null;
 }
 
 /**
@@ -10509,9 +10652,21 @@ function rustTypedMethodCall(read: RustTypeRead, method: string, ref: Unresolved
     if (traits.length > 1) traits = traits.filter((t) => isRustTraitCallable(t, ref, viaTraits.get(t)![0]!, context));
     // Two traits in scope with the method: Rust asks which.
     if (traits.length !== 1) return null;
-    const methods = rustSpecialized(viaTraits.get(traits[0]!)!, read.args, context);
-    // `impl From<A> for T` and `impl From<B> for T`: the argument decides.
-    if (new Set(methods.map((m) => rustTraitImplHeader(m, context)?.traitArgs.join(','))).size > 1) return null;
+    let methods = rustSpecialized(viaTraits.get(traits[0]!)!, read.args, context);
+    // `impl Encoder<Bytes> for C` and `impl Encoder<&[u8]> for C`: the call's
+    // argument decides, where its type is one impl's trait argument —
+    // tokio's `codec.encode(Bytes::from(…), &mut buf)`, axum's
+    // `router.call(request)` on a `request: Request<String>`.
+    const traitArgs = (m: Node): string => rustTraitImplHeader(m, context)?.traitArgs.join(',') ?? '';
+    if (new Set(methods.map(traitArgs)).size > 1) {
+      const fit = methods.filter((m) => {
+        const args = rustTraitImplHeader(m, context)?.traitArgs ?? [];
+        const head = args.find((a) => /^[A-Z]/.test(a)) ?? args[0];
+        return head !== undefined && rustFirstArgIs(head, ref, context);
+      });
+      if (fit.length === 0 || new Set(fit.map(traitArgs)).size > 1) return null;
+      methods = fit;
+    }
     return rustPickMethod(methods, typeFiles, ref, 0.9);
   }
   // An impl of an alias of the type, for the instantiation it names: gleam's
@@ -11213,22 +11368,6 @@ export function matchByQualifiedName(
 function isMethodOwnerKind(n: Node): boolean {
   return n.kind === 'class' || n.kind === 'struct' || n.kind === 'union' || n.kind === 'interface' ||
     (n.language === 'scala' && n.kind === 'module');
-}
-
-/**
- * Is `n` the method `name` of the class `cls` a receiver is taken to name
- * (the class-name and capitalized-receiver strategies of matchMethodCall)?
- * In C and C++, only one of exactly that class: protobuf's `arena.get()`
- * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
- * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
- * other languages, any method of the name whose qualified name has the
- * class's name in it, as before.
- */
-function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
-  if (n.kind !== 'method' || n.name !== name) return false;
-  return cls.language === 'c' || cls.language === 'cpp'
-    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
-    : n.qualifiedName.includes(cls.name);
 }
 
 /**
@@ -16559,6 +16698,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_SCOPES.delete(context);
   RUST_USE_PATHS.delete(context);
   RUST_WALKED_ITEMS.delete(context);
+  RUST_METHOD_RETURNS.delete(context);
   RUST_TRAIT_OF.delete(context);
   RUST_TRAIT_IMPLS.delete(context);
   RUST_TYPED_REFS.delete(context);
@@ -17072,7 +17212,11 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
   switch (cls.language) {
     case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
-    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
+    // A base built by a class's factory — Django's `class Manager(
+    // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
+    // qualifier is the supertype, not the method called on it.
+    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, '')
+      .replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
     case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
     case 'typescript': case 'tsx': case 'javascript': case 'jsx':
@@ -18311,9 +18455,17 @@ export function matchMethodCall(
     // staxrip's `FrameServerFactory.Create(…)` went to its AutoCrop tool's copy.
     if (ref.language === 'vbnet') classCandidates = preferVbProject(classCandidates, ref, context);
 
+    const productionCaller = !isTestPath(ref.filePath);
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
+      // A class declared inside a function is named only in there: a
+      // `File.write(…)` elsewhere is not the `File` a Django test declares.
+      if (!isLexicallyReachable(classNode, ref, context)) continue;
+      // Production code never names a test suite's class: Django's
+      // `manager.check()` in `Model._check_managers` is no test app's
+      // `Manager` model (whose `check` it inherits from `Model`).
+      if (productionCaller && isTestPath(classNode.filePath)) continue;
 
       // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
       // own, else one a base declares (cppMethodOf), never one of a class
@@ -18325,8 +18477,7 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+      const methodNode = classStrategyMethod(classNode, methodName!, context);
 
       if (methodNode) {
         return {
@@ -18394,7 +18545,7 @@ export function matchMethodCall(
   }
 
   // Strategy 2: Instance variable receiver - try capitalized form to find class
-  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
+  // e.g., "permissionEngine" → look for a class named "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
@@ -18402,16 +18553,16 @@ export function matchMethodCall(
         withinCppTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
+      const productionCaller = !isTestPath(ref.filePath);
       for (const classNode of fuzzyClassCandidates) {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
+        // Nor a class declared inside another function, nor a test suite's
+        // class from production code (see Strategy 1).
+        if (!isLexicallyReachable(classNode, ref, context)) continue;
+        if (productionCaller && isTestPath(classNode.filePath)) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!) &&
-          // A Go standard method name is the type's own, not one of another
-          // type its name is part of: kubernetes' `status.String()` is no
-          // `RuntimeStatus::String` beside a `Status` type.
-          (!goStd || n.qualifiedName === `${classNode.name}::${methodName}`));
+        const methodNode = classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode) {
           return {
@@ -18481,6 +18632,15 @@ export function matchMethodCall(
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
+    // Nor is it a method of a class another function declares: Django's
+    // `file.write(…)` in one test is not the `File` a serializer test
+    // declares in its body. The one method such a filter may leave is still
+    // only a guess by the receiver's name (the scoring below), never the
+    // only method of the name: `cache.aadd()` is `BaseCache`'s, while
+    // `value.split()` is no test model's `split`.
+    const reachable = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
+    const scopedOut = reachable.length !== targetMethods.length;
+    targetMethods = reachable;
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref
@@ -18503,7 +18663,7 @@ export function matchMethodCall(
     // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
-    if (targetMethods.length === 1 && !narrowed && !pythonChain && targetMethods[0]!.language === ref.language &&
+    if (targetMethods.length === 1 && !narrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -18527,7 +18687,7 @@ export function matchMethodCall(
     }
 
     // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1 || (targetMethods.length === 1 && pythonChain && !narrowed)) {
+    if (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed)) {
       // What the receiver is named after is its last link: `builder.tokeniser`
       // is a Tokeniser, `table.Columns` no kind of table.
       const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
@@ -21795,6 +21955,41 @@ function tsFieldCall(
     return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
   return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
+}
+
+/**
+ * The `method` named `methodName` declared on `classNode`, among the nodes of
+ * the class's file: the class's exact qualified name first, then the
+ * owner-by-name form the resolver uses elsewhere (`Logger::log`,
+ * `ns::Logger::log`). Never a substring test: `FileLogger::log` contains
+ * `Logger`.
+ *
+ * Known limitation — same-named NESTED classes: the owner-by-name form also
+ * matches `Outer::Logger::log`, and every same-named class is a candidate in
+ * the caller's loop, so a nested `Outer::Logger` can take a top-level
+ * `Logger.log()` (declared first, or the only one with the method). Choosing
+ * among them needs each language's scope rules.
+ */
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
+  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+  const exact = `${classNode.qualifiedName}::${methodName}`;
+  const byName = `${classNode.name}::${methodName}`;
+  return (
+    methods.find((n) => n.qualifiedName === exact) ??
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
+  );
+}
+
+/**
+ * The method a class-name or capitalized-receiver call reaches on `classNode`:
+ * its own (findOwnMethod), else the nearest one a declared supertype has, as a
+ * call on an instance of the class finds it. Django's `form.is_valid()` on
+ * `Form` reaches `BaseForm::is_valid`, which the substring test this replaced
+ * only found because `BaseForm` contains `Form`.
+ */
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext): Node | undefined {
+  return findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName) ??
+    inheritedClassMethod([classNode], methodName, context) ?? undefined;
 }
 
 /**
