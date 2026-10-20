@@ -2002,8 +2002,23 @@ const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
  */
 const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
 
-/** The C types an Objective-C file can define, as opposed to its classes and protocols. */
-const OBJC_C_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'type_alias']);
+/**
+ * What an Objective-C source file defines for itself, as C does: its C types
+ * and its globals, as opposed to its classes and protocols.
+ */
+const OBJC_FILE_LOCAL_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'type_alias', 'variable', 'constant']);
+
+/**
+ * Whether `n` is a C type or global that an Objective-C source file other
+ * than `ref`'s defines, which no other file can name. It leaves the
+ * candidates before one is picked, so a global's declaration in a header
+ * (Hammerspoon's `extern NSString *MJConfigFile;` in variables.h) stands for
+ * the definition in variables.m. isVisibleAcrossFiles applies the same rule
+ * to the pipeline's pick.
+ */
+function isObjcFileLocalElsewhere(n: Node, ref: UnresolvedRef): boolean {
+  return n.language === 'objc' && n.filePath !== ref.filePath && OBJC_FILE_LOCAL_KINDS.has(n.kind) && C_SOURCE_EXT.test(n.filePath);
+}
 
 /** Per context: a C/C++ type's qualified name → its declarations. */
 const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
@@ -3145,8 +3160,9 @@ function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
  *   whichever USB class file ranked first. So is what a source file's
  *   unnamed namespace declares, and a type only source files declare, with
  *   its members (isCppTranslationUnitLocal).
- * - **Objective-C**: a struct, union, enum or typedef a `.m` / `.mm` source
- *   file defines is local to that file, as in C. A class is not.
+ * - **Objective-C**: a struct, union, enum, typedef or global a `.m` / `.mm`
+ *   source file defines is local to that file, as in C; other files reach a
+ *   global through its header's `extern` declaration. A class is not.
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -3220,8 +3236,14 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // An Objective-C source file is a translation unit too: a C type it defines
   // is its own. ObjFW's runtime keeps `static struct Lock { … } *locks;` in
   // synchronized.m, and the AmigaOS `Lock(path, mode)` calls in other files
-  // make no such struct. (A class is the runtime's, wherever it is written.)
-  if (lang === 'objc' && OBJC_C_TYPE_KINDS.has(candidate.kind) && C_SOURCE_EXT.test(candidate.filePath)) return false;
+  // make no such struct. So is a global it defines: another file reaches one
+  // through the header that declares it (`extern OFStdIOStream *OFStdOut;`),
+  // whose node stands for it there. React Native's
+  // `completionHandler(nil, image)` calls a block parameter, not the
+  // `completionHandler` another .mm file keeps, and `#include <vector>` names
+  // no `.mm` file's `vector`. (A class is the runtime's, wherever it is
+  // written.)
+  if (isObjcFileLocalElsewhere(candidate, ref)) return false;
   if (lang === 'go') return isGoNameVisible(candidate, ref);
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
@@ -7876,6 +7898,167 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
 }
 
+/**
+ * Std types a crate can implement a trait for but never declare a method on:
+ * a method the index holds for one is the project's `impl SomeTrait for
+ * String` (`Vec<u8>`, `Arc<T>`, `NonNull<T>`, …).
+ */
+const RUST_STD_TYPES = new Set([
+  'String', 'str', 'Vec', 'VecDeque', 'HashMap', 'HashSet', 'BTreeMap', 'BTreeSet', 'BinaryHeap', 'LinkedList',
+  'Box', 'Rc', 'Arc', 'Weak', 'Cow', 'Cell', 'RefCell', 'Mutex', 'RwLock', 'Option', 'Result', 'PathBuf', 'Path',
+  'OsString', 'OsStr', 'CString', 'CStr', 'NonNull', 'Pin', 'Duration', 'Instant', 'SystemTime', 'PhantomData',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'f32', 'f64', 'bool', 'char',
+]);
+const RUST_DECLARED_TYPE_KINDS = new Set(['struct', 'enum', 'union', 'type_alias', 'trait']);
+
+interface RustImplHeader {
+  /** The trait's name, the last segment of its path (`linked_list::Link` → `Link`). */
+  trait: string;
+  /** The type names its arguments write (`From<&'a Handle>` → `Handle`). */
+  traitArgs: string[];
+  /** The implementing type's name (`NonNull<Entry>` → `NonNull`). */
+  self: string;
+}
+
+const RUST_IMPL_HEADERS = new WeakMap<ResolutionContext, Map<string, RustImplHeader | null>>();
+
+/** `impl<'a, T> From<&'a Handle> for NonNull<Entry> where … {` → its trait and type; null for an inherent impl. */
+function parseRustImplHeader(text: string): RustImplHeader | null {
+  let rest = text.replace(/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/, '').replace(/\{[\s\S]*$/, '').replace(/\bwhere\b[\s\S]*$/, '').trim();
+  // The impl's own generics, `<'a, T: Into<U>>`.
+  if (rest.startsWith('<')) {
+    let depth = 0;
+    let i = 0;
+    for (; i < rest.length; i++) {
+      if (rest[i] === '<') depth++;
+      else if (rest[i] === '>' && --depth === 0) break;
+    }
+    rest = rest.slice(i + 1).trim();
+  }
+  // ` for ` outside the angle brackets parts the trait from the type.
+  let depth = 0;
+  let split = -1;
+  for (let i = 0; i < rest.length && split < 0; i++) {
+    if (rest[i] === '<') depth++;
+    else if (rest[i] === '>') depth--;
+    else if (depth === 0 && /\s/.test(rest[i]!) && /^for\s/.test(rest.slice(i + 1))) split = i;
+  }
+  if (split < 0) return null;
+  const traitPart = rest.slice(0, split).trim().replace(/^!/, '');
+  const head = (part: string): string =>
+    /([A-Za-z_]\w*)\s*(?:<|$)/.exec(part.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '').trim())?.[1] ?? '';
+  const open = traitPart.indexOf('<');
+  const traitArgs = open < 0 ? [] : [...traitPart.slice(open + 1).matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)]
+    .map((m) => m[1]!).filter((id) => id !== 'mut' && id !== 'dyn');
+  return { trait: head(open < 0 ? traitPart : traitPart.slice(0, open)), traitArgs, self: head(rest.slice(split + 5)) };
+}
+
+/** The `impl Trait<…> for Type<…>` a Rust method is declared in: null for an inherent impl, or none. */
+function rustTraitImplHeader(method: Node, context: ResolutionContext): RustImplHeader | null {
+  let memo = RUST_IMPL_HEADERS.get(context);
+  if (!memo) RUST_IMPL_HEADERS.set(context, (memo = new Map()));
+  const hit = memo.get(method.id);
+  if (hit !== undefined) return hit;
+  let header: RustImplHeader | null = null;
+  const lines = context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/) ?? [];
+  for (let i = method.startLine - 2; i >= 0; i--) {
+    const line = lines[i] ?? '';
+    if (/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/.test(line)) {
+      let text = line.replace(/\/\/.*$/, '');
+      for (let j = i + 1; !text.includes('{') && j < Math.min(lines.length, i + 8); j++) text += ` ${(lines[j] ?? '').replace(/\/\/.*$/, '')}`;
+      header = parseRustImplHeader(text);
+      break;
+    }
+    // A top-level item above the method means it was not inside an impl.
+    if (/^(?:pub(?:\([^)]*\))?\s+)?(?:fn|struct|enum|mod|trait|const|static|type)\b/.test(line)) break;
+  }
+  memo.set(method.id, header);
+  return header;
+}
+
+function isRustProjectNamed(name: string, kinds: ReadonlySet<string>, context: ResolutionContext): boolean {
+  return context.getNodesByName(name).some((n) => n.language === 'rust' && kinds.has(n.kind));
+}
+
+const RUST_TRAIT_KIND = new Set(['trait']);
+
+/**
+ * Whether a call's first argument is evidently a `type`: a value built through
+ * it (`IDI::Install`, `Str::from(…)`), `self` in an impl of it, or a name the
+ * enclosing function declares with it (`fn from(name: Str)`, `let s: Str`).
+ */
+function rustFirstArgIs(type: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const method = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf(':'), ref.referenceName.lastIndexOf('.')) + 1);
+  const text = [(lines[ref.line - 1] ?? '').slice(Math.max(0, ref.column)), ...lines.slice(ref.line, ref.line + 4)].join(' ');
+  const open = new RegExp(`\\b${method}\\s*\\(`).exec(text);
+  // Not where the reference says: nothing to read, so nothing to veto.
+  if (!open) return true;
+  let depth = 0;
+  let end = open.index + open[0].length;
+  for (; end < text.length; end++) {
+    const ch = text[end]!;
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) {
+      if (depth === 0) break;
+      depth--;
+    } else if (ch === ',' && depth === 0) break;
+  }
+  const arg = text.slice(open.index + open[0].length, end).trim().replace(/^(?:&\s*(?:mut\s+)?|\*)+/, '').replace(/\.clone\(\)$/, '');
+  if (new RegExp(`^(?:[A-Za-z_]\\w*::)*${type}\\b`).test(arg)) return true;
+  if (!/^[A-Za-z_]\w*$/.test(arg)) return false;
+  const declared = new RegExp(`\\b${arg}\\s*:\\s*&?\\s*(?:'\\w+\\s+)?(?:mut\\s+)?(?:[A-Za-z_]\\w*::)*${type}\\b`);
+  const built = new RegExp(`\\blet\\s+(?:mut\\s+)?${arg}\\s*=\\s*&?\\s*(?:[A-Za-z_]\\w*::)*${type}\\b`);
+  for (let i = ref.line - 1; i >= 0; i--) {
+    const line = lines[i] ?? '';
+    if (arg === 'self' && /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/.test(line)) {
+      const impl = parseRustImplHeader(`${line} {`);
+      return (impl?.self ?? /impl\b(?:\s*<[^>]*>)?\s*(?:[A-Za-z_]\w*::)*([A-Za-z_]\w*)/.exec(line)?.[1]) === type;
+    }
+    if (arg !== 'self' && (declared.test(line) || built.test(line))) return true;
+    // Above the enclosing function, nothing more declares it.
+    if (arg !== 'self' && /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s/.test(line)) break;
+  }
+  return false;
+}
+
+/** Whether the file of `ref` has the project trait `trait` in scope: declared or implemented there, or brought in by a `use`. */
+function isRustTraitInScope(trait: string, ref: UnresolvedRef, target: Node, context: ResolutionContext): boolean {
+  if (ref.filePath === target.filePath) return true;
+  const traits = context.getNodesByName(trait).filter((n) => n.kind === 'trait' && n.language === 'rust');
+  if (traits.some((t) => t.filePath === ref.filePath)) return true;
+  const uses = rustUsesOf(ref.filePath, context);
+  if (uses.names.has(trait)) return true;
+  // A glob over a prelude or a crate's root may hand it on: it can't be told apart.
+  const crates = rustProjectCrates(context);
+  if ([...uses.globs].some((g) => g === 'prelude' || g === 'crate' || crates.has(g))) return true;
+  return traits.some((t) => rustGlobCovers(uses, t, ref));
+}
+
+/**
+ * Whether a Rust call can reach this method of a project `impl` on a std type,
+ * as Rust picks one. A crate implements only a trait for `String`, `Vec`,
+ * `Arc` or `NonNull`, never a method of its own:
+ * - a std trait, which it can implement only for one of its own types
+ *   (`impl From<IDI> for String`): `String::from(x)` is that impl's only when
+ *   `x` is an `IDI`. dioxus's `String::from("…")` calls all went to it,
+ *   tokio's `NonNull::from(waiter)` to its `impl From<&Handle> for NonNull<Entry>`;
+ * - a trait of the project's (`impl Link for Arc<ScheduledIo>`), reached only
+ *   where the trait is in scope: tokio's `Arc::from_raw(ptr)` in `util/wake.rs`
+ *   is std's own, its tests' `files.iter()` a `Vec`'s, not a `Storage` impl's.
+ */
+export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (target.language !== 'rust' || target.kind !== 'method') return true;
+  const cut = target.qualifiedName.lastIndexOf('::');
+  const owner = cut < 0 ? '' : target.qualifiedName.slice(0, cut).split('::').pop()!;
+  if (!RUST_STD_TYPES.has(owner) || isRustProjectNamed(owner, RUST_DECLARED_TYPE_KINDS, context)) return true;
+  const impl = rustTraitImplHeader(target, context);
+  if (!impl || impl.self !== owner || impl.trait === '') return true;
+  if (isRustProjectNamed(impl.trait, RUST_TRAIT_KIND, context)) return isRustTraitInScope(impl.trait, ref, target, context);
+  const local = impl.traitArgs.find((t) => isRustProjectNamed(t, RUST_DECLARED_TYPE_KINDS, context));
+  return local === undefined || rustFirstArgIs(local, ref, context);
+}
+
 /** Whether `type` is a Rust enum that declares `variant` (#2328). */
 function declaresRustVariant(type: Node, variant: string, context: ResolutionContext): boolean {
   if (type.kind !== 'enum') return false;
@@ -8276,6 +8459,7 @@ export function matchByExactName(
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !isObjcFileLocalElsewhere(n, ref) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
     !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
@@ -13640,6 +13824,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_CRATES.delete(context);
   RUST_DEPENDENCIES.delete(context);
   RUST_CRATE_GRAPHS.delete(context);
+  RUST_IMPL_HEADERS.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
   KOTLIN_LAMBDA_RECEIVERS.delete(context);
   SCALA_IMPORTED_SUPERS.delete(context);
@@ -18230,6 +18415,7 @@ export function matchFuzzy(
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !isObjcFileLocalElsewhere(n, ref) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
