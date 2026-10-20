@@ -246,6 +246,14 @@ function resetFnMemo(node: SyntaxNode): void {
   }
 }
 
+/**
+ * A clause's right-hand sides: one `match`, or one per guard
+ * (`f n | n < 0 = a | otherwise = b`), each with its own expression.
+ */
+function clauseMatches(node: SyntaxNode): SyntaxNode[] {
+  return node.childrenForFieldName('match').filter((m): m is SyntaxNode => !!m);
+}
+
 /** Walk a `match` node's expression subtree (and where-clause locals) for calls. */
 function visitMatch(matchNode: SyntaxNode, fnId: string, ctx: ExtractorContext): void {
   ctx.pushScope(fnId);
@@ -284,8 +292,7 @@ export function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext, kind
         break;
       }
     }
-    const match = getChildByField(node, 'match');
-    if (match) visitMatch(match, lastFnId, ctx);
+    for (const match of clauseMatches(node)) visitMatch(match, lastFnId, ctx);
     // where-clause local binds (sibling `binds` field on the function node)
     const binds = getChildByField(node, 'binds');
     if (binds) {
@@ -311,8 +318,7 @@ export function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext, kind
   lastFnScope = currentScope;
   lastFnId = fn.id;
 
-  const match = getChildByField(node, 'match');
-  if (match) visitMatch(match, fn.id, ctx);
+  for (const match of clauseMatches(node)) visitMatch(match, fn.id, ctx);
   // where-clause local binds
   const binds = getChildByField(node, 'binds');
   if (binds) {
@@ -342,8 +348,8 @@ export function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext, kind
  * definitions: point-free local functions are common there.
  */
 function handleStatementBind(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const match = getChildByField(node, 'match');
-  if (!match) {
+  const matches = clauseMatches(node);
+  if (matches.length === 0) {
     const expression = getChildByField(node, 'expression');
     if (expression) ctx.visitNode(expression);
     return true;
@@ -358,8 +364,10 @@ function handleStatementBind(node: SyntaxNode, ctx: ExtractorContext): boolean {
   // names no function: its expression runs in the enclosing one.
   const isPatternBind = !getChildByField(node, 'name') && !!getChildByField(node, 'pattern');
   if (!isDoLetValue && !isPatternBind) return false;
-  for (const child of match.namedChildren) {
-    if (child) ctx.visitNode(child);
+  for (const match of matches) {
+    for (const child of match.namedChildren) {
+      if (child) ctx.visitNode(child);
+    }
   }
   const binds = getChildByField(node, 'binds');
   if (binds) {

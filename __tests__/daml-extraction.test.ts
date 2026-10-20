@@ -251,6 +251,53 @@ reopen : (HasFetch t) => ContractId t -> Update t
 reopen cid = fetchFromInterface @t cid
 `;
 
+const GUARDS = `module Cal where
+
+addDays : Int -> Int -> Int
+addDays n d
+  | n == 0 = d
+  | n < 0 = addDays (n + 1) $ prevDay d
+  | otherwise = addDays (n - 1) $ nextDay d
+
+clamp : Int -> Int
+clamp 0 = zero
+clamp n
+  | n > 10 = ceiling n
+  | otherwise = floorOf n
+  where
+    ceiling m
+      | m > 100 = cap m
+      | otherwise = m
+
+fees : Int -> Update Int
+fees n = do
+  let fee
+        | n > 10 = bigFee n
+        | otherwise = smallFee n
+  pure fee
+`;
+
+describe('guarded right-hand sides', () => {
+  for (const [language, path, source] of [
+    ['DAML', 'daml/Cal.daml', GUARDS],
+    ['Haskell', 'src/Cal.hs', GUARDS.replace(/ : /g, ' :: ')],
+  ] as const) {
+    it(`${language}: links the calls of every guard, not only the first`, () => {
+      const { nodes, unresolvedReferences: refs } = extractFromSource(path, source);
+      expect(refsFrom(refs, find(nodes, 'function', 'addDays'), 'calls')).toEqual(
+        expect.arrayContaining(['addDays', 'prevDay', 'nextDay']),
+      );
+      // A later clause of the same function, and a guarded `where` helper.
+      expect(refsFrom(refs, find(nodes, 'function', 'clamp'), 'calls')).toEqual(expect.arrayContaining(['floorOf']));
+      expect(refsFrom(refs, find(nodes, 'function', 'ceiling'), 'calls')).toContain('cap');
+      // A guarded `let` value runs in the enclosing function.
+      expect(refsFrom(refs, find(nodes, 'function', 'fees'), 'calls')).toEqual(
+        expect.arrayContaining(['bigFee', 'smallFee']),
+      );
+    });
+  }
+});
+
 describe('DAML ledger actions on templates', () => {
   it('calls the template a by-key action names, and the template `create this` is written in', () => {
     const { nodes, unresolvedReferences: refs } = extractFromSource('daml/Settle/Batch.daml', LEDGER);
