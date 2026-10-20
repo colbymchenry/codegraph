@@ -2002,8 +2002,23 @@ const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
  */
 const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
 
-/** The C types an Objective-C file can define, as opposed to its classes and protocols. */
-const OBJC_C_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'type_alias']);
+/**
+ * What an Objective-C source file defines for itself, as C does: its C types
+ * and its globals, as opposed to its classes and protocols.
+ */
+const OBJC_FILE_LOCAL_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'type_alias', 'variable', 'constant']);
+
+/**
+ * Whether `n` is a C type or global that an Objective-C source file other
+ * than `ref`'s defines, which no other file can name. It leaves the
+ * candidates before one is picked, so a global's declaration in a header
+ * (Hammerspoon's `extern NSString *MJConfigFile;` in variables.h) stands for
+ * the definition in variables.m. isVisibleAcrossFiles applies the same rule
+ * to the pipeline's pick.
+ */
+function isObjcFileLocalElsewhere(n: Node, ref: UnresolvedRef): boolean {
+  return n.language === 'objc' && n.filePath !== ref.filePath && OBJC_FILE_LOCAL_KINDS.has(n.kind) && C_SOURCE_EXT.test(n.filePath);
+}
 
 /** Per context: a C/C++ type's qualified name → its declarations. */
 const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
@@ -3145,8 +3160,9 @@ function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
  *   whichever USB class file ranked first. So is what a source file's
  *   unnamed namespace declares, and a type only source files declare, with
  *   its members (isCppTranslationUnitLocal).
- * - **Objective-C**: a struct, union, enum or typedef a `.m` / `.mm` source
- *   file defines is local to that file, as in C. A class is not.
+ * - **Objective-C**: a struct, union, enum, typedef or global a `.m` / `.mm`
+ *   source file defines is local to that file, as in C; other files reach a
+ *   global through its header's `extern` declaration. A class is not.
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -3220,8 +3236,14 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // An Objective-C source file is a translation unit too: a C type it defines
   // is its own. ObjFW's runtime keeps `static struct Lock { … } *locks;` in
   // synchronized.m, and the AmigaOS `Lock(path, mode)` calls in other files
-  // make no such struct. (A class is the runtime's, wherever it is written.)
-  if (lang === 'objc' && OBJC_C_TYPE_KINDS.has(candidate.kind) && C_SOURCE_EXT.test(candidate.filePath)) return false;
+  // make no such struct. So is a global it defines: another file reaches one
+  // through the header that declares it (`extern OFStdIOStream *OFStdOut;`),
+  // whose node stands for it there. React Native's
+  // `completionHandler(nil, image)` calls a block parameter, not the
+  // `completionHandler` another .mm file keeps, and `#include <vector>` names
+  // no `.mm` file's `vector`. (A class is the runtime's, wherever it is
+  // written.)
+  if (isObjcFileLocalElsewhere(candidate, ref)) return false;
   if (lang === 'go') return isGoNameVisible(candidate, ref);
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
@@ -8437,6 +8459,7 @@ export function matchByExactName(
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !isObjcFileLocalElsewhere(n, ref) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
     !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
@@ -18146,6 +18169,7 @@ export function matchFuzzy(
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
+    !isObjcFileLocalElsewhere(n, ref) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&

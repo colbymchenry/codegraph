@@ -32,6 +32,17 @@ export function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | nul
   return null;
 }
 
+/**
+ * Whether a C or Objective-C declaration is a constant: a `const` or
+ * `static const` file-scope declaration carries a `type_qualifier` child
+ * reading "const". Extracted as `constant`, plain globals as `variable`. A
+ * `const` inside a pointer declarator (`char *const p`) qualifies the
+ * pointer, and the declaration stays a variable.
+ */
+export function isConstDeclaration(node: SyntaxNode): boolean {
+  return node.namedChildren.some((c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const');
+}
+
 /** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
 const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
@@ -431,13 +442,7 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  // A `const`/`static const` file-scope declaration carries a `type_qualifier`
-  // child reading "const" — extract those as `constant`, plain globals as
-  // `variable`.
-  isConst: (node) =>
-    node.namedChildren.some(
-      (c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const'
-    ),
+  isConst: isConstDeclaration,
   getReturnType: extractCppReturnType,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`

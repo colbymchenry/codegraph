@@ -4,6 +4,7 @@ import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import {
   blankLoneMacroLines,
   definingDeclaration,
+  isConstDeclaration,
   OBJC_LONE_MACROS,
   rewriteFoundationEnumMacros,
   unnamedTypeVariableName,
@@ -129,6 +130,8 @@ export const objcExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   getReturnType: extractObjcReturnType,
+  // `static const NSInteger kMaxRetries = 3;` is a constant, as in C.
+  isConst: isConstDeclaration,
   // A method is named by its selector. An unnamed struct, union or enum
   // defined in a declaration's type takes the first variable's name, as in C:
   // `static struct { … } placeholder;` is the struct `placeholder`.

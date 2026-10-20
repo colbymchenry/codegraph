@@ -1515,9 +1515,14 @@ export class TreeSitterExtractor {
     // languages) keep almost exclusively inside a class/module. A Ruby `CONST =
     // …` has a `constant`-typed LHS; other languages don't put one here, so this
     // is effectively Ruby-only and doesn't disturb their class-internal locals.
+    // An Objective-C declaration written in an `@implementation`
+    // (`static NSString *const kKey = @"…";`) is file-scope C, though it sits
+    // between `@implementation` and `@end`.
     else if (
       this.extractor.variableTypes.includes(nodeType) &&
-      (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
+      (!this.isInsideClassLikeNode() ||
+        this.isClassScopeConstantAssignment(node) ||
+        (this.language === 'objc' && node.parent?.type === 'implementation_definition'))
     ) {
       // C, C++ and Objective-C: a class, struct, union or enum defined in the
       // declaration's type (`struct Foo { … } foo;`, `static struct { … }
@@ -3709,8 +3714,8 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, target.name, nameNode, { docstring, signature: initSignature, isExported });
       });
-    } else if (this.language === 'c') {
-      // C: a `declaration` node's name nests inside the `declarator` field —
+    } else if (this.language === 'c' || this.language === 'objc') {
+      // C and Objective-C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
       // value); a `function_declarator` is a prototype, not a variable. The
       // generic fallback below only finds a *direct* identifier child, which C
@@ -3733,11 +3738,15 @@ export class TreeSitterExtractor {
           // a spurious type-named global for every macro-prefixed prototype in a
           // header. Those misparses are always bare identifiers; real
           // consts/tables always carry an initializer. The only legit loss is
-          // uninitialized scalar globals (`static int g;`).
+          // uninitialized scalar globals (`static int g;`). Objective-C keeps
+          // them, as it did before it shared this branch: until then it read
+          // nothing but bare identifiers, and missed every
+          // `NSString *const kKey = @"…";`.
           if (
             child.type !== 'init_declarator' &&
             child.type !== 'pointer_declarator' &&
-            child.type !== 'array_declarator'
+            child.type !== 'array_declarator' &&
+            !(this.language === 'objc' && child.type === 'identifier')
           ) {
             continue;
           }

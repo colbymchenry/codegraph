@@ -65,6 +65,7 @@ describe('a doc comment inside an Objective-C @implementation', () => {
       expect(docs).toEqual([
         'property Tests::runs: The number of runs.',
         'struct Tests::g_callbackData: Flags the callbacks set.',
+        'variable Tests::g_callbackData: Flags the callbacks set.',
         'method Tests::testIt: Runs it.',
         'function Tests::helper: A helper.',
         'method Tests::shared: The shared instance.',
