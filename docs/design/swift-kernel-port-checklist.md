@@ -43,6 +43,12 @@ at survey time: exactly 348) ride it (§Dedicated property branch).
 
 ## Grammar prep (NOT staged — land FIRST, before any walker exists)
 
+> **Update 2026-10-19:** the kernel no longer depends on the crate. It
+> compiles the same tarball's `src/` from `codegraph-kernel/grammars/swift/`
+> with a one-line scanner patch, because the crate's MSVC build misread every
+> `try!` on Windows (`docs/grammars/tree-sitter-swift.md`). The wasm below is
+> unchanged.
+
 swift is **not** in `VENDORED_WASM_LANGS` (grammars.ts:291) — production loads
 `require.resolve('tree-sitter-wasms/out/tree-sitter-swift.wasm')` (mapping
 `swift: 'tree-sitter-swift.wasm'` at grammars.ts:34; `.swift` → swift at

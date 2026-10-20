@@ -139,12 +139,15 @@ export function Header() { return <h1><Badge /></h1>; }
  *   writes a type's name right after another name. outline's document list
  *   rendered its `Document` model class, its settings tables the `User` and
  *   `Group` classes.
- * - A name the parent binds itself, as a `const` or a parameter, is that local
- *   wherever its tags sit. outline's menus pick a Radix part into `const
- *   Content = variant === 'dropdown' ? DropdownMenu.SubContent :
+ * - A name the parent binds itself, as a `const`, a parameter or a name it
+ *   destructures, is that local wherever its tags sit, and so is a name a
+ *   function around the parent binds. outline's menus pick a Radix part into
+ *   `const Content = variant === 'dropdown' ? DropdownMenu.SubContent :
  *   ContextMenu.SubContent` and rendered the command bar's styled `Content`
- *   instead. A local is no node, so it renders nothing, unless the parent
- *   declares a component of that name inside itself.
+ *   instead; refine's layout renders the `Header` and `Footer` its props hand
+ *   in, and rendered other examples' components of those names. A local is no
+ *   node, so it renders nothing, unless the function that binds it declares a
+ *   component of that name inside itself.
  */
 describe('JSX child: a name the parent writes only as a type, or binds itself', () => {
   let dir: string;
@@ -322,24 +325,220 @@ export function Toolbar({ actions }) {
     expect(renders('Toolbar')).toEqual(['Icon app/icon.tsx:1']);
   });
 
-  it('keeps a destructured name on the same-named component, as a destructured call does', async () => {
-    // excalidraw's example app: `const { Sidebar, Footer, … } = excalidrawLib`.
-    // Destructuring is not the parent's own binding here, as it is not for a
-    // bare call (`const { t } = useI18n()`), so the name links by name.
+  it('renders nothing for a name the parent destructures from a value or its props', async () => {
     write(
       'packages/excalidraw/components/WelcomeScreen.tsx',
       'export default function WelcomeScreen() {\n  return <div />;\n}\n'
     );
+    write('examples/app/sidebar/ExampleSidebar.tsx', 'export function Sidebar() {\n  return <aside />;\n}\n');
+    write('examples/blog/header.tsx', 'export function Header() {\n  return <header />;\n}\n');
+    write('examples/blog/footer.tsx', 'export function Footer() {\n  return <footer />;\n}\n');
+    write('shared/glyph.tsx', 'export function Glyph() {\n  return <i />;\n}\n');
+    write('shared/icon.tsx', 'export function Icon() {\n  return <svg />;\n}\n');
+    write('shared/panel.tsx', 'export function Panel() {\n  return <section />;\n}\n');
+    // excalidraw's example app takes the library as a prop and renders its
+    // parts, in the component and in a function nested in it.
     write(
       'examples/app/ExampleApp.tsx',
       `export default function ExampleApp({ excalidrawLib }) {
-  const { WelcomeScreen, exportToSvg } = excalidrawLib;
-  return <div><WelcomeScreen /></div>;
+  const { WelcomeScreen, exportToSvg, Sidebar } = excalidrawLib;
+  const renderSidebar = () => {
+    return <Sidebar name="custom" />;
+  };
+  return <div><WelcomeScreen />{renderSidebar()}</div>;
+}
+`
+    );
+    // refine's layout renders the parts its props hand in.
+    write(
+      'examples/app/Layout.tsx',
+      `export const Layout = ({ children, Header, Footer }) => {
+  return (
+    <div>
+      {Header && <Header />}
+      {children}
+      {Footer && <Footer />}
+    </div>
+  );
+};
+`
+    );
+    // A rename's target, a pattern nested in a parameter's, an array pattern.
+    write(
+      'examples/app/Nav.tsx',
+      `import * as React from 'react';
+
+export function Nav({ items, slots: { Panel } }) {
+  const [Icon] = React.useState(null);
+  return (
+    <ul>
+      {items.map(({ icon: Glyph, label }) => <li key={label}><Glyph /><Icon /></li>)}
+      <Panel />
+    </ul>
+  );
 }
 `
     );
     await index();
-    expect(renders('ExampleApp')).toEqual(['WelcomeScreen packages/excalidraw/components/WelcomeScreen.tsx:1']);
+    expect(renders('ExampleApp')).toEqual([]);
+    expect(renders('renderSidebar')).toEqual([]);
+    expect(renders('Layout')).toEqual([]);
+    expect(renders('Nav')).toEqual([]);
+  });
+
+  it('renders nothing for a name a function around the parent binds, unless that function declares it', async () => {
+    write('a-decoy/icon.tsx', 'export function Icon() {\n  return <svg />;\n}\n');
+    write('a-decoy/item.tsx', 'export function StyledItem() {\n  return <li />;\n}\n');
+    write('a-decoy/cell.tsx', 'export function Cell() {\n  return <td />;\n}\n');
+    write(
+      'app/menu.tsx',
+      `export function Menu({ items }) {
+  const Icon = items[0].icon;
+  const renderItem = (item) => <li key={item.id}><Icon /></li>;
+  return <ul>{items.map(renderItem)}</ul>;
+}
+
+export function Tree({ nodes }) {
+  const StyledItem = ({ label }) => <li>{label}</li>;
+  const renderNode = (node) => <StyledItem key={node.id} label={node.label} />;
+  return <ul>{nodes.map(renderNode)}</ul>;
+}
+`
+    );
+    // The callback's `Cell` is its own; the tag below it renders the
+    // component the table declares.
+    write(
+      'app/table.tsx',
+      `export function Table({ rows, columns }) {
+  function Cell({ value }) {
+    return <td>{value}</td>;
+  }
+  const titles = columns.map(({ Cell, title }) => title);
+  return <table>{rows.map((row) => <tr key={row.id}><Cell value={row.value} /></tr>)}</table>;
+}
+`
+    );
+    await index();
+    expect(renders('renderItem')).toEqual([]);
+    expect(renders('renderNode')).toEqual(['StyledItem app/menu.tsx:8']);
+    expect(renders('Table')).toEqual(['Cell app/table.tsx:2']);
+  });
+
+  it('still renders the component for a rename’s key, a default value, a type literal, an object argument or a require', async () => {
+    write('app/footer.tsx', 'export function Footer() {\n  return <footer />;\n}\n');
+    write('app/fallback.tsx', 'export function Fallback() {\n  return <div />;\n}\n');
+    write('app/badge.tsx', 'export function Badge() {\n  return <b />;\n}\n');
+    write('app/legacy.tsx', 'export function Legacy() {\n  return <div />;\n}\n');
+    write('app/chart.tsx', 'export function Chart() {\n  return <canvas />;\n}\n');
+    write(
+      'app/Card.tsx',
+      `import { Footer } from './footer';
+import { Fallback } from './fallback';
+import { Badge } from './badge';
+
+export function Card({ parts, Slot = Fallback }) {
+  const { Footer: CustomFooter } = parts;
+  return (
+    <div>
+      <Footer />
+      <Fallback />
+      <Slot />
+    </div>
+  );
+}
+
+export function Tag({ label }: { label: string, badge: Badge }) {
+  return <Badge>{label}</Badge>;
+}
+
+export function Note(props: { badge: Badge }) {
+  return <Badge />;
+}
+
+export function Shell({ render }) {
+  return render({ Footer }) ?? <Footer />;
+}
+`
+    );
+    // A destructured require or import binds the module's own export.
+    write(
+      'app/legacy-page.jsx',
+      `function LegacyPage() {
+  const { Legacy } = require('./legacy');
+  return <Legacy />;
+}
+
+async function renderChart() {
+  const { Chart } = await import('./chart');
+  return <Chart />;
+}
+
+module.exports = { LegacyPage, renderChart };
+`
+    );
+    await index();
+    expect(renders('Card')).toEqual(['Fallback app/fallback.tsx:1', 'Footer app/footer.tsx:1']);
+    expect(renders('Tag')).toEqual(['Badge app/badge.tsx:1']);
+    expect(renders('Note')).toEqual(['Badge app/badge.tsx:1']);
+    expect(renders('Shell')).toEqual(['Footer app/footer.tsx:1']);
+    expect(renders('LegacyPage')).toEqual(['Legacy app/legacy.tsx:1']);
+    expect(renders('renderChart')).toEqual(['Chart app/chart.tsx:1']);
+  });
+
+  it('renders nothing for a name the file destructures at its top, unless a function declares it inside itself', async () => {
+    write('examples/finefoods/title.tsx', 'export function Title() {\n  return <h1 />;\n}\n');
+    write('examples/crm/text.tsx', 'export function Text() {\n  return <span />;\n}\n');
+    // refine's pages take antd's typography parts once, at the top.
+    write(
+      'examples/blog/show.tsx',
+      `import { Typography } from 'antd';
+
+const { Title, Text } = Typography;
+
+export function PostShow({ post }) {
+  return (
+    <div>
+      <Title level={5}>Title</Title>
+      <Text>{post.title}</Text>
+    </div>
+  );
+}
+
+export function Summary() {
+  function Text({ children }) {
+    return <p>{children}</p>;
+  }
+  return <Text>summary</Text>;
+}
+`
+    );
+    await index();
+    expect(renders('PostShow')).toEqual([]);
+    expect(renders('Summary')).toEqual(['Text examples/blog/show.tsx:15']);
+  });
+
+  it('still renders the component for a top-level require, a top-level callback’s parameter or another function’s local', async () => {
+    write('app/legacy.tsx', 'export function Legacy() {\n  return <div />;\n}\n');
+    write('app/badge.tsx', 'export function Badge() {\n  return <b />;\n}\n');
+    write('app/chart.tsx', 'export function Chart() {\n  return <canvas />;\n}\n');
+    write(
+      'app/page.jsx',
+      `const { Legacy } = require('./legacy');
+
+[1].forEach(({ Badge }) => Badge);
+
+function helper(props) {
+  const { Chart } = props;
+  return Chart;
+}
+
+export function Page() {
+  return <div><Legacy /><Badge /><Chart />{helper}</div>;
+}
+`
+    );
+    await index();
+    expect(renders('Page')).toEqual(['Badge app/badge.tsx:1', 'Chart app/chart.tsx:1', 'Legacy app/legacy.tsx:1']);
   });
 });
 
