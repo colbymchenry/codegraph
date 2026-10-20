@@ -2554,6 +2554,46 @@ program
  *   codegraph affected src/lib/components/Editor.svelte src/routes/+page.svelte
  */
 program
+  .command('architecture')
+  .description('Check dependency boundaries and module cycles')
+  .option('-p, --path <path>', 'Project path')
+  .option('--root <directory>', 'Module grouping root')
+  .option('--depth <number>', 'Module grouping depth (1-4)')
+  .option('--deny <from:to...>', 'Forbidden module dependency directions')
+  .option('--allow-undeclared', 'Include name-only dependency matches')
+  .option('--strict', 'Exit with status 1 when a rule is violated')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { path?: string; root?: string; depth?: string; deny?: string[]; allowUndeclared?: boolean; strict?: boolean; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+    const depth = options.depth === undefined ? undefined : Number(options.depth);
+    if (depth !== undefined && (!Number.isInteger(depth) || depth < 1 || depth > 4)) {
+      throw new Error('depth must be a whole number from 1 to 4.');
+    }
+    const rules = (options.deny ?? []).map(rule => {
+      const parts = rule.split(':');
+      if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error('Each deny rule must be from:to.');
+      return { from: parts[0], to: parts[1] };
+    });
+    const { default: CodeGraph } = await loadCodeGraph();
+    const graph = await CodeGraph.open(projectPath);
+    try {
+      const report = graph.getArchitectureReport({ root: options.root, depth, rules, requireDeclared: !options.allowUndeclared });
+      if (options.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        console.log('Architecture: ' + report.modules + ' modules, ' + report.rules.violated + ' violations, ' + report.cycles.total + ' cycles');
+        for (const violation of report.violations) {
+          console.log(violation.source + ' -> ' + violation.target);
+          for (const evidence of violation.evidence) console.log('  ' + evidence.fromFile + ':' + evidence.line + ' -> ' + evidence.toFile);
+        }
+        for (const cycle of report.cycles.items) console.log('Cycle: ' + cycle.modules.join(' -> '));
+      }
+      if (options.strict && report.rules.violated > 0) process.exitCode = 1;
+    } finally {
+      await graph.close();
+    }
+  });
+
+program
   .command('affected [files...]')
   .description('Find test files affected by changed source files')
   .option('-p, --path <path>', 'Project path')

@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- A read-only architecture report identifies forbidden dependency directions and module cycles with source evidence.
+
 ### Fixes
 
 - In JavaScript and TypeScript, a call written as the body of an `if`, `while`, `for` or `do` without braces, like `if (e.key === "Escape") setOpen(false);`, no longer links to a same-named property or method in another file when the name is the file's own, such as a `setOpen` from `useState` (#2585).
