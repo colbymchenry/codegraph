@@ -7901,6 +7901,8 @@ interface RustUsePath {
   segs: string[];
   /** The offset of its `use` in the file, which decides the module the path starts from. */
   at: number;
+  /** A `pub use` (of any reach), which a glob over its module passes on. */
+  pub: boolean;
 }
 
 /** An inline `mod name { … }`, by the offsets of its braces. */
@@ -8150,10 +8152,12 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
     const outside = root === 'std' || root === 'core' || root === 'alloc' || (root !== '' && dependencies.has(root));
     // Every path, outside ones too: walked, a path dependency on a crate the
     // workspace doesn't list is the project's (a facade's `pub use shared::Thing`).
+    const kw = m.index! + m[0].indexOf('use');
+    const pub = /\bpub(?:\s*\([^()]*\))?\s*$/.test(text.slice(Math.max(0, kw - 48), kw));
     for (const { segs, local } of rustUseTreeBindings(tree)) {
       // A macro's own `use $crate::…` names no module of this file's.
       if (segs.length === 0 || segs[0]!.startsWith('$') || RUST_STD_ROOTS.has(segs[0]!)) continue;
-      const path: RustUsePath = { segs, at: m.index! };
+      const path: RustUsePath = { segs, at: m.index!, pub };
       if (local === null) uses.globPaths.push(path);
       else if (uses.paths.has(local)) uses.paths.get(local)!.push(path);
       else uses.paths.set(local, [path]);
@@ -8398,11 +8402,12 @@ function rustLibModule(crateDir: string, context: ResolutionContext): RustModule
 
 /**
  * The module `name` that `m` declares: inline (`mod name { … }`), else
- * `<name>.rs` or `<name>/mod.rs` in its directory. null for one a `#[path]`
- * puts elsewhere — tokio's `process::imp` is `unix/mod.rs` or `windows.rs` by
- * cfg — as for one with no file.
+ * `<name>.rs` or `<name>/mod.rs` in its directory, else one it passes on under
+ * that name — dioxus's `pub use dioxus_hooks as hooks;`. null for one a
+ * `#[path]` puts elsewhere — tokio's `process::imp` is `unix/mod.rs` or
+ * `windows.rs` by cfg — as for one with no file.
  */
-function rustSubmodule(m: RustModule, name: string, context: ResolutionContext): RustModule | null {
+function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0): RustModule | null {
   const dir = rustJoin(m.dir, name);
   const layout = rustUsesOf(m.file, context);
   if (layout.pathMods.has(name)) return null;
@@ -8410,6 +8415,12 @@ function rustSubmodule(m: RustModule, name: string, context: ResolutionContext):
   if (block) return { file: m.file, dir, block, root: false };
   for (const file of [`${dir}.rs`, `${dir}/mod.rs`]) {
     if (context.fileExists(file)) return { file, dir, block: null, root: false };
+  }
+  if (depth >= 8) return null;
+  for (const p of layout.paths.get(name) ?? []) {
+    if (rustBlockAt(layout.blocks, p.at) !== m.block) continue;
+    const passed = rustWalkModules(p.segs, m, context, depth + 1);
+    if (passed !== null && passed !== 'outside') return passed;
   }
   return null;
 }
@@ -8435,7 +8446,7 @@ function rustSuperModule(m: RustModule, context: ResolutionContext): RustModule 
  * 'outside' for the standard library and every other crate; null when a step
  * finds no module the project holds.
  */
-function rustWalkModules(segs: readonly string[], from: RustModule, context: ResolutionContext): RustModule | 'outside' | null {
+function rustWalkModules(segs: readonly string[], from: RustModule, context: ResolutionContext, depth = 0): RustModule | 'outside' | null {
   const [first, ...rest] = segs;
   if (first === undefined) return from;
   let at: RustModule | null;
@@ -8444,7 +8455,7 @@ function rustWalkModules(segs: readonly string[], from: RustModule, context: Res
   else if (first === 'super') at = rustSuperModule(from, context);
   else if (RUST_STD_ROOTS.has(first)) return 'outside';
   else {
-    at = rustSubmodule(from, first, context);
+    at = rustSubmodule(from, first, context, depth);
     if (at === null) {
       const graph = rustCrateGraph(context);
       const own = rustCrateDirOf(from.file, graph);
@@ -8456,13 +8467,17 @@ function rustWalkModules(segs: readonly string[], from: RustModule, context: Res
   }
   for (const seg of rest) {
     if (at === null) return null;
-    at = seg === 'self' ? at : seg === 'super' ? rustSuperModule(at, context) : rustSubmodule(at, seg, context);
+    at = seg === 'self' ? at : seg === 'super' ? rustSuperModule(at, context) : rustSubmodule(at, seg, context, depth);
   }
   return at;
 }
 
-/** The items `m` declares as `name` at its own level: not in a module it declares inline, nor inside a function. */
-function rustDeclaredItems(m: RustModule, name: string, context: ResolutionContext): Node[] {
+/**
+ * The items `m` declares as `name` at its own level: not in a module it
+ * declares inline, nor inside a function. With `publicOnly`, only its `pub`
+ * ones (a trait or const records no visibility, and counts).
+ */
+function rustDeclaredItems(m: RustModule, name: string, context: ResolutionContext, publicOnly = false): Node[] {
   const out: Node[] = [];
   for (const file of m.alt ? [m.file, m.alt] : [m.file]) {
     const layout = rustUsesOf(file, context);
@@ -8470,6 +8485,7 @@ function rustDeclaredItems(m: RustModule, name: string, context: ResolutionConte
     for (const n of context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((c) => c.name === name)) {
       // An item in a function body is qualified by it (`outer::Inner`); an inline module adds nothing.
       if (n.language !== 'rust' || n.qualifiedName !== name || !RUST_MODULE_ITEM_KINDS.has(n.kind)) continue;
+      if (publicOnly && n.visibility === 'private') continue;
       const at = (layout.lineStarts[n.startLine - 1] ?? 0) + Math.max(0, n.startColumn ?? 0);
       if (rustBlockAt(layout.blocks, at) === block) out.push(n);
     }
@@ -8484,20 +8500,22 @@ function rustDeclaredItems(m: RustModule, name: string, context: ResolutionConte
  * are — else the ones its globs do. An outside crate's add nothing. null when
  * one of them can't be followed. `seen` holds the lookups under way, so
  * modules that glob each other (`use super::*` below a `pub use child::*`)
- * end the walk.
+ * end the walk. `publicOnly` is a glob's view from outside the module: only
+ * what it declares `pub` or passes on with `pub use` — dioxus-hooks' `pub use
+ * use_effect::*` doesn't pass on that module's own `use dioxus_core::*`.
  */
-function rustModuleItems(m: RustModule, name: string, context: ResolutionContext, seen: Set<string>): Node[] | null {
-  const key = `${m.file}\0${m.block?.open ?? -1}\0${name}`;
+function rustModuleItems(m: RustModule, name: string, context: ResolutionContext, seen: Set<string>, publicOnly = false): Node[] | null {
+  const key = `${m.file}\0${m.block?.open ?? -1}\0${name}\0${publicOnly ? 1 : 0}`;
   if (seen.has(key)) return [];
   if (seen.size >= 32) return null;
   const uses = rustUsesOf(m.file, context);
   if (!uses.balanced) return null;
   seen.add(key);
   try {
-    const declared = rustDeclaredItems(m, name, context);
+    const declared = rustDeclaredItems(m, name, context, publicOnly);
     if (declared.length > 0) return declared;
-    const here = (at: number): boolean => rustBlockAt(uses.blocks, at) === m.block;
-    const named = (uses.paths.get(name) ?? []).filter((p) => here(p.at));
+    const here = (p: RustUsePath): boolean => (p.pub || !publicOnly) && rustBlockAt(uses.blocks, p.at) === m.block;
+    const named = (uses.paths.get(name) ?? []).filter(here);
     const found: Node[] = [];
     for (const p of named) {
       const items = rustUsePathItems(p.segs, m, context, seen);
@@ -8508,18 +8526,51 @@ function rustModuleItems(m: RustModule, name: string, context: ResolutionContext
     // `pub use clap_derive::ValueEnum` is a derive macro, and the trait
     // `ValueEnum` still comes in through its `pub use clap_builder::*`.
     if (found.length > 0) return found;
-    for (const g of uses.globPaths) {
-      if (!here(g.at)) continue;
-      const mod = rustWalkModules(g.segs, m, context);
-      if (mod === 'outside') continue;
-      const items = mod === null ? null : rustModuleItems(mod, name, context, seen);
-      if (items === null) return null;
-      found.push(...items);
-    }
-    return found;
+    const globbed = rustGlobbedItems(uses.globPaths.filter(here), () => m, name, context, seen);
+    return globbed === null ? null : [...found, ...globbed];
   } finally {
     seen.delete(key);
   }
+}
+
+/**
+ * The items named `name` that globs bring in, each walked from the module
+ * `fromOf` gives for it — what the module a glob names lets the importer see:
+ * all of it from inside (`use super::*`), its public part from anywhere else.
+ * A glob that brings the name in settles it — two globs bringing in two items
+ * of one name don't compile — so one the walk can't follow (dioxus's
+ * `elements::prelude::*`, a macro's module) matters only when none does; then
+ * the answer is null.
+ */
+function rustGlobbedItems(
+  globs: readonly RustUsePath[],
+  fromOf: (glob: RustUsePath) => RustModule,
+  name: string,
+  context: ResolutionContext,
+  seen: Set<string>,
+): Node[] | null {
+  const found: Node[] = [];
+  let unknown = false;
+  for (const g of globs) {
+    const from = fromOf(g);
+    const mod = rustWalkModules(g.segs, from, context);
+    if (mod === 'outside') continue;
+    const items = mod === null ? null : rustModuleItems(mod, name, context, seen, !rustModuleWithin(from, mod));
+    if (items === null) unknown = true;
+    else found.push(...items);
+  }
+  return found.length > 0 || !unknown ? found : null;
+}
+
+/** Whether module `inner` is `outer` or one declared inside it, inline or in a file below its directory. */
+function rustModuleWithin(inner: RustModule, outer: RustModule): boolean {
+  if (inner.file === outer.file) {
+    for (let b: RustModBlock | null = inner.block; ; b = b.parent) {
+      if (b === outer.block) return true;
+      if (b === null) return false;
+    }
+  }
+  return inner.file.startsWith(outer.dir === '' ? '' : `${outer.dir}/`) && !(outer.dir === '' && outer.block !== null);
 }
 
 /** The items a `use` path names from `from`: its last segment's, in the module the rest walks to. */
@@ -8558,6 +8609,39 @@ function rustUseItems(name: string, filePath: string, context: ResolutionContext
   }
   memo.set(key, ids);
   return ids;
+}
+
+const RUST_GLOB_ITEMS = new WeakMap<ResolutionContext, Map<string, Set<string> | null>>();
+
+/**
+ * The ids of the items named `name` that the globs of `filePath` bring in —
+ * `use dioxus::prelude::*` brings in what that module re-exports from the
+ * crates it is built from. null when the file has no globs or they can't be
+ * followed, and the module names they end in say what they bring instead.
+ */
+function rustGlobItems(name: string, filePath: string, context: ResolutionContext): Set<string> | null {
+  let memo = RUST_GLOB_ITEMS.get(context);
+  if (!memo) RUST_GLOB_ITEMS.set(context, (memo = new Map()));
+  const key = `${filePath}\0${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const uses = rustUsesOf(filePath, context);
+  const items = uses.balanced && uses.globPaths.length > 0
+    ? rustGlobbedItems(uses.globPaths, (g) => rustModuleAt(filePath, g.at, context), name, context, new Set())
+    : null;
+  const ids = items === null ? null : new Set(items.map((n) => n.id));
+  memo.set(key, ids);
+  return ids;
+}
+
+/**
+ * Whether one of the file's globs brings this candidate in: by the modules
+ * they walk to, when those can be followed; else by the module names they end
+ * in (rustGlobCovers).
+ */
+function rustGlobScope(name: string, candidate: Node, uses: RustUses, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const ids = RUST_MODULE_ITEM_KINDS.has(candidate.kind) ? rustGlobItems(name, ref.filePath, context) : null;
+  return ids === null ? rustGlobCovers(uses, candidate, ref) : ids.has(candidate.id);
 }
 
 /** The module a Rust file is: `src/glob.rs` → `glob`, `src/walk/mod.rs` → `walk`. */
@@ -8733,14 +8817,14 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   }
   if (!RUST_PRELUDE.has(name)) {
     // Another file's item — a type, a function — is in scope only through a
-    // `use` that binds it or a glob over its module: tokio's `Context<'_>` is
+    // `use` that binds it or a glob that brings it in: tokio's `Context<'_>` is
     // not `runtime::task::trace`'s `Context` unless the file brings that one
     // in. A method is reached through a value, never a `use`.
     if (TYPE_MEMBER_KINDS.has(candidate.kind) || ref.referenceKind === 'imports' ||
         candidate.kind === 'file' || candidate.kind === 'module' || candidate.kind === 'namespace') return true;
-    return uses.bound.has(name) || rustGlobCovers(uses, candidate, ref);
+    return uses.bound.has(name) || rustGlobScope(name, candidate, uses, ref, context);
   }
-  return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
+  return uses.names.has(name) || rustGlobScope(name, candidate, uses, ref, context);
 }
 
 /**
@@ -15234,6 +15318,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_USE_ITEMS.delete(context);
+  RUST_GLOB_ITEMS.delete(context);
   RUST_CRATES.delete(context);
   RUST_DEPENDENCIES.delete(context);
   RUST_CRATE_GRAPHS.delete(context);
