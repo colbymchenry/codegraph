@@ -3980,6 +3980,9 @@ export class TreeSitterExtractor {
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
+      // A Rust alias is private to its module unless `pub` (any form): the
+      // resolver keeps a private one to its own module (isRustNameInScope).
+      ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)

@@ -7040,7 +7040,11 @@ function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   const supers: string[] = [];
   for (const decl of context.getNodesByName(name)) {
     if (decl.kind !== 'class' || decl.language !== 'objc') continue;
-    const line = context.getFileLines?.(decl.filePath)?.[decl.startLine - 1] ?? context.readFile(decl.filePath)?.split('\n')[decl.startLine - 1] ?? '';
+    // The class may open with an attribute macro on a line of its own, like
+    // `NS_SWIFT_NAME(CrashInstallationStandard)` above KSCrash's
+    // `@interface KSCrashInstallationStandard : KSCrashInstallation`.
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split('\n') ?? [];
+    const line = lines.slice(decl.startLine - 1, decl.endLine).find((l) => l.includes('@interface')) ?? '';
     const sup = /@interface\s+\w+\s*:\s*(\w+)/.exec(line)?.[1];
     if (sup && !supers.includes(sup)) supers.push(sup);
   }
@@ -7493,42 +7497,203 @@ interface RustUses {
   external: Set<string>;
   /** The items the file's project `use`s bind — their leaves, not the paths they walk. */
   bound: Set<string>;
+  /** Each bound item → the first segment of every path that binds it (`crate`, `super`, `tokio_test`). */
+  boundFrom: Map<string, Set<string>>;
 }
 
 const RUST_CRATES = new WeakMap<ResolutionContext, Set<string>>();
 const RUST_DEPENDENCIES = new WeakMap<ResolutionContext, Set<string>>();
 
+interface RustManifestDependency {
+  /** The name code writes for it (`futures_util`). */
+  key: string;
+  /** The package it is: its key, unless `package = "…"` renames it. */
+  pkg: string;
+  /** Its `path = "…"`, from the manifest's directory. */
+  path?: string;
+  /** `workspace = true`: the workspace's `[workspace.dependencies]` declares it. */
+  workspace: boolean;
+  /** `[dependencies]` (per-target ones included), dev, build, or `[workspace.dependencies]`. */
+  kind: 'normal' | 'dev' | 'build' | 'workspace';
+}
+
 /**
- * The crates the project's manifests depend on (`[dependencies]`,
- * `[dev-dependencies]`, `[build-dependencies]`, per-target ones), by the name
- * code writes them (`futures_util`), less the project's own.
+ * A Cargo manifest's dependencies, however each is written: `foo = "1"`, an
+ * inline table, dotted keys (`foo.workspace = true`) or a `[dependencies.foo]`
+ * table of its own.
  */
+function rustManifestDependencies(text: string): RustManifestDependency[] {
+  const deps = new Map<string, RustManifestDependency>();
+  const entry = (kind: RustManifestDependency['kind'], name: string): RustManifestDependency => {
+    const key = name.replace(/-/g, '_');
+    let dep = deps.get(`${kind} ${key}`);
+    if (!dep) deps.set(`${kind} ${key}`, (dep = { key, pkg: key, workspace: false, kind }));
+    return dep;
+  };
+  const read = (dep: RustManifestDependency, fields: string): void => {
+    const pkg = /\bpackage\s*=\s*"([^"]+)"/.exec(fields)?.[1];
+    if (pkg) dep.pkg = pkg.replace(/-/g, '_');
+    const at = /\bpath\s*=\s*"([^"]+)"/.exec(fields)?.[1];
+    if (at) dep.path = at.replace(/\\/g, '/');
+    if (/\bworkspace\s*=\s*true\b/.test(fields)) dep.workspace = true;
+  };
+  let kind: RustManifestDependency['kind'] | null = null;
+  let table: RustManifestDependency | null = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) {
+      const m = /^(?:(workspace)\.|target\..+\.)?(dev-|build-)?dependencies(?:\.([A-Za-z0-9_-]+))?$/.exec(header[1]!.trim());
+      const of = !m ? null : m[1] ? 'workspace' : m[2] === 'dev-' ? 'dev' : m[2] === 'build-' ? 'build' : 'normal';
+      kind = of !== null && !m![3] ? of : null;
+      table = of !== null && m![3] ? entry(of, m![3]) : null;
+      continue;
+    }
+    if (table) {
+      read(table, line);
+      continue;
+    }
+    const dep = kind === null ? null : /^"?([A-Za-z0-9_-]+)"?\s*(?:\.\s*([A-Za-z_-]+)\s*)?=\s*(.*)$/.exec(line);
+    if (dep) read(entry(kind!, dep[1]!), dep[2] ? `${dep[2]} = ${dep[3]}` : dep[3]!);
+  }
+  return [...deps.values()];
+}
+
+/** The crates the project's manifests depend on, by the name code writes them (`futures_util`), less the project's own. */
 function rustDependencyCrates(context: ResolutionContext): Set<string> {
   const hit = RUST_DEPENDENCIES.get(context);
   if (hit) return hit;
   const deps = new Set<string>();
   const manifests = ['Cargo.toml', ...[...getCargoWorkspaceCrateMap(context).values()].map((dir) => `${dir}/Cargo.toml`)];
   for (const manifest of new Set(manifests)) {
-    const text = context.readFile(manifest) ?? '';
-    let inDeps = false;
-    for (const raw of text.split(/\r?\n/)) {
-      const line = raw.replace(/#.*$/, '').trim();
-      const header = /^\[([^\]]+)\]$/.exec(line);
-      if (header) {
-        const table = header[1]!.trim();
-        // `[dependencies.tokio]` names one dependency in its header.
-        const named = /(?:^|\.)(?:dev-|build-)?dependencies\.([A-Za-z0-9_-]+)$/.exec(table);
-        if (named) deps.add(named[1]!.replace(/-/g, '_'));
-        inDeps = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(table);
-        continue;
-      }
-      const key = inDeps ? /^([A-Za-z0-9_-]+)\s*=/.exec(line)?.[1] : undefined;
-      if (key) deps.add(key.replace(/-/g, '_'));
-    }
+    for (const { key } of rustManifestDependencies(context.readFile(manifest) ?? '')) deps.add(key);
   }
   for (const own of rustProjectCrates(context)) deps.delete(own);
   RUST_DEPENDENCIES.set(context, deps);
   return deps;
+}
+
+interface RustCrate {
+  /** Its package name as code writes it (`tokio_test`). */
+  name: string;
+  /** Each dependency of any kind that is a project crate: the name code writes → that crate's directory. */
+  keys: Map<string, string>;
+  /** The project crates its `[dependencies]` name, by directory: the ones it can re-export from. */
+  deps: Set<string>;
+}
+
+interface RustCrateGraph {
+  /** The project's crates by directory: the root package's is ''. */
+  crates: Map<string, RustCrate>;
+  /** A crate's directory → itself and every project crate it depends on, transitively. */
+  reach: Map<string, Set<string>>;
+  /** A file → the directory of the crate it is in, or null for none the manifests name. */
+  fileCrate: Map<string, string | null>;
+}
+
+const RUST_CRATE_GRAPHS = new WeakMap<ResolutionContext, RustCrateGraph>();
+
+/**
+ * The project's crates — the root package, the workspace's members and the
+ * path dependencies they name — and which of them each depends on. A
+ * dependency is found by its `path` (its own or, for `workspace = true`, the
+ * workspace's), so a renamed key or a crate outside the members still lands;
+ * without one, by its package name.
+ */
+function rustCrateGraph(context: ResolutionContext): RustCrateGraph {
+  const hit = RUST_CRATE_GRAPHS.get(context);
+  if (hit) return hit;
+  const crates = new Map<string, RustCrate>();
+  const manifests = new Map<string, string>();
+  const byName = new Map<string, string>();
+  const add = (dir: string): boolean => {
+    if (crates.has(dir)) return true;
+    const text = context.readFile(dir === '' ? 'Cargo.toml' : `${dir}/Cargo.toml`);
+    const name = text ? /\[package\][^[]*?\bname\s*=\s*"([^"]+)"/.exec(text)?.[1]?.replace(/-/g, '_') : undefined;
+    if (!name) return false;
+    crates.set(dir, { name, keys: new Map(), deps: new Set() });
+    manifests.set(dir, text!);
+    if (!byName.has(name)) byName.set(name, dir);
+    return true;
+  };
+  add('');
+  for (const dir of getCargoWorkspaceCrateMap(context).values()) add(dir.replace(/^\.(?:\/|$)/, ''));
+  const inherited = new Map(rustManifestDependencies(context.readFile('Cargo.toml') ?? '')
+    .filter((dep) => dep.kind === 'workspace').map((dep) => [dep.key, dep]));
+  // A path from `dir`, as a project directory; null when it leaves the project.
+  const join = (dir: string, rel: string): string | null => {
+    const joined = path.posix.normalize(dir === '' ? rel : `${dir}/${rel}`).replace(/\/+$/, '');
+    return joined === '.' ? '' : joined === '..' || joined.startsWith('../') || path.posix.isAbsolute(joined) ? null : joined;
+  };
+  const queue = [...crates.keys()];
+  for (let i = 0; i < queue.length; i++) {
+    const dir = queue[i]!;
+    const crate = crates.get(dir)!;
+    for (const dep of rustManifestDependencies(manifests.get(dir)!)) {
+      if (dep.kind === 'workspace') continue;
+      const shared = dep.workspace ? inherited.get(dep.key) : undefined;
+      const at = shared ? (shared.path === undefined ? null : join('', shared.path)) : dep.path === undefined ? null : join(dir, dep.path);
+      let to: string | undefined;
+      if (at !== null && !crates.has(at) && add(at)) queue.push(at);
+      if (at !== null && crates.has(at)) to = at;
+      else to = byName.get(shared?.pkg ?? dep.pkg);
+      if (to === undefined || to === dir) continue;
+      crate.keys.set(dep.key, to);
+      if (dep.kind === 'normal') crate.deps.add(to);
+    }
+  }
+  const reach = new Map<string, Set<string>>();
+  for (const dir of crates.keys()) {
+    const seen = new Set([dir]);
+    const pending = [dir];
+    for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+      for (const to of crates.get(next)!.deps) {
+        if (seen.has(to)) continue;
+        seen.add(to);
+        pending.push(to);
+      }
+    }
+    reach.set(dir, seen);
+  }
+  const graph = { crates, reach, fileCrate: new Map<string, string | null>() };
+  RUST_CRATE_GRAPHS.set(context, graph);
+  return graph;
+}
+
+/** The directory of the crate `filePath` is in: the deepest one that holds it, the root package's (''), or null. */
+function rustCrateDirOf(filePath: string, graph: RustCrateGraph): string | null {
+  const hit = graph.fileCrate.get(filePath);
+  if (hit !== undefined) return hit;
+  let best: string | null = graph.crates.has('') ? '' : null;
+  for (const dir of graph.crates.keys()) {
+    if (dir !== '' && filePath.startsWith(`${dir}/`) && (best === null || dir.length > best.length)) best = dir;
+  }
+  graph.fileCrate.set(filePath, best);
+  return best;
+}
+
+/**
+ * Whether a `use` path from one of `roots` can name this candidate, by its
+ * crate. A path from a crate the file's own manifest depends on (`use
+ * tokio_test::task::spawn`), or from its own crate's name, names that crate's
+ * item or one it re-exports from a crate its `[dependencies]` name, in turn
+ * (`clap::Command` is clap_builder's); `crate::`, `self::` and `super::` start
+ * from the file's own crate. tokio's tests' 133 `spawn(…)` calls are
+ * tokio-test's, never the examples crate's `pub fn spawn`, which nothing
+ * depends on. Any other path — through a module, a crate from outside the
+ * project — and a file in no crate the manifests name say nothing.
+ */
+function rustUseCanReach(roots: Set<string>, candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const graph = rustCrateGraph(context);
+  const at = rustCrateDirOf(candidate.filePath, graph);
+  const own = rustCrateDirOf(ref.filePath, graph);
+  if (at === null || own === null) return true;
+  const crate = graph.crates.get(own)!;
+  for (const root of roots) {
+    const from = root === 'crate' || root === 'self' || root === 'super' || root === crate.name ? own : crate.keys.get(root);
+    if (from === undefined || graph.reach.get(from)!.has(at)) return true;
+  }
+  return false;
 }
 
 /** The project's own crate names (`tokio`, `tokio_util`), from its Cargo.toml files. */
@@ -7553,7 +7718,7 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
   }
   const hit = memo.get(filePath);
   if (hit) return hit;
-  const uses: RustUses = { names: new Set(), globs: new Set(), external: new Set(), bound: new Set() };
+  const uses: RustUses = { names: new Set(), globs: new Set(), external: new Set(), bound: new Set(), boundFrom: new Map() };
   const leaves = (tree: string): string[] => [
     ...[...tree.matchAll(/([A-Za-z_]\w*)\s*(?=[,}]|$|\s+as\b)|\bas\s+([A-Za-z_]\w*)/g)]
       .map((leaf) => leaf[2] ?? leaf[1]!).filter((id) => id !== 'self' && id !== 'as'),
@@ -7574,7 +7739,12 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
       for (const id of leaves(tree)) uses.external.add(id);
       continue;
     }
-    for (const id of leaves(tree)) uses.bound.add(id);
+    for (const id of leaves(tree)) {
+      uses.bound.add(id);
+      const from = uses.boundFrom.get(id);
+      if (from) from.add(root);
+      else uses.boundFrom.set(id, new Set([root]));
+    }
     for (const id of tree.matchAll(/[A-Za-z_]\w*/g)) uses.names.add(id[0]);
     for (const g of tree.matchAll(/(\w+)\s*::\s*(?:\{[^}]*)?\*/g)) uses.globs.add(g[1]!);
   }
@@ -7587,6 +7757,24 @@ function rustModuleName(filePath: string): string {
   const parts = filePath.split('/');
   const base = parts[parts.length - 1]!.replace(/\.rs$/, '');
   return base === 'mod' || base === 'lib' || base === 'main' ? parts[parts.length - 2] ?? base : base;
+}
+
+/** Rust items declared in a module, whose own `pub` (or its absence) says who can name them. */
+const RUST_MODULE_ITEM_KINDS = new Set(['function', 'struct', 'enum', 'union', 'type_alias', 'trait', 'constant', 'variable']);
+
+/**
+ * Whether `ref`'s file can name this Rust item. A private one — no `pub` of
+ * any form — is named only in its own module and the modules inside it: a
+ * `type Result` in `src/build/patch.rs` is `build::patch`'s, seen in that file
+ * and under `src/build/patch/`, never through `use crate::Result` elsewhere,
+ * and no glob passes it on (dioxus's `pub(crate) use patch::*` doesn't). A
+ * `mod.rs`, `lib.rs` or `main.rs` is the module of its whole directory. The
+ * same rule isVisibleAcrossFiles applies to the pipeline's pick, here ahead of
+ * the ranking, so the crate's own `pub(crate) type Result` can win instead.
+ */
+function isRustItemVisibleFrom(candidate: Node, ref: UnresolvedRef): boolean {
+  if (candidate.language !== 'rust' || candidate.visibility !== 'private' || !RUST_MODULE_ITEM_KINDS.has(candidate.kind)) return true;
+  return candidate.filePath === ref.filePath || ref.filePath.startsWith(`${rustModuleDir(candidate.filePath)}/`);
 }
 
 /** Does one of the file's globs bring in this candidate's module (or, for `use super::*`, its parent's)? */
@@ -7606,8 +7794,11 @@ function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): bo
  * `Result`, `Box`) is the prelude's unless the file defines it or imports a
  * project item of that name — serde's macro-hygiene tests declare `struct
  * Ok`, `struct Result`, and serde bound its own `Ok(…)` and `Result<…>` to them.
+ * A private item is out of scope outside its module (isRustItemVisibleFrom),
+ * and an item a `use` binds is one its path's crate can reach (rustUseCanReach).
  */
 export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!isRustItemVisibleFrom(candidate, ref)) return false;
   const name = ref.referenceName;
   // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
   // segment, and a path is not a prelude lookup.
@@ -7663,6 +7854,9 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   }
   if (candidate.filePath === ref.filePath) return true;
   const uses = rustUsesOf(ref.filePath, context);
+  // An item a `use` binds is one its path's crate can name.
+  const from = RUST_MODULE_ITEM_KINDS.has(candidate.kind) ? uses.boundFrom.get(name) : undefined;
+  if (from && !rustUseCanReach(from, candidate, ref, context)) return false;
   // `use std::task::{Context, Poll}`: the file's `Context` is std's, not tokio's
   // `runtime::context::Context`. (A method call `.env(…)` is no imported name.)
   if (uses.external.has(name) && !uses.bound.has(name) && line !== undefined) {
@@ -13199,6 +13393,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_USES.delete(context);
   RUST_CRATES.delete(context);
   RUST_DEPENDENCIES.delete(context);
+  RUST_CRATE_GRAPHS.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
   KOTLIN_LAMBDA_RECEIVERS.delete(context);
   SCALA_IMPORTED_SUPERS.delete(context);
