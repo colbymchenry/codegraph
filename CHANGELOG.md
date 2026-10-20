@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Python, `from app import email` no longer links the importing file to a project variable named `app`, such as a FastAPI or Flask `app = FastAPI()`. (#2584)
 - In Python, a call through a module-level instance, like `_svc.delete(obj)` after `_svc = SceneService()`, now links to the method its class has or inherits, even when other classes have a method of that name. (#2582)
 - In Python, a call on a module imported from outside your project, like `subprocess.run(…)` after `import subprocess`, no longer links to a project method that happens to share its name. Thanks @Egrn for the report. (#2599)
 - `codegraph_explore`, the CLI `codegraph explore` and the prompt hook no longer stall for a minute or more on a large project after a full index; the step that finds the project's busiest file no longer slows to a crawl when a few files are huge, like a generated Android `R.java` (#2571). Thanks @yangfengfan2011.
