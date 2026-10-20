@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **GDScript** and Godot's text scenes and resources (`.gd`, `.tscn`, `.tres`, `project.godot`). Signals (`signal name(...)`) are declarations you can find, and `sig.emit(...)` / `sig.connect(...)` — plus the `emit_signal("sig")` / `connect("sig", …)` string forms — link emitters and subscribers to them, while engine signals (`pressed`, `finished`) stay out. `preload`/`load` now really produce import edges (before, none appeared). A scene's node tree becomes nodes, `script = ExtResource(...)` attaches the script to its node, `[connection]` lines link the emitting node to its handler and target, node-path references (`$Foo/Bar`, `%Unique`, `get_node("…")`) resolve onto the scene nodes they name, and `res://` references resolve to real files — so "who emits this signal", "who loads this scene" and "what touches this node" answer from the graph in one query. Thanks @cosmicnag (#1499) and @i-snyder (#1098). (#1218)
+
 ### Fixes
 
 - In JavaScript and TypeScript, a call written as the body of an `if`, `while`, `for` or `do` without braces, like `if (e.key === "Escape") setOpen(false);`, no longer links to a same-named property or method in another file when the name is the file's own, such as a `setOpen` from `useState` (#2585).

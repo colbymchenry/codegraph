@@ -116,6 +116,8 @@ export const LANGUAGES = [
   'cfquery',
   'cobol',
   'vbnet',
+  'gdscript',
+  'godot_resource',
   'erlang',
   'terraform',
   'unknown',
