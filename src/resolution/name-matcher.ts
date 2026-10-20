@@ -18248,6 +18248,9 @@ export function matchMethodCall(
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
+      // A class declared inside a function is named only in there: a
+      // `File.write(…)` elsewhere is not the `File` a Django test declares.
+      if (!isLexicallyReachable(classNode, ref, context)) continue;
 
       // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
       // own, else one a base declares (cppMethodOf), never one of a class
@@ -18338,6 +18341,8 @@ export function matchMethodCall(
       for (const classNode of fuzzyClassCandidates) {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
+        // Nor a class declared inside another function (see Strategy 1).
+        if (!isLexicallyReachable(classNode, ref, context)) continue;
 
         const methodNode = classStrategyMethod(classNode, methodName!, context);
 
@@ -18409,6 +18414,14 @@ export function matchMethodCall(
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
+    // Nor is it a method of a class another function declares: Django's
+    // `file.write(…)` in one test is not the `File` a serializer test
+    // declares in its body.
+    {
+      const kept = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref

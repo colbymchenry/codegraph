@@ -101,6 +101,46 @@ export function makeStore(): void {
   Store.create();
 }
 `);
+  // A class declared inside a function is named only in there (Django's
+  // serializer test declares a `File` with a `write`): a call elsewhere is
+  // not on it, through the class name or a receiver named after it.
+  fs.writeFileSync(path.join(dir, 'streams.py'), `class SerializerTests:
+    def test_stream(self):
+        class File:
+            def write(self, line):
+                pass
+        f = File()
+        File.write(f, "x")
+`);
+  fs.writeFileSync(path.join(dir, 'storage.py'), `class File:
+    pass
+
+def save(file):
+    file.write("data")
+
+def save_class(f):
+    File.write(f, "data")
+`);
+  // A Kotlin companion object's members are the class's own: `Foo.create()`
+  // is Foo's, not that of `FooBar`, declared first.
+  fs.writeFileSync(path.join(dir, 'Factory.kt'), `package app
+
+class FooBar {
+    companion object {
+        fun create(): FooBar = FooBar()
+    }
+}
+
+class Foo {
+    companion object {
+        fun create(): Foo = Foo()
+    }
+}
+
+fun build() {
+    Foo.create()
+}
+`);
   // R allows dots in a class name: the owner is `Bank.Account`, whole.
   fs.writeFileSync(path.join(dir, 'account.R'), `Bank.Account <- R6::R6Class("Bank.Account",
   public = list(
@@ -128,7 +168,7 @@ afterAll(() => {
 
 /** `file#qualifiedName` of every callee — the file matters: several fixtures share names. */
 function calleesOf(name: string, file: string): string[] {
-  const fn = cg.getNodesByName(name).find((n) => n.kind === 'function' && n.filePath === file);
+  const fn = cg.getNodesByName(name).find((n) => (n.kind === 'function' || n.kind === 'method') && n.filePath === file);
   expect(fn).toBeDefined();
   return cg.getCallees(fn!.id).map(({ node }) => `${node.filePath}#${node.qualifiedName}`);
 }
@@ -164,6 +204,19 @@ describe('method call binds to the receiver class itself, not a class whose name
     const callees = calleesOf('makeStore', 'stores.ts');
     expect(callees).toContain('stores.ts#BaseStore::create');
     expect(callees).not.toContain('stores.ts#AdminStore::create');
+  });
+
+  it('Python: a class another function declares takes no call from outside it', () => {
+    expect(calleesOf('save', 'storage.py')).not.toContain('streams.py#SerializerTests::test_stream::File::write');
+    expect(calleesOf('save_class', 'storage.py')).not.toContain('streams.py#SerializerTests::test_stream::File::write');
+    // Inside the function that declares it, the name is that class.
+    expect(calleesOf('test_stream', 'streams.py')).toContain('streams.py#SerializerTests::test_stream::File::write');
+  });
+
+  it("Kotlin: a companion object's method is its own class's", () => {
+    const callees = calleesOf('build', 'Factory.kt');
+    expect(callees).toContain('Factory.kt#app::Foo::create');
+    expect(callees).not.toContain('Factory.kt#app::FooBar::create');
   });
 
   it('R: a dotted class name is the owner as a whole', () => {
