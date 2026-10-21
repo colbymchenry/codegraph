@@ -35,7 +35,8 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
-import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
+import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
+import { goPackageReaderFor } from '../graph/go-package';
 import {
   extractQueryPaths,
   queryMightContainPaths,
@@ -53,10 +54,12 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
+import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
 import {
   findAllSymbols,
   resolveNamedSymbolFlow,
+  type FlowStep,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
@@ -219,8 +222,9 @@ const NOT_A_DEFINITION = new Set(['file', 'import', 'export', 'parameter']);
  */
 function filesDefiningSymbol(cg: CodeGraph, symbol: string): string[] {
   try {
+    const goPackageOf = goPackageReaderFor(cg);
     const nodes = isQualifiedSymbol(symbol)
-      ? cg.getNodesByName(lastQualifierPart(symbol)).filter((n) => matchesSymbol(n, symbol))
+      ? cg.getNodesByName(lastQualifierPart(symbol)).filter((n) => matchesSymbol(n, symbol, goPackageOf))
       : cg.getNodesByName(symbol);
     return nodes.filter((n) => !NOT_A_DEFINITION.has(n.kind)).map((n) => n.filePath);
   } catch {
@@ -1235,12 +1239,36 @@ const TRIMMED_NAME_SKIP_KINDS = new Set([
  * for a method, so an overloaded name resolves to the definition that was cut
  * (django has 110 `as_sql`s; the note used to offer the bare one and agents
  * then added a path and line to disambiguate it). The bare name otherwise.
+ * The dynamic-dispatch links name both ends of an `X → X` link the same way.
  */
-function followUpName(e: ExploreWantedSpan): string {
+function followUpName(e: Pick<ExploreWantedSpan, 'name' | 'kind' | 'qualifiedName'>): string {
   if (e.kind !== 'method' || !e.qualifiedName) return e.name;
   const segs = e.qualifiedName.split('::');
   const owner = segs.length >= 2 ? segs[segs.length - 2]! : '';
   return /^[A-Za-z_$][\w$]*$/.test(owner) ? `${owner}.${e.name}` : e.name;
+}
+
+/**
+ * Test/spec/icon/i18n file detector — used by explore's pre-floor hard filter,
+ * its rank penalty and comparator deprioritization, and the order of its
+ * dynamic-dispatch links.
+ *
+ * Tests are the engine's own reading (`isTestFile`), the one the gather
+ * already dampened them by: every ecosystem's test names and folders —
+ * a repo-ROOT `test/` (express's routing question once spent 59% of its
+ * envelope on three test files), LLVM's `unittests/`, Google's
+ * `foo_unittest.cc`, a C++ `FooTest.cpp`, `testing/`, `e2e/` — and the
+ * examples, samples, fixtures and benchmarks around a project. A list of
+ * its own here missed every one of those it hadn't been taught.
+ */
+function isLowValue(p: string): boolean {
+  const lp = p.toLowerCase();
+  return (
+    isTestFile(p) ||
+    /(?:^|\/)__test__\//.test(lp) ||
+    /\bicons?\b/.test(lp) ||
+    /\bi18n\b/.test(lp)
+  );
 }
 
 /**
@@ -3305,12 +3333,6 @@ export class ToolHandler {
   }
 
   /**
-   * Describe a synthesized (dynamic-dispatch) edge for human output: how the
-   * callback was wired up — the bridge static parsing can't see. Returns null
-   * for ordinary static edges. Used by trace + the node trail so a synthesized
-   * hop reads as "registered via onUpdate at App.tsx:3148", not a bare arrow.
-   */
-  /**
    * The branch conditions a flow hop's call site runs under, read from the
    * caller's source now (`graph/branch-guards.ts`); '' when unconditional,
    * unreadable, or the grammar for that language is not loaded.
@@ -3333,125 +3355,17 @@ export class ToolHandler {
     }
   }
 
-  private synthEdgeNote(edge: Edge | null): { label: string; compact: string; registeredAt?: string } | null {
-    if (!edge || edge.provenance !== 'heuristic') return null;
-    const m = edge.metadata as Record<string, unknown> | undefined;
-    const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
-    const at = registeredAt ? ` @${registeredAt}` : '';
-    if (m?.synthesizedBy === 'callback') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
-      const field = m.field ? ` on .${String(m.field)}` : '';
-      return {
-        label: `callback — registered via ${via}${field} (dynamic dispatch)`,
-        compact: `dynamic: callback via ${via}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'http-client') {
-      const req = `${String(m.method ?? 'GET')} ${String(m.href ?? '')}`.trim();
-      return {
-        label: `HTTP request \`${req}\` — the client's call onto its own route (cross-tier)`,
-        compact: `dynamic: HTTP ${req}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'queue-job') {
-      const job = m.event ? `\`${String(m.event)}\`` : 'a job';
-      const queue = m.queue ? ` on queue \`${String(m.queue)}\`` : '';
-      return {
-        label: `queue job ${job}${queue} — producer → consumer (cross-tier)`,
-        compact: `dynamic: queue job ${job}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-bus') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      const what = m.channel === 'socket' ? 'socket message' : 'bus event';
-      const dir = m.tier === 'client→server' ? ', client → server' : m.tier === 'server→client' ? ', server → client' : '';
-      return {
-        label: `${what} ${ev} — emit → handler${dir} (dynamic dispatch)`,
-        compact: `dynamic: ${what} ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-emitter') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      return {
-        label: `event ${ev} — emit → handler (dynamic dispatch)`,
-        compact: `dynamic: event ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'react-render') {
-      return {
-        label: `React re-render — \`setState\` re-runs render() (dynamic dispatch)`,
-        compact: `dynamic: React re-render via setState${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'jsx-render') {
-      const child = m.via ? `<${String(m.via)}>` : 'a child component';
-      return {
-        label: `renders ${child} (JSX child — dynamic dispatch)`,
-        compact: `dynamic: renders ${child}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'vue-handler') {
-      const ev = m.event ? `@${String(m.event)}` : 'a template event';
-      return {
-        label: `Vue template handler — bound to ${ev} (dynamic dispatch)`,
-        compact: `dynamic: Vue ${ev} handler`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'interface-impl' && typeof m.promotedInto === 'string') {
-      // Go: the implementing struct gets this method from a type it embeds.
-      return {
-        label: `interface dispatch — runs the method \`${m.promotedInto}\` gets by embedding (dynamic dispatch)`,
-        compact: `dynamic: interface → method promoted into ${m.promotedInto}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'interface-impl') {
-      return {
-        label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
-        compact: `dynamic: interface → impl${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'closure-collection') {
-      const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
-      return {
-        label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
-        compact: `dynamic: runs ${field} handlers${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
-      return {
-        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
-        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'goframe-route') {
-      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
-      return {
-        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
-        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
-        registeredAt,
-      };
-    }
-    // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
-    // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
-    // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
-    if (typeof m?.synthesizedBy === 'string') {
-      const kind = m.synthesizedBy.replace(/-/g, ' ');
-      return { label: `${kind} (dynamic dispatch)`, compact: `dynamic: ${kind}${at}`, registeredAt };
-    }
-    return null;
+  /**
+   * The tag a synthesized (dynamic-dispatch) hop carries in explore's Flow and
+   * dynamic-dispatch links and in the codegraph_node trail, so it reads as
+   * "dynamic: callback via `onUpdate` @App.tsx:3148", not a bare arrow. Null
+   * for an ordinary static edge. The wording is `graph/synthesized-hop.ts`'s,
+   * shared with ContextBuilder's call paths.
+   */
+  private synthEdgeNote(edge: Edge | null): string | null {
+    const hop = describeSynthesizedHop(edge);
+    if (!hop) return null;
+    return `dynamic: ${hop.summary}${hop.registeredAt ? ` @${hop.registeredAt}` : ''}`;
   }
 
   /**
@@ -3482,33 +3396,89 @@ export class ToolHandler {
         flow;
       if (flow.tokens.length < 2) return EMPTY;
       // Surface synthesized (heuristic) edges incident to a named symbol — INCLUDING
-      // the non-callable CONSTANT endpoints in `dynNamed`. `skipInChain` drops a hop
-      // already shown in the rendered main chain (a 2-node chain renders nothing, so a
-      // direct named→named synth hop still surfaces — #687).
-      const collectSynthLinks = (skipInChain: ((e: Edge) => boolean) | null): string[] => {
-        const synthLines: string[] = [];
-        const synthSeen = new Set<string>();
+      // the non-callable CONSTANT endpoints in `dynNamed`. `chain` is the rendered
+      // main chain, whose hops are not repeated here (a 2-node chain renders nothing,
+      // so a direct named→named synth hop still surfaces — #687).
+      //
+      // One line per LINK, keyed by its endpoints' node ids. Keyed by name pair, an
+      // interface method's implementations — `setter.TrySet` → gin's formSource,
+      // headerSource and multipartRequest — were one `TrySet → TrySet` line, and
+      // which one it showed was edge order. When more links exist than fit, links
+      // into tests and examples through an end the query didn't name go last, as
+      // explore's answer leaves those files out; before that, links go by how
+      // pointedly the query named their two ends, so the cap never drops the
+      // implementation the query names for one it doesn't. Links that rank the same
+      // take turns by the named symbol they hang from, so one symbol's long fan-out
+      // can't fill the list before another's first link; edge order breaks ties.
+      const collectSynthLinks = (chain: readonly FlowStep[] | null): string[] => {
+        const MAX_SYNTH_LINKS = 6;
+        const onChain = new Set((chain ?? []).map((s) => s.node.id));
+        // A symbol a token picks out (at most 3 definitions), or a named non-callable
+        // endpoint, weighs 3. A candidate of an ambiguous token weighs 1: prometheus's
+        // `Discovery.refresh` matches a `Discovery` in each discovery package, and in
+        // `Discovery.refresh fetchApps Decoder.Decode` their links to each other filled
+        // the cap and hid the one link into `fetchApps`, which the query names exactly.
+        const weight = (id: string): number =>
+          uniqueNamedNodeIds.has(id) || dynNamed.has(id) ? 3 : named.has(id) ? 1 : 0;
+        const links: Array<{ edge: Edge; src: Node; tgt: Node; lowValue: boolean; weight: number; turn: number }> = [];
+        const seen = new Set<string>();
+        // A link's turn: how many links of its rank the same named symbol already has.
+        // prometheus's `refresh.Discovery.refresh` hands its func field to 28
+        // discovery packages; in `refresh.Discovery.refresh hetzner.refresher.refresh
+        // hcloudDiscovery.refresh` those filled the list before `refresher.refresh` →
+        // robotDiscovery's, at the same rank.
+        const turns = new Map<string, number>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
-          if (synthLines.length >= 6) break;
-          // RAW edges for the same reason as hasHeuristicEdge above — a static
-          // edge over the same pair hides the synthesized one from getCallers.
-          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
-          for (const edge of incident) {
-            if (synthLines.length >= 6) break;
+          // RAW edges for the same reason as `hasHeuristicEdge` in named-symbol-flow
+          // — a static edge over the same pair hides the synthesized one from getCallers.
+          for (const edge of [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)]) {
             if (edge.provenance !== 'heuristic') continue;
             const otherId = edge.source === n.id ? edge.target : edge.source;
-            if (otherId === n.id) continue;
-            const other = cg.getNode(otherId);
+            const key = `${edge.source}>${edge.target}`;
+            if (otherId === n.id || seen.has(key)) continue;
+            seen.add(key);
+            if (onChain.has(edge.source) && onChain.has(edge.target)) continue;
+            const other = named.get(otherId) ?? dynNamed.get(otherId) ?? cg.getNode(otherId);
             if (!other) continue;
-            if (skipInChain && skipInChain(edge)) continue;
-            const src = edge.source === n.id ? n : other;
-            const tgt = edge.source === n.id ? other : n;
-            const key = `${src.name}>${tgt.name}`;
-            if (synthSeen.has(key)) continue;
-            synthSeen.add(key);
-            const note = this.synthEdgeNote(edge);
-            synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
+            const lowValue = weight(otherId) === 0 && isLowValue(other.filePath);
+            const linkWeight = weight(n.id) + weight(otherId);
+            const rank = `${n.id}|${lowValue}|${linkWeight}`;
+            const turn = turns.get(rank) ?? 0;
+            turns.set(rank, turn + 1);
+            links.push({
+              edge,
+              src: edge.source === n.id ? n : other,
+              tgt: edge.source === n.id ? other : n,
+              lowValue,
+              weight: linkWeight,
+              turn,
+            });
           }
+        }
+        links.sort((a, b) => Number(a.lowValue) - Number(b.lowValue) || b.weight - a.weight || a.turn - b.turn);
+        const linkLine = (edge: Edge, src: Node, tgt: Node): string => {
+          // `TrySet → TrySet` says neither which interface nor which implementation:
+          // a same-name link names each end by its owner, as the agent would write it.
+          const same = src.name === tgt.name;
+          return `- ${same ? followUpName(src) : src.name} → ${same ? followUpName(tgt) : tgt.name}   [${this.synthEdgeNote(edge) ?? edge.kind}]`;
+        };
+        // Distinct links can still read the same, and one line says it: gin declares
+        // `Binding` once per build tag, so both declarations' `Bind` link to formBinding's,
+        // and when the Flow runs through one of them, the other's link reads as its hop.
+        const shown = new Set<string>();
+        for (let i = 1; i < (chain?.length ?? 0); i++) {
+          const prev = chain![i - 1]!.node;
+          const { node, edge } = chain![i]!;
+          if (edge?.provenance !== 'heuristic') continue;
+          shown.add(edge.source === prev.id ? linkLine(edge, prev, node) : linkLine(edge, node, prev));
+        }
+        const synthLines: string[] = [];
+        for (const { edge, src, tgt } of links) {
+          if (synthLines.length >= MAX_SYNTH_LINKS) break;
+          const line = linkLine(edge, src, tgt);
+          if (shown.has(line)) continue;
+          shown.add(line);
+          synthLines.push(line);
         }
         return synthLines;
       };
@@ -3629,9 +3599,7 @@ export class ToolHandler {
       // wasn't named. The skip drops a hop already in the rendered main chain; a
       // 2-node chain renders nothing (hasMain false) so a direct named→named synth
       // hop still surfaces — too short for Flow, but #687-visible here.
-      const synthLines = collectSynthLinks(
-        hasMain ? (e: Edge) => pathIds.has(e.source) && pathIds.has(e.target) : null
-      );
+      const synthLines = collectSynthLinks(hasMain ? best : null);
 
       if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return identityOnly();
       const out: string[] = [];
@@ -3640,9 +3608,8 @@ export class ToolHandler {
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) {
-            const sy = this.synthEdgeNote(step.edge);
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? step.edge.kind}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -4628,9 +4595,18 @@ export class ToolHandler {
     const fileGroups = new Map<string, { nodes: Node[]; score: number; peripheral: number }>();
     const entryNodeIds = new Set([...subgraph.roots, ...namedSeedIds]);
 
-    // Build a set of nodes directly connected to entry points (depth 1)
+    // Build a set of nodes directly connected to entry points (depth 1). A
+    // type that names another type in its declaration — a Go struct's field,
+    // the type an alias or a defined type names, a Dart class's field — is
+    // structure, not one hop of the question's flow: connected through it, the
+    // payroll fixture's 8-line `RunResult` (which holds a `Payslip`) outranked
+    // the 51-line method that builds and stores every payslip, and took its
+    // place in the file's budget.
+    const TYPE_KINDS = new Set(['class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'type_alias']);
+    const isTypeDeclaration = (id: string): boolean => TYPE_KINDS.has(subgraph.nodes.get(id)?.kind ?? '');
     const connectedToEntry = new Set<string>();
     for (const edge of subgraph.edges) {
+      if (edge.kind === 'references' && isTypeDeclaration(edge.source) && isTypeDeclaration(edge.target)) continue;
       if (entryNodeIds.has(edge.source)) connectedToEntry.add(edge.target);
       if (entryNodeIds.has(edge.target)) connectedToEntry.add(edge.source);
     }
@@ -4700,7 +4676,6 @@ export class ToolHandler {
     // displaces a flow-central file. Bounded: only the few named seeds, only the
     // types in their signatures.
     const CALLABLE_KINDS = new Set(['method', 'function', 'component', 'constructor']);
-    const TYPE_KINDS = new Set(['class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'type_alias']);
     const SIG_EDGE = new Set(['references', 'type_of', 'returns']);
     const changeSurfaceCandidates: Node[] = [];
     const seenChangeSurface = new Set<string>();
@@ -4770,33 +4745,6 @@ export class ToolHandler {
     // Extract query terms for relevance checking (path-stripped: a pinned
     // file's own path fragments must not count as "term hits" everywhere)
     const queryTerms = matchQuery.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
-
-    // Test/spec/icon/i18n file detector — used by the pre-floor hard filter, the
-    // rank penalty, and the comparator deprioritization.
-    //
-    // The directory pattern is anchored at `^` as well as `/`: a repo-ROOT
-    // `test/` or `spec/` directory (express, cobra, and most of npm/Go) produced
-    // paths like `test/express.raw.js`, which the old leading-`/` form could
-    // never match — so express's routing question spent 59% of its envelope on
-    // three test files while `lib/router/index.js` never rendered.
-    const isLowValue = (p: string) => {
-      const lp = p.toLowerCase();
-      return (
-        /(?:^|\/)(tests?|__tests?__|specs?)\//.test(lp) ||
-        /_test\.go$/.test(lp) ||
-        /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
-        /_test\.py$/.test(lp) ||
-        /_spec\.rb$/.test(lp) ||
-        /_test\.rb$/.test(lp) ||
-        /\.(test|spec)\.[jt]sx?$/.test(lp) ||
-        /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
-        /(tests?|spec)\.cs$/.test(lp) ||
-        /tests?\.swift$/.test(lp) ||
-        /_test\.dart$/.test(lp) ||
-        /\bicons?\b/.test(lp) ||
-        /\bi18n\b/.test(lp)
-      );
-    };
 
     // One DB probe over every file the query touched, then O(1) per lookup.
     // Unions the index-time content-banner flag (CG-5) with the filename
@@ -8042,7 +7990,7 @@ export class ToolHandler {
     const fmt = (e: { node: Node; edge: Edge }) => {
       const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
       const synth = this.synthEdgeNote(e.edge);
-      return synth ? `${base} [${synth.compact}]` : base;
+      return synth ? `${base} [${synth}]` : base;
     };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
       const seen = new Set<string>([node.id]);
@@ -8411,18 +8359,6 @@ export class ToolHandler {
   // =========================================================================
 
   /**
-   * Find a symbol by name, handling disambiguation when multiple matches exist.
-   * Returns the best match and a note about alternatives if any.
-   */
-  /**
-   * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/symbol-lookup`, which owns the rules.
-   */
-  private matchesSymbol(node: Node, symbol: string): boolean {
-    return matchesSymbol(node, symbol);
-  }
-
-  /**
    * Find ALL definitions matching a name, ranked, so codegraph_node can return
    * every overload instead of guessing one (the wrong guess → a Read). Keepers
    * rank before generated stubs (.pb.go etc.); stable within a group preserves
@@ -8450,34 +8386,18 @@ export class ToolHandler {
       return fuzzy[0] ? [fuzzy[0].node] : [];
     }
 
-    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
-    const limit = 50;
-    let results = cg.searchNodes(symbol, { limit });
-
-    // FTS strips colons, so `stage_apply::run` searches the literal
-    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
-    // let `matchesSymbol` filter by qualifier.
-    if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
-    }
-
-    if (results.length === 0) return [];
-
-    const exactMatches = results.filter((r) => this.matchesSymbol(r.node, symbol));
-    if (exactMatches.length === 0) {
-      // No exact match — a qualified lookup must not fall back to a fuzzy file
-      // hit (#173); a bare name may use the single top fuzzy result.
-      return isQualified ? [] : results[0] ? [results[0].node] : [];
-    }
+    // Qualified lookup (`Session.request`, `stage_apply::run`,
+    // `refresh.Discovery.refresh`): the search's matching hits, else the
+    // exact-name index's — shared with explore's resolution. No match is no
+    // match: a qualified lookup must not fall back to a fuzzy file hit (#173).
+    const exactMatches = qualifiedSymbolMatches(cg, symbol, goPackageReaderFor(cg));
+    if (exactMatches.length === 0) return [];
 
     // Down-rank generated files (.pb.go, .pulsar.go, _grpc.pb.go, and anything
     // whose header declares it generated) so a flow query prefers the keeper
     // implementation over the generated stub.
-    const isGen = cg.generatedFilePredicate(exactMatches.map((r) => r.node.filePath));
-    return [...exactMatches]
-      .sort((a, b) => (isGen(a.node.filePath) ? 1 : 0) - (isGen(b.node.filePath) ? 1 : 0))
-      .map((r) => r.node);
+    const isGen = cg.generatedFilePredicate(exactMatches.map((n) => n.filePath));
+    return [...exactMatches].sort((a, b) => (isGen(a.filePath) ? 1 : 0) - (isGen(b.filePath) ? 1 : 0));
   }
 
   /**

@@ -446,6 +446,26 @@ impl<'t> Walker<'t> {
         None
     }
 
+    /// rustImplItemOwner (languages/rust.ts) — the type an item written
+    /// directly in an impl block belongs to: `ValueHint` for the `type Err`
+    /// of `impl FromStr for ValueHint`, then `ValueHint::Err`, as the impl's
+    /// methods are. A type no single name stands for (`()`, `(A, B)`, `[u8]`,
+    /// `u32`) is written as the impl writes it. Mirrored byte-for-byte —
+    /// change both.
+    fn impl_item_owner(&self, node: Node) -> Option<String> {
+        let list = node.parent().filter(|p| p.kind() == "declaration_list")?;
+        let imp = list.parent().filter(|p| p.kind() == "impl_item")?;
+        let mut ty = imp.child_by_field_name("type")?;
+        while ty.kind() == "reference_type" {
+            ty = ty.child_by_field_name("type")?;
+        }
+        self.impl_type_name(Some(ty)).or_else(|| {
+            let words: Vec<&str> =
+                self.text(ty).split([' ', '\t', '\r', '\n']).filter(|w| !w.is_empty()).collect();
+            Some(words.join(" "))
+        })
+    }
+
     // --- visitNode ------------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
@@ -480,8 +500,10 @@ impl<'t> Walker<'t> {
             // Inside a class-like scope the gate fails and the else-ladder
             // falls through with children VISITED — a trait const's value
             // expression emits calls refs from the trait node.
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The initializer extract_variable walked under the declared
+            // symbol took its own candidates; the scan covers the rest.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "use_declaration" {
             self.extract_import(node);
@@ -688,6 +710,12 @@ impl<'t> Walker<'t> {
         }
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            // Private unless `pub` (any form), as the wasm walker reads it:
+            // the resolver keeps a private alias to its own module.
+            visibility: Some(self.visibility_of(node)),
+            // An impl's associated type is its type's (`ValueHint::Err`),
+            // named only through a path, never bare.
+            qualified_name: self.impl_item_owner(node).map(|o| format!("{o}::{name}")),
             ..Extra::default()
         };
         self.create_node("type_alias", &name, node, extra);
@@ -695,11 +723,14 @@ impl<'t> Walker<'t> {
 
     /// extractVariable's generic fallback: kind is ALWAYS `variable` (no
     /// isConst hook), every direct `identifier` child mints a node positioned
-    /// at the CHILD, docstring shared, isExported present-false, no signature,
-    /// and the initializer value is never body-walked.
-    fn extract_variable(&mut self, node: Node<'t>) {
+    /// at the CHILD, docstring shared, isExported present-false, no signature.
+    /// The initializer is walked under the declared symbol (#693), and returned
+    /// then for the declaration scan to skip.
+    fn extract_variable(&mut self, node: Node<'t>) -> Vec<usize> {
         let docstring = preceding_docstring(node, self.src);
         let name_field = node.child_by_field_name("name");
+        // An impl's associated const is its type's (`Limits::MAX`), as its methods are.
+        let owner = self.impl_item_owner(node);
         let mut declared: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
@@ -715,6 +746,7 @@ impl<'t> Walker<'t> {
                     Extra {
                         docstring: docstring.clone(),
                         is_exported: Some(false),
+                        qualified_name: owner.as_ref().map(|o| format!("{o}::{name}")),
                         ..Extra::default()
                     },
                 );
@@ -730,16 +762,19 @@ impl<'t> Walker<'t> {
         // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
         // inside the initializer, so a handler table or a lazily-built
         // singleton linked to nothing.
+        let mut walked = Vec::new();
         if let Some(value) = node.child_by_field_name("value") {
             match declared {
                 Some((row, name)) => {
                     self.stack.push(Scope { row, kind: "variable", name });
                     self.visit_function_body(value);
                     self.stack.pop();
+                    walked.push(value.id());
                 }
                 None => self.visit_function_body(value),
             }
         }
+        walked
     }
 
     /// extractImport via the rust hook: import node named by the ROOT module +
@@ -853,6 +888,11 @@ impl<'t> Walker<'t> {
         let func = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0));
+        // A turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+        // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its
+        // type arguments are no part of the callee's name. Mirrors
+        // TreeSitterExtractor.extractCall.
+        let func = func.map(unwrap_generic_function);
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -891,7 +931,7 @@ impl<'t> Walker<'t> {
                                 // function chain (`Foo::new().bar()`, inner
                                 // callee a scoped_identifier). Instance chains
                                 // keep the bare method name.
-                                let inner_fn = r.child_by_field_name("function");
+                                let inner_fn = r.child_by_field_name("function").map(unwrap_generic_function);
                                 let reencode =
                                     inner_fn.map(|f| f.kind() == "scoped_identifier").unwrap_or(false);
                                 if reencode {
@@ -901,6 +941,7 @@ impl<'t> Walker<'t> {
                                         .chars()
                                         .filter(|c| !c.is_whitespace())
                                         .collect();
+                                    let inner = strip_turbofish(&inner);
                                     callee_name = format!("{inner}().{method_name}");
                                 } else {
                                     callee_name = method_name.to_string();
@@ -945,10 +986,11 @@ impl<'t> Walker<'t> {
                     }
                 }
             } else if matches!(func.kind(), "scoped_identifier" | "scoped_call_expression") {
-                callee_name = self.text(func).to_string();
+                // A path's turbofish is no part of the name either
+                // (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+                callee_name = strip_turbofish(self.text(func));
             } else {
-                // identifier; generic_function keeps the raw turbofish text
-                // (`helper::<T>` — unresolvable downstream, preserved).
+                // identifier (a turbofish was unwrapped above).
                 callee_name = self.text(func).to_string();
             }
         }
@@ -1394,9 +1436,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         if depth > 0
@@ -1411,7 +1457,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -1570,6 +1616,52 @@ fn is_stoplisted(name: &str) -> bool {
         "this" | "self" | "super" | "null" | "nil" | "true" | "false" | "undefined" | "new"
             | "NULL" | "nullptr" | "None"
     )
+}
+
+/// The function a turbofish wraps: `s.get::<u32>` → `s.get`,
+/// `helper::<u8>` → `helper`; any other callee as is.
+fn unwrap_generic_function(func: Node<'_>) -> Node<'_> {
+    if func.kind() == "generic_function" {
+        func.child_by_field_name("function").unwrap_or(func)
+    } else {
+        func
+    }
+}
+
+/// A callee path without its turbofish type arguments: `Vec::<u8>::new` →
+/// `Vec::new`. The brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is
+/// no closing one (`::<fn() -> u8>`). Mirrors stripRustTurbofish in
+/// TreeSitterExtractor: both emit the same bytes.
+fn strip_turbofish(text: &str) -> String {
+    if !text.contains("::<") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ':' && i + 2 < chars.len() && chars[i + 1] == ':' && chars[i + 2] == '<' {
+            let mut depth = 0i32;
+            let mut j = i + 2;
+            while j < chars.len() {
+                let c = chars[j];
+                if c == '<' {
+                    depth += 1;
+                } else if c == '>' && chars[j - 1] != '-' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// LITERAL_RECEIVER_TYPES (shared table).

@@ -5,12 +5,12 @@
  */
 
 import { SqliteDatabase } from './sqlite-adapter';
-import { referenceNameTail } from './reference-tail';
+import { referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
 
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 /**
  * Migration definition
@@ -282,6 +282,36 @@ const migrations: Migration[] = [
         const tail = referenceNameTail(row.reference_name, row.reference_kind);
         if (tail !== row.name_tail) update.run(tail, row.id);
       }
+    },
+  },
+  {
+    version: 15,
+    description: 'Retry a failed reference through an import binding by its whole name: module-tail name index',
+    up: (db) => {
+      // A failed reference through an import binding the module declares
+      // under another name is parked under the module's key from this
+      // version on, and still looked up by its whole name. Rows parked before
+      // keep the tail their name gives, which the name lookup already finds;
+      // a re-index parks them under their modules. Keep the definition in
+      // lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_name ON unresolved_refs(status, reference_name) WHERE status = 'failed' AND name_tail GLOB 'module:*';
+      `);
+    },
+  },
+  {
+    version: 16,
+    description: 'Retry a failed member reference through an import binding by its member: module-tail member index',
+    up: (db) => {
+      // A failed member reference through an import binding (`store.get`) is
+      // parked under the module's key from this version on, and still looked
+      // up by its member, the tail its name gives. Rows parked before keep
+      // that tail, which the tail lookup already finds; a re-index parks
+      // them under their modules. Keep the definition in lockstep with
+      // schema.sql: the expression is MEMBER_TAIL_SQL.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_member ON unresolved_refs(status, ${MEMBER_TAIL_SQL}) WHERE ${MODULE_PARKED_SQL};
+      `);
     },
   },
 ];

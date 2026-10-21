@@ -126,6 +126,24 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
+  it.each([['ts', 'typescript'], ['tsx', 'tsx']] as const)('an awaited call with type arguments names its callee: %s (#2586)', (ext, language) => {
+    const source = [
+      'export async function a() { return await fetchApi<User>("/me"); }',
+      'export async function b() { return await api.fetchApi<User>("/me"); }',
+      'export async function c() { return (await load())(); }',
+      'export async function d() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function e() { return await api.get<User>("/me").then(r => r); }',
+      'export async function f() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function g() { return await await fetchApi<User>("/me"); }',
+      'export async function h() { return await // typed\n fetchApi<User>("/me").then(r => r); }',
+      '',
+    ].join('\n');
+    const result = assertParity(`awaited.${ext}`, source, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi', 'fetchApi().json', 'api.get().then']));
+    expect(calls.some((n) => /^await|^\/[*/]/.test(n))).toBe(false);
+  });
+
   it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {
     // Mostly long lines dense with code punctuation, as a minifier writes them.
     const line = `var a={b:function(){return c(1,2)},d:function(e){return e}};window.L={f:function(){return a.b()}};`.repeat(40);
@@ -312,6 +330,57 @@ export function second() { return probe(); }
       'useFoo', 'pair', 'nested', 'fallback', 'withDefault', 'other', 'list', 'inArrow', 'exported', 'inner',
       ...(typed ? ['make'] : []),
     ]));
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'],
+  ] as const)('typed styled tags are components, parsed as comparisons or not: %s', (ext, language) => {
+    // `styled.div<Props>\`…\`` parses as `(styled.div < Props) > \`…\``; the
+    // type argument's own operators sit between (`<A | B>`, `<Partial<A>>`).
+    const result = assertParity(`styles.${ext}`, `
+import styled, { css } from 'styled-components';
+import { s } from './theme';
+type Props = { align: 'start' | 'end' };
+const Plain = styled.div\`color: red;\`;
+export const Wrapper = styled.div<Props>\`color: \${(p) => s(p.align)};\`;
+const CloseAction = styled.div<{ animation: Animation | null }>\`top: 0;\`;
+const Content = styled(Plain)<Props>\`padding: 4px;\`;
+const NudeButton = styled(Plain).attrs((props: Props) => ({ type: "button" }))<Props>\`\`;
+const Either = styled.div<Props | Other>\`color: red;\`;
+const Nested = styled.div<Partial<Props>>\`color: red;\`;
+const Mixin = css<Props>\`color: red;\`;
+const Compared = styled.length < LIMIT > 2;
+const lowerCase = styled.div<Props>\`color: red;\`;
+`, language);
+    const kind = (name: string) => result.nodes.filter((n) => n.name === name).map((n) => n.kind);
+    for (const name of ['Plain', 'Wrapper', 'CloseAction', 'Content', 'NudeButton', 'Either', 'Nested']) {
+      expect(kind(name), name).toEqual(['component']);
+    }
+    for (const name of ['Mixin', 'Compared', 'lowerCase']) expect(kind(name), name).toEqual(['constant']);
+  });
+
+  it.each([
+    ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('edges the file-scope values a component reads or renders: %s', (ext, language) => {
+    // `.jsx` was left out of the value-reference languages on both paths, so
+    // this file had none of these edges as .jsx and all of them as .js or .tsx.
+    const result = assertParity(`routes.${ext}`, `
+import { lazy } from 'react';
+import Loadable from './Loadable';
+const LoginPage = Loadable(lazy(() => import('./pages/Login')));
+const ROUTE_TABLE = [{ path: '/login', label: 'Login' }];
+const THEME_TOKENS = { color: 'red', size: 12 };
+export function AuthRoutes() { return <LoginPage />; }
+export function Nav() {
+  return <ul style={{ color: THEME_TOKENS.color }}>{ROUTE_TABLE.map((r) => <li key={r.path}>{r.label}</li>)}</ul>;
+}
+export const Box = () => <div data-size={THEME_TOKENS.size} />;
+`, language);
+    const name = (id: string) => result.nodes.find((n) => n.id === id)?.name;
+    expect(result.edges
+      .filter((e) => e.kind === 'references' && e.metadata?.valueRef === true)
+      .map((e) => `${name(e.source)} -> ${name(e.target)}`)
+      .sort()).toEqual(['AuthRoutes -> LoginPage', 'Box -> THEME_TOKENS', 'Nav -> ROUTE_TABLE', 'Nav -> THEME_TOKENS']);
   });
 
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {

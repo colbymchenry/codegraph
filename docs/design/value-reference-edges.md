@@ -1,6 +1,6 @@
 # Design + status: same-file value-reference edges
 
-**Status:** SHIPPED (default-on for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal; `CODEGRAPH_VALUE_REFS=0` disables). The
+**Status:** SHIPPED (default-on for TS/JS/tsx/jsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal; `CODEGRAPH_VALUE_REFS=0` disables). The
 emitter lives in `TreeSitterExtractor.flushValueRefs` (`src/extraction/tree-sitter.ts`).
 **Motivation:** close the impact-analysis hole for *value consumers*. Static
 extraction edges calls, imports, and inheritance, but never edges a constant to the
@@ -13,7 +13,7 @@ readers" class of change (the ReScript-PR false positive that motivated the work
 ## TL;DR for a new session
 
 We emit a `references` edge (`metadata: { valueRef: true }`) from a reader symbol to
-the **file/package-scope `const`/`var` it reads**, same-file only, for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal. Those edges
+the **file/package-scope `const`/`var` it reads**, same-file only, for TS/JS/tsx/jsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal. Those edges
 flow straight into `getImpactRadius` / `codegraph impact` and the impact trail in
 `codegraph_explore` / `codegraph_node` — no agent-behaviour change required.
 
@@ -418,6 +418,17 @@ wiring pass. See the playbook's §2b C++ note.
 tsx-specific path — a const read *only* inside JSX (`<Foo x={CONST}/>`) — relies on the
 reader-scan descending into the JSX subtree; it's locked by a unit test
 (`value-reference-edges.test.ts`), so no separate tsx repo sweep is needed.
+
+**`jsx` was missing until 2026-10.** A `.jsx` file is its own language (`jsx`), parsed
+with the JavaScript grammar, and `VALUE_REF_LANGS` — and the kernel's mirror in
+`codegraph-kernel/src/tsjs/` — listed `javascript` and `tsx` but not `jsx`. So a `.jsx`
+component had no edge to the lazy page it renders (`<LoginPage />` under
+`const LoginPage = Loadable(lazy(…))`) or the table it maps over, while the same file as
+`.js` or `.tsx` had both. Adding it changed nothing else: on mantis, matx, berry,
+mastodon and bigbluebutton-html5 the index only gained edges (400 in all, every one a
+same-file read of a file-scope value that is the only binding of its name in the file),
+and a repo with no `.jsx` files indexed byte-identically. Locked by the `.jsx` cases in
+`value-reference-edges.test.ts` and `kernel-tsjs-parity.test.ts`.
 
 **Svelte / Vue / Astro are covered for free** — their extractors re-parse the `<script>` /
 frontmatter block as `typescript` / `javascript`, which are in `VALUE_REF_LANGS`, so a `const`

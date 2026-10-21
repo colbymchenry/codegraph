@@ -46,16 +46,12 @@ impl Variant {
     fn is_ts(self) -> bool {
         matches!(self, Variant::Typescript | Variant::Tsx)
     }
-    /// VALUE_REF_LANGS includes typescript/tsx/javascript but NOT jsx.
-    fn value_refs(self) -> bool {
-        !matches!(self, Variant::Jsx)
-    }
 }
 
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
 fn is_method_type(v: Variant, kind: &str) -> bool {
     kind == "method_definition"
-        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature"))
+        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature" | "abstract_method_signature"))
         || (!v.is_ts() && kind == "field_definition")
 }
 
@@ -78,7 +74,7 @@ fn is_property_type(v: Variant, kind: &str) -> bool {
 /// `function stop` beside the real `Handle::stop`. Mirrors the TS extractor's
 /// SIGNATURE_METHOD_NODE_TYPES (extraction/tree-sitter.ts).
 fn is_signature_method_type(kind: &str) -> bool {
-    kind == "method_signature"
+    matches!(kind, "method_signature" | "abstract_method_signature")
 }
 
 fn is_function_type(kind: &str) -> bool {
@@ -478,9 +474,6 @@ impl<'t> Walker<'t> {
     // --- value references (captureValueRefScope / flushValueRefs) --------------
 
     fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>, value_target: bool) {
-        if !self.variant.value_refs() {
-            return;
-        }
         let target_kind_ok = kind == "constant" || kind == "variable";
         if value_target
             && target_kind_ok
@@ -497,7 +490,9 @@ impl<'t> Walker<'t> {
                 *self.fs_value_counts.entry(name.to_string()).or_insert(0) += 1;
             }
         }
-        if matches!(kind, "function" | "method" | "constant" | "variable") {
+        // A React wrapper component reads values as a constant's declaration
+        // does (`${BaseMenuItemCSS}` in a styled template).
+        if matches!(kind, "function" | "method" | "constant" | "variable" | "component") {
             self.value_scopes.push(ValueScope { row, node, name: name.to_string() });
         }
     }
@@ -506,7 +501,7 @@ impl<'t> Walker<'t> {
         let scopes = std::mem::take(&mut self.value_scopes);
         let mut targets = std::mem::take(&mut self.fs_values);
         let counts = std::mem::take(&mut self.fs_value_counts);
-        if !self.variant.value_refs() || std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
+        if std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
             return;
         }
         if targets.is_empty() || scopes.is_empty() || util::is_generated_file(self.file_path) {
@@ -612,9 +607,13 @@ impl<'t> Walker<'t> {
     }
 
     /// scanFnRefSubtree: capture-only walk of subtrees the main walkers skip.
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    /// `walked`: subtrees a body walk has already been through.
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: Option<&HashSet<usize>>) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        if walked.map(|w| w.contains(&node.id())).unwrap_or(false) {
             return;
         }
         let kind = node.kind();
@@ -626,7 +625,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -688,6 +687,11 @@ impl<'t> Walker<'t> {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
             self.extract_function(node, None);
             skip_children = true;
+        } else if kind == "function_signature" && self.variant.is_ts() && is_ambient_function_signature(node, self.file_path) {
+            // A bodiless function that no implementation follows: a
+            // `declare function`, a function in a `declare module` body or a `.d.ts`.
+            self.extract_function(node, None);
+            skip_children = true;
         } else if is_class_type(self.variant, kind) {
             self.extract_class(node);
             skip_children = true;
@@ -696,12 +700,16 @@ impl<'t> Walker<'t> {
         {
             if classify_ts_class_member(node) == Member::Property {
                 let prop = self.extract_property(node);
+                // The initializer walked under the property took its own
+                // candidates; the scan covers the rest of the field.
+                let mut walked: Option<HashSet<usize>> = None;
                 if let (Some((row, name)), Some(value)) = (prop, node.child_by_field_name("value")) {
                     self.stack.push(Scope { row, kind: "property", name });
                     self.visit_function_body(value);
                     self.stack.pop();
+                    walked = Some(HashSet::from([value.id()]));
                 }
-                self.scan_fn_ref_subtree(node, 0);
+                self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             } else {
                 self.extract_method(node);
             }
@@ -715,13 +723,19 @@ impl<'t> Walker<'t> {
         } else if self.variant.is_ts() && kind == "type_alias_declaration" {
             skip_children = self.extract_type_alias(node);
         } else if is_variable_type(kind) && !self.inside_class_like() {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // An initializer extract_variable walked under the symbol it
+            // declares (a constant's, a component wrapper's) captured its own
+            // candidates; the scan skips it.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             skip_children = true;
         } else if kind == "import_statement" {
             self.extract_import(node);
         } else if kind == "export_statement" && node.child_by_field_name("source").is_some() {
-            // Re-export: `export { X } from './y'`.
+            // Re-export: `export { X } from './y'`, `export * from './y'`. It
+            // imports the module as `import … from` does (an import node and a
+            // reference to the module), then links each re-exported name.
+            self.extract_import(node);
             self.emit_re_export_refs(node);
         } else if kind == "export_statement" && self.looks_like_vue_store_file() {
             // Vuex MODULE default export (`export default { actions: {…} }`).
@@ -749,7 +763,7 @@ impl<'t> Walker<'t> {
             // says which member wants the type, where `Api → PageId` only said
             // the file did.
             self.extract_property(node);
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, None);
             skip_children = true;
         }
 
@@ -1164,6 +1178,37 @@ fn is_ambient_export(node: Node) -> bool {
         cur = p.parent();
     }
     false
+}
+
+/// isAmbientFunctionSignature (languages/typescript.ts): a bodiless
+/// `function_signature` that is a function's declaration, not an overload of
+/// an implementation that follows it — a `declare function`, one in a
+/// `declare global` body, a declaration file's (`.d.ts`, `.d.mts`, `.d.cts`)
+/// own, and one a declaration file's `declare module 'x'` body declares.
+/// Never a namespace's (`declare namespace`, `module Foo {}`), nor one in an
+/// ordinary module file's `declare module` body, an augmentation.
+fn is_ambient_function_signature(node: Node, file_path: &str) -> bool {
+    if node.kind() != "function_signature" {
+        return false;
+    }
+    let lower = file_path.to_ascii_lowercase();
+    let declaration_file = lower.ends_with(".d.ts") || lower.ends_with(".d.mts") || lower.ends_with(".d.cts");
+    let mut ambient = false;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "internal_module" => return false,
+            // `declare module 'x'`; `module Foo {}` is a namespace.
+            "module" => {
+                return declaration_file
+                    && p.child_by_field_name("name").is_some_and(|n| n.kind() == "string");
+            }
+            "ambient_declaration" => ambient = true,
+            _ => {}
+        }
+        cur = p.parent();
+    }
+    ambient || declaration_file
 }
 
 /// hasExportDeclaration: a statement that exports by name or by assignment

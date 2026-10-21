@@ -733,7 +733,10 @@ impl<'t> Walker<'t> {
         })
     }
 
-    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+    /// The Kotlin visitNode hook: `Some` when it consumed the node, holding the
+    /// initializers it walked as such (`walkInitializer`), which the caller's
+    /// fn-ref scan of the node skips.
+    fn try_visit_hook(&mut self, node: Node<'t>) -> Option<Vec<usize>> {
         // An own-line accessor already walked by its owning property below. The
         // ownership test re-derives the property's kind rather than remembering
         // it: a destructured or local declaration mints no node, so its
@@ -741,10 +744,10 @@ impl<'t> Walker<'t> {
         if matches!(node.kind(), "getter" | "setter") {
             return accessor_owner(node)
                 .and_then(|owner| self.property_kind(owner))
-                .is_some();
+                .map(|_| Vec::new());
         }
         if node.kind() != "property_declaration" {
-            return false;
+            return None;
         }
         let var_decl = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
@@ -764,11 +767,11 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         let name = self.text(name_node).to_string();
         if name.is_empty() {
-            return false;
+            return None;
         }
         let Some(kind) = self.property_kind(node) else {
             // A local — no node is minted, but the initializer is still code.
@@ -778,7 +781,7 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         // The `type`-field signature read is dead (zero fields) → signature
         // undefined; NO docstring/visibility/isStatic — the modifiers merge in
@@ -790,26 +793,30 @@ impl<'t> Walker<'t> {
         // the idiomatic Android callback field) contributed NO call edge at all.
         // The property also OWNS any accessor written on its own line, which the
         // grammar makes a following SIBLING rather than a child; those bodies
-        // used to attribute to the enclosing class.
+        // used to attribute to the enclosing class. The initializers are
+        // walked as such: the fn-ref scan skips them, or it would take each
+        // function value again for the enclosing file or class.
+        let mut walked = Vec::new();
         if let Some(row) = row {
             self.stack.push(Scope { row, kind, name: name.clone() });
             for init in property_initializers(node) {
                 self.visit_function_body(init);
+                walked.push(init.id());
             }
             for acc in following_accessors(node) {
                 self.visit_function_body(acc);
             }
             self.stack.pop();
         }
-        true
+        Some(walked)
     }
 
     // --- the dispatcher (visitNode, Kotlin-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
         stack_guard!();
-        if self.try_visit_hook(node) {
-            self.scan_fn_ref_subtree(node, 0);
+        if let Some(walked) = self.try_visit_hook(node) {
+            self.scan_fn_ref_subtree(node, 0, &walked);
             return;
         }
 
@@ -856,7 +863,7 @@ impl<'t> Walker<'t> {
             // Hook-declined destructuring: extractField/extractVariable both
             // find no matching children for kotlin — NOTHING minted, RHS
             // invisible; candidates-only scan.
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_header" {
             self.extract_import(node);
@@ -1574,9 +1581,13 @@ impl<'t> Walker<'t> {
         });
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes (function_declaration) + the fixed list —
@@ -1594,7 +1605,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

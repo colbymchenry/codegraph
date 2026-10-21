@@ -72,6 +72,7 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -2332,7 +2333,7 @@ for (const direction of ['callers', 'callees'] as const) {
         const cg = await CodeGraph.open(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
-          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
           if (targets.length === 0) {
             info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
             return;
@@ -2456,7 +2457,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
-        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
         if (targets.length === 0) {
           info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
           return;

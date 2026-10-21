@@ -67,36 +67,113 @@ export function goEmbeddedTypeName(type: SyntaxNode | null | undefined, source: 
 }
 
 /**
- * The name nodes of the types a Go alias declaration names, in source order:
- * `Event` in `type Event = mvccpb.Event`, `List` and `Event` in `type Page =
- * List[Event]`, each where it is written, so resolution reads a package
- * qualifier back. The alias's own type parameters (`T` in `type Items[T any]
- * = List[T]`) and Go's predeclared types are not types it names. A generic
- * alias has no rule in tree-sitter-go 0.23: it parses as a `type_spec` whose
- * `=` is an error, and reads as an alias here too. Undefined for a defined
- * type (`type WatchChan <-chan Event`), which declares a type of its own.
+ * The names a type name written bare inside a Go type declaration can mean
+ * without naming another type: the declaration's own type parameters, and
+ * its own name, which in a recursive type is the declaration itself.
  */
-export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[] | undefined {
-  const isAlias = node.type === 'type_alias' ||
-    (node.type === 'type_spec' && node.children.some((c: SyntaxNode) => c.type === 'ERROR' && getNodeText(c, source).trim() === '='));
-  const type = isAlias ? getChildByField(node, 'type') : null;
-  if (!type) return undefined;
-  const params = new Set<string>();
-  for (const decl of getChildByField(node, 'type_parameters')?.namedChildren ?? []) {
-    for (const c of decl.namedChildren) {
-      if (c.type === 'identifier') params.add(getNodeText(c, source));
+function goDeclaredNames(decl: SyntaxNode, source: string): Set<string> {
+  const names = goTypeParameterNames(decl, source);
+  const nameNode = getChildByField(decl, 'name');
+  if (nameNode) names.add(getNodeText(nameNode, source));
+  return names;
+}
+
+/** The type parameters a Go type declaration declares: `T` and `K` in `type Store[T any, K comparable] …`. */
+function goTypeParameterNames(decl: SyntaxNode, source: string): Set<string> {
+  const names = new Set<string>();
+  for (const param of getChildByField(decl, 'type_parameters')?.namedChildren ?? []) {
+    for (const c of param.namedChildren) {
+      if (c.type === 'identifier') names.add(getNodeText(c, source));
     }
   }
-  const names: SyntaxNode[] = [];
-  const walk = (n: SyntaxNode): void => {
+  return names;
+}
+
+/**
+ * Collects the name nodes of the types `type` names onto `names`, in source
+ * order, but Go's predeclared types and, written bare, the `declared` names
+ * of the declaration it is written in.
+ */
+function collectGoTypeNames(type: SyntaxNode, declared: ReadonlySet<string>, source: string, names: SyntaxNode[]): void {
+  // `qualified`: the name of a `pkg.Name`, which is that package's whatever
+  // this one declares.
+  const walk = (n: SyntaxNode, qualified: boolean): void => {
     if (n.type === 'type_identifier') {
       const text = getNodeText(n, source);
-      if (!params.has(text) && !GO_PREDECLARED_TYPES.has(text)) names.push(n);
+      if (!GO_PREDECLARED_TYPES.has(text) && (qualified || !declared.has(text))) names.push(n);
       return;
     }
-    for (const c of n.namedChildren) walk(c);
+    for (const c of n.namedChildren) walk(c, n.type === 'qualified_type');
   };
-  walk(type);
+  walk(type, false);
+}
+
+/**
+ * The name nodes of the types a Go `type_alias` node names on its right-hand
+ * side, in source order: an alias's (`Event` in `type Event = mvccpb.Event`,
+ * `List` and `Event` in `type Page = List[Event]`) and a defined type's
+ * (`WatchResponse` in `type WatchChan <-chan WatchResponse`, `Context` in
+ * `type HandlerFunc func(*Context)`), each where it is written, so resolution
+ * reads a package qualifier back. Not types it names: the declaration's own
+ * type parameters (`T` in `type Items[T any] = List[T]`), Go's predeclared
+ * types, and its own name written bare, which in a recursive type (`type
+ * stateFn func(*Lexer) stateFn`) is the declaration itself. A generic alias
+ * has no rule in tree-sitter-go 0.23: it parses as a `type_spec` whose `=` is
+ * an error, and reads as any other declaration here.
+ */
+export function goAliasTypeNames(node: SyntaxNode, source: string): SyntaxNode[] {
+  const type = getChildByField(node, 'type');
+  if (!type) return [];
+  const names: SyntaxNode[] = [];
+  collectGoTypeNames(type, goDeclaredNames(node, source), source, names);
+  return names;
+}
+
+/**
+ * The name nodes of the types a Go struct's fields are declared with, in
+ * source order: `ResponseHeader` in etcd's `Header *ResponseHeader`,
+ * `HandlersChain` in gin's `handlers HandlersChain`, and every type a field's
+ * function, map, channel or anonymous struct type names. `node` declares the
+ * struct (a `type_spec`, or a `type_alias` of a struct literal). An embedded
+ * field's type is a supertype (goEmbeddedTypeName), but the types it is
+ * instantiated with are not: `Pod` in client-go's
+ * `listers.ResourceIndexer[*v1.Pod]`. Skipped as in goAliasTypeNames: the
+ * struct's own type parameters, the predeclared types, and its own name
+ * written bare, which a linked list's `next *node` names.
+ */
+export function goStructFieldTypeNames(node: SyntaxNode, source: string): SyntaxNode[] {
+  const fields = getChildByField(node, 'type')?.namedChildren.find((c: SyntaxNode) => c.type === 'field_declaration_list');
+  const names: SyntaxNode[] = [];
+  if (!fields) return names;
+  const declared = goDeclaredNames(node, source);
+  for (const field of fields.namedChildren) {
+    if (field.type !== 'field_declaration') continue;
+    let type = getChildByField(field, 'type');
+    // Embedded: no field name (extractInheritance's test).
+    if (type && !field.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier')) {
+      type = type.type === 'generic_type' ? getChildByField(type, 'type_arguments') : null;
+    }
+    if (type) collectGoTypeNames(type, declared, source, names);
+  }
+  return names;
+}
+
+/**
+ * The name nodes of the types a Go interface method's signature names, in
+ * source order: `OpOption` and `PutResponse` in etcd's `Put(ctx
+ * context.Context, key, val string, opts ...OpOption) (*PutResponse, error)`,
+ * and `Context`, whose package stays in the source. `decl` declares the
+ * interface. Skipped: Go's predeclared types and, written bare, the
+ * interface's own type parameters (`T` in `type Store[T any] interface`). Its
+ * own name is a type the method names (`Children() []Node`).
+ */
+export function goInterfaceMethodTypeNames(method: SyntaxNode, decl: SyntaxNode, source: string): SyntaxNode[] {
+  const params = goTypeParameterNames(decl, source);
+  const names: SyntaxNode[] = [];
+  for (const field of ['parameters', 'result']) {
+    const part = getChildByField(method, field);
+    if (part) collectGoTypeNames(part, params, source, names);
+  }
   return names;
 }
 
@@ -165,4 +242,28 @@ export const goExtractor: LanguageExtractor = {
     const match = text.match(/\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/);
     return match?.[1];
   },
+  // A type declared on its own, `type Foo struct{…}`, is a `type_declaration`
+  // holding one spec, and its doc comment comes before the declaration, outside
+  // the spec. A member of a `type ( … )` group has its comment beside it in the
+  // parentheses, and the comment above the group is the group's. A group of one
+  // is that type's declaration, as go doc reads it, unless its member has a
+  // comment of its own.
+  getDeclarationWrapper: (node) => {
+    const parent = node.parent;
+    if (parent?.type !== 'type_declaration' || !parent.firstNamedChild?.equals(node)) return undefined;
+    const specs = parent.namedChildren.filter(
+      (c: SyntaxNode) => c.type === 'type_spec' || c.type === 'type_alias'
+    );
+    return specs.length === 1 ? parent : undefined;
+  },
+  // A comment after code on its line (`const sides = 4 // sides of a square.`)
+  // is that line's, never the doc of the declaration below it.
+  docstringSkipsTrailingComments: true,
+  // A doc comment ends on the line right above its declaration, and a blank
+  // line ends it, as go doc reads it: a banner or a note above that blank line
+  // documents nothing.
+  docstringSkipsDetachedComments: true,
+  // A directive Go tools read, like `//go:embed static` or
+  // `//nolint:errcheck`, is not part of the doc comment go doc shows.
+  docstringSkipsDirectives: true,
 };

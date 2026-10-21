@@ -44,6 +44,9 @@ describe('codegraph affected — test-file conventions (#1507)', () => {
     w('src/wire_format.h', '#pragma once\n\nint ByteSize(int value);\n');
     w('src/wire_format.cc', '#include "wire_format.h"\n\nint ByteSize(int value) { return value; }\n');
     w('src/wire_format_unittest.cc', '#include "wire_format.h"\n\nvoid ComputesByteSize() { ByteSize(1); }\n');
+    w('include/llvm/ADT/FoldingSet.h', '#pragma once\n\nint FoldingSetSize();\n');
+    w('lib/Support/FoldingSet.cpp', '#include "llvm/ADT/FoldingSet.h"\n\nint FoldingSetSize() { return 0; }\n');
+    w('unittests/ADT/FoldingSet.cpp', '#include "llvm/ADT/FoldingSet.h"\n\nvoid SizesTheSet() { FoldingSetSize(); }\n');
     const cg = CodeGraph.initSync(dir);
     await cg.indexAll();
     cg.close();
@@ -64,6 +67,10 @@ describe('codegraph affected — test-file conventions (#1507)', () => {
 
   it("reports Google's C++ _unittest.cc beside the code it tests", () => {
     expect(affected(dir, ['src/wire_format.h', 'src/wire_format.cc'])).toEqual(['src/wire_format_unittest.cc']);
+  });
+
+  it("reports a file in LLVM's unittests/ tree, whatever its name", () => {
+    expect(affected(dir, ['include/llvm/ADT/FoldingSet.h', 'lib/Support/FoldingSet.cpp'])).toEqual(['unittests/ADT/FoldingSet.cpp']);
   });
 
   it('still honours an explicit --filter glob', () => {

@@ -87,8 +87,10 @@ export const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
  * inner node, so before looking for its preceding comment we climb out through
  * these. Examples: `export class X {}` (export_statement), `@dec\ndef f()`
  * (decorated_definition), `const f = () => {}` (lexical_declaration →
- * variable_declarator). Each wraps exactly one declaration, so climbing can't
- * mis-attribute a comment to a sibling. (#780)
+ * variable_declarator), and each method, function or declaration of an
+ * Objective-C `@implementation` (implementation_definition). Each wraps
+ * exactly one declaration, so climbing can't mis-attribute a comment to a
+ * sibling. (#780)
  */
 const DOCSTRING_WRAPPER_TYPES = new Set([
   'export_statement', // JS/TS: export class/function/const ...
@@ -97,6 +99,7 @@ const DOCSTRING_WRAPPER_TYPES = new Set([
   'variable_declaration', // JS/TS: var x = ...
   'variable_declarator', // JS/TS: the `x = () => {}` inside the declaration
   'ambient_declaration', // TS: declare ...
+  'implementation_definition', // ObjC: each method, function or declaration of an @implementation
 ]);
 
 /**
@@ -134,11 +137,30 @@ function cleanCommentMarkers(comment: string): string {
  * declaration without ending the run: Dart's annotations, in `/// Builds it.`
  * `@override` `Widget build(…)`. They are not part of the docstring, and the
  * comments on either side of one join as if it weren't there. Default: none.
+ *
+ * `skipTrailing` leaves out the comments the run opens with that belong to
+ * the line above: one written after code on its line (`const n = 4 // four.`),
+ * and any that begins on the line such a comment ends. Go reads them as that
+ * line's comment, never the next declaration's doc. Default: off.
+ *
+ * `skipDetached` keeps only the comments that end on the line right above the
+ * declaration, together with the ones written on the lines just before them:
+ * a blank line ends the docstring, and a comment that ends on the
+ * declaration's own line documents nothing. That is Go's doc comment, the one
+ * go doc shows. Default: off.
+ *
+ * `skipDirectives` leaves the comment directives Go tools read, like
+ * `//go:embed static` or `//nolint:errcheck`, out of the docstring's text, as
+ * go doc does. They still count as comments when the other options decide
+ * where the docstring starts. Default: off.
  */
 export function getPrecedingDocstring(
   node: SyntaxNode,
   source: string,
-  stepOver: readonly string[] = []
+  stepOver: readonly string[] = [],
+  skipTrailing = false,
+  skipDetached = false,
+  skipDirectives = false
 ): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
@@ -151,7 +173,7 @@ export function getPrecedingDocstring(
   }
 
   let sibling = anchor.previousNamedSibling;
-  const comments: string[] = [];
+  const comments: SyntaxNode[] = [];
 
   while (sibling) {
     if (
@@ -160,7 +182,7 @@ export function getPrecedingDocstring(
       sibling.type === 'block_comment' ||
       sibling.type === 'documentation_comment'
     ) {
-      comments.unshift(getNodeText(sibling, source));
+      comments.unshift(sibling);
       sibling = sibling.previousNamedSibling;
     } else if (stepOver.includes(sibling.type)) {
       sibling = sibling.previousNamedSibling;
@@ -169,8 +191,58 @@ export function getPrecedingDocstring(
     }
   }
 
-  if (comments.length === 0) return undefined;
+  let first = 0;
+  if (skipTrailing) {
+    let endRow = -1;
+    for (const comment of comments) {
+      const trails =
+        first === 0 ? followsCodeOnItsLine(comment, source) : comment.startPosition.row === endRow;
+      if (!trails) break;
+      endRow = comment.endPosition.row;
+      first++;
+    }
+  }
+  if (skipDetached) {
+    // Walk back from the declaration: the last comment must end on the line
+    // above it, and each one before joins while it ends on the line the next
+    // one starts, or the line before that.
+    let start = comments.length;
+    if (start > first && comments[start - 1]!.endPosition.row + 1 === anchor.startPosition.row) {
+      start--;
+      while (start > first && comments[start - 1]!.endPosition.row + 1 >= comments[start]!.startPosition.row) {
+        start--;
+      }
+    }
+    first = start;
+  }
+  const docComments = comments
+    .slice(first)
+    .filter((c) => !skipDirectives || !isDirective(getNodeText(c, source)));
+  if (docComments.length === 0) return undefined;
 
   // Strip each comment's syntax markers (language-aware), then join.
-  return comments.map(cleanCommentMarkers).join('\n').trim();
+  return docComments
+    .map((c) => cleanCommentMarkers(getNodeText(c, source)))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Whether a comment is a directive Go tools read, which go doc leaves out of a
+ * doc comment's text (go/ast's isDirective): a `//` comment with no space
+ * after the slashes that is `//line `, `//extern ` or `//export ` followed by
+ * text, or that opens with a lowercase word, a colon and a lowercase letter or
+ * digit, like `//go:embed static` or `//nolint:errcheck`.
+ */
+function isDirective(comment: string): boolean {
+  if (!comment.startsWith('//')) return false;
+  const text = comment.slice(2);
+  return /^(?:line|extern|export) /.test(text) || /^[a-z0-9]+:[a-z0-9]/.test(text);
+}
+
+/** Whether code comes before `node` on the line it starts on. */
+function followsCodeOnItsLine(node: SyntaxNode, source: string): boolean {
+  let i = node.startIndex;
+  while (i > 0 && (source[i - 1] === ' ' || source[i - 1] === '\t')) i--;
+  return i > 0 && source[i - 1] !== '\n' && source[i - 1] !== '\r';
 }
