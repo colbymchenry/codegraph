@@ -11588,7 +11588,7 @@ export function matchByQualifiedName(
     };
   }
 
-  let candidates = cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context);
+  let candidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context), ref, context);
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
   // That own using ends the lookup here, and resolveOne drops it (an import
@@ -11663,8 +11663,8 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context);
+    const partialCandidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
+      .filter((candidate) => endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context), ref, context);
     const ownLanguage = partialCandidates.filter((candidate) => sameLanguageFamily(candidate.language, ref.language));
     const pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
     const chosen = preferCallSiteFile(pool, ref.filePath)[0];
@@ -14630,7 +14630,7 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
   const family = named.filter((n) => n.qualifiedName === want);
-  const own = cppSpecializationPool(family, ref, context);
+  const own = cppQualifierSpecializationPool(cppSpecializationPool(family, ref, context), ref, context);
   // Specializations of the class's own member template, none the call's:
   // what C++ finds is the template, which has no body here.
   if (own.length === 0 && family.length > 0) return null;
@@ -15223,6 +15223,79 @@ function cppSpecializationPool(candidates: Node[], ref: UnresolvedRef, context: 
   if (args === null) return others.length > 0 ? others : candidates;
   const named = candidates.filter((_, i) => written[i] !== null && cppTemplateArgumentsMatch(written[i]!, args));
   return named.length > 0 ? named : others;
+}
+
+/**
+ * The `candidates` a C++ call through a qualifier written with template
+ * arguments can mean: fmt's `formatter<int>::format(…)` is never the
+ * `format` a test defines for `formatter<incomplete_type>`, which the index
+ * names `fmt::formatter::format` like every other specialization's. A member
+ * defined out of line for a full specialization of its class stays only when
+ * that specialization's arguments are the call's; a template's own members,
+ * a partial specialization's and those defined in their class all stay. The
+ * candidates as they are when the qualifier is written without arguments.
+ */
+function cppQualifierSpecializationPool(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (ref.language !== 'cpp' || candidates.length === 0) return candidates;
+  const args = cppQualifierArguments(ref, context);
+  if (args === null) return candidates;
+  return candidates.filter((n) => {
+    const owner = cppSpecializationOwnerArguments(n, context);
+    return owner === null || cppTemplateArgumentsMatch(owner, args);
+  });
+}
+
+/** The template arguments a C++ call writes on the qualifier before its name: `int` for `formatter<int>::format(…)`, null for none. */
+function cppQualifierArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  const segments = ref.referenceName.split('::');
+  if (segments.length < 2) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  return cppTemplateArgumentsAfter(lines.slice(ref.line - 1, ref.line + 3).join('\n'), segments[segments.length - 2]!, Math.max(0, ref.column));
+}
+
+/** Per context: a C++ member's id → the arguments of the full specialization it is defined out of line for (null: none). */
+const CPP_SPECIALIZATION_OWNER_ARGUMENTS = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+
+/**
+ * The arguments of the full specialization of its class a C++ member is
+ * defined out of line for: `incomplete_type` for fmt's `auto
+ * fmt::formatter<incomplete_type>::format(…)`. Null for a member defined in
+ * its class, and for one whose arguments name the template parameters around
+ * it, a template's own (`Foo<T>::bar`) or a partial specialization's
+ * (`Foo<T*>::bar`).
+ */
+function cppSpecializationOwnerArguments(n: Node, context: ResolutionContext): string[] | null {
+  if (n.language !== 'cpp' || (n.kind !== 'method' && n.kind !== 'function')) return null;
+  const segments = n.qualifiedName.split('::');
+  if (segments.length < 2) return null;
+  let memo = CPP_SPECIALIZATION_OWNER_ARGUMENTS.get(context);
+  if (!memo) CPP_SPECIALIZATION_OWNER_ARGUMENTS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const owner = segments[segments.length - 2]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const name = n.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(n.startLine - 1, n.startLine + 11).join('\n').slice(n.startColumn);
+  let found: string[] | null = null;
+  // `Owner<args>::name`, the declarator's own qualifier.
+  for (const m of head.matchAll(new RegExp(`(?<![\\w$])${owner}<`, 'g'))) {
+    const open = m.index! + m[0].length - 1;
+    const end = cppTemplateArgumentsEnd(head, open);
+    if (end < 0 || !new RegExp(`^\\s*::\\s*~?${name}(?![\\w$])`).test(head.slice(end + 1))) continue;
+    const args = splitCppTopLevel(head.slice(open + 1, end)).map(cppTemplateArgumentKey);
+    // A `template <…>` with parameters on the definition makes it a template's
+    // own member or a partial specialization's, whatever the arguments say:
+    // abseil's `template <int max_words> … BigUnsigned<max_words>::FiveToTheNth(`.
+    const before = `${lines.slice(Math.max(0, n.startLine - 3), n.startLine - 1).join('\n')}\n${head.slice(0, m.index)}`;
+    const header = /\btemplate\s*<\s*(>)?(?![\s\S]*\btemplate\s*<)/.exec(before);
+    const parameters = [...cppTemplateParameters(n, context)];
+    const dependent = (header !== null && header[1] === undefined) ||
+      args.some((a) => parameters.some((p) => new RegExp(`(?<![\\w$])${p}(?![\\w$])`).test(a)));
+    found = dependent || args.length === 0 ? null : args;
+    break;
+  }
+  memo.set(n.id, found);
+  return found;
 }
 
 /** Per context: a C++ function's id → the template arguments it is an explicit specialization for (null: none). */
@@ -18842,6 +18915,12 @@ export function matchMethodCall(
     return null;
   });
   if (strat1) return strat1;
+  // A C++ call through a project class template's specialization written
+  // with its arguments, fmt's `formatter<std::tm, Char>::format(…)`, is a
+  // member of that specialization: when the template's members gave none, a
+  // method picked below by the receiver's name is another class's.
+  if (ref.language === 'cpp' && match === colonMatch && cppQualifierArguments(ref, context) !== null &&
+      context.getNodesByName(objectOrClass!).some((n) => n.language === 'cpp' && isMethodOwnerKind(n))) return null;
 
   // Built-in method names need a validated receiver (#1987). Typed, imported,
   // object-literal and direct class receivers have had their chance above;
