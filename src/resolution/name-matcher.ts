@@ -13651,7 +13651,28 @@ function cppClassParenDepths(
   return depths;
 }
 
-/** The lines of the functions and classes nested in the C++ class declaration `decl`, which ends on line `end`. */
+/**
+ * Is the C or C++ declaration `n` an anonymous union or struct, with no name
+ * and no declarator, whose members are those of the class it is declared in?
+ * C++ looks them up as that class's own: protobuf's generated messages hold
+ * their fields in `union { Impl_ _impl_; };`, and fmt's `value` its argument
+ * in a union of `string`, `custom` and the rest. Not one with a declarator,
+ * `union { … } u;`, whose members are `u`'s, nor a specialization the index
+ * keeps as `<anonymous>`, whose head names its template.
+ */
+function isCppAnonymousMembers(n: Node, context: ResolutionContext): boolean {
+  if (n.name !== '<anonymous>' || (n.kind !== 'union' && n.kind !== 'struct')) return false;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/);
+  const head = lines?.[n.startLine - 1]?.slice(n.startColumn ?? 0);
+  const foot = lines?.[(n.endLine ?? n.startLine) - 1];
+  return !!head && !!foot && /^\s*(?:union|struct)\s*\{/.test(head) && /\}\s*;\s*(?:\/\/.*)?$/.test(foot);
+}
+
+/**
+ * The lines of the functions and classes nested in the C++ class declaration
+ * `decl`, which ends on line `end` — not an anonymous union's or struct's,
+ * whose members are the class's own (isCppAnonymousMembers).
+ */
 function cppNestedSpans(decl: Node, end: number, context: ResolutionContext): Array<[number, number]> {
   let memo = CPP_NESTED_SPANS.get(context);
   if (!memo) CPP_NESTED_SPANS.set(context, (memo = new Map()));
@@ -13659,7 +13680,7 @@ function cppNestedSpans(decl: Node, end: number, context: ResolutionContext): Ar
   if (!spans) {
     spans = context.getNodesInFile(decl.filePath)
       .filter((n) => n.id !== decl.id && n.startLine >= decl.startLine && (n.endLine ?? n.startLine) <= end &&
-        (isCppFunctionNode(n) || CPP_CLASS_KINDS.has(n.kind)))
+        (isCppFunctionNode(n) || (CPP_CLASS_KINDS.has(n.kind) && !isCppAnonymousMembers(n, context))))
       .map((n): [number, number] => [n.startLine, n.endLine ?? n.startLine]);
     memo.set(decl.id, spans);
   }
