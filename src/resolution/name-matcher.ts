@@ -18513,6 +18513,7 @@ export function inferLocalReceiverType(
   // A type goWrittenType can't tell leaves the local to them and to name
   // matching, as before: grpc-go's `ci.GetCommonAuthInfo()`, through an
   // interface its function declares, reaches the one method of that name.
+  let goDeclLine: number | undefined;
   if (ref.language === 'go' && decl) {
     const written = goAssertedLocalType(scanReceiver, ref, context);
     const asserted = written === undefined ? undefined : goWrittenType(written, ref, context);
@@ -18526,14 +18527,18 @@ export function inferLocalReceiverType(
     // *v1.Pod`), which the patterns below don't read, each name of `a, b
     // rest.Interface`, a `var (…)` spec. The patterns scan back for the name
     // with no block scope, so they can also read another declaration of it.
-    const type = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDecl(scanReceiver, ref, context)?.type : undefined;
-    if (type !== undefined) {
-      const named = goNamedType(type);
+    const local = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDeclarationAt(scanReceiver, ref, context) : undefined;
+    if (local?.type !== undefined) {
+      const named = goNamedType(local.type);
       decl.declared = named;
       if (!named) return null;
       decl.raw = named;
       return named.slice(named.indexOf('.') + 1);
     }
+    // A `:=` declares the innermost block's own variable: one in a block or
+    // a function literal that closed before the call is another `r`. The
+    // scan reads the one declaration in scope and no other line.
+    goDeclLine = local?.line;
   }
 
   const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -18562,6 +18567,7 @@ export function inferLocalReceiverType(
   const matchLine = (i: number): string | null => {
     const line = lines[i];
     if (!line) return null;
+    if (goDeclLine !== undefined && i !== goDeclLine - 1) return null;
     // A generated/minified line (one multi-KB statement) is not something a
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
@@ -18605,7 +18611,7 @@ export function inferLocalReceiverType(
   // semantics.
   if (!componentScoped) {
     const states = getInferScanStates(context);
-    const key = `${ref.filePath}|${startIdx}|${ref.language}|${scanReceiver}`;
+    const key = `${ref.filePath}|${startIdx}|${ref.language}|${scanReceiver}|${goDeclLine ?? ''}`;
     const state = states.get(key);
     if (!state) {
       for (let i = callIdx; i >= startIdx; i--) {
@@ -20117,7 +20123,10 @@ function isGoExternalType(raw: string | undefined, filePath: string, context: Re
  * signature spells it, for a function of the call's own package or of an
  * imported project package; the callee itself for a conversion (`list :=
  * model.BotList(bots)`) and for a function of a package outside the
- * project, whose result is a type from outside it too.
+ * project, whose result is a type from outside it too. `store.New()` with
+ * `store` a parameter or local of the function is a call on that variable,
+ * which shadows the package of its name: the result of the method of its
+ * declared type, when the declaration writes one.
  */
 function goBoundCallResult(
   lines: string[],
@@ -20152,7 +20161,13 @@ function goBoundCallResult(
   const name = callee.slice(dot + 1);
   let pkgDir = goPackageDir(filePath);
   if (dot >= 0) {
-    const imported = context.getImportMappings(filePath, 'go').find((imp) => imp.localName === callee.slice(0, dot));
+    const head = callee.slice(0, dot);
+    const local = goLocalDeclarationAt(head, { filePath, line: i + 1, column: m.index + m[0].indexOf(head) }, context);
+    if (local) {
+      const method = local.type === undefined ? null : goMethodOfWrittenType(local.type, name, filePath, context);
+      return method ? goFirstResult(method, context) : null;
+    }
+    const imported = context.getImportMappings(filePath, 'go').find((imp) => imp.localName === head);
     if (!imported) return null;
     if (isGoOutsideImport(imported, filePath, context)) return { raw: callee };
     const dir = context.getGoPackageDir?.(imported.source, filePath);
@@ -20163,7 +20178,37 @@ function goBoundCallResult(
     (n) => n.kind === 'function' && n.language === 'go' && goPackageDir(n.filePath) === pkgDir
   );
   if (!fn) return goPackageTypes(name, pkgDir, context).length > 0 ? { raw: callee } : null;
-  // `(params) *T`, `(params) (*T, error)`, `(params) (t *T, err error)`.
+  return goFirstResult(fn, context);
+}
+
+/**
+ * The method `methodName` of the Go type a declaration writes as `written`
+ * (`*Holder`, `store.Holder`), in that type's own package; null for a type
+ * from outside the project, or one that declares no such method.
+ */
+function goMethodOfWrittenType(written: string, methodName: string, filePath: string, context: ResolutionContext): Node | null {
+  const named = goNamedType(written);
+  if (!named) return null;
+  const dot = named.indexOf('.');
+  let pkgDir = goPackageDir(filePath);
+  if (dot >= 0) {
+    const imported = context.getImportMappings(filePath, 'go').find((imp) => imp.localName === named.slice(0, dot));
+    if (!imported || isGoOutsideImport(imported, filePath, context)) return null;
+    const dir = context.getGoPackageDir?.(imported.source, filePath);
+    if (dir == null) return null;
+    pkgDir = dir;
+  }
+  const qualified = `${named.slice(dot + 1)}::${methodName}`;
+  return context.getNodesByName(methodName).find(
+    (n) => n.kind === 'method' && n.language === 'go' && n.qualifiedName === qualified && goPackageDir(n.filePath) === pkgDir
+  ) ?? null;
+}
+
+/**
+ * The first result of the Go function or method `fn` as its signature spells
+ * it: `(params) *T`, `(params) (*T, error)`, `(params) (t *T, err error)`.
+ */
+function goFirstResult(fn: Node, context: ResolutionContext): { raw: string; file?: string } | null {
   const results = /^\s*\((?:[^()]|\([^()]*\))*\)\s*\(?\s*([^,()]*)/.exec(fn.signature ?? '')?.[1]?.trim();
   const raw = results?.split(/\s+/).pop()?.replace(/\[.*$/, '');
   if (!raw || !/^\*?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/.test(raw)) return null;

@@ -57,6 +57,7 @@ import (
 	"net/http"
 	"os"
 
+	"example.com/app/other"
 	"example.com/app/store"
 )
 
@@ -124,6 +125,33 @@ func projectFuncReturningStdlib()       { f, _ := open(); f.Truncate(0) }
 func interfaceResult()                  { rt := transport(); rt.RoundTrip(nil) }
 func netParam(conn net.Conn)            { conn.LocalAddr() }
 
+// The \`r\` of the block, or of the function literal, is gone by the call.
+func blockShadow() {
+	r := newRing()
+	if true {
+		r := other.New()
+		_ = r
+	}
+	r.Write(nil)
+}
+
+func closureShadow() {
+	r := newRing()
+	go func() { r := other.New(); _ = r }()
+	r.Write(nil)
+}
+
+type Holder struct{}
+
+func (h *Holder) New() *Item { return &Item{} }
+
+type Item struct{}
+
+func (i *Item) Save() {}
+
+// \`store\` is the parameter, not the imported package.
+func shadowPkg(store *Holder) { x := store.New(); x.Save() }
+
 func main() {}
 `,
       'store/store.go': `package store
@@ -133,6 +161,20 @@ type Store struct{}
 func NewStore() *Store { return &Store{} }
 
 func (s *Store) Put(k string) {}
+
+type Thing struct{}
+
+func New() *Thing { return &Thing{} }
+
+func (t *Thing) Save() {}
+`,
+      'other/other.go': `package other
+
+type Other struct{}
+
+func New() *Other { return &Other{} }
+
+func (o *Other) Write(b []byte) {}
 `,
       // Same-named methods elsewhere, so a guess by name has somewhere wrong to go.
       'decoy/decoy.go': `package decoy
@@ -196,6 +238,17 @@ func (s *Store) Put(k string) {}
 
   it('an outside interface a project function returns still reaches its implementation', async () => {
     expect(await methodCallees(cg, 'interfaceResult')).toEqual(['main.go::limiter::RoundTrip']);
+  });
+
+  it.each(['blockShadow', 'closureShadow'])(
+    '%s: a `:=` in a block that closed before the call is another variable',
+    async (caller) => {
+      expect(await methodCallees(cg, caller)).toEqual(['main.go::ringLog::Write']);
+    },
+  );
+
+  it('a parameter named like an imported package is the parameter, and types what its method returns', async () => {
+    expect(await methodCallees(cg, 'shadowPkg')).toEqual(['main.go::Holder::New', 'main.go::Item::Save']);
   });
 });
 
