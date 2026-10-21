@@ -2667,6 +2667,8 @@ interface GoScopeIndex {
   decls: Map<string, GoDecl[]>;
   /** Where each declared name is bound, read on demand: [start, end, declaration]. */
   scopes: Map<string, Array<[number, number, GoDecl]>>;
+  /** Whether the file declares a generic function or method, read on demand. */
+  generic?: boolean;
 }
 
 interface GoDecl {
@@ -2684,6 +2686,12 @@ interface GoDecl {
   from?: string;
   /** The function of the file's own package a `:=` takes its value from: `newStore` in `store := newStore(…)`. */
   callee?: string;
+  /**
+   * Where the values a `:=`, or a `var` that writes no type, gives its names
+   * start (past the `:=` or `=`), and this name's place `k` among the `n` it
+   * declares: `out` is 1 of 2 in `in, out := &in.Items, &out.Items`.
+   */
+  value?: { at: number; k: number; n: number };
 }
 
 const GO_SCOPE_INDEXES = new WeakMap<ResolutionContext, Map<string, GoScopeIndex | null>>();
@@ -2706,7 +2714,11 @@ const GO_PREDECLARED_CALLS: ReadonlySet<string> = new Set([
 function goLocalDecl(name: string, ref: Pick<UnresolvedRef, 'filePath' | 'line' | 'column'>, context: ResolutionContext): GoDecl | undefined {
   const index = goScopeIndex(ref.filePath, context);
   if (!index?.decls.has(name)) return undefined;
-  const at = (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(0, ref.column);
+  return goLocalDeclAt(index, name, (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(0, ref.column));
+}
+
+/** {@link goLocalDecl}, at an offset of the file `index` reads. */
+function goLocalDeclAt(index: GoScopeIndex, name: string, at: number): GoDecl | undefined {
   let found: [number, number, GoDecl] | undefined;
   for (const scope of goScopesOf(index, name)) {
     if (at > scope[0] && at < scope[1] && (!found || scope[0] > found[0])) found = scope;
@@ -2819,7 +2831,8 @@ function readGoScopes(code: string): GoScopeIndex {
     const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
     const call = from ? undefined : /^[ \t]*([A-Za-z_]\w*)[ \t]*(?:\[(?:[^[\]\n]|\[[^[\]\n]*\])*\][ \t]*)?\(/.exec(rhs)?.[1];
     const callee = call && !GO_PREDECLARED_CALLS.has(call) ? call : undefined;
-    for (const [name, at] of names) add(name, { at, kind, type, from, callee });
+    // The names were read backwards from the `:=`.
+    names.forEach(([name, at], r) => add(name, { at, kind, type, from, callee, value: { at: i + 2, k: names.length - 1 - r, n: names.length } }));
   }
   // `var x T`, `var a, b = …`, `const (…)`: names before a type, an `=` or
   // the line's end — in a group, on lines outside the brackets of a value
@@ -2830,12 +2843,16 @@ function readGoScopes(code: string): GoScopeIndex {
     const s = spec.exec(code);
     if (!s) return;
     const type = /^[ \t]+([^\s=;][^=;\n]*?)[ \t]*(?:[=;\n]|$)/.exec(code.slice(at + s[0].length, at + s[0].length + 160))?.[1];
+    // `var a, b = x, y`: the values that type them.
+    const eq = type === undefined ? /^[ \t]*=(?!=)/.exec(code.slice(at + s[0].length, at + s[0].length + 40)) : null;
+    const parts = s[1]!.split(',');
     let p = at + s[0].length - s[1]!.length;
-    for (const part of s[1]!.split(',')) {
+    parts.forEach((part, k) => {
       const name = part.trim();
-      add(name, { at: p + part.indexOf(name), kind: 'local', type });
+      const value = eq ? { at: at + s[0].length + eq[0].length, k, n: parts.length } : undefined;
+      add(name, { at: p + part.indexOf(name), kind: 'local', type, value });
       p += part.length + 1;
-    }
+    });
   };
   for (const m of code.matchAll(/(?<![\w.])(?:var|const)\b[ \t]*/g)) {
     const start = m.index! + m[0].length;
@@ -17744,6 +17761,12 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GO_ALIAS_TARGETS.delete(context);
   GO_DOT_IMPORTS.delete(context);
   GO_ASSERTION_BINDINGS.delete(context);
+  GO_TYPE_SPECS.delete(context);
+  GO_STRUCT_MEMBERS.delete(context);
+  GO_FUNC_TYPE_PARAMS.delete(context);
+  GO_PACKAGE_FILES.delete(context);
+  GO_UNREAD_FILES.delete(context);
+  GO_UNREAD_METHODS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
@@ -20445,7 +20468,7 @@ function goAssertedType(ref: UnresolvedRef, context: ResolutionContext): string 
 
 interface GoChainLink {
   kind: 'operand' | 'select' | 'assert' | 'call' | 'index';
-  /** An operand's or selector's name, an assertion's type. */
+  /** An operand's or selector's name, an assertion's type, what a call's or an index's brackets hold. */
   text: string;
 }
 
@@ -20490,8 +20513,11 @@ function goChainLinks(text: string, start: number, end?: { at: number }): GoChai
       else break;
     } else if (text[i] === '(' || text[i] === '[') {
       // A call whose arguments run past what was read is still a call.
-      links.push({ kind: text[i] === '(' ? 'call' : 'index', text: '' });
-      if (group() === null) break;
+      const link: GoChainLink = { kind: text[i] === '(' ? 'call' : 'index', text: '' };
+      links.push(link);
+      const inner = group();
+      if (inner === null) break;
+      link.text = inner;
     } else break;
   }
   if (end) end.at = i;
@@ -20539,6 +20565,738 @@ function goDotImportDirs(filePath: string, context: ResolutionContext): string[]
   }
   memo.set(filePath, dirs);
   return dirs;
+}
+
+/**
+ * A Go type as written, with the file it is written in: that file's package
+ * and imports give its names their meaning.
+ */
+interface GoTypeText {
+  /** Whitespace collapsed: `[]*Item`, `map[string]model.Item`. */
+  text: string;
+  file: string;
+  /** The type parameters in scope where it is written, which are no package's types, with their constraints. */
+  params?: ReadonlyMap<string, string>;
+}
+
+/**
+ * A type, or null for a value of a type from outside the project or a
+ * predeclared one (no field or method the project declares), or undefined
+ * when that can't be read.
+ */
+type GoTyped = GoTypeText | null | undefined;
+
+/** A Go type declaration as written: `type A = B`, its type parameters, and the type after its name. */
+interface GoTypeSpec {
+  alias: boolean;
+  params: Map<string, string>;
+  /** `[]Schema`, `struct { … }`, `model.Item`. */
+  underlying: string;
+}
+
+/** A struct's fields, each name's type as written, and the types it embeds. */
+interface GoStructMembers {
+  fields: Map<string, string>;
+  embedded: string[];
+  params: Map<string, string>;
+}
+
+const GO_TYPE_SPECS = new WeakMap<ResolutionContext, Map<string, GoTypeSpec | null>>();
+const GO_STRUCT_MEMBERS = new WeakMap<ResolutionContext, Map<string, GoStructMembers | null>>();
+const GO_FUNC_TYPE_PARAMS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/** The keywords a type literal starts with: it declares no method of its own. */
+const GO_TYPE_LITERAL = /^(?:\[|map\b|chan\b|<-|func\b|struct\b|interface\b)/;
+
+/** How many values, fields and types one receiver is followed through. */
+const GO_VALUE_DEPTH = 12;
+
+/**
+ * A Go method call on an indexed element — kubectl's `schemas[ix].ValidateBytes(data)`,
+ * go-to-protobuf's `m.Items[len(m.Items)-1].Unmarshal(dAtA[iNdEx:postIndex])`,
+ * deepcopy-gen's `(*in)[i].DeepCopyInto(&(*out)[i])` — calls a method of the
+ * element type of what is indexed. It reaches the resolver by its bare name,
+ * at the column where its receiver expression starts, like a call through a
+ * type assertion, and nothing typed the receiver: a method name one type
+ * declares went to it, another a namesake in the package that sorts first,
+ * and a common one (every API type's `DeepCopyInto`) to nothing.
+ *
+ * The receiver is typed as Go types it:
+ *  - its head is the parameter, receiver, named result or local the code
+ *    around the call declares there (goLocalDecl), else a package-level
+ *    variable of the call's package or, through an import, of another project
+ *    package;
+ *  - a declaration gives the type it writes (`xs []*T`, `var ring [4]T`) or
+ *    the type of its value: a composite literal, `make`, `new`, `append`, a
+ *    conversion (`[]Schema(c)`), another variable, a field, an element, an
+ *    address (`in, out := &in.Items, &out.Items`), a `range` clause's element;
+ *  - a field's type is read from its struct, a promoted one's from the struct
+ *    embedded, the shallowest as Go's selector picks it;
+ *  - an index takes the element type of a slice, an array, a pointer to an
+ *    array or a map, through a named type's underlying type
+ *    (`type ConjunctiveSchema []Schema`), and `(*p)` dereferences.
+ * The method is then the element type's own, its interface's, or one
+ * embedding promotes into it; a pointer element (`[]*T`) reaches T's
+ * methods. An element type from outside the project's modules
+ * (`[]*net.IPNet`), a predeclared one (`[]error`), a type literal or an alias
+ * of one of those declares no project method, so the call links nothing.
+ * Undefined when the call is not on an indexed element, or what is indexed
+ * can't be typed — a call's result, a type parameter — which leaves the call
+ * to name matching as before.
+ */
+export function matchGoIndexedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  // The receiver is indexed on the call's own line.
+  if (!lines || line === undefined || ref.column < 0 || line.indexOf('].', ref.column) < 0) return undefined;
+  // A column inside a name is no expression's start, and a call written at
+  // its own name calls a function.
+  if (ref.column > 0 && /\w/.test(line[ref.column - 1]!)) return undefined;
+  if (line.startsWith(ref.referenceName, ref.column) && /^\s*\(/.test(line.slice(ref.column + ref.referenceName.length))) return undefined;
+  // The call is the chain's first `.name(…)` link, and ours when an index
+  // comes right before it. Two calls of one name in a chain
+  // (`a[0].Get().b[1].Get()`) share the column; the first is there either way.
+  const callAfterIndex = (links: GoChainLink[]): number => {
+    const k = links.findIndex((l, i) => i > 0 && l.kind === 'select' && l.text === ref.referenceName && links[i + 1]?.kind === 'call');
+    return k > 0 && links[k - 1]!.kind === 'index' ? k : -1;
+  };
+  if (callAfterIndex(goChainLinks(lines.slice(ref.line - 1, ref.line + GO_CHAIN_LINES).join('\n'), ref.column)) < 0) return undefined;
+  // Read again from the file with its comments and strings blanked, where
+  // the receiver's names are scoped.
+  const index = goScopeIndex(ref.filePath, context);
+  if (!index) return undefined;
+  const at = (index.lineStarts[ref.line - 1] ?? index.code.length) + ref.column;
+  const links = goChainLinks(index.code, at);
+  const k = callAfterIndex(links);
+  if (k < 0) return undefined;
+  const receiver = goReceiverChainType(links.slice(0, k), index.code[at] === '(', at, ref.filePath, index, context, 0);
+  if (receiver == null) return receiver;
+  return goMethodOnElement(receiver, ref, context);
+}
+
+/**
+ * The method `ref` names on the type of its receiver. A pointer's is the
+ * type pointed to's.
+ */
+function goMethodOnElement(t: GoTypeText, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  let text = t.text.replace(/^\*/, '');
+  // A pointer to a pointer, or a type literal, has no method of its own.
+  if (text.startsWith('*') || GO_TYPE_LITERAL.test(text)) return null;
+  // A type parameter has the methods its constraint declares: a named
+  // interface's (`[T Validator]`), or none of the project's (`[T any]`,
+  // `[T interface{ Validate() error }]`, a union).
+  const constraint = t.params?.get(text);
+  if (constraint !== undefined) {
+    if (!constraint) return undefined;
+    text = goNormalizeType(constraint);
+    if (!/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\[[\s\S]*\])?$/.test(text) || text === 'comparable') return null;
+  }
+  const named = goNamedTypeDecls({ ...t, text }, context);
+  if (named == null) return named;
+  // An alias of a type from outside the project (`type Ctx = context.Context`)
+  // has that type's methods, none the project declares.
+  if (named.nodes.every((n) => goAliasTarget(n, context) === null)) return null;
+  const result = resolveMethodOnType(named.name, ref.referenceName, ref, context, 0.9, 'instance-method', named.dir);
+  // A type's own method may sit in a file of its package the index couldn't
+  // read: kubernetes' core/v1 generated.pb.go is too large to index, so
+  // `PersistentVolumeClaim`'s own `Unmarshal` is missing, and the one its
+  // embedded `TypeMeta` has would take the call. What such a file declares
+  // is read from its text; the call then links nothing.
+  const target = result ? context.getNodeById?.(result.targetNodeId) : null;
+  if (!target || goPackageDir(target.filePath) !== named.dir || target.qualifiedName !== `${named.name}::${target.name}`) {
+    for (const f of goUnreadPackageFiles(named.dir, context)) {
+      const methods = goUnreadFileMethods(f, context);
+      if (methods === null || methods.has(`${named.name}::${ref.referenceName}`)) return null;
+    }
+  }
+  return result;
+}
+
+const GO_PACKAGE_FILES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const GO_UNREAD_FILES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const GO_UNREAD_METHODS = new WeakMap<ResolutionContext, Map<string, Set<string> | null>>();
+
+/**
+ * The files of a Go package the index read nothing from — one over the size
+ * limit, like kubernetes' 1.7 MB core/v1 generated.pb.go, or one that would
+ * not parse — whose types' methods are missing from the graph. A test file's
+ * methods are no other code's to call.
+ */
+function goUnreadPackageFiles(dir: string, context: ResolutionContext): string[] {
+  let memo = GO_UNREAD_FILES.get(context);
+  if (!memo) GO_UNREAD_FILES.set(context, (memo = new Map()));
+  const hit = memo.get(dir);
+  if (hit) return hit;
+  let files = GO_PACKAGE_FILES.get(context);
+  if (!files) {
+    files = new Map();
+    for (const f of context.getAllFiles()) {
+      if (!f.endsWith('.go') || f.endsWith('_test.go')) continue;
+      const d = goPackageDir(f);
+      const list = files.get(d);
+      if (list) list.push(f);
+      else files.set(d, [f]);
+    }
+    GO_PACKAGE_FILES.set(context, files);
+  }
+  // A file the index read has a node of its own at least.
+  const unread = (files.get(dir) ?? []).filter((f) => context.getNodesInFile(f).length === 0);
+  memo.set(dir, unread);
+  return unread;
+}
+
+/** How large an unread Go file may be for its method declarations to be read from its text. */
+const GO_UNREAD_SCAN_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Each `Type::Method` a Go file the index didn't read declares, from its
+ * text: `func (m *PersistentVolumeClaim) Unmarshal(`. Null when the file is
+ * too large to read, or can't be.
+ */
+function goUnreadFileMethods(filePath: string, context: ResolutionContext): Set<string> | null {
+  let memo = GO_UNREAD_METHODS.get(context);
+  if (!memo) GO_UNREAD_METHODS.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  let methods: Set<string> | null = null;
+  try {
+    const abs = path.join(context.getProjectRoot(), filePath);
+    if (fs.statSync(abs).size <= GO_UNREAD_SCAN_BYTES) {
+      methods = new Set();
+      const decl = /^func\s*\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]\n]*\])?\s*\)\s*([A-Za-z_]\w*)\s*[[(]/gm;
+      for (const m of fs.readFileSync(abs, 'utf8').matchAll(decl)) methods.add(`${m[1]}::${m[2]}`);
+    }
+  } catch {
+    methods = null;
+  }
+  memo.set(filePath, methods);
+  return methods;
+}
+
+/**
+ * The project declarations a named Go type means — `Item` in the package of
+ * the file it is written in or one it dot-imports, `model.Item` in the
+ * package the import names — with its name and package directory. Null for a
+ * predeclared type or one of a package outside the project's modules;
+ * undefined when that can't be told: a type parameter, a name no package
+ * declares (a type declared in a function, a file the index lacks), an
+ * import the index doesn't know.
+ */
+function goNamedTypeDecls(t: GoTypeText, context: ResolutionContext): { name: string; dir: string; nodes: Node[] } | null | undefined {
+  const m = /^([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?(?:\[[\s\S]*\])?$/.exec(t.text);
+  if (!m) return undefined;
+  const [, first, second] = m;
+  let name = first!;
+  let dir: string | null | undefined;
+  if (second === undefined) {
+    if (t.params?.has(name)) return undefined;
+    if (GO_BUILTIN_FIELD_TYPES.has(name)) return null;
+    dir = [goPackageDir(t.file), ...goDotImportDirs(t.file, context)].find((d) => goPackageTypes(name, d, context).length > 0);
+    if (dir === undefined) return undefined;
+  } else {
+    dir = goImportPackageDir(first!, t.file, context);
+    if (dir === undefined) return undefined;
+    if (dir === null) return isGoOutsidePackage(first!, t.file, context) ? null : undefined;
+    name = second;
+  }
+  const nodes = goPackageTypes(name, dir, context);
+  return nodes.length > 0 ? { name, dir, nodes } : undefined;
+}
+
+/**
+ * The type of the Go expression a receiver chain's links spell — `in`,
+ * `(*in)[i]`, `m.Items[k]`, `v.(T)[0]` — at offset `at` of the file `index`
+ * reads. `paren` says the first link is a parenthesized expression.
+ */
+function goReceiverChainType(
+  links: GoChainLink[], paren: boolean, at: number, filePath: string, index: GoScopeIndex,
+  context: ResolutionContext, depth: number,
+): GoTyped {
+  const head = links[0];
+  if (!head || head.kind !== 'operand' || depth > GO_VALUE_DEPTH) return undefined;
+  // A call's result (`x.Items()[0]`) isn't typed here.
+  if (links.some((l) => l.kind === 'call')) return undefined;
+  let t: GoTyped;
+  let i = 1;
+  if (paren) {
+    t = goExprType(head.text, at, filePath, index, context, depth + 1);
+  } else {
+    const decl = goLocalDeclAt(index, head.text, at);
+    if (decl) {
+      t = goDeclaredValueType(decl, filePath, index, context, depth + 1);
+    } else if (context.getImportMappings(filePath, 'go').some((m) => m.localName === head.text)) {
+      // `pkg.Var`: a package-level variable of the package imported.
+      if (links[1]?.kind !== 'select') return undefined;
+      const dir = goImportPackageDir(head.text, filePath, context);
+      if (dir == null) return dir === null && isGoOutsidePackage(head.text, filePath, context) ? null : undefined;
+      t = goPackageVarTypeText(links[1].text, dir, filePath, true, context, depth + 1);
+      i = 2;
+    } else {
+      t = goPackageVarTypeText(head.text, goPackageDir(filePath), filePath, false, context, depth + 1);
+    }
+  }
+  for (; i < links.length && t; i++) {
+    const link = links[i]!;
+    if (link.kind === 'select') t = goFieldTypeOf(t, link.text, context, depth + 1);
+    else if (link.kind === 'index') t = goIsSliceIndex(link.text) ? goSlicedType(t, context, depth + 1) : goElementOf(t, context, depth + 1);
+    // `.(T)` is a T, written where the expression is.
+    else if (link.kind === 'assert' && link.text !== 'type') t = goTypeTextAt(link.text, filePath, at, index, context);
+    else return undefined;
+  }
+  return t;
+}
+
+/** A type written at offset `at` of a file, or at package level for no `index`. */
+function goTypeTextAt(text: string, filePath: string, at: number, index: GoScopeIndex | null, context: ResolutionContext): GoTypeText {
+  return { text: goNormalizeType(text), file: filePath, params: index ? goTypeParamsAt(index, filePath, at, context) : undefined };
+}
+
+/**
+ * The type of a Go expression written in `filePath`: at offset `at` of the
+ * file `index` reads, or at package level for no `index`, where no local is
+ * seen.
+ */
+function goExprType(
+  expr: string, at: number, filePath: string, index: GoScopeIndex | null, context: ResolutionContext, depth: number,
+): GoTyped {
+  const s = expr.trim();
+  if (!s || depth > GO_VALUE_DEPTH) return undefined;
+  if (s.startsWith('&')) {
+    const t = goExprType(s.slice(1), at, filePath, index, context, depth + 1);
+    return t ? { ...t, text: `*${t.text}` } : t;
+  }
+  if (s.startsWith('*')) {
+    const t = goExprType(s.slice(1), at, filePath, index, context, depth + 1);
+    if (!t) return t;
+    return t.text.startsWith('*') ? { ...t, text: t.text.slice(1) } : undefined;
+  }
+  // `make(T, …)`, `new(T)`, `append(xs, …)`.
+  const builtin = /^(make|new|append)\s*\(/.exec(s);
+  if (builtin) {
+    const open = builtin[0].length - 1;
+    if (goClosingBracket(s, open) !== s.length - 1) return undefined;
+    const first = goSplitTopLevel(s.slice(open + 1, -1), ',')[0]?.trim();
+    if (!first) return undefined;
+    if (builtin[1] === 'make') return goTypeTextAt(first, filePath, at, index, context);
+    if (builtin[1] === 'new') return goTypeTextAt(`*${first}`, filePath, at, index, context);
+    return goExprType(first, at, filePath, index, context, depth + 1);
+  }
+  // A composite literal `T{…}`, or a conversion `T(x)`.
+  const typeEnd = goTypeTextEnd(s, 0);
+  if (typeEnd > 0) {
+    let j = typeEnd;
+    while (s[j] === ' ' || s[j] === '\t') j++;
+    if ((s[j] === '{' || s[j] === '(') && goClosingBracket(s, j) === s.length - 1) {
+      const type = goTypeTextAt(s.slice(0, typeEnd), filePath, at, index, context);
+      // `T(x)` is a conversion only when T is a type, not a function.
+      return s[j] === '{' || GO_TYPE_LITERAL.test(type.text) || goNamedTypeDecls(type, context) ? type : undefined;
+    }
+  }
+  if (!index) return undefined;
+  // A name, a field, an element, an assertion.
+  const end = { at: 0 };
+  const links = goChainLinks(s, 0, end);
+  if (end.at !== s.length) return undefined;
+  return goReceiverChainType(links, s.startsWith('('), at, filePath, index, context, depth + 1);
+}
+
+/**
+ * The type a declaration gives the name it declares: the type of the value
+ * it is given, or else the type it writes, read where the declaration is.
+ */
+function goDeclaredValueType(decl: GoDecl, filePath: string, index: GoScopeIndex, context: ResolutionContext, depth: number): GoTyped {
+  if (decl.value) {
+    const { at, k, n } = decl.value;
+    const code = index.code;
+    const rhs = code.slice(at, decl.kind === 'header' ? goHeaderValueEnd(code, at) : goStatementEnd(code, at));
+    // `for k, v := range xs`: v is an element of xs.
+    const ranged = /^\s*range\b/.exec(rhs);
+    if (ranged) {
+      if (k !== 1 || n !== 2) return undefined;
+      return goElementOf(goExprType(rhs.slice(ranged[0].length), decl.at, filePath, index, context, depth + 1), context, depth + 1);
+    }
+    const values = goSplitTopLevel(rhs, ',');
+    // `v, ok := m[key]`, `v, ok := x.(T)`.
+    const value = values.length === n ? values[k] : values.length === 1 && n === 2 && k === 0 && /[\])]\s*$/.test(rhs) ? rhs : undefined;
+    return value === undefined ? undefined : goExprType(value, decl.at, filePath, index, context, depth + 1);
+  }
+  if (decl.type === undefined) return undefined;
+  // A variadic `xs ...T` is a `[]T`.
+  return goTypeTextAt(decl.type.replace(/^\.\.\./, '[]'), filePath, decl.at, index, context);
+}
+
+/**
+ * The type of the package-level variable or constant `name` of the package
+ * in directory `dir`, as `fromFile` sees it — its own package's, where a
+ * `foo_test` package shares the directory and only a test file sees a test
+ * file's, or an imported package's, whose test files no importer sees — read
+ * from its declaration: the type it writes, or the type of its value.
+ */
+function goPackageVarTypeText(
+  name: string, dir: string, fromFile: string, imported: boolean, context: ResolutionContext, depth: number,
+): GoTyped {
+  if (depth > GO_VALUE_DEPTH) return undefined;
+  const clause = imported ? undefined : goPackageClause(fromFile, context);
+  const testFile = (f: string): boolean => /_test\.go$/.test(f);
+  const vars = context.getNodesByName(name).filter((n) =>
+    n.language === 'go' && (n.kind === 'variable' || n.kind === 'constant') && goPackageDir(n.filePath) === dir &&
+    (imported ? !testFile(n.filePath) : goPackageClause(n.filePath, context) === clause && (testFile(fromFile) || !testFile(n.filePath))));
+  let found: GoTyped;
+  for (const v of vars) {
+    const t = goPackageVarSpecType(v, name, context, depth + 1);
+    // Files for other build targets may declare it differently.
+    if (t === undefined || (found !== undefined && (found?.text ?? null) !== (t?.text ?? null))) return undefined;
+    found = t;
+  }
+  return found;
+}
+
+/** The type of one package-level declaration of `name`: the type its spec writes, or its value's. */
+function goPackageVarSpecType(v: Node, name: string, context: ResolutionContext, depth: number): GoTyped {
+  const declared = goPackageValueType(v, context);
+  if (declared === null) return null;
+  if (declared) return goTypeTextAt(declared.written, declared.file, -1, null, context);
+  const lines = context.getFileLines?.(v.filePath) ?? context.readFile(v.filePath)?.split(/\r?\n/);
+  if (!lines) return undefined;
+  // `var name = value`, `name = value` in a group, `var a, name = x, y`: the
+  // spec from its line's start, where its first name is, to its end.
+  const code = blankGoCode(lines.slice(v.startLine - 1, Math.max(v.startLine, v.endLine)).join('\n'));
+  const spec = /^\s*(?:(?:var|const)\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)\s*([\s\S]*)$/
+    .exec(code.slice(0, goStatementEnd(code, v.startColumn)));
+  if (!spec) return undefined;
+  const names = spec[1]!.split(',').map((x) => x.trim());
+  const values = goSplitTopLevel(spec[2]!, ',');
+  const k = names.indexOf(name);
+  return k >= 0 && values.length === names.length ? goExprType(values[k]!, -1, v.filePath, null, context, depth + 1) : undefined;
+}
+
+/**
+ * The type of field `name` of a value of type t: one its struct declares, or
+ * one a struct it embeds promotes, the shallowest as Go's selector picks it.
+ * A pointer is dereferenced first.
+ */
+function goFieldTypeOf(t: GoTypeText, name: string, context: ResolutionContext, depth: number): GoTyped {
+  const text = t.text.replace(/^\*/, '');
+  if (text.startsWith('*') || GO_TYPE_LITERAL.test(text) || depth > GO_VALUE_DEPTH) return undefined;
+  let level: GoTypeText[] = [{ ...t, text }];
+  const seen = new Set<string>();
+  for (let d = 0; d < 4 && level.length > 0; d++) {
+    const found: GoTypeText[] = [];
+    const next: GoTypeText[] = [];
+    let outside = false;
+    for (const type of level) {
+      const struct = goStructOf(type, context, depth + 1);
+      if (struct === null) outside = true;
+      if (!struct) continue;
+      const own = struct.members.fields.get(name);
+      if (own !== undefined) found.push({ text: goNormalizeType(own), file: struct.file, params: struct.members.params });
+      for (const e of struct.members.embedded) {
+        if (seen.has(`${struct.file}\0${e}`)) continue;
+        seen.add(`${struct.file}\0${e}`);
+        next.push({ text: goNormalizeType(e), file: struct.file, params: struct.members.params });
+      }
+    }
+    if (found.length === 1) return found[0];
+    if (found.length > 1) return undefined;
+    // A field no project struct at this depth declares, beside an embedded
+    // type from outside the project, is that type's, of an outside type too.
+    if (outside && next.length === 0) return null;
+    level = next;
+  }
+  return undefined;
+}
+
+/**
+ * The struct a named type is, with the file that declares it: its own
+ * declaration, or the struct an alias or a defined type (`type B A`) names.
+ * Null for a type from outside the project.
+ */
+function goStructOf(t: GoTypeText, context: ResolutionContext, depth: number): { members: GoStructMembers; file: string } | null | undefined {
+  if (depth > GO_VALUE_DEPTH) return undefined;
+  const named = goNamedTypeDecls({ ...t, text: t.text.replace(/^\*/, '') }, context);
+  if (named == null) return named;
+  for (const n of named.nodes) {
+    if (n.kind === 'struct') {
+      const members = goStructMembers(n, context);
+      if (members) return { members, file: n.filePath };
+    } else if (n.kind === 'type_alias') {
+      const spec = goTypeSpec(n, context);
+      if (!spec) continue;
+      const via = goStructOf({ text: goNormalizeType(spec.underlying), file: n.filePath, params: spec.params }, context, depth + 1);
+      if (via !== undefined) return via;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * What `x[i]` is for an x of type t: a slice's, an array's or an array
+ * pointer's element, a map's value, the same of a named type's underlying
+ * type. A string's bytes have no method.
+ */
+function goElementOf(t: GoTyped, context: ResolutionContext, depth: number): GoTyped {
+  if (!t || depth > GO_VALUE_DEPTH) return t;
+  let s = t.text;
+  // A pointer to an array is indexed as the array; any other pointer only
+  // once dereferenced, `(*p)[i]`.
+  if (s.startsWith('*')) {
+    s = s.slice(1);
+    if (!/^\[[^\]]/.test(s)) return undefined;
+  }
+  if (s.startsWith('[') || s.startsWith('map[')) {
+    const close = goClosingBracket(s, s.indexOf('['));
+    const element = close < 0 ? '' : s.slice(close + 1).trim();
+    return element ? { ...t, text: element } : undefined;
+  }
+  if (s === 'string') return null;
+  if (GO_TYPE_LITERAL.test(s)) return undefined;
+  const named = goNamedTypeDecls({ ...t, text: s }, context);
+  if (named == null) return named;
+  for (const n of named.nodes) {
+    const spec = n.kind === 'type_alias' ? goTypeSpec(n, context) : null;
+    if (!spec) continue;
+    const element = goElementOf({ text: goNormalizeType(spec.underlying), file: n.filePath, params: spec.params }, context, depth + 1);
+    if (element !== undefined) return element;
+  }
+  return undefined;
+}
+
+/**
+ * What `x[lo:hi]` is for an x of type t: a slice of the element of an array
+ * or an array pointer, else (a slice, a named slice type, a string) t.
+ */
+function goSlicedType(t: GoTypeText, context: ResolutionContext, depth: number): GoTyped {
+  const s = t.text.replace(/^\*/, '');
+  const array = /^\[[^\]]/.test(s) ? { ...t, text: s } : null;
+  if (!array && t.text.startsWith('*')) return undefined;
+  let underlying = array;
+  if (!underlying && s !== 'string' && !s.startsWith('[')) {
+    const named = goNamedTypeDecls(t, context);
+    if (named === undefined) return undefined;
+    for (const n of named?.nodes ?? []) {
+      const spec = n.kind === 'type_alias' ? goTypeSpec(n, context) : null;
+      if (spec && /^\[[^\]]/.test(spec.underlying)) underlying = { text: goNormalizeType(spec.underlying), file: n.filePath, params: spec.params };
+    }
+  }
+  if (!underlying) return t;
+  const element = goElementOf(underlying, context, depth + 1);
+  return element ? { ...element, text: `[]${element.text}` } : element;
+}
+
+/** Whether an index's brackets hold a slice expression's bounds, `[lo:hi]`. */
+function goIsSliceIndex(inner: string): boolean {
+  return goSplitTopLevel(inner, ':').length > 1;
+}
+
+/** A type's text with its whitespace collapsed: `map[string]*model.Item`. */
+function goNormalizeType(text: string): string {
+  return text.trim().replace(/\s+/g, ' ').replace(/([*\]])\s+/g, '$1').replace(/\s*\.\s*/g, '.');
+}
+
+/**
+ * A Go type declaration read from its source, where its node starts (at the
+ * type's name): `type A = B`, its type parameters, and the type after them.
+ */
+function goTypeSpec(node: Node, context: ResolutionContext): GoTypeSpec | null {
+  let memo = GO_TYPE_SPECS.get(context);
+  if (!memo) GO_TYPE_SPECS.set(context, (memo = new Map()));
+  const hit = memo.get(node.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? [];
+  const code = blankGoCode(lines.slice(node.startLine - 1, Math.max(node.startLine, node.endLine)).join('\n'));
+  let spec: GoTypeSpec | null = null;
+  const name = /^[A-Za-z_]\w*/.exec(code.slice(node.startColumn));
+  if (name) {
+    let i = node.startColumn + name[0].length;
+    const skip = (): void => { while (code[i] === ' ' || code[i] === '\t') i++; };
+    skip();
+    let params = new Map<string, string>();
+    // `Name[T any, U comparable]` declares type parameters; `Name []T` and
+    // `Name [4]T` are a slice and an array.
+    if (code[i] === '[') {
+      const close = goClosingBracket(code, i);
+      const inner = close > i ? code.slice(i + 1, close) : '';
+      if (/^\s*[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s+[^\s,\]]/.test(inner)) {
+        params = goTypeParamList(inner);
+        i = close + 1;
+        skip();
+      }
+    }
+    const alias = code[i] === '=';
+    if (alias) i++;
+    const underlying = code.slice(i, goStatementEnd(code, i)).trim();
+    if (underlying) spec = { alias, params, underlying };
+  }
+  memo.set(node.id, spec);
+  return spec;
+}
+
+/**
+ * The fields a Go struct declares, by name, with the type each is written
+ * with, and the types it embeds (`Base`, `pkg.Base`, `Base[T]`, a pointer's
+ * without its `*`).
+ */
+function goStructMembers(node: Node, context: ResolutionContext): GoStructMembers | null {
+  let memo = GO_STRUCT_MEMBERS.get(context);
+  if (!memo) GO_STRUCT_MEMBERS.set(context, (memo = new Map()));
+  const hit = memo.get(node.id);
+  if (hit !== undefined) return hit;
+  let members: GoStructMembers | null = null;
+  const spec = goTypeSpec(node, context);
+  const open = spec ? /^struct\s*\{/.exec(spec.underlying) : null;
+  const close = spec && open ? goClosingBracket(spec.underlying, open[0].length - 1) : -1;
+  if (spec && open && close > 0) {
+    members = { fields: new Map(), embedded: [], params: spec.params };
+    for (const raw of goSplitTopLevel(spec.underlying.slice(open[0].length, close), '\n;')) {
+      // A tag is a string: its quotes stay, its contents are blank.
+      const member = raw.replace(/(?:`[^`]*`|"[^"]*")\s*$/, '').trim();
+      if (!member) continue;
+      const embedded = /^\*?\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?(?:\s*\[[\s\S]*\])?)$/.exec(member);
+      if (embedded) {
+        members.embedded.push(embedded[1]!);
+        continue;
+      }
+      const named = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+(\S[\s\S]*)$/.exec(member);
+      if (!named) continue;
+      for (const n of named[1]!.split(',')) members.fields.set(n.trim(), named[2]!);
+    }
+  }
+  memo.set(node.id, members);
+  return members;
+}
+
+/**
+ * The type parameters in scope at offset `at` of a Go file: those its
+ * enclosing function declares, or a method's generic receiver
+ * (`func (s *Set[T]) Add(v T)`).
+ */
+function goTypeParamsAt(index: GoScopeIndex, filePath: string, at: number, context: ResolutionContext): ReadonlyMap<string, string> | undefined {
+  // Most files declare no generic function: nothing to look up.
+  index.generic ??= /(?<![\w.])func\s*(?:\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*[A-Za-z_]\w*\s*\[|[A-Za-z_]\w*\s*\[)/.test(index.code);
+  if (!index.generic) return undefined;
+  let lo = 0;
+  let hi = index.lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (index.lineStarts[mid]! <= at) lo = mid; else hi = mid - 1;
+  }
+  const line = lo + 1;
+  const fn = context.getNodesInFile(filePath).find((n) =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= line && n.endLine >= line);
+  if (!fn) return undefined;
+  let memo = GO_FUNC_TYPE_PARAMS.get(context);
+  if (!memo) GO_FUNC_TYPE_PARAMS.set(context, (memo = new Map()));
+  let params = memo.get(fn.id);
+  if (!params) {
+    params = new Map();
+    const lineStart = index.lineStarts[fn.startLine - 1] ?? 0;
+    const head = index.code.slice(lineStart, index.lineStarts[Math.min(fn.endLine, fn.startLine + 40) - 1] ?? index.code.length);
+    // `func Name[T any](`, or `func (s *Set[T, U]) Name(`, whose type
+    // arguments name its type's parameters, constrained where the type is.
+    const generic = /^\s*func\s*(?:\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)\s*(\[)|[A-Za-z_]\w*\s*(\[))/.exec(head);
+    if (generic) {
+      const open = generic.index + generic[0].length - 1;
+      const close = goClosingBracket(head, open);
+      const inner = close > open ? head.slice(open + 1, close) : '';
+      if (generic[1] === undefined) {
+        params = goTypeParamList(inner);
+      } else {
+        const declared = goPackageTypes(generic[1], goPackageDir(filePath), context)
+          .map((n) => goTypeSpec(n, context)?.params).find((p) => p !== undefined && p.size > 0);
+        const constraints = declared ? [...declared.values()] : [];
+        goSplitTopLevel(inner, ',').forEach((p, k) => {
+          const ident = /^\s*([A-Za-z_]\w*)\s*$/.exec(p);
+          if (ident) params!.set(ident[1]!, constraints[k] ?? '');
+        });
+      }
+    }
+    memo.set(fn.id, params);
+  }
+  return params.size > 0 ? params : undefined;
+}
+
+/**
+ * The type parameters a `[…]` list declares, each with its constraint as
+ * written: `T any`, `K comparable, V Validator`, `A, B Number` (both are
+ * `Number`s).
+ */
+function goTypeParamList(inner: string): Map<string, string> {
+  const params = new Map<string, string>();
+  let pending: string[] = [];
+  for (const part of goSplitTopLevel(inner, ',')) {
+    const m = /^\s*([A-Za-z_]\w*)\s*([\s\S]*?)\s*$/.exec(part);
+    if (!m) continue;
+    pending.push(m[1]!);
+    if (!m[2]) continue;
+    for (const p of pending) params.set(p, m[2]);
+    pending = [];
+  }
+  for (const p of pending) params.set(p, '');
+  return params;
+}
+
+/**
+ * The end of the Go type written at offset `i` of `s` — `[]*model.Item`,
+ * `map[string]T`, `pkg.T[int]`, `struct{…}` — or -1 when none starts there.
+ * A function or channel type isn't read.
+ */
+function goTypeTextEnd(s: string, i: number): number {
+  while (s[i] === ' ' || s[i] === '\t') i++;
+  if (s[i] === '*') return goTypeTextEnd(s, i + 1);
+  if (s[i] === '[') {
+    const close = goClosingBracket(s, i);
+    return close < 0 ? -1 : goTypeTextEnd(s, close + 1);
+  }
+  const map = /^map\s*\[/.exec(s.slice(i, i + 8));
+  if (map) {
+    const close = goClosingBracket(s, i + map[0].length - 1);
+    return close < 0 ? -1 : goTypeTextEnd(s, close + 1);
+  }
+  const literal = /^(?:struct|interface)\s*\{/.exec(s.slice(i, i + 16));
+  if (literal) {
+    const close = goClosingBracket(s, i + literal[0].length - 1);
+    return close < 0 ? -1 : close + 1;
+  }
+  const name = /^[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?/.exec(s.slice(i));
+  if (!name || /^(?:func|chan|range|make|new|append)$/.test(name[0])) return -1;
+  let end = i + name[0].length;
+  // Type arguments: `List[T]`.
+  if (s[end] === '[') {
+    const close = goClosingBracket(s, end);
+    if (close > end && !goIsSliceIndex(s.slice(end + 1, close))) end = close + 1;
+  }
+  return end;
+}
+
+/** `s` split at each of the characters `seps` that sits outside brackets. */
+function goSplitTopLevel(s: string, seps: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (depth === 0 && seps.includes(c)) {
+      parts.push(s.slice(from, i));
+      from = i + 1;
+    }
+  }
+  parts.push(s.slice(from));
+  return parts;
+}
+
+/** Where an `if` / `for` / `switch` header's simple statement ends: its `;`, or the `{` its block opens with. */
+function goHeaderValueEnd(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (--depth < 0) return i; }
+    else if (depth === 0 && (c === ';' || c === '{' || c === '\n')) return i;
+  }
+  return code.length;
 }
 
 /** Python types whose methods are the runtime's, never a project symbol's. */
