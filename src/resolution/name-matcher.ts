@@ -11626,16 +11626,23 @@ export function matchByQualifiedName(
 
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
+  // The written name must start a scope of the candidate's: rocksdb's
+  // `CacheShard::ComputeHash` (a template parameter's) is no
+  // `clock_cache::ClockCacheShard::ComputeHash`. A namesake in the call's own
+  // language comes first: protobuf's C++ `DescriptorPool::generated_pool()`
+  // is never its Ruby `Google::Protobuf::DescriptorPool`'s.
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
     const partialCandidates = cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName)), ref, context);
-    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+      .filter((candidate) => endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context);
+    const ownLanguage = partialCandidates.filter((candidate) => sameLanguageFamily(candidate.language, ref.language));
+    const pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
+    const chosen = preferCallSiteFile(pool, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
-        targetNodeId: cppFunctionOverload(chosen, partialCandidates, ref, context).id,
+        targetNodeId: cppFunctionOverload(chosen, pool, ref, context).id,
         confidence: 0.85,
         resolvedBy: 'qualified-name',
       };
@@ -11643,6 +11650,19 @@ export function matchByQualifiedName(
   }
 
   return null;
+}
+
+/**
+ * Whether qualified name `qn` is `name`, or ends with it right after a scope
+ * separator: `::`, or the `.` of a dotted package, namespace, object path or
+ * config key. A name written from the global scope (`::Foo::bar`) is never
+ * the tail of a nested one.
+ */
+function endsAtScopeBoundary(qn: string, name: string): boolean {
+  if (qn === name) return true;
+  if (!qn.endsWith(name)) return false;
+  const before = qn.slice(0, qn.length - name.length);
+  return before.endsWith('::') || before.endsWith('.');
 }
 
 /** A node a `Receiver.method()` call can name as the method's owning type. */
