@@ -322,12 +322,16 @@ describe('a failed reference through an import binding', () => {
     write(root, {
       ...IMPORTERS,
       // A package's binding waits for the name it uses, and so does a plain
-      // named import while its module is missing (`./util`). One whose module
-      // is a file of the project (`./lib`, a barrel yet to pass the name on)
-      // waits for that module, as the other bindings do, and so does a member
-      // of a namespace import (sync-import-member-retry.test.ts).
-      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport { forwarded } from './lib';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, forwarded, NS.make()];\n",
+      // named import while its module is missing (`./util`), or when the file
+      // its module resolves to has another key (`@main`, an alias of
+      // `src/lib/main.ts`). One whose module is a file of the project with the
+      // key (`./lib`, a barrel yet to pass the name on) waits for that module,
+      // as the other bindings do, and so does a member of a namespace import
+      // (sync-import-member-retry.test.ts).
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'], '@main': ['src/lib/main.ts'] } } }),
+      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport { forwarded } from './lib';\nimport { mainThing } from '@main';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, forwarded, mainThing, NS.make()];\n",
       'src/lib/index.ts': 'export {};\n',
+      'src/lib/main.ts': 'export const unrelated = 1;\n',
     });
     (await CodeGraph.init(root, { index: true })).close();
 
@@ -354,6 +358,7 @@ describe('a failed reference through an import binding', () => {
 
       expect(tailOf('src/other.ts', 'express', 'imports')).toBe('express');
       expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('helper');
+      expect(tailOf('src/other.ts', 'mainThing', 'imports')).toBe('mainThing');
 
       // Each module's file is one of the keys its references wait under, and
       // so is a barrel's folder for every file in it.
