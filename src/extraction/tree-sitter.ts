@@ -2126,6 +2126,7 @@ export class TreeSitterExtractor {
       // `(function(){…})()`) hold named inner functions and calls that would
       // otherwise be lost — the dispatcher set skipChildren, so nothing else
       // descends into this subtree. (#528)
+      this.visitParameterDefaults(node, '');
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
       if (body) {
@@ -2176,10 +2177,64 @@ export class TreeSitterExtractor {
     this.nodeStack.push(funcNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    this.visitParameterDefaults(body?.parent ?? node, funcNode.id);
     if (body) {
       this.visitFunctionBody(body, funcNode.id);
     }
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk the default values of a JS/TS function's parameters while the
+   * function is the enclosing node. A default runs on every call that omits
+   * its argument, in the function's own scope, so a call written there is the
+   * function's (`function render(note = buildNote())`, #2588); nothing else
+   * visits it. Only the values are walked: a parameter's type annotation is
+   * extractTypeAnnotations'. An anonymous function's defaults go to the
+   * enclosing node, as its body does. Python is not a caller: `def f(x=g())`
+   * runs `g()` once, when the def executes. Mirrored in the kernel
+   * (tsjs/extractors.rs visit_parameter_defaults).
+   */
+  private visitParameterDefaults(node: SyntaxNode, functionId: string): void {
+    if (this.language !== 'typescript' && this.language !== 'tsx' &&
+        this.language !== 'javascript' && this.language !== 'jsx') return;
+    const params = getChildByField(node, 'parameters');
+    if (!params) return;
+    const visit = (n: SyntaxNode): void => {
+      switch (n.type) {
+        case 'required_parameter':
+        case 'optional_parameter': {
+          const pattern = getChildByField(n, 'pattern');
+          if (pattern) visit(pattern);
+          const value = getChildByField(n, 'value');
+          if (value) this.visitFunctionBody(value, functionId);
+          return;
+        }
+        case 'assignment_pattern':
+        case 'object_assignment_pattern': {
+          const left = getChildByField(n, 'left');
+          if (left) visit(left);
+          const right = getChildByField(n, 'right');
+          if (right) this.visitFunctionBody(right, functionId);
+          return;
+        }
+        case 'pair_pattern': {
+          const value = getChildByField(n, 'value');
+          if (value) visit(value);
+          return;
+        }
+        case 'formal_parameters':
+        case 'object_pattern':
+        case 'array_pattern':
+        case 'rest_pattern':
+          for (let i = 0; i < n.namedChildCount; i++) {
+            const child = n.namedChild(i);
+            if (child) visit(child);
+          }
+          return;
+      }
+    };
+    visit(params);
   }
 
   /**
@@ -2281,6 +2336,7 @@ export class TreeSitterExtractor {
     if (!compNode || !this.extractor) return;
     this.nodeStack.push(compNode.id);
     if (innerFn) {
+      this.visitParameterDefaults(innerFn, compNode.id);
       const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
         ?? getChildByField(innerFn, this.extractor.bodyField);
       if (body) this.visitFunctionBody(body, compNode.id);
@@ -2348,6 +2404,7 @@ export class TreeSitterExtractor {
             // body is walked as a render function's is, never named for the
             // declarator (curriedWrapperBoundName would take MUI's
             // `styled(Box)(({ theme }) => …)` for a function of its own).
+            this.visitParameterDefaults(arg, '');
             const body = this.extractor!.resolveBody?.(arg, this.extractor!.bodyField)
               ?? getChildByField(arg, this.extractor!.bodyField);
             if (body) this.visitFunctionBody(body, '');
@@ -2482,6 +2539,7 @@ export class TreeSitterExtractor {
       // in inline objects). These are ephemeral and create noise (e.g., Svelte context
       // objects: `ctx.set({ get view() { ... } })`).
       if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
+        this.visitParameterDefaults(node, '');
         const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
           ?? getChildByField(node, this.extractor.bodyField);
         if (body) {
@@ -2559,6 +2617,9 @@ export class TreeSitterExtractor {
     this.nodeStack.push(methodNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    // A class field's arrow (`handle = (e = make()) => …`) holds the
+    // parameters, not the field: the body's parent is the function either way.
+    this.visitParameterDefaults(body?.parent ?? node, methodNode.id);
     if (body) {
       this.visitFunctionBody(body, methodNode.id);
     }

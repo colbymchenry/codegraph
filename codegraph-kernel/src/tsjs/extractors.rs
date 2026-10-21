@@ -45,6 +45,7 @@ impl<'t> Walker<'t> {
         if name == "<anonymous>" {
             // Still walk the body: module wrappers hold named inner functions
             // and calls that would otherwise be lost (#528).
+            self.visit_parameter_defaults(node);
             if let Some(body) = body_of(node) {
                 self.visit_function_body(body);
             }
@@ -68,10 +69,57 @@ impl<'t> Walker<'t> {
         self.extract_decorators_for(node, row);
 
         self.stack.push(Scope { row, kind: "function", name });
-        if let Some(body) = body_of(node) {
+        let body = body_of(node);
+        self.visit_parameter_defaults(body.and_then(|b| b.parent()).unwrap_or(node));
+        if let Some(body) = body {
             self.visit_function_body(body);
         }
         self.stack.pop();
+    }
+
+    /// Walk the default values of a function's parameters while the function
+    /// is the enclosing scope: a default runs on every call that omits its
+    /// argument, in the function's own scope (#2588). Only the values; a
+    /// parameter's type annotation is extract_type_annotations'. Mirrors
+    /// TreeSitterExtractor.visitParameterDefaults (this walker is TS/JS only).
+    fn visit_parameter_defaults(&mut self, node: Node<'t>) {
+        if let Some(params) = node.child_by_field_name("parameters") {
+            self.visit_parameter_pattern(params);
+        }
+    }
+
+    fn visit_parameter_pattern(&mut self, n: Node<'t>) {
+        match n.kind() {
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pattern) = n.child_by_field_name("pattern") {
+                    self.visit_parameter_pattern(pattern);
+                }
+                if let Some(value) = n.child_by_field_name("value") {
+                    self.visit_function_body(value);
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = n.child_by_field_name("left") {
+                    self.visit_parameter_pattern(left);
+                }
+                if let Some(right) = n.child_by_field_name("right") {
+                    self.visit_function_body(right);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = n.child_by_field_name("value") {
+                    self.visit_parameter_pattern(value);
+                }
+            }
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                for i in 0..n.named_child_count() {
+                    if let Some(child) = n.named_child(i) {
+                        self.visit_parameter_pattern(child);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The property a CommonJS export assignment binds a function to —
@@ -174,6 +222,7 @@ impl<'t> Walker<'t> {
         self.stack.push(Scope { row, kind: "component", name: name.to_string() });
         match inner_fn {
             Some(inner) => {
+                self.visit_parameter_defaults(inner);
                 if let Some(body) = body_of(inner) {
                     self.visit_function_body(body);
                 }
@@ -246,6 +295,7 @@ impl<'t> Walker<'t> {
                     } else if matches!(arg.kind(), "arrow_function" | "function_expression") {
                         // A style or `.attrs()` function runs as the component's
                         // code: its body is walked, the function never named.
+                        self.visit_parameter_defaults(arg);
                         if let Some(body) = body_of(arg) {
                             self.visit_function_body(body);
                         }
@@ -331,6 +381,7 @@ impl<'t> Walker<'t> {
             // Object-literal methods are ephemeral: walk the body only.
             if let Some(parent) = node.parent() {
                 if matches!(parent.kind(), "object" | "object_expression") {
+                    self.visit_parameter_defaults(node);
                     if let Some(body) = body_of(node) {
                         self.visit_function_body(body);
                     }
@@ -358,7 +409,10 @@ impl<'t> Walker<'t> {
         self.extract_decorators_for(node, row);
 
         self.stack.push(Scope { row, kind: "method", name });
-        if let Some(body) = body_of(node) {
+        // A class field's arrow holds the parameters, not the field.
+        let body = body_of(node);
+        self.visit_parameter_defaults(body.and_then(|b| b.parent()).unwrap_or(node));
+        if let Some(body) = body {
             self.visit_function_body(body);
         }
         self.stack.pop();

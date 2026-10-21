@@ -125,3 +125,8 @@ function calleeShapes(handlers, type, fn, ns) {
   (fn)();
   (ns.fn)();
 }
+
+// #2588: a call in a parameter default belongs to the function.
+export function jsParamDefault(note = buildParamNote(), [first = makeFirst()] = [], ...rest) { return [note, first, rest]; }
+export const jsParamDefaultArrow = ({ n = buildParamNote() }) => n;
+registerParamDefaultsJs({ methods: { go(a = buildParamNote()) { return a; } } });

@@ -280,3 +280,13 @@ export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a:
   const [a, b] = [() => 1, () => 2];
   return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
 }
+
+// #2588: a call in a parameter default belongs to the function.
+export function paramDefault(note = buildParamNote(), { n = buildParamNote().id } = {}, made = new ParamNote()) { return [note, n, made]; }
+export const paramDefaultArrow = (note: { id: number } = buildParamNote()) => note.id;
+export class ParamDefaultHost { m(note = buildParamNote(), cb = () => buildParamNote()) { return [note, cb]; } }
+export class ParamDefaultFields { handle = (e = buildParamNote()) => e; wrapped = throttle((n = buildParamNote()) => n); }
+export const ParamDefaultFwd = forwardRef(({ title = buildParamNote() }: any, ref: any) => <div ref={ref}>{title}</div>);
+setTimeout((n = buildParamNote()) => n, 0);
+export const ParamDefaultNested = memo(forwardRef(({ title = buildParamNote() }: any, ref: any) => <div ref={ref}>{title}</div>));
+registerParamDefaults({ go(a = buildParamNote()) { return a; } });
