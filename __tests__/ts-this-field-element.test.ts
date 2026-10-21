@@ -52,6 +52,19 @@ const files: Record<string, string> = {
     '  private byKey: Record<string, Item> = {};\n' +
     '  first() { return this.items[0].save(); }\n' +
     '  keyed(k: string) { return this.byKey[k].save(); }\n' +
+    '}\n' +
+    // A header over several lines, and a constraint holding braces.
+    'export class Wide<\n' +
+    '  A,\n' +
+    '  B,\n' +
+    '  Item\n' +
+    '> {\n' +
+    '  private items: Item[] = [];\n' +
+    '  first() { return this.items[0].save(); }\n' +
+    '}\n' +
+    'export class Shaped<Item extends { id: string }> {\n' +
+    '  private items: Item[] = [];\n' +
+    '  first() { return this.items[0].save(); }\n' +
     '}\n',
   // Either array's element: no one type to resolve on.
   'src/mixed.ts':
@@ -62,6 +75,11 @@ const files: Record<string, string> = {
     '  private maybe: Item[] | null = null;\n' +
     '  either() { return this.entries[0].save(); }\n' +
     '  nullable() { return this.maybe![0].save(); }\n' +
+    '  private below: Array<Item>\n' +
+    '    | Other = [];\n' +
+    '  private joined: Item[] & Other[] = [];\n' +
+    '  continued() { return this.below[0].save(); }\n' +
+    '  both() { return this.joined[0].save(); }\n' +
     '}\n',
 };
 
@@ -110,10 +128,14 @@ describe('a call on an element of a this-field', () => {
   it("a class's type parameter is not the project class of that name", () => {
     expect(calleesOf('first', 'store.ts')).toEqual([]);
     expect(calleesOf('keyed', 'store.ts')).toEqual([]);
+    const caller = (cls: string) => cg.getNodesByName('first').find((n) => n.qualifiedName === `${cls}::first`)!;
+    for (const cls of ['Wide', 'Shaped']) expect(cg.getCallees(caller(cls).id).filter(({ edge }) => edge.kind === 'calls')).toEqual([]);
   });
 
   it('a union of element types reaches none of them; `| null` keeps the one', () => {
     expect(calleesOf('either', 'mixed.ts')).toEqual([]);
     expect(calleesOf('nullable', 'mixed.ts')).toEqual(['model.ts:Item::save']);
+    expect(calleesOf('continued', 'mixed.ts')).toEqual([]);
+    expect(calleesOf('both', 'mixed.ts')).toEqual([]);
   });
 });

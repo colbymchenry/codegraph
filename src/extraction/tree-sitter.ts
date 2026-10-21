@@ -5786,6 +5786,8 @@ export class TreeSitterExtractor {
               : rawReceiver && this.language === 'swift'
                 ? peelSwiftCallWrappers(rawReceiver, this.source)
                 : rawReceiver;
+            // `this.<field>[]` / `this.<name>` of a subscript receiver, set by its branch below.
+            let thisSubscript: string | null = null;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -5963,7 +5965,7 @@ export class TreeSitterExtractor {
             } else if (
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
-              tsThisSubscriptReceiver(receiver, this.source) !== null
+              (thisSubscript = tsThisSubscriptReceiver(receiver, this.source)) !== null
             ) {
               // An element of a field of the enclosing class —
               // `this.listeners[type].push()`, `this.items[0].save()` — kept
@@ -5971,7 +5973,7 @@ export class TreeSitterExtractor {
               // type off the field's declaration (`Item[]`, `Record<K, V>`)
               // or leaves it unresolved. `this['svc'].start()` is the field
               // itself. Mirrored in the kernel's extract_call.
-              calleeName = `${tsThisSubscriptReceiver(receiver, this.source)}.${methodName}`;
+              calleeName = `${thisSubscript}.${methodName}`;
             } else if (
               (this.language === 'typescript' ||
                 this.language === 'javascript' ||

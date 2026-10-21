@@ -23073,8 +23073,13 @@ const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDec
  * names (`Mailer` of `mailer: Mailer<T>`), whether that is a value's
  * (`typeof X`), and whether the field holds an array of it (`items: Item[]`).
  */
-/** `element`: what one of the field's elements holds — `Item` of `Item[]`, `Array<Item>` or `Record<string, Item>`. */
-type TsFieldDecl = { valueType: boolean; type: string; array?: boolean; element?: string };
+type TsFieldDecl = {
+  valueType: boolean;
+  type: string;
+  array?: boolean;
+  /** What one of the field's elements holds: `Item` of `Item[]`, `Array<Item>` or `Record<string, Item>`. */
+  element?: string;
+};
 /**
  * The call an initializer hands `new X(…)` to: `this.<method>(…)`, or
  * `this.<holder>.<method>(…)` — vscode's `this._register(new Emitter())` and
@@ -23171,6 +23176,14 @@ function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string
   return decl;
 }
 
+/**
+ * Whether what follows a field's type joins it with another type: `| Other[]`,
+ * `& Extra`. `| null` and `| undefined` do not.
+ */
+function tsJoinsAnotherType(tail: string): boolean {
+  return /^\s*[|&]/.test(tail.replace(/^(?:\s*\|\s*(?:null|undefined)\b)+/, ''));
+}
+
 /** Container types whose element type is one of their type arguments, and which. */
 const TS_ELEMENT_CONTAINERS: ReadonlyMap<string, { args: number; at: number }> = new Map([
   ['Array', { args: 1, at: 0 }],
@@ -23188,12 +23201,10 @@ const TS_ELEMENT_CONTAINERS: ReadonlyMap<string, { args: number; at: number }> =
  */
 function tsFieldElementType(type: string, rest: string): string | undefined {
   const plain = (t: string | undefined): string | undefined => (t && /^[A-Za-z_$][\w.$]*$/.test(t) ? t : undefined);
-  // What follows the field's type unions it with another type.
-  const unionAfter = (tail: string): boolean => /^\s*\|/.test(tail.replace(/^(?:\s*\|\s*(?:null|undefined)\b)+/, ''));
   const array = /^\s*\[\s*\]/.exec(rest);
   if (array) {
     const tail = rest.slice(array[0].length);
-    return /^\s*\[/.test(tail) || unionAfter(tail) ? undefined : type;
+    return /^\s*\[/.test(tail) || tsJoinsAnotherType(tail) ? undefined : type;
   }
   const container = TS_ELEMENT_CONTAINERS.get(type);
   if (!container) return undefined;
@@ -23211,7 +23222,7 @@ function tsFieldElementType(type: string, rest: string): string | undefined {
       from = i + 1;
     } else if (c === '>' && depth === 0) {
       args.push(rest.slice(from, i).trim());
-      if (/^\s*\[/.test(rest.slice(i + 1)) || unionAfter(rest.slice(i + 1))) return undefined;
+      if (/^\s*\[/.test(rest.slice(i + 1)) || tsJoinsAnotherType(rest.slice(i + 1))) return undefined;
       return args.length === container.args ? plain(args[container.at]) : undefined;
     }
   }
@@ -23370,11 +23381,17 @@ function tsFieldDeclaration(
  * before.
  */
 function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
+  // A type that goes on below with `| Other[]` holds no one element type.
+  if (onLine?.element) {
+    let below = '';
+    for (let r = row + 1; r < lines.length && /^\s*[|&]/.test(lines[r]!); r++) below += ' ' + lines[r];
+    if (tsJoinsAnotherType(below)) onLine = { ...onLine, element: undefined };
+  }
   if (!onLine?.via && !onLine?.injector) return onLine;
   if (!tsCallEndsStatement(lines, row, onLine.open!)) return null;
   if (onLine.via && !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
   if (onLine.injector && !tsInjectsInstance(cls, onLine.injector, context)) return null;
-  return { valueType: onLine.valueType, type: onLine.type, array: onLine.array, element: onLine.element };
+  return { valueType: onLine.valueType, type: onLine.type, array: onLine.array };
 }
 
 /** Per-context memo: does the project declare a `createInstance` that returns an instance of its constructor argument? */
@@ -23703,14 +23720,25 @@ function tsIndexedPropertyType(
   return undefined;
 }
 
-/** Is `name` one of the type parameters the head of the TS class or interface `cls` declares (`class Emitter<T>`)? */
+/** Lines of a class header the type-parameter reader looks through: decorators, then `class C<…>` over several lines. */
+const TS_CLASS_HEAD_LINES = 24;
+
+/**
+ * Is `name` one of the type parameters the head of the TS class or interface
+ * `cls` declares (`class Emitter<T>`)? The list is read from the `class` /
+ * `interface` keyword to its own `>`, over several lines and through
+ * constraints and defaults that hold braces (`<T extends { id: string }>`).
+ * A list whose `>` is not found reads as declaring `name`: a caller drops
+ * the type rather than take a parameter for a project class.
+ */
 function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
-  const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ').split('{')[0]!;
-  const open = new RegExp(`\\b${cls.name.replace(/\$/g, '\\$')}\\s*<`).exec(head);
+  const head = lines.slice(cls.startLine - 1, cls.startLine - 1 + TS_CLASS_HEAD_LINES).join('\n');
+  const open = new RegExp(`\\b(?:class|interface)\\s+${cls.name.replace(/\$/g, '\\$')}\\s*<`).exec(head);
   if (!open) return false;
   // The parameters between the `<` after the name and its own `>`, split
   // at their top level: `T`, `K extends keyof T = never`.
+  const named = (param: string): boolean => param.trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name;
   let depth = 0;
   let from = open.index + open[0].length;
   for (let i = from; i < head.length; i++) {
@@ -23718,14 +23746,14 @@ function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContex
     if (c === '<' || c === '(' || c === '[' || c === '{') depth++;
     else if (c === ')' || c === ']' || c === '}') depth--;
     else if (c === '>' && head[i - 1] !== '=') {
-      if (depth === 0) return head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name;
+      if (depth === 0) return named(head.slice(from, i));
       depth--;
     } else if (c === ',' && depth === 0) {
-      if (head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name) return true;
+      if (named(head.slice(from, i))) return true;
       from = i + 1;
     }
   }
-  return false;
+  return true;
 }
 
 /**
