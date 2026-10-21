@@ -11136,27 +11136,169 @@ export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: 
   let binds = memo.get(key);
   if (binds === undefined) {
     const text = jsFunctionCodeThrough(fn, filePath, line, context);
-    const { param } = localBindingPatterns(name, 'g');
     const n = name.replace(/\$/g, '\\$');
     // A plain declaration. Destructuring re-binds what a call returns under
     // the same name — `const { t } = useI18n()`, `const { getLabel } =
     // useProps(props)` — which is the same-named function more often than not.
-    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
-    // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
-    // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
-    // The leading `(?=\()` (every match opens a list) keeps the lookbehind to
-    // where one opens. Node 22's V8 stops optimizing the regexes a process
-    // compiles once it has generated about a megabyte of regex code, which a
-    // resolver pool worker soon has, and then tried the lookbehind at every
-    // position, each time reading back through the run of blanks before it:
-    // go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
-    // stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
-    // never resolved.
-    const parameter = new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
-    binds = declared || parameter.test(text);
+    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
+    binds = declared || jsParameterListPattern(name, '').test(text);
     memo.set(key, binds);
   }
   return binds;
+}
+
+/**
+ * A parameter list that names `name` (localBindingPatterns' `param`), never
+ * a control-flow head (`if (openMarkerClose) {`). A return type stays on its
+ * line, never a ternary's `: data.slice()` below `filter(canRowExpand)`, and
+ * may hold an object type, so the match ends at the body's `{`, not at the
+ * type's: `delta(…): { removed: T[]; added: T[] } {`.
+ * The leading `(?=\()` (every match opens a list) keeps the lookbehind to
+ * where one opens. Node 22's V8 stops optimizing the regexes a process
+ * compiles once it has generated about a megabyte of regex code, which a
+ * resolver pool worker soon has, and then tried the lookbehind at every
+ * position, each time reading back through the run of blanks before it:
+ * go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
+ * stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
+ * never resolved.
+ */
+function jsParameterListPattern(name: string, flags: string): RegExp {
+  const { param } = localBindingPatterns(name, flags);
+  const returnType = `(?::(?:[^=;{}()\\n]|${PARAM_BRACE})*)?`;
+  return new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', () => returnType)}`, flags);
+}
+
+/**
+ * Whether the JS/TS function a reference sits in binds its name in a scope
+ * that holds at the reference, not just somewhere in its text: a parameter
+ * list or a lone arrow parameter whose body is still open there (a
+ * function's or a `catch` clause's block, an arrow's block or expression),
+ * or a `var`/`let`/`const`, `function` or `class` whose block or `for`
+ * statement is. A `new Promise((resolve) => …)` executor's `resolve` is the
+ * calls inside it, not a `resolve(file)` after it, and a `const X =
+ * require('./x')` binds the import itself. A function too long to read
+ * again keeps the import.
+ */
+function jsBindingEnclosesReference(name: string, fn: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const through = jsFunctionCodeThrough(fn, ref.filePath, ref.line, context);
+  const cut = through.slice(0, through.lastIndexOf('\n') + 1 + ref.column);
+  if (cut.length > 100_000) return false;
+  // Brackets in strings, template literals and regex literals open no scope.
+  const regexes: number[] = [];
+  const chars = blankStringContents(cut, regexes).split('');
+  for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
+  const code = chars.join('');
+  const n = name.replace(/\$/g, '\\$');
+  const declaration = new RegExp(
+    `\\b(?:(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])(\\s*=\\s*(?:await\\s+)?(?:require|import)\\s*\\()?|(?:function|class)\\s+${n}(?![\\w$]))`,
+    'g'
+  );
+  for (const m of code.matchAll(declaration)) {
+    if (m[1]) continue;
+    const inForHead = /\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, m.index! - 16), m.index));
+    if (inForHead ? jsForStatementOpenAtEnd(code, m.index!) : jsBlockOpenAtEnd(code, m.index!)) return true;
+  }
+  for (const m of code.matchAll(jsParameterListPattern(name, 'g'))) {
+    const end = m.index! + m[0].length;
+    if (code[end - 1] === '{' ? jsBlockOpenAtEnd(code, end) : jsBodyOpenAtEnd(code, end)) return true;
+  }
+  // `new Promise<void>(resolve => { … })`: a lone parameter where an
+  // expression starts, never the name a return type ends with (`(): Bounds =>`).
+  const loneParameter = new RegExp(`(^|[(,=\\[{?:]|=>|\\b(?:return|async|default|yield|await))\\s*${n}\\s*=>`, 'g');
+  for (const m of code.matchAll(loneParameter)) {
+    if (m[1] === ':' && /\)\s*$/.test(code.slice(Math.max(0, m.index! - 200), m.index))) continue;
+    if (jsBodyOpenAtEnd(code, m.index! + m[0].length)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the block that holds `at` (just inside a body's `{`, or where a
+ * declaration starts) is still open at the end of `code`.
+ */
+function jsBlockOpenAtEnd(code: string, at: number): boolean {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    if (code[i] === '{') depth++;
+    else if (code[i] === '}' && --depth < 0) return false;
+  }
+  return true;
+}
+
+const JS_OPERAND_END = /[\w$)\]}'"`]/;
+const JS_OPERAND_START = /[\w$'"`]/;
+
+/**
+ * Whether the body that starts at `at` (an arrow's, after its `=>`, or a
+ * `for` statement's, after its head) is still open at the end of `code`: a
+ * `{…}` block, or an expression or statement, which a comma or a semicolon
+ * ends, or the bracket closing around it, or a line that starts another
+ * statement where no semicolon ends the last.
+ */
+function jsBodyOpenAtEnd(code: string, at: number): boolean {
+  let i = at;
+  while (i < code.length && WHITESPACE.test(code[i]!)) i++;
+  if (code[i] === '{') return jsBlockOpenAtEnd(code, i + 1);
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth < 0) return false;
+    } else if (depth === 0 && (c === ',' || c === ';')) {
+      return false;
+    } else if (depth === 0 && c === '\n') {
+      // `const f = (x) => x + 1` with no semicolon, above the reference: the
+      // line before ends an operand (a name, a closing bracket, a quote) and
+      // the next starts one (the reference itself, when the code ends there)
+      // rather than an operator or a `.` continuing the expression.
+      let before = i - 1;
+      while (before >= 0 && WHITESPACE.test(code[before]!)) before--;
+      let after = i + 1;
+      while (after < code.length && WHITESPACE.test(code[after]!)) after++;
+      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return false;
+      i = after - 1;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a declaration in a `for` head, at `at`, is still in scope at the
+ * end of `code`: in the head, or in the statement after it.
+ */
+function jsForStatementOpenAtEnd(code: string, at: number): boolean {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth < 0) return c === ')' && jsBodyOpenAtEnd(code, i + 1);
+  }
+  return true;
+}
+
+/**
+ * Whether an import-resolved `result` is the file's import of the reference's
+ * name while the calling JS/TS function binds that name itself, in a scope
+ * that holds at the reference (jsBindingEnclosesReference): bitwarden's
+ * `pick(…, isAvailable: (f: string) => boolean)` calling `isAvailable(f)`
+ * means its parameter, not the file's `import { isAvailable } from './sdk'`.
+ * The import resolver answers before matchReference's check, which reads the
+ * function's whole text — too coarse for an import, whose link is usually right.
+ */
+export function isImportShadowedByJsBinding(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language) || !JS_LOCAL_REF_KINDS.has(ref.referenceKind) || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return false;
+  const target = context.getNodeById?.(result.targetNodeId);
+  // (A parameter or local is a value: it hides no interface or type alias, `let coords: Bounds`.)
+  if (!target || target.name !== ref.referenceName || target.kind === 'interface' || target.kind === 'type_alias') return false;
+  const fn = context.getNodeById?.(ref.fromNodeId);
+  if (!fn || (fn.kind !== 'function' && fn.kind !== 'method') || fn.startLine > ref.line || fn.endLine < ref.line) return false;
+  if (target.filePath === ref.filePath && target.startLine >= fn.startLine && target.startLine <= fn.endLine) return false;
+  // No function binds a name its file never does (read once per file and name).
+  if (!isLocallyBoundJsName(ref.referenceName, ref.filePath, context)) return false;
+  if (ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
+  return jsBindingEnclosesReference(ref.referenceName, fn, ref, context);
 }
 
 /**
@@ -11241,28 +11383,50 @@ const JS_BINDING_NAME = /^[\w$]+$/;
 const ARROW_HEAD_CHAR = /[\w$.]/;
 const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
 
+// The balanced groups a parameter's type or default can hold, two levels deep.
+const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
+const PARAM_BRACE = '\\{(?:[^{}]|\\{[^{}]*\\})*\\}';
+const PARAM_BRACKET = '\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\]';
+const PARAM_ANGLE = '<(?!\\s)(?:=>|=(?!>)|[^<>=]|<(?:=>|=(?!>)|[^<>=])*>)*>';
+/**
+ * One piece of a parameter's type or default: a character other than a comma,
+ * or a balanced group, which may hold commas (`Map<K, V>`, `{ a: A, b: B }`,
+ * `(a: number, b: number) => number`). Every alternative starts with a
+ * character of its own — `=>` is the arrow of a function type, and a `<` or
+ * `>` spaced like an operator (`f.length > 0`) is no bracket — so a type has
+ * one parse.
+ */
+const PARAM_PART = `(?:=>|=(?!>)|[^,(){}\\[\\]<>=]|<(?=\\s)|>(?=[\\s=])|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET}|${PARAM_ANGLE})`;
+/** A TypeScript parameter property's modifiers: `constructor(private readonly store: Store)`. */
+const PARAM_MODIFIERS = '(?:(?:public|private|protected|readonly|override)\\s+)*';
+
 function localBindingPatterns(name: string, flags: string): LocalBindingPatterns {
   const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return {
     // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
     // not a shadow: the symbol lives in the other file and the call means it.
     decl: new RegExp(
-      '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+      '\\b(?:const|let|var)\\s+(?:' + n + '(?![\\w$])|[{\\[][^;=]*?\\b' + n + '(?![\\w$])[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
       flags
     ),
-    fn: new RegExp('\\b(?:function|class)\\s+' + n + '\\b', flags),
+    fn: new RegExp('\\b(?:function|class)\\s+' + n + '(?![\\w$])', flags),
     // a parameter: every token before the name in the list is itself a
-    // parameter (identifier, optional type, optional default) — so a string
-    // argument containing the word cannot match.
+    // parameter (identifier or destructuring, optional type, optional
+    // default) — so a string argument containing the word cannot match.
     // Each earlier parameter has exactly one parse: its first non-space
     // character after the identifier picks the type (`?`/`:`), default (`=`)
-    // or bare alternative. Written as `(type)?(default)?\s*`, the same
-    // strings split several ways per parameter, and a failing search
-    // backtracked through every combination — 30-40s per name on a vscode
-    // test file whose helper takes nine `name: T = value` parameters.
+    // or bare alternative, and a type or default runs to the comma. Written
+    // as `(type)?(default)?\s*`, the same strings split several ways per
+    // parameter, and a failing search backtracked through every combination
+    // — 30-40s per name on a vscode test file whose helper takes nine `name:
+    // T = value` parameters. A type or default may hold balanced groups
+    // (PARAM_PART): `isAvailable: (f: string) => boolean`, `cb: () => void`
+    // before the name, `compare = (a, b) => a - b`.
     param: new RegExp(
-      '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*(?:\\?\\s*)?:[^,()]+|\\s*=[^,()]+|\\s*),\\s*)*' +
-        n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)',
+      '\\(\\s*(?:(?:' + PARAM_MODIFIERS + '(?:\\.\\.\\.)?[\\w$]+|' + PARAM_BRACE + '|' + PARAM_BRACKET + ')' +
+        '(?:\\s*(?:\\?\\s*)?:' + PARAM_PART + '+|\\s*=' + PARAM_PART + '+|\\s*),\\s*)*' +
+        PARAM_MODIFIERS + n + '(?![\\w$])(?:\\s*\\??\\s*:' + PARAM_PART + '*)?(?:\\s*=' + PARAM_PART + '*)?' +
+        '(?:\\s*,(?:[^()]|' + PARAM_PAREN + ')*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)',
       flags
     ),
   };
@@ -11309,11 +11473,30 @@ function bindsAnywhere(source: string, name: string): boolean {
 }
 
 /**
+ * The `(` of the parenthesized list `source[at]` sits in, read back over the
+ * balanced groups before it (an earlier parameter's `cb: () => void` or `{ a,
+ * b }`), or -1 when the name sits in a block, an object or an array, after a
+ * statement's end, or too far back to be in a parameter list.
+ */
+function enclosingOpenParen(source: string, at: number): number {
+  let depth = 0;
+  for (let i = at - 1; i >= 0 && at - i <= 2000; i--) {
+    const c = source[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) return c === '(' ? i : -1;
+      depth--;
+    } else if (c === ';' && depth === 0) return -1;
+  }
+  return -1;
+}
+
+/**
  * bindsAnywhere for a plain identifier, tried only where a match can start:
  * a declaration at its keyword (in order, resuming past each match exactly as
- * the global search does), a parameter at the `(` its list opens with — the
- * last `(` before an occurrence of the name, with no `)` between, since no
- * earlier parameter can hold a parenthesis — and `name =>` at each arrow.
+ * the global search does), a parameter at the `(` its list opens with
+ * (enclosingOpenParen, from an occurrence of the name), and `name =>` at each
+ * arrow.
  */
 function bindsAtSites(source: string, name: string, sites: LocalBindingSites): boolean {
   let patterns = LOCAL_BINDING_PATTERNS.get(name);
@@ -11340,8 +11523,8 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
   }
   let tried = -1;
   for (let at = source.indexOf(name); at !== -1; at = source.indexOf(name, at + 1)) {
-    const open = at > 0 ? source.lastIndexOf('(', at - 1) : -1;
-    if (open < 0 || open === tried || source.lastIndexOf(')', at - 1) > open) continue;
+    const open = enclosingOpenParen(source, at);
+    if (open < 0 || open === tried) continue;
     tried = open;
     param.lastIndex = open;
     if (param.test(source)) return true;
