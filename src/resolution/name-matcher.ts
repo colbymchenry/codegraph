@@ -2538,9 +2538,11 @@ export function isGoUnknownQualified(ref: UnresolvedRef, context: ResolutionCont
  * literal's type — names: a type, which Go reads from one package. A method
  * or a function is never it; Go reaches those only through a value or a
  * package. Whichever strategy found a declaration of the name, the type is
- * the one of that name in the reference's own package for a bare name, or in
- * the imported project package for `pkg.T`. Without one there, a method or
- * function of the name is nothing the reference means. etcd's
+ * the one of that name in the reference's own package for a bare name (or in
+ * a package its file dot-imports, goBareTypeDir), or in the imported project
+ * package for `pkg.T`. Without one there, a method or function of the name is
+ * nothing the reference means, nor is any type a bare name only a package
+ * from outside the project the file dot-imports can give it. etcd's
  * `func (ti *treeIndex) KeyIndex(keyi *keyIndex) *keyIndex` linked both
  * `keyIndex` types to the method `treeIndex.keyIndex` beside it,
  * prometheus's `(ec2Client, error)` result to the method the line declares,
@@ -2566,8 +2568,10 @@ export function goTypePositionTarget(result: ResolvedRef, ref: UnresolvedRef, co
   } else {
     const { written, imported } = goRefQualification(ref, context);
     bare = written === undefined;
-    if (bare) pkgDir = goPackageDir(ref.filePath);
-    else if (imported) pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath) ?? null;
+    if (bare) {
+      pkgDir = goBareTypeDir(name, ref.filePath, context);
+      if (pkgDir === null) return null;
+    } else if (imported) pkgDir = context.getGoPackageDir?.(imported.source, ref.filePath) ?? null;
   }
   if (isType && (!bare || goPackageDir(target.filePath) === pkgDir)) return result;
   const types = pkgDir ? goPackageTypes(name, pkgDir, context) : [];
@@ -19916,15 +19920,19 @@ function goImportPackageDir(qualifier: string, filePath: string, context: Resolu
 
 /**
  * The package directory that declares a Go type spelled `raw` in `filePath`:
- * the file's own package for a bare name (`server`, `*Store`), the imported
- * package for a qualified one (`store.Manager`) when it is a project package.
+ * the file's own package for a bare name (`server`, `*Store`), or a package
+ * the file dot-imports that declares it (goBareTypeDir), the imported package
+ * for a qualified one (`store.Manager`) when it is a project package.
  * Undefined when that can't be told, which leaves resolution as it was.
  */
 function goDeclaredTypePackage(raw: string | undefined, filePath: string, context: ResolutionContext): string | undefined {
   if (!raw) return undefined;
   const name = raw.replace(/[*&\s]/g, '');
   const dot = name.indexOf('.');
-  if (dot < 0) return goPackageDir(filePath);
+  if (dot < 0) {
+    const bare = /^[A-Za-z_]\w*/.exec(name)?.[0];
+    return bare ? goBareTypeDir(bare, filePath, context) ?? undefined : goPackageDir(filePath);
+  }
   return goImportPackageDir(name.slice(0, dot), filePath, context) ?? undefined;
 }
 
@@ -20021,7 +20029,7 @@ function goAliasTarget(typeNode: Node, context: ResolutionContext): { name: stri
   const m = head && /^\s*(?:\*\s*)?([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\[.*\])?\s*;?\s*$/.exec(decl.slice(head[0].length));
   let target: { name: string; pkgDir: string } | null | undefined;
   if (m) {
-    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+    const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goBareTypeDir(m[1]!, typeNode.filePath, context);
     const name = m[2] ?? m[1]!;
     target = pkgDir == null || (!m[2] && GO_BUILTIN_FIELD_TYPES.has(name)) ? null : { name, pkgDir };
   } else {
@@ -20069,7 +20077,7 @@ function goEmbeddedTypes(typeNode: Node, context: ResolutionContext): Array<{ na
     for (const member of body.split(/[\n;]/)) {
       const m = /^\s*\*?\s*([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?\s*(?:\[[^\]]*\])?\s*(?:`[^`]*`|"[^"]*")?\s*$/.exec(member);
       if (!m) continue;
-      const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goPackageDir(typeNode.filePath);
+      const pkgDir = m[2] ? goImportPackageDir(m[1]!, typeNode.filePath, context) : goBareTypeDir(m[1]!, typeNode.filePath, context);
       if (pkgDir == null) continue;
       embedded.push({ name: m[2] ?? m[1]!, pkgDir });
     }
@@ -20125,11 +20133,12 @@ export function matchGoAssertedCall(ref: UnresolvedRef, context: ResolutionConte
  * declares it, found where Go finds it: in the file's own package or a
  * package it dot-imports for a bare name, in the imported package for a
  * qualified one. Null for a type found in none — one from outside the
- * project (`http.Flusher`), a predeclared one (`error`) or an alias of such a
- * type: none has a method the project declares. Undefined for one it can't
- * tell: a type literal (`interface{ Flush() }`), a name no package of the
- * project declares (a type declared inside a function, a type parameter), a
- * type the imported project package doesn't hold.
+ * project (`http.Flusher`, or a bare name only a package from outside it
+ * that the file dot-imports can give it), a predeclared one (`error`) or an
+ * alias of such a type: none has a method the project declares. Undefined
+ * for one it can't tell: a type literal (`interface{ Flush() }`), a name no
+ * package of the project declares (a type declared inside a function, a type
+ * parameter), a type the imported project package doesn't hold.
  */
 function goWrittenType(written: string, ref: UnresolvedRef, context: ResolutionContext): GoProjectType | null | undefined {
   // `KVServer`, `*pipe`, `storage.Store`, `*List[int]`: anything else is a type literal.
@@ -20143,8 +20152,9 @@ function goWrittenType(written: string, ref: UnresolvedRef, context: ResolutionC
     if (!dir) return null;
     if (!declares(dir)) return undefined;
   } else {
-    dir = [goPackageDir(ref.filePath), ...goDotImportDirs(ref.filePath, context)].find(declares);
-    if (!dir) return GO_BUILTIN_FIELD_TYPES.has(name!) ? null : undefined;
+    dir = goBareTypeDir(name!, ref.filePath, context);
+    if (dir === null) return null;
+    if (!declares(dir)) return GO_BUILTIN_FIELD_TYPES.has(name!) ? null : undefined;
   }
   // An alias of a type from outside the project (`type Ctx = context.Context`)
   // has that type's methods, none the project declares.
@@ -20338,7 +20348,8 @@ function matchGoPackageValueCall(receiver: string, method: string, ref: Unresolv
   const dot = named.indexOf('.');
   const name = named.slice(dot + 1);
   if (dot < 0 && GO_BUILTIN_FIELD_TYPES.has(name)) return null;
-  const pkgDir = dot < 0 ? goPackageDir(type.file) : goImportPackageDir(named.slice(0, dot), type.file, context);
+  const pkgDir = dot < 0 ? goBareTypeDir(name, type.file, context) : goImportPackageDir(named.slice(0, dot), type.file, context);
+  if (pkgDir === null && dot < 0) return null;
   if (!pkgDir || goPackageTypes(name, pkgDir, context).length === 0) return undefined;
   // A project type whose methods aren't found is left to the strategies
   // below: kubernetes' `var UnstructuredJSONScheme runtime.Codec =
@@ -20402,7 +20413,7 @@ function goValueType(value: string, filePath: string, context: ResolutionContext
   const written = qualifier !== undefined ? `${qualifier}.${name}` : name!;
   if (open === '{') return GO_TYPE_KEYWORDS.has(name!) ? null : { written, file: filePath };
   // A call is a conversion when it names a type of its package.
-  const dir = qualifier !== undefined ? goImportPackageDir(qualifier, filePath, context) : goPackageDir(filePath);
+  const dir = qualifier !== undefined ? goImportPackageDir(qualifier, filePath, context) : goBareTypeDir(name!, filePath, context);
   return dir && goPackageTypes(name!, dir, context).length > 0 ? { written, file: filePath } : undefined;
 }
 
@@ -20564,24 +20575,83 @@ function goClosingBracket(text: string, open: number): number {
   return -1;
 }
 
-const GO_DOT_IMPORTS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+/** The packages a Go file dot-imports. */
+interface GoDotImports {
+  /** The project's, by directory: their exported names the file reads bare. */
+  dirs: string[];
+  /** Whether one is a package from outside the project's modules (`. "github.com/onsi/gomega"`). */
+  outside: boolean;
+  /** The type names the file's text declares, inside its functions too: read when first needed. */
+  types?: Set<string>;
+}
 
-/** The project packages a Go file dot-imports (`import . "example.com/app/storage"`), by directory: their names it reads bare. */
-function goDotImportDirs(filePath: string, context: ResolutionContext): string[] {
+const GO_DOT_IMPORTS = new WeakMap<ResolutionContext, Map<string, GoDotImports>>();
+
+/** The packages a Go file dot-imports (`import . "example.com/app/storage"`). */
+function goDotImports(filePath: string, context: ResolutionContext): GoDotImports {
   let memo = GO_DOT_IMPORTS.get(context);
   if (!memo) GO_DOT_IMPORTS.set(context, (memo = new Map()));
-  let dirs = memo.get(filePath);
-  if (dirs) return dirs;
-  dirs = [];
+  let found = memo.get(filePath);
+  if (found) return found;
+  found = { dirs: [], outside: false };
   for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
     // The imports come before any other declaration.
     if (/^(?:func|type|var|const)\b/.test(line)) break;
     const dot = /^\s*(?:import\s+)?\.\s+"([^"]+)"/.exec(line);
-    const dir = dot ? context.getGoPackageDir?.(dot[1]!, filePath) : null;
-    if (dir) dirs.push(dir);
+    if (!dot || !context.getGoPackageDir) continue;
+    const dir = context.getGoPackageDir(dot[1]!, filePath);
+    if (dir) found.dirs.push(dir);
+    // A relative or `/internal/` path is the project's own, mapped or not.
+    else if (!dot[1]!.startsWith('.') && !dot[1]!.includes('/internal/')) found.outside = true;
   }
-  memo.set(filePath, dirs);
-  return dirs;
+  memo.set(filePath, found);
+  return found;
+}
+
+/**
+ * The directory of the package that declares a Go type written bare in
+ * `filePath` (`Controller`, `*Manager`), as Go reads the name: the file's own
+ * package, else a package of the project the file dot-imports that declares
+ * it (harbor's config tests read `Controller` from `. ".../controller/config"`).
+ * Null for an exported name that only a package from outside the project the
+ * file dot-imports can give it (`. "github.com/onsi/gomega"`): no type of the
+ * project's. The file's own package when no package declares the name, as
+ * before: a type the index doesn't hold there, like one a function declares
+ * (ginkgo's `type CompleteSpecContext interface {…}` inside a test), which
+ * hides a dot import's.
+ */
+function goBareTypeDir(name: string, filePath: string, context: ResolutionContext): string | null {
+  const own = goPackageDir(filePath);
+  const dots = goDotImports(filePath, context);
+  if ((dots.dirs.length === 0 && !dots.outside) || goPackageTypes(name, own, context).length > 0) return own;
+  const dir = dots.dirs.find((d) => goPackageTypes(name, d, context).length > 0);
+  if (dir !== undefined) return dir;
+  if (!dots.outside || !/^[A-Z]\w*$/.test(name)) return own;
+  if (!dots.types) {
+    dots.types = new Set();
+    for (const line of context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []) {
+      for (const m of line.replace(/\/\/.*$/, '').matchAll(/(?:^|[^\w.])type\s+([A-Za-z_]\w*)/g)) dots.types.add(m[1]!);
+    }
+  }
+  return dots.types.has(name) ? own : null;
+}
+
+/**
+ * What a Go embedding written bare (`*Manager`) names when the file's own
+ * package doesn't declare the name: the type of the package the file
+ * dot-imports that does (goBareTypeDir), not another package's namesake name
+ * matching found as near the file, or nothing for a name only a package from
+ * outside the project can give the file. Any other is left as it is.
+ */
+export function goDotImportedSupertype(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return result;
+  const dir = goBareTypeDir(name, ref.filePath, context);
+  if (dir === goPackageDir(ref.filePath) || goRefQualification(ref, context).written !== undefined) return result;
+  if (dir === null) return null;
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (target && goPackageDir(target.filePath) === dir) return result;
+  return { ...result, targetNodeId: preferCallSiteFile(goPackageTypes(name, dir, context), ref.filePath)[0]!.id };
 }
 
 /**
@@ -20814,8 +20884,8 @@ function goNamedTypeDecls(t: GoTypeText, context: ResolutionContext): { name: st
   if (second === undefined) {
     if (t.params?.has(name)) return undefined;
     if (GO_BUILTIN_FIELD_TYPES.has(name)) return null;
-    dir = [goPackageDir(t.file), ...goDotImportDirs(t.file, context)].find((d) => goPackageTypes(name, d, context).length > 0);
-    if (dir === undefined) return undefined;
+    dir = goBareTypeDir(name, t.file, context);
+    if (dir === null) return null;
   } else {
     dir = goImportPackageDir(first!, t.file, context);
     if (dir === undefined) return undefined;
@@ -22481,9 +22551,13 @@ function matchGoFieldChainCall(
       const m = line.match(fieldTypeRe);
       if (!m || !m[1]) continue;
       const rawType = m[1];
-      // The package that declares the field's type: the struct's own for a
-      // bare type name, the imported one for a package-qualified name.
-      let pkgDir = goPackageDir(s.filePath);
+      // The package that declares the field's type: for a bare type name the
+      // struct's own, or one its file dot-imports (harbor's config tests read
+      // `controller Controller` from `. ".../controller/config"`) — none of
+      // the project's for a name only a package from outside it can give the
+      // file — the imported one for a package-qualified name.
+      let pkgDir = rawType.includes('.') ? undefined : goBareTypeDir(rawType, s.filePath, context);
+      if (pkgDir === null) continue;
       // A package-qualified field type (`http.Handler`, `sql.DB`) is only
       // followed when the package is one of the project's: stripping the
       // qualifier and matching the bare name would conflate a stdlib or
