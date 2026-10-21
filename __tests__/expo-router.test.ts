@@ -741,8 +741,10 @@ export default function ReviewScreen() {
 
     // One transition into /capture/review, and it comes from /capture.
     expect(links.map((l) => screens.screens.find((s) => s.id === l.from)?.path)).toEqual(['/capture']);
-    // Written right there: no chain, and no Swift guard smuggled in.
-    expect(links[0]!.via).toEqual([]);
+    // Written in this screen's own file, reached through the memo wrapper it
+    // renders, and no Swift guard smuggled in.
+    expect(links[0]!.via.map((v) => v.name)).toEqual(['MemoizedCaptureComponent', 'CaptureComponent']);
+    expect(links[0]!.via.every((v) => v.language !== 'swift')).toBe(true);
     expect(links[0]!.when).toBe('!isRetakeBatchActive');
     expect(links[0]!.sites[0]!.file).toBe('src/app/capture/index.tsx');
     // …and /capture/review is not left feeding only itself.

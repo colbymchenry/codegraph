@@ -411,7 +411,16 @@ Each of these cost real debugging time; they are not hypothetical.
    hands over `Login` (`defaultExportedName`). A tag's edge now depends on the
    modules the file's lazy values load, so those are synthesis inputs
    (`lazyValueModules`): a sync that gives one its default export redraws the
-   tag, as a fresh index would draw it.
+   tag, as a fresh index would draw it. A component node minted for a wrapper
+   with no render function of its own (outline's `styled(ActionButton).attrs(…)
+   <Props>\`…\``, `memo(Button)`) renders the component it wraps, with no tag to
+   read: `wrappedComponentName` reads the name off the declaration, and the
+   `jsx-render` synthesizer binds it as `jsxChild` binds a tag, but only where
+   the file binds the name itself, by a declaration or an import of a project
+   module (`wrappedChild`). bigbluebutton imports through Meteor `/imports/…`
+   paths no resolver follows, and a guess among its dozens of styled `Icon`s
+   and `FlexColumn`s was wrong every time. A file that declares such a wrapper
+   is a synthesis input even with no markup.
 20. **An import that looks like a package can be a path.** Create React App
    and Vite admin templates (berry, mantis, matx) set `"baseUrl": "src"` or
    `"paths": { "*": ["./src/*"] }` in a jsconfig and write every cross-file

@@ -40,7 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
-import { declaredComponent, exportedComponent, lazyValueModules } from './frameworks/react';
+import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -61,6 +61,9 @@ const JSX_FAMILY = ['tsx', 'jsx', 'javascript'];
 // the next match, which `opensTag` reads as a type argument, not a tag.
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)(?=[\s/><])/g;
 const MAX_JSX_CHILDREN = 30;
+// A wrapper around a component — `styled(ActionButton)`, `memo(Button)`,
+// `forwardRef(Render)` — renders it without a tag (`wrappedComponentName`).
+const WRAPPER_CALL_RE = /\b(?:styled|memo|forwardRef)\s*\(\s*[A-Z]/;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
 // are already caught by JSX_TAG_RE via the SFC component node.
@@ -1890,6 +1893,32 @@ function jsxChild(
 }
 
 /**
+ * The component a wrapper component wraps, by the name its declaration hands
+ * the wrapper (`wrappedComponentName`), bound the way a tag of that name in the
+ * file is (`jsxChild`), but only where the file binds the name itself: a value
+ * or a component it declares, or an import of a project module the index
+ * holds. Anything else names no component of the project, and a namesake
+ * elsewhere is no guess worth an edge: bigbluebutton's `styled(Icon)`, imported through a
+ * Meteor `/imports/…` path no resolver follows, would render whichever of its
+ * dozens of `Icon`s came first, and SigNoz's `styled(Text)` of `const { Text }
+ * = Typography` a `Text` from another page's styles.
+ */
+function wrappedChild(
+  ctx: ResolutionContext,
+  name: string,
+  file: string,
+  importsOf: () => Map<string, string>,
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>,
+  exportOf: (module: string, exported: string) => Node | null
+): Node | undefined {
+  const declared = ownValueOf(name) !== undefined ||
+    (ctx.getNodesInFileNamed?.(file, name) ?? ctx.getNodesInFile(file).filter((n) => n.name === name))
+      .some((n) => JSX_CHILD_KINDS.has(n.kind));
+  if (!declared && !projectImport(ctx, name, file)) return undefined;
+  return jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
+}
+
+/**
  * Whether the `<Name` at `at` opens a JSX tag. A type argument list follows
  * its type's name directly — `useState<User>()`, `Array<Item>`, the
  * `<Document>` of `<PaginatedList<Document>` — and a tag never does, short of
@@ -2249,12 +2278,47 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     if ((++scannedFiles & 15) === 0) await onYield();
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
-    if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
+    if (!content) continue;
+    const hasTags = content.includes('</') || content.includes('/>');
+    const wraps = WRAPPER_CALL_RE.test(content);
+    if (!hasTags && !wraps) continue; // JSX-file gate
     // File-level language gate, not merely a project-level one: mixed C/JS
     // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560). A
     // TypeScript `.ts` file holds no JSX either: a `<Name>` there is a type
     // assertion or text, like outline's OpenSearch XML template.
     const inFile = ctx.getNodesInFile(file);
+    // Once per file and name: the value the file declares under it, if any.
+    const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
+    const ownValueOf = (name: string) => {
+      if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
+      return ownValues.get(name);
+    };
+    // A wrapper component renders the component it wraps, with no tag to read:
+    // outline's `const NudeButton = styled(ActionButton)…`, a `memo(Button)`.
+    // Without the link a render flow through it ends at the wrapper. The name
+    // binds as a tag of that name in this file would, where the file binds it
+    // (`wrappedChild`), so a package's `styled(Link)` renders nothing here. Any
+    // JS-family file: a styles `.ts` file declares wrappers too.
+    if (wraps) {
+      let wrapperImports: Map<string, string> | null = null;
+      for (const wrapper of inFile) {
+        if (wrapper.kind !== 'component' || !JS_FAMILY.includes(wrapper.language)) continue;
+        const name = wrappedComponentName(wrapper, ctx);
+        if (!name) continue;
+        const importsOf = () => (wrapperImports ??= importedFrom(ctx, file, wrapper.language));
+        const child = wrappedChild(ctx, name, file, importsOf, ownValueOf, exportOf);
+        if (!child || child.id === wrapper.id || crossesCodeBoundary(wrapper.language, child.language)) continue;
+        const key = `${wrapper.id}>${child.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: wrapper.id, target: child.id, kind: 'calls', line: wrapper.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'jsx-render', via: name, wrapped: true },
+        });
+      }
+    }
+    if (!hasTags) continue;
     const fns = inFile.filter((n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language));
     // JSX outside every function renders from where a plain call there is
     // attributed (#2587): a top-level `const ICONS = { a: <Icon /> }` from the
@@ -2308,12 +2372,6 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     let imports: Map<string, string> | null = null;
     const importsOf = () =>
       (imports ??= importedFrom(ctx, file, parents[0]!.language));
-    // Once per file and name: the value the file declares under it, if any.
-    const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
-    const ownValueOf = (name: string) => {
-      if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
-      return ownValues.get(name);
-    };
     // A function renders the tags its own lines hold, so functions that span
     // the same lines share them: every function of a minified bundle spans
     // its one line, and reading that line again per function took 9 to 25 s
@@ -4855,6 +4913,8 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
+  // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
+  if (WRAPPER_CALL_RE.test(content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
   if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
   const patterns = [THUNK_DECL_RE, CELERY_TASK_DECORATOR_RE, CELERY_DISPATCH_RE,

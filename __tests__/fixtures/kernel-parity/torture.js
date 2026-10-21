@@ -102,3 +102,13 @@ async function exprReceivers(x) {
   this.a.b.run();
   new Runner().go();
 }
+// --- component wrappers walked under the component ------------------------------
+const PANEL_GAP = 8;
+const Panel = styled(Widget)`
+  gap: ${PANEL_GAP}px;
+  color: ${(props) => colorOf(props.theme)};
+`;
+const Row = styled.div.attrs((props) => ({ role: roleOf(props) }))`
+  ${Panel} { margin: 0; }
+`;
+const MemoPanel = React.memo(Panel, legacyHelper);

@@ -884,6 +884,27 @@ function handedComponent(value: Node, context: ResolutionContext, nodes = contex
 }
 
 /**
+ * The name of the component a wrapper component's declaration hands its
+ * rendering to: what `styled(…)` is given (outline's `styled(ActionButton)`,
+ * whatever `.attrs(…)`, `.withConfig(…)`, type arguments or template follow),
+ * or what a `memo` or `forwardRef` call wraps (`memo(Button)`, `React.memo(Row,
+ * areEqual)`, `memo(forwardRef(Input))`; `wrappedName`). React renders it
+ * whenever it renders the wrapper, so a JSX tag's render flow goes on to it.
+ * Null for a wrapper of an element (`styled.div`, `styled('a')`) and for one
+ * around an inline render function, which has a body of its own.
+ */
+export function wrappedComponentName(component: Node, context: ResolutionContext): string | null {
+  const code = stripCommentsForRegex(declarationText(component, context), 'typescript');
+  const init = initializerAt(code, component.name.length);
+  if (init < 0) return null;
+  const expression = code.slice(init, statementEnd(code, init)).trim();
+  const styled = /^styled\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]/.exec(expression);
+  const name = styled ? styled[1]!
+    : /^(?:React\s*\.\s*)?(?:memo|forwardRef)\b/.test(expression) ? wrappedName(expression) : null;
+  return name && isPascalCase(name) && name !== component.name ? name : null;
+}
+
+/**
  * The component a route's `layout:` reference names, found the way the
  * route's own component is: through the route file's import of it, else
  * declared in reach — or a lazily loaded layout module's component, or the

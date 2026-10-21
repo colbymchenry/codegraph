@@ -1048,7 +1048,8 @@ export class TreeSitterExtractor {
   /**
    * Record value-reference bookkeeping as nodes are created: file-scope const/var symbols with
    * distinctive names become reference targets; function/method/const/var symbols become reader
-   * scopes whose bodies flushValueRefs scans.
+   * scopes whose bodies flushValueRefs scans, and so do React wrapper components, whose
+   * declaration reads values as a constant's does (`${BaseMenuItemCSS}` in a styled template).
    */
   private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode, valueTarget = true): void {
     // Pascal targets `constant` only: its extractor emits function PARAMETERS
@@ -1079,7 +1080,7 @@ export class TreeSitterExtractor {
         this.fileScopeValueCounts.set(name, (this.fileScopeValueCounts.get(name) ?? 0) + 1);
       }
     }
-    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable') {
+    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable' || kind === 'component') {
       this.valueRefScopes.push({ id, node, name });
     }
   }
@@ -1584,16 +1585,18 @@ export class TreeSitterExtractor {
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
-      this.extractVariable(node);
+      const walked = this.extractVariable(node);
       // extractVariable doesn't walk every initializer shape (object literals
       // are deliberately skipped; Python/Ruby don't walk at all), so scan the
       // declaration subtree for function-as-value candidates — `const routes =
       // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
       // at nested function definitions (their bodies are walked — and
       // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk. A type walked above captured
-      // its own.
-      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : undefined);
+      // initializers extractVariable DOES walk. A type walked above, and a
+      // component wrapper's initializer extractVariable walked under the
+      // component (which must not hand the component it wraps to the file),
+      // captured their own.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : walked);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
@@ -2230,7 +2233,8 @@ export class TreeSitterExtractor {
    * the node range spans the body. When the wrapper has an inline render
    * function, its body is walked so the component's callees (hooks, helpers) are
    * captured under the component node — matching how a plain
-   * `const Foo = () => …` arrow component already behaves.
+   * `const Foo = () => …` arrow component already behaves. Without one, the
+   * initializer is walked instead (walkComponentWrapper).
    */
   private extractReactComponentNode(
     name: string,
@@ -2239,12 +2243,127 @@ export class TreeSitterExtractor {
     extra: { docstring?: string; signature?: string; isExported?: boolean }
   ): void {
     const compNode = this.createNode('component', name, declarator, extra);
-    if (!compNode || !innerFn || !this.extractor) return;
+    if (!compNode || !this.extractor) return;
     this.nodeStack.push(compNode.id);
-    const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
-      ?? getChildByField(innerFn, this.extractor.bodyField);
-    if (body) this.visitFunctionBody(body, compNode.id);
+    if (innerFn) {
+      const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
+        ?? getChildByField(innerFn, this.extractor.bodyField);
+      if (body) this.visitFunctionBody(body, compNode.id);
+    } else {
+      const value = getChildByField(declarator, 'value');
+      if (value) this.walkComponentWrapper(value);
+    }
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk a wrapper with no render function of its own — `styled.div\`…\``,
+   * `styled(Base).attrs(…)<P>\`…\``, emotion's and MUI's `styled(Base)(styles)`,
+   * `memo(Base)` — with its component on the stack, the way a constant's
+   * initializer is walked with the constant on it (#693). The template's
+   * interpolations, the `.attrs()` / `.withConfig()` / options arguments, a
+   * style function and a `memo` comparator are the component's own code.
+   *
+   * The wrapper's own chain is the library it is declared with: `styled`,
+   * `styled.div`, `.attrs`, `memo` name no project code, so their calls are not
+   * recorded (every one would park as a reference nothing answers). Nor is the
+   * component it wraps (`styled(ActionButton)`, `memo(Button)`) a function
+   * passed as a value: React renders it whenever it renders this one, so the
+   * JSX synthesizer links it as a render, a hop explore can follow. A type
+   * argument read as comparisons (`styled.div<Props>`, see
+   * isTypedStyledTemplate) is a type, and is not walked. Mirrored in the kernel
+   * (tsjs/extractors.rs walk_component_wrapper).
+   */
+  private walkComponentWrapper(link: SyntaxNode): void {
+    switch (link.type) {
+      case 'binary_expression': {
+        // `(styled(Base) < Props) > \`…\``: the tag is the leftmost operand
+        // and the template the rightmost; the operands between are the type.
+        let tag: SyntaxNode | null = link;
+        while (tag?.type === 'binary_expression') tag = getChildByField(tag, 'left');
+        let template: SyntaxNode | null = link;
+        while (template?.type === 'binary_expression') template = getChildByField(template, 'right');
+        if (tag) this.walkComponentWrapper(tag);
+        if (template) this.visitFunctionBody(template, '');
+        return;
+      }
+      case 'call_expression': {
+        const callee = getChildByField(link, 'function');
+        if (callee) this.walkComponentWrapper(callee);
+        const args = getChildByField(link, 'arguments');
+        if (!args) return;
+        // A tagged template's argument is its template: the styles.
+        if (args.type !== 'arguments') {
+          this.visitFunctionBody(args, '');
+          return;
+        }
+        // `styled(Base)`, `memo(Base)`: the first argument is the component
+        // wrapped, or a wrapper around it (`memo(forwardRef(Inner))`).
+        const calleeText = callee ? getNodeText(callee, this.source) : '';
+        const root = calleeText === 'styled' || REACT_COMPONENT_HOCS.has(calleeText);
+        const first = args.namedChild(0);
+        const base = root && (first?.type === 'identifier' || first?.type === 'member_expression') ? first : null;
+        for (let i = 0; i < args.namedChildCount; i++) {
+          const arg = args.namedChild(i);
+          if (!arg || (base && arg.startIndex === base.startIndex)) continue;
+          if (root && i === 0 && arg.type === 'call_expression' && this.isComponentWrapperCall(arg)) {
+            this.walkComponentWrapper(arg);
+          } else if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+            // A style or `.attrs()` function runs as the component's code; its
+            // body is walked as a render function's is, never named for the
+            // declarator (curriedWrapperBoundName would take MUI's
+            // `styled(Box)(({ theme }) => …)` for a function of its own).
+            const body = this.extractor!.resolveBody?.(arg, this.extractor!.bodyField)
+              ?? getChildByField(arg, this.extractor!.bodyField);
+            if (body) this.visitFunctionBody(body, '');
+          } else {
+            this.visitFunctionBody(arg, '');
+          }
+        }
+        this.captureWrapperArgumentRefs(args, base);
+        return;
+      }
+      case 'member_expression':
+      case 'subscript_expression': {
+        const object = getChildByField(link, 'object');
+        if (object) this.walkComponentWrapper(object);
+        return;
+      }
+      case 'non_null_expression':
+      case 'parenthesized_expression':
+      case 'instantiation_expression': {
+        // `styled.div<{ open: boolean }>` error-recovers into a call on
+        // `non_null_expression(instantiation_expression(styled.div, …))`.
+        const inner = getChildByField(link, 'function') ?? link.namedChild(0);
+        if (inner) this.walkComponentWrapper(inner);
+        return;
+      }
+    }
+  }
+
+  /** A call of the kind reactComponentHoc reads as a component wrapper: `styled…(…)`, `memo(…)`, `forwardRef(…)`. */
+  private isComponentWrapperCall(call: SyntaxNode): boolean {
+    const callee = getChildByField(call, 'function');
+    if (!callee) return false;
+    const text = getNodeText(callee, this.source);
+    return /^styled\b/.test(text) || REACT_COMPONENT_HOCS.has(text);
+  }
+
+  /**
+   * Function-as-value candidates (#756) among a wrapper call's arguments — a
+   * `memo` comparator, a style function passed by name — attributed to the
+   * component. The component the call wraps is not one: it is what the
+   * component renders.
+   */
+  private captureWrapperArgumentRefs(args: SyntaxNode, base: SyntaxNode | null): void {
+    const spec = this.fnRefSpec;
+    const rule = spec?.dispatch.get(args.type);
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!spec || !rule || !fromNodeId) return;
+    for (const cand of captureFnRefCandidates(args, rule, spec, this.source)) {
+      if (base && cand.line === base.startPosition.row + 1 && cand.column === base.startPosition.column) continue;
+      this.fnRefCandidates.push({ ...cand, fromNodeId });
+    }
   }
 
   /**
@@ -3434,9 +3553,14 @@ export class TreeSitterExtractor {
    *
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
+   *
+   * Returns the initializers it walked under a component wrapper, whose
+   * function-as-value candidates that walk already took (the caller's scan of
+   * the declaration skips them).
    */
-  private extractVariable(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractVariable(node: SyntaxNode): Set<number> | undefined {
+    if (!this.extractor) return undefined;
+    let walked: Set<number> | undefined;
 
     // Different languages have different variable declaration structures
     // TypeScript/JavaScript: lexical_declaration contains variable_declarator children
@@ -3508,6 +3632,7 @@ export class TreeSitterExtractor {
                   signature: initSignature,
                   isExported,
                 });
+                if (!hoc.inner) (walked ??= new Set()).add(valueNode.id);
                 continue;
               }
             }
@@ -3864,6 +3989,7 @@ export class TreeSitterExtractor {
         }
       }
     }
+    return walked;
   }
 
   /** Resolve a Lua assignment target into its callable name and optional table receiver. */

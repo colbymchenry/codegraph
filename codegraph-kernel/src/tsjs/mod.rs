@@ -490,7 +490,9 @@ impl<'t> Walker<'t> {
                 *self.fs_value_counts.entry(name.to_string()).or_insert(0) += 1;
             }
         }
-        if matches!(kind, "function" | "method" | "constant" | "variable") {
+        // A React wrapper component reads values as a constant's declaration
+        // does (`${BaseMenuItemCSS}` in a styled template).
+        if matches!(kind, "function" | "method" | "constant" | "variable" | "component") {
             self.value_scopes.push(ValueScope { row, node, name: name.to_string() });
         }
     }
@@ -605,9 +607,13 @@ impl<'t> Walker<'t> {
     }
 
     /// scanFnRefSubtree: capture-only walk of subtrees the main walkers skip.
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    /// `walked`: subtrees a body walk has already been through.
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: Option<&HashSet<usize>>) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        if walked.map(|w| w.contains(&node.id())).unwrap_or(false) {
             return;
         }
         let kind = node.kind();
@@ -619,7 +625,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -699,7 +705,7 @@ impl<'t> Walker<'t> {
                     self.visit_function_body(value);
                     self.stack.pop();
                 }
-                self.scan_fn_ref_subtree(node, 0);
+                self.scan_fn_ref_subtree(node, 0, None);
             } else {
                 self.extract_method(node);
             }
@@ -713,8 +719,10 @@ impl<'t> Walker<'t> {
         } else if self.variant.is_ts() && kind == "type_alias_declaration" {
             skip_children = self.extract_type_alias(node);
         } else if is_variable_type(kind) && !self.inside_class_like() {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // A component wrapper's initializer extract_variable walked under
+            // the component captured its own candidates; the scan skips it.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             skip_children = true;
         } else if kind == "import_statement" {
             self.extract_import(node);
@@ -750,7 +758,7 @@ impl<'t> Walker<'t> {
             // says which member wants the type, where `Api → PageId` only said
             // the file did.
             self.extract_property(node);
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, None);
             skip_children = true;
         }
 
