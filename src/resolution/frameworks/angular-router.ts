@@ -693,6 +693,11 @@ function angularAppRoot(filePath: string, context: ResolutionContext): string {
 
 export type AngularRouteTable = RootedRouteTable;
 
+/** True for a route the table holds: this resolver's, at an absolute path. */
+function inAngularTable(node: Node): boolean {
+  return isAngularRoute(node) && node.name.startsWith('/');
+}
+
 const tables = new WeakMap<ResolutionContext, AngularRouteTable>();
 
 export function angularRouteTable(context: ResolutionContext): AngularRouteTable {
@@ -702,7 +707,7 @@ export function angularRouteTable(context: ResolutionContext): AngularRouteTable
   const byRoot = new Map<string, RouteTable>();
   const byFile = new Map<string, Node>();
   for (const node of all) {
-    if (!isAngularRoute(node) || !node.name.startsWith('/')) continue;
+    if (!inAngularTable(node)) continue;
     const root = angularAppRoot(node.filePath, context);
     let t = byRoot.get(root);
     if (!t) byRoot.set(root, (t = { source: all, exact: new Map(), dynamic: [] }));
@@ -758,6 +763,23 @@ export function angularRouteTable(context: ResolutionContext): AngularRouteTable
   const table: AngularRouteTable = { source: all, byRoot };
   tables.set(context, table);
   return table;
+}
+
+const appCounts = new WeakMap<ResolutionContext, { source: readonly Node[]; count: number }>();
+
+/**
+ * How many apps the table splits into — `byRoot.size` of
+ * {@link angularRouteTable}, counted from the routes alone: building the table
+ * reads every file that mounts or redirects.
+ */
+function angularAppCount(context: ResolutionContext): number {
+  const all = context.getNodesByKind('route');
+  const cached = appCounts.get(context);
+  if (cached && cached.source === all) return cached.count;
+  const roots = new Set<string>();
+  for (const node of all) if (inAngularTable(node)) roots.add(angularAppRoot(node.filePath, context));
+  appCounts.set(context, { source: all, count: roots.size });
+  return roots.size;
 }
 
 /**
@@ -968,6 +990,17 @@ export const angularRouterResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_CALL.test(name) || LAZY_COMPONENT_REF.test(name) || LAYOUT_REF.test(name);
+  },
+
+  navigation: {
+    tails: ['navigate', 'navigateByUrl', 'createUrlTree', 'parseUrl'],
+    // A call matches against its own app's table — or, in a workspace of one
+    // app, against that app's from anywhere, a shared library included
+    // (`angularRoutesFor`).
+    scope: (route, context) => {
+      if (!inAngularTable(route)) return null;
+      return angularAppCount(context) === 1 ? [''] : [angularAppRoot(route.filePath, context)];
+    },
   },
 
   extract(filePath: string, content: string): FrameworkExtractionResult {

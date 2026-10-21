@@ -243,6 +243,11 @@ function isNuxtPage(node: Node): boolean {
   );
 }
 
+/** True for a route the table holds: a config route or a Nuxt page, at an absolute path. */
+function inVueTable(node: Node): boolean {
+  return (isVueConfigRoute(node) || isNuxtPage(node)) && node.name.startsWith('/');
+}
+
 const tables = new WeakMap<ResolutionContext, VueRouteTable>();
 
 export function vueRouteTable(context: ResolutionContext): VueRouteTable {
@@ -257,12 +262,10 @@ export function vueRouteTable(context: ResolutionContext): VueRouteTable {
     return t;
   };
   for (const node of all) {
-    const config = isVueConfigRoute(node);
-    if (!config && !isNuxtPage(node)) continue;
-    if (!node.name.startsWith('/')) continue;
+    if (!inVueTable(node)) continue;
     const root = appRootFor(node.filePath);
     addRouteTo(tableAt(root), node.name, node);
-    if (config) {
+    if (isVueConfigRoute(node)) {
       const group = configFiles.get(node.filePath);
       if (group) group.nodes.push(node);
       else configFiles.set(node.filePath, { root, nodes: [node] });
@@ -410,6 +413,12 @@ export const vueRouterResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_CALL.test(name) || name.startsWith('import:') || name.startsWith('layout:');
+  },
+
+  navigation: {
+    tails: ['push', 'replace', 'navigateTo'],
+    // A call matches against the table of the app its file is in.
+    scope: (route) => (inVueTable(route) ? [appRootFor(route.filePath)] : null),
   },
 
   extract(filePath: string, content: string): FrameworkExtractionResult {

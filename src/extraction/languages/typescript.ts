@@ -57,15 +57,93 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\.\.\.(?=\s*[},])/g, '   ');
 }
 
+/**
+ * Whether `node` is declared in a `declare module 'x' { … }` or `declare
+ * global { … }` body, which exports it without an `export` keyword.
+ *
+ * This is TypeScript's own rule: the binder makes an ambient module body an
+ * export context unless the body holds an export declaration (`export {…}`,
+ * `export * from`, `export =`, `export default x`), and a namespace nested in
+ * one is ambient too. What such a body declares belongs to that module or to
+ * the global scope, not to this file (`interface Window`, chart.js's
+ * `PluginOptionsByType`): other files reach it through them, and so does the
+ * library whose type it extends. `declare namespace X` is not one: in a module
+ * file, X belongs to that file. Mirrored in the kernel (tsjs/mod.rs
+ * `is_ambient_export`).
+ */
+export function isAmbientExport(node: SyntaxNode): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'statement_block' && hasExportDeclaration(current)) return false;
+    if (current.type !== 'ambient_declaration') continue;
+    // `declare global` is the keyword and a bare block, with no field names.
+    for (let i = 0; i < current.childCount; i++) {
+      if (current.child(i)?.type === 'global') return true;
+    }
+    const declared = current.namedChild(0);
+    if (declared?.type === 'module' && getChildByField(declared, 'name')?.type === 'string') return true;
+  }
+  return false;
+}
+
+/** A statement in `block` that exports by name or by assignment, not by declaring. */
+function hasExportDeclaration(block: SyntaxNode): boolean {
+  for (let i = 0; i < block.namedChildCount; i++) {
+    const statement = block.namedChild(i);
+    if (statement?.type === 'export_statement' && !getChildByField(statement, 'declaration')) return true;
+  }
+  return false;
+}
+
+/** A TypeScript declaration file: `.d.ts`, `.d.mts`, `.d.cts`. */
+const DECLARATION_FILE = /\.d\.[cm]?ts$/i;
+
+/**
+ * Whether a bodiless `function_signature` is a function's declaration rather
+ * than an overload of an implementation that follows it, and one a name or
+ * an import reaches.
+ *
+ * TypeScript writes a function without a body in two places. Before the
+ * implementation it overloads (`function f(a: number): void;`, then `function
+ * f(a) {…}`), and there the implementation is the function's node. In an
+ * ambient context nothing follows, and the signature is all the declaration
+ * there is: a `declare function`, a function in a `declare global` body, a
+ * declaration file's own functions, which are ambient with or without
+ * `declare`, and a function a declaration file's `declare module 'x'` body
+ * declares, which an import of `x` reaches (see resolution/ambient-modules).
+ * Without a node, `import { convertToHtml } from 'mammoth'` had nothing to
+ * bind to. Two are left out: a namespace's function is only ever reached
+ * through the namespace (`semver.compare`, `vscode.window.showMessage`), which
+ * the index doesn't model, so on its own it is only a bare name for unrelated
+ * calls to land on; and a `declare module` body in an ordinary module file
+ * augments the package's own module, whose functions the import means.
+ * Mirrored in the kernel (tsjs/mod.rs `is_ambient_function_signature`).
+ */
+export function isAmbientFunctionSignature(node: SyntaxNode, filePath: string): boolean {
+  if (node.type !== 'function_signature') return false;
+  const declarationFile = DECLARATION_FILE.test(filePath);
+  let ambient = false;
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'internal_module') return false;
+    if (current.type === 'module') {
+      // `declare module 'x'`; `module Foo {}` is a namespace.
+      if (getChildByField(current, 'name')?.type !== 'string') return false;
+      return declarationFile;
+    }
+    if (current.type === 'ambient_declaration') ambient = true;
+  }
+  return ambient || declarationFile;
+}
+
 export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
+  isAmbientFunction: isAmbientFunctionSignature,
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   // `method_signature` is the interface/type-literal form of a method; without it
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need
   // an equivalent — their grammars reuse `method_declaration`.
-  methodTypes: ['method_definition', 'public_field_definition', 'method_signature'],
+  methodTypes: ['method_definition', 'public_field_definition', 'method_signature', 'abstract_method_signature'],
   classifyMethodNode: classifyTsClassMember,
   // The interface counterpart of `public_field_definition`. It carries no value,
   // so it is always a property and never needs classifyMethodNode.
@@ -143,7 +221,7 @@ export const typescriptExtractor: LanguageExtractor = {
       if (current.type === 'export_statement') return true;
       current = current.parent;
     }
-    return false;
+    return isAmbientExport(node);
   },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {

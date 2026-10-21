@@ -118,7 +118,8 @@ async function activate(root: string, project: Project): Promise<void> {
     if (writer.existing?.mode === 'daemon') {
       for (const candidate of getDaemonSocketCandidates(root)) {
         const socket = await connectWithHello(candidate);
-        if (!socket || socket === 'version-mismatch') continue;
+        // A daemon of another version, older or not, is left to the project's own launchers.
+        if (!socket || typeof socket === 'string') continue;
         if (project.refs === 0) { socket.destroy(); return; }
         project.socket = socket;
         socket.once('close', () => {

@@ -168,3 +168,23 @@ typedef union {
 } word_t;
 
 static unsigned int hdr_raw(union packet_hdr *h) { return h->raw; }
+
+/* struct, union and enum definitions in a declaration's type: each is a node
+   beside the declaration's variables, documented by the comment above the
+   declaration; an unnamed one takes the name of its first variable */
+static void noop_builtin(void) {}
+
+/* The parser's state. */
+static struct parse_state { int depth; const char *at; } parse_state, *active_state;
+static struct { int argc; char **argv; } SPT;
+static const struct { const char *name; void (*fn)(void); } builtin_table[] = {
+  { "noop", noop_builtin },
+};
+union { int i; float f; } scratch_word = { 0 };
+enum { MODE_IDLE, MODE_BUSY } current_mode;
+struct { int unused; } make_unnamed(void);
+
+static int declared_types_local(void) {
+  static struct { int hits; } local_stats;
+  return ++local_stats.hits + current_mode;
+}

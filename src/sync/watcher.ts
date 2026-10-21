@@ -650,7 +650,7 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot), this.projectRoot)) {
       this.maybeScheduleForRemovedDir(rel);
       return;
     }

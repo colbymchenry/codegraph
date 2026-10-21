@@ -355,7 +355,7 @@ entry-points panel.
 
 **The caveat is part of the screen, not a note on it.** A persistent 11.5px `--ink-3` line sits above the rows, between two
 hairline rules, and never collapses or dismisses: *"No static reference in the index — dynamic use is possible."* Under the list,
-every reason a candidate was left off is printed with its count ("1 677 in test files", "378 exported, or declared in a header",
+every reason a candidate was left off is printed with its count ("1 677 in test files", "378 exported, declared in a header, or merged into a library or global type",
 "40 overriding a member declared further up"), preceded by the scale — *"2 494 symbols in this index carry no incoming reference
 at all; 2 474 of them were left off this list."* Twenty rows drawn from twenty candidates and twenty drawn from two and a half
 thousand are different screens and only that sentence tells them apart.
@@ -378,8 +378,10 @@ modules are not dimmed — a module with one `.pb.go` in it is still one somebod
 
 **What the list refuses to claim** is the whole design. Behind it, `src/graph/dead-code.ts` starts from "no incoming edge
 other than `contains`" and subtracts every candidate there is any reason to believe something reaches: exported symbols and
-header declarations, test and generated files, abstract and interface members, anything carrying a `decorates` edge, overrides
-of an ancestor's member, names the language calls by itself, vendored directories, files nothing in the index reaches (those are
+header declarations, test and generated files, abstract and interface members, anything carrying a decorator (a `decorates`
+edge, or a decorator from outside the index the resolver could not follow), overrides of an ancestor's member, a TypeScript
+hook its framework calls by name on a decorated class that skips the `implements` clause (which names are hooks is read off the
+classes that do write the interface out), names the language calls by itself, vendored directories, files nothing in the index reaches (those are
 islands — the Map's job, not this list's), names the resolver failed to resolve somewhere, names shared with a symbol that IS
 referenced, and — the only rule that reads a file — names written more than once in a file that can reach them.
 

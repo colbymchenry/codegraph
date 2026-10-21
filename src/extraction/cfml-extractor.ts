@@ -147,10 +147,12 @@ export class CfmlExtractor {
   private extractTagBased(): void {
     const parser = getParser('cfml');
     if (!parser) {
+      // Same code as TreeSitterExtractor's missing parser, so a grammar that
+      // failed to load is never stored as this file's index data (#2335).
       this.errors.push({
         message: 'cfml grammar not loaded',
         severity: 'error',
-        code: 'unsupported_language',
+        code: 'parser_error',
       });
       return;
     }

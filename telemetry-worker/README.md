@@ -80,7 +80,8 @@ nothing looks broken from the outside. That ran from 2026-08-11 to October 2026.
 
 ## Rollups & retention (nightly cron)
 
-`src/rollup.ts` runs on a Cron Trigger at **00:30 UTC** and does two things.
+`src/rollup.ts` runs on a Cron Trigger at **00:30 UTC** and does two things, the purge
+first.
 
 **Rolls up** the day that just ended into `daily_machines`, `daily_event_counts`,
 `daily_dim_counts` and `machine_first_seen.first_index_day`, then re-runs the two days before
@@ -88,7 +89,12 @@ it — offline clients ship completed-day rollups late, so a day keeps growing a
 It then **catches up** on any earlier day that saw activity but never got a rollup (a
 `machine_days` day with no `daily_machines` row — a night the run failed or the database
 refused writes), newest first, up to 31 a night. An outage heals on the first good night
-instead of leaving a hole someone has to notice. The aggregation is one
+instead of leaving a hole someone has to notice. Cloudflare ends a Cron Trigger after 15
+minutes of wall-clock time, and a day that still holds millions of legacy usage rows (below)
+takes minutes, so the run starts no new day and no new fold chunk once 10 minutes have
+passed (`NIGHTLY_BUDGET_MS`). A day it stops partway gets no rollup at all, so it is still a
+missed day the next night, which carries on from the last folded chunk; the summary line
+counts those days as `deferred`. The aggregation is one
 `INSERT … SELECT … ON CONFLICT DO UPDATE` per table or dimension, so it happens inside D1 and
 no event row crosses the wire. Every write overwrites the recomputed value rather than adding
 to it: **re-running a day is a no-op, never a double count.** Two things the SQL is careful
@@ -100,7 +106,9 @@ rollup over old days is the whole migration. Adding a breakdown is a line in `RO
 never a migration — that is what the generic `(dim, value)` shape buys.
 
 **Purges** raw `events` and `usage_daily` rows older than `RETENTION_DAYS` (90, a var in
-`wrangler.jsonc`) in bounded `DELETE` batches, and logs one line of counts. `machine_days` and `machine_first_seen` are
+`wrangler.jsonc`) in bounded `DELETE` batches, before any rollup: behind a long catch-up it
+would be the part the 15-minute limit cuts off, night after night, while the database
+grows. The run ends with one line of counts. `machine_days` and `machine_first_seen` are
 never purged — retention cohorts need the full history and they are two orders of magnitude
 smaller. Rollups are kept forever, so shortening the window costs ad-hoc drill-back, never a
 chart.
@@ -122,10 +130,13 @@ each day is a full scan of that day's events, and the request has a wall-clock b
 
 ### Backfilling first_index_day
 
-`first_index_day` (migration `0002`) is what the dashboard's activation funnel reads, and only
-the rollup writes it. Days rolled up before the migration left it NULL, and days stored before
+`first_index_day` (migration `0002`) is what the dashboard's activation funnel reads. The
+ingest worker lowers it as each index event is stored, so an index run that uploads days late
+still counts, and the rollup re-derives it from the raw events of every day it rolls up. Days
+rolled up before the migration left it NULL, an index event stored before the ingest worker
+began setting it (#2333) counts only once its day is rolled up again, and days stored before
 `0003` still hold their usage as one `events` row per upload. Re-running the rollup over every
-day that still has raw events fixes both — it folds that day's legacy usage rows into
+day that still has raw events fixes all three — it folds that day's legacy usage rows into
 `usage_daily`, sets `first_index_day`, and recomputes the day's rollups. It is idempotent, so
 overlapping or repeating a range is harmless. A day with millions of legacy rows takes several
 minutes, so go a day at a time:
@@ -299,6 +310,15 @@ To drive the cron body by hand, run `wrangler dev --test-scheduled` and hit
 `localhost:8787/__scheduled?cron=30+0+*+*+*`. For `POST /admin/rollup` locally, copy
 `.dev.vars.example` to `.dev.vars` — without an `ADMIN_TOKEN` the route 404s, exactly as a
 deploy that never set the secret does.
+
+The repo's own test suite also covers this worker and the dashboard API without wrangler:
+it runs their source against these migrations in an in-memory SQLite database, including
+late uploads and a nightly run whose catch-up outlasts the cron's time limit. From the repo
+root (it is part of `npm test` there):
+
+```bash
+npx vitest run __tests__/telemetry-services.test.ts
+```
 
 ## Changing the schema
 

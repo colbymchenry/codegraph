@@ -1057,6 +1057,33 @@ program
   });
 
 /**
+ * The `status` warnings for indexed files whose symbols are missing although
+ * their content is current (#2335, #2336): one line per group, saying what is
+ * wrong, what to do, and naming up to three of the files.
+ */
+function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErrors: string[] }): string[] {
+  const dash = getGlyphs().dash;
+  const sample = (paths: string[]): string =>
+    paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
+  const lines: string[] = [];
+  const reindex = health.needsReindex.length;
+  if (reindex > 0) {
+    lines.push(
+      `${formatNumber(reindex)} ${reindex === 1 ? 'file is missing its' : 'files are missing their'} symbols ${dash} ` +
+      `run "codegraph sync" to re-index ${reindex === 1 ? 'it' : 'them'}: ${sample(health.needsReindex)}`
+    );
+  }
+  const unparsed = health.parseErrors.length;
+  if (unparsed > 0) {
+    lines.push(
+      `${formatNumber(unparsed)} ${unparsed === 1 ? 'file could not be parsed, so its symbols are' : 'files could not be parsed, so their symbols are'} ` +
+      `missing: ${sample(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`
+    );
+  }
+  return lines;
+}
+
+/**
  * codegraph status [path]
  */
 program
@@ -1103,6 +1130,9 @@ program
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
       const pendingRefs = cg.getPendingReferenceCount();
+      // Files whose content is current but whose symbols are missing — the
+      // content-hash check behind "up to date" cannot see them (#2336).
+      const health = cg.getIndexHealth();
 
       // JSON output mode
       if (options.json) {
@@ -1143,6 +1173,12 @@ program
             // interrupted resolution pass left edges missing; the next
             // sync sweeps them (#1187).
             pendingRefs,
+            // Files stored without their symbols (e.g. while their grammar
+            // could not load, #2335); the next sync re-indexes them.
+            filesNeedingReindex: health.needsReindex.length,
+            // Files with a recorded parse error and no symbols from it
+            // (#2336); unchanged until the file or the parser changes.
+            filesWithParseErrors: health.parseErrors.length,
           },
         }));
         cg.destroy();
@@ -1235,7 +1271,10 @@ program
           console.log(`  Removed:   ${changes.removed.length} files`);
         }
         info('Run "codegraph sync" to update the index');
-      } else {
+      }
+      const missingSymbols = describeFilesMissingSymbols(health);
+      for (const line of missingSymbols) warn(line);
+      if (totalChanges === 0 && missingSymbols.length === 0) {
         success('Index is up to date');
       }
       console.log();
@@ -1751,6 +1790,14 @@ program
           language: f.language,
           nodeCount: f.nodeCount,
           size: f.size,
+          // What extraction recorded for the file — a parse error, a skip
+          // reason — so a health check needn't read the database (#2336).
+          errors: (f.errors ?? []).map((e) => ({
+            severity: e.severity,
+            code: e.code,
+            message: e.message,
+            line: e.line,
+          })),
         }));
         console.log(JSON.stringify(output, null, 2));
         cg.destroy();

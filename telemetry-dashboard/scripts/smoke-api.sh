@@ -105,6 +105,7 @@ field "retention window"     retention_days   14         "$META"
 # The fixture stops on 07-10, months ago: nothing has arrived since, but the
 # rollup did cover every day that saw activity, so it is not behind.
 field "ingest stalled (no events since 07-10)" ingest_stalled true "$META"
+field "…named by the last day anything was stored" latest_ingest_day 2026-07-10 "$META"
 field "rollup not behind (it covered every active day)" rollup_behind false "$META"
 field "nobody active yesterday" machines_yesterday 0 "$META"
 
@@ -306,6 +307,19 @@ field "rollup behind once a day goes un-rolled" rollup_behind true "$META"
 field "…and yesterday's machine is counted"     machines_yesterday 1 "$META"
 npx wrangler d1 execute codegraph-telemetry --local \
   --command "DELETE FROM machine_days WHERE machine_id = '$STALE_ID'" >/dev/null 2>&1
+
+echo
+echo "Usage counters alone are not a stalled ingest"
+# Usage lands in usage_daily, not events, so a day of tool calls with no install or
+# index run must not read as "not storing anything". Removed again straight after.
+npx wrangler d1 execute codegraph-telemetry --local \
+  --command "INSERT INTO usage_daily (day, machine_id, kind, name, count) VALUES ('$YESTERDAY', '$STALE_ID', 'mcp_tool', 'codegraph_explore', 3)" >/dev/null 2>&1
+META="$(get "/api/meta")"
+field "not stalled while usage arrives"           ingest_stalled    false        "$META"
+field "…the usage day is the last day stored"     latest_ingest_day "$YESTERDAY" "$META"
+field "…though the last lifecycle event is 07-10" latest_raw_day    2026-07-10   "$META"
+npx wrangler d1 execute codegraph-telemetry --local \
+  --command "DELETE FROM usage_daily WHERE machine_id = '$STALE_ID'" >/dev/null 2>&1
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
