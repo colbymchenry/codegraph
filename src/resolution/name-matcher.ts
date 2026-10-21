@@ -2703,7 +2703,7 @@ const GO_PREDECLARED_CALLS: ReadonlySet<string> = new Set([
  * statement's blocks (`else` included), a `select` case's in its clause, a
  * parameter in its function's body.
  */
-function goLocalDecl(name: string, ref: UnresolvedRef, context: ResolutionContext): GoDecl | undefined {
+function goLocalDecl(name: string, ref: Pick<UnresolvedRef, 'filePath' | 'line' | 'column'>, context: ResolutionContext): GoDecl | undefined {
   const index = goScopeIndex(ref.filePath, context);
   if (!index?.decls.has(name)) return undefined;
   const at = (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(0, ref.column);
@@ -2712,6 +2712,31 @@ function goLocalDecl(name: string, ref: UnresolvedRef, context: ResolutionContex
     if (at > scope[0] && at < scope[1] && (!found || scope[0] > found[0])) found = scope;
   }
   return found?.[2];
+}
+
+/**
+ * The declaration {@link goLocalDecl} reads for `name` at `at` (1-based line,
+ * 0-based column): where the declared name is, and the type it is declared
+ * with when the declaration writes one — `d *Discovery`, `var o refresh.Options`,
+ * `x := &T{…}`. Undefined when the function around `at` declares no such name:
+ * it is package-level, or an import.
+ */
+export function goLocalDeclarationAt(
+  name: string,
+  at: Pick<UnresolvedRef, 'filePath' | 'line' | 'column'>,
+  context: ResolutionContext
+): { line: number; column: number; type?: string } | undefined {
+  const decl = goLocalDecl(name, at, context);
+  if (!decl) return undefined;
+  const { lineStarts } = goScopeIndex(at.filePath, context)!;
+  let lo = 0;
+  let hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (lineStarts[mid]! <= decl.at) lo = mid;
+    else hi = mid - 1;
+  }
+  return { line: lo + 1, column: decl.at - lineStarts[lo]!, type: decl.type };
 }
 
 /**
@@ -3031,7 +3056,7 @@ function goScopesOf(index: GoScopeIndex, name: string): Array<[number, number, G
  * blanked: offsets and newlines stay, so a regex match still maps to its
  * line and column.
  */
-function blankGoCode(src: string): string {
+export function blankGoCode(src: string): string {
   const parts: string[] = [];
   let last = 0;
   const blank = (from: number, to: number): void => {
