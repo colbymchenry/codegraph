@@ -19275,6 +19275,10 @@ export function matchMethodCall(
       // defined over an interface (`type Codec Serializer`) has methods the
       // index doesn't give it.
       if (goStd && goDeclared !== undefined) return null;
+      // Nor one the type declares in a file the index couldn't read: in
+      // kubernetes, `pod.Unmarshal(…)` on a `*v1.Pod` is the pod's own, in
+      // core/v1's generated.pb.go, never the `TypeMeta` one a name finds.
+      if (ref.language === 'go' && importedFqn !== undefined && goUnreadFileDeclares(inferredType, methodName!, importedFqn, context)) return null;
       // The receiver's declared type is one the project doesn't declare —
       // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
       // method is that outside type's. gson's `list.add(…)` went to a project
@@ -19931,8 +19935,10 @@ export const GO_TYPE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface'
  * method the type doesn't declare is promoted from a type it embeds, which
  * its declaration names (`BaseAPI`, `*cached.BaseManager`, `ReadView`); the
  * name-based supertype walk would mix in every same-named type's embeddings.
- * Undefined when the package declares no such type (a dot import, a file
- * that isn't indexed): the caller then resolves by name as before.
+ * One the type declares in a file of its package the index couldn't read is
+ * missing from the graph, and nothing stands for it. Undefined when the
+ * package declares no such type (a dot import, a file that isn't indexed):
+ * the caller then resolves by name as before.
  */
 function resolveGoMethodInPackage(
   typeName: string,
@@ -19952,6 +19958,10 @@ function resolveGoMethodInPackage(
   }
   const types = goPackageTypes(typeName, pkgDir, context);
   if (types.length === 0) return undefined;
+  // kubernetes' core/v1 generated.pb.go is too large to index, so `Pod`'s
+  // own `String` is missing, and `pod.String()` went to the one its embedded
+  // `TypeMeta` has.
+  if (goUnreadFileDeclares(typeName, methodName, pkgDir, context)) return null;
   if (depth >= 4) return null;
   let unplaced = 0;
   for (const t of types) {
@@ -20328,8 +20338,10 @@ function matchGoPackageValueCall(receiver: string, method: string, ref: Unresolv
   // A project type whose methods aren't found is left to the strategies
   // below: kubernetes' `var UnstructuredJSONScheme runtime.Codec =
   // unstructuredJSONScheme{}` is a `Codec`, defined over an interface whose
-  // methods its node doesn't carry.
-  return resolveMethodOnType(name, method, ref, context, 0.9, 'instance-method', pkgDir) ?? undefined;
+  // methods its node doesn't carry. Not when the type declares the method in
+  // a file the index couldn't read: that one is the type's own.
+  return resolveMethodOnType(name, method, ref, context, 0.9, 'instance-method', pkgDir) ??
+    (goUnreadFileDeclares(name, method, pkgDir, context) ? null : undefined);
 }
 
 /** A Go package-level value's type as its declaration writes it, with the declaring file; null for one with no project method. */
@@ -20697,20 +20709,24 @@ function goMethodOnElement(t: GoTypeText, ref: UnresolvedRef, context: Resolutio
   // An alias of a type from outside the project (`type Ctx = context.Context`)
   // has that type's methods, none the project declares.
   if (named.nodes.every((n) => goAliasTarget(n, context) === null)) return null;
-  const result = resolveMethodOnType(named.name, ref.referenceName, ref, context, 0.9, 'instance-method', named.dir);
-  // A type's own method may sit in a file of its package the index couldn't
-  // read: kubernetes' core/v1 generated.pb.go is too large to index, so
-  // `PersistentVolumeClaim`'s own `Unmarshal` is missing, and the one its
-  // embedded `TypeMeta` has would take the call. What such a file declares
-  // is read from its text; the call then links nothing.
-  const target = result ? context.getNodeById?.(result.targetNodeId) : null;
-  if (!target || goPackageDir(target.filePath) !== named.dir || target.qualifiedName !== `${named.name}::${target.name}`) {
-    for (const f of goUnreadPackageFiles(named.dir, context)) {
-      const methods = goUnreadFileMethods(f, context);
-      if (methods === null || methods.has(`${named.name}::${ref.referenceName}`)) return null;
-    }
+  return resolveMethodOnType(named.name, ref.referenceName, ref, context, 0.9, 'instance-method', named.dir);
+}
+
+/**
+ * Whether a file of the Go package in `dir` that the index couldn't read
+ * declares `typeName`'s method `methodName` (or can't be read either): the
+ * method is then missing from the graph, and the one an embedded type has
+ * is not it. kubernetes' 1.7 MB core/v1 generated.pb.go holds `Pod`'s and
+ * `PersistentVolumeClaim`'s own `String`, `Marshal` and `Unmarshal`. Read
+ * from the files' text, so a method that really is promoted, like the
+ * `GetName` `ObjectMeta` gives `Pod`, still links.
+ */
+function goUnreadFileDeclares(typeName: string, methodName: string, dir: string, context: ResolutionContext): boolean {
+  for (const f of goUnreadPackageFiles(dir, context)) {
+    const methods = goUnreadFileMethods(f, context);
+    if (methods === null || methods.has(`${typeName}::${methodName}`)) return true;
   }
-  return result;
+  return false;
 }
 
 const GO_PACKAGE_FILES = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -20740,8 +20756,9 @@ function goUnreadPackageFiles(dir: string, context: ResolutionContext): string[]
     }
     GO_PACKAGE_FILES.set(context, files);
   }
-  // A file the index read has a node of its own at least.
-  const unread = (files.get(dir) ?? []).filter((f) => context.getNodesInFile(f).length === 0);
+  // A file the index read has a node of its own, named after it.
+  const unread = (files.get(dir) ?? []).filter((f) =>
+    (context.getNodesInFileNamed?.(f, path.posix.basename(f)) ?? context.getNodesInFile(f)).length === 0);
   memo.set(dir, unread);
   return unread;
 }
