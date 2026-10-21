@@ -44,11 +44,13 @@ import { MCPSession } from './session';
 import {
   Daemon,
   clearStaleDaemonLock,
+  installChangedReason,
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
-import { clearStaleDaemonArtifacts } from './daemon-registry';
+import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
+import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
   assertNoRebuild,
@@ -84,12 +86,26 @@ const DIRECT_QUERY_POOL_MAX = 2;
 const DAEMON_INTERNAL_ENV = 'CODEGRAPH_DAEMON_INTERNAL';
 
 /**
+ * Env var naming the launcher that holds the project's writer slot for the
+ * daemon it spawns, after stopping an older one (#2335). That daemon takes the
+ * slot over instead of finding it held.
+ */
+const DAEMON_HANDOVER_ENV = 'CODEGRAPH_DAEMON_HANDOVER';
+
+/**
  * Retries for the detached daemon arbitrating the O_EXCL lock against a racing
  * sibling. Tiny — the lock resolves on the first round in practice; the retries
  * only cover clearing a genuinely stale (dead-pid) lockfile.
  */
 const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
+
+/**
+ * How long a daemon the writer slot is held for (#2335) waits out a racing
+ * candidate that took the daemon lock first. That candidate cannot get the
+ * slot, so it leaves; this bounds a wait that never ends.
+ */
+const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
 
 /**
  * A fallback that serves reads without a watcher or a writer lock (#1963).
@@ -134,6 +150,14 @@ function makeFallbackEngine(root: string): MCPEngine {
   }
   if (existing && isProcessAlive(existing.pid)) {
     return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+  }
+  // This session's own install was upgraded or removed underneath it (#2335):
+  // its code no longer loads whole, so as the project's writer it would only
+  // keep a daemon from the current install from starting. Its daemon exits
+  // for the same reason, which is how it got here.
+  if (CodeGraphPackageVersion !== '0.0.0-unknown' &&
+      installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
+    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
   }
   return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
 }
@@ -243,9 +267,10 @@ function resolveDaemonRoot(explicitPath: string | null): string | null {
  * `process.execArgv` (carries `--liftoff-only`, so the daemon never re-execs)
  * and `process.argv[1]` (this script). The spawned process self-arbitrates the
  * O_EXCL lock, so racing launchers may each spawn one — losers exit and every
- * launcher proxies through the single winner.
+ * launcher proxies through the single winner. `handover` tells the daemon this
+ * launcher holds the writer slot for it (see {@link DAEMON_HANDOVER_ENV}).
  */
-function spawnDetachedDaemon(root: string): void {
+function spawnDetachedDaemon(root: string, handover = false): void {
   const scriptPath = process.argv[1];
   if (!scriptPath) {
     // No resolvable CLI entry point to re-invoke — let the caller fall back to
@@ -267,6 +292,8 @@ function spawnDetachedDaemon(root: string): void {
     // where a long-dead session's host pid would trigger spurious shutdowns.
     const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
     delete env[HOST_PPID_ENV];
+    if (handover) env[DAEMON_HANDOVER_ENV] = String(process.pid);
+    else delete env[DAEMON_HANDOVER_ENV];
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -277,6 +304,12 @@ function spawnDetachedDaemon(root: string): void {
         env,
       },
     );
+    // An upgrade can delete the install this launcher runs from — its daemon
+    // then exits (#2335) and a respawn finds no executable. spawn reports that
+    // as an asynchronous 'error' event, which would crash this process if
+    // nobody listened. No daemon binds either way; the caller's poll gives up
+    // and the session is served in-process.
+    child.on('error', () => { /* no daemon — see above */ });
     child.unref();
   } finally {
     // The child holds its own dup of the log fd now; the launcher doesn't need it.
@@ -284,6 +317,76 @@ function spawnDetachedDaemon(root: string): void {
       try { fs.closeSync(logFd); } catch { /* ignore */ }
     }
   }
+}
+
+/**
+ * How long a launcher replacing an older daemon waits for one that is partway
+ * through its shutdown, past the stop's own 3s wait. Tool calls are held
+ * meanwhile, so it is short: a daemon that takes longer leaves the session
+ * served in-process until the proxy's next retry (#2277) finds it gone.
+ */
+const OLDER_DAEMON_SHUTDOWN_GRACE_MS = 5_000;
+
+/**
+ * Stop the daemon serving `root` from an older install so the caller can start
+ * one from this install (#2335). A daemon keeps the code it started with: one
+ * that outlived an upgrade went on loading grammars from the removed install
+ * and wrote every file it re-indexed as empty, and as the project's writer it
+ * kept every newer session from syncing. {@link stopOlderDaemon} finds it by
+ * the project lock, verifies it, and never stops one of the same, a newer or an
+ * unknown version. `answered` says an older daemon answered this launcher's
+ * own probe. Resolves `stopped` (this launcher now holds the project's writer
+ * slot for the daemon it starts next), `none` (no older daemon holds the
+ * project), or `kept` (one does, unverified or still shutting down).
+ */
+async function replaceOlderDaemon(root: string, answered: boolean): Promise<'stopped' | 'none' | 'kept'> {
+  const result = await stopOlderDaemon(root, CodeGraphPackageVersion, {
+    shutdownGraceMs: OLDER_DAEMON_SHUTDOWN_GRACE_MS,
+  });
+  // No older daemon in the lock (none, or already replaced), or it had exited.
+  if (!result || result.outcome === 'not-running') return 'none';
+  const daemon = result.version
+    ? `the CodeGraph ${result.version} daemon (pid ${result.pid})`
+    : 'an older CodeGraph daemon';
+  if (result.outcome === 'term' || result.outcome === 'kill') {
+    process.stderr.write(
+      `[CodeGraph MCP] Stopped ${daemon} serving this project; starting one from this install (${CodeGraphPackageVersion}).\n`
+    );
+    return 'stopped';
+  }
+  if (result.outcome === 'still-running') {
+    process.stderr.write(`[CodeGraph MCP] Asked ${daemon} serving this project to stop, but it has not exited yet.\n`);
+  } else if (answered) {
+    process.stderr.write(
+      `[CodeGraph MCP] Found ${daemon} serving this project but could not verify it, so left it running; serving this session in-process.\n`
+    );
+  }
+  return 'kept';
+}
+
+/**
+ * Wait out the daemon candidate `pid` holding the daemon lock while launcher
+ * `handoverFrom` holds the writer slot for this daemon (#2335): the candidate
+ * cannot get the slot, so it releases the lock and exits. Resolves true once
+ * `pid` no longer holds the lock; false at once when no slot is held for this
+ * daemon, and false when that stops being so or the wait runs out.
+ */
+async function outwaitCandidate(root: string, handoverFrom: number | null, pid: number): Promise<boolean> {
+  const heldForUs = (): boolean => {
+    const writer = readWriterLock(root);
+    return handoverFrom !== null && writer?.pid === handoverFrom && writer.mode === 'handover';
+  };
+  if (!heldForUs()) return false;
+  process.stderr.write(`[CodeGraph daemon] Waiting for daemon candidate pid ${pid} to give up the lock; the writer lock is held for this daemon.\n`);
+  const deadline = Date.now() + HANDOVER_CANDIDATE_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!heldForUs()) return false;
+    let holder: number | undefined;
+    try { holder = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.pid; } catch { holder = undefined; }
+    if (holder !== pid || !isProcessAlive(pid)) return true;
+    await sleep(25);
+  }
+  return false;
 }
 
 /**
@@ -495,11 +598,15 @@ export class MCPServer {
     // kills/restarts can be placed in time (#1431 — the log was undatable).
     timestampStderrLines();
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
+    // Read once and dropped, so nothing this daemon spawns inherits it.
+    const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);
+    const handoverFrom = Number.isInteger(handoverPid) && handoverPid > 0 ? handoverPid : null;
+    delete process.env[DAEMON_HANDOVER_ENV];
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
 
       if (lock.kind === 'acquired') {
-        const daemon = new Daemon(root);
+        const daemon = new Daemon(root, { handoverFrom });
         await daemon.start();
         this.daemon = daemon;
         this.mode = 'daemon';
@@ -529,6 +636,9 @@ export class MCPServer {
           stillStarting ||
           await probeDaemonIdentity(existing)
         ) {
+          // A daemon the writer slot is held for outwaits a candidate still
+          // starting in its way, which cannot get the slot and leaves (#2335).
+          if (stillStarting && await outwaitCandidate(root, handoverFrom, existing.pid)) continue;
           process.stderr.write(
             `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
           );
@@ -560,7 +670,8 @@ export class MCPServer {
   /**
    * Proxy mode (the common case). Serve the MCP handshake LOCALLY for instant
    * tool registration, forwarding tool calls to the shared daemon — which is
-   * connected in the background (probed, then spawned + polled if absent) so the
+   * connected in the background (probed, then spawned + polled if absent; one of
+   * an older release is stopped first, #2335) so the
    * handshake never waits ~600ms on it. Runs until the host disconnects; the
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
@@ -577,9 +688,8 @@ export class MCPServer {
       for (const candidate of candidates) {
         const s = await connectWithHello(candidate);
         // A wrong-version daemon IS up — definitive; propagate so the caller
-        // serves in-process instead of spawning + polling for 6s. Don't keep
-        // probing fallbacks past it.
-        if (s === 'version-mismatch') return s;
+        // replaces it (an older release) or serves in-process instead of
+        // spawning + polling for 6s. Don't keep probing fallbacks past it.
         if (s) return s;
       }
       return null;
@@ -588,16 +698,31 @@ export class MCPServer {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
-      if (probe) return probe;
-      // None reachable — spawn one (detached) and poll for its bind.
-      spawnDetachedDaemon(root);
-      for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-        await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const s = await connectAnyCandidate();
-        if (s === 'version-mismatch') return null;
-        if (s) return s;
+      if (probe && probe !== 'older-version') return probe;
+      // A daemon of an older release answered — or none did, while the project
+      // lock may still name one on a socket we don't probe (on Windows, daemons
+      // before #2278 named their pipe after the root as typed). Either way it
+      // makes way for one from this install (#2335).
+      const answered = probe === 'older-version';
+      const older = await replaceOlderDaemon(root, answered);
+      if (older === 'kept' && answered) return null;
+      // None reachable — spawn one (detached) and poll for its bind. After a
+      // replacement this launcher holds the writer slot for it meanwhile.
+      try {
+        spawnDetachedDaemon(root, older === 'stopped');
+        for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
+          await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
+          const s = await connectAnyCandidate();
+          // Another version answering now, older or not, waits for the next
+          // retry: one replacement per attempt, so this can never loop.
+          if (s === 'older-version' || s === 'version-mismatch') return null;
+          if (s) return s;
+        }
+        return null; // never bound — the proxy serves this session in-process
+      } finally {
+        // The new daemon has taken the slot over, or never came; a no-op unless still ours.
+        if (older === 'stopped') releaseWriterLock(root);
       }
-      return null; // never bound — the proxy serves this session in-process
     };
     await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
   }

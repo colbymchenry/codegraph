@@ -5,8 +5,8 @@
 
 use crate::textutil as util;
 use super::{
-    body_of, is_builtin_type, is_literal_receiver, is_react_hoc, is_variable_type,
-    is_vue_collection_name, Extra, Scope, Walker,
+    body_of, is_builtin_type, is_host_global_root, is_literal_receiver, is_object_member_function,
+    is_react_hoc, is_static_object_key, is_variable_type, is_vue_collection_name, Extra, Scope, Walker,
 };
 use crate::buffers::edge_kind_index;
 use tree_sitter::Node;
@@ -103,6 +103,9 @@ impl<'t> Walker<'t> {
     /// inner is the inline render function, or None for `styled.x`/`memo(Ref)`.
     /// Outer None = not a component wrapper.
     fn react_component_hoc(&self, value: Node<'t>) -> Option<Option<Node<'t>>> {
+        if self.is_typed_styled_template(value) {
+            return Some(None);
+        }
         if value.kind() != "call_expression" {
             return None;
         }
@@ -126,6 +129,35 @@ impl<'t> Walker<'t> {
             }
         }
         Some(inner)
+    }
+
+    /// A typed styled tag, `styled.div<Props>` before a template literal, which
+    /// parses as comparisons: `(styled.div < Props) > template`. The leftmost
+    /// operand is the `styled` tag against a `<`; the rightmost is the
+    /// template_string against a `>` (`>>` when the type argument ends in its
+    /// own `<…>`). Mirrors TreeSitterExtractor.isTypedStyledTemplate.
+    fn is_typed_styled_template(&self, value: Node<'t>) -> bool {
+        if value.kind() != "binary_expression" {
+            return false;
+        }
+        let (mut tag_parent, mut tag) = (value, value.child_by_field_name("left"));
+        while let Some(t) = tag.filter(|t| t.kind() == "binary_expression") {
+            (tag_parent, tag) = (t, t.child_by_field_name("left"));
+        }
+        let (mut template_parent, mut template) = (value, value.child_by_field_name("right"));
+        while let Some(t) = template.filter(|t| t.kind() == "binary_expression") {
+            (template_parent, template) = (t, t.child_by_field_name("right"));
+        }
+        let (Some(tag), Some(template)) = (tag, template) else {
+            return false;
+        };
+        let operator = |n: Node<'t>| n.child_by_field_name("operator").map(|o| o.kind()).unwrap_or("");
+        let closing = operator(template_parent);
+        template.kind() == "template_string"
+            && operator(tag_parent) == "<"
+            && !closing.is_empty()
+            && closing.bytes().all(|b| b == b'>')
+            && util::styled_callee().is_match(self.text(tag))
     }
 
     fn extract_react_component_node(
@@ -363,8 +395,15 @@ impl<'t> Walker<'t> {
             return false;
         }
         let n = regex::escape(name);
+        // `R` (CRLF mode): JS's multiline `^`/`$` treat `\r` as a line end as
+        // well as `\n`; `(?m)` alone sees only `\n`, and would miss `export
+        // default NAME;\r\n` on every Windows autocrlf checkout.
+        // Inside `{ … }` the name is bounded by a character that can't
+        // continue an identifier, not by `\b`, which takes a `$` for a
+        // separator. The crate has no look-around, so the bounds consume.
+        // ASCII classes, not `\w`: this crate's `\w` is Unicode, JS's is not.
         let pattern = format!(
-            r"(?m)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
+            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{n}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})",
             n = n
         );
         match regex::Regex::new(&pattern) {
@@ -387,7 +426,7 @@ impl<'t> Walker<'t> {
             let Some(name_node) = child.child_by_field_name("name") else { continue };
             let value = child.child_by_field_name("value");
 
-            // Destructured patterns are skipped — except RTK Query generated
+            // Destructured patterns mint no node — except RTK Query generated
             // hooks (`export const { useGetXQuery } = api`).
             if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
                 if name_node.kind() == "object_pattern"
@@ -395,6 +434,11 @@ impl<'t> Walker<'t> {
                 {
                     self.extract_rtk_hook_bindings(name_node, is_exported);
                 }
+                // The initializer (and any default in the pattern) still runs:
+                // walk the declarator as a function body walks it, with the
+                // enclosing scope on the stack (#2340). Mirrors
+                // TreeSitterExtractor.extractVariable.
+                self.visit_function_body(child);
                 continue;
             }
             let name = self.text(name_node).to_string();
@@ -442,6 +486,15 @@ impl<'t> Walker<'t> {
             );
             if let Some(row) = var_row {
                 self.extract_variable_type_annotation(child, row);
+            }
+
+            // A named object literal owns its function members, exported or
+            // not (#2300): `const api = { load() {…} }` gives `api::load`. The
+            // rest of the literal is walked under the owner (#693). Mirrors
+            // the ownedObject branch of TreeSitterExtractor.extractVariable.
+            if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
+                self.extract_owned_object_members(obj, row, kind, &name, true, false);
+                continue;
             }
 
             // Exported const object-of-functions / store shapes.
@@ -545,6 +598,189 @@ impl<'t> Walker<'t> {
                 },
             );
         }
+    }
+
+    // --- owned object literals (#2300) ------------------------------------------------
+
+    /// ownsObjectLiterals: a generated or minified bundle — named so or not —
+    /// keeps the old shape. (Every tsjs variant is TS/JS, so only that check
+    /// remains; it is computed once per file.)
+    fn owns_object_literals(&self) -> bool {
+        self.owns_objects
+    }
+
+    /// ownedMemberFunction: the function an owned literal's member becomes,
+    /// named by its static key — `load() {…}`, `load: () => {…}`,
+    /// `load: function () {…}`, `load: function* () {…}`. None for every other
+    /// member (a computed key, a value, a shorthand, a spread).
+    fn owned_member_function(&self, member: Node<'t>) -> Option<(Node<'t>, String)> {
+        if member.kind() == "method_definition" {
+            let key = member.child_by_field_name("name")?;
+            if !is_static_object_key(key.kind()) {
+                return None;
+            }
+            return Some((member, util::object_key_name(self.text(key))));
+        }
+        if member.kind() != "pair" {
+            return None;
+        }
+        let key = member.child_by_field_name("key")?;
+        let value = member.child_by_field_name("value")?;
+        if !is_static_object_key(key.kind()) || !is_object_member_function(value.kind()) {
+            return None;
+        }
+        Some((value, util::object_key_name(self.text(key))))
+    }
+
+    /// ownedObjectValue: `value` when it is an object literal owning at least
+    /// one function member.
+    pub(super) fn owned_object_value(&self, value: Option<Node<'t>>) -> Option<Node<'t>> {
+        let value = value?;
+        if !matches!(value.kind(), "object" | "object_expression") || !self.owns_object_literals() {
+            return None;
+        }
+        for i in 0..value.named_child_count() {
+            if let Some(member) = value.named_child(i) {
+                if self.owned_member_function(member).is_some() {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    /// Put an owner on the stack — on top of the file alone for one on the
+    /// global object — returning what was set aside for leave_owner.
+    fn enter_owner(&mut self, row: u32, kind: &'static str, name: &str, global: bool) -> Vec<Scope> {
+        let rest = if global { self.stack.split_off(1) } else { Vec::new() };
+        self.stack.push(Scope { row, kind, name: name.to_string() });
+        rest
+    }
+
+    fn leave_owner(&mut self, rest: Vec<Scope>) {
+        self.stack.pop();
+        self.stack.extend(rest);
+    }
+
+    /// extractOwnedObjectMembers: each function member becomes its own node,
+    /// qualified under the owner (at file scope for one on the global object).
+    /// Every other member runs where the literal is written: under the owner
+    /// for a module-scope declaration (`values_under_owner`, #693), under the
+    /// enclosing scope for a local or an assignment. The literal's shorthand
+    /// members go to the function-as-value capture the same way.
+    fn extract_owned_object_members(&mut self, obj: Node<'t>, row: u32, kind: &'static str, name: &str, values_under_owner: bool, global: bool) {
+        let held = values_under_owner.then(|| self.enter_owner(row, kind, name, global));
+        self.maybe_capture_fn_refs(obj);
+        for i in 0..obj.named_child_count() {
+            let Some(member) = obj.named_child(i) else { continue };
+            if let Some((func, member_name)) = self.owned_member_function(member) {
+                if values_under_owner {
+                    self.extract_function(func, Some(member_name));
+                } else {
+                    let rest = self.enter_owner(row, kind, name, global);
+                    self.extract_function(func, Some(member_name));
+                    self.leave_owner(rest);
+                }
+            } else {
+                self.visit_function_body(member);
+            }
+        }
+        if let Some(rest) = held {
+            self.leave_owner(rest);
+        }
+    }
+
+    /// extractLocalObjectOwner: `const api = { load() {…} }` in a function body
+    /// or an IIFE gets the node a module-scope declaration would, with its
+    /// members under it. False when the declarator holds no owned literal.
+    pub(super) fn extract_local_object_owner(&mut self, declarator: Node<'t>) -> bool {
+        let Some(name_node) = declarator.child_by_field_name("name") else { return false };
+        if name_node.kind() != "identifier" {
+            return false;
+        }
+        let Some(obj) = self.owned_object_value(declarator.child_by_field_name("value")) else {
+            return false;
+        };
+        let is_const = declarator.parent().map(|d| self.is_const_decl(d)).unwrap_or(false);
+        let kind: &'static str = if is_const { "constant" } else { "variable" };
+        let name = self.text(name_node).to_string();
+        // A local: never the target of another scope's value read.
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(declarator, self.src),
+            signature: Some(util::init_signature(self.text(obj))),
+            is_exported: Some(false),
+            not_value_target: true,
+            ..Extra::default()
+        };
+        let Some(row) = self.create_node(kind, &name, declarator, extra) else { return false };
+        self.extract_variable_type_annotation(declarator, row);
+        self.extract_owned_object_members(obj, row, kind, &name, false, false);
+        true
+    }
+
+    /// extractAssignedObjectOwner: `window.App = {…}` / `App.utils = {…}` /
+    /// `dw_page = {…}`. A plain identifier target is qualified like a
+    /// declaration. A path's owner is named by its last link and qualified by
+    /// the path as written, and so are its members (`window.App::init`); a
+    /// path on the global object is global wherever it is written, so it is
+    /// contained by the file. False (nothing extracted) for any other assignment.
+    pub(super) fn extract_assigned_object_owner(&mut self, node: Node<'t>, module_level: bool) -> bool {
+        let Some(obj) = self.owned_object_value(node.child_by_field_name("right")) else { return false };
+        let Some(path) = self.object_owner_path(node.child_by_field_name("left")) else { return false };
+        // A plain name assigned at module level is a global (`dw_page = {…}`);
+        // in a function it is a local being reassigned.
+        if path.len() == 1 && !module_level {
+            return false;
+        }
+        let qualified_name = (path.len() > 1).then(|| path.join("."));
+        let global = path.len() > 1 && is_host_global_root(&path[0]);
+        let rest = if global { self.stack.split_off(1) } else { Vec::new() };
+        let statement = node.parent().filter(|p| p.kind() == "expression_statement").unwrap_or(node);
+        let name = path.last().cloned().unwrap_or_default();
+        // `App.utils` is read as `App.utils`, never as a bare `utils`.
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(statement, self.src),
+            signature: Some(util::init_signature(self.text(obj))),
+            is_exported: Some(false),
+            qualified_name: qualified_name.clone(),
+            not_value_target: !(path.len() == 1 || global),
+            ..Extra::default()
+        };
+        let row = self.create_node("variable", &name, node, extra);
+        self.stack.extend(rest);
+        let Some(row) = row else { return false };
+        if let Some(qualified_name) = qualified_name {
+            self.object_path_owners.insert(row, qualified_name);
+        }
+        self.extract_owned_object_members(obj, row, "variable", &name, false, global);
+        true
+    }
+
+    /// objectOwnerPath: an assignment target's links written as plain names
+    /// (`dw_page` → [dw_page], `App.utils.dom` → [App, utils, dom]), or None
+    /// for anything else — `this.x`, `a[k]`, a call, CommonJS's
+    /// `module.exports` / `exports.x`, or a prototype.
+    fn object_owner_path(&self, left: Option<Node<'t>>) -> Option<Vec<String>> {
+        let mut path: Vec<String> = Vec::new();
+        let mut cur = left?;
+        while cur.kind() == "member_expression" {
+            let property = cur.child_by_field_name("property")?;
+            if property.kind() != "property_identifier" {
+                return None;
+            }
+            path.push(self.text(property).to_string());
+            cur = cur.child_by_field_name("object")?;
+        }
+        if cur.kind() != "identifier" {
+            return None;
+        }
+        let root = self.text(cur);
+        if root == "module" || root == "exports" || path.iter().any(|p| p == "prototype") {
+            return None;
+        }
+        path.push(root.to_string());
+        path.reverse();
+        Some(path)
     }
 
     // --- object-literal / store helpers -------------------------------------------------
@@ -1162,9 +1398,15 @@ impl<'t> Walker<'t> {
         if self.stack.is_empty() {
             return;
         }
-        let func = node
-            .child_by_field_name("function")
-            .or_else(|| node.named_child(0));
+        let raw = node.child_by_field_name("function").or_else(|| node.named_child(0));
+        let func = raw.map(|f| self.peel_await_callee(f));
+        // Where the reference sits: the call, or the callee an `await` was
+        // peeled off (`await f<T>(x)` starts at `await`; the call to `f`
+        // starts where `f` does, as in `await f(x)`). Mirrors refStart.
+        let at = match (raw, func) {
+            (Some(r), Some(f)) if r.id() != f.id() => f,
+            _ => node,
+        };
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1240,7 +1482,7 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_call_ref(&callee_name.clone(), node);
+            self.push_call_ref(&callee_name.clone(), at);
         }
     }
 
@@ -1262,10 +1504,26 @@ impl<'t> Walker<'t> {
         Some(self.text(property).to_string())
     }
 
+    /// `await f<T>(x)` parses with `await f` as the callee; the call is to
+    /// `f` (#2586). Peels every `await`, skipping a comment written after one.
+    /// TS-family only. Mirrors peelTsAwaitCallee.
+    fn peel_await_callee(&self, node: Node<'t>) -> Node<'t> {
+        if !self.variant.is_ts() {
+            return node;
+        }
+        let mut cur = node;
+        while cur.kind() == "await_expression" {
+            let mut walker = cur.walk();
+            let Some(inner) = cur.named_children(&mut walker).find(|c| c.kind() != "comment") else { break };
+            cur = inner;
+        }
+        cur
+    }
+
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
-        let inner = call.child_by_field_name("function")?;
+        let inner = self.peel_await_callee(call.child_by_field_name("function")?);
         Self::plain_member_name(self.text(inner))
     }
 
@@ -1434,6 +1692,22 @@ impl<'t> Walker<'t> {
                             let name = self.text(iface).to_string();
                             self.push_ref(class_row, &name, implements_kind, iface);
                         }
+                    }
+                }
+                // TS `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+                // supertype is a `type` of the clause; a `generic_type` is named
+                // by its `name` field (`Store`, never `Store<T>`).
+                "extends_type_clause" => {
+                    let mut cursor = child.walk();
+                    let targets: Vec<Node<'t>> = child.children_by_field_name("type", &mut cursor).collect();
+                    for target in targets {
+                        let named = if target.kind() == "generic_type" {
+                            target.child_by_field_name("name").unwrap_or(target)
+                        } else {
+                            target
+                        };
+                        let name = self.text(named).to_string();
+                        self.push_ref(class_row, &name, extends_kind, target);
                     }
                 }
                 // JS `class Foo extends Bar` — class_heritage holds a bare

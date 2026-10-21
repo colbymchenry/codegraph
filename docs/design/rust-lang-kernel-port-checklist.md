@@ -317,10 +317,10 @@ trait_item — supertraits `trait Sub: Super + Display`). Per bound child:
 
 Each yields an `extends` ref from the trait node at the bound's position.
 Struct/enum extraction also calls extractInheritance; rust struct_item children
-include `field_declaration_list` → the 5652 recursion descends, but rust
-`field_declaration` always carries a `field_identifier` name so the Go
-struct-embedding branch (5496) never fires. Verify with the torture fixture
-anyway.
+include `field_declaration_list` → the 5652 recursion descends and finds
+nothing: the Go struct-embedding branch (5496) runs for Go only (it was inert
+here anyway — rust `field_declaration` always carries a `field_identifier`
+name), so rustlang.rs has no `field_declaration` arm.
 
 ### impl Trait for Type — extractRustImplItem (5690)
 
@@ -370,12 +370,19 @@ while `Vec`/`Option`/`Box`/`Self` are NOT. QUIRKS, PRESERVE:
 - property_signature/method_signature branch (1283) — TS-only node types,
   never rust.
 
-### Static-member refs, cpp-isms — NOT rust
+### Static-member refs (rust since #2328); cpp-isms — NOT rust
 
-`rust` ∉ STATIC_MEMBER_LANGS (345) → extractStaticMemberRef no-ops (its call
-in the body walker at 5218 must be a no-op in the walker too — cheap early
-return). namespacePrefix, cppLocalFnPtrs, stack-construction, operator calls,
-template strip: all c/cpp-gated, none apply.
+`rust` ∈ STATIC_MEMBER_LANGS since #2328, with its own branch in
+extractStaticMemberRef (body walker only; the kernel's
+`extract_static_member_ref`, called at the same point of the walk): a
+`scoped_identifier` whose member is capitalized — unless it is a call's
+callee, the prefix of a longer path or part of a `use` tree — and a
+`struct_pattern`'s `scoped_type_identifier` emit one `references` ref named by
+the receiver (the segment before the member; `Self` → the impl's type via
+getReceiverType, nothing inside a trait), positioned at the receiver. The
+resolver keeps it only on an enum that declares the member as a variant.
+namespacePrefix, cppLocalFnPtrs, stack-construction, operator calls, template
+strip: all c/cpp-gated, none apply.
 
 ### Docstrings (tree-sitter-helpers.ts:95)
 

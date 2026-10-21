@@ -114,7 +114,8 @@ describe('reference target-kind gate', () => {
     write('core/Cargo.toml', `[package]\nname = "pupil_core"\nversion = "0.1.0"\n`);
     write('core/src/lib.rs', `pub mod ports;\n`);
     write('core/src/ports.rs', `pub trait CacheStore {\n    fn get(&self);\n}\n`);
-    write('app/Cargo.toml', `[package]\nname = "app"\nversion = "0.1.0"\n`);
+    // Re-exporting pupil_core's module takes a dependency on it, as Cargo requires.
+    write('app/Cargo.toml', `[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\npupil_core = { path = "../core" }\n`);
     write('app/src/lib.rs', `pub use pupil_core::ports;\n\npub mod platform;\n`);
     write(
       'app/src/platform.rs',

@@ -178,7 +178,7 @@ type_identifier + ≥2 params + NO other lone-identifier param; gtest
 recoverMangledCppName (line 406 — only already-mangled names, `Ret (name)`
 idiom left alone, last token before `(`, primitive/keyword guard);
 stripCppTemplateArgs (line 157 — depth-counted removal of every balanced
-`<…>`); cDeclaratorIdentifier (tree-sitter.ts:234 — declarator chain walk,
+`<…>`); cDeclaratorIdentifier (languages/c-cpp.ts — declarator chain walk,
 function_declarator → null, 12-hop guard).
 
 ## tree-sitter.ts branches (anchors as of `705e501`)
@@ -186,7 +186,9 @@ function_declarator → null, 12-hop guard).
 | Line | Mechanism | Must-mirror details |
 |---|---|---|
 | 962 | cpp namespace prefix stack (#1291) | named `namespace_definition` pushes its name (C++17 `a::b` as written) onto the QN prefix while walking children; anonymous falls through bare |
+| — | cpp brace scopes (erroring trees only) | when the tree has errors, every visitNode takes its namespace prefix from the source's braces, and at declaration level (only class scopes above the file node) its enclosing classes: `languages/cpp-brace-scopes.ts` ↔ `ccpp/brace_scopes.rs`. A class-like node's end is its body's `}`; a class-like `type` of a namespace-level `declaration` is walked as a class. Reachable in the kernel only under `CODEGRAPH_KERNEL_CCPP_ERROR_EXTRACT=1` (every other erroring file defers) — kept parity-true there |
 | 2795 | C file-scope variables | only when NO function ancestor; iterate declarators; accept ONLY init_declarator / pointer_declarator / array_declarator — a BARE identifier declarator is a macro-prototype misparse, skip (loses uninit scalars by design); name via cDeclaratorIdentifier; signature `= <first 100 chars>`; kind constant/variable via isConst |
+| — | class-like types defined in declarations | a `declaration` outside any body whose `type` is a class/struct/union/enum specifier WITH a body: visit the type before extracting the variables, in C always and in C++ when the tree has no errors or the file is walked in brace scopes (the row above) — not in an erroring C++ file whose braces don't balance (`walkDeclaredTypes` ↔ `walk_declared_types`); the declaration's fn-ref scan skips the walked type. An unnamed specifier whose parent declaration has it as `type` takes the first declarator's cDeclaratorIdentifier name — in function bodies too (the c/cpp `resolveName` ↔ `extract_name_raw`) — and the declaration's preceding comment is its docstring (`getDeclarationWrapper` ↔ `class_like_docstring`) |
 | 4313 | explicit operator calls (#1247) | callee = `function` field + ERROR-wrapped `operator_name` sibling; compact symbolic spacing (`operator *`→`operator*`, word forms keep space); receiver `->`→`.`; DROP unless receiver is `this` (bare name) or simple identifier/member chain (silent miss over wrong edge) |
 | ~4340 | field_expression method calls | `recv.method`/`ptr->method` → `recv.method`; SKIP_RECEIVERS {self,this,cls,super} → bare name; LITERAL receiver → emit nothing (#1230) |
 | 4398 | call-result receivers (#645/#608) | receiver is call_expression → `<innerCallee>().<method>` re-encode (c AND cpp in the gate list) |
@@ -194,7 +196,7 @@ function_declarator → null, 12-hop guard).
 | 4545 | local fn-ptr call fan-out (#932-adjacent) | bare-identifier callee found in cppLocalFnPtrs[callerId] → emit one `calls` ref PER recorded target, suppress the local name |
 | 5173 | stack construction (#1035) | cpp `declaration` where `type` ∈ {type_identifier, template_type, qualified_identifier} and any init_declarator has `value` ∈ {argument_list, initializer_list} → extractInstantiation |
 | 5183 | fn-ptr binding recording | inside a body: `declaration>init_declarator` (identifier declarator) or `assignment_expression` (identifier left); value must be pointer_expression whose child(0) is `&`; target ∈ {identifier, template_function, qualified_identifier}, template-stripped; per-callerId map of per-local Sets (branch reassignments accumulate) |
-| 5408 | base_class_clause → extends (#1043) | per base: type_identifier / qualified_identifier / template_type, stripCppTemplateArgs'd; access-specifier keywords skipped |
+| 5408 | base_class_clause → extends (#1043) | per base: type_identifier / qualified_identifier / template_type, stripCppTemplateArgs'd; access-specifier keywords skipped. The only c/cpp supertype source: the Go struct-embedding branch (`field_declaration` with no direct `field_identifier`) runs for Go only, so a pointer/array/reference/function member (`Cache* cache_;`) is never an `extends` |
 | 4740 | static member refs — **cpp only** (c not in STATIC_MEMBER_LANGS, line 345) | `Foo::BAR` value reads → `references` edge; VERIFY the MEMBER_ACCESS_TYPES shapes for qualified_identifier + the call-callee skip during the port |
 | — | value-reference edges | **c: YES** (VALUE_REF_LANGS line 401), **cpp: NO**. Port the value-ref machinery for C only (crib go.rs / tsjs — shadow prune, scope stack, MAX_VALUE_REF_NODES cap, CODEGRAPH_VALUE_REFS=0 kill) |
 | — | fn-ref capture (#756) | function-ref.ts:376: `c: cFamilySpec()`, `cpp: cFamilySpec({ addressOfOnly: true })`; note line ~582: `&Cls::m` exemption from the bare-ids-are-free-functions rule — read cFamilySpec fully when porting |

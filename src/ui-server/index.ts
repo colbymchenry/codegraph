@@ -397,9 +397,10 @@ function safeDecode(value: string): string {
 /**
  * Bind the first free port at or after `port`, on loopback only.
  *
- * Only `EADDRINUSE` advances to the next port — a permission failure or a bad
- * address will not get better one port over, and retrying twenty times would
- * only bury the real error.
+ * Only a port that is taken advances to the next one (see
+ * {@link shouldTryNextPort}) — a permission failure every port shares, or a
+ * bad address, will not get better one port over, and retrying twenty times
+ * would only bury the real error.
  */
 async function listenWithFallback(
   server: http.Server,
@@ -407,6 +408,9 @@ async function listenWithFallback(
 ): Promise<number> {
   // Port 0 means "any free port", so there is nothing to fall back from.
   const attempts = opts.port === 0 || !opts.fallback ? 1 : Math.max(1, opts.attempts);
+  const platform = process.platform;
+  // Whether any port was refused rather than in use — the message says so.
+  let refused = false;
 
   for (let i = 0; i < attempts; i++) {
     const candidate = opts.port === 0 ? 0 : opts.port + i;
@@ -419,8 +423,9 @@ async function listenWithFallback(
       return address.port;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EADDRINUSE' || i === attempts - 1) {
-        throw describeBindFailure(err, candidate, opts);
+      if (code === 'EACCES') refused = true;
+      if (!shouldTryNextPort(code, candidate, platform) || i === attempts - 1) {
+        throw describeBindFailure(err, candidate, opts, platform, refused);
       }
     }
   }
@@ -434,7 +439,8 @@ async function listenWithFallback(
  * The same `http.Server` is reused across attempts: a `listen()` that failed
  * with EADDRINUSE never took a handle, so it can be listened on again directly
  * (verified on Node 20 and 22 — `server.listening` is still `false` afterwards,
- * and `close()` on a never-listening server would itself throw).
+ * and `close()` on a never-listening server would itself throw). The same goes
+ * for a port Windows refused with EACCES (checked on Node 22 and 24).
  */
 function listenOnce(server: http.Server, port: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -452,22 +458,78 @@ function listenOnce(server: http.Server, port: number): Promise<void> {
   });
 }
 
-/** Turn a bind failure into something a user can act on. */
-function describeBindFailure(
+/**
+ * Whether a `listen()` on `port` that failed with `code` leaves the next port
+ * worth trying.
+ *
+ * `EADDRINUSE` does, and so does `EACCES` on Windows: a port another program
+ * holds exclusively (`SO_EXCLUSIVEADDRUSE`), or one inside a range the system
+ * reserves (Hyper-V and WinNAT reserve whole blocks of them), fails there with
+ * EACCES rather than EADDRINUSE. Elsewhere, EACCES below 1024 is the
+ * privileged-port rule, which the next port is under too, so walking on would
+ * only bury it. From 1024 up it is something refusing that one port — a
+ * security policy, say — and the next one may be allowed.
+ */
+export function shouldTryNextPort(
+  code: string | undefined,
+  port: number,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (code === 'EADDRINUSE') return true;
+  return code === 'EACCES' && !isPrivilegedPort(port, platform);
+}
+
+/**
+ * Whether `port` is one only an administrator may bind: below 1024, on every
+ * platform but Windows, which has no such rule.
+ */
+function isPrivilegedPort(port: number, platform: NodeJS.Platform): boolean {
+  return platform !== 'win32' && port > 0 && port < 1024;
+}
+
+/** The command that lists the port ranges Windows reserves. */
+const LIST_RESERVED_PORTS = '`netsh int ipv4 show excludedportrange protocol=tcp`';
+
+/**
+ * Turn a bind failure into something a user can act on, and that is true where
+ * it is read: Windows refuses ports for reasons POSIX doesn't have, and has no
+ * privileged ports.
+ *
+ * `refused` says whether any port a fallback walk tried was refused (EACCES)
+ * rather than in use; it only changes the message for a walk that ran out.
+ */
+export function describeBindFailure(
   err: unknown,
   port: number,
-  opts: { port: number; fallback: boolean; attempts: number }
+  opts: { port: number; fallback: boolean },
+  platform: NodeJS.Platform = process.platform,
+  refused = false
 ): Error {
   const code = (err as NodeJS.ErrnoException).code;
+  const windows = platform === 'win32';
+  if (opts.fallback && shouldTryNextPort(code, port, platform)) {
+    // A failure that moves on only ends the walk when there is nowhere left.
+    const taken =
+      !refused && code === 'EADDRINUSE'
+        ? 'in use'
+        : windows
+          ? `in use or reserved (${LIST_RESERVED_PORTS} lists the reserved ranges)`
+          : 'in use or not allowed';
+    return new Error(`Ports ${opts.port}–${port} are all ${taken}. Free one, or pick another with --port.`);
+  }
   if (code === 'EADDRINUSE') {
-    return opts.fallback
-      ? new Error(
-          `Ports ${opts.port}–${port} are all in use. Free one, or pick another with --port.`
-        )
-      : new Error(`Port ${port} is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.`);
+    return new Error(`Port ${port} is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.`);
   }
   if (code === 'EACCES') {
-    return new Error(`Not allowed to listen on port ${port}. Ports below 1024 usually need elevated privileges — pick a higher one with --port.`);
+    if (isPrivilegedPort(port, platform)) {
+      return new Error(`Not allowed to listen on port ${port}. Ports below 1024 usually need elevated privileges — pick a higher one with --port.`);
+    }
+    return new Error(
+      (windows
+        ? `Windows refused port ${port}: another program holds it, or it is in a reserved range (${LIST_RESERVED_PORTS} lists them).`
+        : `Not allowed to listen on port ${port}: the system refused permission.`) +
+        ' Pick another with --port, or omit --port to let CodeGraph find a free one.'
+    );
   }
   return err instanceof Error ? err : new Error(String(err));
 }

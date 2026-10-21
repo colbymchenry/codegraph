@@ -82,6 +82,31 @@ on those repos plus SCrawler and PCL:
 12. **LINQ queries** — query expressions no longer require a trailing
     `Select`/`Group` clause, `Aggregate`-led queries, and
     `Distinct`/`Skip`/`Take` clauses.
+13. **Names that begin with a keyword** — upstream lexed every member
+    modifier as one `token(prec(10, choice(…)))` and `Sub New` as one
+    `token(prec(100, …))`. A token that outranks the `prec(-1)` identifier
+    ends where its text ends, so `Public SharedCache` lexed as `Shared` +
+    `Cache`, `Public Dimension` as `Dim` + `ension`, and `Sub NewItem()` as a
+    constructor followed by `Item`. `Dim` and `Const` also appeared inside
+    that token, which kept the local-declaration `Dim`/`Const` out of keyword
+    extraction too, so `Constants.X = 1` in a method lexed as `Const ants.X`.
+    The modifiers and `Sub New` are now plain keywords, which the `word`
+    lexer matches only after it has read the whole identifier. `Protected
+    Friend` and `Private Protected` parse as two modifiers, and `prec(1)` on
+    `member_modifier` keeps a line that could start either a member or a
+    local declaration read as a member, as before.
+    The high-precedence tokens had also let the lexer fold a newline into the
+    keyword after it. Two parses depended on that by accident, so they are
+    now part of the grammar. `option_statements` may begin with newlines (an
+    `Option` line under a comment banner, as in every `My Project`
+    designer file). Upstream's top-level `file_attribute_section` is gone, so
+    every attribute line above a top-level declaration belongs to that
+    declaration, as one inside a class or namespace already did.
+    Measured on all five corpora below: clean parses rose on staxrip (138 →
+    141 of 145) and fell nowhere. Apart from the fixed names and the
+    positions of the newlines no longer folded into a keyword, the trees
+    changed only where `Protected Friend` became two modifiers and where an
+    attribute line now attaches to its declaration.
 
 ### External scanner (`src/scanner.c`, new)
 
@@ -130,6 +155,16 @@ Known remaining gap (localized ERROR regions, deliberately unpatched):
   `word:` stays and column-0 labels keep a localized error; indented labels
   parse fine. Worth an upstream tree-sitter investigation eventually.
 
+Before changing a keyword rule, run `tree-sitter generate --log` and read the
+`Keywords - exclude …` lines. A keyword-shaped token that is left out of
+keyword extraction is lexed with its own precedence, and if that precedence is
+above the identifier's it splits every identifier that starts with it. Those
+lines name the tokens left out and the reason: a token that matches the same
+string as another one, or that conflicts with a token, such as `"\n"`. Four
+remain: `Inherits`, plain `Implements` and both spellings of `IsNot`. Valid VB
+never starts a name where one of them can appear, so they split nothing in
+valid code.
+
 ## Rebuild
 
 ```bash
@@ -155,6 +190,14 @@ npm install tree-sitter-cli@0.25.10   # ≥0.25 REQUIRED: the /u regex flag (Uni
 npx tree-sitter generate              # src/scanner.c from the patch is picked up
 npx tree-sitter build --wasm -o tree-sitter-vbnet.wasm   # needs emscripten or Docker
 ```
+
+The CLI's Docker fallback uses emscripten 4.0.4. A local emsdk at the same
+version works too, including on Windows (`emsdk install 4.0.4`,
+`emsdk activate 4.0.4`, then `emsdk_env`). Built that way from this patch,
+the vendored wasm's sha256 is
+`5a8aa2911e28e43e22b077ae56c8143ccfe52485bb6719152b60e2e66a1a9e53`. The
+wasm this one replaced did not rebuild byte for byte with that toolchain, but
+the rebuild parsed every file in SCrawler and staxrip to the same tree.
 
 Upstream's checked-in `test/corpus` expectations predate its own grammar.js
 (every corpus test fails at the pinned commit, before any patching), so the

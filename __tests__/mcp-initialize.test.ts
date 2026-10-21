@@ -101,6 +101,26 @@ function waitFor<T>(
   });
 }
 
+/**
+ * Remove `dir` once nothing holds it. Even after the killed server's 'close',
+ * Windows can keep the dir itself busy a moment longer under load, and
+ * `fs.rmSync`'s `maxRetries` never retries EBUSY on a directory: it throws at
+ * once. A dir still held at the deadline fails the test.
+ */
+async function removeWhenReleased(dir: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(code) || Date.now() > deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 describe('MCP initialize handshake (issue #172)', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -118,7 +138,7 @@ describe('MCP initialize handshake (issue #172)', () => {
       await closed;
     }
     child = null;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await removeWhenReleased(tempDir);
   });
 
   it('responds to initialize quickly when no .codegraph exists in cwd', async () => {
@@ -186,4 +206,20 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(prompts.error).toBeUndefined();
     expect(prompts.result.prompts).toEqual([]);
   }, 15000);
+});
+
+describe('MCP initialize teardown', () => {
+  // On Windows a dir another process holds (here as its cwd) refuses removal
+  // with EBUSY; the teardown waits until it is let go.
+  it.runIf(process.platform === 'win32')('removes a dir once the process holding it has exited', async () => {
+    const held = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-held-'));
+    const holder = spawn(process.execPath, ['-e', "process.stdout.write('ready'); setTimeout(() => {}, 500)"], {
+      cwd: held,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    await once(holder.stdout, 'data'); // running, so its cwd is open
+    expect(() => fs.rmdirSync(held)).toThrow(/EBUSY/);
+    await removeWhenReleased(held);
+    expect(fs.existsSync(held)).toBe(false);
+  });
 });

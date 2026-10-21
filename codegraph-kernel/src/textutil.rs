@@ -55,7 +55,7 @@ pub fn is_generated_file(file_path: &str) -> bool {
             r"\.pb\.[jt]s$",
             r"_pb\.[jt]s$",
             r"_grpc_pb\.[jt]s$",
-            r"\.min\.m?js$",
+            r"[.-]min\.m?js$",
             r"_pb2(_grpc)?\.py$",
             r"_pb2\.pyi$",
             r"\.pb\.(cc|h)$",
@@ -76,6 +76,56 @@ pub fn is_generated_file(file_path: &str) -> bool {
         .collect()
     });
     patterns.iter().any(|p| p.is_match(file_path))
+}
+
+// isMinifiedContent's WEBPACK_RUNTIME (`\b` ASCII, as in JS).
+re!(webpack_runtime, r"(?-u:\b)function __webpack_require__\s*\(");
+
+/// isMinifiedContent (src/extraction/generated-detection.ts): a `.js` / `.mjs`
+/// / `.cjs` file of at least 4000 UTF-16 units whose text sits mostly on lines
+/// of 1000 units or more, dense with `;{}(),` — or that carries a webpack
+/// runtime. Lengths are counted in UTF-16 units, as the JS string ops count
+/// them, so both extractors agree on every file.
+pub fn is_minified_content(file_path: &str, content: &str) -> bool {
+    const LINE: usize = 1000;
+    let lower = file_path.to_ascii_lowercase();
+    if !(lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs")) {
+        return false;
+    }
+    // UTF-16 units never outnumber UTF-8 bytes: a short file is out at once.
+    if content.len() < 4 * LINE {
+        return false;
+    }
+    let total = content.encode_utf16().count();
+    if total < 4 * LINE {
+        return false;
+    }
+    if webpack_runtime().is_match(content) {
+        return true;
+    }
+    let (mut long, mut punctuation) = (0usize, 0usize);
+    let (mut line_len, mut line_punct) = (0usize, 0usize);
+    for unit in content.encode_utf16() {
+        if unit == 10 {
+            if line_len >= LINE {
+                long += line_len;
+                punctuation += line_punct;
+            }
+            line_len = 0;
+            line_punct = 0;
+            continue;
+        }
+        line_len += 1;
+        // ; { } ( ) ,
+        if matches!(unit, 59 | 123 | 125 | 40 | 41 | 44) {
+            line_punct += 1;
+        }
+    }
+    if line_len >= LINE {
+        long += line_len;
+        punctuation += line_punct;
+    }
+    long as f64 >= total as f64 * 0.5 && punctuation as f64 >= long as f64 * 0.03
 }
 
 /// Byte offsets of each line start, for UTF-16 column conversion.

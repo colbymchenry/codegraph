@@ -379,6 +379,12 @@ export const tanstackRouterResolver: FrameworkResolver = {
     return NAV_CALL.test(name);
   },
 
+  navigation: {
+    tails: ['navigate', 'redirect'],
+    // A call matches against the table of the app its file is in.
+    scope: (route) => (isTanstackRoute(route) ? [appRootFor(route.filePath)] : null),
+  },
+
   extract(filePath: string, content: string): FrameworkExtractionResult {
     // A file-based route file describes ONE route, so the file's own shape says
     // whether that route is a page. A file holding a code-based route TREE

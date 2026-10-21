@@ -75,11 +75,14 @@ afterAll(() => {
   if (root) fs.rmSync(root, { recursive: true, force: true });
 });
 
-const renders = (routeName: string): string[] => {
+const bindings = (routeName: string, layout: boolean): string[] => {
   const route = cg.getNodesByKind('route').find((r) => r.name === routeName);
   if (!route) return [];
-  return cg.getOutgoingEdges(route.id).filter((e) => e.kind === 'references').map((e) => cg.getNode(e.target)!.name);
+  return cg.getOutgoingEdges(route.id)
+    .filter((e) => e.kind === 'references' && Boolean((e.metadata as Record<string, unknown> | undefined)?.layout) === layout)
+    .map((e) => cg.getNode(e.target)!.name);
 };
+const renders = (routeName: string): string[] => bindings(routeName, false);
 
 describe('nested, lazy and constant React Router routes', () => {
   it('compose their paths and render their modules', () => {
@@ -88,6 +91,11 @@ describe('nested, lazy and constant React Router routes', () => {
     expect(renders('/')).toEqual(['LandingRoute']);
     expect(renders('/app')).toEqual(['AppRoot']);
     expect(renders('/app/discussions')).toEqual(['DiscussionsRoute']);
+  });
+
+  it('a child route renders inside its parent’s component, the layout around it', () => {
+    expect(bindings('/app/discussions', true)).toEqual(['AppRoot']);
+    expect(bindings('/', true)).toEqual([]);
   });
 
   it('resolves an app’s own tsconfig alias', () => {

@@ -17,7 +17,6 @@ import {
   ExtractionError,
   Edge,
   UnresolvedReference,
-  ReferenceKind,
 } from '../types';
 import { QueryBuilder, NodeIdentity } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -25,7 +24,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -35,6 +34,8 @@ import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks
 import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
+import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
@@ -114,6 +115,12 @@ export interface IndexResult {
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
+  /**
+   * Wall time in milliseconds. `CodeGraph.indexAll` reports the whole run —
+   * scanning, parsing and storing, then resolving references and linking —
+   * as it does the node and edge totals; the orchestrator's own result
+   * covers only the files' extraction.
+   */
   durationMs: number;
 }
 
@@ -132,8 +139,15 @@ export interface SyncResult {
   filesModified: number;
   filesRemoved: number;
   nodesUpdated: number;
+  /**
+   * Wall time in milliseconds. `CodeGraph.sync` reports the whole sync,
+   * resolution and linking included; the orchestrator's own result covers
+   * only reconciling and re-extracting the files.
+   */
   durationMs: number;
   changedFilePaths?: string[];
+  /** The part of `changedFilePaths` that was not indexed before this sync. */
+  addedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];
   /**
@@ -150,6 +164,8 @@ export interface SyncResult {
    * nothing downstream.
    */
   definitionDelta?: string[];
+  /** Tracked files this sync found gone and deleted from the index. */
+  removedFilePaths?: string[];
 }
 
 /**
@@ -254,6 +270,17 @@ const ANDROID_RES_TYPES: readonly string[] = [
   'menu', 'mipmap', 'navigation', 'transition', 'values', 'xml',
 ];
 
+/**
+ * `build` is also a legal JVM package segment: directories named `build` under
+ * a conventional source root (any source set: main, test, androidTest, ...) are
+ * packages, not module/build output (#1642).
+ */
+const JVM_BUILD_PACKAGE_DIRS: readonly string[] = [
+  '**/src/*/java/**/build/',
+  '**/src/*/kotlin/**/build/',
+  '**/src/*/scala/**/build/',
+];
+
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
 const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
@@ -262,14 +289,93 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
-  // `build` is also a legal JVM package segment. Keep it under conventional
-  // source roots (any source set: main, test, androidTest, ...) while continuing
-  // to exclude module/build output (#1642). Unignore only the directory, not its
-  // subtree: other defaults still apply.
-  '!**/src/*/java/**/build/',
-  '!**/src/*/kotlin/**/build/',
-  '!**/src/*/scala/**/build/',
+  // Keep JVM packages named `build` (#1642). Unignore only the directory, not
+  // its subtree: other defaults still apply.
+  ...JVM_BUILD_PACKAGE_DIRS.map((d) => `!${d}`),
+  // Walk a `build` folder below `src/` too: a project can keep a whole
+  // feature or module there. Only its hand-written source files are indexed
+  // — see buildOutputFolderUnderSrc. Other defaults still apply inside it.
+  '!**/src/**/build/',
 ];
+
+/**
+ * Source files no compiler or bundler writes into a build folder: TypeScript
+ * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
+ * components, whose builds emit JavaScript, declarations, CSS, HTML and
+ * source maps instead; and Go, C# and Rust, whose toolchains write elsewhere
+ * (Go's binaries, .NET's `bin/` and `obj/`, Cargo's `target/`). Python, C and
+ * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
+ * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
+ */
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
+/** TypeScript declarations, which `tsc` writes beside its JavaScript. */
+const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
+/** Matches the JVM packages named `build`, whose whole subtree stays indexed. */
+const jvmBuildPackages = ignore().add(JVM_BUILD_PACKAGE_DIRS);
+
+/**
+ * The `build` folder below a `src/` folder that file `rel` sits in, with a
+ * trailing slash (`src/build/` for `src/build/legacy/page.tsx`), or null. A JVM
+ * package named `build` (#1642) does not count.
+ */
+function srcBuildFolderOf(rel: string): string | null {
+  if (!/(?:^|\/)build\//i.test(rel)) return null;
+  const parts = rel.split('/');
+  let inSrc = false;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]!.toLowerCase();
+    if (part === 'src') {
+      inSrc = true;
+    } else if (part === 'build' && inSrc) {
+      const folder = parts.slice(0, i + 1).join('/') + '/';
+      return jvmBuildPackages.ignores(folder) ? null : folder;
+    }
+  }
+  return null;
+}
+
+/**
+ * When `rel` is a file in a `build` folder below `src/` that a build step could
+ * have written, that folder (see {@link srcBuildFolderOf}); otherwise null.
+ *
+ * The folder itself is walked: projects keep real source there (luci-go
+ * milo's whole `src/build/` feature, Go's `src/go/build`, a .NET solution's
+ * `src/Build/` project). But an output tree built or copied into `src/` — a
+ * nested CRA app's `build/`, a vendored pdf.js, a Laravel `public/build` —
+ * holds JavaScript, CSS, HTML and maps, never {@link HAND_WRITTEN_SOURCE}, so
+ * only those hand-written types are indexed from it. Paths
+ * without an extension are left alone: they are directories (a watcher event
+ * for a removed folder carries no trailing slash), never files a build writes.
+ */
+function buildOutputFolderUnderSrc(rel: string): string | null {
+  const name = rel.slice(rel.lastIndexOf('/') + 1);
+  if (!name.includes('.')) return null;
+  if (HAND_WRITTEN_SOURCE.test(name) && !DECLARATION_FILE.test(name)) return null;
+  return srcBuildFolderOf(rel);
+}
+
+/**
+ * `ig` with {@link buildOutputFolderUnderSrc} applied on top of its patterns,
+ * for every caller of the defaults alike. `projectRules` are the project's own
+ * root ignore rules: a file they re-include by name, or whose folder they
+ * re-include from the `build` folder down (`!src/build/`, the documented
+ * opt-in), keeps every type, as it did before this rule.
+ */
+function excludeBuildOutputUnderSrc(ig: Ignore, projectRules: Ignore | null): Ignore {
+  const ignoredByPatterns = ig.ignores.bind(ig);
+  ig.ignores = (rel: string): boolean => {
+    if (ignoredByPatterns(rel)) return true;
+    const folder = buildOutputFolderUnderSrc(rel);
+    if (folder === null) return false;
+    if (!projectRules) return true;
+    // The file, then each folder above it up to the `build` folder.
+    for (let end = rel.length; end >= folder.length; end = rel.lastIndexOf('/', end - 2) + 1) {
+      if (projectRules.test(rel.slice(0, end)).unignored) return false;
+    }
+    return true;
+  };
+  return ig;
+}
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
 function isValidUtf8(buf: Buffer): boolean {
@@ -451,11 +557,19 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  const projectRules = ignore();
   const rootGitignore = path.join(rootDir, '.gitignore');
-  if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  if (fs.existsSync(rootGitignore)) {
+    const patterns = readGitignorePatterns(rootGitignore);
+    ig.add(patterns);
+    projectRules.add(patterns);
+  }
   const extra = readGitExcludeExtraPatterns(rootDir);
-  if (extra) ig.add(extra);
-  return ig;
+  if (extra) {
+    ig.add(extra);
+    projectRules.add(extra);
+  }
+  return excludeBuildOutputUnderSrc(ig, projectRules);
 }
 
 /**
@@ -464,7 +578,7 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * whose gitignore semantics their own `git ls-files` already enforced (#514).
  */
 function defaultsOnlyIgnore(): Ignore {
-  return ignore().add(DEFAULT_IGNORE_PATTERNS);
+  return excludeBuildOutputUnderSrc(ignore().add(DEFAULT_IGNORE_PATTERNS), null);
 }
 
 /**
@@ -589,7 +703,7 @@ function collectIncludedFiles(
       if (defaults.ignores(rel)) return;
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
-      if (!isSourceFile(rel, overrides)) return;
+      if (!isSourceFile(rel, overrides, rootDir)) return;
       out.add(rel);
     }
   };
@@ -798,9 +912,10 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
  */
 export function preloadLanguagesForFiles(
   files: string[],
-  overrides?: Record<string, Language>
+  overrides?: Record<string, Language>,
+  rootDir?: string
 ): Language[] {
-  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
+  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
   // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
   if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
@@ -1345,7 +1460,8 @@ export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null)
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
+    const isSource = (filePath: string): boolean => isSourceFile(filePath, overrides, rootDir);
+    collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
     return changes;
   } catch {
     return null;
@@ -1417,7 +1533,7 @@ export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSource: (filePath: string) => boolean, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string): void {
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1446,7 +1562,7 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
   const classify = (statusCode: string, rel: string): void => {
     const filePath = normalizePath(prefix + rel);
-    if (!isSourceFile(filePath, overrides)) return;
+    if (!isSource(filePath)) return;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
@@ -1510,11 +1626,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // and they are left alone (#970, #976), mirroring the full-index scan.
   for (const rel of untrackedDirs) {
     for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides, includeIgnored, exclude);
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, isSource, includeIgnored, exclude);
     }
   }
   for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides, includeIgnored, exclude);
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, isSource, includeIgnored, exclude);
   }
 }
 
@@ -1538,7 +1654,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides)) {
+      if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1589,7 +1705,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides)) {
+      if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1697,7 +1813,7 @@ function scanDirectoryWalk(
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
-              if (isSourceFile(relativePath, overrides)) {
+              if (isSourceFile(relativePath, overrides, rootDir)) {
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -1718,7 +1834,7 @@ function scanDirectoryWalk(
         }
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
-          if (isSourceFile(relativePath, overrides)) {
+          if (isSourceFile(relativePath, overrides, rootDir)) {
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
@@ -1754,38 +1870,6 @@ function scanDirectoryWalk(
     }
   }
   return files;
-}
-
-/**
- * Resurrect a resolution edge that is about to be dropped (its target symbol
- * was removed, renamed, or its whole file deleted) as the ORIGINAL unresolved
- * reference that created it, read from the refName/refKind stamp
- * `createEdges` writes into edge metadata. Inserted as status='pending', the
- * ref is consumed by the same sync's resolution sweep: it rebinds to an
- * alternative definition if one exists, or parks as status='failed' where the
- * #1240 retry finds it if the symbol later reappears.
- *
- * Returns null — drop silently, the pre-#1240 behavior — for edges without a
- * refName stamp (created before the stamp existed, or synthesized): rebuilding
- * a ref from the target's plain node name would strip the receiver/qualifier
- * context the original text carried (`h.greet` → `greet`) and could rebind
- * somewhere a full re-index never would. Silent beats wrong.
- */
-function resurrectRefFromDroppedEdge(
-  e: Edge & { sourceFilePath: string; sourceLanguage: Language }
-): UnresolvedReference | null {
-  const refName = e.metadata?.refName;
-  if (typeof refName !== 'string' || refName.length === 0) return null;
-  const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
-  return {
-    fromNodeId: e.source,
-    referenceName: refName,
-    referenceKind: refKind,
-    line: e.line ?? 0,
-    column: e.column ?? 0,
-    filePath: e.sourceFilePath,
-    language: e.sourceLanguage,
-  };
 }
 
 /**
@@ -2173,7 +2257,7 @@ export class ExtractionOrchestrator {
     await new Promise(resolve => setImmediate(resolve));
 
     // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = preloadLanguagesForFiles(files, overrides);
+    const neededLanguages = preloadLanguagesForFiles(files, overrides, this.rootDir);
 
     // Parse files on a pool of worker threads (keeps the main thread free for UI
     // and uses every core). Falls back to in-process parsing when the compiled
@@ -2244,7 +2328,7 @@ export class ExtractionOrchestrator {
      * here on the main thread, where the codegraph.json overrides are loaded.
      */
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
-      const language = detectLanguage(filePath, content, overrides);
+      const language = detectLanguage(filePath, content, overrides, this.rootDir);
       const names = this.frameworksForFile(filePath, frameworkNames);
       if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
       return pool.requestParse({ filePath, content, language, frameworkNames: names });
@@ -2289,11 +2373,17 @@ export class ExtractionOrchestrator {
       const nodeCount = result.kernelCounts?.nodes ?? result.nodes.length;
       const edgeCount = result.kernelCounts?.edges ?? result.edges.length;
 
+      // A file whose grammar failed to load was never parsed (#2335).
+      const grammarUnavailable = hasGrammarLoadFailure(result.errors);
+
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
-      const language = detectLanguage(filePath, content, overrides);
-      if (storeWriter) {
+      const language = detectLanguage(filePath, content, overrides, this.rootDir);
+      if (grammarUnavailable) {
+        // Store nothing: a row from an earlier run keeps its data, and with no
+        // row (or an older hash) the next sync or index retries the file.
+      } else if (storeWriter) {
         if (result.kernelBuffers) {
           // Buffers go to the writer as-is; the worker decodes + finalizes.
           // The main thread's only per-file work stays O(1) + the content hash.
@@ -2321,7 +2411,9 @@ export class ExtractionOrchestrator {
         errors.push(...result.errors);
       }
 
-      if (nodeCount > 0) {
+      if (grammarUnavailable) {
+        filesErrored++;
+      } else if (nodeCount > 0) {
         filesIndexed++;
         totalNodes += nodeCount;
         totalEdges += edgeCount;
@@ -2331,7 +2423,7 @@ export class ExtractionOrchestrator {
         // Files with no symbols but no errors (yaml, twig, properties) are
         // tracked at the file level — count them as indexed so the CLI doesn't
         // misleadingly report "No files found to index".
-        const lang = detectLanguage(filePath, content, overrides);
+        const lang = detectLanguage(filePath, content, overrides, this.rootDir);
         if (isFileLevelOnlyLanguage(lang)) {
           filesIndexed++;
         } else {
@@ -2619,7 +2711,7 @@ export class ExtractionOrchestrator {
         // so decode here — otherwise a kernel-language retry passes the gate
         // below via `errors.length === 0`, stores nothing, and the file is
         // permanently recorded as "(0 symbols)" with the error erased (#1541).
-        const language = detectLanguage(filePath, content, overrides);
+        const language = detectLanguage(filePath, content, overrides, this.rootDir);
         result = materializeKernelResult(result, filePath, language);
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
@@ -2674,7 +2766,7 @@ export class ExtractionOrchestrator {
           }
 
           // Same undecoded-transport hazard as the first retry pass (#1541).
-          const language = detectLanguage(filePath, fullContent, overrides);
+          const language = detectLanguage(filePath, fullContent, overrides, this.rootDir);
           result = materializeKernelResult(result, filePath, language);
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
@@ -2735,7 +2827,9 @@ export class ExtractionOrchestrator {
         errors.push(...result.errors);
       }
 
-      if (result.nodes.length > 0) {
+      if (hasGrammarLoadFailure(result.errors)) {
+        filesErrored++; // nothing was stored (#2335)
+      } else if (result.nodes.length > 0) {
         filesIndexed++;
         totalNodes += result.nodes.length;
         totalEdges += result.edges.length;
@@ -2834,7 +2928,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir), this.rootDir);
 
     // Check file size
     if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
@@ -2918,6 +3012,12 @@ export class ExtractionOrchestrator {
     result: ExtractionResult,
     onYield?: MaybeYield
   ): Promise<void> {
+    // The file was never parsed: its grammar failed to load (#2335). Storing
+    // this would replace the file's symbols with an empty row under the new
+    // content hash, which no hash-based sync revisits. Keep whatever the index
+    // has; the stale (or missing) row makes the next sync retry the file.
+    if (hasGrammarLoadFailure(result.errors)) return;
+
     // A kernel result can arrive as an undecoded buffer transport (empty
     // node/edge arrays, tables riding in kernelBuffers). Decode it before
     // storing — persisting the transport as-is records the file as having no
@@ -2944,7 +3044,10 @@ export class ExtractionOrchestrator {
       const existingIsMarker =
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
-      if (!existingIsMarker || !incomingHasContent) {
+      // A row an older engine stored while the grammar could not load
+      // (#2335) records no parse at all: any real result replaces it.
+      const existingNeverParsed = hasGrammarLoadFailure(existingFile.errors);
+      if (!existingNeverParsed && (!existingIsMarker || !incomingHasContent)) {
         return; // No changes
       }
     }
@@ -3206,14 +3309,15 @@ export class ExtractionOrchestrator {
    * - edges whose source is in a file this sync already re-extracted are
    *   skipped — their references were re-resolved from scratch moments ago;
    * - very common names are skipped by the per-name ceiling in
-   *   `getResolutionEdgesByTargetName`.
+   *   `getResolutionEdgesByTargetName`, counted over the edges up to
+   *   `countedUpToEdgeId` when given (those before the sync's failed-ref retry).
    *
    * Returns the number of references resurrected.
    */
-  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): number {
+  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[], countedUpToEdgeId?: number): number {
     if (definitionDelta.length === 0) return 0;
     const alreadyFresh = new Set(changedFilePaths);
-    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta);
+    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta, undefined, countedUpToEdgeId);
 
     const edgeIds: number[] = [];
     const refs: UnresolvedReference[] = [];
@@ -3232,6 +3336,130 @@ export class ExtractionOrchestrator {
     // place for a rebind ELSEWHERE would keep both, turning drift into
     // duplication.
     this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /**
+   * Re-open resolution edges whose answer was READ from a file this sync
+   * touched, although neither end of the edge changed: a python attribute typed
+   * through a factory or a base class in another file records those files as
+   * `metadata.typeFrom`. The definition delta cannot see these — editing what a
+   * factory returns, or what a base `__init__` assigns, adds or removes no
+   * definition — so without this a synced index keeps the old type forever.
+   * The edges go back to pending refs; returns the files they come from, whose
+   * pending rows the caller resolves.
+   */
+  resurrectTypeDependentEdges(touchedPaths: string[], changedFilePaths: string[]): string[] {
+    const touched = new Set(touchedPaths.filter((p) => /\.pyi?$/.test(p)));
+    if (touched.size === 0) return [];
+    const alreadyFresh = new Set(changedFilePaths);
+
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    const files = new Set<string>();
+    for (const e of this.queries.getEdgesWithTypeFrom()) {
+      if (alreadyFresh.has(e.sourceFilePath)) continue;
+      const from = e.metadata?.typeFrom;
+      if (!Array.isArray(from) || !from.some((f) => typeof f === 'string' && touched.has(f))) continue;
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+      files.add(e.sourceFilePath);
+    }
+    if (refs.length === 0) return [];
+    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return [...files];
+  }
+
+  /**
+   * Re-open every resolution a language made, for the sync's sweep to redo
+   * against the current graph — the answer when an input to that language's
+   * resolution changed project-wide rather than per definition. Python
+   * package roots are that kind of input: an added `__init__.py` or an edited
+   * `pyproject.toml` moves where modules start for importers in files the
+   * sync never touched, and CG-33's per-name rebind can't see it. Parked
+   * failures are re-queued too, since some of them now resolve. Same
+   * conservatism as {@link resurrectStaleResolutionEdges}: an edge without a
+   * refName stamp is never deleted.
+   */
+  resurrectResolutionEdgesForLanguage(language: Language): number {
+    return (
+      this.reopenEdges(this.queries.getResolutionEdgesBySourceLanguage(language)) +
+      this.queries.requeueFailedReferencesByLanguage(language)
+    );
+  }
+
+  /**
+   * The narrow form, for modules or packages that appeared or vanished below
+   * an unchanged set of roots: re-open the edges whose target lies in
+   * `targetFiles` or whose source lies under `sourceDirs`, and re-queue the
+   * parked failures naming one of `moduleLeaves`. Returns the files whose
+   * references were re-opened.
+   */
+  resurrectResolutionEdgesTouching(
+    language: Language,
+    scope: { targetFiles: string[]; sourceDirs: string[]; moduleLeaves: string[] }
+  ): string[] {
+    const files = new Set<string>();
+    const edges = this.queries.getResolutionEdgesTouchingFiles(language, scope.targetFiles, scope.sourceDirs, scope.moduleLeaves);
+    for (const e of edges) files.add(e.sourceFilePath);
+    this.reopenEdges(edges);
+    this.queries.requeueFailedReferencesByLanguage(language, scope.moduleLeaves, files);
+    return [...files];
+  }
+
+  /**
+   * Re-open what importers bound from a Python package whose `__init__.py`
+   * was edited: in each importing file, the edges and parked failures whose
+   * reference starts with a name bound from that package (`N`, `N.run`,
+   * `pkg.N`). A def or re-export added, removed or repointed there moves
+   * exactly those answers — `from pkg import N` prefers what `__init__.py`
+   * binds over a submodule `pkg/N` — and nothing in the importer's other
+   * references. A name whose import edge already lands where the package
+   * binds it now is left alone, so an edit that moves nothing re-resolves
+   * nothing. Returns the files whose references were re-opened.
+   */
+  resurrectPythonPackageImporters(bindings: Map<string, Map<string, string | null>>): string[] {
+    if (bindings.size === 0) return [];
+    const edges = this.queries.getResolutionEdgesFromFiles('python', [...bindings.keys()]);
+    const refHead = (e: { metadata?: Record<string, unknown> }): string | null => {
+      const refName = e.metadata?.refName;
+      return typeof refName === 'string' ? refName.split('.')[0]! : null;
+    };
+    // Where each bound name's own import edge lands today.
+    const bindsNow = new Map<string, string>();
+    for (const e of edges) {
+      const refName = e.metadata?.refName;
+      if (e.kind !== 'imports' || typeof refName !== 'string' || refName.includes('.')) continue;
+      const target = this.queries.getNodeById(e.target);
+      if (target) bindsNow.set(`${e.sourceFilePath}\0${refName}`, `${target.filePath}\0${target.kind === 'file' ? '' : target.name}`);
+    }
+    const moved = new Map<string, Set<string>>();
+    for (const [file, names] of bindings) {
+      for (const [name, binding] of names) {
+        if (binding !== null && bindsNow.get(`${file}\0${name}`) === binding) continue;
+        let set = moved.get(file);
+        if (!set) moved.set(file, (set = new Set()));
+        set.add(name);
+      }
+    }
+    if (moved.size === 0) return [];
+    this.reopenEdges(edges.filter((e) => moved.get(e.sourceFilePath)?.has(refHead(e) ?? '') === true));
+    this.queries.requeueFailedReferencesBinding('python', moved);
+    return [...moved.keys()];
+  }
+
+  private reopenEdges(edges: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>): number {
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const e of edges) {
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
     return refs.length;
   }
 
@@ -3272,10 +3500,14 @@ export class ExtractionOrchestrator {
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    const addedFilePaths: string[] = [];
+    const removedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
     // pairs below to derive `definitionDelta` (CG-33).
     const pairsBefore = new Set<string>();
+    // Importers' import statements, read once per sync for the files it removes.
+    const importReader = createImportReader(this.rootDir);
 
     onProgress?.({
       phase: 'scanning',
@@ -3317,7 +3549,7 @@ export class ExtractionOrchestrator {
       const overrides = loadExtensionOverrides(this.rootDir);
       currentFiles = unique.filter(
         (p) =>
-          isSourceFile(p, overrides) &&
+          isSourceFile(p, overrides, this.rootDir) &&
           !scope.ignores(p) &&
           fs.existsSync(path.join(this.rootDir, p))
       );
@@ -3379,12 +3611,30 @@ export class ExtractionOrchestrator {
       }
       onFileChange?.(tracked.path);
       this.queries.deleteFile(tracked.path);
+      removedFilePaths.push(tracked.path);
       filesRemoved++;
     };
+    const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
-        removeTracked(tracked);
+        removed.push(tracked);
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    // The references other files make THROUGH the removed ones to files that
+    // stay (a package `__init__.py` or an `index.ts` re-exporting what it
+    // imports) go back to pending too: the cascade keeps their edges, and a
+    // fresh index of the tree without these files binds them differently or
+    // not at all. Before any of them is deleted, and for all of them at once.
+    if (removed.length > 0) {
+      const tImporters = Date.now();
+      const reopened = reopenReferencesThroughRemovedFiles(this.queries, importReader, removed);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-removed-module-importers: ${Date.now() - tImporters}ms (${reopened} refs re-opened)`);
+    }
+    for (const tracked of removed) {
+      removeTracked(tracked);
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -3400,13 +3650,18 @@ export class ExtractionOrchestrator {
       }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
+      // A row an older engine stored while the file's grammar could not load
+      // (#2335) holds no parse of these bytes: re-index it even though its
+      // size, mtime and hash all match. Rows with a real parse error are
+      // deterministic and are not retried.
+      const neverParsed = tracked !== undefined && hasGrammarLoadFailure(tracked.errors);
 
       // Cheap pre-filter: an already-indexed file whose size AND mtime both match
       // the DB is unchanged — skip it without reading or hashing. (A content
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked) {
+      if (tracked && !neverParsed) {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
@@ -3432,7 +3687,10 @@ export class ExtractionOrchestrator {
       // Not source after all — an MPEG transport stream named `.ts` (#1910):
       // a new one is ignored, a tracked file that became one is removed.
       if (content === null) {
-        if (tracked) removeTracked(tracked);
+        if (tracked) {
+          reopenReferencesThroughRemovedFiles(this.queries, importReader, [tracked]);
+          removeTracked(tracked);
+        }
         continue;
       }
       const contentHash = hashContent(content);
@@ -3441,8 +3699,9 @@ export class ExtractionOrchestrator {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
+        addedFilePaths.push(filePath);
         filesAdded++;
-      } else if (tracked.contentHash !== contentHash) {
+      } else if (tracked.contentHash !== contentHash || neverParsed) {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
@@ -3461,7 +3720,7 @@ export class ExtractionOrchestrator {
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
-      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides));
+      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides, this.rootDir));
     }
 
     // Index changed files
@@ -3477,7 +3736,7 @@ export class ExtractionOrchestrator {
 
       const result = await this.indexFile(filePath);
       if (result.errors.some(e => e.severity === 'error')) failedFilePaths.push(filePath);
-      nodesUpdated += result.nodes.length;
+      if (!hasGrammarLoadFailure(result.errors)) nodesUpdated += result.nodes.length; // else nothing was stored (#2335)
 
       const pause = backpressure?.();
       if (pause) await pause;
@@ -3510,8 +3769,10 @@ export class ExtractionOrchestrator {
       nodesUpdated,
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
+      ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
+      ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
     };
   }
 
@@ -3587,7 +3848,7 @@ export class ExtractionOrchestrator {
       for (const filePath of candidates) {
         const tracked = this.queries.getFileByPath(filePath);
         const fullPath = path.join(this.rootDir, filePath);
-        if (!isSourceFile(filePath, overrides) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
+        if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
           if (tracked) removed.push(filePath);
           continue;
         }
