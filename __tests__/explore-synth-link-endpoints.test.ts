@@ -233,6 +233,34 @@ describe('codegraph_explore — dynamic-dispatch links are listed per link', () 
     }
   }, 120_000);
 
+  it('lets the named symbols take turns, so one long fan-out does not fill the list', async () => {
+    // prometheus's `refresh.Discovery.refresh` hands its func field to 28
+    // discovery packages, and in a query that also names hetzner's
+    // `refresher.refresh` those links filled the list before robotDiscovery's.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-synth-links-turns-'));
+    const write = (rel: string, content: string) => fs.writeFileSync(path.join(dir, rel), content);
+    const family = (iface: string, classes: string[]) => {
+      write(`${iface.toLowerCase()}.ts`, `export interface ${iface} {\n  run(): number;\n}\n`);
+      for (const name of classes) {
+        write(
+          `${name.toLowerCase()}.ts`,
+          `import type { ${iface} } from './${iface.toLowerCase()}';\n\nexport class ${name} implements ${iface} {\n  run(): number {\n    return 1;\n  }\n}\n`
+        );
+      }
+    };
+    family('Wide', ['WideA', 'WideB', 'WideC', 'WideD', 'WideE', 'WideF', 'WideG', 'WideH']);
+    family('Narrow', ['NarrowA', 'NarrowB']);
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'Wide.run Narrow.run' });
+    const links = linkLines(res.content[0].text as string);
+    expect(links).toHaveLength(6);
+    // Both of Narrow's links make the list, taking turns with Wide's.
+    expect(links.map((l) => /^- (\w+)\.run →/.exec(l)?.[1])).toEqual(['Wide', 'Narrow', 'Wide', 'Narrow', 'Wide', 'Wide']);
+    expect(links.filter((l) => l.startsWith('- Narrow.run → ')).map((l) => /→ (\w+)\.run/.exec(l)?.[1]).sort()).toEqual(['NarrowA', 'NarrowB']);
+  }, 120_000);
+
   it('prints two links that read the same once, and none that reads like a Flow hop', async () => {
     // gin declares `Binding` once per build tag (binding.go, binding_nomsgpack.go),
     // so formBinding.Bind is linked from two `Binding.Bind` nodes and both links

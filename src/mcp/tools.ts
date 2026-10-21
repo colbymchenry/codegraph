@@ -3407,7 +3407,9 @@ export class ToolHandler {
       // into tests and examples through an end the query didn't name go last, as
       // explore's answer leaves those files out; before that, links go by how
       // pointedly the query named their two ends, so the cap never drops the
-      // implementation the query names for one it doesn't. Edge order breaks ties.
+      // implementation the query names for one it doesn't. Links that rank the same
+      // take turns by the named symbol they hang from, so one symbol's long fan-out
+      // can't fill the list before another's first link; edge order breaks ties.
       const collectSynthLinks = (chain: readonly FlowStep[] | null): string[] => {
         const MAX_SYNTH_LINKS = 6;
         const onChain = new Set((chain ?? []).map((s) => s.node.id));
@@ -3418,8 +3420,14 @@ export class ToolHandler {
         // the cap and hid the one link into `fetchApps`, which the query names exactly.
         const weight = (id: string): number =>
           uniqueNamedNodeIds.has(id) || dynNamed.has(id) ? 3 : named.has(id) ? 1 : 0;
-        const links: Array<{ edge: Edge; src: Node; tgt: Node; lowValue: boolean; weight: number }> = [];
+        const links: Array<{ edge: Edge; src: Node; tgt: Node; lowValue: boolean; weight: number; turn: number }> = [];
         const seen = new Set<string>();
+        // A link's turn: how many links of its rank the same named symbol already has.
+        // prometheus's `refresh.Discovery.refresh` hands its func field to 28
+        // discovery packages; in `refresh.Discovery.refresh hetzner.refresher.refresh
+        // hcloudDiscovery.refresh` those filled the list before `refresher.refresh` →
+        // robotDiscovery's, at the same rank.
+        const turns = new Map<string, number>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           // RAW edges for the same reason as `hasHeuristicEdge` in named-symbol-flow
           // — a static edge over the same pair hides the synthesized one from getCallers.
@@ -3432,16 +3440,22 @@ export class ToolHandler {
             if (onChain.has(edge.source) && onChain.has(edge.target)) continue;
             const other = named.get(otherId) ?? dynNamed.get(otherId) ?? cg.getNode(otherId);
             if (!other) continue;
+            const lowValue = weight(otherId) === 0 && isLowValue(other.filePath);
+            const linkWeight = weight(n.id) + weight(otherId);
+            const rank = `${n.id}|${lowValue}|${linkWeight}`;
+            const turn = turns.get(rank) ?? 0;
+            turns.set(rank, turn + 1);
             links.push({
               edge,
               src: edge.source === n.id ? n : other,
               tgt: edge.source === n.id ? other : n,
-              lowValue: weight(otherId) === 0 && isLowValue(other.filePath),
-              weight: weight(n.id) + weight(otherId),
+              lowValue,
+              weight: linkWeight,
+              turn,
             });
           }
         }
-        links.sort((a, b) => Number(a.lowValue) - Number(b.lowValue) || b.weight - a.weight);
+        links.sort((a, b) => Number(a.lowValue) - Number(b.lowValue) || b.weight - a.weight || a.turn - b.turn);
         const linkLine = (edge: Edge, src: Node, tgt: Node): string => {
           // `TrySet → TrySet` says neither which interface nor which implementation:
           // a same-name link names each end by its owner, as the agent would write it.
