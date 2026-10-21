@@ -852,12 +852,14 @@ function goMethodKey(m: Node): string {
 function goStdlibMethodKey(importPath: string | null, name: string): string {
   return GO_EXPORTED_NAME.test(name) ? name : `std:${importPath ?? ''}\0${name}`;
 }
-/** A Go type's method keys ({@link goMethodKey}), by where each is known from. */
+/** What a Go type has, or an interface asks for. */
 interface GoMethodNames {
-  /** Declared in the project: the type's own, and those of the project types it embeds. */
-  readonly declared: Set<string>;
-  /** Those of the standard-library types it embeds, and `error`'s (see ./go-stdlib-methods). */
-  readonly stdlib: ReadonlySet<string>;
+  /**
+   * Its methods by {@link goMethodKey}: its own, the project types' it
+   * embeds, and those the standard-library types it embeds bring
+   * (./go-stdlib-methods), `error`'s included.
+   */
+  readonly methods: Set<string>;
   /** Embedded types from outside the index whose methods nothing names, by package and name. */
   readonly opaque: ReadonlySet<string>;
 }
@@ -980,14 +982,14 @@ function goGrpcServerArity(signature: string | undefined): string | null {
  *
  * A type embedded from outside the index leaves only the resolver's failed
  * `extends` row. The methods of a standard-library type, and of `error`, are
- * known (./go-stdlib-methods): prometheus's `TBRun` is all of `testing.TB`
- * plus `Run`, not any struct with a `Run`. Such a method answers only one the
- * standard library asks for too: etcd's gRPC `LockClient.Lock` is not the
- * `Lock` an embedded `sync.Mutex` promotes. Any other outside type's methods
- * are unknown, so a struct embedding the same type has them, and otherwise
- * only the one type with every method the interface does name is taken to
- * implement it — kapacitor's `Diagnostic` (a third-party `Logger` plus `Log`)
- * has no more claim on every struct with a `Log` than on none of them.
+ * known (./go-stdlib-methods), with their counts: prometheus's `TBRun` is all
+ * of `testing.TB` plus `Run`, not any struct with a `Run`, and a struct
+ * embedding `sync.Mutex` is hugo's `Locker` but not etcd's gRPC `LockClient`,
+ * whose `Lock` takes a context and a request. Any other outside type's
+ * methods are unknown, so a struct embedding the same type has them, and
+ * otherwise only the one type with every method the interface does name is
+ * taken to implement it — kapacitor's `Diagnostic` (a third-party `Logger`
+ * plus `Log`) has no more claim on every struct with a `Log` than on none.
  *
  * Methods match by name, and an unexported name by its package too
  * ({@link goMethodKey}). prometheus has a `refresher { refresh(…) }` in each of
@@ -1124,49 +1126,33 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
   }
   await onYield();
 
-  // Own methods plus every embedded type's, by where each is known from.
-  const NONE_KNOWN: ReadonlySet<string> = new Set();
+  // Own methods plus every embedded type's, a standard-library one's too.
+  const NONE_OPAQUE: ReadonlySet<string> = new Set();
   const methodNames = (id: string): GoMethodNames => {
     const types = embedClosure(id);
-    if (types.length === 1 && !outside.has(id)) return { declared: ownMethods(id), stdlib: NONE_KNOWN, opaque: NONE_KNOWN };
-    const declared = new Set<string>();
-    const stdlib = new Set<string>();
+    if (types.length === 1 && !outside.has(id)) return { methods: ownMethods(id), opaque: NONE_OPAQUE };
+    const methods = new Set<string>();
     const opaque = new Set<string>();
     for (const t of types) {
-      for (const m of ownMethods(t)) declared.add(m);
+      for (const m of ownMethods(t)) methods.add(m);
       const out = outside.get(t);
       if (!out) continue;
-      for (const known of out.stdlib) for (const key of known.keys()) stdlib.add(key);
+      for (const known of out.stdlib) for (const key of known.keys()) methods.add(key);
       for (const type of out.opaque) opaque.add(type);
     }
-    return { declared, stdlib, opaque };
+    return { methods, opaque };
   };
 
-  // Every method `want` names, wherever it is known from: a method the
-  // standard library asks for is answered by any method of that key, and one
-  // only the project asks for by a method the project declares.
-  const coversNamed = (have: GoMethodNames, want: GoMethodNames): boolean => {
-    for (const m of want.declared) {
-      if (!have.declared.has(m) && !want.stdlib.has(m)) return false;
-    }
-    for (const m of want.stdlib) {
-      if (!have.declared.has(m) && !have.stdlib.has(m)) return false;
+  const covers = (have: Set<string>, want: Set<string>): boolean => {
+    if (have.size < want.size) return false;
+    for (const m of want) {
+      if (!have.has(m)) return false;
     }
     return true;
   };
   const coversOpaque = (have: GoMethodNames, want: GoMethodNames): boolean => {
     for (const type of want.opaque) {
       if (!have.opaque.has(type)) return false;
-    }
-    return true;
-  };
-  const declaresAll = (own: Set<string>, want: GoMethodNames): boolean => {
-    if (want.opaque.size > 0) return false;
-    for (const m of want.declared) {
-      if (!own.has(m)) return false;
-    }
-    for (const m of want.stdlib) {
-      if (!own.has(m)) return false;
     }
     return true;
   };
@@ -1260,7 +1246,7 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
   for (const s of goImplementers) {
     if ((++scanned255 & 63) === 0) await onYield();
     const have = methodNames(s.id);
-    if (have.declared.size + have.stdlib.size + have.opaque.size === 0) continue;
+    if (have.methods.size + have.opaque.size === 0) continue;
     candidates.push(s);
     candidateMethods.set(s.id, have);
   }
@@ -1268,8 +1254,7 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
   for (const iface of goInterfaces) {
     if ((++scanned255 & 63) === 0) await onYield();
     const want = methodNames(iface.id);
-    const named = want.stdlib.size === 0 ? want.declared.size : new Set([...want.declared, ...want.stdlib]).size;
-    if (named === 0 && want.opaque.size === 0) continue; // empty interface (`any`) — would match everything
+    if (want.methods.size + want.opaque.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
     const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
@@ -1299,7 +1284,7 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       const have = candidateMethods.get(s.id)!;
-      if (have.declared.size + have.stdlib.size < named || !coversNamed(have, want)) continue;
+      if (!covers(have.methods, want.methods)) continue;
       if (!wanted) wanted = wantedArities(iface);
       if (!aritiesFit(s.id, wanted)) continue;
       covering++;
@@ -1308,10 +1293,11 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
         if (covering === 1) sole = s;
         continue;
       }
-      if (declaresAll(ownMethods(s.id), want)) link(s);
-      else throughEmbedding.push(s);
+      const own = ownMethods(s.id);
+      if (want.opaque.size > 0 || (own !== have.methods && !covers(own, want.methods))) throughEmbedding.push(s);
+      else link(s);
     }
-    if (sole && covering === 1 && named > 0) throughEmbedding.push(sole);
+    if (sole && covering === 1 && want.methods.size > 0) throughEmbedding.push(sole);
     for (const s of throughEmbedding) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       link(s);

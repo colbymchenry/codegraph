@@ -13,8 +13,10 @@
  *
  * The methods of the standard-library types projects embed are known now,
  * with their parameter and result counts, and `error` is recorded as the
- * embedding it is. Such a method answers only what the standard library asks
- * for: an embedded `sync.Mutex` gives no struct etcd's gRPC `LockClient.Lock`.
+ * embedding it is. Such a method counts like any other, at its counts: an
+ * embedded `sync.Mutex` makes a struct hugo's `Locker`, but not etcd's gRPC
+ * `LockClient`, whose `Lock` takes a context and a request, and a `Write` that
+ * takes a record is no `io.Writer`'s.
  * An unexported one is its own package's, as Go has it: `testing.TB`'s
  * `private`, which no project type can declare. Embedding any other outside
  * type (`zapcore.Core`, `grpc.ClientStream`) asks for methods nothing names:
@@ -74,6 +76,12 @@ func (d *Discovery) Run(name string, f func(*testing.T)) bool { return false }
 type tRunner struct{ *testing.T }
 
 func (r tRunner) Run(name string, f func(*testing.T)) bool { return r.T.Run(name, f) }
+
+// discovery/file's test helper: all of TBRun through *testing.T, Run included.
+type testRunner struct {
+	*testing.T
+	dir string
+}
 
 type syncWriter interface {
 	io.Writer
@@ -165,7 +173,13 @@ type LockClient interface {
 	Unlock(ctx context.Context, key string) error
 }
 
-// A mutex's Lock and Unlock are not those.
+// hugo's: what a mutex has.
+type Locker interface {
+	Lock()
+	Unlock()
+}
+
+// A mutex's Lock and Unlock: a Locker's, not a LockClient's.
 type waitRecorder struct {
 	sync.Mutex
 	actions []string
@@ -355,12 +369,17 @@ describe('Go implicit satisfaction knows what standard-library embeddings bring'
       'errs.statusErr -> errs.coded',
       'fileutil.FileBufReader -> fileutil.FileReader',
       'fileutil.fileReader -> fileutil.FileReader',
+      // An *os.File is what prometheus's SegmentFile and syncWriter describe.
+      'fileutil.fileReader -> promql.SegmentFile',
+      'fileutil.fileReader -> promql.syncWriter',
       'fileutil.lockProxy -> fileutil.LockClient',
+      'fileutil.waitRecorder -> fileutil.Locker',
       'gin.responseWriter -> gin.ResponseWriter',
       'promql.JSONFileLogger -> promql.QueryLogger',
       'promql.Segment -> promql.syncWriter',
       'promql.queryLogFile -> promql.syncWriter',
       'promql.tRunner -> promql.TBRun',
+      'promql.testRunner -> promql.TBRun',
     ]);
   });
 
@@ -368,13 +387,15 @@ describe('Go implicit satisfaction knows what standard-library embeddings bring'
     const implementers = (name: string, file: string) =>
       (buildTypeHierarchy(cg, one(name, file))?.descendants ?? []).map((d) => `${d.relation} ${pkg(d.node)}`).sort();
     // Not the discoverer with a Run, nor fakeTB, whose private is its own package's.
-    expect(implementers('TBRun', 'promql/promql.go')).toEqual(['implements promql.tRunner']);
+    expect(implementers('TBRun', 'promql/promql.go')).toEqual(['implements promql.tRunner', 'implements promql.testRunner']);
     // Not walLog, whose Write takes a record and returns only an error.
     expect(implementers('syncWriter', 'promql/promql.go')).toEqual([
+      'implements fileutil.fileReader',
       'implements promql.Segment',
       'implements promql.queryLogFile',
     ]);
-    // A call through TBRun reaches tRunner's Run, not the discoverer's.
+    // A call through TBRun reaches tRunner's Run, not the discoverer's;
+    // testRunner's is testing's, outside the graph.
     const run = cg
       .getOutgoingEdgesFrom([one('TBRun', 'promql/promql.go').id], ['contains'])
       .map((e) => cg.getNode(e.target))
@@ -397,14 +418,15 @@ describe('Go implicit satisfaction knows what standard-library embeddings bring'
     }
   });
 
-  it('answers a method only the project asks for with one the project declares', () => {
+  it('holds a method a standard-library embedding brings to the counts of the one it answers', () => {
     const into = (name: string, file: string) =>
       cg
         .getIncomingEdgesTo([one(name, file).id], ['implements'])
         .filter((e) => meta(e).synthesizedBy === 'go-implements')
         .map((e) => pkg(cg.getNode(e.source)))
         .sort();
-    // waitRecorder's Lock and Unlock are sync.Mutex's.
+    // waitRecorder's Lock and Unlock are sync.Mutex's: they take nothing.
+    expect(into('Locker', 'fileutil/fileutil.go')).toEqual(['fileutil.waitRecorder']);
     expect(into('LockClient', 'fileutil/fileutil.go')).toEqual(['fileutil.lockProxy']);
     // responseWriter's Header is http.ResponseWriter's, which ResponseWriter asks for.
     expect(into('ResponseWriter', 'gin/response_writer.go')).toEqual(['gin.responseWriter']);
