@@ -29,6 +29,9 @@ export interface UnresolvedRef {
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
+  /** The tail a ref that failed to resolve is parked under, when it is not
+   * the one its name gives (see `importBindingTail`). */
+  nameTail?: string;
 }
 
 /**
@@ -154,6 +157,14 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * The nodes one type declaration extends or implements, through its own
+   * resolved `implements`/`extends` edges: where getSupertypes unions those of
+   * every type sharing a simple name, this is the supertypes of the node
+   * `id`. Empty during the first resolution pass, as getSupertypes is.
+   * Optional so external/test contexts compile without it.
+   */
+  getSupertypeNodes?(id: string): Node[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile
@@ -174,8 +185,29 @@ export interface ResolutionContext {
    */
   isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
   /**
-   * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
-   * `null` when the project doesn't define any. Cached per resolver
+   * The project file a module specifier, written in `fromFile`, names — the
+   * import resolver's own answer (for Python: from the package roots), or null
+   * when no project file provides it. Supplied by the coordinator.
+   */
+  resolveModuleFile?(source: string, fromFile: string, language: Language): string | null;
+  /**
+   * Whether `source`, imported from `fromFile`, is a package: one the file's
+   * package.json or an enclosing one declares, a Node built-in, or a
+   * runtime's virtual module (`node:`, `bun:`, `astro:`…). Such an import
+   * never binds to a same-named project module, only to a declaration file
+   * the project keeps for the package. Supplied by the coordinator.
+   */
+  isDeclaredPackage?(source: string, fromFile: string): boolean;
+  /**
+   * Whether `filePath` (project-relative) is one of the files the index holds.
+   * `fileExists` also answers for a directory and for a file on disk the
+   * index never read, such as one under `node_modules`. Supplied by the
+   * coordinator; a minimal context can omit it.
+   */
+  isIndexedFile?(filePath: string): boolean;
+  /**
+   * Project import-path aliases (tsconfig/jsconfig `paths`, and `baseUrl`).
+   * Returns `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
    * existing test fixtures and external context implementations
    * compile without modification; production resolver implements it.
@@ -183,17 +215,21 @@ export interface ResolutionContext {
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
   /**
    * The aliases of the tsconfig / jsconfig nearest `fromFile` below the
-   * project root that declares `paths` — a monorepo app's own `@/*` — or null.
+   * project root that declares `paths` or `baseUrl` — a monorepo app's own
+   * `@/*`, a nested Vite app's `"baseUrl": "src"` — or null.
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
-   * Go module info from `go.mod` at the project root. Returns `null`
-   * when the project has no `go.mod` (non-Go projects, pre-modules
-   * Go code, or projects whose modules live in subdirectories). Used
-   * by the Go branch of import resolution to distinguish in-module
-   * cross-package imports from third-party packages.
+   * The project-relative directory (`/`-separated, `.` for the root) of
+   * the Go package an import path names, when it is a package of one of the
+   * project's own modules — the `go.mod` at the root or any `go.mod` above
+   * an indexed `.go` file (#2322) — else `null` (the standard library,
+   * third-party modules, a project with no `go.mod`). `fromFile`, the
+   * importing file, breaks a tie between two modules declaring one path.
+   * Used by the Go branch of resolution to tell in-project cross-package
+   * imports from outside ones, and to find the package's files.
    */
-  getGoModule?(): import('./go-module').GoModule | null;
+  getGoPackageDir?(importPath: string, fromFile?: string): string | null;
   /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
@@ -224,6 +260,13 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The import node of every C / C++ `#include`, narrowed to the path it
+   * spells and where it is written: what ./cpp-includers builds the include
+   * graph from. Optional so minimal contexts compile; it falls back to
+   * reading the import nodes themselves.
+   */
+  getCppIncludeNodes?(): Array<Pick<Node, 'id' | 'name' | 'filePath' | 'language' | 'startLine' | 'startColumn'>>;
 }
 
 /**
@@ -237,13 +280,58 @@ export interface FrameworkExtractionResult {
 }
 
 /**
+ * Nodes a framework can name only from several files at once, with the
+ * references that bind each — and how to recognise the ones an earlier run
+ * produced, so a run can remove those it no longer wants.
+ */
+export interface CrossFileNodes extends FrameworkExtractionResult {
+  /** The kind every one of these nodes has. */
+  kind: Node['kind'];
+  /** True for a node this pass produces, and for no node extraction does. */
+  owns(node: Node): boolean;
+}
+
+/**
+ * The navigation calls a router binds to its routes — `navigate('/login')`,
+ * `router.push('/x')` — described so a sync can find the ones a changed route
+ * may answer (see `FrameworkResolver.navigation`).
+ */
+export interface NavigationCalls {
+  /**
+   * The name tails of the calls `claimsReference` accepts as navigation —
+   * `push` for `history.push` — which find them through the failed-tail
+   * index; `claimsReference` then decides on the whole name.
+   */
+  tails: readonly string[];
+  /**
+   * The files whose navigation calls can name `route`: the path prefixes of
+   * the apps whose table it is in (`''` for every file), or null when it is
+   * not one of this router's routes.
+   */
+  scope(route: Node, context: ResolutionContext): readonly string[] | null;
+}
+
+/**
  * Framework-specific resolver
  */
 export interface FrameworkResolver {
   /** Framework name */
   name: string;
-  /** Languages this framework applies to. If omitted, applies to all languages. */
+  /**
+   * Languages this framework applies to: `extract()` runs only on files in
+   * them, and `resolve()` sees only references written in them (unless
+   * `resolveLanguages` says otherwise). If omitted, applies to all languages.
+   */
   languages?: Language[];
+  /**
+   * The languages whose references `resolve()` sees, when they are not
+   * `languages`. For a resolver that reads references in languages it
+   * extracts nothing from: SvelteKit's `$lib/…` imports and Svelte 5 runes
+   * are written in `.ts` / `.js` modules too, but only a `.svelte` file holds
+   * a route. Widening `languages` instead would run `extract()` on those
+   * files.
+   */
+  resolveLanguages?: readonly Language[];
   /**
    * Packages an app declares when it is built on this framework. When set,
    * `extract()` runs only on files of an app whose package.json — the file's
@@ -264,6 +352,7 @@ export interface FrameworkResolver {
    * an attribute/descriptor, not a declared symbol (e.g. Django's
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
+   * Asked only about references written in the languages `resolve()` sees.
    */
   claimsReference?(name: string): boolean;
   /**
@@ -289,6 +378,39 @@ export interface FrameworkResolver {
    * second run can recover the original in-file form from `qualifiedName`.
    */
   postExtract?(context: ResolutionContext): Node[];
+  /**
+   * Nodes no single file's `extract()` can decide on — a React Router route
+   * table written in one file is a table of routes only because another
+   * file hands it to the router. Called after `postExtract` on every index
+   * and every sync, it returns the COMPLETE set the framework wants now. The
+   * orchestrator inserts the new ones (their references pending, for the
+   * resolution that follows), removes the ones an earlier run inserted that
+   * are no longer wanted, renames the ones whose name changed, and leaves
+   * the rest alone, so an unchanged node keeps its edges. A node lives in the
+   * file it is written in, so re-extracting that file drops it until the
+   * next run puts it back.
+   */
+  crossFileNodes?(context: ResolutionContext): CrossFileNodes;
+  /**
+   * Set by a router whose `resolve()` binds a navigation call to one of its
+   * route nodes. A call whose route did not exist yet was parked as failed, or
+   * bound to whatever answered it then (a catch-all, a parameter route), and
+   * the retry that matches a failed ref's name tail against the names a sync
+   * adds (#1240) never finds it: its name is the router's method, never the
+   * route's path. So a sync that adds, removes or renames a route puts the
+   * calls this describes back for its resolution sweep.
+   */
+  navigation?: NavigationCalls;
+  /**
+   * The modules whose content `resolve()` reads to answer `ref`, a route
+   * node's reference — none for most. A React route that renders a same-file
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to the component
+   * that module exports, through any barrel that forwards it, and to the
+   * declaration while the module is missing or exports none: the answer
+   * changes with those files although no name the reference carries does, so
+   * a sync that adds or changes one of them resolves the reference again.
+   */
+  lazyModules?(ref: UnresolvedRef, context: ResolutionContext): readonly string[];
 }
 
 /**

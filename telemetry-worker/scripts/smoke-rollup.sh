@@ -16,7 +16,8 @@
 #   * the purge deletes only rows past the window, and leaves machine_days /
 #     machine_first_seen alone
 #   * each machine's first_index_day is its earliest index, and survives the purge
-#   * the cron catches up on a day that saw activity but was never rolled up
+#   * the cron catches up on a day that saw activity but was never rolled up, and
+#     logs its one summary line
 #   * usage comes from usage_daily; a legacy usage row still in `events` is folded
 #     into it (counts added, row deleted) before the day is rolled up
 #   * /admin/rollup does not exist without ADMIN_TOKEN, and rejects a wrong one
@@ -196,6 +197,12 @@ is "rollup $DAY_RESET with reset → 200" 200 "$(roll "day=$DAY_RESET&reset=1")"
 # rolled up), and purges everything past the window.
 is "cron trigger → 200" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/__scheduled?cron=30+0+*+*+*")"
 sleep 2
+# Its one summary line: written once the purge and every rollup are done, and with
+# nothing this small left for the next night by the time budget.
+is "the cron logs its summary, nothing failed or deferred" "0/0" \
+   "$(grep -ao '{"msg":"nightly rollup".*}' "$LOG" | tail -1 |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+        const r=JSON.parse(s||"{}");console.log(`${r.failed}/${r.deferred}`);})')"
 
 # Rolling a purged day with reset=1 must NOT blank the rollups it already has: past
 # the window the reset is ignored, so the delete-then-rebuild can't find zero events.

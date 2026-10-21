@@ -7,9 +7,10 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
-import { Language } from '../types';
+import { ExtractionError, Language } from '../types';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -241,10 +242,14 @@ export function hasMpegTsExtension(filePath: string): boolean {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its extensions count as indexable in addition
  * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to. A Shopify theme's
+ * JSON templates count only when it is given, since telling a theme apart takes
+ * a look at the files beside them (see `isShopifyLiquidJson`).
  */
-export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
-  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isShopifyLiquidJson(filePath, rootDir)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
@@ -253,14 +258,54 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
 }
 
 /**
+ * What marks a Shopify theme's root, beside its `templates/` and `sections/`:
+ * the `layout/theme.liquid` every theme must have, or its settings schema.
+ */
+const SHOPIFY_THEME_MARKERS = ['layout/theme.liquid', 'config/settings_schema.json'];
+
+/** The folders a Shopify theme is made of. */
+const SHOPIFY_THEME_FOLDERS = /^(assets|blocks|config|layout|locales|sections|snippets|templates)$/i;
+
+/**
+ * The root of the Shopify theme `filePath` is in: the directory holding the
+ * theme folder (one `folders` matches) the file sits in, when that directory
+ * also holds one of `SHOPIFY_THEME_MARKERS`. Project-relative and
+ * `/`-separated, '' for the project root; undefined when the file is in no
+ * theme. `exists` says whether a project-relative path exists. The folder
+ * nearest the file is tried first.
+ */
+export function shopifyThemeRoot(
+  filePath: string,
+  exists: (relativePath: string) => boolean,
+  folders: RegExp = SHOPIFY_THEME_FOLDERS,
+): string | undefined {
+  const segments = filePath.split('/');
+  for (let i = segments.length - 2; i >= 0; i--) {
+    if (!folders.test(segments[i]!)) continue;
+    const themeDir = segments.slice(0, i).join('/');
+    if (SHOPIFY_THEME_MARKERS.some((marker) => exists(themeDir ? `${themeDir}/${marker}` : marker))) return themeDir;
+  }
+  return undefined;
+}
+
+/**
  * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
  * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
  * extractor links them. (config/ + locales/ JSON have no section refs.)
+ *
+ * Only inside a Shopify theme: the directory holding that `templates/` or
+ * `sections/` must also hold one of `SHOPIFY_THEME_MARKERS`. Plenty of other
+ * projects keep JSON in folders with those names — a .NET project template's
+ * `templates/<name>/.template.config/template.json`, schematics, CMS content —
+ * and it is not Liquid. The theme is looked for under `rootDir`, the project
+ * root `filePath` is relative to; without one there is no theme to find.
  */
-export function isShopifyLiquidJson(filePath: string): boolean {
+export function isShopifyLiquidJson(filePath: string, rootDir?: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
-  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+  if (rootDir === undefined || !/(^|\/)(templates|sections)\/.+\.json$/i.test(filePath)) return false;
+  const exists = (relativePath: string): boolean => fs.existsSync(path.join(rootDir, relativePath));
+  return shopifyThemeRoot(filePath, exists, /^(templates|sections)$/i) !== undefined;
 }
 
 /**
@@ -377,11 +422,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
   // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
   // generated files off main and the 0.7.3-with-generated-files tag ships an
-  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
-  // tarball is byte-for-byte what the kernel's cargo build compiles — table
-  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
-  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
-  // classified list in the swift checklist doc.
+  // older ABI-14 generation; grammar.json rules are JSON-equal, and the
+  // kernel compiles the same tarball's src/ (codegraph-kernel/grammars/swift)
+  // — table identity by construction). Replaces the ^0.4.0 tree-sitter-wasms
+  // build (ABI 13 → 15). NOT graph-neutral — delta is error-set membership
+  // only; classified list in the swift checklist doc. The kernel's copy
+  // carries docs/grammars/tree-sitter-swift.patch (`try!` on Windows); this
+  // wasm doesn't need it — see that doc's .md.
   'swift',
   // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
   // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
@@ -536,15 +583,18 @@ export function getParser(language: Language): Parser | null {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its mappings take precedence over the built-in
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to, as for
+ * `isSourceFile`: a Shopify theme's JSON templates are Liquid only with it.
  */
-export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>, rootDir?: string): Language {
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
-  // links each section `"type"` to its `sections/<type>.liquid`).
-  if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // A Shopify theme's OS 2.0 JSON templates / section groups → the Liquid
+  // extractor (it links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath, rootDir)) return 'liquid';
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
@@ -826,6 +876,21 @@ export function getUnavailableGrammarErrors(): Partial<Record<Language, string>>
     out[language] = message;
   }
   return out;
+}
+
+/**
+ * Whether these extraction errors say the file was never parsed because its
+ * grammar was not available (`parser_error`, recorded by the extractor when
+ * `getParser` has nothing for the language).
+ *
+ * That is a fact about the running process, not about the file: a daemon whose
+ * install was upgraded or deleted underneath it fails every lazy grammar load
+ * (#2335). Such a result must never replace a file's index data, and a row an
+ * older engine stored that way must be re-indexed — not treated as current
+ * because its content hash still matches.
+ */
+export function hasGrammarLoadFailure(errors: readonly ExtractionError[] | undefined): boolean {
+  return !!errors && errors.some((e) => e.code === 'parser_error');
 }
 
 /**

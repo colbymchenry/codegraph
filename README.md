@@ -650,7 +650,10 @@ What it skips out of the box:
 - **Dependency, build, and cache directories** — `node_modules`, `vendor`,
   `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every
   [supported stack](#supported-languages) — so the graph is your code, not
-  third-party noise. This holds even with no `.gitignore`.
+  third-party noise. This holds even with no `.gitignore`. A `build` folder
+  inside `src/` is the exception: no build step writes TypeScript, JSX, Vue,
+  Svelte, Astro, Go, C# or Rust files into one, so those are indexed from it,
+  and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.

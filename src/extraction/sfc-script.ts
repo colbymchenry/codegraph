@@ -95,7 +95,11 @@ export function foldScriptResult(result: ExtractionResult, fold: ScriptFold, sin
   for (const edge of result.edges) {
     if (edge.kind === 'contains' && edge.source === blockFile) continue;
     if (edge.line) edge.line += fold.lineOffset;
-    if (fold.perInstance && runsAsComponent(edge.source) && edge.kind !== 'imports') edge.source = fold.componentNodeId;
+    // What a top-level value DOES is the component's; what it HOLDS stays its
+    // own — `const api = { load() {…} }` keeps `api::load` (#2300).
+    if (fold.perInstance && runsAsComponent(edge.source) && edge.kind !== 'imports' && edge.kind !== 'contains') {
+      edge.source = fold.componentNodeId;
+    }
     sink.edges.push(edge);
   }
 

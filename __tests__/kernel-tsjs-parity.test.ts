@@ -98,6 +98,126 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('named object literals own their members: %s (#2300)', (ext, language) => {
+    const source = [
+      '/* é😀 */ const Api = { read() { helper(); }, close: () => helper(), gen: function* () { yield 1; }, \'quoted-key\': function () {}, [dyn()]() { helper(); }, eager: helper(), alias: helper, helper };',
+      'function helper() {}',
+      '/** Saved. */',
+      'export const Exported = { save() { helper(); } };',
+      '(function () { const Local = { run() { helper(); } }, data = { x: 1 }; Local.run(); window.WS = { ws() { Local.run(); } }; })();',
+      'App.utils = { pad(s) { return s; } };',
+      '// The page.',
+      'dw_page = { start() { helper(); } };',
+      'function setup() { ns.late = { go() {} }; let h; h = { on() {} }; }',
+      'module.exports = { cjs() {} };',
+      'Foo.prototype = { proto() {} };',
+      'self.handlers = { click() {} };',
+      'consume({ ephemeral() {} });',
+      '',
+    ].join('\n');
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`literal.${ext}`, source.replace(/\n/g, ending), language);
+      expect(result.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining([
+        'Api::read', 'Api::close', 'Api::gen', 'Api::quoted-key', 'Exported::save', 'Local::run', 'window.WS',
+        'window.WS::ws', 'App.utils::pad', 'dw_page::start', 'ns.late::go', 'self.handlers::click',
+      ]));
+      // A plain name reassigned inside a function is a local, not a namespace.
+      for (const name of ['cjs', 'proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+    }
+  });
+
+  it.each([['ts', 'typescript'], ['tsx', 'tsx']] as const)('an awaited call with type arguments names its callee: %s (#2586)', (ext, language) => {
+    const source = [
+      'export async function a() { return await fetchApi<User>("/me"); }',
+      'export async function b() { return await api.fetchApi<User>("/me"); }',
+      'export async function c() { return (await load())(); }',
+      'export async function d() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function e() { return await api.get<User>("/me").then(r => r); }',
+      'export async function f() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function g() { return await await fetchApi<User>("/me"); }',
+      'export async function h() { return await // typed\n fetchApi<User>("/me").then(r => r); }',
+      '',
+    ].join('\n');
+    const result = assertParity(`awaited.${ext}`, source, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi', 'fetchApi().json', 'api.get().then']));
+    expect(calls.some((n) => /^await|^\/[*/]/.test(n))).toBe(false);
+  });
+
+  it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {
+    // Mostly long lines dense with code punctuation, as a minifier writes them.
+    const line = `var a={b:function(){return c(1,2)},d:function(e){return e}};window.L={f:function(){return a.b()}};`.repeat(40);
+    const result = assertParity(file, `${line}\n${line}\n`, 'javascript');
+    expect(result.nodes.some((n) => n.kind === 'function' && (n.name === 'b' || n.name === 'f'))).toBe(false);
+  });
+
+  describe.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a store exported by a later statement: %s', (ext, language) => {
+    it.each(['LF', 'CRLF'])('keeps its actions (%s)', (ending) => {
+      // `export default useStore;` is found by a multiline regex over the
+      // source. JS's `$` matches before the `\r` of a CRLF line ending; the
+      // kernel's must too, or a Windows checkout loses the store's actions.
+      const source = [
+        'import { create } from "zustand";',
+        'const useStore = create((set) => ({ inc: () => set({}) }));',
+        'export default useStore;',
+        '',
+      ].join(ending === 'CRLF' ? '\r\n' : '\n');
+      const result = assertParity(`store.${ext}`, source, language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(true);
+    });
+
+    it.each([
+      ['items$', 'export { items$ };', true],
+      ['$items', 'export { $items as default };', true],
+      ['items', 'export { items$ };', false],
+      ['items', 'export { $items };', false],
+    ] as const)('an export clause names %s only whole: `%s`', (name, exportLine, kept) => {
+      // `\b` takes a `$` for a separator: it can't bound `items$` or
+      // `$items`, and it finds `items` inside both. `other` keeps the
+      // negative cases above assertParity's node floor.
+      const source = [
+        'import { create } from "zustand";',
+        `const ${name} = create((set) => ({ inc: () => set({}) }));`,
+        'const other = 1;',
+        exportLine,
+        '',
+      ].join('\n');
+      const result = assertParity(`store.${ext}`, source, language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(kept);
+    });
+  });
+
+  describe.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a store whose name has a `$`, exported by a later statement: %s', (ext, language) => {
+    // The later-export check builds a regex from the name. Its `$` must match
+    // the character, as the kernel's escaped pattern does, not a line end.
+    const store = (name: string, ...exportLines: string[]) => [
+      'import { create } from "zustand";',
+      `const ${name} = create((set) => ({ inc: () => set({}) }));`,
+      ...exportLines,
+      '',
+    ].join('\n');
+
+    it.each([
+      ['items$', 'export default items$;'],
+      ['$store', 'export default $store;'],
+      ['a$b', 'export { a$b };'],
+    ])('keeps its actions (%s)', (name, exportLine) => {
+      const result = assertParity(`store.${ext}`, store(name, exportLine), language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(true);
+    });
+
+    it('is not exported by a different name at a line end', () => {
+      const result = assertParity(`store.${ext}`, store('items$', 'const items = 1;', 'export {', '  items', '};'), language);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'inc')).toBe(false);
+    });
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('same-line accessors retain distinct identities after Unicode: %s (#1349)', (ext, language) => {
     const source = 'class Point { /* é😀 */ get x() { return read(); } set x(v) { write(v); } }';
     const result = assertParity(`point.${ext}`, source, language);
@@ -188,6 +308,81 @@ async function exprReceivers(x, y) {
       ]);
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('walks a module-scope destructuring declaration like a body does: %s (#2340)', (ext, language) => {
+    const typed = language === 'typescript' || language === 'tsx';
+    const result = assertParity(`fixture.${ext}`, `
+import { handler } from './h';
+const { a } = useFoo(1);
+let [b, c] = pair();
+var { d: { e } } = nested();
+const { f = fallback() } = withDefault(handler);
+const [g = other(), ...rest] = list(() => inArrow(handler));
+export const { h } = exported(new Store());
+export const { useGetUserQuery } = api;
+${typed ? 'const { k }: Shape = make();' : ''}
+function probe() { const { j } = inner(); return j; }
+export function second() { return probe(); }
+`, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining([
+      'useFoo', 'pair', 'nested', 'fallback', 'withDefault', 'other', 'list', 'inArrow', 'exported', 'inner',
+      ...(typed ? ['make'] : []),
+    ]));
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'],
+  ] as const)('typed styled tags are components, parsed as comparisons or not: %s', (ext, language) => {
+    // `styled.div<Props>\`…\`` parses as `(styled.div < Props) > \`…\``; the
+    // type argument's own operators sit between (`<A | B>`, `<Partial<A>>`).
+    const result = assertParity(`styles.${ext}`, `
+import styled, { css } from 'styled-components';
+import { s } from './theme';
+type Props = { align: 'start' | 'end' };
+const Plain = styled.div\`color: red;\`;
+export const Wrapper = styled.div<Props>\`color: \${(p) => s(p.align)};\`;
+const CloseAction = styled.div<{ animation: Animation | null }>\`top: 0;\`;
+const Content = styled(Plain)<Props>\`padding: 4px;\`;
+const NudeButton = styled(Plain).attrs((props: Props) => ({ type: "button" }))<Props>\`\`;
+const Either = styled.div<Props | Other>\`color: red;\`;
+const Nested = styled.div<Partial<Props>>\`color: red;\`;
+const Mixin = css<Props>\`color: red;\`;
+const Compared = styled.length < LIMIT > 2;
+const lowerCase = styled.div<Props>\`color: red;\`;
+`, language);
+    const kind = (name: string) => result.nodes.filter((n) => n.name === name).map((n) => n.kind);
+    for (const name of ['Plain', 'Wrapper', 'CloseAction', 'Content', 'NudeButton', 'Either', 'Nested']) {
+      expect(kind(name), name).toEqual(['component']);
+    }
+    for (const name of ['Mixin', 'Compared', 'lowerCase']) expect(kind(name), name).toEqual(['constant']);
+  });
+
+  it.each([
+    ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('edges the file-scope values a component reads or renders: %s', (ext, language) => {
+    // `.jsx` was left out of the value-reference languages on both paths, so
+    // this file had none of these edges as .jsx and all of them as .js or .tsx.
+    const result = assertParity(`routes.${ext}`, `
+import { lazy } from 'react';
+import Loadable from './Loadable';
+const LoginPage = Loadable(lazy(() => import('./pages/Login')));
+const ROUTE_TABLE = [{ path: '/login', label: 'Login' }];
+const THEME_TOKENS = { color: 'red', size: 12 };
+export function AuthRoutes() { return <LoginPage />; }
+export function Nav() {
+  return <ul style={{ color: THEME_TOKENS.color }}>{ROUTE_TABLE.map((r) => <li key={r.path}>{r.label}</li>)}</ul>;
+}
+export const Box = () => <div data-size={THEME_TOKENS.size} />;
+`, language);
+    const name = (id: string) => result.nodes.find((n) => n.id === id)?.name;
+    expect(result.edges
+      .filter((e) => e.kind === 'references' && e.metadata?.valueRef === true)
+      .map((e) => `${name(e.source)} -> ${name(e.target)}`)
+      .sort()).toEqual(['AuthRoutes -> LoginPage', 'Box -> THEME_TOKENS', 'Nav -> ROUTE_TABLE', 'Nav -> THEME_TOKENS']);
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
@@ -255,6 +450,30 @@ class Consumer:
     const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
     expect(names.sort()).toEqual(['Store.Fetch', 'c.Fetch', 'c.store.Fetch']);
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
+  });
+
+  it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {
+    // The stoplist holds bare words like Python's `None`; `raft.None` (etcd)
+    // and cgo's `C.NULL` are still values. The name is operand + field, so a
+    // break or comment after the dot keeps it; one inside the operand doesn't.
+    const source = `package demo
+import "example.com/raft"
+type Store struct{}
+func (s *Store) new() any { return nil }
+func wire(s *Store) {
+	Submit(raft.None, C.NULL, None, nil)
+	pool := sync.Pool{New: s.new}
+	Submit(raft.
+		Next, raft./* c */ Prev, raft.// c
+		Last)
+	Submit(s.
+		inner.Fetch)
+	_ = pool
+}
+`;
+    const result = assertParity('values.go', ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['C.NULL', 'raft.Last', 'raft.Next', 'raft.None', 'raft.Prev', 's.new']);
   });
 
   it.each(REAL_SOURCES)('real source parity: %s', (rel) => {

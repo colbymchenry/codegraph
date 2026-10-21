@@ -14,6 +14,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { commandsHref, localizeDefault, parseAngularRoutes, staticString } from '../src/resolution/frameworks/angular-router';
+import { readMicrosyntax, templateMemberUses } from '../src/resolution/angular-template-synthesizer';
+import { buildDeadCodeReport } from '../src/graph/dead-code';
 import { buildScreens } from '../src/ui-server/api/screens';
 import { buildSteps } from '../src/ui-server/api/steps';
 
@@ -108,6 +110,83 @@ describe('Angular destinations', () => {
     expect(commandsHref(`['edit']`)).toBeNull();
     // Nothing static: it would match any route of its length.
     expect(commandsHref('[`/${a}`, b, c]')).toBeNull();
+  });
+});
+
+describe('what a template reads at render', () => {
+  const uses = (template: string) => templateMemberUses(template).map((u) => `${u.name}${u.call ? '()' : ''} ${u.via}`);
+
+  it('reads property bindings, interpolations, structural directives, control flow and @let', () => {
+    expect(uses(`<button (click)="cycle()" [attr.aria-label]="label()"><i [name]="icon()"></i></button>`)).toEqual([
+      'label() [attr.aria-label]',
+      'icon() [name]',
+    ]);
+    expect(uses(`<p *ngIf="isOpen(); else closed">{{ count() }} {{ total }}</p><ng-template #closed></ng-template>`)).toEqual([
+      'isOpen() *ngIf',
+      'count() {{ }}',
+      'total {{ }}',
+    ]);
+    expect(uses(`@if (loading()) { x } @else if (failed()) { y } @switch (mode()) { @case (Mode.A) { a } }`)).toEqual([
+      'loading() @if',
+      'failed() @else if',
+      'mode() @switch',
+      'Mode @case',
+    ]);
+    // `on timer(5s)` is a trigger, not a call.
+    expect(uses(`@defer (on viewport; when ready(); prefetch on timer(5s)) { x }`)).toEqual(['ready() @defer']);
+    expect(uses(`@let total = price() * quantity; <input [(ngModel)]="title">`)).toEqual(['price() @let', 'quantity @let', 'title [(ngModel)]']);
+  });
+
+  it("leaves out a pipe, an object key, another object's member, a string, a comment and an event binding", () => {
+    expect(uses(`{{ total | currency: code() }} <i [ngClass]="{ active: isActive() }" [x]="form.reset() || this.own()"></i>`)).toEqual([
+      'total {{ }}',
+      'code() {{ }}',
+      'isActive() [ngClass]',
+      'form [x]',
+      'own() [x]',
+    ]);
+    expect(uses(`<!-- {{ legacy() }} <b [x]="old()"></b> --> {{ 'quoted()' }} <b (click)="save()"></b>`)).toEqual([]);
+    // A template literal's text is a string; its holes are expressions.
+    expect(uses('<td [class.today]="isToday(`${key}-${formatDay(day)}`)" [title]="`quoted()`"></td>')).toEqual([
+      'isToday() [class.today]',
+      'key [class.today]',
+      'formatDay() [class.today]',
+      'day [class.today]',
+    ]);
+  });
+
+  it('leaves out the names the template declares, where they are visible', () => {
+    // A microsyntax's locals, keys and context names belong to the directive.
+    expect(uses(`<li *ngFor="let item of items(); let i = index; trackBy: trackById" [title]="item.name">{{ i }}</li>`)).toEqual([
+      'items() *ngFor',
+      'trackById *ngFor',
+    ]);
+    // An alias belongs to the body, not to the condition that names it.
+    expect(uses(`@if (user(); as user) { {{ user.name }} }`)).toEqual(['user() @if']);
+    expect(uses(`<div *ngIf="user() as user">{{ user.name }}</div>`)).toEqual(['user() *ngIf']);
+    // `track` sees the loop's own names.
+    expect(uses(`@for (item of items(); track item.id; let odd = $odd) { {{ item.name }} {{ odd }} }`)).toEqual(['items() @for']);
+    expect(uses(`@let total = price(); {{ total }}`)).toEqual(['price() @let']);
+    // A reference variable is seen across the template, even before it is declared.
+    expect(uses(`<b [x]="input.value"></b><input #input>`)).toEqual([]);
+    expect(uses(`<ng-template let-row let-i="index">{{ row.name }} {{ i }}</ng-template>`)).toEqual([]);
+  });
+
+  it('splits a microsyntax into its expressions and its locals', () => {
+    expect(readMicrosyntax('let item of items | async; index as i; trackBy: trackFn')).toEqual({
+      expressions: [
+        { at: 12, text: 'items | async' },
+        { at: 48, text: 'trackFn' },
+      ],
+      locals: ['item', 'i'],
+    });
+    expect(readMicrosyntax('user$ | async as user; else loading')).toEqual({
+      expressions: [
+        { at: 0, text: 'user$ | async ' },
+        { at: 28, text: 'loading' },
+      ],
+      locals: ['user'],
+    });
   });
 });
 
@@ -315,6 +394,185 @@ export class AdminRoutingModule {}
       '/login -> /home',
       '/login -> /home via done',
     ]);
+  });
+});
+
+describe("an Angular template's bindings, indexed", () => {
+  let cg: CodeGraph;
+  let root: string;
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-bindings-'));
+    projects.push(root);
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ dependencies: { '@angular/core': '^19.0.0', '@angular/router': '^19.0.0' } }),
+      'src/app/app.routes.ts': `import { Routes } from '@angular/router';
+import { TasksComponent } from './tasks/tasks.component';
+export const routes: Routes = [{ path: 'tasks', component: TasksComponent }];
+`,
+      // An inline template: its bindings are written in the class's own file.
+      'src/app/nav/nav.component.ts': `import { Component, signal } from '@angular/core';
+@Component({
+  selector: 'app-nav',
+  template: \`<nav>
+    <app-theme-toggle [class.open]="isOpen()" />
+  </nav>\`,
+})
+export class NavComponent {
+  isOpen = signal(false);
+}
+`,
+      'src/app/theme-toggle/theme-toggle.component.ts': `import { Component, computed, signal } from '@angular/core';
+@Component({ selector: 'app-theme-toggle', templateUrl: './theme-toggle.component.html' })
+export class ThemeToggleComponent {
+  private readonly theme = signal<'light' | 'dark'>('light');
+  icon = computed(() => (this.theme() === 'dark' ? 'moon' : 'sun'));
+  label = computed(() => (this.theme() === 'dark' ? 'Dark' : 'Light'));
+  cycle(): void {
+    this.theme.set(this.theme() === 'dark' ? 'light' : 'dark');
+  }
+  unused(): void {}
+}
+`,
+      'src/app/theme-toggle/theme-toggle.component.html': `<button (click)="cycle()" [attr.aria-label]="label()">
+  <lucide-icon [name]="icon()"></lucide-icon>
+</button>
+`,
+      'src/app/tasks/tasks.component.ts': `import { Component, computed, signal } from '@angular/core';
+@Component({ selector: 'app-tasks', templateUrl: './tasks.component.html' })
+export class TasksComponent {
+  lists = signal<{ id: number; title: string; items: { done: boolean }[] }[]>([]);
+  selectedListId = signal<number | null>(null);
+  selected = computed(() => this.lists().find((l) => l.id === this.selectedListId()));
+  editing = signal(false);
+  title = 'Tasks';
+  form = { reset() {} };
+  days = Array.from({ length: 3 }, (_, i) => i + 1);
+  row = computed(() => 0);
+  nameInput = (value: string) => value;
+
+  get canSave(): boolean {
+    return this.lists().length > 0;
+  }
+  remainingItems(list: { items: { done: boolean }[] }): number {
+    return list.items.filter((i) => !i.done).length;
+  }
+  trackById(index: number, list: { id: number }): number {
+    return list.id;
+  }
+  displayFn(list: { title: string }): string {
+    return list.title;
+  }
+  format(value: string): string {
+    return value;
+  }
+  reset(): void {}
+  set(): void {}
+  legacy(): string {
+    return '';
+  }
+  quoted(): string {
+    return '';
+  }
+  save(): void {}
+}
+`,
+      'src/app/tasks/tasks.component.html': `<!-- {{ legacy() }} -->
+<h1 [title]="title">{{ 'quoted()' }}</h1>
+<input #nameInput [value]="nameInput.value" (blur)="selected() && save()" />
+@if (editing()) {
+  <span>editing</span>
+}
+<ul>
+  @for (list of lists(); track trackById($index, list)) {
+    <li [class.active]="list.id === selectedListId()" (click)="selectedListId.set(list.id)">
+      {{ list.title | format }} <small>{{ remainingItems(list) }}</small>
+    </li>
+  }
+</ul>
+@for (row of [selected()]; track row) {
+  <b>{{ row?.title }}</b>
+}
+@for (day of days; track day) {
+  <i>{{ day }}</i>
+}
+<mat-autocomplete [displayWith]="displayFn"></mat-autocomplete>
+<button [disabled]="!canSave" (click)="form.reset()">Reset</button>
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    cg = await CodeGraph.init(root, { index: true });
+  });
+  afterAll(() => cg.close());
+
+  /** `Source -> target [kind] via @ file:line` for every template edge of one mechanism. */
+  const templateEdges = (synthesizedBy: string) =>
+    cg
+      .getNodesByKind('class')
+      .flatMap((c) =>
+        cg
+          .getOutgoingEdgesFrom([c.id], ['calls', 'references'])
+          .filter((e) => (e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === synthesizedBy)
+          .map((e) => {
+            const meta = e.metadata as Record<string, unknown>;
+            const target = cg.getNode(e.target)!;
+            return `${c.name} -> ${target.kind} ${target.name} [${e.kind}${meta.fnRef ? ' fnRef' : ''}] ${String(meta.via)} @ ${String(meta.registeredAt)}`;
+          })
+      )
+      .sort();
+
+  it("links each binding's own-member call — and a callable it only reads — to the component, at the binding's line", () => {
+    expect(templateEdges('angular-binding')).toEqual([
+      'NavComponent -> property isOpen [calls] [class.open] @ src/app/nav/nav.component.ts:5',
+      // A getter runs when it is read.
+      'TasksComponent -> method canSave [calls] [disabled] @ src/app/tasks/tasks.component.html:21',
+      // A field a call filled is read, not called.
+      'TasksComponent -> method days [references] @for @ src/app/tasks/tasks.component.html:17',
+      // A function handed to a child is a function reference.
+      'TasksComponent -> method displayFn [references fnRef] [displayWith] @ src/app/tasks/tasks.component.html:20',
+      'TasksComponent -> method remainingItems [calls] {{ }} @ src/app/tasks/tasks.component.html:10',
+      'TasksComponent -> method trackById [calls] @for @ src/app/tasks/tasks.component.html:8',
+      // A signal is a field, and calling it reads it.
+      'TasksComponent -> property editing [calls] @if @ src/app/tasks/tasks.component.html:4',
+      'TasksComponent -> property lists [calls] @for @ src/app/tasks/tasks.component.html:8',
+      'TasksComponent -> property selectedListId [calls] [class.active] @ src/app/tasks/tasks.component.html:9',
+      'ThemeToggleComponent -> method icon [calls] [name] @ src/app/theme-toggle/theme-toggle.component.html:2',
+      'ThemeToggleComponent -> method label [calls] [attr.aria-label] @ src/app/theme-toggle/theme-toggle.component.html:1',
+    ]);
+    // An inline template's edge sits on its own line of the class's file.
+    const nav = cg.getNodesByKind('class').find((c) => c.name === 'NavComponent')!;
+    expect(cg.getOutgoingEdgesFrom([nav.id], ['calls']).find((e) => cg.getNode(e.target)?.name === 'isOpen')?.line).toBe(5);
+  });
+
+  it('links nothing for a field read, a pipe, a member of another object, a comment, a string or a name the template declares', () => {
+    const tasks = cg.getNodesByKind('class').find((c) => c.name === 'TasksComponent')!;
+    const linked = cg.getOutgoingEdgesFrom([tasks.id], ['calls', 'references']).map((e) => cg.getNode(e.target)?.name);
+    for (const name of ['title', 'format', 'reset', 'set', 'legacy', 'quoted', 'row', 'nameInput']) expect(linked).not.toContain(name);
+    // A member the event bindings already link keeps that edge: `selected()` is both.
+    expect(templateEdges('angular-event')).toEqual([
+      'TasksComponent -> method save [calls] (blur) @ src/app/tasks/tasks.component.html:3',
+      'TasksComponent -> method selected [calls] (blur) @ src/app/tasks/tasks.component.html:3',
+      'ThemeToggleComponent -> method cycle [calls] (click) @ src/app/theme-toggle/theme-toggle.component.html:1',
+    ]);
+  });
+
+  it('takes members a template uses off the dead-code list, and keeps the ones it does not', () => {
+    const listed = buildDeadCodeReport(cg, { limit: 100 }).entries.map((e) => e.node.name);
+    expect(listed).toContain('unused');
+    expect(listed).not.toContain('icon');
+    expect(listed).not.toContain('label');
+    expect(listed).not.toContain('remainingItems');
+    expect(listed).not.toContain('canSave');
+  });
+
+  it('draws a binding as render-time work in Steps, not as something the user triggers', async () => {
+    const screen = cg.getNodesByKind('route').find((r) => r.name === '/tasks')!;
+    const payload = await buildSteps(cg, root, new URLSearchParams({ anchor: screen.id }));
+    const labels = payload.steps.map((s) => s.label);
+    expect(payload.steps.find((s) => s.label === 'save')?.trigger).toMatchObject({ kind: 'prop', name: '(blur)', of: 'input' });
+    for (const name of ['remainingItems', 'canSave', 'trackById', 'lists']) expect(labels).not.toContain(name);
   });
 });
 

@@ -22,7 +22,8 @@ export function recordSpawns(fixture: string): { args: string[]; env: NodeJS.Pro
   return { args: ['--require', SPAWN_RECORDER], env: { CG_TEST_SPAWN_LOG: spawnLogFor(fixture) } };
 }
 
-function recordedPids(fixture: string): number[] {
+/** The pids of every candidate the launchers started for `fixture` recorded. */
+export function recordedPids(fixture: string): number[] {
   let raw = '';
   try { raw = fs.readFileSync(spawnLogFor(fixture), 'utf8'); } catch { return []; }
   return raw.split('\n').map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0);

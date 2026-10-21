@@ -122,6 +122,43 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     expect(names).not.toContain('registration');
   });
 
+  it.each(['\n', '\r\n'])('classes named with a scope or template arguments retain parity (%j)', (eol) => {
+    const source = [
+      'namespace leveldb {',
+      'template <typename Key, class Comparator>',
+      'class SkipList { struct Node; Node* head_; };',
+      'template <typename Key, class Comparator>',
+      'struct SkipList<Key, Comparator>::Node {',
+      '  Node* Next(int n) { return nullptr; }',
+      '  struct Link { int hops() const { return 0; } };',
+      '};',
+      'class Table { struct Rep; };',
+      'struct Table::Rep { int seqno() const { return 0; } };',
+      'namespace leveldb {',
+      'struct leveldb::Table::Rep2 {};',
+      '}',
+      'struct ::Top { int depth() const { return 0; } };',
+      '}  // namespace leveldb',
+      'template <typename R, typename... Args>',
+      'class FunctionMocker<R(Args...)> { R Invoke(Args... args) { return R(); } };',
+      'template <> struct fmt::formatter<int> { int format(int x) const { return x; } };',
+      'union ::Global::Bits { int all; };',
+      'struct Tag;',
+      'struct ::Tag { int bits() const { return 0; } };',
+      '',
+    ].join(eol);
+    assertParity('scoped-classes.h', source, 'cpp', 10);
+    const result = tryKernelExtract('scoped-classes.h', source, 'cpp')!;
+    const named = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.qualifiedName).sort();
+    // A name written from the global scope alone has no scope to be qualified under.
+    expect(result.nodes.map((n) => n.qualifiedName).filter((q) => q.startsWith('::') || q.includes('::::'))).toEqual([]);
+    expect(named('struct')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node', 'leveldb::SkipList::Node::Link', 'leveldb::Table::Rep', 'leveldb::Table::Rep2']));
+    expect(named('union')).toEqual(['Global::Bits']);
+    expect(named('method')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node::Next', 'leveldb::SkipList::Node::Link::hops', 'leveldb::Table::Rep::seqno']));
+    // A specialization is not named after its template.
+    expect([...named('struct'), ...named('class')].filter((q) => /formatter|FunctionMocker/.test(q))).toEqual([]);
+  });
+
   it.each(['\n', '\r\n'])('COM interface declarations retain native/wasm parity (%j)', (eol) => {
     const source = [
       '#define interface struct',
@@ -230,6 +267,52 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
       '',
     ].join('\n');
     assertParity('fixtures/kern.cu', cuda, 'cpp');
+  });
+
+  // protobuf's generated headers and leveldb's thread annotations put
+  // attribute macros where tree-sitter can't read them: stacked in a class
+  // head, between a pointer and its name, after a parameter list or a field,
+  // opening a member. The hoisted preParse blanks them all, so the file parses
+  // clean and goes through the kernel instead of deferring — at parity.
+  it.each(['\n', '\r\n'])('attribute-macro shapes parse clean through the hoisted preParse (%j)', (eol) => {
+    const source = [
+      'namespace google {',
+      'namespace protobuf {',
+      'class PROTOBUF_EXPORT  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Any final : public ::google::protobuf::Message',
+      '/* @@protoc_insertion_point(class_definition:google.protobuf.Any) */ {',
+      ' public:',
+      '  ~Any() PROTOBUF_FINAL;',
+      '  [[nodiscard]] const ::google::protobuf::UnknownFieldSet& unknown_fields() const',
+      '      ABSL_ATTRIBUTE_LIFETIME_BOUND {',
+      '    return _internal_metadata_.unknown_fields();',
+      '  }',
+      '  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL',
+      '  GetDescriptor() {',
+      '    return default_instance().GetMetadata().descriptor;',
+      '  }',
+      '  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view name() const { return name_; }',
+      '  void Swap(Any* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) { InternalSwap(other); }',
+      '',
+      ' private:',
+      '  void InternalSwap(Any* PROTOBUF_NONNULL other);',
+      '  int count_ GUARDED_BY(mu_);',
+      '};',
+      'void Any::InternalSwap(Any* PROTOBUF_NONNULL other) { swap(*other); }',
+      '}  // namespace protobuf',
+      '}  // namespace google',
+      '',
+    ].join(eol);
+    assertParity('fixtures/any.pb.h', source, 'cpp', 6);
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    const result = tryKernelExtract('fixtures/any.pb.h', source, 'cpp')!;
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toEqual(expect.arrayContaining([
+      'google::protobuf::Any::GetDescriptor',
+      'google::protobuf::Any::InternalSwap',
+      'google::protobuf::Any::Swap',
+      'google::protobuf::Any::name',
+      'google::protobuf::Any::unknown_fields',
+    ]));
   });
 
   // Every torture fixture again with CRLF line endings — the shape every

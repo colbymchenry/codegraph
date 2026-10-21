@@ -113,6 +113,46 @@ fn next() {}
     assertParity('commands.rs', source.replace(/\n/g, '\r\n'));
   });
 
+  it('variant paths reference their receiver (#2328)', () => {
+    const source = `
+use crate::mode::{self, Mode};
+const DEFAULT: Mode = Mode::A;
+impl Mode {
+    fn flip(&self) -> u8 {
+        let _s = "ü"; let _x = Self::B;
+        match self { Self::A => 1, Mode::C(x) => *x, mode::Mode::D { x } => *x, _ => 0 }
+    }
+}
+trait Tr { fn t(&self) { let _ = Self::K; } }
+fn uses() {
+    use crate::mode::Mode::A;
+    let _a = crate::mode::Mode::A; let _b = Mode::C(1); let _c = Mode::D { x: 2 };
+    let _d = Mode::new(); let _e = util::take(3); let _f = u8::MAX; let _g = Limits::MAX;
+    let _h = xs.map(Mode::C); let _i = Option::<u8>::None; let _j = Mode::A.flip();
+    if let Mode::C(x) | Mode::B = m {}
+    match o { Option::Some(_) => std::cmp::Ordering::Less, _ => cmp::Ordering::Greater };
+}
+`;
+    assertParity('variants.rs', source);
+    assertParity('variants.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: each path to a capitalized member outside a call's callee,
+    // a struct literal and a `use` is a `references` ref to its receiver
+    // (`Self` read as the impl's type; none in a trait). The resolver decides
+    // which of them name a project enum's variant.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const refs = extractFromSource('variants.rs', source, 'rust').unresolvedReferences;
+    delete process.env.CODEGRAPH_KERNEL;
+    const lines = source.split('\n');
+    const paths = refs
+      .filter((r) => r.referenceKind === 'references' && /^\w+\s*::/.test(lines[r.line - 1]!.slice(r.column)))
+      .map((r) => `${r.referenceName}:${r.line}`);
+    expect(paths.sort()).toEqual([
+      'Limits:14', 'Mode:13', 'Mode:15', 'Mode:15', 'Mode:16', 'Mode:16', 'Mode:3', 'Mode:6',
+      'Mode:7', 'Mode:7', 'Mode:7', 'Option:17', 'Ordering:17', 'Ordering:17',
+    ]);
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

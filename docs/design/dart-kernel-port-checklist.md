@@ -190,10 +190,12 @@ change dart's grammar, which is exactly the hazard this vendor kills.
 
 Types: functionTypes=[`function_signature`] (:119); classTypes=
 [`class_definition`] (:120); methodTypes=[`method_signature`,
-`constructor_signature`] (:126); interfaceTypes=[] ; structTypes=[];
+`constructor_signature`, `constant_constructor_signature`,
+`redirecting_factory_constructor_signature`] (:126 — the last two since
+2026-10-06); interfaceTypes=[] ; structTypes=[];
 enumTypes=[`enum_declaration`] (:129); enumMemberTypes=[`enum_constant`]
-(:130); typeAliasTypes=[`type_alias`] (:131); importTypes=[`import_or_export`]
-(:132); **callTypes=[] (:133 — extractCall NEVER runs for dart; all call refs
+(:130); typeAliasTypes=[`type_alias`] (:131); importTypes=[`import_or_export`,
+`part_directive`] (:132 — the second since 2026-10-06); **callTypes=[] (:133 — extractCall NEVER runs for dart; all call refs
 ride `extractBareCall` in the body walker)**; variableTypes=[] (:134 —
 extractVariable never runs); extraClassNodeTypes=[`mixin_declaration`,
 `extension_declaration`] (:135). nameField=`name` (:172), bodyField=`body`
@@ -237,9 +239,18 @@ Grammar-shape facts the config leans on (all probed, `mini-cst.txt` /
   initializers]`) — reached by the walker via plain recursion into
   `declaration`. `const` constructors are `declaration >
   constant_constructor_signature` and redirecting factories are
-  `declaration > redirecting_factory_constructor_signature` — **NEITHER is
-  in methodTypes → const ctors and `const factory X.r() = Impl;` are
-  INVISIBLE (no node, no refs)**. Fields are `declaration >
+  `declaration > redirecting_factory_constructor_signature` — both carry
+  NO fields (children: `const_builtin`? `"factory"`? identifier [`.`
+  identifier] formal_parameter_list, then for a redirect `=` and the
+  target: `type_identifier` [type_arguments] [`.` name], where the target
+  constructor's name is a `type_identifier` without type arguments and an
+  `identifier` after them). Until 2026-10-06 neither was in methodTypes
+  (no node, no refs); now both mint methods exactly like the bare
+  `constructor_signature` (§isMisparsedFunction, §resolveName). Abstract and
+  `external` members are `declaration > function_signature` too (an anon
+  `external`/`static` keyword may precede the signature). In every one of
+  these the member's dartdoc and annotations are siblings of the
+  `declaration`, not of the signature — §getDeclarationWrapper. Fields are `declaration >
   (static)? (final|const|type|var) > initialized_identifier_list |
   static_final_declaration_list` (§Constants).
 - **Statements/expressions:** calls have NO call node — a postfix chain is
@@ -269,12 +280,31 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   expression node); initValue = its text `.slice(0,100)` (UTF-16);
   `ctx.createNode('constant', name, node, { signature: initValue ? \`=
   ${initValue}${initValue.length >= 100 ? '...' : ''}\` : undefined })`.
-  Return **true** (consumed — even when nameNode missing? NO: name found is
-  required for createNode but the hook returns true for EVERY
+  When the constant is minted, the hook pushes it and walks the WHOLE
+  declaration with the body walker (`ctx.walkInitializer(node)` —
+  visitFunctionBody that records the node as walked), then pops: the
+  initializer's calls, instantiations, static and member reads, types,
+  closures (block bodies and local functions included) and fn-ref
+  candidates (the `varinit` capture of the declaration itself included) are
+  the CONSTANT's. Return **true** (consumed — even when nameNode missing? NO:
+  name found is required for createNode but the hook returns true for EVERY
   static_final_declaration reached, node minted or not — transcribe the
-  early-return shape exactly: `if (nameNode) {…}; return true`). The
-  dispatcher then runs `scanFnRefSubtree(node, 0)` and never descends →
-  §Function-as-value for what still gets captured. Everything else → false.
+  early-return shape exactly: `if (nameNode) {…; if (constant) walk}; return
+  true`). The dispatcher then runs `scanFnRefSubtree(node, 0, walked)` —
+  which skips a walked declaration outright, so only an unminted one is
+  scanned — and never descends.
+- **visitNode — the field / top-level variable branch.** `node.type ===
+  'initialized_identifier'` whose parent is an `initialized_identifier_list`
+  directly under `program`, or under a `declaration` in a
+  class_body/extension_body/enum_body → `ctx.walkInitializer(node)` with no
+  push (the stack top is the file or the class/enum), return **true**. These
+  declarations mint no node, so their initializers are the FILE's or the
+  CLASS's. An `initialized_identifier` anywhere else — the second variable of
+  a local `for (var i = 0, j = n(); …)`, under `initialized_variable_definition`
+  — is left to its function's body walk (the double-walk's pass 2a reaches it
+  too, so the parent check is load-bearing). The `declaration` and `program`
+  type rows push only the DECLARED type's refs; initializer types come from
+  the walk. Everything else → false.
   **Reality of the node type (probed, `probe2-cst.txt`):**
   `static_final_declaration` = a `final`/`const` declaration WITH an
   initializer that is **top-level** (`const SHARED_MAX = 10;`, `final
@@ -301,6 +331,16 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   **LIVE and load-bearing for dart**: the comment there names Dart; a
   method/function node's endLine extends to the sibling body's end, e.g.
   `named` L123-125 spans its body).
+- **getDeclarationWrapper** — node's parent is a `declaration` AND node is
+  that declaration's FIRST named child (`firstNamedChild.equals(node)`;
+  kernel `named_child(0) == node` — an anon `external`/`static` keyword
+  before the signature doesn't count) → the `declaration`, else undefined.
+  Read by tree-sitter.ts's `docstringFor` (every docstring lookup, so the
+  kernel's `docstring_of` wraps all five `preceding_docstring` calls) and
+  by extractDecoratorsFor's scan #2 (§Decorators); scan #1 and
+  `getBodyDocstring` keep the node itself. Only Dart defines it — never add
+  `declaration` to DOCSTRING_WRAPPER_TYPES / docstring.rs `is_wrapper`,
+  which C/C++ (whose `declaration` wraps declarators) share.
 - **getReturnType = extractDartReturnType (:80-92)** — ctor = dartCtorInfo
   (§below): a validated ctor returns the CLASS name (named ctors, factories
   → ret = enclosing class). Else sig = dartInnerSignature (:9 —
@@ -330,7 +370,12 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   extension_declaration/enum_declaration and reads ITS name field) and
   `reduce` ≠ `Action` → treated as the method it is (pinned:
   `extract-probe4.txt` — method `reduce`, position starting AT `reduce`,
-  sig/ret undefined, decorates override intact).
+  sig/ret undefined, decorates override intact). dartCtorInfo reads only the
+  identifiers BEFORE the formal_parameter_list, so a redirecting factory's
+  target (`factory Foo() = _Impl.named;`) never names it. A
+  `constant_constructor_signature` / `redirecting_factory_constructor_signature`
+  that dartCtorInfo rejects (names no enclosing type — error recovery) is
+  skipped too: it can be nothing else.
 - **getSignature (:189-208)** — method_signature unwraps to
   function/getter/setter signature (NOT ctor/factory/operator); params =
   find namedChild `formal_parameter_list`; retType = find namedChild
@@ -346,7 +391,9 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   formal_parameter_list on method_signature); **bodiless named ctor
   (declaration > constructor_signature) → `"()"`-style params-only sig**
   (node IS the ctor signature; its formal_parameter_list is found by type) —
-  pin BOTH ctor sig shapes; operators → undefined.
+  pin BOTH ctor sig shapes; operators → undefined. `const` ctors and
+  redirecting factories → params only too: no retType is looked up for them
+  (a redirect's `= _Impl` type_identifier is its target, not a return type).
 - **getVisibility (:209-222)** — method_signature → unwrap to
   function/getter/setter signature → its first `identifier` child; other
   nodes → childForFieldName('name'). Name starts `_` → 'private', else
@@ -367,26 +414,32 @@ Hooks PRESENT (port each exactly — anchors into languages/dart.ts):
   children for type `'static'` → true; else false. `static WidgetT make()`
   → true ✓ (the `static` keyword is an anon child of method_signature);
   bare constructor_signature → false. Top-level functions → false.
-- **resolveName (:244-260)** — dartCtorInfo: named ctor/factory → the ctor
-  name (`named`, `create`, `_`); unnamed ctor or non-ctor → undefined (falls
-  to extractName §below).
+- **resolveName (:244-260)** — dartCtorInfo: named ctor/factory (`const`
+  and redirecting ones included) → the ctor name (`named`, `create`, `_`);
+  unnamed ctor or non-ctor → undefined (falls to extractName §below).
 - **extractImport (:261-304)** — importText = trimmed full node slice;
   moduleName = the URI string content: `library_import >
   import_specification > configurable_uri > uri > string_literal` (else the
-  same chain under `library_export`), quotes stripped via
-  `.replace(/['"]/g,'')`. Returns {moduleName, signature} (no handledRefs)
+  same chain under `library_export`; a `part_directive` holds its `uri`
+  directly), quotes stripped via `.replace(/['"]/g,'')` (dartUriText).
+  Returns {moduleName, signature} (no handledRefs)
   → import NODE (name = the URI, e.g. `package:torture/other.dart`,
-  `dart:async`, `src/reexported.dart`) + the generic `imports` ref
+  `dart:async`, `src/reexported.dart`, `x.g.dart`) + the generic `imports` ref
   (tree-sitter.ts:3183-3194) {from: file node (no namespace exists), name =
-  URI, line/col of the import_or_export node}. `as alias`, `show`/`hide`
+  URI, line/col of the directive node — at its first annotation when it has
+  one}. `as alias`, `show`/`hide`
   combinators: IGNORED (not read). **`import 'x.dart' deferred as y;` is
   INVISIBLE** — the deferred form's import_specification holds a bare `uri`
   (NO configurable_uri wrapper) → hook returns null → falls through the
   multi-import inline handlers (none match import_or_export) → no node, no
-  ref (pinned, `extract-mini.txt`). `part`/`part of`/`library` directives
-  are different node types (part_directive, part_of_directive, library_name)
-  in NO type list → invisible. None of the TS/py/rust/php/ruby binding
-  emitters (:3197-3234) fire for dart.
+  ref (pinned, `extract-mini.txt`). **`part 'x.g.dart';` is an import since
+  2026-10-06** (signature `part 'x.g.dart';`): the resolver reads its URI by
+  the import/export rules (`dartDirectiveFile`), so the library's file links
+  the part's file and a change to the part reaches the library's dependents.
+  `part of` and `library` (part_of_directive, library_name) are in NO type
+  list → invisible: the library's `part` edge already joins the two files.
+  None of the TS/py/rust/php/ruby binding emitters (:3197-3234) fire for
+  dart.
 - **extractBareCall (:305-379)** — §Calls, the full matrix.
 
 Hooks ABSENT (the walker must NOT do these): `preParse`, `recoverMangledName`,
@@ -412,7 +465,7 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 
 | Node | Branch | Behavior |
 |---|---|---|
-| every node | visitNode hook first (:943) | `static_final_declaration` consumed (§Constants); handled → scanFnRefSubtree + STOP |
+| every node | visitNode hook first (:943) | `static_final_declaration` consumed and body-walked for its constant; a field's or top-level variable's `initialized_identifier` consumed and body-walked for the class/file (§Constants); handled → scanFnRefSubtree (skipping what was walked) + STOP |
 | every node | maybeCaptureFnRefs (:990) | fires for `arguments`/`assignment_expression`/`pair`/`list_literal`/`static_final_declaration` in visitNode context — the source of the file/class-attributed fn-ref twins (§double-walk) |
 | `function_signature` | functionTypes:994 | methodTypes does NOT include it → **always extractFunction:1517**, even inside a class (isInsideClassLike && !methodTypes.includes → else-arm). In-class function_signatures occur only for ABSTRACT/bodiless methods, reached via their `declaration` wrapper (`declaration > function_signature`, probed) → **kind `function` contained by the class** (pinned: `AbstractT::mustImpl` is a function; the sibling `declaration > getter_signature` abstract getter stays invisible). skipChildren |
 | `class_definition` | classTypes:1005 | no classifyClassNode → always extractClass:1679 (abstract/sealed/base/etc. included) |
@@ -420,12 +473,12 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 | `method_signature`, `constructor_signature` | methodTypes:1027 | **NOT class-gated at the ladder** — extractMethod:1737 runs anywhere; its own gate :1747 (not class-like, no methodsAreTopLevel, no receiver) falls back: parent `object`/`object_expression`? (never in dart) else **extractFunction** — this is how extension-TYPE members and any stray non-class method_signature become plain `function` nodes (pinned: `extension type MetersT` → function `km`, bare QN) |
 | `enum_declaration` | enumTypes:1064 → extractEnum:1914 | §Class family |
 | `type_alias` | typeAliasTypes:1071 → extractTypeAlias:2890 | plain type_alias node; `getChildByField(node,'value')` → **null** (no fields) → **NO refs from the aliased type** (`typedef MapAlias = Map<String, WidgetT>` emits nothing); returns false → children re-visited (function_type/formal_parameter_list children match nothing) |
-| `import_or_export` | importTypes:1209 → extractImport:3170 | §Extractor config |
+| `import_or_export`, `part_directive` | importTypes:1209 → extractImport:3170 | §Extractor config. No skipChildren: the directive's children are still recursed, so an annotated directive's arguments are fn-ref capture points (`@Tag(f) import 'a.dart';` captures `f`). The kernel arm recurses too — since 2026-10-06; before, its `import_or_export` arm returned and missed those (TortureDirectives.dart pins both) |
 | `new_expression` | INSTANTIATION_KINDS:1255 (`new_expression` ∈ :354-361) | extractInstantiation:4610 → ctor field lookups null → namedChild(0) = type_identifier → `instantiates` ref from stack top; `<`-strip + last-`.`-segment apply (`new p.Foo<T>()` → `Foo`). findAnonymousClassBody → always null for dart. Children still recursed |
 | `function_body` (sibling of a consumed signature) | **no branch** | recursed → THE DOUBLE-WALK (§below) |
-| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature hits methodTypes; initialized_identifier/list, constant_constructor_signature, redirecting_factory_constructor_signature, initializers, annotations-in-place: nothing |
+| `declaration` (fields, bodiless ctors) | no branch | recursed → constructor_signature, constant_constructor_signature and redirecting_factory_constructor_signature hit methodTypes; each field `initialized_identifier` hits the hook (body-walked for the class); initializers, annotations-in-place: nothing |
 | `getter_signature` / `setter_signature` BARE (top level) | no branch | **top-level getters/setters are INVISIBLE** (no node; their sibling function_body is visitNode-recursed where calls don't extract) — in classes they're method_signature-wrapped → methods |
-| `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
+| `const_object_expression`, `selector`, `cascade_section`, `assignment_expression`, `local_variable_declaration`, patterns, `extension_type_declaration`, `part_of_directive`, `library_name`, lambdas | no branch | recursed; calls only extract in the BODY walker (`extractBareCall` is not consulted by visitNode!) — §Calls for the consequences |
 | `property_signature`/`method_signature` TS branch (:1282) | **shadowed** | method_signature is consumed at :1027 first; property_signature isn't a dart kind — branch unreachable |
 
 ### THE DOUBLE-WALK (sibling bodies) — reproduce it exactly
@@ -624,15 +677,22 @@ chain → FIRST value child only); `static final sharedInst = WidgetT(0)` →
 constant under the class, sig `= WidgetT`; multi-declarations → one node
 each with own columns. **NO nodes ever**: instance fields (typed/untyped/
 late/var), `static var`, top-level var/typed vars, top-level getters/
-setters, const constructors, redirecting factories, extension_type
-containers, `part`/`part of`/`library`/deferred imports. **Initializer
-side-effects:** hook-consumed constants' initializers are NOT walked → no
-calls/instantiates from them (only scanFnRefSubtree capture — §fn-refs);
-initialized_identifier fields' initializers ARE recursed by visitNode but
-only INSTANTIATION_KINDS fires there → `int counter = 0;` emits nothing,
-but a field `final w = new Widget();` would emit `instantiates Widget` from
-the CLASS (and a top-level `var w = new Widget();` from the FILE). No
-static-member refs from any of these contexts (body-walker only).
+setters, extension_type containers, `part of`/`library`/deferred
+imports. (Named `const` constructors and redirecting factories mint
+methods since 2026-10-06, and a `part` directive an import; the unnamed
+constructors still mint nothing.) **Initializers
+are code:** every initializer is walked with the body walker — a
+constant's for the constant (riverpod's `final repoProvider =
+Provider((ref) => Repository(ref.watch(dioProvider)));` → calls
+`Provider`, `Repository`, `ref.watch` from `repoProvider`), a field's
+(instance, `static var`, typed, `late`) for its class, a top-level
+`var`/typed/`late final` one for the FILE. The full body matrix applies:
+calls, instantiates, static-member and member reads, type refs, closures
+with block bodies (a local function inside one mints a `function` under
+the constant, with the double-walk's pass 2b on its body), interpolation
+calls, fn-ref candidates. Each is walked ONCE: the hook consumes the entry,
+so the visitNode recursion that used to reach `new_expression` /
+maybeCaptureFnRefs inside a field initializer no longer does.
 
 ### Calls — extractBareCall (dart.ts:305-379) in the body walker (:5159-5173)
 
@@ -658,24 +718,86 @@ extract-mini.txt):
 | `w?.render()` | conditional_assignable_selector | `w.render` — **`?.` is encoded exactly like `.`** |
 | `y2..add(1)..add(2)` (cascades) | cascade_section (argument_part NOT inside a selector) | **NOTHING — cascade calls are completely invisible** |
 | `new WidgetT(2)` | new_expression → INSTANTIATION branch :5145 FIRST | `instantiates WidgetT` (extractBareCall's new_expression arm :363-367 is DEAD — the else-if never reaches it); args still recursed |
-| `pad(const EdgeInsetsT.all(8.0))` | const_object_expression :369-376 | `EdgeInsetsT.all` at the CONST node position (typeId + '.' + nameId; type-only form → `EdgeInsetsT`); children recursed after |
+| `pad(const EdgeInsetsT.all(8.0))` | const_object_expression :369-376 | `EdgeInsetsT.all` at the CONST node position (typeId + '.' + nameId; type-only form → `EdgeInsetsT`); children recursed after. The FIRST type_identifier: `const p.X.named()` → `p.named` (prefix bug, preserved) |
+| `BlocProviderT<CounterT>.value(…);` as a statement | args selector; prev = `.value` selector; accessorPrev = a selector holding only `type_arguments`, whose prev is the identifier | `BlocProviderT.value` (dartTypeArgumentsReceiver, since 2026-10-06 — bare `value` before); the `.value().tail` re-encode reads it the same way |
+| `=> BlocProviderT<CounterT>.value(…)`, and as an initializer, argument or `return` value | `constructor_invocation` (type_identifier [`.` type_identifier] type_arguments `.` identifier arguments) | `BlocProviderT.value` at the node position — the LAST type_identifier, so `p.X<T>.named()` → `X.named` (since 2026-10-06; nothing before) |
 | `generic<int>(5)` | args selector (type args ride argument_part) | bare `generic` |
+| `ref.read<Repo>(p)`, `Provider<int>((ref) => 0)`, `X<T>(name: v)` parsed as two comparisons, `(ref.read < Repo) > (p)` (§Misparsed generic calls) | the `<` relational_operator (dartMisparsedGenericCall) | the parsed call's ref — `ref.read` / `Provider` / `X`, at the `<` |
 | `await fetch()` | recursion through unary/await_expression | `fetch` at the selector |
 | `throw StateError('bad')` | recursion | `StateError` |
 | `'sum ${a + compute()}'` | template_substitution recursion | `compute` (interpolation calls EMIT); `$name` → identifier_dollar_escaped → nothing |
 | local-lambda body `final lam = (int a) { helper(a); }` | function_expression recursed transparently | `helper` attributed to the ENCLOSING function; `lam(5)` → `lam` |
-| ctor initializers (`: size = seed()`), enum-constant args (`ok(200)`), default param values, hook-consumed constant initializers | never body-walked | NOTHING |
+| `final p = Provider((ref) => Repo(ref.watch(d)))`, `static var s = make()`, `final _c = Controller();` in a class, `var v = load();` | the hook's walkInitializer (§Constants) | the full matrix, from the constant / the class / the file |
+| ctor initializers (`: size = seed()`), enum-constant args (`ok(200)`), default param values | never body-walked | NOTHING |
+| `tester //` + newline + `.state(x)`, `box.grow /* by */ (3)` | comments are named SIBLINGS between the chain's parts | `tester.state` / `box.grow` — every sibling step skips `comment` and `documentation_comment` (dartPrevNamed / dartNextNamed; kernel `prev_named` / `next_named`), so a comment changes nothing |
+
+Every sibling step along a member chain goes past comments: the callee before
+an argument part, dartReceiverOf / receiver_of, dartCalleeOfArgPart's two,
+dartTypeArgumentsReceiver's type, and dartMemberRead's receiver and its
+next-selector check. tree-sitter-dart keeps a comment as a named node wherever
+it is written, so before (2026-10-06) a comment between a member and its
+arguments lost the call and emitted a member read, a getter read or static
+access after a comment (`Config //`, dart format's line-break idiom) was lost,
+and a call after one kept only its bare name. The misparsed-generic-call
+layout checks below still read the raw siblings: a comment there means the
+code is not laid out as a call.
 
 extractCall (:3684), LITERAL_RECEIVER_TYPES (:373-388), SKIP_RECEIVERS, the
 parenthesized-conversion regex (:4530), template-strip — ALL UNREACHABLE for
 dart (callTypes empty). Do not port them.
 
+#### Misparsed generic calls (dartMisparsedGenericCall / misparsed_generic_call)
+
+tree-sitter-dart parses a generic call with arguments as two comparisons about
+as often as it parses it as a call — the GLR tie goes either way with the code
+around it: `final a = ref.watch<int>(p);`, `ref.read<Repo>(p);`, `int g(Ref
+ref) => ref.read<int>(1);` and `Provider<int>((ref) => 0)` come out as
+`relational_expression(relational_expression(<callee> < <type>) > <args>)`,
+while `print(ref.watch<int>(p) + 1)`, `obj.a.b<Repo>(p)` and
+`ref.read<Repo>(a, b)` parse as calls (2,853 nests vs 2,836 parsed generic
+calls with arguments across bloc, riverpod and flutter/samples). The args are
+a `parenthesized_expression`, or a `record_literal` when named
+(`DropdownButton<String>(items: …)`); the type part is `identifier`, a `.Name`
+selector (`p.Repo`) and/or a type_arguments-only selector (`Map<K, V>`); the
+callee part sits under `unary_expression` / `await_expression` for `await` and
+prefix operators. Recovered at the `<` when the type names a type (`/^[_$]*[A-Z]/`
+or `int double num bool dynamic void`), `<` touches the callee and `(` touches
+the `>`; `a < B > (c)`, `a<b>(c)` and `a <B>(c)` stay comparisons, and so does
+`a.b /* c */<B>(c)`: the comment is a sibling of its own against the `<`, so
+it is rejected as the callee (else the gate passed with no call, and the
+comment-skipping member read was suppressed). The
+recovered form emits what the parsed call does:
+
+- `calls` at the `<` (the parsed call's argument_part starts there);
+- `references <Type>` for the type argument, via isDartTypeName (§Type refs);
+  the static-member path skips `Map` in `<Map<K, V>>` so it is not doubled;
+- no member read of the callee (`ref.read`, also under `await`) or of a
+  prefixed type (`p.Repo`).
+
+A call chained on a recovered one keeps its bare name (`increment` in
+`BlocProvider.of<CounterCubit>(context).increment()`), unlike the parsed
+chain's `BlocProvider.of().increment`. The resolver gives both the same
+method: a bare link is typed from the chain written before it, and so is an
+encoded chain whose inner call declares no type of its own to return — a
+generic factory's type parameter (`static T of<T>`) or a factory outside the
+project (#750). Nothing is gained by re-encoding the recovered chain.
+
+The grammar can also end an arrow function in front of a generic call:
+`(ref) => ref.watch<int>(p)` → `((ref) => ref).watch<int>(p)`, in the
+relational and the selector form alike. dartReceiverOf / receiver_of read a
+receiver in that place from the end of the arrow's body (Dart writes a member
+access on an arrow itself in parentheses), for callee names and static-member
+refs: `ref.watch`, `BlocProvider.of`. dartCalleeOfArgPart / callee_of_arg_part
+do not, so `() => BlocProvider.of<CounterCubit>(context).increment()` keeps
+`increment` bare, which resolves as above.
+
 ### Static-member / value-read refs — dart branch (:4759-4767), STATIC_MEMBER_LANGS:346
 
 Called from the body walker only (:5218). The DART-SPECIFIC branch (the
 shared MEMBER_ACCESS_TYPES path is never reached — it returns first):
-node.type === `selector` AND it has NO `argument_part` child AND
-previousNamedSibling is an `identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
+node.type === `selector` AND it has NO `argument_part` child AND the
+receiver (dartReceiverOf: the previous named sibling past comments) is an
+`identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
 `references <identifier text>` from the enclosing symbol at the
 **IDENTIFIER's (receiver's) position** (pushStaticMemberRef :4800). Pins:
 
@@ -690,7 +812,8 @@ previousNamedSibling is an `identifier` matching `/^[A-Z][A-Za-z0-9_]*$/` →
 - `this.x` → prev is a `this` node → nothing. Case patterns (`case
   ColorT.blue:`) → `constant_pattern > qualified` shape, no selector →
   NOTHING (pinned gap). Cascade sections → no selector → nothing.
-  Class-field/constant initializers and visitNode contexts → never called.
+  visitNode contexts → never called; initializers are body-walked, so a
+  read written in one emits from its constant / class / file.
 
 ### Type-annotation references — dart ∈ TYPE_ANNOTATION_LANGUAGES (:5753), the dart branch (:5819-5833) is LIVE
 
@@ -720,7 +843,12 @@ BUILTIN_TYPES (:5768-5782), at each leaf's position. Consequences (pinned):
   = constructor_signature → param types emit (`Widget.named(WidgetT w)` →
   references WidgetT); `this.`-params (constructor_param) hold no
   type_identifier → nothing. Bodiless declaration-wrapped ctors: extractMethod
-  runs on the bare constructor_signature → sig = node → same.
+  runs on the bare constructor_signature → sig = node → same; so do `const`
+  ctors. A redirecting factory walks its named children one by one and
+  skips a DIRECT type_identifier that is not UpperCamel (`/^[_$]*[A-Z]/`):
+  after `=` those are an import prefix (`= p.Impl`) or the target
+  constructor's name (`= _$QuestionImpl.fromJson`, where `fromJson` is a
+  type_identifier) — `references _$QuestionImpl` only.
 - Getters: references from the getter's TYPE (suppressed if builtin —
   `int get area` → nothing; `WidgetT get w` → references WidgetT).
 - extractVariableTypeAnnotation (:6074) needs a `type_annotation` child —
@@ -734,35 +862,116 @@ BUILTIN_TYPES (:5768-5782), at each leaf's position. Consequences (pinned):
 Dart annotations are `annotation` (with `name:` field; args form has an
 `arguments` child) or `marker_annotation`-free — probed: both `@override`
 (bare) and `@Deprecated('x')` (args) are node type `annotation`, PRECEDING
-SIBLINGS of the declaration they decorate (inside program / class_body).
+SIBLINGS of the function or method they decorate (inside program /
+class_body); a class-like declaration's annotations open its own node
+instead (scan #1).
 extractDecoratorsFor (:4897) is called for classes (:1710), functions
 (:1599), methods (:1819) — NOT for hook-minted constants, enums(!), or
 type aliases (extractEnum/extractTypeAlias never call it — an annotated
 enum emits nothing). Mechanics for dart:
 
 - Scan #1 (direct children :4976-4988): annotations are never children of
-  the signature → inert (no `modifiers` node either).
+  the signature → inert for functions and methods (no `modifiers` node
+  either). A class-like declaration is different: class, mixin, extension
+  and extension type nodes START at their first annotation, which is the
+  node's own leading child, so scan #1 emits it (`@immutable class Foo` →
+  decorates `immutable`). Enums and typedefs are built the same way, but
+  nothing scans them.
 - Scan #2 (preceding siblings :5002-5023): walk BACKWARD from the
-  declaration; `annotation` is in the accepted set (:5017); stop at the
-  first non-annotation sibling. consider(): target = first namedChild of
-  accepted types → the `identifier` (`override`, `deprecated`, `pragma`,
-  `immutable`, `Deprecated`) → `<`-strip + last-`.`-segment (`@ui.Widget`
-  style would strip to `Widget`) → **`decorates` ref {from the decorated
-  node, name, line/col of the ANNOTATION node}**. With-args annotations
+  declaration; `annotation` is in the accepted set (:5017); step over
+  `comment` / `documentation_comment` siblings (since 2026-10-06, below);
+  stop at the first other non-annotation sibling. consider(): target =
+  first namedChild of accepted types → the `identifier` (`override`,
+  `deprecated`, `pragma`, `immutable`, `Deprecated`) or `scoped_identifier`
+  (`meta.immutable`, `Foo.named`, `p.Foo.named`) → `<`-strip + last-`.`-segment
+  (`@meta.immutable` → `immutable`, `@p.Foo.named(…)` → `named`; the strip
+  runs first, so `@Foo<int>.named(…)`, which parses with an ERROR inside the
+  name, → `Foo`) → **`decorates` ref {from the decorated node, name,
+  line/col of the ANNOTATION node, i.e. its `@`}**. With-args annotations
   emit their NAME; the argument expressions are never visited (no refs from
   `@Deprecated('use other')`'s string).
 - **Stacked annotations emit in REVERSE source order** (the backward walk):
   `@Deprecated('x')\n@pragma('vm:entry-point')\nvoid f()` → decorates
   `pragma` FIRST, then `Deprecated` (pinned).
 - For a method: the previous member's function_body (or any declaration)
-  breaks the chain correctly. The annotation-BETWEEN-doc-and-decl also
-  breaks the DOCSTRING chain (§Docstrings).
-- Bodiless ctors (declaration-wrapped): extractMethod runs on
-  constructor_signature whose PARENT is the `declaration` node — the
-  backward scan runs over declaration's children (constructor_signature is
-  namedChild(0) → declIdx 0 → no siblings scanned) → an annotation before
-  the declaration attaches to NOTHING. Annotated fields likewise emit
-  nothing (no extractor runs).
+  breaks the chain correctly. (The docstring walk steps OVER annotations
+  since 2026-10-06 — §Docstrings.)
+- **Comments between the annotations and the declaration are stepped over**
+  (since 2026-10-06). An annotation always belongs to the next declaration,
+  so dart.ts sets `decoratorStepOverTypes: ['comment',
+  'documentation_comment']`, which scan #2 skips, and the kernel's
+  `extract_decorators_for` skips the same `DECORATOR_STEP_OVER` list. No
+  other language sets one. Until then the comment ended the scan and the
+  annotation above it attached to nothing. Now these all attach: `@override`
+  `// ignore: must_call_super` `void f()`, `@x` `/// Doc below.` `void f()`,
+  `@x /* c */ void f()`, a comment on the annotation's own line, and comments
+  between stacked annotations (still in reverse order). Pinned in
+  TortureAnnotatedComments.dart and dart-annotation-comments.test.ts.
+  - Still ends the scan, comments or not: a field's `declaration`, a
+    top-level variable, an import, the previous member's body (`void a() {}
+    // note` `@x void b()` gives `b` only `x`), a class-like declaration.
+  - Class-likes are unaffected. Their leading annotations are scan #1's,
+    which reads every child, comments among them included.
+  - Validation (bloc @b9be1e2 / riverpod @4ba1be2, kernel loaded, on top of
+    the annotation resolution below): `decorates` refs +7 / +54, edges +0 /
+    +16, nothing else in the dumps changed. bloc's 7 are all `@override`.
+    riverpod's 54 (on 48 declarations) are `@override` 32, `@internal` 6 and
+    `@riverpod` 16 (lint fixtures and one website snippet), and each
+    `@riverpod` links `const riverpod`. Kernel and wasm full-index dumps are
+    byte-identical, and the parity sweeps show 0 diffs.
+  - The AST scan's 55th riverpod site is `@override` `// ignore: …` on a
+    FIELD, which no extractor records. A scan that also counts annotation →
+    comment runs INSIDE class-like nodes finds riverpod's 24 `@riverpod`
+    `// ignore: …` `class X` lint fixtures and bloc's `@JsonEnum(…)` `/// …`
+    `enum`. Scan #1 already reads those (an enum's, never: see above).
+- Members with no body (declaration-wrapped ctors, const ctors, redirecting
+  factories, abstract and `external` members): the signature's PARENT is the
+  `declaration`, so until 2026-10-06 the backward scan ran over the
+  declaration's own children (the signature is namedChild(0) → declIdx 0 →
+  nothing scanned) and an annotation before the declaration attached to
+  NOTHING (`@visibleForTesting Foo._();`, `@protected void m();`). Now scan
+  #2 starts at getDeclarationWrapper's `declaration`: same backward walk,
+  same reverse order, and a field's `declaration` in between still stops
+  it. Annotated fields themselves emit nothing (no extractor runs).
+  Validation (bloc @b9be1e2 / riverpod @4ba1be2): +10 / +186 `decorates`
+  refs, all SDK or package:meta names (`useResult`, `override`, `internal`,
+  `visibleForTesting`, …), so no edges; before #2380, riverpod's 23 new
+  `@internal` refs on `X.internal(…)` ctors resolved to the ctor itself.
+- **Resolution is TS-side and Dart-specific** (since 2026-10-06):
+  resolveOneInner hands every Dart `decorates` ref to name-matcher.ts's
+  `matchDartAnnotation` before any other strategy, and nothing falls
+  through. A Dart annotation is a const variable or a const constructor
+  call, never a method, getter or function, so the shared decorator ranking
+  (findBestMatch: +25 function/method, +15 class, nothing for a constant)
+  never sees one. That ranking sent riverpod's 506 `@riverpod` to the
+  analyzer's extension getter `RiverpodAnnotatedAnnotatedNodeOfX::riverpod`
+  (0.4) instead of `const riverpod = Riverpod();`.
+  - The matcher re-reads the written form from the `@` in comment-blanked
+    source. It is a call only when `(` follows on the same line, so a record
+    return type on the next line is not taken for arguments.
+  - `@x`: on a member, the enclosing type's own static `constant` /
+    `enum_member` `x` (a class-like's own annotations stand outside its
+    body); else a top-level `constant` the library can see (#2386's model,
+    the own library shadowing imports). `@X(…)`: a visible class `X`, not
+    an extension.
+  - `@p.x` / `@p.X(…)`, when `p` is an import prefix (dart-libraries.ts
+    `dartImportPrefixes`, the imports of the file's whole library): the same
+    through that prefix. Otherwise `@T.x` → T's own `constant` /
+    `enum_member` `x`, and `@T.named(…)` → T's named constructor (#2380's
+    `isDartConstructor`); `@p.T.x` / `@p.T.named(…)` likewise through `p`.
+  - A sole candidate links at 0.9 (`exact-match`, or `qualified-name`
+    through a type). Several (only where the library model can't establish
+    the library) fall back to findBestMatch's proximity at 0.7 / 0.4.
+  - Not modelled: a `final` is not told apart from a `const` (compiling code
+    never annotates with a visible `final`), nor a typedef used to call a
+    constructor.
+  - Validation (main 99246848, kernel loaded): bloc 0 edges changed (no
+    annotation there names a project declaration); riverpod exactly the 506
+    `@riverpod` edges retargeted to `const riverpod` at 0.9, every other
+    `decorates` edge (`$internal`, `Riverpod`, `Dependencies`, …) identical,
+    nodes, refs and files identical. Every extracted annotation in both
+    repos is written with one name, so the prefixed and `T.x` forms are
+    pinned by dart-annotation-targets.test.ts only.
 
 ### Docstrings (tree-sitter-helpers.ts:95-127) — dartdoc is KEPT, both forms
 
@@ -776,10 +985,59 @@ plain `//` comments all become docstrings and accumulate together** (pinned:
 strip + `^\/\/[/!]?\s?` + `^\s*\*\s?` gm strips fire — **all `gm` strips
 ride `js_multiline_strip` in docstring.rs (#1329 CRLF semantics) — call the
 shared code, port nothing**. DOCSTRING_WRAPPER_TYPES contains no dart kinds
-→ no anchor climbing. **An `annotation` between the comment run and the
-declaration BREAKS the chain** (pinned: `/// Broken by annotation.`
-`@deprecated` `void annotated()` → doc undefined — the dominant real-world
-loss since `@override` is ubiquitous). Docstrings attach to: functions,
+→ no anchor climbing; instead `docstringFor` starts from
+getDeclarationWrapper's `declaration` for a member with no body (until
+2026-10-06 those looked inside the wrapper and found nothing, e.g.
+`const BlocProvider.value(…)`'s dartdoc; validation added 32 docstrings on
+bloc and 126 on riverpod, none changed or removed).
+
+**The walk steps OVER `annotation` siblings** (since 2026-10-06). Until then
+an annotation between the comment run and the declaration ended the walk:
+`/// Builds it.` `@override` `Widget build(…)` lost its dartdoc, the
+dominant real-world loss since `@override` is everywhere. Now dart.ts sets
+`docstringStepOverTypes: ['annotation']`, which docstringFor hands to
+getPrecedingDocstring's `stepOver`. The kernel's `docstring_of` calls
+docstring.rs's `preceding_docstring_stepping_over(…, &["annotation"])`.
+`preceding_docstring` and every other language keep the empty list.
+- Stepped over: stacked annotations, multi-line ones (`@Deprecated(` …
+  `)`), inline ones (`/* c */ @x void f()`, freezed's `@optionalTypeArgs
+  TResult maybeMap…` on the declaration line), and blank lines, which are
+  not nodes. This works from a `declaration` wrapper too.
+- Comments on either side of an annotation keep the join semantics:
+  `/// a` `@x` `// b` `void f()` → `a\nb` (was `b`), and `/// Doc.`
+  `@override` `// ignore: …` → `Doc.\nignore: …`.
+- Still ends the walk: any other named sibling, such as the previous
+  member's `function_body`, a field's or a bodiless member's `declaration`,
+  a top-level variable (`static_final_declaration_list` /
+  `initialized_identifier_list`), an `import_or_export` or `part_directive`,
+  or a class-like declaration. A comment trailing the previous member on its
+  line (`void a() {} // note`) is collected, as it already was for a member
+  with no annotation.
+- Class-like declarations needed nothing. A class, mixin, extension,
+  extension type, enum or typedef node starts at its first annotation
+  (§Decorators), so the dartdoc above the annotations is the node's previous
+  sibling and was always kept. A comment written BETWEEN such an annotation
+  and the keyword (`@JsonEnum(…)` `/// The state…` `enum LinterRuleState`)
+  is inside the node and is NOT read (pinned). bloc has 1 such dartdoc,
+  riverpod none (23 `// ignore:` lines and 1 plain comment). A member's
+  comment below its annotation IS read: it is the signature's previous
+  sibling.
+- Local functions get no docstring with or without annotations: the
+  signature sits in `local_function_declaration > lambda_expression`, with
+  no previous sibling.
+- Validation (bloc @b9be1e2 / riverpod @4ba1be2, 3f96f80f plus the
+  declaration-wrapper fix, kernel loaded): docstrings +26 / +1,072, changed
+  0 / 9 (each a `// ignore:` line below the annotation, now joined after
+  the dartdoc above), removed 0. Everything else in the dumps (nodes,
+  edges, refs, files) is byte-identical; kernel and wasm full-index dumps
+  are byte-identical; the parity sweeps show 0 diffs. bloc's 26 are all
+  hand-written dartdoc, mostly behind `@mustCallSuper` / `@override`. Of
+  riverpod's 1,072, 667 runs hold a dartdoc (401 in generated
+  `.freezed.dart` / `.g.dart` files, 266 hand-written) and 405 are plain
+  comments only (`// ignore: riverpod_lint/…` in the lint fixtures, the
+  website's snippet markers).
+
+Docstrings attach to: functions,
 methods (incl. `<anonymous>` operators), classes/mixins/extensions, enums,
 type aliases. NOT to: hook-minted constants (extra carries only signature —
 pinned drop), enum members, imports, the file node. No comment-gluing into
@@ -857,14 +1115,17 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
 - `[topLevel, blockDoc]` list ✓ (locals' list_literals capture too — the
   dispatch fires wherever the node is walked); `{'k': topLevel}` pair ✓;
   `final aliasTop = aliased;` top-level/static → varinit bare-identifier ✓
-  (pinned from=file / from=class); a LOCAL `final alias = topLevel;` →
+  (from the constant `aliasTop` — the hook walks the declaration with it
+  pushed); a LOCAL `final alias = topLevel;` →
   initialized_variable_definition NOT in dispatch → not captured.
 - obj.method member values (`final g = obj.method`) → the last child is a
   selector → normalizeValue [] → nothing (no member special for dart).
-- Capture points: visitFunctionBody:5137 (bodies), visitNode:990 (the
-  §double-walk twins from file/class scope), scanFnRefSubtree (hook-consumed
-  constant initializers — halts at `function_expression` :609, so lambdas
-  inside a constant's initializer don't leak candidates).
+- Capture points: visitFunctionBody:5137 (bodies, and every initializer
+  the hook walks — from the constant / class / file, lambdas included),
+  visitNode:990 (the §double-walk twins from file/class scope),
+  scanFnRefSubtree (only a `static_final_declaration` whose constant wasn't
+  minted — the scan skips what the hook walked, so nothing is captured
+  twice; it halts at `function_expression` :609).
 - **Flush gate (:639-728): effectively "defined in this file" ONLY** — dart
   import refs are URIs (`package:foo/util.dart`, `dart:async`) which match
   neither SIMPLE_NAME nor QUALIFIED_IMPORT (`:` and `/` excluded) →
@@ -1016,8 +1277,10 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
    `svy-dart/torture.dart` (231 lines, parses clean; its
    `extract-torture.txt` is the expected-output pin). Inventory by branch:
    imports (dart:, package: with `as`+`show`, export with `hide`,
-   **deferred → invisible**, part → invisible); doc shapes (`///` run,
-   `/** */` kept, `//` kept, annotation-broken chain); annotations (bare,
+   **deferred → invisible**, part → invisible — an import since
+   2026-10-06, pinned with every directive form in TortureDirectives.dart,
+   and `part of` by library name in TorturePartOfName.dart); doc shapes (`///` run,
+   `/** */` kept, `//` kept, a `///` above an annotation); annotations (bare,
    with-args, stacked → reverse order, on class); top-level constants
    (CAPS/lowercase/multi/typed/derived, sig truncation ≥100 chars);
    top-level var/typed-var/getter/setter (all invisible); async vs
