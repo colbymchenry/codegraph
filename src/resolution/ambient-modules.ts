@@ -224,6 +224,51 @@ export function scanAmbientModules(source: string): AmbientModuleScan {
   return { script, blocks };
 }
 
+/** Where a file declares into the global scope. */
+export interface GlobalScopeScan {
+  /** No top-level `import` or `export`: the file's top level is the global scope. */
+  script: boolean;
+  /**
+   * `line:column` of every word at the global scope: at a script's top level,
+   * and directly inside `declare global { … }`. A declaration starts at one of
+   * these exactly when it is a global (its keyword: `interface`, `type`, `class`,
+   * `abstract`, `enum`, `function`, `const`, …).
+   */
+  globalWords: Set<string>;
+}
+
+/**
+ * The global scope's share of `source`: its top level if the file is a
+ * script, and the bodies of its `declare global` blocks. A namespace's or a
+ * `declare module` block's members, and a module's own declarations, are
+ * not in it.
+ */
+export function scanGlobalScope(source: string): GlobalScopeScan {
+  const { script } = scanAmbientModules(source);
+  const globalWords = new Set<string>();
+  let declare = 0; // 1: `declare`, 2: `declare global`
+  let inGlobal = false;
+  tokenize(source, (kind, text, line, column, depth) => {
+    if (inGlobal) {
+      if (kind === Kind.Punct && text === '}' && depth === 0) inGlobal = false;
+      else if (kind === Kind.Word && depth === 1) globalWords.add(`${line}:${column}`);
+      return;
+    }
+    if (depth !== 0) {
+      declare = 0;
+      return;
+    }
+    if (kind === Kind.Word) {
+      if (script) globalWords.add(`${line}:${column}`);
+      declare = text === 'declare' ? 1 : declare === 1 && text === 'global' ? 2 : 0;
+      return;
+    }
+    if (kind === Kind.Punct && text === '{' && declare === 2) inGlobal = true;
+    declare = 0;
+  });
+  return { script, globalWords };
+}
+
 /**
  * Feed `source`'s tokens to `visit`: words, string literals (by their
  * contents), template literals (as one token, their `${…}` expressions read as

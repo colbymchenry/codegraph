@@ -21,7 +21,7 @@ import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestPath } from '../search/query-utils';
-import { isMergedAmbientDeclaration } from './ambient-modules';
+import { isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
@@ -1531,6 +1531,51 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
     })();
   memo.set(filePath, sealed);
   return sealed;
+}
+
+/** A TypeScript or JavaScript source file, read as such (an SFC's markup is not). */
+const TS_JS_FILE = /\.[cm]?[jt]sx?$/i;
+
+/** Per-context memo: file → where it declares into the global scope (null when unreadable). */
+const TS_GLOBAL_SCOPES = new WeakMap<ResolutionContext, Map<string, GlobalScopeScan | null>>();
+
+/** scanGlobalScope of `file`, a CommonJS file's top level counting as its own. */
+function tsGlobalScope(file: string, context: ResolutionContext): GlobalScopeScan | null {
+  let memo = TS_GLOBAL_SCOPES.get(context);
+  if (!memo) TS_GLOBAL_SCOPES.set(context, (memo = new Map()));
+  let scope = memo.get(file);
+  if (scope === undefined) {
+    const source = context.readFile(file);
+    scope = source === null ? null : scanGlobalScope(source);
+    if (scope?.script && HAS_CJS_EXPORT.test(source!)) scope = { script: false, globalWords: new Set() };
+    memo.set(file, scope);
+  }
+  return scope;
+}
+
+/**
+ * Whether a supertype written as a bare name the file doesn't import, in an
+ * ES module, may be `n`: a declaration of the file's own, or a global one —
+ * at a script's top level (a file with no import or export, a script `.d.ts`)
+ * or directly inside `declare global`. A module's own declaration, exported
+ * or not, is reached only through an import, which the import resolver has
+ * followed already, and a namespace's member is no global. So an interface's
+ * `extends Omit<…>` is TypeScript's `Omit`, never vscode's `export type Omit`
+ * in quickInput.ts, and `extends Function` never terminal-suggest's
+ * `Fig.Function`.
+ */
+function isTsSupertypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
+  const scope = tsGlobalScope(n.filePath, context);
+  return !scope || scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
+}
+
+/** Whether `ref` is a supertype written as a bare name its ES module doesn't import (isTsSupertypeInScope). */
+function isTsBareSupertype(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return isInheritanceRef(ref) && JS_FAMILY.has(ref.language) && TS_JS_FILE.test(ref.filePath) &&
+    /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) &&
+    !context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
+    tsGlobalScope(ref.filePath, context)?.script === false;
 }
 
 /**
@@ -11356,6 +11401,9 @@ export function matchByExactName(
   const valueRef = ref.referenceKind === 'references' || ref.referenceKind === 'function_ref';
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
+  // Read once, and only for a candidate in another file: it scans the file.
+  let bareSupertype: boolean | undefined;
+  const tsBareSupertype = (): boolean => (bareSupertype ??= isTsBareSupertype(ref, context));
   const sameName = context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
@@ -11456,6 +11504,10 @@ export function matchByExactName(
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
     (!inheritanceRef || isSupertypeTarget(n)) &&
+    // And a supertype a TS/JS module names without importing it is its own or
+    // a global, never another module's — ahead of the ranking, so a global
+    // `interface Window` in a `declare global` still wins.
+    !(inheritanceRef && n.filePath !== ref.filePath && tsBareSupertype() && !isTsSupertypeInScope(n, ref, context)) &&
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
@@ -12477,6 +12529,62 @@ export function matchCollapsedObjectCall(ref: UnresolvedRef, context: Resolution
   return resolveObjectPathMember(host[2]!.replace(/[\s?]/g, ''), ref.referenceName, ref, context, host[1]!) ?? undefined;
 }
 
+/**
+ * The method `methodName` a TS/JS class or interface declared in `file` gets
+ * from its supertypes, found through that declaration's own extends and
+ * implements edges: the member a supertype's own declaration has, each
+ * supertype and then its own supertypes in the order they are written, as
+ * the walk by name goes. That walk (getSupertypes) unions the supertypes of
+ * every type sharing the name and looks the method up by its name again, so a
+ * supertype declared in many files — vscode's `IDisposable`, in eleven — gave
+ * whichever one came first, another app's included. Undefined when `file`
+ * declares no such type, or none of its supertypes has the member.
+ */
+function esInheritedMethod(typeName: string, methodName: string, file: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const supertypeNodes = context.getSupertypeNodes;
+  if (!supertypeNodes) return undefined;
+  const decls = context.getNodesByName(typeName).filter((n) => n.filePath === file && (n.kind === 'class' || n.kind === 'interface'));
+  const seen = new Set(decls.map((n) => n.id));
+  const inherited = (decl: Node, depth: number): Node | undefined => {
+    for (const base of supertypeNodes(decl.id)) {
+      if (seen.has(base.id)) continue;
+      seen.add(base.id);
+      const members = context.getMethodMatches?.(base.name, methodName, ref.language) ??
+        context.getNodesByName(methodName).filter((m) => m.kind === 'method' && m.qualifiedName.endsWith(`${base.name}::${methodName}`));
+      const own = members.find((m) => m.filePath === base.filePath && m.startLine >= base.startLine && m.endLine <= base.endLine);
+      if (own) return own;
+      const above = depth < 3 ? inherited(base, depth + 1) : undefined;
+      if (above) return above;
+    }
+    return undefined;
+  };
+  for (const decl of decls) {
+    const found = inherited(decl, 0);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The supertypes, by name, of the TS/JS classes named `typeName`: the walk by
+ * name without an interface's supertypes, which only esInheritedMethod reads,
+ * from the interface's own declaration. Through any interface of the name, a
+ * type from a package or a global namespace (vscode's `NodeJS.ReadableStream`)
+ * reached the supertypes of the project's own `ReadableStream`, and a type
+ * whose import doesn't resolve those of whichever app declares one.
+ */
+function esClassSupertypes(typeName: string, language: Language, context: ResolutionContext): string[] {
+  if (!context.getSupertypeNodes) return context.getSupertypes?.(typeName, language) ?? [];
+  const names = new Set<string>();
+  for (const n of context.getNodesByName(typeName)) {
+    if (n.language !== language || n.kind !== 'class') continue;
+    for (const s of context.getSupertypeNodes(n.id)) {
+      if (s.name && s.name !== typeName) names.add(s.name);
+    }
+  }
+  return [...names];
+}
+
 // Exported for the precedence unit tests (#1079): they assert the
 // preferredFqn → same-file → matches[0] ordering directly.
 export function resolveMethodOnType(
@@ -12544,7 +12652,16 @@ export function resolveMethodOnType(
     // a supertype), so a wrong inference produces no edge.
     if (depth < 4 && context.getSupertypes) {
       const viaSupers = nmTimedT('rmot-supers', ref, (): ResolvedRef | null => {
-        for (const supertype of context.getSupertypes!(typeName, ref.language)) {
+        // A TS/JS type whose declaration is known — the file it is imported
+        // from, or else the call's own — takes the member its own supertypes
+        // declare before any type of the same name elsewhere is asked.
+        const es = ES_IMPORT_LANGUAGES.has(ref.language);
+        if (depth === 0 && es) {
+          const inherited = esInheritedMethod(typeName, methodName, preferredFqn ?? ref.filePath, ref, context);
+          if (inherited) return { original: ref, targetNodeId: inherited.id, confidence, resolvedBy };
+        }
+        const supertypes = es ? esClassSupertypes(typeName, ref.language, context) : context.getSupertypes!(typeName, ref.language);
+        for (const supertype of supertypes) {
           const via = resolveMethodOnType(
             supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
           );
@@ -17086,6 +17203,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_IMPORTED_TYPE_FILES.delete(context);
   TS_NAMED_CLASSES.delete(context);
   TS_AMBIENT_MODULE_FILES.delete(context);
+  TS_GLOBAL_SCOPES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -23372,6 +23490,7 @@ export function matchFuzzy(
       (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
+    !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareSupertype(ref, context) && !isTsSupertypeInScope(finalCandidates[0]!, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
