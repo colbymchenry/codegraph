@@ -14,7 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
+import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
@@ -16155,6 +16155,81 @@ function isUndeclaredTypeName(typeName: string, ref: UnresolvedRef, context: Res
     !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language));
 }
 
+/**
+ * Is the qualifier of a C++ `X::m()` call a class the index doesn't hold, as
+ * protobuf's `FeatureSet` is (declared in `descriptor.pb.h`, which is over the
+ * indexer's size cap)? A capitalized name that no C or C++ type, alias or
+ * namespace node has, and that the calling file makes nothing of itself
+ * (cppNamesBroughtIn).
+ */
+function isCppUndeclaredQualifier(qualifier: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return isUndeclaredTypeName(qualifier, ref, context) &&
+    cppTypesNamed(qualifier, context).length === 0 &&
+    !context.getNodesByName(qualifier).some((n) => (n.language === 'cpp' || n.language === 'c') && (n.kind === 'namespace' || n.kind === 'module')) &&
+    !cppNamesBroughtIn(ref.filePath, context).has(qualifier);
+}
+
+const CPP_FILE_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+const CPP_MACRO_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+
+/**
+ * The names a C++ file makes types or namespaces of itself, which the index
+ * holds no node for: its template parameters (fmt's `Traits` of `typename
+ * Traits = buffer_traits`), the aliases it declares — in a function body
+ * too, or by expanding a macro that declares them — and the namespaces it
+ * names: opened, aliased or used (`using namespace …;`). googletest's typed
+ * tests declare `TypeParam` and `TestFixture`.
+ */
+function cppNamesBroughtIn(file: string, context: ResolutionContext): ReadonlySet<string> {
+  let memo = CPP_FILE_TYPE_NAMES.get(context);
+  if (!memo) CPP_FILE_TYPE_NAMES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = stripCommentsForRegex((context.readFile(file) ?? '').replace(/\\\r?\n/g, ' '), 'cpp');
+  const names = cppTypeNamesDeclared(text);
+  for (const m of text.matchAll(/\bnamespace\s+([^;{}()]{1,200}?)\s*[;{]/g)) {
+    for (const name of m[1]!.match(/[A-Za-z_]\w*/g) ?? []) names.add(name);
+  }
+  for (const [macro, declared] of cppMacroTypeNames(context)) {
+    if (hasCppWord(text, macro)) for (const name of declared) names.add(name);
+  }
+  if (/\bTYPED_TEST(?:_P)?\s*\(/.test(text)) names.add('TypeParam').add('TestFixture');
+  memo.set(file, names);
+  return names;
+}
+
+/**
+ * The type names each of the project's macros declares where it is
+ * expanded: rocksdb's `IMPORT_RIBBON_IMPL_TYPES(T)` declares `using
+ * SimpleSoln = …;`, a vendored googletest's `TYPED_TEST` its `TestFixture`.
+ */
+function cppMacroTypeNames(context: ResolutionContext): Map<string, ReadonlySet<string>> {
+  const hit = CPP_MACRO_TYPE_NAMES.get(context);
+  if (hit) return hit;
+  const macros = new Map<string, ReadonlySet<string>>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|h\+\+|inl|inc|ipp|tcc)$/i.test(file)) continue;
+    const raw = context.readFile(file);
+    if (!raw || !raw.includes('define')) continue;
+    // Each `#define` with the lines it continues; only its body is stripped of comments.
+    for (const m of raw.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(?:\([^)\n]*\))?((?:[^\n\\]|\\\r?\n|\\(?!\r?\n))*)/gm)) {
+      if (macros.has(m[1]!) || !/\b(?:using|typedef|template)\b/.test(m[2]!)) continue;
+      const names = cppTypeNamesDeclared(stripCommentsForRegex(m[2]!.replace(/\\\r?\n/g, ' '), 'cpp'));
+      if (names.size > 0) macros.set(m[1]!, names);
+    }
+  }
+  CPP_MACRO_TYPE_NAMES.set(context, macros);
+  return macros;
+}
+
+/** Does `text` hold `word` as a whole identifier? */
+function hasCppWord(text: string, word: string): boolean {
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!/\w/.test(text[at - 1] ?? '') && !/\w/.test(text[at + word.length] ?? '')) return true;
+  }
+  return false;
+}
+
 function inferCppReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
@@ -17250,6 +17325,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_FRAMES.delete(context);
   clearCppNamespaceMemos(context);
   clearCppRawStringMemos(context);
+  CPP_FILE_TYPE_NAMES.delete(context);
+  CPP_MACRO_TYPE_NAMES.delete(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_STEM_HEADERS.delete(context);
   TEST_SUITE_FILES.delete(context);
@@ -19298,6 +19375,13 @@ export function matchMethodCall(
       // `$comment->delete()` — names the caller's own class only by a shared
       // word. The guess is the caller itself, so there is no guess.
       if (bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId) {
+        // Nor is there one for a C++ `X::m()` through a class the index
+        // doesn't hold: a class whose name only shares a word with `X` is
+        // another class, since one named `X` was looked for first.
+        // protobuf's `FeatureSet::descriptor()` went to
+        // `JavaFeatures_NestInFileClassFeature::descriptor`, its Python
+        // extension's `OneofOptions::default_instance()` to `CppFileOptions`'.
+        if (ref.language === 'cpp' && match === colonMatch && isCppUndeclaredQualifier(objectOrClass!, ref, context)) return null;
         return {
           original: ref,
           targetNodeId: bestMatch.id,
