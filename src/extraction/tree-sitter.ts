@@ -624,13 +624,36 @@ function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: S
 }
 
 /**
+ * A TS/JS receiver that subscripts the enclosing class's object: an element
+ * of a field, `this.<field>[k]` → `this.<field>[]`, or a field named by a
+ * string key, `this['svc']` → `this.svc`. Null for any other subscript.
+ * Mirrored in the kernel's this_subscript_of.
+ */
+function tsThisSubscriptReceiver(node: SyntaxNode, source: string): string | null {
+  if (node.type !== 'subscript_expression') return null;
+  const objectNode = getChildByField(node, 'object');
+  if (!objectNode) return null;
+  const object = peelTsJsReceiver(objectNode);
+  if (object.type === 'this') {
+    const index = getChildByField(node, 'index');
+    const key = index?.type === 'string' ? /^(['"])([A-Za-z_$][\w$]*)\1$/.exec(getNodeText(index, source))?.[2] : undefined;
+    return key ? `this.${key}` : null;
+  }
+  if (object.type !== 'member_expression' || getChildByField(object, 'object')?.type !== 'this') return null;
+  const property = getChildByField(object, 'property');
+  if (!property || !THIS_FIELD_PROPERTY_TYPES.has(property.type)) return null;
+  return `this.${getNodeText(property, source)}[]`;
+}
+
+/**
  * Whether a TS/JS receiver still collapses to the bare method name: `this` /
  * `super` (the resolver reads the owner off the enclosing class), a member
  * chain rooted at either or at `window` (the project-global escape of
  * {@link isUnresolvedTsJsChain}), and `new C()` (its class is written at the
- * call). A subscript anywhere in the chain does not: `this.listeners[type]` is
- * an element of a field, which the resolver cannot type, so the bare name
- * would exact-match any project method of that name (`push`).
+ * call). A subscript anywhere in the chain does not: the resolver cannot
+ * read the receiver back from it, so the bare name would exact-match any
+ * project method of that name. (An element of a this-field is typed instead,
+ * see {@link tsThisSubscriptReceiver}.)
  */
 function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
@@ -5938,6 +5961,18 @@ export class TreeSitterExtractor {
               const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
               calleeName = `this.${fieldName}.${methodName}`;
             } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              tsThisSubscriptReceiver(receiver, this.source) !== null
+            ) {
+              // An element of a field of the enclosing class —
+              // `this.listeners[type].push()`, `this.items[0].save()` — kept
+              // as `this.<field>[].<method>`: the resolver reads the element
+              // type off the field's declaration (`Item[]`, `Record<K, V>`)
+              // or leaves it unresolved. `this['svc'].start()` is the field
+              // itself. Mirrored in the kernel's extract_call.
+              calleeName = `${tsThisSubscriptReceiver(receiver, this.source)}.${methodName}`;
+            } else if (
               (this.language === 'typescript' ||
                 this.language === 'javascript' ||
                 this.language === 'tsx' ||
@@ -5998,7 +6033,7 @@ export class TreeSitterExtractor {
             ) {
               // Any other TS/JS receiver is an expression with no static
               // type here — `(a ?? b).map()`, `f().list.map()`,
-              // `arr[0].run()`, `(() => {}).call()`. The bare method name this
+              // `arr[0].run()`, `this.a.b[k].run()`, `(() => {}).call()`. The bare method name this
               // used to emit exact-matched whichever project method shared the
               // name (`(await list()).map()` onto an adapter class's `map`).
               // Emit nothing: a silent miss, never a wrong edge. Mirrored in
