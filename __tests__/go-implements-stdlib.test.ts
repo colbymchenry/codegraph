@@ -11,12 +11,14 @@
  * asked only for `Run`, and 40 service discoverers "implemented" it. The
  * embedded `error` was not even recorded.
  *
- * The method names of the standard-library types projects embed are known
- * now, and `error` is recorded as the embedding it is. Such a name answers
- * only what the standard library asks for: an embedded `sync.Mutex` gives no
- * struct etcd's gRPC `LockClient.Lock`. Embedding any other outside type
- * (`zapcore.Core`, `grpc.ClientStream`) asks for methods nothing names: a
- * struct embedding the same type has them, and otherwise only the one struct
+ * The methods of the standard-library types projects embed are known now,
+ * with their parameter and result counts, and `error` is recorded as the
+ * embedding it is. Such a method answers only what the standard library asks
+ * for: an embedded `sync.Mutex` gives no struct etcd's gRPC `LockClient.Lock`.
+ * An unexported one is its own package's, as Go has it: `testing.TB`'s
+ * `private`, which no project type can declare. Embedding any other outside
+ * type (`zapcore.Core`, `grpc.ClientStream`) asks for methods nothing names:
+ * a struct embedding the same type has them, and otherwise only the one struct
  * with every method the interface does name is taken to implement it.
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
@@ -25,7 +27,24 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { buildTypeHierarchy } from '../src/graph/type-hierarchy';
+import { goStdlibMethods } from '../src/resolution/go-stdlib-methods';
 import type { Edge, Node } from '../src/types';
+
+/**
+ * A project struct declaring every method `testing.TB` has, at its counts,
+ * its unexported `private` included, and a TBRun's `Run`: in a package whose
+ * directory is itself named `testing`, its `private` is still not testing's.
+ */
+function fakeTestingTB(): string {
+  const lines = ['package testing', '', 'type fakeTB struct{}', ''];
+  for (const [name, arity] of [...goStdlibMethods('testing', 'TB')!, ['Run', '2/1'] as const]) {
+    const [params, results] = arity.split('/').map(Number) as [number, number];
+    const list = Array.from({ length: params }, (_, i) => `a${i} int`).join(', ');
+    const result = results === 0 ? '' : results === 1 ? ' int' : ` (${Array(results).fill('int').join(', ')})`;
+    lines.push(`func (f *fakeTB) ${name}(${list})${result} { panic(0) }`);
+  }
+  return `${lines.join('\n')}\n`;
+}
 
 const FILES: Record<string, string> = {
   'go.mod': 'module example.com/app\n\ngo 1.22\n',
@@ -70,6 +89,12 @@ type queryLogFile struct{}
 
 func (f *queryLogFile) Write(p []byte) (int, error) { return len(p), nil }
 func (f *queryLogFile) Sync() error                 { return nil }
+
+// Its Write takes a record and returns only an error: no io.Writer's.
+type walLog struct{}
+
+func (w *walLog) Write(rec *Record) error { return nil }
+func (w *walLog) Sync() error             { return nil }
 
 type SegmentFile interface {
 	Stat() (os.FileInfo, error)
@@ -282,6 +307,7 @@ type DNSProvider interface {
 	libdns.RecordSetter
 }
 `,
+  'testing/fake.go': fakeTestingTB(),
 };
 
 let root = '';
@@ -338,10 +364,12 @@ describe('Go implicit satisfaction knows what standard-library embeddings bring'
     ]);
   });
 
-  it('asks for all of testing.TB, so a discoverer with a Run is no TBRun', () => {
+  it('asks for every method of testing.TB and io.Writer, testing\'s own private and io\'s counts included', () => {
     const implementers = (name: string, file: string) =>
       (buildTypeHierarchy(cg, one(name, file))?.descendants ?? []).map((d) => `${d.relation} ${pkg(d.node)}`).sort();
+    // Not the discoverer with a Run, nor fakeTB, whose private is its own package's.
     expect(implementers('TBRun', 'promql/promql.go')).toEqual(['implements promql.tRunner']);
+    // Not walLog, whose Write takes a record and returns only an error.
     expect(implementers('syncWriter', 'promql/promql.go')).toEqual([
       'implements promql.Segment',
       'implements promql.queryLogFile',
