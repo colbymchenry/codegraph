@@ -700,12 +700,16 @@ impl<'t> Walker<'t> {
         {
             if classify_ts_class_member(node) == Member::Property {
                 let prop = self.extract_property(node);
+                // The initializer walked under the property took its own
+                // candidates; the scan covers the rest of the field.
+                let mut walked: Option<HashSet<usize>> = None;
                 if let (Some((row, name)), Some(value)) = (prop, node.child_by_field_name("value")) {
                     self.stack.push(Scope { row, kind: "property", name });
                     self.visit_function_body(value);
                     self.stack.pop();
+                    walked = Some(HashSet::from([value.id()]));
                 }
-                self.scan_fn_ref_subtree(node, 0, None);
+                self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             } else {
                 self.extract_method(node);
             }
@@ -719,8 +723,9 @@ impl<'t> Walker<'t> {
         } else if self.variant.is_ts() && kind == "type_alias_declaration" {
             skip_children = self.extract_type_alias(node);
         } else if is_variable_type(kind) && !self.inside_class_like() {
-            // A component wrapper's initializer extract_variable walked under
-            // the component captured its own candidates; the scan skips it.
+            // An initializer extract_variable walked under the symbol it
+            // declares (a constant's, a component wrapper's) captured its own
+            // candidates; the scan skips it.
             let walked = self.extract_variable(node);
             self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             skip_children = true;

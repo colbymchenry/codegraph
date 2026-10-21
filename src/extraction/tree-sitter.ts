@@ -1521,9 +1521,12 @@ export class TreeSitterExtractor {
           this.nodeStack.pop();
         }
         // A field initializer can also register callbacks
-        // (`static handlers = { click: onClick }`) — scan it for
-        // function-as-value candidates (capture-only, halts at functions).
-        this.scanFnRefSubtree(node, 0);
+        // (`static handlers = { click: onClick }`). The walk above took those
+        // for the property, so the scan for function-as-value candidates
+        // (capture-only, halts at functions) skips the initializer it walked
+        // and covers the rest of the field: the class would keep a second
+        // reference to each function from the same spot.
+        this.scanFnRefSubtree(node, 0, propNode && valueNode ? new Set([valueNode.id]) : undefined);
         skipChildren = true;
       } else {
         this.extractMethod(node);
@@ -1616,16 +1619,18 @@ export class TreeSitterExtractor {
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
       const walked = this.extractVariable(node);
-      // extractVariable doesn't walk every initializer shape (object literals
-      // are deliberately skipped; Python/Ruby don't walk at all), so scan the
-      // declaration subtree for function-as-value candidates — `const routes =
-      // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
-      // at nested function definitions (their bodies are walked — and
-      // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk. A type walked above, and a
-      // component wrapper's initializer extractVariable walked under the
-      // component (which must not hand the component it wraps to the file),
-      // captured their own.
+      // extractVariable doesn't walk every initializer (a store's members are
+      // extracted one by one, and only TS/JS, Python, Go and Rust walk one at
+      // all), so scan the declaration subtree for function-as-value candidates
+      // — `const routes = { home: renderHome }`, `handlers = {"recv":
+      // target_cb}`. The scan halts at nested function definitions (their
+      // bodies are walked — and attributed — separately). It skips what was
+      // walked already: a type walked above, and every initializer
+      // extractVariable walked under the symbol it declares — a constant's, a
+      // component wrapper's (which must not hand the component it wraps to the
+      // file). Those captured their own, and flush-time dedup keys on the
+      // source, so the file would keep a second reference to each function
+      // from the same spot.
       this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : walked);
       skipChildren = true; // extractVariable handles children
     }
@@ -2016,9 +2021,9 @@ export class TreeSitterExtractor {
       createNode: (kind, name, node, extra) => self.createNode(kind, name, node, extra),
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
-      walkInitializer: (node) => {
+      walkInitializer: (node, functionId = '') => {
         (ctx.walked ??= new Set()).add(node.id);
-        self.visitFunctionBody(node, '');
+        self.visitFunctionBody(node, functionId);
       },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
@@ -2869,8 +2874,8 @@ export class TreeSitterExtractor {
   /**
    * Extract a class field declaration (e.g. Java field_declaration, C# field_declaration).
    * Extracts each declarator as a 'field' kind node inside the owning class.
-   * Returns the C# declarators it walked, for the function-as-value scan to
-   * skip.
+   * Returns the initializers it walked (a C# declarator, a Java `value`), for
+   * the function-as-value scan to skip.
    */
   private extractField(node: SyntaxNode): Set<number> {
     const walked = new Set<number>();
@@ -2988,11 +2993,11 @@ export class TreeSitterExtractor {
                 decl.namedChild(decl.namedChildCount - 1),
                 varDecl ? getChildByField(varDecl, 'type') : null,
               );
-              // Its function-as-value candidates are the field's, captured
-              // here once. (VB.NET captures none; Java's scan still takes
-              // its initializers for the class as well.)
-              walked.add(decl.id);
             }
+            // Its function-as-value candidates are the field's, captured here
+            // once (VB.NET captures none): the scan would take Java's again for
+            // the class.
+            walked.add(valueNode.id);
             this.visitFunctionBody(valueNode, fieldNode.id);
             this.nodeStack.pop();
           }
@@ -3584,9 +3589,11 @@ export class TreeSitterExtractor {
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
    *
-   * Returns the initializers it walked under a component wrapper, whose
-   * function-as-value candidates that walk already took (the caller's scan of
-   * the declaration skips them).
+   * Returns the initializers it walked under the symbol they declare — a
+   * constant's or a variable's (#693), a component wrapper's — whose
+   * function-as-value candidates that walk already took for the symbol. The
+   * caller's scan of the declaration skips them: it would take each again for
+   * the file, as a second reference to the same function from the same spot.
    */
   private extractVariable(node: SyntaxNode): Set<number> | undefined {
     if (!this.extractor) return undefined;
@@ -3686,6 +3693,7 @@ export class TreeSitterExtractor {
             const ownedObject = varNode ? this.ownedObjectValue(valueNode) : null;
             if (varNode && ownedObject) {
               this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false);
+              (walked ??= new Set()).add(ownedObject.id);
               continue;
             }
 
@@ -3772,6 +3780,7 @@ export class TreeSitterExtractor {
               if (varNode) this.nodeStack.push(varNode.id);
               this.visitFunctionBody(valueNode, '');
               if (varNode) this.nodeStack.pop();
+              if (varNode) (walked ??= new Set()).add(valueNode.id);
             }
 
             if (extractObjectMethods && objectOfFns) {
@@ -3820,6 +3829,7 @@ export class TreeSitterExtractor {
         if (assigned) this.nodeStack.push(assigned.id);
         this.visitFunctionBody(right, '');
         if (assigned) this.nodeStack.pop();
+        if (assigned) (walked ??= new Set()).add(right.id);
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
@@ -3860,6 +3870,7 @@ export class TreeSitterExtractor {
           if (varNode) this.nodeStack.push(varNode.id);
           this.visitFunctionBody(valueField, varNode?.id ?? '');
           if (varNode) this.nodeStack.pop();
+          if (varNode) (walked ??= new Set()).add(valueField.id);
         }
       }
 
@@ -4016,6 +4027,7 @@ export class TreeSitterExtractor {
           if (declared) this.nodeStack.push(declared.id);
           this.visitFunctionBody(valueNode, '');
           if (declared) this.nodeStack.pop();
+          if (declared) (walked ??= new Set()).add(valueNode.id);
         }
       }
     }

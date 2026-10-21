@@ -500,8 +500,10 @@ impl<'t> Walker<'t> {
             // Inside a class-like scope the gate fails and the else-ladder
             // falls through with children VISITED — a trait const's value
             // expression emits calls refs from the trait node.
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The initializer extract_variable walked under the declared
+            // symbol took its own candidates; the scan covers the rest.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "use_declaration" {
             self.extract_import(node);
@@ -721,9 +723,10 @@ impl<'t> Walker<'t> {
 
     /// extractVariable's generic fallback: kind is ALWAYS `variable` (no
     /// isConst hook), every direct `identifier` child mints a node positioned
-    /// at the CHILD, docstring shared, isExported present-false, no signature,
-    /// and the initializer value is never body-walked.
-    fn extract_variable(&mut self, node: Node<'t>) {
+    /// at the CHILD, docstring shared, isExported present-false, no signature.
+    /// The initializer is walked under the declared symbol (#693), and returned
+    /// then for the declaration scan to skip.
+    fn extract_variable(&mut self, node: Node<'t>) -> Vec<usize> {
         let docstring = preceding_docstring(node, self.src);
         let name_field = node.child_by_field_name("name");
         // An impl's associated const is its type's (`Limits::MAX`), as its methods are.
@@ -759,16 +762,19 @@ impl<'t> Walker<'t> {
         // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
         // inside the initializer, so a handler table or a lazily-built
         // singleton linked to nothing.
+        let mut walked = Vec::new();
         if let Some(value) = node.child_by_field_name("value") {
             match declared {
                 Some((row, name)) => {
                     self.stack.push(Scope { row, kind: "variable", name });
                     self.visit_function_body(value);
                     self.stack.pop();
+                    walked.push(value.id());
                 }
                 None => self.visit_function_body(value),
             }
         }
+        walked
     }
 
     /// extractImport via the rust hook: import node named by the ROOT module +
@@ -1430,9 +1436,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         if depth > 0
@@ -1447,7 +1457,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

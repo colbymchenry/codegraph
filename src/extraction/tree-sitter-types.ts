@@ -56,11 +56,12 @@ export interface ExtractorContext {
   visitFunctionBody(body: SyntaxNode, functionId: string): void;
   /**
    * Walk a declaration's initializer as code the scope on top of the stack
-   * runs, the way a function body is walked. When the hook then reports the
-   * node handled, the function-as-value scan the dispatcher runs over it skips
-   * what was walked here: the walk captured those candidates already.
+   * runs, the way a function body is walked (`functionId` as for
+   * visitFunctionBody). When the hook then reports the node handled, the
+   * function-as-value scan the dispatcher runs over it skips what was walked
+   * here: the walk captured those candidates already.
    */
-  walkInitializer(node: SyntaxNode): void;
+  walkInitializer(node: SyntaxNode, functionId?: string): void;
   /** Add an unresolved reference */
   addUnresolvedReference(ref: UnresolvedReference): void;
   /** Push a node ID onto the scope stack (for containment/qualified name building) */

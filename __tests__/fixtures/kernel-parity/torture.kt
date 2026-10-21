@@ -52,6 +52,7 @@ val withGetter: Int
     get() = 42
 val initLambda: () -> Unit = { caller() }
 val initSam = Runnable { caller() }
+val handlerList = listOf(::caller)
 val initObject = object : Runnable {
     override fun run() {
         caller()
@@ -60,6 +61,7 @@ val initObject = object : Runnable {
 
 class WidgetK(val size: Int, private var name: String = defaultName()) {
     val area: Int = size * size
+    val hooks = listOf(::caller)
     var label: String? = null
     val computed: Int
         get() = size * 2

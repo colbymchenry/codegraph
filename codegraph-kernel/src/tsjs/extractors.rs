@@ -530,9 +530,11 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// Returns the initializers it walked under a component wrapper, whose
-    /// fn-ref candidates that walk already took (the caller's scan of the
-    /// declaration skips them). Mirrors TreeSitterExtractor.extractVariable.
+    /// Returns the initializers it walked under the symbol they declare — a
+    /// constant's or a variable's (#693), a component wrapper's — whose fn-ref
+    /// candidates that walk already took for the symbol (the caller's scan of
+    /// the declaration skips them; it would take each again for the file).
+    /// Mirrors TreeSitterExtractor.extractVariable.
     pub(super) fn extract_variable(&mut self, node: Node<'t>) -> Option<HashSet<usize>> {
         let mut walked: Option<HashSet<usize>> = None;
         let is_const = self.is_const_decl(node);
@@ -619,6 +621,7 @@ impl<'t> Walker<'t> {
             // the ownedObject branch of TreeSitterExtractor.extractVariable.
             if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
                 self.extract_owned_object_members(obj, row, kind, &name, true, false);
+                walked.get_or_insert_with(HashSet::new).insert(obj.id());
                 continue;
             }
 
@@ -678,6 +681,7 @@ impl<'t> Walker<'t> {
                             self.stack.push(Scope { row, kind, name: name.clone() });
                             self.visit_function_body(v);
                             self.stack.pop();
+                            walked.get_or_insert_with(HashSet::new).insert(v.id());
                         }
                         None => self.visit_function_body(v),
                     }
