@@ -143,6 +143,26 @@ describe('resolving a bare specifier through the app’s own config', () => {
     expect(resolveImportPath('components/Button', 'src/App.jsx', 'jsx', ctx)).toBeNull();
     expect(resolveImportPath('@/components/Button', 'src/App.jsx', 'jsx', ctx)).toBe('src/components/Button.jsx');
   });
+
+  it('maps a rooted specifier through paths, as tsc does (bigbluebutton’s "/*": ["*"])', () => {
+    const rooted: AliasMap = {
+      baseUrl: path.join(ROOT, 'bigbluebutton-html5'),
+      declaresBaseUrl: true,
+      patterns: [{ prefix: '/', suffix: '', hasWildcard: true, replacements: ['*'] }],
+    };
+    const from = 'bigbluebutton-html5/imports/ui/components/button/styles.js';
+    const ctx = stubContext([from, 'bigbluebutton-html5/imports/ui/components/common/icon/component.jsx'], {
+      nearest: (f) => (f.startsWith('bigbluebutton-html5/') ? rooted : null),
+    });
+    expect(resolveImportPath('/imports/ui/components/common/icon/component', from, 'javascript', ctx))
+      .toBe('bigbluebutton-html5/imports/ui/components/common/icon/component.jsx');
+  });
+
+  it('never reads a rooted specifier from baseUrl, and leaves a protocol-relative one alone', () => {
+    const ctx = stubContext(['app/main.js', 'app/imports/ui/icon.js', 'app/cdn.example.com/lib.js'], { nearest: () => baseUrlOnly('app') });
+    expect(resolveImportPath('/imports/ui/icon', 'app/main.js', 'javascript', ctx)).toBeNull();
+    expect(resolveImportPath('//cdn.example.com/lib', 'app/main.js', 'javascript', ctx)).toBeNull();
+  });
 });
 
 function writeTree(root: string, files: Record<string, string>): void {
@@ -386,6 +406,17 @@ const SYNC_MODULES: Record<string, string> = {
   'src/state/store.js': 'export const store = { get(k) { return k; } };\n',
   'src/config.js': 'const config = { port: 3000 };\nexport default config;\n',
 };
+// The same, written from the app's root (bigbluebutton's `"/*": ["*"]`).
+const ROOTED_IMPORTERS: Record<string, string> = {
+  'package.json': JSON.stringify({ name: 'late-rooted-app', dependencies: { react: '^18' } }),
+  'html5/tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '/*': ['*'] } } }),
+  'html5/imports/call.js': "import runIt from '/imports/handlers/run';\nexport function go() { return runIt(); }\n",
+  'html5/imports/draw.js': "import { Widget as W } from '/imports/widgets/Widget';\nexport function paint() { return new W(); }\n",
+};
+const ROOTED_MODULES: Record<string, string> = {
+  'html5/imports/handlers/run.js': 'export default function handle() { return 1; }\n',
+  'html5/imports/widgets/Widget.js': 'export class Widget {}\n',
+};
 
 describe('a sync links an import read from baseUrl once its module appears', () => {
   const roots: string[] = [];
@@ -433,6 +464,19 @@ describe('a sync links an import read from baseUrl once its module appears', () 
     expect(edgesOf(cg)).toEqual(freshEdges);
   }, 120_000);
 
+  it('matches a fresh index for rooted imports the app maps through paths', async () => {
+    const { root, cg } = await indexed(ROOTED_IMPORTERS);
+    writeTree(root, ROOTED_MODULES);
+    const result = await cg.sync();
+    expect(result.filesAdded).toBe(Object.keys(ROOTED_MODULES).length);
+
+    const fresh = await indexed({ ...ROOTED_IMPORTERS, ...ROOTED_MODULES });
+    const freshEdges = edgesOf(fresh.cg);
+    expect(freshEdges.some((e) => e.startsWith('calls function html5/imports/call.js:go') && e.includes('-> function html5/imports/handlers/run.js:handle'))).toBe(true);
+    expect(freshEdges.some((e) => e.startsWith('instantiates function html5/imports/draw.js:paint') && e.includes('-> class html5/imports/widgets/Widget.js:Widget'))).toBe(true);
+    expect(edgesOf(cg)).toEqual(freshEdges);
+  }, 120_000);
+
   it('matches a fresh index when an edit gives the module what its importers import', async () => {
     const stubs = Object.fromEntries(Object.keys(SYNC_MODULES).map((file) => [file, 'export const placeholder = 1;\n']));
     const { root, cg } = await indexed({ ...SYNC_IMPORTERS, ...stubs });
@@ -444,4 +488,83 @@ describe('a sync links an import read from baseUrl once its module appears', () 
     const fresh = await indexed({ ...SYNC_IMPORTERS, ...SYNC_MODULES });
     expect(edgesOf(cg)).toEqual(edgesOf(fresh.cg));
   }, 120_000);
+});
+
+describe('rooted imports an app maps through its own tsconfig paths (bigbluebutton shape)', () => {
+  let root = '';
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rooted-paths-'));
+    writeTree(root, {
+      'package.json': JSON.stringify({ name: 'bigbluebutton', private: true }),
+      'bigbluebutton-html5/package.json': JSON.stringify({ name: 'bbb-html5', dependencies: { react: '^18', 'styled-components': '^5' } }),
+      // JSONC, a block comment beside a "/*" pattern, as bigbluebutton writes it.
+      'bigbluebutton-html5/tsconfig.json': `{
+  "compilerOptions": {
+    /* Module Resolution Options */
+    "baseUrl": ".",
+    "paths": {
+      /* Support absolute /imports/* with a leading '/' */
+      "/*": ["*"]
+    }
+  }
+}
+`,
+      'bigbluebutton-html5/imports/ui/components/common/icon/component.jsx': `const Icon = ({ iconName }) => <i className={iconName} />;
+export default Icon;
+`,
+      'bigbluebutton-html5/imports/utils/format.js': `export function formatTime(time) {
+  return String(time);
+}
+`,
+      // A namesake that a name match takes.
+      'bigbluebutton-html5/imports/ui/components/audio/styles.js': `import styled from 'styled-components';
+const Icon = styled.i\`\`;
+export default { Icon };
+`,
+      'bigbluebutton-html5/imports/ui/components/timer/component.jsx': `import Icon from '/imports/ui/components/common/icon/component';
+import { formatTime } from '/imports/utils/format';
+export default function Timer({ time }) {
+  return <Icon iconName={formatTime(time)} />;
+}
+`,
+      'bigbluebutton-html5/imports/ui/components/button/styles.js': `import styled from 'styled-components';
+import Icon from '/imports/ui/components/common/icon/component';
+const ButtonIcon = styled(Icon)\`\`;
+export default { ButtonIcon };
+`,
+    });
+    cg = await CodeGraph.init(root, { index: true });
+  });
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  const ICON = 'bigbluebutton-html5/imports/ui/components/common/icon/component.jsx';
+  const TIMER = 'bigbluebutton-html5/imports/ui/components/timer/component.jsx';
+
+  /** `kind` edges out of `file`'s nodes, as `name -> name@path`. */
+  const edgesOut = (file: string, kind: string): string[] =>
+    cg.getOutgoingEdgesFrom(cg.getNodesInFile(file).map((n) => n.id))
+      .filter((e) => e.kind === kind)
+      .map((e) => `${cg.getNode(e.source)!.name} -> ${cg.getNode(e.target)!.name}@${cg.getNode(e.target)!.filePath}`);
+
+  it('links the module a rooted import names', () => {
+    expect(edgesOut(TIMER, 'imports')).toContain(`component.jsx -> component.jsx@${ICON}`);
+    expect(edgesOut(TIMER, 'imports')).toContain('component.jsx -> format.js@bigbluebutton-html5/imports/utils/format.js');
+  });
+
+  it('renders and calls what the rooted import binds, not a namesake', () => {
+    const calls = edgesOut(TIMER, 'calls');
+    expect(calls).toContain(`Timer -> Icon@${ICON}`);
+    expect(calls).not.toContain('Timer -> Icon@bigbluebutton-html5/imports/ui/components/audio/styles.js');
+    expect(calls).toContain('Timer -> formatTime@bigbluebutton-html5/imports/utils/format.js');
+  });
+
+  it('links a styled wrapper of a rooted import to the component it wraps', () => {
+    expect(edgesOut('bigbluebutton-html5/imports/ui/components/button/styles.js', 'calls')).toContain(`ButtonIcon -> Icon@${ICON}`);
+  });
 });

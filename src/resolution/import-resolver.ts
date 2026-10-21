@@ -1381,17 +1381,25 @@ function resolveFromOwnConfig(
   return null;
 }
 
-/** Where the importing app's own config reads a bare specifier from (see resolveFromOwnConfig), or null when it reads none. */
+/**
+ * Where the importing app's own config reads a bare specifier from (see
+ * resolveFromOwnConfig), or null when it reads none. A rooted one,
+ * `/imports/ui/components/icon/component`, is a path: tsc maps it through
+ * `paths` (bigbluebutton's `"/*": ["*"]`, kept from its Meteor days) and
+ * never reads it from `baseUrl`.
+ */
 function ownConfigCandidates(
   importPath: string,
   fromFile: string,
   language: Language,
   context: ResolutionContext
 ): string[] | null {
-  if (!ESM_IMPORT_LANGUAGES.has(language) || !importPath || importPath.startsWith('/') || /^[A-Za-z][\w+.-]*:/.test(importPath)) return null;
+  if (!ESM_IMPORT_LANGUAGES.has(language) || !importPath || importPath.startsWith('//') || /^[A-Za-z][\w+.-]*:/.test(importPath)) return null;
   const config = context.getNearestAliases?.(fromFile) ?? context.getProjectAliases?.();
   if (!config) return null;
-  const candidates = aliasAndBaseUrlCandidates(importPath, config, context.getProjectRoot());
+  const candidates = importPath.startsWith('/')
+    ? applyAliases(importPath, config, context.getProjectRoot())
+    : aliasAndBaseUrlCandidates(importPath, config, context.getProjectRoot());
   return candidates.length > 0 ? candidates : null;
 }
 
