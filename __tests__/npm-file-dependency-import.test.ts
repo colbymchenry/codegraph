@@ -4,6 +4,10 @@
  * import of `packages/common/utils.ts` — with no root `workspaces` to say so.
  * Before, the import failed and the call was matched by name: right while the
  * name was unique, the nearest same-named function otherwise (#2456).
+ *
+ * The dependency is the declaring package's: a fixture app's `"left-pad":
+ * "file:../stub-left-pad"` is the stub for the fixture's own files, and
+ * `left-pad` stays the npm package for the rest of the project.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -46,6 +50,30 @@ export function renderPage(): string {
   return renderButton('ok');
 }
 `,
+    'package.json': JSON.stringify({ name: 'acme-root', private: true, dependencies: { 'left-pad': '^1.0.0' } }),
+    '__tests__/fixtures/app/package.json': JSON.stringify({ name: 'fixture-app', dependencies: { 'left-pad': 'file:../stub-left-pad' } }),
+    '__tests__/fixtures/app/use.ts': `import leftPad from 'left-pad';
+
+export function useStub(): string {
+  return leftPad('x', 1);
+}
+`,
+    '__tests__/fixtures/stub-left-pad/package.json': JSON.stringify({ name: 'left-pad', main: 'index.ts' }),
+    '__tests__/fixtures/stub-left-pad/index.ts': `export default function leftPad(s: string, n: number): string {
+  return s;
+}
+`,
+    '__tests__/fixtures/stub-left-pad/lib/pad.ts': `export function pad(s: string): string {
+  return s;
+}
+`,
+    'src/main.ts': `import leftPad from 'left-pad';
+import { pad } from 'left-pad/lib/pad';
+
+export function run(): string {
+  return leftPad(pad('x'), 3);
+}
+`,
   };
   for (const [rel, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -76,5 +104,15 @@ describe('an npm dependency on a sibling directory', () => {
 
   it('link: in devDependencies, a scoped name', () => {
     expect(edgesOf('packages/web/src/page.ts', 'renderPage')).toContain('calls -> packages/ui/button.ts (import)');
+  });
+});
+
+describe('a file: dependency a fixture app declares on a stub of an npm package', () => {
+  it('is the stub for the fixture\'s own files', () => {
+    expect(edgesOf('__tests__/fixtures/app/use.ts', 'useStub')).toContain('calls -> __tests__/fixtures/stub-left-pad/index.ts (import)');
+  });
+
+  it('leaves the npm package external for the rest of the project: no edge from production code into the stub', () => {
+    expect(edgesOf('src/main.ts', 'run').filter((e) => e.includes('stub-left-pad'))).toEqual([]);
   });
 });

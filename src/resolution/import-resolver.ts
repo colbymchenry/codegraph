@@ -389,7 +389,7 @@ function resolveImportPathUncached(
   // alias map first (custom prefixes like `@components/*` would
   // otherwise be misclassified as npm). What still looks like a package
   // may name a file through the importing app's own config.
-  if (isExternalImport(importPath, language, context)) {
+  if (isExternalImport(importPath, language, context, { fromFile })) {
     return resolveFromOwnConfig(importPath, fromFile, language, context);
   }
 
@@ -1105,12 +1105,15 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * asked `resolveImportPath` whether an alias maps the specifier to a file.
  * Matching a prefix proves nothing by itself: a catch-all `"*"` pattern
  * (`"*": ["./typings/*"]`) has an empty prefix and matches every package.
+ *
+ * `fromFile` (projectRoot-relative) is the importing file, for the path
+ * dependencies only the files under a package.json see.
  */
 export function isExternalImport(
   importPath: string,
   language: Language,
   context?: ResolutionContext,
-  options: { aliasPrefixes?: boolean } = {}
+  options: { aliasPrefixes?: boolean; fromFile?: string } = {}
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
@@ -1122,7 +1125,7 @@ export function isExternalImport(
   // workspace map first so they aren't misclassified as external (#629). The
   // map is null for single-package repos, so this is a no-op there.
   const workspaces = context?.getWorkspacePackages?.();
-  if (workspaces && resolveWorkspaceImport(importPath, workspaces)) {
+  if (workspaces && resolveWorkspaceImport(importPath, workspaces, options.fromFile)) {
     return false;
   }
 
@@ -1302,7 +1305,7 @@ function resolveAliasedImport(
   //     extension/index permutations below then find its barrel (#629).
   const workspaces = context.getWorkspacePackages?.();
   if (workspaces) {
-    const base = resolveWorkspaceImport(importPath, workspaces);
+    const base = resolveWorkspaceImport(importPath, workspaces, fromFile);
     if (base) {
       const hit = tryWithExt(base);
       if (hit) return hit;
@@ -4218,7 +4221,7 @@ export function isBoundToOutOfRepoImport(
     if (imp.localName !== name) continue;
     // A package the repository declares itself (`declare module 'x'`) has
     // its declarations in the repository.
-    return isExternalImport(imp.source, ref.language, context) &&
+    return isExternalImport(imp.source, ref.language, context, { fromFile: ref.filePath }) &&
       resolveImportPath(imp.source, ref.filePath, ref.language, context) === null &&
       !ambientModuleDeclares(imp.source, imp.exportedName, imp.isDefault, ref, context);
   }
@@ -4291,7 +4294,7 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   const binding = mappings.find((m) => m.localName === name) ??
     (receiver && ref.referenceKind === 'calls' ? localTypeBinding(receiver, ref, context, mappings) : undefined);
   if (!binding) return undefined;
-  if (isExternalImport(binding.source, ref.language, context) &&
+  if (isExternalImport(binding.source, ref.language, context, { fromFile: ref.filePath }) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
       !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix)) &&
       // A module the app's `baseUrl` or catch-all `paths` reads (`layout/MainLayout`).

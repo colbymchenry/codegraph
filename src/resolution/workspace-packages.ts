@@ -17,9 +17,10 @@
  * Scope deliberately small for v1 (mirrors path-aliases.ts):
  *   - reads `workspaces` (array OR `{ packages: [...] }`) from package.json,
  *     plus a minimal `pnpm-workspace.yaml` `packages:` list
- *   - reads a sibling directory any package.json depends on by path
+ *   - reads a sibling directory a package.json depends on by path
  *     (`"acme-shared": "file:../common"`, `link:`, `portal:`), which needs
- *     no workspace declaration at all
+ *     no workspace declaration at all — for the files under that manifest,
+ *     as npm installs it for that package only; the root manifest's for all
  *   - expands `*`, `?` and `{a,b}` within a folder name and `**` across
  *     folders (`packages/*`, pnpm's nested `packages/**\/*`), and leaves out
  *     what a negated glob (`!**\/example`) matches
@@ -46,6 +47,14 @@ export interface WorkspacePackages {
    * list). Absent for npm/pnpm members (their index conventions cover it).
    */
   entryByName?: Map<string, string>;
+  /**
+   * The path dependencies a package.json below the root declares, visible
+   * to the files under its directory only: that directory → dep `name` →
+   * target directory (both relative to projectRoot, posix). A fixture app's
+   * `"left-pad": "file:../stub-left-pad"` is the stub for the fixture, and
+   * leaves `left-pad` the npm package for everyone else.
+   */
+  scopedByName?: Map<string, Map<string, string>>;
 }
 
 /**
@@ -82,17 +91,30 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   // workspaces, different manifest. An npm package does the same with
   // `"acme-shared": "file:../common"` and no root `workspaces` (#2456).
   const entryByName = new Map<string, string>();
-  for (const [name, dir] of collectFileDeps(projectRoot)) {
+  const fileDeps = collectFileDeps(projectRoot);
+  for (const [name, dir] of fileDeps.get('') ?? []) {
     if (byName.has(name)) continue;
     byName.set(name, dir);
     const entry = readOhpmMain(projectRoot, dir);
     if (entry) entryByName.set(name, entry);
   }
+  fileDeps.delete('');
 
-  if (byName.size === 0) return null;
+  if (byName.size === 0 && fileDeps.size === 0) return null;
 
-  logDebug('workspace packages loaded', { count: byName.size });
-  return { byName, entryByName: entryByName.size > 0 ? entryByName : undefined };
+  logDebug('workspace packages loaded', { count: byName.size, scoped: fileDeps.size });
+  return {
+    byName,
+    entryByName: entryByName.size > 0 ? entryByName : undefined,
+    scopedByName: fileDeps.size > 0 ? fileDeps : undefined,
+  };
+}
+
+/** Every directory the workspace map names, longest first: the members, and what a path dependency points at. */
+export function workspaceMemberDirs(ws: WorkspacePackages): string[] {
+  const dirs = new Set(ws.byName.values());
+  for (const names of ws.scopedByName?.values() ?? []) for (const dir of names.values()) dirs.add(dir);
+  return [...dirs].sort((a, b) => b.length - a.length);
 }
 
 /**
@@ -120,16 +142,19 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
 
 /**
  * Scan the project for `oh-package.json5` and `package.json` manifests and
- * collect their `file:`-protocol dependencies as workspace members: dep name
- * (what the source imports) → target directory (projectRoot-relative posix).
- * An npm dependency counts when it names a directory of the project other
- * than the root — not a tarball, and nothing under `node_modules`.
+ * collect their `file:`-protocol dependencies as workspace members, by the
+ * directory they are visible from: `''` (the whole project) for every ohpm
+ * manifest and the root package.json, a package.json's own directory
+ * otherwise. Under each, dep name (what the source imports) → target
+ * directory (projectRoot-relative posix). An npm dependency counts when it
+ * names a directory of the project other than the root — not a tarball, and
+ * nothing under `node_modules`.
  *
  * Precision rule: a name declared with DIFFERENT target directories in
- * different manifests (e.g. every sample in a samples monorepo has its own
- * "common") is AMBIGUOUS and dropped entirely — a missing edge beats a wrong
- * cross-module link. Registry dependencies (`@ohos/axios: "^2.0.0"`) don't
- * use `file:` and are ignored, staying external.
+ * different manifests of one scope (e.g. every sample in a samples monorepo
+ * has its own "common") is AMBIGUOUS and dropped entirely — a missing edge
+ * beats a wrong cross-module link. Registry dependencies (`@ohos/axios:
+ * "^2.0.0"`) don't use `file:` and are ignored, staying external.
  *
  * The walk is bounded (depth + directory budget) and prunes build/dependency
  * dirs; a manifest is parsed only where the walk finds one.
@@ -143,8 +168,8 @@ const OHPM_SKIP_DIRS = new Set([
   'build', 'dist', 'out', 'oh-package-lock.json5',
 ]);
 
-function collectFileDeps(projectRoot: string): Map<string, string> {
-  const byName = new Map<string, string>();
+function collectFileDeps(projectRoot: string): Map<string, Map<string, string>> {
+  const byScope = new Map<string, Map<string, string>>();
   const ambiguous = new Set<string>();
 
   const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];
@@ -171,23 +196,27 @@ function collectFileDeps(projectRoot: string): Map<string, string> {
       if (e.name !== OHPM_MANIFEST && e.name !== NPM_MANIFEST) continue;
 
       const deps = readFileDeps(path.join(abs, e.name));
+      const scope = e.name === NPM_MANIFEST ? rel : '';
+      let byName = byScope.get(scope);
       for (const [name, target] of deps) {
         const targetAbs = path.resolve(abs, target);
         const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
         if (targetRel.startsWith('..')) continue; // escapes the project
         if (e.name === NPM_MANIFEST && (targetRel === '' || /(?:^|\/)node_modules(?:\/|$)/.test(targetRel) || !isDirectory(targetAbs))) continue;
+        if (!byName) byScope.set(scope, (byName = new Map()));
         const existing = byName.get(name);
         if (existing === undefined) {
-          if (!ambiguous.has(name)) byName.set(name, targetRel);
+          if (!ambiguous.has(`${scope}|${name}`)) byName.set(name, targetRel);
         } else if (existing !== targetRel) {
           byName.delete(name);
-          ambiguous.add(name);
+          ambiguous.add(`${scope}|${name}`);
         }
       }
+      if (byName?.size === 0) byScope.delete(scope);
     }
   }
 
-  return byName;
+  return byScope;
 }
 
 function isDirectory(abs: string): boolean {
@@ -233,20 +262,35 @@ function readFileDeps(manifestAbs: string): Array<[string, string]> {
  * WITHOUT an extension — the caller applies the language's extension/index
  * resolution. `@scope/ui/widgets` → `packages/ui/widgets`; the bare package
  * name `@scope/ui` → its directory. Returns `null` when no member package
- * name matches.
+ * name matches. A path dependency a package.json below the root declares is
+ * a member for the files under that manifest only, so those are read with
+ * `fromFile` (projectRoot-relative), the nearest declaring manifest first.
  */
 export function resolveWorkspaceImport(
   importPath: string,
-  ws: WorkspacePackages
+  ws: WorkspacePackages,
+  fromFile?: string
 ): string | null {
   // Longest matching package name wins, so `@scope/ui/core` prefers a
   // `@scope/ui/core` package over a `@scope/ui` one when both exist.
-  let bestName: string | null = null;
-  for (const name of ws.byName.keys()) {
-    if (importPath === name || importPath.startsWith(name + '/')) {
-      if (!bestName || name.length > bestName.length) bestName = name;
+  const longest = (names: Map<string, string>): string | null => {
+    let bestName: string | null = null;
+    for (const name of names.keys()) {
+      if (importPath === name || importPath.startsWith(name + '/')) {
+        if (!bestName || name.length > bestName.length) bestName = name;
+      }
+    }
+    return bestName;
+  };
+  if (ws.scopedByName && fromFile !== undefined) {
+    const file = fromFile.replace(/\\/g, '/');
+    const scopes = [...ws.scopedByName].filter(([dir]) => file.startsWith(dir + '/')).sort((a, b) => b[0].length - a[0].length);
+    for (const [, names] of scopes) {
+      const name = longest(names);
+      if (name) return (names.get(name)! + importPath.slice(name.length)).replace(/\/{2,}/g, '/');
     }
   }
+  const bestName = longest(ws.byName);
   if (!bestName) return null;
   const dir = ws.byName.get(bestName)!;
   const subpath = importPath.slice(bestName.length); // '' or '/widgets'

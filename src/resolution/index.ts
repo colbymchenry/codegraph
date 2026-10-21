@@ -700,7 +700,7 @@ export class ReferenceResolver {
       // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
       // `node_modules`, topcoder's `config` package on its `config/` folder.
       isOutOfRepoImport: (source, fromFile, language) => {
-        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false, fromFile })) return false;
         const resolved = resolveImportPath(source, fromFile, language, this.context);
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
