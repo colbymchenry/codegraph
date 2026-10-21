@@ -4243,9 +4243,12 @@ export function isBoundToOutOfRepoImport(
  *    barrel pass the name on (`context/index.ts` gaining `export {
  *    useInvocation } from './context'`) declares nothing. So it waits under
  *    the key only when its module is a project file that has the key, the
- *    file whose edit that is: not while the module is missing, nor for a
- *    workspace package's own name (`@vben/icons`), whose key is the package's
- *    folder, which its entry file (`src/index.ts`) never has.
+ *    file whose edit that is, and gives no such name yet: not while the module
+ *    is missing, nor for a workspace package's own name (`@vben/icons`), whose
+ *    key is the package's folder, which its entry file (`src/index.ts`) never
+ *    has, nor when the module already gives the name and the reference failed
+ *    for another reason (a constant passed where a function is expected),
+ *    which no edit of its exports changes.
  *  - a direct member of any binding, a named import's included
  *    (`NODE_PATH_EXCLUDELIST.includes(p)`, `store.get(k)`, `NS.make()`). It
  *    reaches the binding's declaration, or a member of it, through the module,
@@ -4304,6 +4307,8 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   if (!receiver && !binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName) {
     const moduleFile = resolveImportPath(binding.source, ref.filePath, ref.language, context);
     if (!moduleFile || !(context.isIndexedFile?.(moduleFile) ?? true) || !moduleReferenceKeys(moduleFile).includes(tail)) return undefined;
+    const want = { isDefault: false, isNamespace: false, exportedName: binding.exportedName, memberName: null };
+    if (findExportedSymbol(moduleFile, want, ref.language, context, new Set())) return undefined;
   }
   return tail;
 }
