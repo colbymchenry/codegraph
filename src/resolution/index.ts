@@ -33,9 +33,9 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
-import { clearAmbientModuleMemos, ambientModuleFunctionIds } from './ambient-modules';
+import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -1356,11 +1356,15 @@ export class ReferenceResolver {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
-    // A function a declaration file's `declare module 'x'` declares is reached
-    // only through an import of `x`, never by its bare name from another file
-    // (see ./ambient-modules).
-    if (resolved && resolved.resolvedBy !== 'import' && ambientModuleFunctionIds(this.context).has(resolved.targetNodeId) &&
-        this.nodeById(resolved.targetNodeId)?.filePath !== ref.filePath) return null;
+    // A declaration of a declaration file's `declare module 'x'` is reached
+    // through an import of `x`, never by its bare name from a file that
+    // reaches no `x` (see reachesAmbientModule).
+    if (resolved && resolved.resolvedBy !== 'import') {
+      const specifier = ambientModuleDeclarations(this.context).get(resolved.targetNodeId);
+      const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
+      if (declaringFile !== undefined && declaringFile !== ref.filePath &&
+          !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);

@@ -515,6 +515,81 @@ describe('an import of a package the repository declares itself', () => {
     }
   }, 60_000);
 
+  it('reaches any declaration of the module only from a file that reaches the module', async () => {
+    // vscode's own shapes. A namespace import's `vscode.TextDocument`, a name
+    // from a file re-exporting the module (copilot's `vscodeTypes.ts`), and the
+    // proposed API files' own declarations of `vscode` reach `vscode.d.ts`.
+    // Node's `fs`, electron's `clipboard`, a `ProcessEnv` the file never
+    // imports, and an LSP `TextDocument` through a barrel don't, though the
+    // module declares the names.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'ext' }),
+      'typings/vscode.d.ts': `declare module 'vscode' {
+  export interface TextDocument { uri: string }
+  export class Disposable { dispose(): void; }
+  export class EventEmitter<T> { fire(data: T): void; }
+  export interface FileSystem { readFile(path: string): Promise<Uint8Array> }
+  export interface Clipboard { writeText(value: string): Promise<void> }
+  export type ProcessEnv = { [key: string]: string };
+  export namespace workspace {
+    export const fs: FileSystem;
+  }
+  export namespace env {
+    export const clipboard: Clipboard;
+  }
+}
+`,
+      'typings/vscode.proposed.watch.d.ts': `declare module 'vscode' {
+  export interface Watcher extends Disposable {
+    document: TextDocument;
+  }
+}
+`,
+      'src/vscodeTypes.ts': "import * as vscode from 'vscode';\nexport import TextDocument = vscode.TextDocument;\n",
+      'src/ext.ts': "import * as vscode from 'vscode';\nexport function title(doc: vscode.TextDocument): string { return doc.uri; }\n",
+      'src/viaShim.ts': "import { TextDocument } from './vscodeTypes';\nexport function size(doc: TextDocument): number { return doc.uri.length; }\n",
+      'src/node.ts': "import { readFileSync } from 'fs';\nexport function read(): string { return readFileSync('x', 'utf8'); }\n",
+      'src/main.ts': "import { clipboard } from 'electron';\nexport function copy(): void { clipboard.writeText('x'); }\n",
+      'src/env.ts': "export function home(env: ProcessEnv): string { return env.HOME ?? ''; }\n",
+      'src/languageModes.ts': "export { TextDocument } from 'vscode-languageserver-textdocument';\n",
+      'src/html.ts': "import { TextDocument } from './languageModes';\nexport function lineCount(doc: TextDocument): number { return 0; }\n",
+      // `new vscode.EventEmitter<T>()` is recorded by its last name, as a type is.
+      'src/emitter.ts': "import * as vscode from 'vscode';\nexport const changed = new vscode.EventEmitter<string>();\n",
+      // A file that imports the module, but binds the bare name elsewhere.
+      'src/mixed.ts': "import * as vscode from 'vscode';\nimport { TextDocument } from 'vscode-languageserver-textdocument';\nexport function lines(doc: TextDocument): number { return vscode ? 0 : 1; }\n",
+      // typescript-language-features' protocol.d.ts: a module augmenting a
+      // package's namespace, which its `export =` hands out.
+      'typings/protocol.d.ts': `import type ts from 'typescript-lib';
+export = ts.server.protocol;
+declare module 'typescript-lib' {
+  namespace server.protocol {
+    interface Response { readonly _serverType?: string }
+  }
+}
+`,
+      'src/cached.ts': "import type * as Proto from '../typings/protocol';\nexport function ok(response: Proto.Response): boolean { return !!response; }\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'src/ext.ts')).toContain('references typings/vscode.d.ts:TextDocument');
+      expect(edgesFrom(cg, 'src/viaShim.ts')).toContain('references typings/vscode.d.ts:TextDocument');
+      expect(edgesFrom(cg, 'src/emitter.ts')).toContain('instantiates typings/vscode.d.ts:EventEmitter');
+      expect(edgesFrom(cg, 'src/cached.ts')).toContain('references typings/protocol.d.ts:Response');
+      expect(edgesFrom(cg, 'src/mixed.ts').filter((e) => e.includes('typings/vscode.d.ts:TextDocument'))).toEqual([]);
+      expect(edgesFrom(cg, 'typings/vscode.proposed.watch.d.ts')).toEqual(expect.arrayContaining([
+        'extends typings/vscode.d.ts:Disposable',
+        'references typings/vscode.d.ts:TextDocument',
+      ]));
+      for (const file of ['src/node.ts', 'src/env.ts', 'src/languageModes.ts', 'src/html.ts']) {
+        expect(edgesFrom(cg, file).filter((e) => e.includes('typings/vscode.d.ts')), file).toEqual([]);
+      }
+      expect(edgesFrom(cg, 'src/main.ts')).not.toContain('imports typings/vscode.d.ts:clipboard');
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
   it('never takes a test fixture’s copy of the declaration for the program’s', async () => {
     // copilot keeps fixture copies of vscode's proposed API typings, which its
     // tsconfig leaves out of the build.

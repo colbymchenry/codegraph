@@ -460,8 +460,10 @@ interface Memo {
   scanned: { byFile: Map<string, AmbientModule[]>; bySpecifier: Map<string, AmbientModule[]> } | null;
   /** Per block (`file`, line, column): its declarations, by name. */
   members: Map<string, Map<string, Node[]>>;
-  /** See ambientModuleFunctionIds. */
-  functionIds: ReadonlySet<string> | null;
+  /** See ambientModuleDeclarations. */
+  declarationIds: ReadonlyMap<string, string> | null;
+  /** The blocks of TypeScript files other than declaration files, by file (see isInModuleBlock). */
+  otherBlocks: Map<string, readonly AmbientModuleBlock[]>;
   /** declarationsFor's answers, by specifier and importing file. */
   declarations: Map<string, AmbientModule[]>;
   /** isMergedAmbientDeclaration's answers, by node id. */
@@ -477,7 +479,7 @@ export function clearAmbientModuleMemos(context: ResolutionContext): void {
 
 function memoFor(context: ResolutionContext): Memo {
   let memo = MEMO.get(context);
-  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), functionIds: null, declarations: new Map(), merged: new Map() }));
+  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map() }));
   return memo;
 }
 
@@ -517,7 +519,7 @@ function scanned(context: ResolutionContext): NonNullable<Memo['scanned']> {
 const DECLARATION_KINDS = new Set<Node['kind']>(['function', 'class', 'interface', 'type_alias', 'enum', 'constant', 'variable', 'component']);
 
 /** Whether `node` starts inside the block, by position. */
-function inBlock(node: Node, block: AmbientModuleBlock): boolean {
+function inBlock(node: Pick<Node, 'startLine' | 'startColumn'>, block: AmbientModuleBlock): boolean {
   const afterStart = node.startLine > block.startLine || (node.startLine === block.startLine && node.startColumn >= block.startColumn);
   const beforeEnd = node.startLine < block.endLine || (node.startLine === block.endLine && node.startColumn <= block.endColumn);
   return afterStart && beforeEnd;
@@ -661,23 +663,49 @@ function blockDeclaring(node: Node, context: ResolutionContext): AmbientModule |
 }
 
 /**
- * The ids of the functions declaration files' `declare module 'x'` bodies
- * declare. Only an import of `x` reaches one: a module's functions are never
- * global, so a bare `encode()` elsewhere is no call of the `encode` excalidraw
- * declares for `png-chunks-encode`. A set, so asking about every reference a
- * strategy other than the import resolver settles costs a lookup.
+ * The declarations at the own level of declaration files' `declare module 'x'`
+ * bodies, by id, each with the `x` its block declares. A module's members are
+ * never global: a bare `encode()` elsewhere is no call of the `encode`
+ * excalidraw declares for `png-chunks-encode`, Node's `import * as fs from
+ * 'fs'` no import of the `fs` vscode's `workspace` namespace declares, and an
+ * ESLint `Property` no use of emmet's `declare module 'EmmetFlatNode'`. A
+ * map, so asking about every reference a strategy other than the import
+ * resolver settles costs a lookup (see reachesAmbientModule).
  */
-export function ambientModuleFunctionIds(context: ResolutionContext): ReadonlySet<string> {
+export function ambientModuleDeclarations(context: ResolutionContext): ReadonlyMap<string, string> {
   const memo = memoFor(context);
-  if (memo.functionIds) return memo.functionIds;
-  const ids = new Set<string>();
+  if (memo.declarationIds) return memo.declarationIds;
+  const ids = new Map<string, string>();
   for (const [file, modules] of scanned(context).byFile) {
     for (const node of context.getNodesInFile(file)) {
-      if (node.kind === 'function' && isBlockLevel(node) && modules.some((mod) => inBlock(node, mod))) ids.add(node.id);
+      if (!isBlockLevel(node)) continue;
+      const mod = modules.find((m) => inBlock(node, m));
+      if (mod) ids.set(node.id, mod.specifier);
     }
   }
-  memo.functionIds = ids;
+  memo.declarationIds = ids;
   return ids;
+}
+
+/**
+ * Whether line:column of `file` lies inside a block declaring `specifier`:
+ * one of the module's own declarations, which merge, as vscode's proposed API
+ * files add to `vscode.d.ts`'s `declare module 'vscode'`. A declaration
+ * file's blocks are the scanned ones; another TypeScript file's are read the
+ * first time one is asked about.
+ */
+export function isInModuleBlock(file: string, line: number, column: number, specifier: string, context: ResolutionContext): boolean {
+  let blocks: readonly AmbientModuleBlock[] | undefined = scanned(context).byFile.get(file);
+  if (!blocks && !DECLARATION_FILE.test(file)) {
+    const memo = memoFor(context);
+    blocks = memo.otherBlocks.get(file);
+    if (!blocks) {
+      const source = context.readFile(file);
+      blocks = source && /\bdeclare\s+module\s*['"]/.test(source) ? scanAmbientModules(source).blocks : [];
+      memo.otherBlocks.set(file, blocks);
+    }
+  }
+  return (blocks ?? []).some((block) => block.specifier === specifier && inBlock({ startLine: line, startColumn: column }, block));
 }
 
 /**

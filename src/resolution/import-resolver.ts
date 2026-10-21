@@ -15,7 +15,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
-import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile } from './ambient-modules';
+import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, isInModuleBlock } from './ambient-modules';
 import { moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
@@ -2971,6 +2971,50 @@ export function resolveViaImport(
 /** Whether `source`, imported in a file of `language`, is an ES module specifier written as a name, not a path. */
 function isBareModuleSpecifier(source: string, language: Language): boolean {
   return ESM_IMPORT_LANGUAGES.has(language) && !source.startsWith('.') && !source.startsWith('/');
+}
+
+/**
+ * Reference kinds the extractor records by a qualified name's last part: a
+ * type position (`doc: vscode.TextDocument`) and a construction (`new
+ * vscode.EventEmitter<T>()`). A call keeps what it is called through.
+ */
+const LAST_NAME_KINDS: ReadonlySet<string> = new Set(['references', 'extends', 'implements', 'type_of', 'returns', 'instantiates']);
+
+/**
+ * Whether `ref`, in another file than the declaration, may name by its bare
+ * name a declaration of the repository's own `declare module '<specifier>'`
+ * in `declaringFile` (see ambientModuleDeclarations), the import resolver
+ * having bound nothing:
+ * - written inside a block declaring the same module, whose declarations
+ *   merge (vscode's proposed API files add to `vscode.d.ts`);
+ * - the last name of a qualified one, the file importing the module or the
+ *   declaring file: `vscode.TextDocument` under `import * as vscode from
+ *   'vscode'`, typescript-language-features' `Proto.Response` under `import
+ *   type * as Proto from './protocol/protocol'`, whose `export =` hands out the
+ *   namespace the file's block augments;
+ * - a name the file imports from the module, from the declaring file, or from
+ *   a project file that imports the module and re-exports it (copilot's
+ *   `vscodeTypes.ts`: `export import X = vscode.X`).
+ * A name bound to another package (an LSP `TextDocument`), to Node's own
+ * modules (`fs`), or to a project file that doesn't import the module, or a
+ * bare name a file reaching no such module writes, is not one of the module's.
+ */
+export function reachesAmbientModule(ref: UnresolvedRef, specifier: string, declaringFile: string, context: ResolutionContext): boolean {
+  if (isInModuleBlock(ref.filePath, ref.line, ref.column ?? 0, specifier, context)) return true;
+  const mappings = context.getImportMappings(ref.filePath, ref.language);
+  const relative = (source: string): boolean => source.startsWith('.') || source.startsWith('/');
+  const leadsTo = (source: string, through: (file: string) => boolean): boolean => {
+    if (source === specifier) return true;
+    if (!relative(source)) return false;
+    const file = resolveImportPath(source, ref.filePath, ref.language, context);
+    return file !== null && (file === declaringFile || through(file));
+  };
+  const head = ref.referenceName.split('.')[0]!;
+  const binding = mappings.find((m) => m.localName === head);
+  if (binding) {
+    return leadsTo(binding.source, (file) => context.getImportMappings(file, ref.language).some((m) => m.source === specifier));
+  }
+  return LAST_NAME_KINDS.has(ref.referenceKind) && mappings.some((m) => leadsTo(m.source, () => false));
 }
 
 /**
