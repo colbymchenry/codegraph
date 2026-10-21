@@ -122,6 +122,43 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     expect(names).not.toContain('registration');
   });
 
+  it.each(['\n', '\r\n'])('classes named with a scope or template arguments retain parity (%j)', (eol) => {
+    const source = [
+      'namespace leveldb {',
+      'template <typename Key, class Comparator>',
+      'class SkipList { struct Node; Node* head_; };',
+      'template <typename Key, class Comparator>',
+      'struct SkipList<Key, Comparator>::Node {',
+      '  Node* Next(int n) { return nullptr; }',
+      '  struct Link { int hops() const { return 0; } };',
+      '};',
+      'class Table { struct Rep; };',
+      'struct Table::Rep { int seqno() const { return 0; } };',
+      'namespace leveldb {',
+      'struct leveldb::Table::Rep2 {};',
+      '}',
+      'struct ::Top { int depth() const { return 0; } };',
+      '}  // namespace leveldb',
+      'template <typename R, typename... Args>',
+      'class FunctionMocker<R(Args...)> { R Invoke(Args... args) { return R(); } };',
+      'template <> struct fmt::formatter<int> { int format(int x) const { return x; } };',
+      'union ::Global::Bits { int all; };',
+      'struct Tag;',
+      'struct ::Tag { int bits() const { return 0; } };',
+      '',
+    ].join(eol);
+    assertParity('scoped-classes.h', source, 'cpp', 10);
+    const result = tryKernelExtract('scoped-classes.h', source, 'cpp')!;
+    const named = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.qualifiedName).sort();
+    // A name written from the global scope alone has no scope to be qualified under.
+    expect(result.nodes.map((n) => n.qualifiedName).filter((q) => q.startsWith('::') || q.includes('::::'))).toEqual([]);
+    expect(named('struct')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node', 'leveldb::SkipList::Node::Link', 'leveldb::Table::Rep', 'leveldb::Table::Rep2']));
+    expect(named('union')).toEqual(['Global::Bits']);
+    expect(named('method')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node::Next', 'leveldb::SkipList::Node::Link::hops', 'leveldb::Table::Rep::seqno']));
+    // A specialization is not named after its template.
+    expect([...named('struct'), ...named('class')].filter((q) => /formatter|FunctionMocker/.test(q))).toEqual([]);
+  });
+
   it.each(['\n', '\r\n'])('COM interface declarations retain native/wasm parity (%j)', (eol) => {
     const source = [
       '#define interface struct',

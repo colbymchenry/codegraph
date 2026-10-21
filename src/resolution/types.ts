@@ -157,6 +157,14 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * The nodes one type declaration extends or implements, through its own
+   * resolved `implements`/`extends` edges: where getSupertypes unions those of
+   * every type sharing a simple name, this is the supertypes of the node
+   * `id`. Empty during the first resolution pass, as getSupertypes is.
+   * Optional so external/test contexts compile without it.
+   */
+  getSupertypeNodes?(id: string): Node[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile
@@ -177,8 +185,29 @@ export interface ResolutionContext {
    */
   isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
   /**
-   * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
-   * `null` when the project doesn't define any. Cached per resolver
+   * The project file a module specifier, written in `fromFile`, names — the
+   * import resolver's own answer (for Python: from the package roots), or null
+   * when no project file provides it. Supplied by the coordinator.
+   */
+  resolveModuleFile?(source: string, fromFile: string, language: Language): string | null;
+  /**
+   * Whether `source`, imported from `fromFile`, is a package: one the file's
+   * package.json or an enclosing one declares, a Node built-in, or a
+   * runtime's virtual module (`node:`, `bun:`, `astro:`…). Such an import
+   * never binds to a same-named project module, only to a declaration file
+   * the project keeps for the package. Supplied by the coordinator.
+   */
+  isDeclaredPackage?(source: string, fromFile: string): boolean;
+  /**
+   * Whether `filePath` (project-relative) is one of the files the index holds.
+   * `fileExists` also answers for a directory and for a file on disk the
+   * index never read, such as one under `node_modules`. Supplied by the
+   * coordinator; a minimal context can omit it.
+   */
+  isIndexedFile?(filePath: string): boolean;
+  /**
+   * Project import-path aliases (tsconfig/jsconfig `paths`, and `baseUrl`).
+   * Returns `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
    * existing test fixtures and external context implementations
    * compile without modification; production resolver implements it.
@@ -186,7 +215,8 @@ export interface ResolutionContext {
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
   /**
    * The aliases of the tsconfig / jsconfig nearest `fromFile` below the
-   * project root that declares `paths` — a monorepo app's own `@/*` — or null.
+   * project root that declares `paths` or `baseUrl` — a monorepo app's own
+   * `@/*`, a nested Vite app's `"baseUrl": "src"` — or null.
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
@@ -371,6 +401,16 @@ export interface FrameworkResolver {
    * calls this describes back for its resolution sweep.
    */
   navigation?: NavigationCalls;
+  /**
+   * The modules whose content `resolve()` reads to answer `ref`, a route
+   * node's reference — none for most. A React route that renders a same-file
+   * `const Docs = lazy(() => import('./pages/Docs'))` binds to the component
+   * that module exports, through any barrel that forwards it, and to the
+   * declaration while the module is missing or exports none: the answer
+   * changes with those files although no name the reference carries does, so
+   * a sync that adds or changes one of them resolves the reference again.
+   */
+  lazyModules?(ref: UnresolvedRef, context: ResolutionContext): readonly string[];
 }
 
 /**

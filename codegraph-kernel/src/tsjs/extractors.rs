@@ -9,6 +9,7 @@ use super::{
     is_react_hoc, is_static_object_key, is_variable_type, is_vue_collection_name, Extra, Scope, Walker,
 };
 use crate::buffers::edge_kind_index;
+use std::collections::HashSet;
 use tree_sitter::Node;
 
 impl<'t> Walker<'t> {
@@ -170,12 +171,129 @@ impl<'t> Walker<'t> {
         let Some(row) = self.create_node("component", name, declarator, extra) else {
             return;
         };
-        let Some(inner) = inner_fn else { return };
         self.stack.push(Scope { row, kind: "component", name: name.to_string() });
-        if let Some(body) = body_of(inner) {
-            self.visit_function_body(body);
+        match inner_fn {
+            Some(inner) => {
+                if let Some(body) = body_of(inner) {
+                    self.visit_function_body(body);
+                }
+            }
+            // Without a render function, the initializer is walked instead.
+            None => {
+                if let Some(value) = declarator.child_by_field_name("value") {
+                    self.walk_component_wrapper(value);
+                }
+            }
         }
         self.stack.pop();
+    }
+
+    /// A wrapper with no render function of its own (`styled.div\`…\``,
+    /// `styled(Base).attrs(…)<P>\`…\``, `styled(Base)(styles)`, `memo(Base)`),
+    /// walked with its component on the stack as a constant's initializer is
+    /// (#693): the template's interpolations and the `.attrs()` / options /
+    /// style-function / comparator arguments are the component's code. The
+    /// wrapper's own chain (`styled`, `styled.div`, `.attrs`, `memo`) is not
+    /// recorded, the component it wraps is left to the JSX synthesizer (it is
+    /// what this one renders), and a typed tag's type operands are not walked.
+    /// Mirrors TreeSitterExtractor.walkComponentWrapper.
+    fn walk_component_wrapper(&mut self, link: Node<'t>) {
+        stack_guard!();
+        match link.kind() {
+            "binary_expression" => {
+                // `(styled(Base) < Props) > \`…\``: the tag is the leftmost
+                // operand and the template the rightmost; between is the type.
+                let mut tag = Some(link);
+                while let Some(t) = tag.filter(|t| t.kind() == "binary_expression") {
+                    tag = t.child_by_field_name("left");
+                }
+                let mut template = Some(link);
+                while let Some(t) = template.filter(|t| t.kind() == "binary_expression") {
+                    template = t.child_by_field_name("right");
+                }
+                if let Some(tag) = tag {
+                    self.walk_component_wrapper(tag);
+                }
+                if let Some(template) = template {
+                    self.visit_function_body(template);
+                }
+            }
+            "call_expression" => {
+                let callee = link.child_by_field_name("function");
+                if let Some(c) = callee {
+                    self.walk_component_wrapper(c);
+                }
+                let Some(args) = link.child_by_field_name("arguments") else { return };
+                // A tagged template's argument is its template: the styles.
+                if args.kind() != "arguments" {
+                    self.visit_function_body(args);
+                    return;
+                }
+                // `styled(Base)`, `memo(Base)`: the first argument is the
+                // component wrapped, or a wrapper around it.
+                let callee_text = callee.map(|c| self.text(c)).unwrap_or("");
+                let root = callee_text == "styled" || is_react_hoc(callee_text);
+                let base = args
+                    .named_child(0)
+                    .filter(|f| root && matches!(f.kind(), "identifier" | "member_expression"));
+                for i in 0..args.named_child_count() {
+                    let Some(arg) = args.named_child(i) else { continue };
+                    if base.map(|b| b.start_byte() == arg.start_byte()).unwrap_or(false) {
+                        continue;
+                    }
+                    if root && i == 0 && arg.kind() == "call_expression" && self.is_component_wrapper_call(arg) {
+                        self.walk_component_wrapper(arg);
+                    } else if matches!(arg.kind(), "arrow_function" | "function_expression") {
+                        // A style or `.attrs()` function runs as the component's
+                        // code: its body is walked, the function never named.
+                        if let Some(body) = body_of(arg) {
+                            self.visit_function_body(body);
+                        }
+                    } else {
+                        self.visit_function_body(arg);
+                    }
+                }
+                self.capture_wrapper_argument_refs(args, base);
+            }
+            "member_expression" | "subscript_expression" => {
+                if let Some(object) = link.child_by_field_name("object") {
+                    self.walk_component_wrapper(object);
+                }
+            }
+            "non_null_expression" | "parenthesized_expression" | "instantiation_expression" => {
+                // `styled.div<{ open: boolean }>` error-recovers into a call on
+                // `non_null_expression(instantiation_expression(styled.div, …))`.
+                if let Some(inner) = link.child_by_field_name("function").or_else(|| link.named_child(0)) {
+                    self.walk_component_wrapper(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A call reactComponentHoc reads as a component wrapper: `styled…(…)`,
+    /// `memo(…)`, `forwardRef(…)`. Mirrors isComponentWrapperCall.
+    fn is_component_wrapper_call(&self, call: Node<'t>) -> bool {
+        let Some(callee) = call.child_by_field_name("function") else { return false };
+        let text = self.text(callee);
+        util::styled_callee().is_match(text) || is_react_hoc(text)
+    }
+
+    /// Function-as-value candidates (#756) among a wrapper call's arguments,
+    /// attributed to the component — never the component the call wraps.
+    /// Mirrors captureWrapperArgumentRefs.
+    fn capture_wrapper_argument_refs(&mut self, args: Node<'t>, base: Option<Node<'t>>) {
+        let Some(mode) = super::fnref::dispatch(args.kind()) else { return };
+        if self.stack.is_empty() {
+            return;
+        }
+        let from = self.top_row();
+        for (cand, _mode) in super::fnref::capture(args, mode, self.src) {
+            if base.map(|b| b.start_byte() == cand.column_byte).unwrap_or(false) {
+                continue;
+            }
+            self.fn_ref_cands.push((from, cand));
+        }
     }
 
     // --- extractClass ------------------------------------------------------------
@@ -412,7 +530,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    pub(super) fn extract_variable(&mut self, node: Node<'t>) {
+    /// Returns the initializers it walked under the symbol they declare — a
+    /// constant's or a variable's (#693), a component wrapper's — whose fn-ref
+    /// candidates that walk already took for the symbol (the caller's scan of
+    /// the declaration skips them; it would take each again for the file).
+    /// Mirrors TreeSitterExtractor.extractVariable.
+    pub(super) fn extract_variable(&mut self, node: Node<'t>) -> Option<HashSet<usize>> {
+        let mut walked: Option<HashSet<usize>> = None;
         let is_const = self.is_const_decl(node);
         let kind: &'static str = if is_const { "constant" } else { "variable" };
         let docstring = crate::docstring::preceding_docstring(node, self.src);
@@ -468,6 +592,9 @@ impl<'t> Walker<'t> {
                                 ..Extra::default()
                             },
                         );
+                        if inner.is_none() {
+                            walked.get_or_insert_with(HashSet::new).insert(v.id());
+                        }
                         continue;
                     }
                 }
@@ -494,6 +621,7 @@ impl<'t> Walker<'t> {
             // the ownedObject branch of TreeSitterExtractor.extractVariable.
             if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
                 self.extract_owned_object_members(obj, row, kind, &name, true, false);
+                walked.get_or_insert_with(HashSet::new).insert(obj.id());
                 continue;
             }
 
@@ -553,6 +681,7 @@ impl<'t> Walker<'t> {
                             self.stack.push(Scope { row, kind, name: name.clone() });
                             self.visit_function_body(v);
                             self.stack.pop();
+                            walked.get_or_insert_with(HashSet::new).insert(v.id());
                         }
                         None => self.visit_function_body(v),
                     }
@@ -574,6 +703,7 @@ impl<'t> Walker<'t> {
                 self.extract_object_literal_functions(coll);
             }
         }
+        walked
     }
 
     /// extractRtkHookBindings — `export const { useGetXQuery } = api`.
@@ -1398,9 +1528,15 @@ impl<'t> Walker<'t> {
         if self.stack.is_empty() {
             return;
         }
-        let func = node
-            .child_by_field_name("function")
-            .or_else(|| node.named_child(0));
+        let raw = node.child_by_field_name("function").or_else(|| node.named_child(0));
+        let func = raw.map(|f| self.peel_await_callee(f));
+        // Where the reference sits: the call, or the callee an `await` was
+        // peeled off (`await f<T>(x)` starts at `await`; the call to `f`
+        // starts where `f` does, as in `await f(x)`). Mirrors refStart.
+        let mut at = match (raw, func) {
+            (Some(r), Some(f)) if r.id() != f.id() => f,
+            _ => node,
+        };
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1464,7 +1600,15 @@ impl<'t> Walker<'t> {
                     }
                 }
             } else {
-                callee_name = self.text(func).to_string();
+                // A callee that names nothing (a call, a function, a
+                // subscript) is no reference. Mirrors tsJsCalleeName.
+                match self.callee_name_of(func) {
+                    Some((name, name_at)) => {
+                        callee_name = name;
+                        at = name_at;
+                    }
+                    None => return,
+                }
             }
         }
 
@@ -1476,7 +1620,28 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_call_ref(&callee_name.clone(), node);
+            self.push_call_ref(&callee_name.clone(), at);
+        }
+    }
+
+    /// The name a non-member callee writes, past `(fn)`, `fn!`, `(fn as F)`,
+    /// `await` and a tag's type arguments (`css<Props>`), or None for one that
+    /// names nothing: a call, a function, a subscript, `(0, fn)`. A dotted
+    /// chain keeps its text, `(a.b)()` → `a.b`. The node is where the name
+    /// starts, which is where the reference sits. Mirrors tsJsCalleeName.
+    fn callee_name_of(&self, func: Node<'t>) -> Option<(String, Node<'t>)> {
+        let mut cur = peel_receiver(func);
+        while cur.kind() == "instantiation_expression" {
+            let inner = cur.child_by_field_name("function").or_else(|| cur.named_child(0))?;
+            cur = peel_receiver(inner);
+        }
+        match cur.kind() {
+            "identifier" | "super" | "import" => Some((self.text(cur).to_string(), cur)),
+            "member_expression" => {
+                let chain: String = self.text(cur).chars().filter(|c| !c.is_whitespace()).collect();
+                util::dotted_chain().is_match(&chain).then_some((chain, cur))
+            }
+            _ => None,
         }
     }
 
@@ -1498,10 +1663,36 @@ impl<'t> Walker<'t> {
         Some(self.text(property).to_string())
     }
 
+    /// `await f<T>(x)` parses with `await f` as the callee (#2586), and a
+    /// prefix operator over a generic call the same way
+    /// (`!settings.get<boolean>('X')`, `void apiRequest<T>()`); the call is to
+    /// `f`. Peels every `await` and prefix operator, skipping a comment written
+    /// after an `await`. TS-family only. Mirrors peelTsPrefixedCallee.
+    fn peel_await_callee(&self, node: Node<'t>) -> Node<'t> {
+        if !self.variant.is_ts() {
+            return node;
+        }
+        let mut cur = node;
+        loop {
+            let inner = match cur.kind() {
+                "unary_expression" => cur.child_by_field_name("argument"),
+                "await_expression" => {
+                    let mut walker = cur.walk();
+                    let found = cur.named_children(&mut walker).find(|c| c.kind() != "comment");
+                    found
+                }
+                _ => break,
+            };
+            let Some(inner) = inner else { break };
+            cur = inner;
+        }
+        cur
+    }
+
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
-        let inner = call.child_by_field_name("function")?;
+        let inner = self.peel_await_callee(call.child_by_field_name("function")?);
         Self::plain_member_name(self.text(inner))
     }
 
@@ -1670,6 +1861,22 @@ impl<'t> Walker<'t> {
                             let name = self.text(iface).to_string();
                             self.push_ref(class_row, &name, implements_kind, iface);
                         }
+                    }
+                }
+                // TS `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+                // supertype is a `type` of the clause; a `generic_type` is named
+                // by its `name` field (`Store`, never `Store<T>`).
+                "extends_type_clause" => {
+                    let mut cursor = child.walk();
+                    let targets: Vec<Node<'t>> = child.children_by_field_name("type", &mut cursor).collect();
+                    for target in targets {
+                        let named = if target.kind() == "generic_type" {
+                            target.child_by_field_name("name").unwrap_or(target)
+                        } else {
+                            target
+                        };
+                        let name = self.text(named).to_string();
+                        self.push_ref(class_row, &name, extends_kind, target);
                     }
                 }
                 // JS `class Foo extends Bar` — class_heritage holds a bare

@@ -108,7 +108,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, callEdges)).toEqual(['direct_caller']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -152,7 +151,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'handleClick'))).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -182,7 +180,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(target?.filePath.endsWith('handlers.ts')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -207,7 +204,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, edges)).not.toContain('wire');
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -235,7 +231,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(target?.filePath.endsWith('real.c')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -260,7 +255,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRef).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -284,7 +278,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(selfLoops).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -349,7 +342,6 @@ describe('Function-as-value capture (#756)', () => {
       }
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -406,7 +398,6 @@ describe('Function-as-value capture (#756)', () => {
       ]);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -456,7 +447,6 @@ describe('Function-as-value capture (#756)', () => {
       }
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -496,7 +486,6 @@ describe('Function-as-value capture (#756)', () => {
       ).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -543,7 +532,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'run0'))).toEqual(['thisRef']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -588,7 +576,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(cg.getIncomingEdges(decoy.id).filter((e) => e.metadata?.fnRef === true)).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -617,7 +604,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, edges)).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -661,7 +647,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'dupCmd')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -702,7 +687,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'load'))).toEqual(['sorter']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -743,7 +727,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'title')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -796,12 +779,11 @@ describe('Function-as-value capture (#756)', () => {
 
       // The DRF wiring: get_serializer_class → the imported serializer class,
       // via `return` — the issue's headline gap. The module-level registry
-      // dict rides BOTH the assigned name (the initializer walk, #693) and the
-      // file node (the dispatcher's own scan, which runs either way).
+      // dict rides the assigned name (the initializer walk, #693), and not the
+      // file node as well: the dispatcher's scan skips what that walk took.
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'OrgSerializerFull'))).toEqual([
         'SERIALIZER_REGISTRY',
         'get_serializer_class',
-        'views.py',
       ]);
       // Second branch return + a module-level call argument.
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'OrgSerializerBrief'))).toEqual([
@@ -823,7 +805,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(callers.some((c) => c.node.name === 'get_serializer_class')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -856,7 +837,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'unknown_thing')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -1598,7 +1578,74 @@ func Unknown(obj interface{}) { Submit(obj.Fetch) }
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'cb_a'))).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
+    }
+  });
+
+  // An initializer walked under the symbol it declares (#693) takes its
+  // function values for that symbol. The declaration-wide scan took each one
+  // again for the enclosing file or class: a second reference to the same
+  // function from the same spot (TS/JS constants and class fields, Python,
+  // Go, Rust, Java fields, Kotlin properties). Each function here is
+  // referenced only from an initializer, so a second source shows.
+  it('INITIALIZER WALKS: a function in an initializer is referenced once, by what it declares', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-init-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'app.ts'),
+      [
+        'export function tsHome() {}',
+        'export function tsAbout() {}',
+        'export function tsClick() {}',
+        'export function tsBoot() {}',
+        'function register(fn: () => void) {}',
+        'const routes = { tsHome, about: tsAbout, list: [tsHome] };',
+        'const api = { load() {}, tsAbout };',
+        'export class Widget {',
+        '  static handlers = { click: tsClick };',
+        '}',
+        'register(tsBoot);',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'views.py'),
+      ['def py_home():', '    pass', '', 'HANDLERS = {"home": py_home}', 'ROUTES = [py_home]'].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'handlers.go'),
+      ['package main', '', 'func goHome() {}', '', 'var handlers = map[string]func(){"home": goHome}'].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib.rs'),
+      ['fn rust_home() {}', 'static HANDLERS: &[fn()] = &[rust_home];'].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Registry.java'),
+      [
+        'class Registry {',
+        '  static void javaHome() {}',
+        '  static final java.util.List<Runnable> TABLE = java.util.List.of(Registry::javaHome);',
+        '}',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'handlers.kt'),
+      ['fun ktHome() {}', 'val ktHandlers = listOf(::ktHome)', 'class KtWidget {', '    val hooks = listOf(::ktHome)', '}'].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'tsHome'))).toEqual(['routes']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'tsAbout'))).toEqual(['api', 'routes']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'tsClick'))).toEqual(['handlers']);
+      // A call argument at module scope is the file's, as before.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'tsBoot'))).toEqual(['app.ts']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'py_home'))).toEqual(['HANDLERS', 'ROUTES']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'goHome'))).toEqual(['handlers']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'rust_home'))).toEqual(['HANDLERS']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'javaHome'))).toEqual(['TABLE']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'ktHome'))).toEqual(['hooks', 'ktHandlers']);
+    } finally {
+      cg.destroy();
     }
   });
 });

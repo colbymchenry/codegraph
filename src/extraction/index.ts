@@ -35,6 +35,7 @@ import { declaredDependencies } from '../resolution/frameworks/package-deps';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
+import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
@@ -163,6 +164,8 @@ export interface SyncResult {
    * nothing downstream.
    */
   definitionDelta?: string[];
+  /** Tracked files this sync found gone and deleted from the index. */
+  removedFilePaths?: string[];
 }
 
 /**
@@ -267,6 +270,17 @@ const ANDROID_RES_TYPES: readonly string[] = [
   'menu', 'mipmap', 'navigation', 'transition', 'values', 'xml',
 ];
 
+/**
+ * `build` is also a legal JVM package segment: directories named `build` under
+ * a conventional source root (any source set: main, test, androidTest, ...) are
+ * packages, not module/build output (#1642).
+ */
+const JVM_BUILD_PACKAGE_DIRS: readonly string[] = [
+  '**/src/*/java/**/build/',
+  '**/src/*/kotlin/**/build/',
+  '**/src/*/scala/**/build/',
+];
+
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
 const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
@@ -275,14 +289,93 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
-  // `build` is also a legal JVM package segment. Keep it under conventional
-  // source roots (any source set: main, test, androidTest, ...) while continuing
-  // to exclude module/build output (#1642). Unignore only the directory, not its
-  // subtree: other defaults still apply.
-  '!**/src/*/java/**/build/',
-  '!**/src/*/kotlin/**/build/',
-  '!**/src/*/scala/**/build/',
+  // Keep JVM packages named `build` (#1642). Unignore only the directory, not
+  // its subtree: other defaults still apply.
+  ...JVM_BUILD_PACKAGE_DIRS.map((d) => `!${d}`),
+  // Walk a `build` folder below `src/` too: a project can keep a whole
+  // feature or module there. Only its hand-written source files are indexed
+  // — see buildOutputFolderUnderSrc. Other defaults still apply inside it.
+  '!**/src/**/build/',
 ];
+
+/**
+ * Source files no compiler or bundler writes into a build folder: TypeScript
+ * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
+ * components, whose builds emit JavaScript, declarations, CSS, HTML and
+ * source maps instead; and Go, C# and Rust, whose toolchains write elsewhere
+ * (Go's binaries, .NET's `bin/` and `obj/`, Cargo's `target/`). Python, C and
+ * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
+ * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
+ */
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
+/** TypeScript declarations, which `tsc` writes beside its JavaScript. */
+const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
+/** Matches the JVM packages named `build`, whose whole subtree stays indexed. */
+const jvmBuildPackages = ignore().add(JVM_BUILD_PACKAGE_DIRS);
+
+/**
+ * The `build` folder below a `src/` folder that file `rel` sits in, with a
+ * trailing slash (`src/build/` for `src/build/legacy/page.tsx`), or null. A JVM
+ * package named `build` (#1642) does not count.
+ */
+function srcBuildFolderOf(rel: string): string | null {
+  if (!/(?:^|\/)build\//i.test(rel)) return null;
+  const parts = rel.split('/');
+  let inSrc = false;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]!.toLowerCase();
+    if (part === 'src') {
+      inSrc = true;
+    } else if (part === 'build' && inSrc) {
+      const folder = parts.slice(0, i + 1).join('/') + '/';
+      return jvmBuildPackages.ignores(folder) ? null : folder;
+    }
+  }
+  return null;
+}
+
+/**
+ * When `rel` is a file in a `build` folder below `src/` that a build step could
+ * have written, that folder (see {@link srcBuildFolderOf}); otherwise null.
+ *
+ * The folder itself is walked: projects keep real source there (luci-go
+ * milo's whole `src/build/` feature, Go's `src/go/build`, a .NET solution's
+ * `src/Build/` project). But an output tree built or copied into `src/` — a
+ * nested CRA app's `build/`, a vendored pdf.js, a Laravel `public/build` —
+ * holds JavaScript, CSS, HTML and maps, never {@link HAND_WRITTEN_SOURCE}, so
+ * only those hand-written types are indexed from it. Paths
+ * without an extension are left alone: they are directories (a watcher event
+ * for a removed folder carries no trailing slash), never files a build writes.
+ */
+function buildOutputFolderUnderSrc(rel: string): string | null {
+  const name = rel.slice(rel.lastIndexOf('/') + 1);
+  if (!name.includes('.')) return null;
+  if (HAND_WRITTEN_SOURCE.test(name) && !DECLARATION_FILE.test(name)) return null;
+  return srcBuildFolderOf(rel);
+}
+
+/**
+ * `ig` with {@link buildOutputFolderUnderSrc} applied on top of its patterns,
+ * for every caller of the defaults alike. `projectRules` are the project's own
+ * root ignore rules: a file they re-include by name, or whose folder they
+ * re-include from the `build` folder down (`!src/build/`, the documented
+ * opt-in), keeps every type, as it did before this rule.
+ */
+function excludeBuildOutputUnderSrc(ig: Ignore, projectRules: Ignore | null): Ignore {
+  const ignoredByPatterns = ig.ignores.bind(ig);
+  ig.ignores = (rel: string): boolean => {
+    if (ignoredByPatterns(rel)) return true;
+    const folder = buildOutputFolderUnderSrc(rel);
+    if (folder === null) return false;
+    if (!projectRules) return true;
+    // The file, then each folder above it up to the `build` folder.
+    for (let end = rel.length; end >= folder.length; end = rel.lastIndexOf('/', end - 2) + 1) {
+      if (projectRules.test(rel.slice(0, end)).unignored) return false;
+    }
+    return true;
+  };
+  return ig;
+}
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
 function isValidUtf8(buf: Buffer): boolean {
@@ -464,11 +557,19 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  const projectRules = ignore();
   const rootGitignore = path.join(rootDir, '.gitignore');
-  if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  if (fs.existsSync(rootGitignore)) {
+    const patterns = readGitignorePatterns(rootGitignore);
+    ig.add(patterns);
+    projectRules.add(patterns);
+  }
   const extra = readGitExcludeExtraPatterns(rootDir);
-  if (extra) ig.add(extra);
-  return ig;
+  if (extra) {
+    ig.add(extra);
+    projectRules.add(extra);
+  }
+  return excludeBuildOutputUnderSrc(ig, projectRules);
 }
 
 /**
@@ -477,7 +578,7 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * whose gitignore semantics their own `git ls-files` already enforced (#514).
  */
 function defaultsOnlyIgnore(): Ignore {
-  return ignore().add(DEFAULT_IGNORE_PATTERNS);
+  return excludeBuildOutputUnderSrc(ignore().add(DEFAULT_IGNORE_PATTERNS), null);
 }
 
 /**
@@ -3208,14 +3309,15 @@ export class ExtractionOrchestrator {
    * - edges whose source is in a file this sync already re-extracted are
    *   skipped — their references were re-resolved from scratch moments ago;
    * - very common names are skipped by the per-name ceiling in
-   *   `getResolutionEdgesByTargetName`.
+   *   `getResolutionEdgesByTargetName`, counted over the edges up to
+   *   `countedUpToEdgeId` when given (those before the sync's failed-ref retry).
    *
    * Returns the number of references resurrected.
    */
-  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): number {
+  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[], countedUpToEdgeId?: number): number {
     if (definitionDelta.length === 0) return 0;
     const alreadyFresh = new Set(changedFilePaths);
-    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta);
+    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta, undefined, countedUpToEdgeId);
 
     const edgeIds: number[] = [];
     const refs: UnresolvedReference[] = [];
@@ -3234,6 +3336,130 @@ export class ExtractionOrchestrator {
     // place for a rebind ELSEWHERE would keep both, turning drift into
     // duplication.
     this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /**
+   * Re-open resolution edges whose answer was READ from a file this sync
+   * touched, although neither end of the edge changed: a python attribute typed
+   * through a factory or a base class in another file records those files as
+   * `metadata.typeFrom`. The definition delta cannot see these — editing what a
+   * factory returns, or what a base `__init__` assigns, adds or removes no
+   * definition — so without this a synced index keeps the old type forever.
+   * The edges go back to pending refs; returns the files they come from, whose
+   * pending rows the caller resolves.
+   */
+  resurrectTypeDependentEdges(touchedPaths: string[], changedFilePaths: string[]): string[] {
+    const touched = new Set(touchedPaths.filter((p) => /\.pyi?$/.test(p)));
+    if (touched.size === 0) return [];
+    const alreadyFresh = new Set(changedFilePaths);
+
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    const files = new Set<string>();
+    for (const e of this.queries.getEdgesWithTypeFrom()) {
+      if (alreadyFresh.has(e.sourceFilePath)) continue;
+      const from = e.metadata?.typeFrom;
+      if (!Array.isArray(from) || !from.some((f) => typeof f === 'string' && touched.has(f))) continue;
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+      files.add(e.sourceFilePath);
+    }
+    if (refs.length === 0) return [];
+    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return [...files];
+  }
+
+  /**
+   * Re-open every resolution a language made, for the sync's sweep to redo
+   * against the current graph — the answer when an input to that language's
+   * resolution changed project-wide rather than per definition. Python
+   * package roots are that kind of input: an added `__init__.py` or an edited
+   * `pyproject.toml` moves where modules start for importers in files the
+   * sync never touched, and CG-33's per-name rebind can't see it. Parked
+   * failures are re-queued too, since some of them now resolve. Same
+   * conservatism as {@link resurrectStaleResolutionEdges}: an edge without a
+   * refName stamp is never deleted.
+   */
+  resurrectResolutionEdgesForLanguage(language: Language): number {
+    return (
+      this.reopenEdges(this.queries.getResolutionEdgesBySourceLanguage(language)) +
+      this.queries.requeueFailedReferencesByLanguage(language)
+    );
+  }
+
+  /**
+   * The narrow form, for modules or packages that appeared or vanished below
+   * an unchanged set of roots: re-open the edges whose target lies in
+   * `targetFiles` or whose source lies under `sourceDirs`, and re-queue the
+   * parked failures naming one of `moduleLeaves`. Returns the files whose
+   * references were re-opened.
+   */
+  resurrectResolutionEdgesTouching(
+    language: Language,
+    scope: { targetFiles: string[]; sourceDirs: string[]; moduleLeaves: string[] }
+  ): string[] {
+    const files = new Set<string>();
+    const edges = this.queries.getResolutionEdgesTouchingFiles(language, scope.targetFiles, scope.sourceDirs, scope.moduleLeaves);
+    for (const e of edges) files.add(e.sourceFilePath);
+    this.reopenEdges(edges);
+    this.queries.requeueFailedReferencesByLanguage(language, scope.moduleLeaves, files);
+    return [...files];
+  }
+
+  /**
+   * Re-open what importers bound from a Python package whose `__init__.py`
+   * was edited: in each importing file, the edges and parked failures whose
+   * reference starts with a name bound from that package (`N`, `N.run`,
+   * `pkg.N`). A def or re-export added, removed or repointed there moves
+   * exactly those answers — `from pkg import N` prefers what `__init__.py`
+   * binds over a submodule `pkg/N` — and nothing in the importer's other
+   * references. A name whose import edge already lands where the package
+   * binds it now is left alone, so an edit that moves nothing re-resolves
+   * nothing. Returns the files whose references were re-opened.
+   */
+  resurrectPythonPackageImporters(bindings: Map<string, Map<string, string | null>>): string[] {
+    if (bindings.size === 0) return [];
+    const edges = this.queries.getResolutionEdgesFromFiles('python', [...bindings.keys()]);
+    const refHead = (e: { metadata?: Record<string, unknown> }): string | null => {
+      const refName = e.metadata?.refName;
+      return typeof refName === 'string' ? refName.split('.')[0]! : null;
+    };
+    // Where each bound name's own import edge lands today.
+    const bindsNow = new Map<string, string>();
+    for (const e of edges) {
+      const refName = e.metadata?.refName;
+      if (e.kind !== 'imports' || typeof refName !== 'string' || refName.includes('.')) continue;
+      const target = this.queries.getNodeById(e.target);
+      if (target) bindsNow.set(`${e.sourceFilePath}\0${refName}`, `${target.filePath}\0${target.kind === 'file' ? '' : target.name}`);
+    }
+    const moved = new Map<string, Set<string>>();
+    for (const [file, names] of bindings) {
+      for (const [name, binding] of names) {
+        if (binding !== null && bindsNow.get(`${file}\0${name}`) === binding) continue;
+        let set = moved.get(file);
+        if (!set) moved.set(file, (set = new Set()));
+        set.add(name);
+      }
+    }
+    if (moved.size === 0) return [];
+    this.reopenEdges(edges.filter((e) => moved.get(e.sourceFilePath)?.has(refHead(e) ?? '') === true));
+    this.queries.requeueFailedReferencesBinding('python', moved);
+    return [...moved.keys()];
+  }
+
+  private reopenEdges(edges: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>): number {
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const e of edges) {
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
     return refs.length;
   }
 
@@ -3275,10 +3501,13 @@ export class ExtractionOrchestrator {
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
     const addedFilePaths: string[] = [];
+    const removedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
     // pairs below to derive `definitionDelta` (CG-33).
     const pairsBefore = new Set<string>();
+    // Importers' import statements, read once per sync for the files it removes.
+    const importReader = createImportReader(this.rootDir);
 
     onProgress?.({
       phase: 'scanning',
@@ -3382,12 +3611,30 @@ export class ExtractionOrchestrator {
       }
       onFileChange?.(tracked.path);
       this.queries.deleteFile(tracked.path);
+      removedFilePaths.push(tracked.path);
       filesRemoved++;
     };
+    const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
-        removeTracked(tracked);
+        removed.push(tracked);
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    // The references other files make THROUGH the removed ones to files that
+    // stay (a package `__init__.py` or an `index.ts` re-exporting what it
+    // imports) go back to pending too: the cascade keeps their edges, and a
+    // fresh index of the tree without these files binds them differently or
+    // not at all. Before any of them is deleted, and for all of them at once.
+    if (removed.length > 0) {
+      const tImporters = Date.now();
+      const reopened = reopenReferencesThroughRemovedFiles(this.queries, importReader, removed);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-removed-module-importers: ${Date.now() - tImporters}ms (${reopened} refs re-opened)`);
+    }
+    for (const tracked of removed) {
+      removeTracked(tracked);
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -3440,7 +3687,10 @@ export class ExtractionOrchestrator {
       // Not source after all — an MPEG transport stream named `.ts` (#1910):
       // a new one is ignored, a tracked file that became one is removed.
       if (content === null) {
-        if (tracked) removeTracked(tracked);
+        if (tracked) {
+          reopenReferencesThroughRemovedFiles(this.queries, importReader, [tracked]);
+          removeTracked(tracked);
+        }
         continue;
       }
       const contentHash = hashContent(content);
@@ -3522,6 +3772,7 @@ export class ExtractionOrchestrator {
       ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
+      ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
     };
   }
 

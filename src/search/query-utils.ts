@@ -345,7 +345,11 @@ export function isTestPath(filePath: string): boolean {
     // Test-support modules and doubles by directory name: Gradle's
     // `core/data-test/`, `core/datastore-test/`, `:testing`; Go's `testdata/`;
     // `testutil(s)/`, `test-utils/`, `fakes/`, `mocks/`, `__mocks__/`.
-    /(?:^|\/)(?:[\w.]+[-_]test(?:s|ing)?|testdata|testutils?|test[-_]utils?|fakes?|mocks?|__mocks__|stubs)\//.test(lower)
+    /(?:^|\/)(?:[\w.]+[-_]test(?:s|ing)?|testdata|testutils?|test[-_]utils?|fakes?|mocks?|__mocks__|stubs)\//.test(lower) ||
+    // Unit-test trees: LLVM's and Breakpad's `unittests/`, glog's
+    // `dcheck_unittest/`. Not a bare `unittest/`: CPython's `Lib/unittest/` is
+    // the framework itself.
+    /(?:^|\/)(?:unittests|[\w.]+[-_]unittests?)\//.test(lower)
   ) {
     return true;
   }

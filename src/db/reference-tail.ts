@@ -73,6 +73,26 @@ const MODULE_REFERENCE = /^(?:layout:)?(?:lazy-import:(.+)|import:(.+)#[^#]+)$/;
 /** What a module reference's tail starts with. No symbol's name does, so a lookup by symbol names never finds one. */
 const MODULE_KEY = 'module:';
 
+/** Whether a tail or lookup key waits for a module (`module:Team`) rather than for a name. */
+export function isModuleKey(key: string): boolean {
+  return key.startsWith(MODULE_KEY);
+}
+
+/**
+ * SQL for the tail a reference parked under its module (`module:*`) has by its
+ * own name: what follows the name's last dot — `store.get` → 'get' — or the
+ * whole name. A member reference through an import binding still waits for
+ * its member (see
+ * `importBindingTail`), so the retry, the navigation retry and the dead-code
+ * check look it up by that. idx_unresolved_failed_module_member indexes the
+ * expression, and SQLite uses an expression index only for a query that
+ * spells the expression exactly so: schema.sql and the v16 migration do.
+ */
+export const MEMBER_TAIL_SQL = "substr(reference_name, length(rtrim(reference_name, replace(reference_name, '.', ''))) + 1)";
+
+/** The rows parked under a module: the partial WHERE of the indexes that find them. */
+export const MODULE_PARKED_SQL = "status = 'failed' AND name_tail GLOB 'module:*'";
+
 /**
  * The tail of a reference that waits for a module rather than for a name: the
  * module path's stem behind 'module:' — `./pages/Team` → 'module:Team',
@@ -123,9 +143,17 @@ export function importPathKeys(filePath: string): string[] {
  * same path through its folder. A sync looks them up for the files it adds
  * AND the ones it changes: a route renders the component its module exports,
  * so an edit that gives the module one is what the route waited for. So does
- * a reference through an import binding the module declares under another
- * name (`importBindingTail`), which is parked under the same keys.
+ * a reference through an import binding of the module, and a direct member
+ * reference through any binding (`importBindingTail`), which are parked under
+ * the same keys.
  */
 export function moduleReferenceKeys(filePath: string): string[] {
-  return importPathKeys(filePath).map((key) => MODULE_KEY + key);
+  const keys = importPathKeys(filePath);
+  // A Python package's `__init__.py` is a submodule of the package above it,
+  // as a module file beside it is through its folder: `app/pkg/sub/__init__.py`
+  // is what `from app.pkg import sub as s`, parked as 'module:pkg', imports.
+  const parts = filePath.split('/');
+  const above = parts.length >= 3 && parts[parts.length - 1] === '__init__.py' ? parts[parts.length - 3]! : '';
+  if (above && !keys.includes(above)) keys.push(above);
+  return keys.map((key) => MODULE_KEY + key);
 }
