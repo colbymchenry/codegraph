@@ -14,11 +14,12 @@
  * `testing.TB`'s `private` and `reflect.Type`'s `common` and `uncommon` are
  * why only an embedding satisfies those outside their own package.
  *
- * Read from Go's own source (go1.27.3). The interfaces are the ones projects
- * embed; the structs are the commonly embedded ones that implement one of
- * them. A struct whose methods would answer one of these interfaces' names
- * with another signature (`http.Header.Write`, `sync.WaitGroup.Done`) is left
- * out.
+ * Read from Go's own source (go1.27.3) by scripts/gen-go-stdlib-methods.mjs,
+ * which regenerates the table for the types it lists. The interfaces are the
+ * ones projects embed; the structs are the commonly embedded ones that
+ * implement one of them. A struct whose methods would answer one of these
+ * interfaces' names with another signature (`http.Header.Write`,
+ * `sync.WaitGroup.Done`) is left out.
  */
 const GO_STDLIB_METHODS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   io: {
