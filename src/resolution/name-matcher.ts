@@ -16163,13 +16163,55 @@ function isUndeclaredTypeName(typeName: string, ref: UnresolvedRef, context: Res
  * (cppNamesBroughtIn).
  */
 function isCppUndeclaredQualifier(qualifier: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return isUndeclaredTypeName(qualifier, ref, context) &&
-    cppTypesNamed(qualifier, context).length === 0 &&
-    !context.getNodesByName(qualifier).some((n) => (n.language === 'cpp' || n.language === 'c') && (n.kind === 'namespace' || n.kind === 'module')) &&
-    !cppNamesBroughtIn(ref.filePath, context).has(qualifier);
+  if (!isUndeclaredTypeName(qualifier, ref, context) || cppTypesNamed(qualifier, context).length > 0 ||
+      context.getNodesByName(qualifier).some((n) => (n.language === 'cpp' || n.language === 'c') && (n.kind === 'namespace' || n.kind === 'module'))) return false;
+  const names = cppNamesBroughtIn(ref.filePath, context);
+  return !names.types.has(qualifier) && !names.namespaces.has(qualifier);
 }
 
-const CPP_FILE_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+/**
+ * Is the qualifier of a C++ `x::m()` call a namespace, `absl` in
+ * `absl::StripPrefix(…)` or `fmt` in `fmt::ptr(p)`, and not a type? A
+ * lowercase name that no C or C++ type or alias node has, and that the
+ * calling file doesn't declare as a template parameter or an alias
+ * (cppNamesBroughtIn). A namespace holds functions and types, never a
+ * class's method.
+ */
+function isCppNamespaceQualifier(qualifier: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return /^[a-z_]/.test(qualifier) && cppTypesNamed(qualifier, context).length === 0 &&
+    !cppNamesBroughtIn(ref.filePath, context).types.has(qualifier);
+}
+
+/**
+ * Is `method` the constructor of the class a C++ call `ns::m(…)` names
+ * through its namespace? Its owner, right inside `ns`, is `m` itself or a
+ * specialization of the class template `m`, which the index holds without
+ * a name: protobuf's `internal::SourceWrapper<absl::Cord>(&data)` constructs
+ * the `struct SourceWrapper<absl::Cord>` in message_lite.cc, whose template
+ * is only declared. fmt's `template <> struct scanner<num>` is no `scan`.
+ */
+function isCppConstructorThrough(namespace: string, method: Node, context: ResolutionContext): boolean {
+  const parts = method.qualifiedName.split('::');
+  if (parts.length < 3 || parts[parts.length - 3] !== namespace) return false;
+  const owner = parts[parts.length - 2]!;
+  if (owner === method.name) return true;
+  if (owner !== '<anonymous>') return false;
+  const holder = context.getNodesByQualifiedName(parts.slice(0, -1).join('::')).find((n) =>
+    n.filePath === method.filePath && n.startLine <= method.startLine && (n.endLine ?? n.startLine) >= method.startLine);
+  const lines = holder ? context.getFileLines?.(holder.filePath) ?? context.readFile(holder.filePath)?.split(/\r?\n/) : undefined;
+  const head = holder && lines ? lines.slice(holder.startLine - 1, holder.startLine + 1).join(' ') : '';
+  return new RegExp(String.raw`\b(?:class|struct|union)\s+(?:[A-Za-z_]\w*\s+)*${method.name}\s*<`).test(head);
+}
+
+/** The names a C++ file makes something of itself, which the index holds no node for (see cppNamesBroughtIn). */
+interface CppFileNames {
+  /** Template parameters and aliases. */
+  types: ReadonlySet<string>;
+  /** The namespaces it opens, aliases or uses. */
+  namespaces: ReadonlySet<string>;
+}
+
+const CPP_FILE_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, CppFileNames>>();
 const CPP_MACRO_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
 
 /**
@@ -16180,20 +16222,22 @@ const CPP_MACRO_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, Readonly
  * names: opened, aliased or used (`using namespace …;`). googletest's typed
  * tests declare `TypeParam` and `TestFixture`.
  */
-function cppNamesBroughtIn(file: string, context: ResolutionContext): ReadonlySet<string> {
+function cppNamesBroughtIn(file: string, context: ResolutionContext): CppFileNames {
   let memo = CPP_FILE_TYPE_NAMES.get(context);
   if (!memo) CPP_FILE_TYPE_NAMES.set(context, (memo = new Map()));
   const hit = memo.get(file);
   if (hit) return hit;
   const text = stripCommentsForRegex((context.readFile(file) ?? '').replace(/\\\r?\n/g, ' '), 'cpp');
-  const names = cppTypeNamesDeclared(text);
+  const types = cppTypeNamesDeclared(text);
+  const namespaces = new Set<string>();
   for (const m of text.matchAll(/\bnamespace\s+([^;{}()]{1,200}?)\s*[;{]/g)) {
-    for (const name of m[1]!.match(/[A-Za-z_]\w*/g) ?? []) names.add(name);
+    for (const name of m[1]!.match(/[A-Za-z_]\w*/g) ?? []) namespaces.add(name);
   }
   for (const [macro, declared] of cppMacroTypeNames(context)) {
-    if (hasCppWord(text, macro)) for (const name of declared) names.add(name);
+    if (hasCppWord(text, macro)) for (const name of declared) types.add(name);
   }
-  if (/\bTYPED_TEST(?:_P)?\s*\(/.test(text)) names.add('TypeParam').add('TestFixture');
+  if (/\bTYPED_TEST(?:_P)?\s*\(/.test(text)) types.add('TypeParam').add('TestFixture');
+  const names = { types, namespaces };
   memo.set(file, names);
   return names;
 }
@@ -19165,6 +19209,17 @@ export function matchMethodCall(
     return null;
   }
 
+  // A C++ name through a namespace, `absl::StripPrefix(…)` or `fmt::ptr(p)`,
+  // is a function or type of that namespace, never a class's method, which
+  // is all the strategies below find: protobuf's `absl::StripPrefix` went to
+  // `rust::MultiCasePrefixStripper::StripPrefix`, and fmt's `fmt::ptr` to a
+  // scanner's `ptr` method, past fmt's own `ptr`, which a namespace macro
+  // declares and is read after them. The one exception is the constructor of
+  // a class the call names in that namespace (isCppConstructorThrough).
+  // Asked only of a guess about to be made.
+  const throughCppNamespace = (): boolean =>
+    ref.language === 'cpp' && match === colonMatch && isCppNamespaceQualifier(objectOrClass!, ref, context);
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for a class named "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
@@ -19186,6 +19241,7 @@ export function matchMethodCall(
         const methodNode = classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode) {
+          if (throughCppNamespace()) return null;
           return {
             original: ref,
             targetNodeId: methodNode.id,
@@ -19299,6 +19355,7 @@ export function matchMethodCall(
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
+      if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, targetMethods[0]!, context)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -19382,6 +19439,7 @@ export function matchMethodCall(
         // `JavaFeatures_NestInFileClassFeature::descriptor`, its Python
         // extension's `OneofOptions::default_instance()` to `CppFileOptions`'.
         if (ref.language === 'cpp' && match === colonMatch && isCppUndeclaredQualifier(objectOrClass!, ref, context)) return null;
+        if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, bestMatch, context)) return null;
         return {
           original: ref,
           targetNodeId: bestMatch.id,
