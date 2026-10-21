@@ -19,11 +19,13 @@
  * FormSchema }`), and that link must come back when the declaration does.
  *
  * A plain named import through a barrel (`import { useInvocation } from
- * '@/test_investigation/context'`) had the same gap: `context/index.ts`
- * declares none of the names it forwards, and a file behind it can declare
- * the name under another one (`export { default as ThemeToggle } from
- * './theme-toggle.vue'`). It is parked under its module's key as well, which
- * the barrel and every file in the barrel's folder carry.
+ * '@/test_investigation/context'`) waits the same way: `context/index.ts`
+ * declares none of the names it forwards. When the barrel or a file behind it
+ * is added, sync re-opens the barrel's importers (module-importers.ts); an
+ * edit that gives an existing barrel the name re-opened nothing, so the
+ * import and its uses stayed unlinked. Such a reference is parked under its
+ * module's key as well, which the barrel and every file in the barrel's
+ * folder carry.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
@@ -272,7 +274,7 @@ describe('sync links a plain named import through a barrel', () => {
 
     write(root, BARRELS);
     const result = await graph.sync();
-    // The importers did not change: only the retry of their parked refs links them.
+    // The importers did not change: only what sync re-opens or retries links them.
     expect(result.filesAdded).toBe(Object.keys(BARRELS).length);
     expect(result.filesModified).toBe(0);
     expect(linksOf(graph, BARREL_LINKS)).toEqual(BARREL_LINKS);
@@ -282,8 +284,8 @@ describe('sync links a plain named import through a barrel', () => {
   it('when a file behind the barrel is added after its importers', async () => {
     // The hooks' file declares them by name, which a sync always looked up
     // (until it appears, they link by name to their namesakes). The
-    // component's file declares only `theme-toggle`: the folder it shares
-    // with the barrel is what leads to it.
+    // component's file declares only `theme-toggle`: the barrel that forwards
+    // it is what leads to it.
     const root = tempRoot();
     write(root, { ...BARREL_IMPORTERS, ...BARRELS });
     const graph = await index(root);
@@ -296,6 +298,9 @@ describe('sync links a plain named import through a barrel', () => {
   }, 120_000);
 
   it('when an edit gives the barrel the names it forwards', async () => {
+    // The barrel was there all along: no file appears, and the edit declares
+    // none of the names it now passes on. Only the barrel's module key finds
+    // the importers' failed references.
     const root = tempRoot();
     write(root, { ...BARREL_IMPORTERS, ...BEHIND });
     write(root, Object.fromEntries(Object.keys(BARRELS).map((file) => [file, 'export {};\n'])));
