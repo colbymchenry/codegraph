@@ -222,6 +222,13 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect F# implementation and script files, not signature files', () => {
+    expect(detectLanguage('src/Program.fs')).toBe('fsharp');
+    expect(detectLanguage('src/Library.fsi')).not.toBe('fsharp');
+    expect(detectLanguage('build.fsx')).toBe('fsharp');
+    expect(isSourceFile('src/Program.fs')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -324,6 +331,7 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('fsharp');
   });
 });
 
@@ -463,6 +471,522 @@ in
     expect(node('package')?.isExported).toBe(true);
     expect(node('privateNested')?.isExported).toBe(false);
     expect(node('licenses')?.isExported).toBe(true);
+  });
+});
+
+describe('F# Extraction', () => {
+  const kindsAndNames = (result: ReturnType<typeof extractFromSource>) =>
+    result.nodes.filter((n) => n.kind !== 'file').map((n) => `${n.kind} ${n.qualifiedName}`);
+  const refs = (result: ReturnType<typeof extractFromSource>, kind: string) =>
+    result.unresolvedReferences.filter((r) => r.referenceKind === kind).map((r) => r.referenceName);
+
+  it('should extract namespaces, modules, functions, values and opens', () => {
+    const code = `
+namespace Shop.Core
+
+open System
+open Shop.Util
+
+module Calc =
+    let helper (x: int) = x * 2
+    let rec area s = helper s
+    let limit = 10
+`;
+    const result = extractFromSource('Calc.fs', code);
+
+    expect(kindsAndNames(result)).toEqual(
+      expect.arrayContaining([
+        'namespace Shop.Core',
+        'module Shop.Core::Calc',
+        'function Shop.Core::Calc::helper',
+        'function Shop.Core::Calc::area',
+        'variable Shop.Core::Calc::limit',
+      ])
+    );
+    expect(refs(result, 'imports')).toEqual(['System', 'Shop.Util']);
+    expect(refs(result, 'calls')).toContain('helper');
+  });
+
+  it('should name an open by what it opens, not by the scope it is written in', () => {
+    const result = extractFromSource('A.fs', 'namespace Shop.Core\n\nopen System\n');
+    expect(result.nodes.find((n) => n.kind === 'import')?.qualifiedName).toBe('System');
+  });
+
+  it('should keep a type that carries attributes', () => {
+    const code = `
+module M
+
+[<AbstractClass>]
+type Base(name: string) =
+    abstract Describe : unit -> string
+
+[<Struct>]
+type V = V of int
+
+[<RequireQualifiedAccess>]
+type Kind = A | B
+`;
+    const result = extractFromSource('M.fs', code);
+    const base = result.nodes.find((n) => n.name === 'Base');
+    expect(base?.kind).toBe('class');
+    expect(base?.decorators).toContain('AbstractClass');
+    expect(result.nodes.find((n) => n.name === 'V')?.kind).toBe('union');
+    expect(result.nodes.find((n) => n.name === 'Kind')?.kind).toBe('union');
+    expect(result.nodes.find((n) => n.qualifiedName === 'M::Base::Describe')?.kind).toBe('method');
+  });
+
+  it('should extract unions, records, enums, abbreviations and exceptions', () => {
+    const code = `
+module Types
+
+type Shape = Circle of float | Rect of float * float
+type Order = { Id: int; Name: string }
+type Color = Red = 1 | Green = 2
+type Ids = int list
+exception Boom of string
+`;
+    const result = extractFromSource('Types.fs', code);
+
+    expect(kindsAndNames(result)).toEqual(
+      expect.arrayContaining([
+        'union Types::Shape',
+        'enum_member Types::Shape::Circle',
+        'enum_member Types::Shape::Rect',
+        'struct Types::Order',
+        'field Types::Order::Id',
+        'field Types::Order::Name',
+        'enum Types::Color',
+        'enum_member Types::Color::Red',
+        'type_alias Types::Ids',
+        'class Types::Boom',
+      ])
+    );
+  });
+
+  it('should emit extends for `inherit` and implements for `interface ... with`', () => {
+    const code = `
+module M
+
+type Derived(x: int) =
+    inherit Base("d")
+    interface System.IDisposable with
+        member _.Dispose() = cleanup ()
+    interface IComparable<Derived> with
+        member _.CompareTo(o) = 0
+`;
+    const result = extractFromSource('M.fs', code);
+    const derived = result.nodes.find((n) => n.name === 'Derived')!;
+
+    const from = (kind: string) =>
+      result.unresolvedReferences.filter((r) => r.referenceKind === kind && r.fromNodeId === derived.id).map((r) => r.referenceName);
+    expect(from('extends')).toEqual(['Base']);
+    expect(from('implements')).toEqual(['IDisposable', 'IComparable']);
+    // The members of an interface implementation are the type's own.
+    expect(kindsAndNames(result)).toEqual(
+      expect.arrayContaining(['method M::Derived::Dispose', 'method M::Derived::CompareTo'])
+    );
+    expect(refs(result, 'calls')).toContain('cleanup');
+  });
+
+  it('should extract class `let` bindings, `val` fields, constructors and property accessors', () => {
+    const code = `
+module M
+
+type Counter(start: int) =
+    let mutable count = start
+    let bump y = count <- count + y
+    val mutable Extra : int
+    new() = Counter(0)
+    member this.Count with get () = count and set v = bump v
+    member val Auto = 0 with get, set
+    static member Create() = Counter(1)
+`;
+    const result = extractFromSource('M.fs', code);
+
+    expect(kindsAndNames(result)).toEqual(
+      expect.arrayContaining([
+        'field M::Counter::count',
+        'method M::Counter::bump',
+        'field M::Counter::Extra',
+        'method M::Counter::new',
+        'property M::Counter::Count',
+        'property M::Counter::Auto',
+        'method M::Counter::Create',
+      ])
+    );
+    // The setter body calls `bump`; the secondary constructor calls the primary one.
+    expect(refs(result, 'calls')).toEqual(expect.arrayContaining(['bump', 'Counter']));
+    expect(result.nodes.find((n) => n.name === 'Create')?.isStatic).toBe(true);
+  });
+
+  it('should read the whole parameter list and return type of a member', () => {
+    const code = [
+      'module M',
+      '',
+      'type C() =',
+      '    member this.Add x y = x + y',
+      '    member this.Typed(a: int) : string = helper a',
+      '    member this.Area = 1',
+      '',
+    ].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const sig = (name: string) => result.nodes.find((n) => n.name === name)?.signature;
+
+    expect(sig('Add')).toBe('x y');
+    expect(sig('Typed')).toBe('(a: int) : string');
+    expect(result.nodes.find((n) => n.name === 'Add')?.kind).toBe('method');
+    expect(result.nodes.find((n) => n.name === 'Area')?.kind).toBe('property');
+    // Neither the parameters nor the name are walked as the body.
+    expect(refs(result, 'calls')).toEqual(['helper']);
+  });
+
+  it('should keep a class `let` private to its class', () => {
+    const code = ['module M', '', 'type C() =', '    let helper y = y', '    let state = 0', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    for (const name of ['helper', 'state']) {
+      const node = result.nodes.find((n) => n.name === name)!;
+      expect(node.isExported).toBe(false);
+      expect(node.visibility).toBe('private');
+    }
+  });
+
+  it('should treat `struct ... end` as a struct and keep its `val` fields', () => {
+    const result = extractFromSource('M.fs', 'module M\n\ntype Pt = struct\n    val X: int\nend\n');
+    expect(kindsAndNames(result)).toEqual(expect.arrayContaining(['struct M::Pt', 'field M::Pt::X']));
+  });
+
+  it('should name an active pattern by its banana clips', () => {
+    const result = extractFromSource('M.fs', 'module M\n\nlet (|Even|Odd|) n = if n % 2 = 0 then Even else Odd\n');
+    expect(kindsAndNames(result)).toContain('function M::(|Even|Odd|)');
+  });
+
+  it('should read access modifiers off the declaration', () => {
+    const code = `
+module M
+
+let private hidden x = x
+let internal shared x = x
+let open' x = x
+type private Secret = A | B
+type Holder() =
+    member private this.Inner() = 1
+    member internal this.Mid() = 2
+    static member private Make() = 3
+    member this.Open() = 4
+`;
+    const result = extractFromSource('M.fs', code);
+    const node = (name: string) => result.nodes.find((n) => n.name === name)!;
+
+    expect(node('hidden').isExported).toBe(false);
+    expect(node('hidden').visibility).toBe('private');
+    expect(node('shared').isExported).toBe(true);
+    expect(node('shared').visibility).toBe('internal');
+    expect(node('open\'').isExported).toBe(true);
+    expect(node('Secret').isExported).toBe(false);
+    expect(node('Inner').isExported).toBe(false);
+    expect(node('Mid').isExported).toBe(true);
+    expect(node('Make').isExported).toBe(false);
+    expect(node('Make').isStatic).toBe(true);
+    expect(node('Open').isExported).toBe(true);
+  });
+
+  it('should extract calls through application, pipes and qualified names', () => {
+    const code = `
+module M
+
+let run xs =
+    xs |> List.map Helpers.double |> Seq.sum |> ignore
+    Logger.info "done"
+    compute 1 2
+`;
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls).toEqual(expect.arrayContaining(['double', 'sum', 'ignore', 'info', 'compute']));
+  });
+
+  it('should reference the types a signature names, and skip primitives', () => {
+    const code = `
+module M
+
+type Order = { Id: int; Customer: Customer; Lines: OrderLine list }
+
+let total (o: Order) (rate: Rate) : Money = Money 0
+`;
+    const result = extractFromSource('M.fs', code);
+    const from = (name: string) =>
+      result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references' && r.fromNodeId === result.nodes.find((n) => n.name === name)!.id)
+        .map((r) => r.referenceName)
+        .sort();
+
+    expect(from('Customer')).toEqual(['Customer']);
+    expect(from('Lines')).toEqual(['OrderLine']);
+    expect(from('Id')).toEqual([]);
+    expect(from('total')).toEqual(['Money', 'Order', 'Rate']);
+    // Typed parameters followed by a return type still make a function.
+    const total = result.nodes.find((n) => n.name === 'total')!;
+    expect(total.kind).toBe('function');
+    expect(total.signature).toBe('(o: Order) (rate: Rate) : Money');
+  });
+
+  it('should make a symbol the implementer of an object expression interface', () => {
+    const code = ['module M', '', 'let make () =', '    { new IDisposable with', '        member _.Dispose() = cleanup () }', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const make = result.nodes.find((n) => n.name === 'make')!;
+
+    expect(
+      result.unresolvedReferences.filter((r) => r.referenceKind === 'implements' && r.fromNodeId === make.id).map((r) => r.referenceName)
+    ).toEqual(['IDisposable']);
+  });
+
+  it('should extract the bindings and types joined by `and`', () => {
+    const code = [
+      'module rec Rec',
+      '',
+      'let even n = if n = 0 then true else odd (n - 1)',
+      'and odd n = if n = 0 then false else even (n - 1)',
+      '',
+      'type A = { X: B }',
+      'and B = { Y: int }',
+      'and C() =',
+      '    member this.Area = 1',
+      '',
+    ].join(String.fromCharCode(10));
+    const result = extractFromSource('Rec.fs', code);
+
+    expect(kindsAndNames(result)).toEqual(
+      expect.arrayContaining(['function Rec::even', 'function Rec::odd', 'struct Rec::A', 'struct Rec::B', 'class Rec::C'])
+    );
+    // The body of `odd` is odd's own: it calls `even`, not the other way round.
+    const odd = result.nodes.find((n) => n.name === 'odd')!;
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === odd.id).map((r) => r.referenceName)).toEqual(['even']);
+  });
+
+  it('should treat a member without an argument list as a property', () => {
+    const code = ['module M', '', 'type C() =', '    member this.Area = 1', '    member this.Total() = 2', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    expect(result.nodes.find((n) => n.name === 'Area')?.kind).toBe('property');
+    expect(result.nodes.find((n) => n.name === 'Total')?.kind).toBe('method');
+  });
+
+  it('should not call an operator that only appears as syntax or as a standard value', () => {
+    const code = ['module M', '', 'let f x = match x with | true -> 1 | false -> 0', 'let g = id >> (=) 1', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    expect(calls).not.toContain('(|)');
+    expect(calls).not.toContain('(=)');
+  });
+
+  it('should call a project operator but not a standard one', () => {
+    const code = ['module M', '', 'let (+++) a b = a + b', 'let use1 () = 1 +++ 2', 'let use2 () = 1 + 2', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+    expect(calls).toContain('(+++)');
+    expect(calls).not.toContain('(+)');
+  });
+
+  it('should extract every name a destructuring binding introduces', () => {
+    const code = ['module M', '', 'let x, y = 1, 2', 'let (a1, b1) = foo ()', 'let { Name = n; Age = age } = person', 'let _, kept = 1, 2', ''].join(String.fromCharCode(10));
+    const names = extractFromSource('M.fs', code).nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+
+    expect(names).toEqual(['x', 'y', 'a1', 'b1', 'n', 'age', 'kept']);
+  });
+
+  it('should credit the initializer of a destructuring binding to every name it binds', () => {
+    const code = ['module M', '', 'let x, y = make ()', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    for (const name of ['x', 'y']) {
+      const id = result.nodes.find((n) => n.name === name)!.id;
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === id).map((r) => r.referenceName)).toEqual(['make']);
+    }
+  });
+
+  it('should scope declarations of `namespace global` under a namespace named global', () => {
+    const code = ['namespace global', '', 'type Gt() =', '    member _.X = 1', ''].join(String.fromCharCode(10));
+    expect(kindsAndNames(extractFromSource('G.fs', code))).toEqual(
+      expect.arrayContaining(['namespace global', 'class global::Gt', 'property global::Gt::X'])
+    );
+  });
+
+  it('should read a function whose attributes are written after `let`', () => {
+    const code = ['module M', '', 'let [<Fact>] ``a test`` () = helper ()', 'let [<Literal>] K = 3', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const test = result.nodes.find((n) => n.name === '``a test``')!;
+
+    expect(test.kind).toBe('function');
+    expect(test.decorators).toContain('Fact');
+    expect(result.nodes.find((n) => n.name === 'K')?.kind).toBe('variable');
+    // An attribute is not a type the signature uses.
+    expect(refs(result, 'references')).toEqual([]);
+    expect(refs(result, 'calls')).toEqual(['helper']);
+  });
+
+  it('should call a type through explicit type arguments', () => {
+    const code = ['module M', '', 'let a = new Foo(1)', 'let b = new Bar<int>(2)', 'let c = Baz<int>(3)', ''].join(String.fromCharCode(10));
+    expect(refs(extractFromSource('M.fs', code), 'calls')).toEqual(['Foo', 'Bar', 'Baz']);
+  });
+
+  it('should keep the attributes and access of a module', () => {
+    const code = ['module M', '', '[<AutoOpen>]', 'module Inner =', '    let f x = x', '', 'module private Hidden =', '    let g x = x', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    expect(result.nodes.find((n) => n.name === 'Inner')?.decorators).toEqual(['AutoOpen']);
+    expect(result.nodes.find((n) => n.name === 'Hidden')?.isExported).toBe(false);
+  });
+
+  it('should not call a property read that is passed as an argument', () => {
+    const code = ['module M', '', 'let f bb lo xs = bb.EmitZ32 lo.Length', 'let g xs = List.map LogEvent.information xs', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls).toContain('EmitZ32');
+    expect(calls).not.toContain('Length');
+    // A qualified reference through a module or type is a function reference.
+    expect(calls).toContain('information');
+  });
+
+  it('should find the callee that follows an infix operator, and a pipe once', () => {
+    const code = ['module M', '', 'let r = foo 1 + bar 2', 'let s = foo 1 * bar 2 - baz 3', 'let t x = x |> f 1', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls).toEqual(expect.arrayContaining(['foo', 'bar', 'baz']));
+    expect(calls.filter((c) => c === 'f')).toHaveLength(1);
+  });
+
+  it('should extract bindings named in any script', () => {
+    const code = ['module M', '', 'let Δ, Ω = 1, 2', ''].join(String.fromCharCode(10));
+    expect(extractFromSource('M.fs', code).nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['Δ', 'Ω']);
+  });
+
+  it('should extract every binding of `let rec ... and ...`', () => {
+    const code = ['module M', '', 'let rec even n = odd (n - 1)', '', 'and odd n = even (n - 1)', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const callsOf = (name: string) => {
+      const id = result.nodes.find((n) => n.name === name)!.id;
+      return result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === id).map((r) => r.referenceName);
+    };
+
+    expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).toEqual(['even', 'odd']);
+    expect(result.nodes.find((n) => n.name === 'even')?.decorators).toContain('rec');
+    expect(callsOf('even')).toEqual(['odd']);
+    expect(callsOf('odd')).toEqual(['even']);
+  });
+
+  it('should name `namespace rec` by its path, not by the keyword', () => {
+    const result = extractFromSource('M.fs', ['namespace rec Shop.Core', '', 'type A = { X: int }', ''].join(String.fromCharCode(10)));
+    expect(kindsAndNames(result)).toEqual(expect.arrayContaining(['namespace Shop.Core', 'struct Shop.Core::A']));
+  });
+
+  it('should read a lambda binding as a function and keep signatures on one line', () => {
+    const code = ['module M', '', 'let f = fun x y -> x', 'let g (a: int,', '         b: int) = a', ''].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+
+    expect(result.nodes.find((n) => n.name === 'f')?.kind).toBe('function');
+    expect(result.nodes.find((n) => n.name === 'f')?.signature).toBe('x y');
+    expect(result.nodes.find((n) => n.name === 'g')?.signature).not.toContain(String.fromCharCode(10));
+  });
+
+  it('should use a union case where a pattern matches it, once', () => {
+    const code = ['module M', '', 'let area s =', '    match s with', '    | Circle r -> r', '    | Rect (w, h) -> w', '    | None -> 0.0', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    for (const name of ['Circle', 'Rect', 'None']) expect(calls.filter((c) => c === name)).toHaveLength(1);
+    // The binding's own pattern is not a use.
+    expect(calls).not.toContain('area');
+  });
+
+  it('should not call the text of an SRTP constraint, and should call a parenthesised function', () => {
+    const code = ['module M', '', 'let inline add (x: ^a) (y: ^a) = (^a : (static member (+) : ^a * ^a -> ^a) (x, y))', 'let use1 x = (helper) x', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls.filter((c) => c.includes('^'))).toEqual([]);
+    expect(calls).toContain('helper');
+  });
+
+  it('should use a capitalised name written as a value, and not a lowercase one', () => {
+    const code = [
+      'module M',
+      '',
+      'let a x = if x then Red else Green',
+      'let b = [Red; Green]',
+      'let c = f Red',
+      'let d = { Color = Red }',
+      'let e xs = List.map helper xs',
+      '',
+    ].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls.filter((c) => c === 'Red')).toHaveLength(4);
+    expect(calls.filter((c) => c === 'Green')).toHaveLength(2);
+    // A lowercase name is as likely a local as a function.
+    expect(calls).not.toContain('helper');
+  });
+
+  it('should read `function` bindings as functions and abstract slots without an arrow as properties', () => {
+    const code = [
+      'module M',
+      '',
+      'let g = function | A -> 1 | B -> 2',
+      'type T =',
+      '    abstract Foo : int with get, set',
+      '    abstract Bar : int',
+      '    abstract Baz : int -> int',
+      '',
+    ].join(String.fromCharCode(10));
+    const result = extractFromSource('M.fs', code);
+    const kind = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kind('g')).toBe('function');
+    expect([kind('Foo'), kind('Bar'), kind('Baz')]).toEqual(['property', 'property', 'method']);
+  });
+
+  it('should emit one call per call site, qualified or not', () => {
+    const code = ['module M', '', 'let q = Deep.deep ()', 'let r xs = List.map (fun z -> z) xs', 'let s = plain 1', ''].join(String.fromCharCode(10));
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls.filter((c) => c === 'deep')).toHaveLength(1);
+    expect(calls.filter((c) => c === 'map')).toHaveLength(1);
+    expect(calls.filter((c) => c === 'plain')).toHaveLength(1);
+  });
+
+  it('should not take a record label, or a name a parameter shadows, for a call', () => {
+    const nl = String.fromCharCode(10);
+    const labels = ['module M', '', 'let mk c = { Customer = c; Status = Active }', ''].join(nl);
+    expect(refs(extractFromSource('M.fs', labels), 'calls')).toEqual(['Active']);
+
+    const shadowed = [
+      'module M',
+      '',
+      'type T() =',
+      '    member _.Run (f: int -> int, x) = f x',
+      'let apply (f: int -> int) x = f x',
+      'let lam = fun h -> h 1',
+      'let piped f xs = xs |> f',
+      'let rec go n = go n',
+      'let qualified (f: int) = Util.f f',
+      '',
+    ].join(nl);
+    expect(refs(extractFromSource('M.fs', shadowed), 'calls').sort()).toEqual(['f', 'go']);
+  });
+
+  it('should keep a dot inside an operator or a backticked name', () => {
+    const code = ['module M', '', 'let (+.) a b = a', 'let r = (+.) 1 2', 'let s = ``my.fn`` 3', 'let v x = x |> Circle', ''].join(
+      String.fromCharCode(10),
+    );
+    const calls = refs(extractFromSource('M.fs', code), 'calls');
+
+    expect(calls).toContain('(+.)');
+    expect(calls).toContain('``my.fn``');
+    expect(calls.filter((c) => c === 'Circle')).toHaveLength(1);
+  });
+
+  it('should end the first type of an `and` chain where its own definition ends', () => {
+    const code = ['module M', '', 'type A = { X: int }', 'and B = { Y: int }', ''].join(String.fromCharCode(10));
+    const types = extractFromSource('M.fs', code).nodes;
+
+    expect(types.find((n) => n.name === 'A')?.endLine).toBe(3);
+    expect(types.find((n) => n.name === 'B')?.startLine).toBe(4);
+  });
+
+  it('should link `#load` in a script like an open file', () => {
+    const result = extractFromSource('build.fsx', '#r "nuget: Foo"\n#load "Helpers.fsx"\nopen Helpers\n');
+    expect(refs(result, 'imports')).toEqual(['Helpers.fsx', 'Helpers']);
   });
 });
 
