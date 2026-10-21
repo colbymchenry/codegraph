@@ -14610,14 +14610,68 @@ function cppArrowTarget(
 
 /**
  * The element a container's iterator of the type `iterator` points at, read
- * from the container's template arguments (cppArrowTarget). Null for any
- * other type, and for an element a class template's own `begin()` or
+ * from the container's template arguments (cppArrowTarget), or what `->` on
+ * a value of one of the project's classes reaches (cppOperatorTarget). Null
+ * for any other type, and for an element a class template's own `begin()` or
  * `operator*` writes with its template parameter.
  */
 function cppIteratorTarget(iterator: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
   const container = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(iterator.text))?.[1];
-  const element = container ? cppRangeElementOf({ ...iterator, text: container }, at, context, 1) : null;
+  const element = container ? cppRangeElementOf({ ...iterator, text: container }, at, context, 1) : cppOperatorTarget(iterator, at, context);
   return element && (element.scope === iterator.scope || !isCppTemplateParameterType(element)) ? element : null;
+}
+
+/**
+ * What `->` on a value of one of the project's classes of the type `type`
+ * reaches, as C++ reads `x->m`: what the class's `operator->` returns,
+ * through the pointer it is, or with `->` applied again to a class it is (a
+ * library holder's held type, or another of these); else what its
+ * `operator*` returns. The return type is read where the class declares it,
+ * with the class's own template parameters bound to the arguments `type` is
+ * written with (cppTemplateBound). rocksdb's `MultiGetContext::Range::Iterator`
+ * declares `KeyContext* operator->()`, its `UnownedPtr<DB>` a `T*
+ * operator->()`, a `DB*`, and its `FileSystemPtr` returns a
+ * `std::shared_ptr<FileSystem>`. Null when the class declares neither, or
+ * what it returns can't be read.
+ */
+function cppOperatorTarget(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext, hops = 0): CppWrittenType | null {
+  const written = cppWithoutTypeKeywords(type.text);
+  if (hops > 2 || !written || isCppPointerType(written) || isCppLibraryType(written, context)) return null;
+  const found = cppClassWritten(written, type, at, context);
+  if (!found?.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return null;
+  const arrow = cppMethodsOf(found.node, 'operator->', at, context);
+  const returned = cppReturnTypeOf(arrow.length > 0 ? arrow : cppMethodsOf(found.node, 'operator*', at, context), context);
+  const bound = returned && cppTemplateBound(returned, found.node, { ...type, text: written }, at, context);
+  if (!bound) return null;
+  if (arrow.length === 0) return { ...bound, text: bound.text.replace(/&+\s*$/, '').trim() };
+  return cppPointee(bound) ?? cppOperatorTarget(bound, at, context, hops + 1);
+}
+
+/**
+ * The type `returned`, which the class template `cls` writes, with `cls`'s
+ * own template parameters bound to the arguments of `type`, a specialization
+ * of it: the `T*` of `UnownedPtr<T>` is a `DB*` for an `UnownedPtr<DB>`. An
+ * alias the class declares (`pointer`) is followed first, and an argument is
+ * looked up where `type` is written. A type of a class that is no template
+ * comes back as written; null for a parameter `type` doesn't bind.
+ */
+function cppTemplateBound(returned: CppWrittenType, cls: Node, type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  const params = cppOwnTemplateParameters(cls, context);
+  if (params.length === 0) return returned;
+  const args = cppTemplateArguments(type.text) ?? [];
+  const followed = cppFollowWrittenAliases(returned, at, context) ?? returned;
+  const core = followed.text.replace(/\b(?:const|volatile|typename)\b|[*&]/g, ' ').trim();
+  const index = params.indexOf(core);
+  if (index >= 0) {
+    const arg = args[index]?.trim();
+    return arg ? { ...type, text: followed.text.replace(new RegExp(`\\b${core}\\b`), arg) } : null;
+  }
+  let text = followed.text;
+  params.forEach((param, i) => {
+    const arg = args[i]?.trim();
+    if (param && arg) text = text.replace(new RegExp(`\\b${param}\\b`, 'g'), arg);
+  });
+  return { ...followed, text };
 }
 
 /**
