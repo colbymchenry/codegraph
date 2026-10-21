@@ -486,6 +486,33 @@ function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
 }
 
 /**
+ * A Rust callee path without its turbofish type arguments: `Vec::<u8>::new`
+ * calls `Vec::new`, `Store::with_capacity::<u8>` calls `Store::with_capacity`.
+ * The arguments' brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is no
+ * closing one (`::<fn() -> u8>`). Mirrored in the kernel's strip_turbofish
+ * (rustlang.rs): both emit the same bytes.
+ */
+function stripRustTurbofish(text: string): string {
+  if (!text.includes('::<')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith('::<', i)) {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < text.length; j++) {
+        const c = text[j];
+        if (c === '<') depth++;
+        else if (c === '>' && text[j - 1] !== '-' && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
+/**
  * A Swift receiver's text from its innermost wrapped operand on: the wrappers
  * sit on the chain's left edge, so `!Settings.Defaults` reads
  * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
@@ -5465,6 +5492,15 @@ export class TreeSitterExtractor {
         func = peelSwiftCallWrappers(func, this.source);
       }
 
+      // A Rust turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+      // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its type
+      // arguments are no part of the callee's name, which stayed in the ref
+      // (`s.get::<u32>`) and resolved through no strategy. Mirrored in the
+      // kernel's extract_call (rustlang.rs).
+      if (func && this.language === 'rust' && func.type === 'generic_function') {
+        func = getChildByField(func, 'function') ?? func;
+      }
+
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the
       // callee is NOT a field_expression — the call_expression carries
@@ -5640,10 +5676,16 @@ export class TreeSitterExtractor {
                 // fluent codebases. Leave those to the bare-name path.
                 reencode = /^[A-Z]/.test(innerCallee);
               } else {
-                const innerFn = getChildByField(receiver, 'function');
+                let innerFn = getChildByField(receiver, 'function');
+                // Rust: the inner call's turbofish is no part of its name either
+                // (`Foo::create::<T>().run()`, `Vec::<u8>::new().len()`).
+                if (this.language === 'rust' && innerFn?.type === 'generic_function') {
+                  innerFn = getChildByField(innerFn, 'function') ?? innerFn;
+                }
                 innerCallee = innerFn
                   ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
                   : '';
+                if (this.language === 'rust') innerCallee = stripRustTurbofish(innerCallee);
                 // Rust: only re-encode an associated-function chain
                 // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
                 // Go: only a bare package-level factory chain (`New().Method()`),
@@ -5805,8 +5847,9 @@ export class TreeSitterExtractor {
             }
           }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
-          // Scoped call: Module::function()
-          calleeName = getNodeText(func, this.source);
+          // Scoped call: Module::function(); a Rust path's turbofish is no
+          // part of the name (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+          calleeName = this.language === 'rust' ? stripRustTurbofish(getNodeText(func, this.source)) : getNodeText(func, this.source);
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
           // C# member call `recv.Method(...)`. When the receiver is itself a call
           // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`

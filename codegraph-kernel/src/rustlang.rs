@@ -882,6 +882,11 @@ impl<'t> Walker<'t> {
         let func = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0));
+        // A turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+        // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its
+        // type arguments are no part of the callee's name. Mirrors
+        // TreeSitterExtractor.extractCall.
+        let func = func.map(unwrap_generic_function);
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -920,7 +925,7 @@ impl<'t> Walker<'t> {
                                 // function chain (`Foo::new().bar()`, inner
                                 // callee a scoped_identifier). Instance chains
                                 // keep the bare method name.
-                                let inner_fn = r.child_by_field_name("function");
+                                let inner_fn = r.child_by_field_name("function").map(unwrap_generic_function);
                                 let reencode =
                                     inner_fn.map(|f| f.kind() == "scoped_identifier").unwrap_or(false);
                                 if reencode {
@@ -930,6 +935,7 @@ impl<'t> Walker<'t> {
                                         .chars()
                                         .filter(|c| !c.is_whitespace())
                                         .collect();
+                                    let inner = strip_turbofish(&inner);
                                     callee_name = format!("{inner}().{method_name}");
                                 } else {
                                     callee_name = method_name.to_string();
@@ -974,10 +980,11 @@ impl<'t> Walker<'t> {
                     }
                 }
             } else if matches!(func.kind(), "scoped_identifier" | "scoped_call_expression") {
-                callee_name = self.text(func).to_string();
+                // A path's turbofish is no part of the name either
+                // (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+                callee_name = strip_turbofish(self.text(func));
             } else {
-                // identifier; generic_function keeps the raw turbofish text
-                // (`helper::<T>` — unresolvable downstream, preserved).
+                // identifier (a turbofish was unwrapped above).
                 callee_name = self.text(func).to_string();
             }
         }
@@ -1599,6 +1606,52 @@ fn is_stoplisted(name: &str) -> bool {
         "this" | "self" | "super" | "null" | "nil" | "true" | "false" | "undefined" | "new"
             | "NULL" | "nullptr" | "None"
     )
+}
+
+/// The function a turbofish wraps: `s.get::<u32>` → `s.get`,
+/// `helper::<u8>` → `helper`; any other callee as is.
+fn unwrap_generic_function(func: Node<'_>) -> Node<'_> {
+    if func.kind() == "generic_function" {
+        func.child_by_field_name("function").unwrap_or(func)
+    } else {
+        func
+    }
+}
+
+/// A callee path without its turbofish type arguments: `Vec::<u8>::new` →
+/// `Vec::new`. The brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is
+/// no closing one (`::<fn() -> u8>`). Mirrors stripRustTurbofish in
+/// TreeSitterExtractor: both emit the same bytes.
+fn strip_turbofish(text: &str) -> String {
+    if !text.contains("::<") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ':' && i + 2 < chars.len() && chars[i + 1] == ':' && chars[i + 2] == '<' {
+            let mut depth = 0i32;
+            let mut j = i + 2;
+            while j < chars.len() {
+                let c = chars[j];
+                if c == '<' {
+                    depth += 1;
+                } else if c == '>' && chars[j - 1] != '-' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// LITERAL_RECEIVER_TYPES (shared table).
