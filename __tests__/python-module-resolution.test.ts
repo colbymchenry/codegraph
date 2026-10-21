@@ -26,7 +26,7 @@ describe('Python module resolution', () => {
 
   afterEach(() => {
     if (cg) cg.destroy();
-    else if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
   function write(files: Record<string, string>): void {
