@@ -2819,6 +2819,17 @@ export class ReferenceResolver {
     return resolveImportPath(specifier, fromFile, language, this.context);
   }
 
+  /**
+   * What `ref` resolves to against the graph as it is now, writing nothing:
+   * its target and how it was found, or null. A sync compares it with the
+   * edge the reference made before, to re-open only an edge an edit moved.
+   */
+  resolveNow(ref: UnresolvedReference): { targetNodeId: string; resolvedBy: string } | null {
+    if (!ref.filePath || !ref.language) return null;
+    const resolved = this.resolveOne({ ...ref, filePath: ref.filePath, language: ref.language });
+    return resolved ? { targetNodeId: resolved.targetNodeId, resolvedBy: resolved.resolvedBy } : null;
+  }
+
   /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
   hasNavigationRouters(): boolean {
     return this.frameworks.some((f) => f.navigation !== undefined);

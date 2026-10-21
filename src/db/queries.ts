@@ -3164,6 +3164,48 @@ export class QueryBuilder {
   }
 
   /**
+   * The import bindings of `filePaths` that resolved some other way than
+   * through their import — `imports` edges out of each file's node named for
+   * the binding, whose `resolvedBy` is a name match or a framework's — with
+   * the source file and language a resurrection needs and the file of each
+   * target. Synthesized edges are left out. The binding edges of a file are
+   * an indexed range (idx_edges_source_kind); few of them resolve by name.
+   */
+  getImportBindingsResolvedElsewhere(
+    filePaths: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const out: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> = [];
+    const unique = [...new Set(filePaths)].map((filePath) => `file:${filePath}`);
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE e.source IN (${placeholders})
+              AND e.kind = 'imports'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+              AND json_valid(e.metadata)
+              AND json_extract(e.metadata, '$.resolvedBy') != 'import'`
+        )
+        .all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }>;
+      for (const row of rows) {
+        out.push({
+          ...rowToEdge(row),
+          edgeId: row.id,
+          sourceFilePath: row.source_file_path,
+          sourceLanguage: row.source_language,
+          targetFilePath: row.target_file_path,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
    * The resolution edges into `targetIds` — every edge into one of them but
    * `contains` and synthesized (`provenance='heuristic'`) ones — with the
    * source file and language a resurrection needs and the file of each target.

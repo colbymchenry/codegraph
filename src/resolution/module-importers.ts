@@ -272,6 +272,67 @@ export function reopenReferencesThroughChangedDefaults(
   return reopened + reopenEdgeList(queries, queries.getResolutionEdgesInto(members).filter(stays));
 }
 
+/**
+ * Re-open, for the sync's sweep, the imports of `files` that a name match
+ * took instead of the import, when the binding now resolves another way.
+ * `import { EmptyState } from './layouts/shared'`, linked by name to a
+ * namesake while the barrel did not pass `EmptyState` on, kept the namesake
+ * after an edit gave the barrel `export { EmptyState } from './EmptyState'`:
+ * that edit declares nothing, so neither the rebind nor the walk below a
+ * barrel sees it, and a fresh index links the binding through the module. A
+ * name match into the module itself (`import { Card } from './card'` where
+ * `card.ts` exports `Card` only as its default) can come undone the same way.
+ * Each importer's edges bound before this sync resolved anything (up to
+ * `resolvedUpToEdgeId`) go back: those through the name, and those into the
+ * members of what the name match took, which a value typed by the binding
+ * reached (`w.run()` with `w: Widget`). Only the importers' bindings that
+ * resolved some other way than their import are read, an indexed range per
+ * importer, then only those importers' import statements, and `resolveNow`
+ * says what each binding of `files` resolves to against the graph as it is:
+ * one that resolves as it did, such as a name match a fresh index makes too,
+ * stays. Returns the number re-opened.
+ */
+export function reopenNameMatchedImports(
+  queries: QueryBuilder,
+  reader: ImportReader,
+  files: ReadonlyArray<{ path: string; language: Language }>,
+  resolvedUpToEdgeId: number,
+  resolveModule: ModuleResolver,
+  resolveNow: (ref: UnresolvedReference) => { targetNodeId: string; resolvedBy: string } | null,
+): number {
+  const bindings = new Map<string, { names: string[] }>();
+  // What each importer's name matches took, whose members a typed value reached.
+  const took = new Set<string>();
+  for (const file of files) {
+    if (!BARREL_LANGUAGES.has(file.language)) continue;
+    const importers = new Set<string>();
+    for (const i of queries.getImportsInto(`file:${file.path}`, file.path)) {
+      if (i.language !== 'python' && BINDING_LANGUAGES.has(i.language)) importers.add(i.filePath);
+    }
+    if (importers.size === 0) continue;
+    for (const edge of queries.getImportBindingsResolvedElsewhere([...importers])) {
+      const name = edge.metadata?.refName;
+      if (typeof name !== 'string' || edge.edgeId > resolvedUpToEdgeId) continue;
+      const binding = reader.mappings(edge.sourceFilePath, edge.sourceLanguage).find((m) => m.localName === name);
+      if (!binding || binding.isNamespace) continue;
+      if (resolveModule(binding.source, edge.sourceFilePath, edge.sourceLanguage) !== file.path) continue;
+      const ref = resurrectRefFromDroppedEdge(edge);
+      const now = ref ? resolveNow(ref) : null;
+      if (!ref || (now && now.targetNodeId === edge.target && now.resolvedBy === edge.metadata?.resolvedBy)) continue;
+      const entry = bindings.get(edge.sourceFilePath) ?? { names: [] };
+      if (!entry.names.includes(name)) entry.names.push(name);
+      bindings.set(edge.sourceFilePath, entry);
+      took.add(edge.target);
+    }
+  }
+  const stays = (e: { edgeId: number }): boolean => e.edgeId <= resolvedUpToEdgeId;
+  const reopened = reopenEdges(queries, bindings, stays);
+  if (took.size === 0) return reopened;
+  const members = queries.getOutgoingEdgesFrom([...took], ['contains']).map((edge) => edge.target);
+  if (members.length === 0) return reopened;
+  return reopened + reopenEdgeList(queries, queries.getResolutionEdgesInto(members).filter((e) => bindings.has(e.sourceFilePath) && stays(e)));
+}
+
 /** The languages a barrel a lazy route reads through is written in: the ES-module family. */
 const BARREL_LANGUAGES = new Set<Language>(['typescript', 'tsx', 'javascript', 'jsx']);
 

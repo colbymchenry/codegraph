@@ -54,7 +54,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
-import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
+import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -1198,6 +1198,24 @@ export class CodeGraph {
             const throughDefaults = movedDefaults.length === 0 ? 0
               : reopenReferencesThroughChangedDefaults(this.queries, importReader, movedDefaults, edgesBeforeResolution);
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-default-exports: ${Date.now() - tDefaults}ms (${movedDefaults.length} defaults moved, ${throughDefaults} refs re-opened)`);
+
+            // An import a name match took while its module did not export the
+            // name, once the binding resolves another way: `import {
+            // EmptyState } from './layouts/shared'` kept a namesake after the
+            // barrel's edit gave it the re-export, which declares nothing. And
+            // a name match into the edited module itself, which the edit can
+            // undo.
+            const tNamed = Date.now();
+            const editedModules = modified.flatMap((filePath) => {
+              const file = this.queries.getFileByPath(filePath);
+              return file ? [{ path: filePath, language: file.language }] : [];
+            });
+            const nameMatched = reopenNameMatchedImports(
+              this.queries, importReader, editedModules, edgesBeforeResolution,
+              (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language),
+              (ref) => this.resolver.resolveNow(ref)
+            );
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-name-matched-imports: ${Date.now() - tNamed}ms (${nameMatched} refs re-opened)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
