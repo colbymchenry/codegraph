@@ -29,7 +29,11 @@
  *    (`fmt::detail::buffer` under fmt's FMT_BEGIN_NAMESPACE);
  *  - a class a source file (`.cc`, `.cpp`, `.c`) defines belongs to that
  *    translation unit, so only that file sees it (leveldb's skiplist test
- *    declares its own `leveldb::Comparator`);
+ *    declares its own `leveldb::Comparator`) — and so does a name a header
+ *    writes, read for code in that file, which includes the header: a
+ *    pimpl's `std::unique_ptr<Rep> rep_`, whose `Table::Rep` the source file
+ *    calling through it defines (leveldb's `Table`, rocksdb's
+ *    `BlockBasedTableBuilder`);
  *  - a template parameter (`template <class Base> class X : public Base`) or
  *    a member of one (`public T::Base`) is whatever a template argument makes
  *    it: no edge.
@@ -76,14 +80,15 @@ function isCFamily(n: Node): boolean {
 }
 
 /**
- * The declarations code at `site` can see (visibleFrom), where a class local
- * to a function counts only in that function's lines: the index names it
- * after the function, and every gtest `TEST_F` body in a namespace is
- * `ns::TEST_F`, so one body's local `Listener` passed for any other's — in
- * the body itself, and in the methods of a local class of its own.
+ * The declarations code at `site` can see (visibleFrom), read for code in
+ * the file `unit`, where a class local to a function counts only in that
+ * function's lines: the index names it after the function, and every gtest
+ * `TEST_F` body in a namespace is `ns::TEST_F`, so one body's local
+ * `Listener` passed for any other's — in the body itself, and in the methods
+ * of a local class of its own.
  */
-function seenFrom(site: CppNameSite, context: ResolutionContext): (n: Node) => boolean {
-  const visible = visibleFrom(site.file);
+function seenFrom(site: CppNameSite, context: ResolutionContext, unit?: string): (n: Node) => boolean {
+  const visible = visibleFrom(site.file, unit);
   return (n) => {
     if (!visible(n)) return false;
     const fn = cppFunctionAround(n, context);
@@ -111,9 +116,12 @@ function cppFunctionAround(cls: Node, context: ResolutionContext): Node | null {
   return fn;
 }
 
-/** The declarations code in `file` can see: a header's, and the file's own. */
-function visibleFrom(file: string): (n: Node) => boolean {
-  return (n) => n.filePath === file || !SOURCE_FILE.test(n.filePath);
+/**
+ * The declarations code in `file` can see: a header's, and the file's own —
+ * and, read for code in the file `unit` (one that includes `file`), `unit`'s.
+ */
+function visibleFrom(file: string, unit?: string): (n: Node) => boolean {
+  return (n) => n.filePath === file || n.filePath === unit || !SOURCE_FILE.test(n.filePath);
 }
 
 export function matchCppSupertype(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -176,13 +184,14 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const global = written.startsWith('::');
   if (!global && site.parameters.has(segments[0]!)) return null;
 
-  const visible = seenFrom(site, context);
+  // (For code in the reference's own file: the file it is in includes the one that writes the name.)
+  const visible = seenFrom(site, context, ref.filePath);
   const scopes = cppScopesWithin(site.scope);
   if (site.classScope) scopes.splice(1, 0, site.classScope);
   const resolved = (node: Node): CppWrittenClass => ({ node, exact: true });
 
   // The scopes around the name short of the global one, or only the global one for `::Base`.
-  const lexical = classNode(cppClassNamed(written, global ? [''] : scopes.slice(0, -1), ref, context, visible), site, context);
+  const lexical = classNode(cppClassNamed(written, global ? [''] : scopes.slice(0, -1), ref, context, visible), site, context, visible);
   if (lexical !== undefined) return lexical && resolved(lexical);
 
   // What the file writes before the name, the nearest first: each stands for
@@ -193,7 +202,7 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const usings = usingsIn(site.file, context).filter((u) => u.line < site.line).reverse();
   const lookUp = (spelled: string): Node | undefined => {
     const absolute = spelled.startsWith('::');
-    return classNode(cppClassNamed(spelled, absolute ? [''] : scopes, ref, context, visible), site, context) ?? undefined;
+    return classNode(cppClassNamed(spelled, absolute ? [''] : scopes, ref, context, visible), site, context, visible) ?? undefined;
   };
   // `::_pbi::MessageGlobalsBase` under `namespace _pbi = ::google::protobuf::internal;`.
   if (segments.length > 1) {
@@ -216,7 +225,7 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
       if (hit) return resolved(hit);
     }
     // The global scope.
-    const outermost = classNode(cppClassNamed(written, [''], ref, context, visible), site, context);
+    const outermost = classNode(cppClassNamed(written, [''], ref, context, visible), site, context, visible);
     if (outermost !== undefined) return outermost && resolved(outermost);
   }
   // `fmt::detail::buffer`, where a macro opens `namespace fmt` around `detail::buffer`.
@@ -267,10 +276,11 @@ function writtenBase(ref: UnresolvedRef, context: ResolutionContext): string {
 }
 
 /**
- * The node of the class a lookup found, as the file that writes the name sees
- * it (null: the name names no particular class; undefined: keep looking).
+ * The node of the class a lookup found, among the declarations the lookup can
+ * see (`visible`; null: the name names no particular class; undefined: keep
+ * looking).
  */
-function classNode(named: CppNamedClass, site: CppNameSite, context: ResolutionContext): Node | null | undefined {
+function classNode(named: CppNamedClass, site: CppNameSite, context: ResolutionContext, visible: (n: Node) => boolean): Node | null | undefined {
   if (named === null || named === undefined) return named;
   if ('alias' in named) return named.alias;
   const classes = context
@@ -278,8 +288,8 @@ function classNode(named: CppNamedClass, site: CppNameSite, context: ResolutionC
     .filter((n) => isCFamily(n) && CLASS_KINDS.has(n.kind) && n.id !== site.self?.id);
   // A lookup that ended on the class itself (its namespace lost) found nothing.
   if (classes.length === 0) return undefined;
-  const visible = classes.filter(seenFrom(site, context));
-  return pick(visible.length > 0 ? visible : classes, site.file);
+  const shown = classes.filter(visible);
+  return pick(shown.length > 0 ? shown : classes, site.file);
 }
 
 /**
