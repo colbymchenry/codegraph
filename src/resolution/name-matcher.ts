@@ -3628,10 +3628,12 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
     ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return false;
-  // `^<name>\s*[(<]` at the call's column, without compiling a pattern per call.
+  // `^<name>\s*[(<]` at the call's column (or a JS/TS wrapper's tail after the
+  // name), without compiling a pattern per call.
   if (!line.startsWith(ref.referenceName, ref.column)) return false;
   CALL_OPENER.lastIndex = ref.column + ref.referenceName.length;
-  if (!CALL_OPENER.test(line)) return false;
+  JS_PEELED_CALLEE_TAIL.lastIndex = CALL_OPENER.lastIndex;
+  if (!CALL_OPENER.test(line) && !(JS_FAMILY.has(ref.language) && JS_PEELED_CALLEE_TAIL.test(line))) return false;
   // Nothing but whitespace, an operator or an opener may precede a bare call:
   // read the text before the column backwards, past trailing whitespace,
   // instead of end-anchoring a pattern that scans the prefix from its start.
@@ -3649,6 +3651,12 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
 
 /** `\s*[(<]` from a given index (sticky) — an optional call's `?.(` too. */
 const CALL_OPENER = /\s*(?:\?\.\s*)?[(<]/y;
+/**
+ * What follows a JS/TS callee's name inside a wrapper the extractor sees
+ * through — `fn!()`, `(fn)()`, `(fn as F)()`, `(fn satisfies F)()` — whose
+ * reference sits at the name, as a plain call's does (sticky).
+ */
+const JS_PEELED_CALLEE_TAIL = /\s*[!)]|\s+(?:as|satisfies)(?![\w$])/y;
 const WHITESPACE = /\s/;
 const WORD_CHAR = /\w/;
 /** A character that ends a receiver: `.`, a word character, `$`, `]` or `)`. */

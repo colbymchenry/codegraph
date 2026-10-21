@@ -559,13 +559,17 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
 
 /**
  * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
- * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
- * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ * `await f` (#2586), and a prefix operator over a generic call the same way:
+ * `!settings.get<boolean>('X')`, `void apiRequest<T>()`, `typeof load<T>()`.
+ * The call is to `f`. Peels every `await` and prefix operator, skipping a
+ * comment written after an `await`. Mirrored in the kernel (tsjs/extractors.rs).
  */
-function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+function peelTsPrefixedCallee(node: SyntaxNode): SyntaxNode {
   let cur = node;
-  while (cur.type === 'await_expression') {
-    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+  while (cur.type === 'await_expression' || cur.type === 'unary_expression') {
+    const inner = cur.type === 'unary_expression'
+      ? getChildByField(cur, 'argument')
+      : cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
     if (!inner) break;
     cur = inner;
   }
@@ -591,6 +595,32 @@ function peelTsJsReceiver(node: SyntaxNode): SyntaxNode {
     cur = inner;
   }
   return cur;
+}
+
+/**
+ * The name a TS/JS call's callee writes when it is no member access, past the
+ * wrappers that keep it the same callee — `(fn)()`, `fn!()`, `(fn as F)()`,
+ * `await f<T>()`, the type arguments of a tagged template's tag
+ * (`css<Props>\`…\``) — or null when it names nothing: a call (`connect(map)
+ * (View)`, `create<T>()(…)`, `breakpoint('tablet')\`…\``), a function (an
+ * IIFE), a subscript (`handlers[type]()`), `(0, fn)()`. Its text used to be
+ * the reference's name, an IIFE's whole body among them, which no symbol is.
+ * A dotted chain in parentheses keeps its text, `(a.b)()` → `a.b`, as the
+ * parenthesized-callee normalization in extractCall reads it. `at` is where the
+ * name starts, which is where the reference sits, as a plain `fn()` call's does:
+ * scope checks read the name there (a parameter `fn` shadows a namesake).
+ */
+function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: SyntaxNode } | null {
+  let cur = peelTsJsReceiver(func);
+  while (cur.type === 'instantiation_expression') {
+    const inner = getChildByField(cur, 'function') ?? cur.namedChild(0);
+    if (!inner) return null;
+    cur = peelTsJsReceiver(inner);
+  }
+  if (cur.type === 'identifier' || cur.type === 'super' || cur.type === 'import') return { name: getNodeText(cur, source), at: cur };
+  if (cur.type !== 'member_expression') return null;
+  const chain = getNodeText(cur, source).replace(/\s+/g, '');
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(chain) ? { name: chain, at: cur } : null;
 }
 
 /**
@@ -5603,7 +5633,7 @@ export class TreeSitterExtractor {
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
       if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
-        const peeled = peelTsAwaitCallee(func);
+        const peeled = peelTsPrefixedCallee(func);
         if (peeled !== func) refStart = peeled.startPosition;
         func = peeled;
       }
@@ -5909,7 +5939,7 @@ export class TreeSitterExtractor {
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
               let innerFn = getChildByField(receiver, 'function');
-              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsPrefixedCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -5992,6 +6022,15 @@ export class TreeSitterExtractor {
           } else {
             calleeName = getNodeText(func, this.source);
           }
+        } else if (TS_JS_CHAIN_LANGUAGES.has(this.language)) {
+          // A callee that names nothing — a call, a function, a subscript —
+          // is no reference: a silent miss, never a name no symbol has. A
+          // curried call's inner call is visited on its own. Mirrored in the
+          // kernel's extract_call (tsjs/extractors.rs callee_name_of).
+          const named = tsJsCalleeName(func, this.source);
+          if (named === null) return;
+          calleeName = named.name;
+          refStart = named.at.startPosition;
         } else {
           calleeName = getNodeText(func, this.source);
         }
