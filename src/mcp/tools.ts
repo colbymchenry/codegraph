@@ -35,7 +35,8 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
-import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
+import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
+import { goPackageReaderFor } from '../graph/go-package';
 import {
   extractQueryPaths,
   queryMightContainPaths,
@@ -221,8 +222,9 @@ const NOT_A_DEFINITION = new Set(['file', 'import', 'export', 'parameter']);
  */
 function filesDefiningSymbol(cg: CodeGraph, symbol: string): string[] {
   try {
+    const goPackageOf = goPackageReaderFor(cg);
     const nodes = isQualifiedSymbol(symbol)
-      ? cg.getNodesByName(lastQualifierPart(symbol)).filter((n) => matchesSymbol(n, symbol))
+      ? cg.getNodesByName(lastQualifierPart(symbol)).filter((n) => matchesSymbol(n, symbol, goPackageOf))
       : cg.getNodesByName(symbol);
     return nodes.filter((n) => !NOT_A_DEFINITION.has(n.kind)).map((n) => n.filePath);
   } catch {
@@ -8343,18 +8345,6 @@ export class ToolHandler {
   // =========================================================================
 
   /**
-   * Find a symbol by name, handling disambiguation when multiple matches exist.
-   * Returns the best match and a note about alternatives if any.
-   */
-  /**
-   * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/symbol-lookup`, which owns the rules.
-   */
-  private matchesSymbol(node: Node, symbol: string): boolean {
-    return matchesSymbol(node, symbol);
-  }
-
-  /**
    * Find ALL definitions matching a name, ranked, so codegraph_node can return
    * every overload instead of guessing one (the wrong guess → a Read). Keepers
    * rank before generated stubs (.pb.go etc.); stable within a group preserves
@@ -8382,34 +8372,18 @@ export class ToolHandler {
       return fuzzy[0] ? [fuzzy[0].node] : [];
     }
 
-    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
-    const limit = 50;
-    let results = cg.searchNodes(symbol, { limit });
-
-    // FTS strips colons, so `stage_apply::run` searches the literal
-    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
-    // let `matchesSymbol` filter by qualifier.
-    if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
-    }
-
-    if (results.length === 0) return [];
-
-    const exactMatches = results.filter((r) => this.matchesSymbol(r.node, symbol));
-    if (exactMatches.length === 0) {
-      // No exact match — a qualified lookup must not fall back to a fuzzy file
-      // hit (#173); a bare name may use the single top fuzzy result.
-      return isQualified ? [] : results[0] ? [results[0].node] : [];
-    }
+    // Qualified lookup (`Session.request`, `stage_apply::run`,
+    // `refresh.Discovery.refresh`): the search's matching hits, else the
+    // exact-name index's — shared with explore's resolution. No match is no
+    // match: a qualified lookup must not fall back to a fuzzy file hit (#173).
+    const exactMatches = qualifiedSymbolMatches(cg, symbol, goPackageReaderFor(cg));
+    if (exactMatches.length === 0) return [];
 
     // Down-rank generated files (.pb.go, .pulsar.go, _grpc.pb.go, and anything
     // whose header declares it generated) so a flow query prefers the keeper
     // implementation over the generated stub.
-    const isGen = cg.generatedFilePredicate(exactMatches.map((r) => r.node.filePath));
-    return [...exactMatches]
-      .sort((a, b) => (isGen(a.node.filePath) ? 1 : 0) - (isGen(b.node.filePath) ? 1 : 0))
-      .map((r) => r.node);
+    const isGen = cg.generatedFilePredicate(exactMatches.map((n) => n.filePath));
+    return [...exactMatches].sort((a, b) => (isGen(a.filePath) ? 1 : 0) - (isGen(b.filePath) ? 1 : 0));
   }
 
   /**
