@@ -253,6 +253,55 @@ describe('Installer targets — partial-state idempotency', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
+  it.runIf(process.platform !== 'win32')('codex: a symlinked AGENTS.md is written through, and the link survives install and uninstall (#2721)', () => {
+    const codex = getTarget('codex')!;
+    const shared = path.join(tmpHome, 'dotfiles', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.writeFileSync(shared, '# shared rules\n\nBe terse.\n');
+    const link = path.join(tmpHome, '.codex', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(shared, link);
+
+    codex.install('global', { autoAllow: false });
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    const installed = fs.readFileSync(shared, 'utf-8');
+    expect(installed).toContain('# shared rules');
+    expect(installed).toContain('<!-- CODEGRAPH_START -->');
+    expect(fs.readFileSync(link, 'utf-8')).toBe(installed);
+    expect(codex.install('global', { autoAllow: false }).files.find((f) => f.path.endsWith('AGENTS.md'))!.action).toBe('unchanged');
+
+    codex.uninstall('global');
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(shared, 'utf-8')).toBe('# shared rules\n\nBe terse.\n');
+  });
+
+  it.runIf(process.platform !== 'win32')('codex: a symlinked config.toml is written through too (#2721)', () => {
+    const codex = getTarget('codex')!;
+    const shared = path.join(tmpHome, 'dotfiles', 'codex.toml');
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.writeFileSync(shared, 'model = "o3"\n');
+    const link = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(shared, link);
+
+    codex.install('global', { autoAllow: false });
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(shared, 'utf-8')).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(shared, 'utf-8')).toContain('model = "o3"');
+  });
+
+  it.runIf(process.platform !== 'win32')('a dangling symlink gets its target written, so the link comes alive (#2721)', () => {
+    const codex = getTarget('codex')!;
+    const target = path.join(tmpHome, 'dotfiles', 'AGENTS.md');
+    const link = path.join(tmpHome, '.codex', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(target, link);
+
+    codex.install('global', { autoAllow: false });
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, 'utf-8')).toContain('<!-- CODEGRAPH_START -->');
+  });
+
   it('codex: install writes config.toml AND the AGENTS.md codegraph block (#704)', () => {
     const codex = getTarget('codex')!;
     const first = codex.install('global', { autoAllow: false });

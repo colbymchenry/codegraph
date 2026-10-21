@@ -78,19 +78,45 @@ export function readJsonFile(filePath: string): Record<string, any> {
  *
  * Prevents corruption if the process crashes mid-write. The temp
  * file is cleaned up on rename failure.
+ *
+ * A symlink is written through: the file it points to is replaced and the
+ * link stays. `rename(2)` onto the link's own path would swap the link for a
+ * regular file — a `~/.codex/AGENTS.md -> ~/dotfiles/AGENTS.md` kept in a
+ * dotfiles repo became a detached copy on install, so later edits to the
+ * shared file no longer reached Codex, and uninstall left the copy behind
+ * instead of the link (#2721).
  */
 export function atomicWriteFileSync(filePath: string, content: string): void {
-  const dir = path.dirname(filePath);
+  const target = symlinkTarget(filePath);
+  const dir = path.dirname(target);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  const tmpPath = filePath + '.tmp.' + process.pid;
+  const tmpPath = target + '.tmp.' + process.pid;
   try {
     fs.writeFileSync(tmpPath, content);
-    fs.renameSync(tmpPath, filePath);
+    fs.renameSync(tmpPath, target);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     throw err;
+  }
+}
+
+/**
+ * The file a symlink at `filePath` points to, through every link; `filePath`
+ * itself when it is not a link, or when the link dangles (its target is then
+ * created where the link points, so the link comes alive).
+ */
+function symlinkTarget(filePath: string): string {
+  try {
+    if (!fs.lstatSync(filePath).isSymbolicLink()) return filePath;
+  } catch {
+    return filePath;
+  }
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(path.dirname(filePath), fs.readlinkSync(filePath));
   }
 }
 
