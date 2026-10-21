@@ -76,6 +76,20 @@ function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, 
   return macros;
 }
 
+/** The outermost namespaces the project's namespace-opening macros open: `fmt` for `FMT_BEGIN_NAMESPACE`. */
+export function cppMacroNamespaceHeads(context: ResolutionContext): string[] {
+  return [...cppNamespaceMacros(context).openers.values()].map((path) => path[0]!);
+}
+
+/**
+ * The project's macros that stand for a single name, by the macro's name:
+ * `#define ROCKSDB_NAMESPACE rocksdb`, so the namespace rocksdb declares as
+ * `namespace ROCKSDB_NAMESPACE` is `rocksdb` to code that names it.
+ */
+export function cppNameMacros(context: ResolutionContext): ReadonlyMap<string, string> {
+  return cppNamespaceMacros(context).aliases;
+}
+
 /** The line ranges of a C / C++ file each namespace macro opens, with the namespace path it opens. */
 export function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
   let memo = CPP_NS_FRAMES.get(context);

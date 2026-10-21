@@ -53,13 +53,30 @@ const PYTHON: Files = {
 };
 const PYTHON_BARRELS = ['app/shop/__init__.py', 'lib/api.py', 'app/orm/__init__.py'];
 
-/** ES modules: an `index.ts` re-exporting under the same name and under another. */
+/**
+ * ES modules: an `index.ts` re-exporting under the same name and under
+ * another, and modules re-exporting it in turn — an outer `index.ts`, all of
+ * it and one name renamed, and a module passing on one name, read through a
+ * namespace import — imported in its stead. It is imported from Vue
+ * components too (one beside it, as `.`), and through a scoped package a
+ * `tsconfig` path maps to it.
+ */
 const TS: Files = {
   'package.json': '{"name":"app"}',
+  'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@app/widgets': ['./src/components/index.ts'] } } }),
+  'src/View.vue':
+    "<script setup lang=\"ts\">\nimport { Button } from './components';\nconst label = Button();\n</script>\n<template><div>{{ label }}</div></template>\n",
+  'src/aliased.ts': "import { Button } from '@app/widgets';\nexport function aliased() { return Button(); }\n",
+  'src/components/Panel.vue':
+    "<script setup lang=\"ts\">\nimport { Button } from '.';\nconst inner = Button();\n</script>\n<template><div>{{ inner }}</div></template>\n",
   'src/components/Button.ts': 'export function Button() { return 1; }\n',
   'src/components/Icon.ts': 'export function BaseIcon() { return 2; }\n',
   'src/components/index.ts': "export { Button } from './Button';\nexport { BaseIcon as Icon } from './Icon';\n",
   'src/app.ts': "import { Button, Icon } from './components';\nexport function render() { return [Button(), Icon()]; }\n",
+  'src/ui/index.ts': "export * from '../components';\nexport { Icon as UiIcon } from '../components';\n",
+  'src/page.ts': "import { Button, UiIcon } from './ui';\nexport function page() { return [Button(), UiIcon()]; }\n",
+  'src/kit.ts': "export { Button as KitButton } from './components';\n",
+  'src/screen.ts': "import * as kit from './kit';\nexport function screen() { return kit.KitButton(); }\n",
 };
 const TS_BARRELS = ['src/components/index.ts'];
 
@@ -116,9 +133,29 @@ const without = (files: Files, gone: string[]): Files =>
 const only = (files: Files, kept: string[]): Files =>
   Object.fromEntries(Object.entries(files).filter(([file]) => kept.includes(file)));
 
+/**
+ * A file beside the one an extensionless import resolved to, which outranks
+ * it: a component's `./button` names `button.ts` when it is there, and
+ * `button.vue` when it is not — `sizeOf`, which both export, from the one or
+ * the other, and `onlyVue`, which only `button.vue` exports, through it or by
+ * its name.
+ */
+const OUTRANKING: Files = {
+  'package.json': '{"name":"app"}',
+  'src/widgets/button.vue':
+    '<script lang="ts">\nexport function sizeOf() { return 1; }\nexport function onlyVue() { return 3; }\n</script>\n<template><button /></template>\n',
+  'src/widgets/button.ts':
+    "export default function button() { return 'b'; }\nexport function buttonClass() { return 'c'; }\nexport function sizeOf() { return 2; }\n",
+  'src/widgets/group.vue':
+    "<script setup lang=\"ts\">\nimport Button, { buttonClass, sizeOf, onlyVue } from './button';\nconst c = buttonClass();\nconst b = Button();\nconst s = sizeOf();\nconst o = onlyVue();\n</script>\n<template><div>{{ c }}{{ b }}{{ s }}{{ o }}</div></template>\n",
+  'src/widgets/panel.ts': "import button from './button';\nexport function panel() { return button(); }\n",
+};
+const OUTRANKING_FILES = ['src/widgets/button.ts'];
+
 describe.each([
   ['Python package and module', PYTHON, PYTHON_BARRELS],
   ['ES module barrel', TS, TS_BARRELS],
+  ['file outranking the one an import resolved to', OUTRANKING, OUTRANKING_FILES],
 ])('sync re-resolves the imports through a re-exporting file: %s', (_label, files, barrels) => {
   it('when it is deleted', async () => {
     const root = tempRoot();

@@ -17,9 +17,9 @@
  * `Iterator` the call means inherits `Valid` from `IteratorBase`. A template
  * parameter, a library type and an alias of a type outside the project hold
  * no project class, so those calls get no edge; neither does a call the held
- * class has no method for (unless a class template's specialization may
- * declare it). A held type the project doesn't declare — a generated message
- * — leaves the call as it was.
+ * class has no method for (unless a class template's specialization, or a
+ * base the index doesn't link, may declare it). A held type the project
+ * doesn't declare — a generated message — leaves the call as it was.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -443,6 +443,37 @@ describe('what keeps the call as it was', () => {
     });
     try {
       expect(calls(cg, 'rocksdb::Drop')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('a held class with a base the index does not link, which may declare the method', async () => {
+    // protobuf's FlatAllocator derives from a `decltype(…)` that names FlatAllocatorImpl.
+    const cg = await indexed({
+      'src/google/protobuf/descriptor.cc': lines(
+        '#include <memory>',
+        'namespace google {',
+        'namespace protobuf {',
+        'namespace internal {',
+        'template <typename... T>',
+        'class FlatAllocatorImpl {',
+        ' public:',
+        '  void PlanArray(int array_size) {}',
+        '};',
+        'template <typename... T>',
+        'FlatAllocatorImpl<T...> ApplyTypeList(int);',
+        'class FlatAllocator : public decltype(ApplyTypeList<char, int>(0)) {};',
+        '}  // namespace internal',
+        'void PlanAllocationSize(std::unique_ptr<internal::FlatAllocator>& alloc) {',
+        '  alloc->PlanArray(1);',
+        '}',
+        '}  // namespace protobuf',
+        '}  // namespace google',
+      ),
+    });
+    try {
+      expect(calls(cg, 'google::protobuf::PlanAllocationSize')).toEqual(['google::protobuf::internal::FlatAllocatorImpl::PlanArray']);
     } finally {
       cg.close();
     }

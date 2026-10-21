@@ -141,7 +141,7 @@ function summarize(file: string, context: ResolutionContext, cache: Cache): File
  * generic comment stripper is a regex pass over the whole file and this walk
  * touches every header of a translation unit, vendor trees included.
  */
-function directiveLines(source: string): string[] {
+export function directiveLines(source: string): string[] {
   const out: string[] = [];
   let inBlock = false;
   for (const raw of maskCppRawStrings(source).source.split(/\r?\n/)) {

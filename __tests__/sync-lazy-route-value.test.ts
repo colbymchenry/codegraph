@@ -168,7 +168,8 @@ describe('sync redraws a route that renders a same-file lazy value when its modu
       // module it loads leads to it.
       '/docs': ['src/pages/Docs.tsx::DocsPage'],
     });
-    expect(renders(cg!)).toEqual(['App -> src/pages/Team.tsx::Team']);
+    // A tag naming a lazy value renders the page that value loads, named like it or not.
+    expect(renders(cg!)).toEqual(['App -> src/pages/Docs.tsx::DocsPage', 'App -> src/pages/Team.tsx::Team']);
     expect(cg!.getPendingReferenceCount()).toBe(0);
     expect(graphOf(cg!)).toEqual(await freshGraph(files));
   }, 60_000);

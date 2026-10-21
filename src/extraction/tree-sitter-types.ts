@@ -56,11 +56,12 @@ export interface ExtractorContext {
   visitFunctionBody(body: SyntaxNode, functionId: string): void;
   /**
    * Walk a declaration's initializer as code the scope on top of the stack
-   * runs, the way a function body is walked. When the hook then reports the
-   * node handled, the function-as-value scan the dispatcher runs over it skips
-   * what was walked here: the walk captured those candidates already.
+   * runs, the way a function body is walked (`functionId` as for
+   * visitFunctionBody). When the hook then reports the node handled, the
+   * function-as-value scan the dispatcher runs over it skips what was walked
+   * here: the walk captured those candidates already.
    */
-  walkInitializer(node: SyntaxNode): void;
+  walkInitializer(node: SyntaxNode, functionId?: string): void;
   /** Add an unresolved reference */
   addUnresolvedReference(ref: UnresolvedReference): void;
   /** Push a node ID onto the scope stack (for containment/qualified name building) */
@@ -101,6 +102,14 @@ export interface LanguageExtractor {
 
   /** Node types that represent functions */
   functionTypes: string[];
+  /**
+   * A bodiless function that is the function's whole declaration, not one
+   * overload of an implementation that follows it: TypeScript's
+   * `function_signature` in an ambient context (`declare function f(): void;`,
+   * a declaration file's own or its `declare module` body's), never in a
+   * namespace. Extracted as a function, like a `functionTypes` node.
+   */
+  isAmbientFunction?: (node: SyntaxNode, filePath: string) => boolean;
   /** Node types that represent classes */
   classTypes: string[];
   /** Node types that represent methods */
@@ -190,6 +199,20 @@ export interface LanguageExtractor {
    * line and never documents the declaration below it.
    */
   docstringSkipsTrailingComments?: boolean;
+  /**
+   * Keep in a docstring only the comments that end on the line right above
+   * the declaration, together with the ones written on the lines just before
+   * them: a blank line ends it. That is Go's doc comment, the one go doc
+   * shows, so a section banner or a note a blank line separates from a
+   * declaration documents nothing.
+   */
+  docstringSkipsDetachedComments?: boolean;
+  /**
+   * Leave out of a docstring's text the comment directives Go tools read, like
+   * `//go:embed static`, `//nolint:errcheck` or `//export F`, as go doc does:
+   * a declaration whose only comment is a directive has no doc.
+   */
+  docstringSkipsDirectives?: boolean;
   /**
    * Node types that may stand between a declaration and the decorators written
    * before it without ending the scan for them. Dart writes comments there
@@ -313,6 +336,14 @@ export interface LanguageExtractor {
    * When present, the receiver type is included in the qualified name for better searchability.
    */
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * The scope a class, struct or union declaration writes its name in, when
+   * it does: C++'s `SkipList` for an out-of-line nested class `struct
+   * SkipList<Key, Comparator>::Node`. The class is qualified under it the way
+   * an out-of-line method is under its receiver, and so are its members.
+   */
+  getClassScope?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
    * Extract a function/method's normalized return type name (bare class name,

@@ -3,9 +3,11 @@
  * the test learns the pid of every detached daemon candidate they spawn
  * (#1773). Racing launchers may each spawn one; the losers exit on their own
  * once they see the winner's lock, but on a loaded machine one can still be
- * starting when the test tears down. Written synchronously at spawn time, so
- * the pid is on disk before the launcher can be stopped. Candidates inherit
- * the preload through `process.execArgv`; they spawn nothing detached.
+ * starting when the test tears down. Written synchronously as the spawn
+ * returns, so the pid is on disk before the launcher can exit. A launcher
+ * killed inside the spawn records nothing, and on Windows leaves that candidate
+ * suspended for good. Candidates inherit the preload through
+ * `process.execArgv`; they spawn nothing detached.
  */
 const childProcess = require('child_process');
 const fs = require('fs');
