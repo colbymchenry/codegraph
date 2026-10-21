@@ -80,6 +80,37 @@ describe('isTestFile', () => {
     expect(isTestFile('cmd/promtool/unittest.go')).toBe(false);
   });
 
+  it('flags everything in a unittests/ or foo_unittest/ directory', () => {
+    // LLVM's and Breakpad's unit-test trees hold helpers with no test-like
+    // name, and glog builds each `*_unittest/` directory as a test program.
+    for (const file of [
+      'llvm/unittests/ADT/CountCopyAndMove.h',
+      'unittests/ADT/FoldingSet.cpp',
+      'clang-tools-extra/clangd/unittests/Annotations.cpp',
+      'src/client/windows/unittests/dump_analysis.cc',
+      'src/dcheck_unittest/glog_dcheck.cc',
+      'src/includes_unittest/glog_includes_logging.cc',
+      'tools/net-unittests/fake_socket.py',
+    ]) {
+      expect(isTestPath(file), file).toBe(true);
+      expect(isTestFile(file), file).toBe(true);
+    }
+  });
+
+  it('does NOT flag a bare unittest/ directory', () => {
+    // CPython's `Lib/unittest/` is the framework, and so is the googletest LLVM
+    // vendors under `third-party/unittest/`; `unittest2` is the framework's backport.
+    for (const file of [
+      'Lib/unittest/mock.py',
+      'Lib/unittest/__init__.py',
+      'third-party/unittest/googletest/src/gtest.cc',
+      'unittest2/case.py',
+    ]) {
+      expect(isTestPath(file), file).toBe(false);
+      expect(isTestFile(file), file).toBe(false);
+    }
+  });
+
   it('does NOT flag production files that merely contain "test" lowercase', () => {
     // The fix is capital-led so camelCase boundaries distinguish these.
     expect(isTestFile('src/latest/loader.kt')).toBe(false);

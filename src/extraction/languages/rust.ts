@@ -71,6 +71,24 @@ export function rustImplTypeName(typeNode: SyntaxNode | null, source: string): s
   }
 }
 
+/**
+ * The type an item written directly in an `impl` block belongs to: `ValueHint`
+ * for the `type Err = String;` of `impl FromStr for ValueHint`, which is then
+ * `ValueHint::Err`, as the impl's methods are `ValueHint::…`. A type no single
+ * name stands for (`()`, `(A, B)`, `[u8]`, `u32`) is written as the impl
+ * writes it. Undefined for an item outside an impl. Mirrored byte-for-byte by
+ * the native kernel's `impl_item_owner` (codegraph-kernel/src/rustlang.rs) —
+ * change both.
+ */
+export function rustImplItemOwner(node: SyntaxNode, source: string): string | undefined {
+  const impl = node.parent?.type === 'declaration_list' ? node.parent.parent : null;
+  if (impl?.type !== 'impl_item') return undefined;
+  let type = getChildByField(impl, 'type');
+  while (type?.type === 'reference_type') type = getChildByField(type, 'type');
+  if (!type) return undefined;
+  return rustImplTypeName(type, source) ?? getNodeText(type, source).split(/[ \t\r\n]+/).filter(Boolean).join(' ');
+}
+
 export const rustExtractor: LanguageExtractor = {
   // `function_signature_item` is a trait method DECLARATION (`fn render(&self);`,
   // no body). Extracting it makes a trait's method set first-class, which

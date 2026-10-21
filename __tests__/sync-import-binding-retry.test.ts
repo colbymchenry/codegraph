@@ -316,9 +316,10 @@ describe('a failed reference through an import binding', () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
-      // A package's binding and a member of a namespace import wait for the
-      // name they use; a plain named import of a project module waits for
-      // the module, as the other bindings do.
+      // A package's binding waits for the name it uses; a plain named import
+      // of a project module waits for its module, as the other bindings do,
+      // and so does a member of a namespace import
+      // (sync-import-member-retry.test.ts).
       'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, NS.make()];\n",
     });
     (await CodeGraph.init(root, { index: true })).close();
@@ -342,9 +343,9 @@ describe('a failed reference through an import binding', () => {
       expect(tailOf('src/App.svelte', 'Banner', 'references')).toBe('module:Hero');
       expect(tailOf('src/pages/index.astro', 'Shell', 'imports')).toBe('module:BaseLayout');
       expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('module:util');
+      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('module:ns');
 
       expect(tailOf('src/other.ts', 'express', 'imports')).toBe('express');
-      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('make');
 
       // Each module's file is one of the keys its references wait under, and
       // so is a barrel's folder for every file in it.
