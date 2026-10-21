@@ -235,6 +235,10 @@ export interface GlobalScopeScan {
    * `abstract`, `enum`, `function`, `const`, …).
    */
   globalWords: Set<string>;
+  /** The file's `declare module '<name>' { … }` blocks, whose names are the declared module's. */
+  moduleBlocks: readonly AmbientModuleBlock[];
+  /** Names an `import X = …` declaration binds: `import AutofillIpcServer = autofill.AutofillIpcServer`. */
+  importAliases: Set<string>;
 }
 
 /**
@@ -244,11 +248,22 @@ export interface GlobalScopeScan {
  * not in it.
  */
 export function scanGlobalScope(source: string): GlobalScopeScan {
-  const { script } = scanAmbientModules(source);
+  const { script, blocks: moduleBlocks } = scanAmbientModules(source);
   const globalWords = new Set<string>();
+  const importAliases = new Set<string>();
   let declare = 0; // 1: `declare`, 2: `declare global`
   let inGlobal = false;
+  let alias = 0; // 1: `import` (or `import type`), 2: `import X`
+  let aliasName = '';
   tokenize(source, (kind, text, line, column, depth) => {
+    if (kind === Kind.Word && text === 'import') alias = 1;
+    else if (alias === 1 && kind === Kind.Word && text !== 'type') {
+      alias = 2;
+      aliasName = text;
+    } else if (alias === 2 && kind === Kind.Punct && text === '=') {
+      importAliases.add(aliasName);
+      alias = 0;
+    } else if (!(alias === 1 && kind === Kind.Word)) alias = 0;
     if (inGlobal) {
       if (kind === Kind.Punct && text === '}' && depth === 0) inGlobal = false;
       else if (kind === Kind.Word && depth === 1) globalWords.add(`${line}:${column}`);
@@ -266,7 +281,7 @@ export function scanGlobalScope(source: string): GlobalScopeScan {
     if (kind === Kind.Punct && text === '{' && declare === 2) inGlobal = true;
     declare = 0;
   });
-  return { script, globalWords };
+  return { script, globalWords, moduleBlocks, importAliases };
 }
 
 /**
@@ -519,7 +534,7 @@ function scanned(context: ResolutionContext): NonNullable<Memo['scanned']> {
 const DECLARATION_KINDS = new Set<Node['kind']>(['function', 'class', 'interface', 'type_alias', 'enum', 'constant', 'variable', 'component']);
 
 /** Whether `node` starts inside the block, by position. */
-function inBlock(node: Pick<Node, 'startLine' | 'startColumn'>, block: AmbientModuleBlock): boolean {
+export function inBlock(node: Pick<Node, 'startLine' | 'startColumn'>, block: AmbientModuleBlock): boolean {
   const afterStart = node.startLine > block.startLine || (node.startLine === block.startLine && node.startColumn >= block.startColumn);
   const beforeEnd = node.startLine < block.endLine || (node.startLine === block.endLine && node.startColumn <= block.endColumn);
   return afterStart && beforeEnd;

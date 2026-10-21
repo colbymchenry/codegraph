@@ -7011,13 +7011,15 @@ describe('Cross-language type/import gate (RN name collisions)', () => {
     // TS name-match — so a TS ref to `TestRunner` crossed web→jvm. The ref here
     // is intentionally NOT imported: a clean relative import would mask the bug
     // by resolving via the import map before the framework strategy can win.
+    // So the TS type is a global, declared in a script `.d.ts`: the one kind of
+    // type a module names without importing it.
     fs.writeFileSync(
       path.join(tempDir, 'package.json'),
       JSON.stringify({ dependencies: { 'react-native': '*' } })
     );
     fs.writeFileSync(
-      path.join(tempDir, 'useTests.ts'),
-      `export type TestRunner = { run: () => void };\n`
+      path.join(tempDir, 'useTests.d.ts'),
+      `type TestRunner = { run: () => void };\n`
     );
     fs.writeFileSync(
       path.join(tempDir, 'basic.tsx'),

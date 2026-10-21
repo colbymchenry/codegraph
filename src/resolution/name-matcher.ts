@@ -20,8 +20,8 @@ import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './c
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
-import { isTestPath } from '../search/query-utils';
-import { isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
+import { isTestFile, isTestPath } from '../search/query-utils';
+import { inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
@@ -1547,35 +1547,71 @@ function tsGlobalScope(file: string, context: ResolutionContext): GlobalScopeSca
   if (scope === undefined) {
     const source = context.readFile(file);
     scope = source === null ? null : scanGlobalScope(source);
-    if (scope?.script && HAS_CJS_EXPORT.test(source!)) scope = { script: false, globalWords: new Set() };
+    if (scope?.script && HAS_CJS_EXPORT.test(source!)) scope = { ...scope, script: false, globalWords: new Set() };
     memo.set(file, scope);
   }
   return scope;
 }
 
 /**
- * Whether a supertype written as a bare name the file doesn't import, in an
- * ES module, may be `n`: a declaration of the file's own, or a global one —
- * at a script's top level (a file with no import or export, a script `.d.ts`)
- * or directly inside `declare global`. A module's own declaration, exported
- * or not, is reached only through an import, which the import resolver has
- * followed already, and a namespace's member is no global. So an interface's
- * `extends Omit<…>` is TypeScript's `Omit`, never vscode's `export type Omit`
- * in quickInput.ts, and `extends Function` never terminal-suggest's
- * `Fig.Function`.
+ * Whether a type written as a bare name the file doesn't import, in an ES
+ * module, may be `n`: a declaration of the file's own, or a global one — at a
+ * script's top level (a file with no import or export, a script `.d.ts`) or
+ * directly inside `declare global`. A module's own declaration, exported or
+ * not, is reached only through an import, which the import resolver has
+ * followed already, and a namespace's member is no global. So `extends
+ * Omit<…>` and `options: Omit<IPickOptions, 'canPickMany'>` are TypeScript's
+ * `Omit`, never vscode's `export type Omit` in quickInput.ts, and `extends
+ * Function` never terminal-suggest's `Fig.Function`.
+ *
+ * The globals project code relies on come from declaration files and
+ * `declare global` blocks. A script `.ts` is a sample or a fixture whose top
+ * level is global only to its own program — vscode's colorize fixtures
+ * declare `type T` and copilot's eslint fixtures `interface Node` — and a
+ * test's or fixture's globals are its tests' only, as its `declare module`
+ * blocks are (see ambient-modules.ts).
  */
-function isTsSupertypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+function isTsTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
   const scope = tsGlobalScope(n.filePath, context);
-  return !scope || scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
+  if (!scope) return true;
+  if ((scope.script && !isDeclarationFile(n.filePath)) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
+  return scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
 }
 
-/** Whether `ref` is a supertype written as a bare name its ES module doesn't import (isTsSupertypeInScope). */
-function isTsBareSupertype(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return isInheritanceRef(ref) && JS_FAMILY.has(ref.language) && TS_JS_FILE.test(ref.filePath) &&
-    /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) &&
-    !context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
-    tsGlobalScope(ref.filePath, context)?.script === false;
+/**
+ * Whether `ref` names a type by a bare name its ES module doesn't import
+ * (isTsTypeInScope): a supertype, or a type annotation's or type argument's
+ * name, which TS and JS files record as `references` and nothing else does.
+ * The last name of a qualified type, `vscode.TextDocument`, is no bare name,
+ * and neither is a name inside a `declare module 'x'` block, which is module
+ * `x`'s own: legend-state's augmentation of `'@legendapp/state/react'` writes
+ * that module's `FCReactive` without importing it. An `import X = ns.X`
+ * alias imports its name.
+ */
+function isTsBareTypeName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const typeRef = ref.referenceKind === 'references';
+  if (!(typeRef || isInheritanceRef(ref)) || !JS_FAMILY.has(ref.language) || !TS_JS_FILE.test(ref.filePath) ||
+      !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName) ||
+      context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) ||
+      (typeRef && isWrittenQualified(ref, context))) return false;
+  const scope = tsGlobalScope(ref.filePath, context);
+  const at = { startLine: ref.line, startColumn: ref.column };
+  return scope?.script === false && !scope.importAliases.has(ref.referenceName) &&
+    !scope.moduleBlocks.some((block) => inBlock(at, block));
+}
+
+/**
+ * Whether a name recorded alone was written after a `.`, as the last name of
+ * `ns.Type` or `import('x').Type` is. A column that doesn't find the name on
+ * its line counts as written so, which leaves the reference as it was.
+ */
+function isWrittenQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  if (!line.startsWith(ref.referenceName, ref.column)) return true;
+  let i = ref.column - 1;
+  while (i >= 0 && (line[i] === ' ' || line[i] === '\t')) i--;
+  return line[i] === '.';
 }
 
 /**
@@ -11585,8 +11621,8 @@ export function matchByExactName(
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
   // Read once, and only for a candidate in another file: it scans the file.
-  let bareSupertype: boolean | undefined;
-  const tsBareSupertype = (): boolean => (bareSupertype ??= isTsBareSupertype(ref, context));
+  let bareTypeName: boolean | undefined;
+  const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
   const sameName = context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
@@ -11687,10 +11723,10 @@ export function matchByExactName(
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
     (!inheritanceRef || isSupertypeTarget(n)) &&
-    // And a supertype a TS/JS module names without importing it is its own or
-    // a global, never another module's — ahead of the ranking, so a global
-    // `interface Window` in a `declare global` still wins.
-    !(inheritanceRef && n.filePath !== ref.filePath && tsBareSupertype() && !isTsSupertypeInScope(n, ref, context)) &&
+    // And a supertype or type a TS/JS module names without importing it is
+    // its own or a global, never another module's — ahead of the ranking, so
+    // a global `interface Window` in a `declare global` still wins.
+    !(n.filePath !== ref.filePath && tsBareTypeName() && !isTsTypeInScope(n, ref, context)) &&
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
@@ -23890,7 +23926,7 @@ export function matchFuzzy(
       (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
-    !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareSupertype(ref, context) && !isTsSupertypeInScope(finalCandidates[0]!, ref, context)) &&
+    !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareTypeName(ref, context) && !isTsTypeInScope(finalCandidates[0]!, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
