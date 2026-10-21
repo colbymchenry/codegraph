@@ -1540,7 +1540,7 @@ const TS_JS_FILE = /\.[cm]?[jt]sx?$/i;
 const TS_GLOBAL_SCOPES = new WeakMap<ResolutionContext, Map<string, GlobalScopeScan | null>>();
 
 /** scanGlobalScope of `file`, a CommonJS file's top level counting as its own. */
-function tsGlobalScope(file: string, context: ResolutionContext): GlobalScopeScan | null {
+export function tsGlobalScope(file: string, context: ResolutionContext): GlobalScopeScan | null {
   let memo = TS_GLOBAL_SCOPES.get(context);
   if (!memo) TS_GLOBAL_SCOPES.set(context, (memo = new Map()));
   let scope = memo.get(file);

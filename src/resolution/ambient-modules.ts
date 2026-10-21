@@ -284,6 +284,113 @@ export function scanGlobalScope(source: string): GlobalScopeScan {
   return { script, globalWords, moduleBlocks, importAliases };
 }
 
+/** One `namespace A.B { … }` statement, or one in the old spelling, `module A { … }`. */
+export interface NamespaceBlock {
+  /** The namespace's full name, the namespaces around it first: `A.B` for `namespace B` in `namespace A`, as for `namespace A.B`. */
+  path: string;
+  /** The `namespace` keyword: 1-based line, 0-based column. */
+  startLine: number;
+  startColumn: number;
+  /** The closing brace. */
+  endLine: number;
+  endColumn: number;
+  /**
+   * A global namespace: directly inside `declare global`, at a declaration
+   * script's top level, or in another global one. A script `.ts`'s top level
+   * is global to its own program only (see isTsTypeInScope in name-matcher).
+   */
+  global: boolean;
+}
+
+/**
+ * Every namespace block in `source`, a nested one under its full name. Read
+ * from tokens, as the module blocks are. One in a `declare module 'x'` body is
+ * module `x`'s, never global, and named as if at the file's top level, where
+ * the module's own declarations name it (`const passport:
+ * passport.PassportStatic`). One in a class's or a function's body is no
+ * namespace a qualified name reaches, and is left out.
+ */
+export function scanNamespaceBlocks(source: string, declarationFile: boolean): NamespaceBlock[] {
+  const topLevelGlobal = declarationFile && scanAmbientModules(source).script;
+  const blocks: NamespaceBlock[] = [];
+  // What each open brace opened, innermost last.
+  const open: Array<NamespaceBlock | 'global' | 'module' | 'other'> = [];
+  let names: string[] | null = null; // the names after `namespace`, while its header is read
+  let expectName = false;
+  let keyword = { line: 0, column: 0 };
+  let declare = 0; // 1: `declare`, 2: `declare global`
+  let ambientModule = false; // just read `module 'x'`
+  let afterDot = false;
+  tokenize(source, (kind, text, line, column) => {
+    if (kind === Kind.Punct && text === '{') {
+      const header = names && names.length > 0 && !expectName ? names : null;
+      const outer = open[open.length - 1];
+      if (declare === 2) {
+        open.push('global');
+      } else if (ambientModule) {
+        open.push('module');
+      } else if (header && outer !== 'other') {
+        const parent = typeof outer === 'object' ? outer : null;
+        const block: NamespaceBlock = {
+          path: (parent ? `${parent.path}.` : '') + header.join('.'),
+          startLine: keyword.line,
+          startColumn: keyword.column,
+          endLine: line,
+          endColumn: column,
+          global: parent ? parent.global : outer === 'global' || (outer === undefined && topLevelGlobal),
+        };
+        blocks.push(block);
+        open.push(block);
+      } else {
+        open.push('other');
+      }
+      names = null;
+      declare = 0;
+      ambientModule = false;
+      afterDot = false;
+      return;
+    }
+    if (kind === Kind.Punct && text === '}') {
+      const closed = open.pop();
+      if (typeof closed === 'object') {
+        closed.endLine = line;
+        closed.endColumn = column;
+      }
+      names = null;
+      declare = 0;
+      ambientModule = false;
+      afterDot = false;
+      return;
+    }
+    ambientModule = names !== null && expectName && names.length === 0 && kind === Kind.String;
+    if (names) {
+      if (expectName && kind === Kind.Word) {
+        names.push(text);
+        expectName = false;
+        return;
+      }
+      if (!expectName && kind === Kind.Punct && text === '.') {
+        expectName = true;
+        return;
+      }
+      names = null;
+    }
+    if (kind === Kind.Word) {
+      if ((text === 'namespace' || text === 'module') && !afterDot) {
+        names = [];
+        expectName = true;
+        keyword = { line, column };
+      }
+      declare = text === 'declare' ? 1 : declare === 1 && text === 'global' ? 2 : 0;
+      afterDot = false;
+      return;
+    }
+    declare = 0;
+    afterDot = kind === Kind.Punct && text === '.';
+  });
+  return blocks;
+}
+
 /**
  * Feed `source`'s tokens to `visit`: words, string literals (by their
  * contents), template literals (as one token, their `${…}` expressions read as
@@ -483,6 +590,8 @@ interface Memo {
   declarations: Map<string, AmbientModule[]>;
   /** isMergedAmbientDeclaration's answers, by node id. */
   merged: Map<string, boolean>;
+  /** Each read file's namespace blocks (see namespaceBlocks). */
+  namespaces: Map<string, readonly NamespaceBlock[]>;
 }
 
 const MEMO = new WeakMap<ResolutionContext, Memo>();
@@ -494,8 +603,20 @@ export function clearAmbientModuleMemos(context: ResolutionContext): void {
 
 function memoFor(context: ResolutionContext): Memo {
   let memo = MEMO.get(context);
-  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map() }));
+  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map(), namespaces: new Map() }));
   return memo;
+}
+
+/** The namespace blocks of `file` (scanNamespaceBlocks), read once a resolution pass. */
+export function namespaceBlocks(file: string, context: ResolutionContext): readonly NamespaceBlock[] {
+  const memo = memoFor(context);
+  let blocks = memo.namespaces.get(file);
+  if (!blocks) {
+    const source = context.readFile(file);
+    blocks = source && /\b(?:namespace|module)\s+[A-Za-z_$]/.test(source) ? scanNamespaceBlocks(source, DECLARATION_FILE.test(file)) : [];
+    memo.namespaces.set(file, blocks);
+  }
+  return blocks;
 }
 
 /**
@@ -534,7 +655,10 @@ function scanned(context: ResolutionContext): NonNullable<Memo['scanned']> {
 const DECLARATION_KINDS = new Set<Node['kind']>(['function', 'class', 'interface', 'type_alias', 'enum', 'constant', 'variable', 'component']);
 
 /** Whether `node` starts inside the block, by position. */
-export function inBlock(node: Pick<Node, 'startLine' | 'startColumn'>, block: AmbientModuleBlock): boolean {
+export function inBlock(
+  node: Pick<Node, 'startLine' | 'startColumn'>,
+  block: Pick<AmbientModuleBlock, 'startLine' | 'startColumn' | 'endLine' | 'endColumn'>
+): boolean {
   const afterStart = node.startLine > block.startLine || (node.startLine === block.startLine && node.startColumn >= block.startColumn);
   const beforeEnd = node.startLine < block.endLine || (node.startLine === block.endLine && node.startColumn <= block.endColumn);
   return afterStart && beforeEnd;

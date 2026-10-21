@@ -15,7 +15,8 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
-import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, isInModuleBlock } from './ambient-modules';
+import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
+import { isTestFile } from '../search/query-utils';
 import { moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
@@ -30,6 +31,7 @@ import {
   reExportSource,
   pythonFunctionModuleAlias,
   isRustAssociatedItem,
+  tsGlobalScope,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -2628,6 +2630,232 @@ export function resolvePhpQualifiedClassRef(
   // A method the class inherits is left to the strategies that walk supertypes.
   if (methods.length !== 1) return undefined;
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
+/** TypeScript and JavaScript files: where the extractors record type names. */
+const TS_JS_FILE = /\.[cm]?[jt]sx?$/i;
+
+/**
+ * The last name of a TypeScript type written qualified — `React.ReactNode`,
+ * `TChat.ChatMessage`, `EQueryType.CLICKHOUSE` — which both extractors record
+ * alone. TypeScript reads it as a member of what its qualifier names: the
+ * module an import names (`import * as T`, or a package the repository
+ * declares itself, `vscode.TextDocument`), a namespace, enum or class an
+ * import names or the file declares, or a namespace the project declares
+ * global (`Express.User`). Matched by the last name alone, outline's
+ * `React.ReactNode` reached its own editor `class ReactNode`, excalidraw's
+ * `TChat.ChatMessage` a `ChatMessage` component, signoz's
+ * `EQueryType.CLICKHOUSE` another enum's member, and outline's
+ * `UnfurlResourceType.Group` the `Group` model the file imports. undefined
+ * when the name was not written after a qualifier this reads
+ * (`import('./x').T`, a line break), names an `import X = ns.Y` alias, or
+ * names a module whose member it cannot follow; null when the qualifier is a
+ * package's or a global the project doesn't declare, or has no such member —
+ * so name fallbacks must not guess.
+ */
+export function resolveTsQualifiedTypeRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.referenceKind !== 'references' || !ESM_IMPORT_LANGUAGES.has(ref.language) || !TS_JS_FILE.test(ref.filePath)) return undefined;
+  const qualifier = typeQualifier(ref, context);
+  if (!qualifier) return undefined;
+  const head = qualifier[0]!;
+  const path = [...qualifier.slice(1), ref.referenceName];
+  const imp = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === head);
+  let target: Node | null | undefined;
+  if (imp) {
+    target = importedTypeMember(imp, path, ref, context);
+  } else {
+    if (tsGlobalScope(ref.filePath, context)?.importAliases.has(head)) return undefined;
+    target = ownTypeMember(head, path, ref, context);
+    if (target === undefined) target = globalTypeMember(qualifier.join('.'), ref, context) ?? null;
+  }
+  if (target === undefined) return undefined;
+  return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: imp ? 'import' : 'qualified-name' } : null;
+}
+
+/**
+ * The names a type's last name was written after, first to last: `['React']`
+ * for `React.ReactNode`, `['a', 'b']` for `a.b.C`. Null for a name written
+ * alone, after an expression (`import('./x').T`), or not where the reference
+ * puts it.
+ */
+function typeQualifier(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
+  if (!line?.startsWith(ref.referenceName, ref.column)) return null;
+  const names: string[] = [];
+  let i = ref.column - 1;
+  for (;;) {
+    while (i >= 0 && (line[i] === ' ' || line[i] === '\t')) i--;
+    if (line[i] !== '.') break;
+    i--;
+    while (i >= 0 && (line[i] === ' ' || line[i] === '\t')) i--;
+    const end = i + 1;
+    while (i >= 0 && /[\w$]/.test(line[i]!)) i--;
+    const name = line.slice(i + 1, end);
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+    names.unshift(name);
+  }
+  return names.length > 0 ? names : null;
+}
+
+/**
+ * A type path through an import of the file's: the module's export the path
+ * starts with (`T.X`, through barrels and the repository's `declare module`
+ * blocks), or the member of the enum, class or namespace the import names.
+ * null for a package the repository doesn't declare, or a container without
+ * the member; undefined when the module's export can't be followed.
+ */
+function importedTypeMember(imp: ImportMapping, path: string[], ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
+  const file = resolveImportPath(imp.source, ref.filePath, ref.language, context);
+  const bare = isBareModuleSpecifier(imp.source, ref.language);
+  let found: Node | undefined;
+  let rest: string[];
+  if (imp.isNamespace) {
+    const want = { isDefault: false, isNamespace: true, exportedName: path[0]!, memberName: path[0]! };
+    found = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
+      (file ? findExportedSymbol(file, want, ref.language, context, new Set()) : undefined);
+    if (found && path.length === 1) return found;
+    rest = path.slice(1);
+  } else {
+    const want = { isDefault: imp.isDefault, isNamespace: false, exportedName: imp.isDefault ? 'default' : imp.exportedName, memberName: null };
+    found = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
+      (file ? findExportedSymbol(file, want, ref.language, context, new Set()) : undefined);
+    rest = path;
+  }
+  if (found) {
+    const member = STATIC_MEMBER_CONTAINERS.has(found.kind) ? containerMember(found, rest, context) : undefined;
+    return member ?? typeMemberIn(found.filePath, [], [found.name, ...rest], context) ?? null;
+  }
+  // A namespace the module declares, for which the index holds no node.
+  const namespace = imp.isNamespace ? path[0]! : imp.isDefault ? null : imp.exportedName;
+  const declaring = file && namespace ? namespaceDeclaringFile(file, namespace, ref.language, context) : undefined;
+  if (declaring) return typeMemberIn(declaring.file, [], [declaring.name, ...rest], context) ?? null;
+  // A package from outside the repository, which it doesn't declare itself:
+  // its type is no project node. An import this resolver can't follow but no
+  // manifest declares, like zod's own tests' `import * as z from "zod/v3"`
+  // through the package's `exports`, keeps the ordinary strategies.
+  const outside = !file && !findAmbientModuleFile(imp.source, ref.filePath, context) &&
+    context.isOutOfRepoImport?.(imp.source, ref.filePath, ref.language) === true;
+  return outside ? null : undefined;
+}
+
+/**
+ * A type path through what the file declares itself as `head`: in the
+ * innermost namespace around the reference that declares it, else at the
+ * file's top level. null when the file declares `head` but nothing at the
+ * path; undefined when it declares no `head`.
+ */
+function ownTypeMember(head: string, path: string[], ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
+  const at = { startLine: ref.line, startColumn: ref.column };
+  const scopes = namespaceBlocks(ref.filePath, context)
+    .filter((b) => inBlock(at, b))
+    .map((b) => b.path.split('.'))
+    .sort((a, b) => b.length - a.length);
+  for (const scope of [...scopes, []]) {
+    if (!hasNamespace(ref.filePath, [...scope, head].join('.'), context) && declarationsIn(ref.filePath, scope, head, context).length === 0) continue;
+    return typeMemberIn(ref.filePath, scope, [head, ...path], context) ?? null;
+  }
+  return undefined;
+}
+
+/**
+ * The member of a namespace the project declares global (`Express.User`, an
+ * interface in `declare global { namespace Express { … } }`): a declaration of
+ * the reference's name directly in such a block. A test's or a fixture's
+ * globals reach its tests only.
+ */
+function globalTypeMember(namespace: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const fromTest = isTestFile(ref.filePath);
+  return context.getNodesByName(ref.referenceName)
+    .filter((n) => {
+      if (!TS_JS_FILE.test(n.filePath) || n.qualifiedName !== n.name || !MEMBER_DECLARATION_KINDS.has(n.kind)) return false;
+      if (!fromTest && isTestFile(n.filePath)) return false;
+      const block = innermostBlock(n, namespaceBlocks(n.filePath, context));
+      return block?.global === true && block.path === namespace;
+    })
+    .sort(typesFirst)[0];
+}
+
+/**
+ * What `path` names in `file`, from the namespace `scope` (the file's top
+ * level when empty): a namespace takes the next name as a member of its own,
+ * and an enum, a class or an interface takes the rest as its `::` members.
+ */
+function typeMemberIn(file: string, scope: string[], path: string[], context: ResolutionContext): Node | undefined {
+  const [name, ...rest] = path;
+  if (name === undefined) return undefined;
+  if (rest.length > 0 && hasNamespace(file, [...scope, name].join('.'), context)) {
+    return typeMemberIn(file, [...scope, name], rest, context);
+  }
+  const declared = declarationsIn(file, scope, name, context);
+  if (rest.length === 0) return declared[0];
+  const container = declared.find((n) => STATIC_MEMBER_CONTAINERS.has(n.kind));
+  return container ? containerMember(container, rest, context) : undefined;
+}
+
+/** An enum's, a class's or an interface's member at `path` (`Kind::Line`), in the container's own file. */
+function containerMember(container: Node, path: string[], context: ResolutionContext): Node | undefined {
+  if (path.length === 0) return undefined;
+  return context.getNodesByQualifiedName(`${container.qualifiedName}::${path.join('::')}`)
+    .filter((n) => n.filePath === container.filePath)
+    .sort(typesFirst)[0];
+}
+
+/** Kinds a declaration at a file's or a namespace's own level has; a class's member is `Class::member`. */
+const MEMBER_DECLARATION_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>([
+  'class', 'interface', 'type_alias', 'enum', 'struct', 'function', 'component', 'constant', 'variable',
+]);
+
+/** Kinds a type position names. */
+const TYPE_DECLARATION_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>([
+  'class', 'interface', 'type_alias', 'enum', 'enum_member', 'struct',
+]);
+
+/** Types before values: an interface before the constant merged with it. */
+function typesFirst(a: Node, b: Node): number {
+  return Number(!TYPE_DECLARATION_KINDS.has(a.kind)) - Number(!TYPE_DECLARATION_KINDS.has(b.kind));
+}
+
+/** The declarations named `name` directly in the namespace `scope` of `file` (its top level when empty), types first. */
+function declarationsIn(file: string, scope: string[], name: string, context: ResolutionContext): Node[] {
+  const blocks = namespaceBlocks(file, context);
+  const want = scope.join('.');
+  return (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+    .filter((n) => n.qualifiedName === name && MEMBER_DECLARATION_KINDS.has(n.kind) && (innermostBlock(n, blocks)?.path ?? '') === want)
+    .sort(typesFirst);
+}
+
+/** Whether `file` declares the namespace `path`, itself or as the prefix of a longer one (`namespace A.B` declares `A`). */
+function hasNamespace(file: string, path: string, context: ResolutionContext): boolean {
+  return namespaceBlocks(file, context).some((b) => b.path === path || b.path.startsWith(`${path}.`));
+}
+
+/** The innermost namespace block a node starts in. */
+function innermostBlock(node: Pick<Node, 'startLine' | 'startColumn'>, blocks: readonly NamespaceBlock[]): NamespaceBlock | undefined {
+  let inner: NamespaceBlock | undefined;
+  for (const block of blocks) {
+    if (!inBlock(node, block)) continue;
+    if (!inner || block.startLine > inner.startLine || (block.startLine === inner.startLine && block.startColumn > inner.startColumn)) inner = block;
+  }
+  return inner;
+}
+
+/** The file that declares the namespace a module exports as `name`, through its re-exports, and the name it declares it under. */
+function namespaceDeclaringFile(
+  file: string,
+  name: string,
+  language: Language,
+  context: ResolutionContext,
+  depth = 0,
+): { file: string; name: string } | undefined {
+  if (depth > REEXPORT_MAX_DEPTH) return undefined;
+  if (namespaceBlocks(file, context).some((b) => b.path === name || b.path.startsWith(`${name}.`))) return { file, name };
+  for (const rex of context.getReExports?.(file, language) ?? []) {
+    if (rex.kind !== 'wildcard' && !(rex.kind === 'named' && rex.exportedName === name)) continue;
+    const next = resolveImportPath(rex.source, file, language, context);
+    const found = next ? namespaceDeclaringFile(next, rex.kind === 'named' ? rex.originalName : name, language, context, depth + 1) : undefined;
+    if (found) return found;
+  }
+  return undefined;
 }
 
 export function resolveViaImport(

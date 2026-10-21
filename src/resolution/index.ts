@@ -35,7 +35,7 @@ import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -1495,6 +1495,12 @@ export class ReferenceResolver {
     if (isVbPathCall(ref)) {
       return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)), ref);
     }
+
+    // The last name of a TypeScript type written qualified (`React.ReactNode`,
+    // `TChat.ChatMessage`) is a member of what its qualifier names, which no
+    // framework, import or name strategy may guess past by the name alone.
+    const tsQualified = resolveTsQualifiedTypeRef(ref, this.context);
+    if (tsQualified !== undefined) return this.gateLanguage(tsQualified, ref);
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
     // import-based resolution first (an imported callback resolves through its
