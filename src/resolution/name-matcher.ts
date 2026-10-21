@@ -21199,22 +21199,18 @@ function rustTypeTextAt(text: string): string {
 
 /**
  * The type a Rust local or parameter is written with — `reader: Pin<&mut
- * R>`, `let timer: Option<Timer> = …` — read off its nearest declaration in
- * the calling function; null when that declaration writes none (`let f =
- * pin!(f)`).
+ * R>`, `let timer: Option<Timer> = …` — as its binding in scope at the call
+ * writes it (rustBindingAt: a block's own `let`, the latest shadow, never a
+ * struct literal's `reader: …` field); null when that binding writes none
+ * (`let f = pin!(f)`).
  */
 function rustDeclaredTypeText(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declared = new RegExp(`\\blet\\s+(?:mut\\s+)?${escaped}\\b(?:\\s*:(?!:)\\s*(.*))?|\\b${escaped}\\s*:(?!:)\\s*(.*)$`);
-  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
-    const m = declared.exec(lines[i] ?? '');
-    if (!m) continue;
-    const written = m[1] ?? m[2];
-    return written === undefined ? null : rustTypeTextAt(written);
-  }
-  return null;
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return null;
+  const offset = (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column);
+  const found = rustBindingAt(scopes, name, offset);
+  if (!found || found.ambiguous || found.binding.type === undefined) return null;
+  return rustTypeTextAt(found.binding.type);
 }
 
 /**
