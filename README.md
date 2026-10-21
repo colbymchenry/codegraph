@@ -126,6 +126,14 @@ codegraph init
 
 Auto-sync is enabled by default. CodeGraph watches the project and updates the graph on every file change — while your agent edits code, or you add, modify, or delete files. **The index is never stale, and there is nothing to re-run.**
 
+### Or let your agent do it
+
+[`skills/codegraph-setup/SKILL.md`](skills/codegraph-setup/SKILL.md) is an [Agent Skill](https://agentskills.io) that walks your agent through all of the above — installing the CLI (after asking you), wiring itself up either globally or for the current project only, indexing the project — and later through refreshing, checking or removing it. Copy the `skills/codegraph-setup/` folder into your agent's skills directory (for Claude Code, `~/.claude/skills/`), then just ask: *"add codegraph to this project"*. Agents without skills support can follow the same file directly:
+
+```text
+Set up CodeGraph for this project by following https://raw.githubusercontent.com/colbymchenry/codegraph/main/skills/codegraph-setup/SKILL.md
+```
+
 ### Uninstall
 
 Changed your mind? One command removes CodeGraph from every agent it configured **and** the CLI itself — every install it finds (standalone bundle, npm global package, launcher link), shown to you before anything is deleted:

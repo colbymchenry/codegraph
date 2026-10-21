@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- A ready-made agent skill now ships in `skills/codegraph-setup/`: give it to Claude Code, Codex CLI, Gemini CLI, opencode or any agent that reads skills, and it can install CodeGraph, wire itself up for every project or just the current one, and index your project on request — then refresh, check or remove it later — without you running the commands by hand.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
