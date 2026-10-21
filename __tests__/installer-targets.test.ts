@@ -828,6 +828,52 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(second.files[0].action).toBe('unchanged');
   });
 
+  it.each([
+    'provider: custom-provider\nmax_turns: 16\n',
+    'custom_settings: {keep: true}\n',
+    'custom_message: |\n  Keep this message\n  and its second line\n',
+    'custom_list:\n- keep\n- other\n',
+    '"custom setting": keep\n',
+  ])('hermes: install, re-install, and uninstall preserve root siblings %s', (sibling) => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const prefix = 'mcp_servers:\n  other:\n    command: keep-other\n';
+    fs.writeFileSync(config, prefix + '  codegraph:\n    command: old-codegraph\n' + sibling);
+
+    hermes.install('global', { autoAllow: false });
+    const installed = fs.readFileSync(config, 'utf8');
+    expect(installed.startsWith(prefix)).toBe(true);
+    expect(installed).toContain('    enabled: true\n' + sibling);
+    expect(hermes.install('global', { autoAllow: false }).files[0].action).toBe('unchanged');
+    expect(fs.readFileSync(config, 'utf8')).toBe(installed);
+
+    hermes.uninstall('global');
+    const uninstalled = fs.readFileSync(config, 'utf8');
+    expect(uninstalled.startsWith(prefix + sibling)).toBe(true);
+    expect(uninstalled).not.toContain('codegraph:');
+    expect(uninstalled).not.toContain('mcp-codegraph');
+  });
+
+  it('hermes: adds a server before scalar siblings and recognizes commented root sections', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const sibling = 'provider: custom-provider\nmax_turns: 16\n';
+    const prefix = 'mcp_servers: # configured servers\n  other:\n    command: keep-other\n';
+    fs.writeFileSync(config, prefix + sibling);
+
+    expect(hermes.detect('global').alreadyConfigured).toBe(false);
+    hermes.install('global', { autoAllow: false });
+    const installed = fs.readFileSync(config, 'utf8');
+    expect(installed.startsWith(prefix + '  codegraph:\n')).toBe(true);
+    expect(installed).toContain('    enabled: true\n' + sibling);
+    expect(installed.match(/^mcp_servers:/gm)).toHaveLength(1);
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+    hermes.uninstall('global');
+    expect(fs.readFileSync(config, 'utf8').startsWith(prefix + sibling)).toBe(true);
+  });
+
   it('hermes: uninstall removes only codegraph MCP server and toolset entry', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');

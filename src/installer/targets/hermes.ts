@@ -148,13 +148,16 @@ function joinLines(lines: string[]): string {
 }
 
 function topLevelRange(lines: string[], key: string): LineRange | null {
-  const start = lines.findIndex((line) => line.trim() === `${key}:`);
+  const startPattern = new RegExp(`^${escapeRegExp(key)}:\\s*(?:#.*)?$`);
+  const start = lines.findIndex((line) => startPattern.test(line));
   if (start === -1) return null;
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
     const line = lines[i] ?? '';
     if (line.trim() === '') continue;
-    if (/^[A-Za-z_][A-Za-z0-9_-]*:\s*(?:#.*)?$/.test(line)) {
+    // Every root mapping starts a sibling, including scalar, flow-style,
+    // and block values. Its value need not be empty for the block to end.
+    if (/^[^\s#].*:(?:[ \t]|$)/.test(line)) {
       end = i;
       break;
     }
