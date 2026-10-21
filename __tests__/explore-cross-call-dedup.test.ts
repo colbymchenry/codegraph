@@ -265,11 +265,23 @@ describe('a second call against a real index', () => {
     // the pointer names it.
     expect(second).toContain(POINTER);
     for (const [file, lines] of before) {
-      const repeated = [...(after.get(file) ?? [])].filter((n) => lines.has(n));
+      const repeated = [...(after.get(file) ?? [])].filter((n) => lines.has(n)).sort((a, b) => a - b);
       if (repeated.length === 0) continue;
-      // The only sanctioned repeat is the anti-abandonment restore, which fires
-      // ONLY when the call found nothing new to say — and this one did.
-      throw new Error(`call 2 re-sent ${file} lines ${repeated.slice(0, 5).join(',')}`);
+      // Two sanctioned repeats. The anti-abandonment restore fires ONLY when
+      // the call found nothing new to say — and this one did. And rule 3 of
+      // the range algebra: a held run shorter than MIN_COVERED_LINES is
+      // re-sent inside the block around it rather than replaced by a pointer
+      // (the 7-line `RunResult` struct of cycle.go, held by call 1, comes back
+      // whole inside call 2's render of the file's head — #2756). Any longer
+      // run is a duplicate.
+      const runs: number[][] = [];
+      for (const n of repeated) {
+        const run = runs[runs.length - 1];
+        if (run && n === run[run.length - 1]! + 1) run.push(n);
+        else runs.push([n]);
+      }
+      const long = runs.find((run) => run.length >= EXPLORE_DEDUP.MIN_COVERED_LINES);
+      if (long) throw new Error(`call 2 re-sent ${file} lines ${long.slice(0, 5).join(',')}`);
     }
   }, 120_000);
 
