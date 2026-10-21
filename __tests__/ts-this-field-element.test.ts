@@ -45,6 +45,24 @@ const files: Record<string, string> = {
     '  on(type: string, h: string) { this.listeners[type].push(h); }\n' +
     '  builtin(i: number) { return this.names[i].trim(); }\n' +
     '}\n',
+  // `Item` here is the class's type parameter, not the project class.
+  'src/store.ts':
+    'export class Store<Item> {\n' +
+    '  private items: Item[] = [];\n' +
+    '  private byKey: Record<string, Item> = {};\n' +
+    '  first() { return this.items[0].save(); }\n' +
+    '  keyed(k: string) { return this.byKey[k].save(); }\n' +
+    '}\n',
+  // Either array's element: no one type to resolve on.
+  'src/mixed.ts':
+    "import { Item } from './model';\n" +
+    "import { Other } from './decoy';\n" +
+    'export class Mixed {\n' +
+    '  private entries: Item[] | Other[] = [];\n' +
+    '  private maybe: Item[] | null = null;\n' +
+    '  either() { return this.entries[0].save(); }\n' +
+    '  nullable() { return this.maybe![0].save(); }\n' +
+    '}\n',
 };
 
 beforeAll(async () => {
@@ -62,8 +80,8 @@ afterAll(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-const calleesOf = (name: string) => {
-  const caller = cg.getNodesByName(name).find((n) => n.filePath.endsWith('holder.ts') && n.kind === 'method')!;
+const calleesOf = (name: string, file = 'holder.ts') => {
+  const caller = cg.getNodesByName(name).find((n) => n.filePath.endsWith(file) && n.kind === 'method')!;
   return cg.getCallees(caller.id)
     .filter(({ edge }) => edge.kind === 'calls')
     .map(({ node: n }) => `${path.basename(n.filePath)}:${n.qualifiedName}`)
@@ -87,5 +105,15 @@ describe('a call on an element of a this-field', () => {
   it('an element of a builtin type reaches no project method', () => {
     expect(calleesOf('on')).toEqual([]);
     expect(calleesOf('builtin')).toEqual([]);
+  });
+
+  it("a class's type parameter is not the project class of that name", () => {
+    expect(calleesOf('first', 'store.ts')).toEqual([]);
+    expect(calleesOf('keyed', 'store.ts')).toEqual([]);
+  });
+
+  it('a union of element types reaches none of them; `| null` keeps the one', () => {
+    expect(calleesOf('either', 'mixed.ts')).toEqual([]);
+    expect(calleesOf('nullable', 'mixed.ts')).toEqual(['model.ts:Item::save']);
   });
 });

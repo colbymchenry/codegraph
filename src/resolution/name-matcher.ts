@@ -23182,11 +23182,19 @@ const TS_ELEMENT_CONTAINERS: ReadonlyMap<string, { args: number; at: number }> =
  * The type an element of a field holds, from the field's written type (`type`)
  * and what follows it on the line (`rest`): `Item` of `Item[]`, `Array<Item>`
  * and `Record<string, Item>`. Undefined for any other type, an array of
- * arrays, or an element that is not a plain type name (a union, a generic).
+ * arrays, an element that is not a plain type name (a union, a generic), or
+ * a field typed as a union with another type (`Item[] | Other[]`); `| null`
+ * and `| undefined` leave the element as it is.
  */
 function tsFieldElementType(type: string, rest: string): string | undefined {
   const plain = (t: string | undefined): string | undefined => (t && /^[A-Za-z_$][\w.$]*$/.test(t) ? t : undefined);
-  if (/^\s*\[\s*\]/.test(rest)) return /^\s*\[\s*\]\s*\[/.test(rest) ? undefined : type;
+  // What follows the field's type unions it with another type.
+  const unionAfter = (tail: string): boolean => /^\s*\|/.test(tail.replace(/^(?:\s*\|\s*(?:null|undefined)\b)+/, ''));
+  const array = /^\s*\[\s*\]/.exec(rest);
+  if (array) {
+    const tail = rest.slice(array[0].length);
+    return /^\s*\[/.test(tail) || unionAfter(tail) ? undefined : type;
+  }
   const container = TS_ELEMENT_CONTAINERS.get(type);
   if (!container) return undefined;
   const open = /^\s*</.exec(rest);
@@ -23203,7 +23211,7 @@ function tsFieldElementType(type: string, rest: string): string | undefined {
       from = i + 1;
     } else if (c === '>' && depth === 0) {
       args.push(rest.slice(from, i).trim());
-      if (/^\s*\[/.test(rest.slice(i + 1))) return undefined;
+      if (/^\s*\[/.test(rest.slice(i + 1)) || unionAfter(rest.slice(i + 1))) return undefined;
       return args.length === container.args ? plain(args[container.at]) : undefined;
     }
   }
@@ -23767,10 +23775,15 @@ function matchTsThisFieldCall(
   });
   // `this.<field>[k].<method>()` calls the element's type: what the field's
   // declaration writes for it, or nothing.
-  const held = (decl: TsFieldRead): TsFieldRead | null =>
-    !element ? decl : !decl.valueType && decl.element ? { valueType: false, type: decl.element } : null;
+  // A type parameter of the declaring class names no type (`class
+  // Store<Item> { items: Item[] }`), whatever project class shares its name.
+  const held = (decl: TsFieldRead, cls: Node): TsFieldRead | null =>
+    !element ? decl
+      : !decl.valueType && decl.element && !tsClassTypeParameter(cls, decl.element, context)
+        ? { valueType: false, type: decl.element }
+        : null;
   if (found) {
-    const decl = held(found.decl);
+    const decl = held(found.decl, found.cls);
     return decl ? tsFieldCall(decl, found.cls, methodName, ref, context) : null;
   }
   // Else a same-named class elsewhere may declare it, read for a calling
@@ -23781,7 +23794,7 @@ function matchTsThisFieldCall(
     for (const cls of owners) {
       if (cls.filePath === ref.filePath) continue;
       const read = tsFieldDeclaration(cls, field, context);
-      const decl = read && held(read);
+      const decl = read && held(read, cls);
       if (decl && tsTypeVisibleIn(decl.type, ref, context)) return decl;
     }
     return null;
