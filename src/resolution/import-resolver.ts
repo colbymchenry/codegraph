@@ -17,7 +17,7 @@ import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
 import { isTestFile } from '../search/query-utils';
-import { moduleTail } from '../db/reference-tail';
+import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -4233,14 +4233,19 @@ export function isBoundToOutOfRepoImport(
  *    './tag/tag.controller'`, a CommonJS `require`), a namespace import, or an
  *    aliased one (`import { Component as Wrapper }`, `{ default as X }`) names
  *    what the module declares under another name, so its own name, the
- *    default tail, is one the module never declares. So is a plain named
- *    import's (`import { useInvocation } from './context'`) when its module is
- *    a barrel (`context/index.ts`): the barrel declares none of the names it
- *    passes on, and an edit that gives it one declares nothing. Whether a
- *    module is one can't be told while it lacks the name, so every binding
- *    waits for its module. A sync still looks a binding up by its own name as
- *    well: the file that declares it can be anywhere, and a binding its
- *    module never resolves is linked by the name alone.
+ *    default tail, is one the module never declares. A sync still looks it up
+ *    by that name as well: a binding its module never resolves is linked by
+ *    the name alone.
+ *    A plain named import (`import { useInvocation } from './context'`) names
+ *    what its module declares or passes on by that name. A file that declares
+ *    it is found by the name, and the importers of a module that appears are
+ *    re-opened through it (see module-importers), but an edit that makes a
+ *    barrel pass the name on (`context/index.ts` gaining `export {
+ *    useInvocation } from './context'`) declares nothing. So it waits under
+ *    the key only when its module is a project file that has the key, the
+ *    file whose edit that is: not while the module is missing, nor for a
+ *    workspace package's own name (`@vben/icons`), whose key is the package's
+ *    folder, which its entry file (`src/index.ts`) never has.
  *  - a direct member of any binding, a named import's included
  *    (`NODE_PATH_EXCLUDELIST.includes(p)`, `store.get(k)`, `NS.make()`). It
  *    reaches the binding's declaration, or a member of it, through the module,
@@ -4294,7 +4299,13 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   const modulePath = binding.source.startsWith('.')
     ? path.posix.join(path.posix.dirname(ref.filePath), binding.source)
     : binding.source;
-  return moduleTail(modulePath) || undefined;
+  const tail = moduleTail(modulePath);
+  if (!tail) return undefined;
+  if (!receiver && !binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName) {
+    const moduleFile = resolveImportPath(binding.source, ref.filePath, ref.language, context);
+    if (!moduleFile || !(context.isIndexedFile?.(moduleFile) ?? true) || !moduleReferenceKeys(moduleFile).includes(tail)) return undefined;
+  }
+  return tail;
 }
 
 /**

@@ -344,9 +344,9 @@ describe('a failed member reference through an import binding', () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
-      // A member of a package's binding, and a chain or a longer path through
-      // a binding, wait for the name they use. The whole name of an unaliased
-      // named import waits for its module (sync-import-binding-retry.test.ts).
+      // A member of a package's binding, the whole name of an unaliased named
+      // import, and a chain or a longer path through a binding wait for the
+      // name they use.
       'src/other.ts':
         "import express from 'express';\nimport { helper } from './util';\nimport CONFIG from './config';\n" +
         'export const app = express.Router();\nexport const value = helper;\n' +
@@ -362,10 +362,10 @@ describe('a failed member reference through an import binding', () => {
     expect(tails.get('src/entry.ts calls useStore.setState')).toBe('module:entry-store');
     expect(tails.get('src/client.ts calls api.get')).toBe('module:api');
     expect(tails.get('src/components/Panel.vue calls COLUMNS.map')).toBe('module:table');
-    expect(tails.get('src/other.ts imports helper')).toBe('module:util');
 
     expect(tails.get('src/noise.ts calls extApi.get')).toBe('get');
     expect(tails.get('src/other.ts calls express.Router')).toBe('Router');
+    expect(tails.get('src/other.ts imports helper')).toBe('helper');
     expect(tails.get('src/other.ts calls CONFIG.api.fetch')).toBe('fetch');
     expect(tails.get('src/other.ts calls CONFIG.load().then')).toBe('then');
     // The chain's own first call is a direct member.

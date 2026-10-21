@@ -24,8 +24,8 @@
  * is added, sync re-opens the barrel's importers (module-importers.ts); an
  * edit that gives an existing barrel the name re-opened nothing, so the
  * import and its uses stayed unlinked. Such a reference is parked under its
- * module's key as well, which the barrel and every file in the barrel's
- * folder carry.
+ * module's key as well when its module is a file of the project that has the
+ * key, as the barrel does.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
@@ -321,11 +321,13 @@ describe('a failed reference through an import binding', () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
-      // A package's binding waits for the name it uses; a plain named import
-      // of a project module waits for its module, as the other bindings do,
-      // and so does a member of a namespace import
-      // (sync-import-member-retry.test.ts).
-      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, NS.make()];\n",
+      // A package's binding waits for the name it uses, and so does a plain
+      // named import while its module is missing (`./util`). One whose module
+      // is a file of the project (`./lib`, a barrel yet to pass the name on)
+      // waits for that module, as the other bindings do, and so does a member
+      // of a namespace import (sync-import-member-retry.test.ts).
+      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport { forwarded } from './lib';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, forwarded, NS.make()];\n",
+      'src/lib/index.ts': 'export {};\n',
     });
     (await CodeGraph.init(root, { index: true })).close();
 
@@ -347,10 +349,11 @@ describe('a failed reference through an import binding', () => {
       expect(tailOf('src/layouts/LayoutMain.vue', 'Error404', 'imports')).toBe('module:404');
       expect(tailOf('src/App.svelte', 'Banner', 'references')).toBe('module:Hero');
       expect(tailOf('src/pages/index.astro', 'Shell', 'imports')).toBe('module:BaseLayout');
-      expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('module:util');
+      expect(tailOf('src/other.ts', 'forwarded', 'imports')).toBe('module:lib');
       expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('module:ns');
 
       expect(tailOf('src/other.ts', 'express', 'imports')).toBe('express');
+      expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('helper');
 
       // Each module's file is one of the keys its references wait under, and
       // so is a barrel's folder for every file in it.
