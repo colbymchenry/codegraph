@@ -28,6 +28,8 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { tauriCommandEdges } from './tauri-synthesizer';
+
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
 import { nextLinkEdges } from './next-router-synthesizer';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
@@ -4853,6 +4855,9 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
+  if (/\.rs$/.test(filePath) && /tauri\s*::\s*(?:command|generate_handler)/.test(content)) return true;
+  if (/\.(?:[cm]?[jt]sx?)$/.test(filePath) && content.includes('@tauri-apps/api/')) return true;
+
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
@@ -4888,6 +4893,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // a queue job onto its consumer, a bus / socket event onto its handler.
   // Before the in-process emitter pass: the same (source, target) pair
   // keeps the more specific edge — the one that says which tier it crosses.
+  { name: 'tauriEdges', gate: (has) => has('rust') && has(...JS_FAMILY), run: (_q, c, y) => tauriCommandEdges(c, y) },
+
   { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
   // A Spring / Laravel test's request (`mockMvc.perform(post("/x"))`,
   // `$this->postJson('api/x')`) onto the route it reaches, so the handler
