@@ -5,7 +5,7 @@ import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { Worker } from 'worker_threads';
 import CodeGraph from '../src/index';
-import { measurePendingChanges } from '../src/mcp/index-freshness';
+import { endFreshnessMeasurements, measurePendingChanges } from '../src/mcp/index-freshness';
 import { ToolHandler } from '../src/mcp/tools';
 
 describe('MCP status freshness (#1959)', () => {
@@ -28,7 +28,11 @@ describe('MCP status freshness (#1959)', () => {
     handler = new ToolHandler(cg);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Every case leaves a measurement worker still ending, which can still
+    // hold the index or the project dir: on Windows under load the removal
+    // then failed with EBUSY. Wait until they are gone.
+    await endFreshnessMeasurements();
     try { cg.close(); } catch { /* ignore */ }
     fs.rmSync(root, { recursive: true, force: true });
   });

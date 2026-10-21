@@ -126,6 +126,24 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
+  it.each([['ts', 'typescript'], ['tsx', 'tsx']] as const)('an awaited call with type arguments names its callee: %s (#2586)', (ext, language) => {
+    const source = [
+      'export async function a() { return await fetchApi<User>("/me"); }',
+      'export async function b() { return await api.fetchApi<User>("/me"); }',
+      'export async function c() { return (await load())(); }',
+      'export async function d() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function e() { return await api.get<User>("/me").then(r => r); }',
+      'export async function f() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function g() { return await await fetchApi<User>("/me"); }',
+      'export async function h() { return await // typed\n fetchApi<User>("/me").then(r => r); }',
+      '',
+    ].join('\n');
+    const result = assertParity(`awaited.${ext}`, source, language);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['fetchApi', 'api.fetchApi', 'fetchApi().json', 'api.get().then']));
+    expect(calls.some((n) => /^await|^\/[*/]/.test(n))).toBe(false);
+  });
+
   it.each(['bundle.js', 'vendor-min.js', 'vendor.min.js'])('a minified bundle keeps its literals unowned: %s (#2300)', (file) => {
     // Mostly long lines dense with code punctuation, as a minifier writes them.
     const line = `var a={b:function(){return c(1,2)},d:function(e){return e}};window.L={f:function(){return a.b()}};`.repeat(40);
@@ -339,6 +357,30 @@ const lowerCase = styled.div<Props>\`color: red;\`;
       expect(kind(name), name).toEqual(['component']);
     }
     for (const name of ['Mixin', 'Compared', 'lowerCase']) expect(kind(name), name).toEqual(['constant']);
+  });
+
+  it.each([
+    ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('edges the file-scope values a component reads or renders: %s', (ext, language) => {
+    // `.jsx` was left out of the value-reference languages on both paths, so
+    // this file had none of these edges as .jsx and all of them as .js or .tsx.
+    const result = assertParity(`routes.${ext}`, `
+import { lazy } from 'react';
+import Loadable from './Loadable';
+const LoginPage = Loadable(lazy(() => import('./pages/Login')));
+const ROUTE_TABLE = [{ path: '/login', label: 'Login' }];
+const THEME_TOKENS = { color: 'red', size: 12 };
+export function AuthRoutes() { return <LoginPage />; }
+export function Nav() {
+  return <ul style={{ color: THEME_TOKENS.color }}>{ROUTE_TABLE.map((r) => <li key={r.path}>{r.label}</li>)}</ul>;
+}
+export const Box = () => <div data-size={THEME_TOKENS.size} />;
+`, language);
+    const name = (id: string) => result.nodes.find((n) => n.id === id)?.name;
+    expect(result.edges
+      .filter((e) => e.kind === 'references' && e.metadata?.valueRef === true)
+      .map((e) => `${name(e.source)} -> ${name(e.target)}`)
+      .sort()).toEqual(['AuthRoutes -> LoginPage', 'Box -> THEME_TOKENS', 'Nav -> ROUTE_TABLE', 'Nav -> THEME_TOKENS']);
   });
 
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {

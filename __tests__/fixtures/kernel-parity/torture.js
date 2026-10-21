@@ -14,6 +14,7 @@ const arrow = (x) => legacyHelper(x, 1);
 
 class Widget extends EventEmitter {
   static registry = new Map();
+  static hooks = { tick: legacyHelper };
   #privateField = 1;
   label = 'w';
   onTick = () => {
@@ -78,6 +79,7 @@ export default {
 // leaked to the FILE node; a non-exported object literal was skipped outright.
 const eagerConfig = loadConfig();
 const handlerMap = { onSave: () => persist(eagerConfig), onLoad: loadConfig() };
+const registry = { legacyHelper, run: arrow, nested: [legacyHelper] };
 const lazyList = [() => persist(eagerConfig)];
 // --- CommonJS export assignments (#1675) -----------------------------------
 exports.getItems = async (req, res) => { res.json(await findItems()); };
@@ -101,4 +103,25 @@ async function exprReceivers(x) {
   (() => 1).call(null);
   this.a.b.run();
   new Runner().go();
+}
+// --- component wrappers walked under the component ------------------------------
+const PANEL_GAP = 8;
+const Panel = styled(Widget)`
+  gap: ${PANEL_GAP}px;
+  color: ${(props) => colorOf(props.theme)};
+`;
+const Row = styled.div.attrs((props) => ({ role: roleOf(props) }))`
+  ${Panel} { margin: 0; }
+`;
+const MemoPanel = React.memo(Panel, legacyHelper);
+// --- callees that name nothing, and wrappers that keep one -----------------------
+function calleeShapes(handlers, type, fn, ns) {
+  (() => { legacyHelper(1, 2); })();
+  (function () { arrow(3); })();
+  connect(mapState)(Widget);
+  breakpoint('tablet')`padding: 0;`;
+  handlers[type](1);
+  (0, fn)();
+  (fn)();
+  (ns.fn)();
 }

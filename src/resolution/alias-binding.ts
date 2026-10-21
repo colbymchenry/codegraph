@@ -148,3 +148,14 @@ export function extractLocalExportAliases(content: string): Array<{ exportedName
   }
   return out;
 }
+
+/**
+ * The binding a module's default export is as a whole: `export default
+ * Page;`, `export { Page as default }`. Null for a declaration or an
+ * expression: `export default withAuth(Page)` hands over a call, whose first
+ * identifier is no binding of the module's.
+ */
+export function defaultExportBinding(content: string): string | null {
+  return /(?:^|;)\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*(?:;|$)/m.exec(content)?.[1] ??
+    extractLocalExportAliases(content).find((a) => a.exportedName === 'default')?.localName ?? null;
+}

@@ -4513,9 +4513,18 @@ export class ToolHandler {
     const fileGroups = new Map<string, { nodes: Node[]; score: number; peripheral: number }>();
     const entryNodeIds = new Set([...subgraph.roots, ...namedSeedIds]);
 
-    // Build a set of nodes directly connected to entry points (depth 1)
+    // Build a set of nodes directly connected to entry points (depth 1). A
+    // type that names another type in its declaration — a Go struct's field,
+    // the type an alias or a defined type names, a Dart class's field — is
+    // structure, not one hop of the question's flow: connected through it, the
+    // payroll fixture's 8-line `RunResult` (which holds a `Payslip`) outranked
+    // the 51-line method that builds and stores every payslip, and took its
+    // place in the file's budget.
+    const TYPE_KINDS = new Set(['class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'type_alias']);
+    const isTypeDeclaration = (id: string): boolean => TYPE_KINDS.has(subgraph.nodes.get(id)?.kind ?? '');
     const connectedToEntry = new Set<string>();
     for (const edge of subgraph.edges) {
+      if (edge.kind === 'references' && isTypeDeclaration(edge.source) && isTypeDeclaration(edge.target)) continue;
       if (entryNodeIds.has(edge.source)) connectedToEntry.add(edge.target);
       if (entryNodeIds.has(edge.target)) connectedToEntry.add(edge.source);
     }
@@ -4585,7 +4594,6 @@ export class ToolHandler {
     // displaces a flow-central file. Bounded: only the few named seeds, only the
     // types in their signatures.
     const CALLABLE_KINDS = new Set(['method', 'function', 'component', 'constructor']);
-    const TYPE_KINDS = new Set(['class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'type_alias']);
     const SIG_EDGE = new Set(['references', 'type_of', 'returns']);
     const changeSurfaceCandidates: Node[] = [];
     const seenChangeSurface = new Set<string>();
@@ -4659,25 +4667,18 @@ export class ToolHandler {
     // Test/spec/icon/i18n file detector — used by the pre-floor hard filter, the
     // rank penalty, and the comparator deprioritization.
     //
-    // The directory pattern is anchored at `^` as well as `/`: a repo-ROOT
-    // `test/` or `spec/` directory (express, cobra, and most of npm/Go) produced
-    // paths like `test/express.raw.js`, which the old leading-`/` form could
-    // never match — so express's routing question spent 59% of its envelope on
-    // three test files while `lib/router/index.js` never rendered.
+    // Tests are the engine's own reading (`isTestFile`), the one the gather
+    // above already dampened them by: every ecosystem's test names and folders —
+    // a repo-ROOT `test/` (express's routing question once spent 59% of its
+    // envelope on three test files), LLVM's `unittests/`, Google's
+    // `foo_unittest.cc`, a C++ `FooTest.cpp`, `testing/`, `e2e/` — and the
+    // examples, samples, fixtures and benchmarks around a project. A list of
+    // its own here missed every one of those it hadn't been taught.
     const isLowValue = (p: string) => {
       const lp = p.toLowerCase();
       return (
-        /(?:^|\/)(tests?|__tests?__|specs?)\//.test(lp) ||
-        /_test\.go$/.test(lp) ||
-        /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
-        /_test\.py$/.test(lp) ||
-        /_spec\.rb$/.test(lp) ||
-        /_test\.rb$/.test(lp) ||
-        /\.(test|spec)\.[jt]sx?$/.test(lp) ||
-        /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
-        /(tests?|spec)\.cs$/.test(lp) ||
-        /tests?\.swift$/.test(lp) ||
-        /_test\.dart$/.test(lp) ||
+        isTestFile(p) ||
+        /(?:^|\/)__test__\//.test(lp) ||
         /\bicons?\b/.test(lp) ||
         /\bi18n\b/.test(lp)
       );
