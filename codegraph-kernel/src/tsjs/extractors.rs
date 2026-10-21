@@ -1529,7 +1529,7 @@ impl<'t> Walker<'t> {
         // Where the reference sits: the call, or the callee an `await` was
         // peeled off (`await f<T>(x)` starts at `await`; the call to `f`
         // starts where `f` does, as in `await f(x)`). Mirrors refStart.
-        let at = match (raw, func) {
+        let mut at = match (raw, func) {
             (Some(r), Some(f)) if r.id() != f.id() => f,
             _ => node,
         };
@@ -1596,7 +1596,15 @@ impl<'t> Walker<'t> {
                     }
                 }
             } else {
-                callee_name = self.text(func).to_string();
+                // A callee that names nothing (a call, a function, a
+                // subscript) is no reference. Mirrors tsJsCalleeName.
+                match self.callee_name_of(func) {
+                    Some((name, name_at)) => {
+                        callee_name = name;
+                        at = name_at;
+                    }
+                    None => return,
+                }
             }
         }
 
@@ -1609,6 +1617,27 @@ impl<'t> Walker<'t> {
 
         if !callee_name.is_empty() {
             self.push_call_ref(&callee_name.clone(), at);
+        }
+    }
+
+    /// The name a non-member callee writes, past `(fn)`, `fn!`, `(fn as F)`,
+    /// `await` and a tag's type arguments (`css<Props>`), or None for one that
+    /// names nothing: a call, a function, a subscript, `(0, fn)`. A dotted
+    /// chain keeps its text, `(a.b)()` → `a.b`. The node is where the name
+    /// starts, which is where the reference sits. Mirrors tsJsCalleeName.
+    fn callee_name_of(&self, func: Node<'t>) -> Option<(String, Node<'t>)> {
+        let mut cur = peel_receiver(func);
+        while cur.kind() == "instantiation_expression" {
+            let inner = cur.child_by_field_name("function").or_else(|| cur.named_child(0))?;
+            cur = peel_receiver(inner);
+        }
+        match cur.kind() {
+            "identifier" | "super" | "import" => Some((self.text(cur).to_string(), cur)),
+            "member_expression" => {
+                let chain: String = self.text(cur).chars().filter(|c| !c.is_whitespace()).collect();
+                util::dotted_chain().is_match(&chain).then_some((chain, cur))
+            }
+            _ => None,
         }
     }
 
@@ -1630,17 +1659,27 @@ impl<'t> Walker<'t> {
         Some(self.text(property).to_string())
     }
 
-    /// `await f<T>(x)` parses with `await f` as the callee; the call is to
-    /// `f` (#2586). Peels every `await`, skipping a comment written after one.
-    /// TS-family only. Mirrors peelTsAwaitCallee.
+    /// `await f<T>(x)` parses with `await f` as the callee (#2586), and a
+    /// prefix operator over a generic call the same way
+    /// (`!settings.get<boolean>('X')`, `void apiRequest<T>()`); the call is to
+    /// `f`. Peels every `await` and prefix operator, skipping a comment written
+    /// after an `await`. TS-family only. Mirrors peelTsPrefixedCallee.
     fn peel_await_callee(&self, node: Node<'t>) -> Node<'t> {
         if !self.variant.is_ts() {
             return node;
         }
         let mut cur = node;
-        while cur.kind() == "await_expression" {
-            let mut walker = cur.walk();
-            let Some(inner) = cur.named_children(&mut walker).find(|c| c.kind() != "comment") else { break };
+        loop {
+            let inner = match cur.kind() {
+                "unary_expression" => cur.child_by_field_name("argument"),
+                "await_expression" => {
+                    let mut walker = cur.walk();
+                    let found = cur.named_children(&mut walker).find(|c| c.kind() != "comment");
+                    found
+                }
+                _ => break,
+            };
+            let Some(inner) = inner else { break };
             cur = inner;
         }
         cur

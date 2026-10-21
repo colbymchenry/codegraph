@@ -112,3 +112,14 @@ const Row = styled.div.attrs((props) => ({ role: roleOf(props) }))`
   ${Panel} { margin: 0; }
 `;
 const MemoPanel = React.memo(Panel, legacyHelper);
+// --- callees that name nothing, and wrappers that keep one -----------------------
+function calleeShapes(handlers, type, fn, ns) {
+  (() => { legacyHelper(1, 2); })();
+  (function () { arrow(3); })();
+  connect(mapState)(Widget);
+  breakpoint('tablet')`padding: 0;`;
+  handlers[type](1);
+  (0, fn)();
+  (fn)();
+  (ns.fn)();
+}

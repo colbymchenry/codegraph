@@ -153,6 +153,21 @@ export const MemoCompared = memo(ImportedComponent, helperFn);
 export const MemoForward = memo(forwardRef(RenderInput));
 export const RefForwarded = React.forwardRef(RenderInput);
 
+// Callees that name nothing, and the wrappers that keep one.
+export async function calleeShapes(handlers: Record<string, () => void>, fn: () => void, load: () => Promise<() => void>) {
+  (() => { helperFn(); })();
+  create<ButtonProps>()(helperFn);
+  handlers['open']();
+  (0, fn)();
+  fn!();
+  (fn as () => void)();
+  (await load())();
+  await helperFn<ButtonProps>();
+  void helperFn<ButtonProps>();
+  if (!NS.helper.deep<boolean>(1)) return;
+  return typeof create<ButtonProps>() === 'function' && !!create<RowProps>();
+}
+
 export function App() {
   const nodes: GraphNode[] = [];
   return (
