@@ -294,6 +294,7 @@ async function exprReceivers(x, y) {
   f().list.map(g);
   (() => 1).call(null);
   this.a.b.run();
+  this.listeners[type].push(h);
   super.stop();
   new Runner().go();
   window.Api.start();

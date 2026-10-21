@@ -628,11 +628,14 @@ function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: S
  * `super` (the resolver reads the owner off the enclosing class), a member
  * chain rooted at either or at `window` (the project-global escape of
  * {@link isUnresolvedTsJsChain}), and `new C()` (its class is written at the
- * call).
+ * call). A subscript anywhere in the chain does not: `this.listeners[type]` is
+ * an element of a field, which the resolver cannot type, so the bare name
+ * would exact-match any project method of that name (`push`).
  */
 function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
+    if (cur.type === 'subscript_expression') return false;
     const object = getChildByField(cur, 'object');
     cur = object ? peelTsJsReceiver(object) : null;
   }

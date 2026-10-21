@@ -1999,11 +1999,14 @@ fn peel_receiver(node: Node<'_>) -> Node<'_> {
 }
 
 /// `this` / `super`, a member chain rooted at either or at `window`, or
-/// `new C()` still collapse to the bare method name (mirrors
-/// keepsBareTsJsReceiver).
+/// `new C()` still collapse to the bare method name; a subscript anywhere in
+/// the chain does not (mirrors keepsBareTsJsReceiver).
 fn keeps_bare_receiver(node: Node<'_>, src: &str) -> bool {
     let mut cur = node;
     while matches!(cur.kind(), "member_expression" | "subscript_expression") {
+        if cur.kind() == "subscript_expression" {
+            return false;
+        }
         match cur.child_by_field_name("object") {
             Some(object) => cur = peel_receiver(object),
             None => return false,
