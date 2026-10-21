@@ -260,6 +260,7 @@ describe('a Go struct references the types its fields are declared with', () => 
           .map((r) => `${r.referenceKind} ${r.referenceName}`)
           .sort();
       };
+      // An embedded `error` is an embedding too: the one predeclared type with a method.
       expect(refsOf('Embedder')).toEqual([
         'extends Base',
         'extends ClientWithList',
@@ -267,6 +268,7 @@ describe('a Go struct references the types its fields are declared with', () => 
         'extends List',
         'extends Pointer',
         'extends Queryable',
+        'extends error',
         'references Pod',
         'references PodList',
       ]);
