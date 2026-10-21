@@ -23,6 +23,7 @@ var oldVar = 'x';
 @scoped.Registry<Config>('name')
 export abstract class BaseService extends EventTarget implements Disposable, Serializable {
   static instances = 0;
+  static handlers = { refresh: helperFn, table: CONFIG_TABLE };
   private readonly cache: Map<string, Config> = new Map();
   public fonts: FontConfig;
   count = 0;
@@ -189,6 +190,7 @@ export const actionsMap = {
   update(input: UpdateInput) {
     return persistExisting(input);
   },
+  fallback: helperFn,
 };
 
 // Zustand-style store through middleware wrappers.

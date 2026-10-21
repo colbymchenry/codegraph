@@ -305,6 +305,8 @@ routes![top_level_h];
 const INIT_CONST: usize = compute_len();
 static INIT_LAZY: Lazy<Cfg> = Lazy::new(|| build_cfg());
 static INIT_ALIAS: fn() = free_fn;
+// A table the walk above takes for its symbol, and the scan no longer for the file.
+static INIT_TABLE: &[fn()] = &[handler, handler2];
 
 pub union Reg {
     pub raw: u32,

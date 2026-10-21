@@ -431,8 +431,10 @@ impl<'t> Walker<'t> {
             self.extract_class(node);
             skip_children = true;
         } else if kind == "assignment" && !self.inside_class_like() {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The right-hand side extract_variable walked under the assigned
+            // name took its own candidates; the scan covers the rest.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "import_statement" || kind == "import_from_statement" {
             self.extract_import(node);
@@ -564,7 +566,9 @@ impl<'t> Walker<'t> {
     }
 
     /// extractVariable's python branch: `left = right` at module scope.
-    fn extract_variable(&mut self, node: Node<'t>) {
+    /// Returns the right-hand side when it was walked under the assigned
+    /// name, for the declaration scan to skip.
+    fn extract_variable(&mut self, node: Node<'t>) -> Vec<usize> {
         let docstring = preceding_docstring(node, self.src);
         let left = node.child_by_field_name("left").or_else(|| node.named_child(0));
         let right = node.child_by_field_name("right").or_else(|| node.named_child(1));
@@ -589,16 +593,19 @@ impl<'t> Walker<'t> {
         // module-level `app = FastAPI()` / `handler = lambda: run()` dropped
         // every call on the right-hand side. A tuple target mints no symbol, so
         // its RHS is walked at the enclosing scope rather than lost.
+        let mut walked = Vec::new();
         if let Some(right) = right {
             match assigned {
                 Some((row, name)) => {
                     self.stack.push(Scope { row, kind: "variable", name });
                     self.visit_function_body(right);
                     self.stack.pop();
+                    walked.push(right.id());
                 }
                 None => self.visit_function_body(right),
             }
         }
+        walked
     }
 
     fn extract_import(&mut self, node: Node<'t>) {
@@ -955,9 +962,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes ∪ the fixed arrow/lambda list — python's
@@ -974,7 +985,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

@@ -14,6 +14,7 @@ const arrow = (x) => legacyHelper(x, 1);
 
 class Widget extends EventEmitter {
   static registry = new Map();
+  static hooks = { tick: legacyHelper };
   #privateField = 1;
   label = 'w';
   onTick = () => {
@@ -78,6 +79,7 @@ export default {
 // leaked to the FILE node; a non-exported object literal was skipped outright.
 const eagerConfig = loadConfig();
 const handlerMap = { onSave: () => persist(eagerConfig), onLoad: loadConfig() };
+const registry = { legacyHelper, run: arrow, nested: [legacyHelper] };
 const lazyList = [() => persist(eagerConfig)];
 // --- CommonJS export assignments (#1675) -----------------------------------
 exports.getItems = async (req, res) => { res.json(await findItems()); };

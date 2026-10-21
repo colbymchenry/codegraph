@@ -507,12 +507,14 @@ impl<'t> Walker<'t> {
             self.extract_enum(node);
             skip_children = true;
         } else if kind == "field_declaration" && self.inside_class_like() {
-            self.extract_field(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The initializers extract_field walked under their fields took
+            // their own candidates; the scan covers the rest.
+            let walked = self.extract_field(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "local_variable_declaration" && !self.inside_class_like() {
             self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_declaration" {
             self.extract_import(node);
@@ -726,8 +728,11 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractField — each declarator becomes a field/constant node.
-    fn extract_field(&mut self, node: Node<'t>) {
+    /// extractField — each declarator becomes a field/constant node. Returns
+    /// the initializers walked under their fields, for the declaration scan to
+    /// skip.
+    fn extract_field(&mut self, node: Node<'t>) -> Vec<usize> {
+        let mut walked = Vec::new();
         let docstring = preceding_docstring(node, self.src);
         let visibility = self.visibility_of(node);
         let is_static = Some(self.is_static(node));
@@ -786,6 +791,7 @@ impl<'t> Walker<'t> {
                         self.stack.push(Scope { row, kind: field_kind, name: name.clone() });
                         self.visit_function_body(value);
                         self.stack.pop();
+                        walked.push(value.id());
                     }
                 }
             }
@@ -805,6 +811,7 @@ impl<'t> Walker<'t> {
                 );
             }
         }
+        walked
     }
 
     /// extractVariable's generic fallback (top-level locals — rare in Java).
@@ -1230,9 +1237,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // (functionTypes is empty for Java; lambda_expression halts the scan)
@@ -1242,7 +1253,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
