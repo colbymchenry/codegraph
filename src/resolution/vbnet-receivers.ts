@@ -466,21 +466,27 @@ const VB_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
  * Members named `name` declared directly in `type` (any partial part of it),
  * case aside. A member is declared inside a part of its type, so it is looked
  * up in those parts' files: one lookup per type name, not one per member name.
+ * The parts are in the type's own project: SCrawler's plugins each declare a
+ * `UserData`, whose members are not one another's.
  */
 function membersNamed(type: Node, name: string, context: ResolutionContext): Node[] {
   let memo = VB_MEMBERS.get(context);
   if (!memo) VB_MEMBERS.set(context, (memo = new Map()));
+  const project = projectOf(type.filePath, context);
   const qn = `${type.qualifiedName}::${name}`.toLowerCase();
-  const hit = memo.get(qn);
+  const key = `${project}|${qn}`;
+  const hit = memo.get(key);
   if (hit) return hit;
   const own = type.qualifiedName.toLowerCase();
   const files = new Set([type.filePath]);
   for (const part of context.getNodesByLowerName(type.name.toLowerCase())) {
-    if (part.language === 'vbnet' && part.qualifiedName.toLowerCase() === own) files.add(part.filePath);
+    if (part.language === 'vbnet' && part.qualifiedName.toLowerCase() === own && projectOf(part.filePath, context) === project) {
+      files.add(part.filePath);
+    }
   }
   const members = [...files].flatMap((file) => nodesByQualifiedName(file, context).get(qn) ?? []);
   if (memo.size >= 65536) memo.delete(memo.keys().next().value!);
-  memo.set(qn, members);
+  memo.set(key, members);
   return members;
 }
 
@@ -848,6 +854,83 @@ function typesNamedAt(
   return { owners: [...tier.filter((c) => c.filePath === file), ...tier.filter((c) => c.filePath !== file)], ambiguous: distinct.size > 1 };
 }
 
+const VB_NAMESPACES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * Every namespace the project's VB.NET code is declared in, by its full name
+ * (lowercased, dot-joined, root namespace first), and each namespace around
+ * one: `acme`, `acme.billing`, `scrawler.api.reddit`.
+ */
+function knownNamespaces(context: ResolutionContext): Set<string> {
+  const hit = VB_NAMESPACES.get(context);
+  if (hit) return hit;
+  const known = new Set<string>();
+  const add = (segments: string[]) => {
+    for (let i = 1; i <= segments.length; i++) known.add(segments.slice(0, i).join('.'));
+  };
+  for (const n of context.getNodesByKind('namespace')) if (n.language === 'vbnet') add(fullSegments(n, context));
+  for (const file of context.getAllFiles()) if (/\.vb$/i.test(file)) add(projectInfo(file, context).root);
+  VB_NAMESPACES.set(context, known);
+  return known;
+}
+
+/** The namespace a line of a file is in, as full segments: its project's root namespace, then the `Namespace` block around it. */
+function namespaceAround(file: string, line: number, context: ResolutionContext): string[] {
+  const root = projectInfo(file, context).root;
+  const around = typesAround(file, line, context);
+  const outer = around[around.length - 1];
+  const cut = outer ? outer.qualifiedName.indexOf('::') : -1;
+  if (cut < 0) return root;
+  const head = outer!.qualifiedName.slice(0, cut).toLowerCase();
+  return nodesByQualifiedName(file, context).get(head)?.some((n) => n.kind === 'namespace') ? [...root, ...head.split('.')] : root;
+}
+
+/**
+ * The namespace a name written first in a path means where it is written,
+ * as full segments — as VB.NET looks one up: nested in a namespace around the
+ * read, the innermost first and the root namespaces last, else in one the
+ * file or its project imports. Null when no namespace of that name is there:
+ * `Billing` is Acme's `Billing` in Acme's code, and nothing in a project
+ * whose own namespaces don't have one.
+ */
+function namespaceNamed(name: string, ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  const known = knownNamespaces(context);
+  const key = name.toLowerCase();
+  const around = namespaceAround(ref.filePath, ref.line, context);
+  for (let i = around.length; i >= 0; i--) {
+    const candidate = [...around.slice(0, i), key];
+    if (known.has(candidate.join('.'))) return candidate;
+  }
+  for (const imported of importedNamespaces(ref.filePath, context)) {
+    const candidate = [...imported.split('.'), key];
+    if (known.has(candidate.join('.'))) return candidate;
+  }
+  return null;
+}
+
+/**
+ * The project types named `name` declared directly in namespace `ns` (full
+ * segments): the caller's project's, if it has one — SCrawler's projects
+ * share a root namespace — and null when that leaves two different types.
+ */
+function typesInNamespace(ns: string[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
+  const key = ns.join('.');
+  let found = projectTypesNamed(name, context, VB_READ_TYPE_KINDS)
+    .filter((c) => fullSegments(c, context).slice(0, -1).join('.') === key);
+  const own = found.filter((c) => sameVbProject(c.filePath, ref.filePath, context));
+  if (own.length > 0) found = own;
+  const distinct = new Set(found.map((c) => `${projectOf(c.filePath, context)}|${c.qualifiedName.toLowerCase()}`));
+  return distinct.size > 1 ? null
+    : [...found.filter((c) => c.filePath === ref.filePath), ...found.filter((c) => c.filePath !== ref.filePath)];
+}
+
+/** A member named `name` of a `Module` declared directly in namespace `ns`, which VB.NET reads through the namespace: `Assets.Logo`. */
+function moduleMemberIn(ns: string[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const key = ns.join('.');
+  return moduleMembersNamed(name, ref, context).find((n) =>
+    (VB_VALUE_KINDS.has(n.kind) || n.kind === 'method') && fullSegments(n, context).slice(0, -2).join('.') === key);
+}
+
 /** The call site's own file first, then its project's, the rest after, each in its given order. */
 export function preferVbProject(nodes: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
   if (nodes.length < 2) return nodes;
@@ -941,20 +1024,30 @@ function valueMemberType(member: Node, context: ResolutionContext, args: Readonl
 }
 
 /**
- * The type of what a receiver-less `name` reads where a call is: a member of
- * a class around the call or of one it inherits, else of a `Module`. Null when
- * it declares no type the source shows, undefined when nothing has the name.
+ * The member a receiver-less `name` reads where a call is: a field, property
+ * or function of a class around the call or of one it inherits (with what
+ * that class's type parameters stand for there), else of a `Module`.
  */
-function memberType(name: string, ref: UnresolvedRef, context: ResolutionContext): VbType | null | undefined {
+function memberAround(name: string, ref: UnresolvedRef, context: ResolutionContext): { node: Node; args: Map<string, VbType> } | undefined {
   const fits = (n: Node) => VB_VALUE_KINDS.has(n.kind) || n.kind === 'method';
   for (const around of typesAround(ref.filePath, ref.line, context)) {
     for (const { node, args } of ancestry(around, context)) {
       const member = membersNamed(node, name, context).find(fits);
-      if (member) return valueMemberType(member, context, args);
+      if (member) return { node: member, args };
     }
   }
   const global = moduleMembersNamed(name, ref, context).find(fits);
-  return global ? valueMemberType(global, context) : undefined;
+  return global ? { node: global, args: new Map() } : undefined;
+}
+
+/**
+ * The type of what a receiver-less `name` reads where a call is (see
+ * memberAround). Null when it declares no type the source shows, undefined
+ * when nothing has the name.
+ */
+function memberType(name: string, ref: UnresolvedRef, context: ResolutionContext): VbType | null | undefined {
+  const member = memberAround(name, ref, context);
+  return member ? valueMemberType(member.node, context, member.args) : undefined;
 }
 
 /** The type a method, function or property returns, read from its declaration; null for a `Sub` or none written. */
@@ -1378,6 +1471,11 @@ interface VbReceiver {
   throughType: boolean;
   /** The name is a value whose type has the same name (`theme As Theme`): VB.NET's "Color Color" rule. */
   colorColor?: boolean;
+  /**
+   * The receiver names a namespace (`Billing`, `Acme.Billing`), whose types and
+   * Modules' members are read through it: its full segments. No owners.
+   */
+  namespace?: string[];
 }
 
 /** `Name` for an escaped `[Name]`. */
@@ -1398,7 +1496,8 @@ function valueReceiver(t: VbType | null | undefined, context: ResolutionContext)
  * inherits, `{T}` a value of `T`. A name holds a value of its declared type
  * when it is a local, a parameter, or a member of a type around the read or
  * of a Module; any other name means the class, module, structure, interface
- * or enum it names there. A value whose type has its name (`Public Property
+ * or enum it names there, else a namespace (`Billing`, the root namespace
+ * `Acme`). A value whose type has its name (`Public Property
  * Settings As Settings`, `theme As Theme`) may mean either, by VB.NET's
  * "Color Color" rule: the member read through it decides (matchVbMemberRead).
  */
@@ -1419,17 +1518,29 @@ function receiverAt(head: string, ref: UnresolvedRef, context: ResolutionContext
     : bound && !bound.array && bound.name.toLowerCase() === name.toLowerCase() ? bound : null;
   if (!written) return valueReceiver(bound, context);
   const found = typesNamedAt(written, context, VB_READ_TYPE_KINDS);
-  return found.ambiguous || found.owners.length === 0 ? null
-    : { owners: found.owners, throughType: true, ...(bound ? { colorColor: true } : {}) };
+  if (found.ambiguous) return null;
+  if (found.owners.length > 0) return { owners: found.owners, throughType: true, ...(bound ? { colorColor: true } : {}) };
+  const namespace = bound === undefined ? namespaceNamed(name, ref, context) : null;
+  return namespace ? { owners: [], throughType: false, namespace } : null;
 }
 
 /**
  * What `name`, read through `at`, is as a receiver in turn: a value of the
  * type a field, property or function declares, or a type nested in a type
- * named for it (`Outer.Mode`). Null where the member, or its type, is not
- * known here.
+ * named for it (`Outer.Mode`); through a namespace, a type declared in it, a
+ * namespace nested in it, or the value one of its Modules' members holds.
+ * Null where the member, or its type, is not known here.
  */
 function memberAt(at: VbReceiver, name: string, ref: UnresolvedRef, context: ResolutionContext): VbReceiver | null {
+  if (at.namespace) {
+    const types = typesInNamespace(at.namespace, name, ref, context);
+    if (types === null) return null;
+    if (types.length > 0) return { owners: types, throughType: true };
+    const nested = [...at.namespace, name.toLowerCase()];
+    if (knownNamespaces(context).has(nested.join('.'))) return { owners: [], throughType: false, namespace: nested };
+    const member = moduleMemberIn(at.namespace, name, ref, context);
+    return member ? valueReceiver(valueMemberType(member, context), context) : null;
+  }
   if (at.owners.length === 0) return null;
   const fits = (n: Node) => VB_INSTANCE_READ_KINDS.has(n.kind) || (at.throughType && VB_READ_TYPE_KINDS.has(n.kind));
   const found = memberOn(at.owners, name, ref, context, true, at.typed, fits) ??
@@ -1482,6 +1593,116 @@ function namesWithoutRunning(ref: UnresolvedRef, context: ResolutionContext): bo
   return /\b(?:AddressOf\s+|NameOf\s*\(\s*)$/i.test(line.slice(0, Math.max(0, ref.column)));
 }
 
+const VB_NO_ARGUMENTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether VB.NET can call a method with no arguments: it declares no
+ * parameter, or only `Optional` ones and a `ParamArray`. Read from its
+ * declaration; true when that can't be read.
+ */
+function takesNoArguments(n: Node, context: ResolutionContext): boolean {
+  let memo = VB_NO_ARGUMENTS.get(context);
+  if (!memo) VB_NO_ARGUMENTS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const code = codeLines(n.filePath, context).slice(n.startLine - 1, n.startLine + 6).join(' ');
+  const head = new RegExp(`\\b(?:Sub|Function)\\s+\\[?${escapeRegex(unescaped(n.name))}\\]?(?![\\w$%&!#@])`, 'i').exec(code);
+  let none = true;
+  if (head) {
+    let at = head.index + head[0].length;
+    // `Function Parse(Of T)(text As String)`: the type parameters come first.
+    if (/^\s*\(\s*Of\b/i.test(code.slice(at))) at = closeParen(code, code.indexOf('(', at)) + 1;
+    const open = at > 0 ? /^\s*\(/.exec(code.slice(at)) : null;
+    const params = open ? splitArgs(code, at + open[0].length - 1) : null;
+    none = !params || params.every((p) => {
+      const param = p.replace(/<[^<>]*>/g, '').replace(/^[\s_]+/, '');
+      return param === '' || /^(?:(?:ByVal|ByRef)\s+)*(?:Optional|ParamArray)\b/i.test(param);
+    });
+  }
+  memo.set(n.id, none);
+  return none;
+}
+
+/**
+ * The overload of `member` (a method) that VB.NET runs where a reference
+ * names it without parentheses: one that takes no arguments — `Me.Load` is
+ * `Load(Optional force = False)`, not `Load(path)` — and never the member
+ * the reference is in: a constructor's `Me.New` is another constructor.
+ * `member` itself when its overloads don't tell; null when the only one is
+ * the member the reference is in.
+ */
+function runnableOverload(member: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const cut = member.qualifiedName.lastIndexOf('::');
+  const owner = cut > 0 ? context.getNodesByQualifiedName(member.qualifiedName.slice(0, cut))
+    .find((n) => n.language === 'vbnet' && VB_TYPE_KINDS.has(n.kind)) : undefined;
+  const project = projectOf(member.filePath, context);
+  const overloads = owner ? membersNamed(owner, member.name, context)
+    .filter((n) => n.kind === 'method' && projectOf(n.filePath, context) === project) : [];
+  const others = overloads.filter((n) => n.id !== ref.fromNodeId);
+  if (others.length === 0) return member.id === ref.fromNodeId ? null : member;
+  const runnable = others.filter((n) => takesNoArguments(n, context));
+  const pool = runnable.length > 0 ? runnable : others;
+  return pool.find((n) => n.id === member.id) ?? pool[0]!;
+}
+
+/**
+ * The field, property or Module variable a bare name before the dot reads as
+ * well, where VB.NET binds the name to one: `Button1` in `Button1.Text` is
+ * the form's own control, `Title` a field its class inherits, `Current` a
+ * variable of one of its project's Modules — whatever the member read through
+ * it. Null for a parameter or local of that name, which hides the member;
+ * for `Me`, `MyBase` and a `{T}` value; for a `With` block's `.Text`, whose
+ * `With` names the value; and for a member declared as a type of its own name
+ * from outside the project (`Responser As Responser`): VB.NET reads that
+ * type's Shared members and nested types through the type, not the member,
+ * and nothing here shows which these are.
+ */
+function headMemberOf(head: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  if (head.startsWith('{') || /^(?:Me|MyClass|MyBase)$/i.test(head)) return null;
+  const name = unescaped(head);
+  // The name itself starts the access where the reference is: `Button1` or `[Button1]`, then the dot.
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const bracketed = line[ref.column] === '[';
+  let at = ref.column + (bracketed ? 1 : 0);
+  if (line.slice(at, at + name.length).toLowerCase() !== name.toLowerCase()) return null;
+  at += name.length;
+  if (bracketed && line[at++] !== ']') return null;
+  while (line[at] === ' ' || line[at] === '\t') at++;
+  if (line[at] !== '.') return null;
+  if (localBinding(name, ref, context)) return null;
+  const found = memberAround(name, ref, context);
+  const member = found?.node;
+  if (!member || !VB_VALUE_KINDS.has(member.kind) || member.id === ref.fromNodeId) return null;
+  // Another project's Module is one this code can't name without a reference to it.
+  const cut = member.qualifiedName.lastIndexOf('::');
+  const foreign = projectOf(member.filePath, context) !== projectOf(ref.filePath, context);
+  if (foreign && cut > 0 && isModule(member.qualifiedName.slice(0, cut), context)) return null;
+  return isOutsideNamesake(member, found!.args, context) ? null : member;
+}
+
+const VB_NAMESAKES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a member is declared as a type of its own name that isn't one of
+ * the project's (`Responser As Responser`), or names two of them: a read
+ * through its name may be one through that type, which nothing here can tell.
+ */
+function isOutsideNamesake(member: Node, args: ReadonlyMap<string, VbType>, context: ResolutionContext): boolean {
+  let memo = VB_NAMESAKES.get(context);
+  if (!memo) VB_NAMESAKES.set(context, (memo = new Map()));
+  // What a type parameter stands for depends on where the member is reached from.
+  const hit = args.size === 0 ? memo.get(member.id) : undefined;
+  if (hit !== undefined) return hit;
+  const declared = valueMemberType(member, context, args);
+  let namesake = false;
+  if (declared && !declared.array && declared.name.toLowerCase() === unescaped(member.name).toLowerCase()) {
+    const types = typesNamedAt(declared, context, VB_READ_TYPE_KINDS);
+    namesake = types.ambiguous || types.owners.length === 0;
+  }
+  if (args.size === 0) memo.set(member.id, namesake);
+  return namesake;
+}
+
 /**
  * Resolve a VB.NET member read or write to the member the receiver's type
  * declares or inherits. Through a type's name (#2305) — `AppSession.SessionId`,
@@ -1494,7 +1715,12 @@ function namesWithoutRunning(ref: UnresolvedRef, context: ResolutionContext): bo
  * mean. A value named like its type (`theme As Theme`) reads an instance
  * member as a value does and a Shared one as the type does, by VB.NET's
  * "Color Color" rule. A method named either way is called, as without
- * parentheses VB.NET runs it, unless `AddressOf` or `NameOf` only names it.
+ * parentheses VB.NET runs it — the overload that takes no arguments — unless
+ * `AddressOf` or `NameOf` only names it. Through a namespace — `Billing.Invoice`,
+ * `Acme.Billing.Invoice.MaxLines`, a Module's `Assets.Logo` — it links the type
+ * or the Module's member the namespace declares. A bare name before the dot
+ * that is a field, property or Module variable (`Button1` of `Button1.Text`)
+ * is read too, whatever the member read through it.
  * Null when a link of the path is not typed here (an outside type:
  * `Color.Red`, `str.Length`), is late-bound (`Object`), or names two of the
  * project's types.
@@ -1504,10 +1730,11 @@ export function matchVbMemberRead(ref: UnresolvedRef, context: ResolutionContext
   if (!m) return null;
   const links = m[2] ? m[2].slice(1).split('.') : [];
   const at = pathReceiver(m[1]!, links, ref, context);
-  if (!at || at.owners.length === 0) return null;
   // `MySettings.Default` reads the property declared `[Default]`, and back.
   const name = unescaped(m[3]!);
   const calls = (member: Node) => member.kind === 'method' && !namesWithoutRunning(ref, context);
+  // A method VB.NET runs here is the overload it can call without arguments.
+  const run = (member: Node | undefined): Node | null => (!member ? null : calls(member) ? runnableOverload(member, ref, context) : member);
   const throughValue = (member: Node): ResolvedRef => ({
     original: ref,
     targetNodeId: member.id,
@@ -1515,13 +1742,36 @@ export function matchVbMemberRead(ref: UnresolvedRef, context: ResolutionContext
     resolvedBy: 'instance-method',
     ...(calls(member) ? { edgeKind: 'calls' as const } : {}),
   });
+  // The member a bare name before the dot reads, beside what is read through
+  // it. A method run through the name (`Button1.PerformClick`) is linked alone,
+  // as a call written with parentheses is.
+  const withHead = (read: ResolvedRef | null): ResolvedRef | null => {
+    const head = links.length === 0 ? headMemberOf(m[1]!, ref, context) : null;
+    if (!head) return read;
+    if (!read) return { original: ref, targetNodeId: head.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    return read.edgeKind === 'calls' ? read : { ...read, alsoTargets: [...(read.alsoTargets ?? []), { targetNodeId: head.id }] };
+  };
+  if (at?.namespace) {
+    // A type, or a Module's member, read through its namespace.
+    const types = typesInNamespace(at.namespace, name, ref, context);
+    const target = types?.[0] ?? (types ? run(moduleMemberIn(at.namespace, name, ref, context)) : null);
+    if (!target || target.id === ref.fromNodeId) return null;
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: target.kind === 'method' ? 0.85 : 0.9,
+      resolvedBy: 'qualified-name',
+      ...(calls(target) ? { edgeKind: 'calls' as const } : {}),
+    };
+  }
+  if (!at || at.owners.length === 0) return withHead(null);
   if (!at.throughType) {
     // The member the name means: the nearest the type declares or inherits.
     // The read's own member (`Return Me.Count` in `Count`) runs itself.
     const fits = (n: Node) => VB_INSTANCE_READ_KINDS.has(n.kind);
-    const member = (memberOn(at.owners, name, ref, context, true, at.typed, fits) ??
-      memberOn(at.owners, `[${name}]`, ref, context, true, at.typed, fits))?.node;
-    return member && member.id !== ref.fromNodeId ? throughValue(member) : null;
+    const member = run((memberOn(at.owners, name, ref, context, true, at.typed, fits) ??
+      memberOn(at.owners, `[${name}]`, ref, context, true, at.typed, fits))?.node);
+    return withHead(member && member.id !== ref.fromNodeId ? throughValue(member) : null);
   }
   // Not the member the read is written in: staxrip's `Overrides ReadOnly
   // Property Package` returns the class's `Shared ReadOnly Property Package`.
@@ -1534,9 +1784,10 @@ export function matchVbMemberRead(ref: UnresolvedRef, context: ResolutionContext
     const found = member;
     member = context.getNodesByQualifiedName(found.qualifiedName).find((n) => n.isStatic && n.filePath === found.filePath && fits(n)) ?? found;
   }
+  member = run(member) ?? member;
   // "Color Color": a value named like its type (`theme As Theme`) reads an
   // instance member through itself, and only a Shared one through the type.
-  if (at.colorColor && !isSharedMember(member, context)) return throughValue(member);
+  if (at.colorColor && !isSharedMember(member, context)) return withHead(throughValue(member));
   if (member.kind === 'method') {
     return {
       original: ref,
@@ -1649,7 +1900,7 @@ export function isVbMemberInScope(n: Node, ref: UnresolvedRef, context: Resoluti
 export function clearVbnetReceiverMemos(context: ResolutionContext): void {
   for (const memo of [VB_CODE_LINES, VB_WORD_LINES, VB_BINDINGS, VB_FILE_TYPES, VB_FILE_QNS, VB_MEMBERS, VB_MODULES, VB_SUPERS, VB_ANCESTRIES,
     VB_PROJECTS, VB_PROJECT_INFO, VB_FILE_IMPORTS, VB_ALIASES, VB_BASE_NAMES, VB_TYPE_PARAMS, VB_EXTENSIONS, VB_TYPE_IMPORTS,
-    VB_SCOPES] as Array<WeakMap<ResolutionContext, unknown>>) {
+    VB_SCOPES, VB_NAMESPACES, VB_NO_ARGUMENTS, VB_NAMESAKES] as Array<WeakMap<ResolutionContext, unknown>>) {
     memo.delete(context);
   }
 }
