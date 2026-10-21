@@ -9244,6 +9244,35 @@ function matchRustSelfPath(name: string, ref: UnresolvedRef, context: Resolution
 }
 
 /**
+ * A Rust call through a generic type parameter of the function or `impl`
+ * around it — `Key::get(…)` in protobuf's `fn map_get<Key: MapKey>`, with
+ * `trait MapKey: FfiMapKey` — is to the method one of the traits its bounds
+ * name declares, or one of the traits they extend: `FfiMapKey::get`. Bounds
+ * only from outside the project (`T: Default`) name no project method, nor do
+ * two traits that both declare it: null. Undefined when `name` is no generic
+ * parameter there.
+ */
+function matchRustGenericPath(name: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return undefined;
+  const written: RustWrittenType = { text: name, file: ref.filePath, at: (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column) };
+  const bounds = rustGenericBounds(name, written, context);
+  if (bounds === undefined) return undefined;
+  const traits = bounds.filter((b) => !/^['?]/.test(b.trim()) && !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
+  if (traits.length === 0) return null;
+  const result = rustTraitsMethodCall(traits, written, method, ref, context);
+  if (result === 'unread') return null;
+  // (The bound names the trait, so its method is reached as a typed call is:
+  // its missing `pub` doesn't hide it from another module.)
+  if (result) {
+    let typed = RUST_TYPED_REFS.get(context);
+    if (!typed) RUST_TYPED_REFS.set(context, (typed = new WeakSet()));
+    typed.add(ref);
+  }
+  return result;
+}
+
+/**
  * Whether `candidate` is declared directly in an inline `mod <name> { … }` of
  * its own file — the only way a path through `name` reaches it, since an
  * inline module adds nothing to its items' qualified names. The module is the
@@ -18744,6 +18773,11 @@ export function matchMethodCall(
   if (ref.language === 'rust' && match === colonMatch && objectOrClass === 'Self') {
     const own = matchRustSelfPath(methodName!, ref, context);
     if (own !== undefined) return own;
+  }
+  // A Rust `T::x(…)` through a generic parameter: the method its bounds' traits declare (matchRustGenericPath).
+  if (ref.language === 'rust' && match === colonMatch && /^[A-Z]\w*$/.test(objectOrClass!) && objectOrClass !== 'Self') {
+    const bounded = matchRustGenericPath(objectOrClass!, methodName!, ref, context);
+    if (bounded !== undefined) return bounded;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
