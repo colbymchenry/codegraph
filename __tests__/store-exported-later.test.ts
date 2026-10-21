@@ -48,6 +48,20 @@ describe('store actions on a later-exported const', () => {
     expect(fnNames(asDefault)).toContain('bump');
   });
 
+  it.each([
+    ['items$', 'export { items$ };', true],
+    ['$items', 'export { $items as default };', true],
+    ['items', 'export { items$ };', false],
+    ['items', 'export { $items };', false],
+  ] as const)('an export clause names %s only whole: `%s`', (name, exportLine, kept) => {
+    // A `$` belongs to the name: `items$` is exported, `items` is not.
+    const code = `
+      const ${name} = create((set) => ({ inc: () => set({}) }))
+      ${exportLine}
+    `;
+    expect(fnNames(code).includes('inc')).toBe(kept);
+  });
+
   it('a const nothing exports keeps its members out of the graph', () => {
     const code = `
       const useStore = create((set) => ({ bump: () => set({}) }))

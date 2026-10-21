@@ -7,6 +7,8 @@
  *  - the type is looked up in the LEXICAL namespaces of the call site — for
  *    `second::use()` writing `Widget w;`, `second::Widget` before a global
  *    `Widget`; a `::T` spelling is global only;
+ *  - a type named through a `typedef` / `using` alias is the type the alias
+ *    names, looked up from the alias's own scope (cpp-type-aliases.ts);
  *  - among that type's constructors, the single overload whose parameter
  *    count admits the argument count wins (defaults and `...` widen a range);
  *    two admitting overloads (`T(int)` / `T(double)` for `T w(x)`) resolve to
@@ -17,6 +19,7 @@
  */
 import type { Node } from '../types';
 import type { ResolvedRef, ResolutionContext, UnresolvedRef } from './types';
+import { resolveCppAliasedType } from './cpp-type-aliases';
 
 const CONSTRUCTOR_REF = /^(.*)::([^:]+)\/(\d+)$/;
 
@@ -80,14 +83,26 @@ function constructorShape(signature: string | undefined): { min: number; max: nu
 export function matchCppConstructor(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const match = ref.referenceName.match(CONSTRUCTOR_REF);
   if (!match) return null;
-  const [, rawType, name, count] = match;
-  const type = rawType!.replace(/^::/, '');
-  if (type.split('::').pop() !== name) return null;
+  const [, rawType, ctorName, count] = match;
+  let type = rawType!.replace(/^::/, '');
+  if (type.split('::').pop() !== ctorName) return null;
   const argc = Number(count);
 
   // Innermost lexical namespace first, then outward, then global.
   const caller = context.getNodeById?.(ref.fromNodeId);
-  const scopes = rawType!.startsWith('::') ? [] : (caller?.qualifiedName.split('::') ?? []);
+  let scopes = rawType!.startsWith('::') ? [] : (caller?.qualifiedName.split('::') ?? []);
+  // A type named through an alias (`Table::Iterator iter(&table_);` under
+  // `typedef SkipList<…> Table;`) constructs the type the alias names, looked
+  // up from where the alias wrote it — never an outer class the alias hides.
+  if (!rawType!.startsWith('::')) {
+    const aliased = resolveCppAliasedType(type, ref, context);
+    if (aliased === null) return null;
+    if (aliased) {
+      type = [...aliased.target, ...aliased.rest].join('::');
+      scopes = aliased.scope ? aliased.scope.split('::') : [];
+    }
+  }
+  const name = type.split('::').pop()!;
   const candidates: string[] = [];
   for (let i = scopes.length; i > 0; i--) candidates.push(`${scopes.slice(0, i).join('::')}::${type}`);
   candidates.push(type);
@@ -98,7 +113,7 @@ export function matchCppConstructor(ref: UnresolvedRef, context: ResolutionConte
       .filter((n) => n.language === 'cpp' && (n.kind === 'class' || n.kind === 'struct' || n.kind === 'union'));
     if (owners.length === 0) continue;
     const constructors = context
-      .getNodesByName(name!)
+      .getNodesByName(name)
       .filter((n) => n.language === 'cpp' && n.kind === 'method' && n.qualifiedName === `${qualified}::${name}`);
     // Brace-init prefers an initializer_list overload over arity — that
     // choice needs the argument types, so decline.

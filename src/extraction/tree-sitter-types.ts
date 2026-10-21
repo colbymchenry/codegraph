@@ -54,6 +54,13 @@ export interface ExtractorContext {
   visitNode(node: SyntaxNode): void;
   /** Visit a function body to extract calls */
   visitFunctionBody(body: SyntaxNode, functionId: string): void;
+  /**
+   * Walk a declaration's initializer as code the scope on top of the stack
+   * runs, the way a function body is walked. When the hook then reports the
+   * node handled, the function-as-value scan the dispatcher runs over it skips
+   * what was walked here: the walk captured those candidates already.
+   */
+  walkInitializer(node: SyntaxNode): void;
   /** Add an unresolved reference */
   addUnresolvedReference(ref: UnresolvedReference): void;
   /** Push a node ID onto the scope stack (for containment/qualified name building) */
@@ -94,6 +101,14 @@ export interface LanguageExtractor {
 
   /** Node types that represent functions */
   functionTypes: string[];
+  /**
+   * A bodiless function that is the function's whole declaration, not one
+   * overload of an implementation that follows it: TypeScript's
+   * `function_signature` in an ambient context (`declare function f(): void;`,
+   * a declaration file's own or its `declare module` body's), never in a
+   * namespace. Extracted as a function, like a `functionTypes` node.
+   */
+  isAmbientFunction?: (node: SyntaxNode, filePath: string) => boolean;
   /** Node types that represent classes */
   classTypes: string[];
   /** Node types that represent methods */
@@ -159,6 +174,51 @@ export interface LanguageExtractor {
    * their own variants. Returns cleaned prose, or undefined when there is none.
    */
   getBodyDocstring?: (node: SyntaxNode, source: string) => string | undefined;
+  /**
+   * The node that wraps `node` and stands in its place among the declarations
+   * around it, when the grammar adds one. The doc comment and annotations
+   * written before the declaration precede that wrapper, so both are looked up
+   * from it. Dart wraps a member with no body (`Foo._();`, an abstract
+   * `void m();`) in a `declaration` node, and Go a type declared on its own
+   * (`type Foo struct{…}`) in a `type_declaration`. Returns undefined when
+   * there is none.
+   */
+  getDeclarationWrapper?: (node: SyntaxNode) => SyntaxNode | undefined;
+  /**
+   * Node types that may stand between a declaration and the comments written
+   * above it without ending the comment run its docstring is read from. Dart
+   * writes annotations there (`/// Builds it.` `@override` `Widget build(…)`):
+   * each one is stepped over, and comments on either side of it still join.
+   */
+  docstringStepOverTypes?: string[];
+  /**
+   * Leave out of a docstring the comments that belong to the line above it:
+   * one written after code on its line, and any that begins on the line such
+   * a comment ends. In Go, `var origin = Point{} // the origin.` comments that
+   * line and never documents the declaration below it.
+   */
+  docstringSkipsTrailingComments?: boolean;
+  /**
+   * Keep in a docstring only the comments that end on the line right above
+   * the declaration, together with the ones written on the lines just before
+   * them: a blank line ends it. That is Go's doc comment, the one go doc
+   * shows, so a section banner or a note a blank line separates from a
+   * declaration documents nothing.
+   */
+  docstringSkipsDetachedComments?: boolean;
+  /**
+   * Leave out of a docstring's text the comment directives Go tools read, like
+   * `//go:embed static`, `//nolint:errcheck` or `//export F`, as go doc does:
+   * a declaration whose only comment is a directive has no doc.
+   */
+  docstringSkipsDirectives?: boolean;
+  /**
+   * Node types that may stand between a declaration and the decorators written
+   * before it without ending the scan for them. Dart writes comments there
+   * (`@override` `// ignore: must_call_super` `void f()`), and an annotation
+   * always belongs to the declaration that follows it.
+   */
+  decoratorStepOverTypes?: string[];
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */
@@ -277,6 +337,14 @@ export interface LanguageExtractor {
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * The scope a class, struct or union declaration writes its name in, when
+   * it does: C++'s `SkipList` for an out-of-line nested class `struct
+   * SkipList<Key, Comparator>::Node`. The class is qualified under it the way
+   * an out-of-line method is under its receiver, and so are its members.
+   */
+  getClassScope?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
    * Extract a function/method's normalized return type name (bare class name,
    * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
    * by C/C++ so resolution can infer a chained receiver's type from what the
@@ -310,6 +378,16 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Detect a member read that may run code — Dart's `x.area`, which calls the
+   * getter `area` when `area` is one. Returns the ref name (`x.area`) and the
+   * node to position it on, or undefined. Emitted as a `references` ref from
+   * the function the read is in; the resolver links it only to a getter, with
+   * a `calls` edge (a plain field read links nothing). `parent` is the node's
+   * parent, handed down by the body walker.
+   */
+  extractMemberRead?: (node: SyntaxNode, parent?: SyntaxNode) => { name: string; node: SyntaxNode } | undefined;
 
   /**
    * Node types representing a file-level package/namespace declaration

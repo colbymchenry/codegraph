@@ -25,7 +25,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = (p) => path.join(ROOT, 'dist', p);
@@ -106,9 +106,11 @@ if (files.length === 0) {
 }
 
 // --- load the built engine ---------------------------------------------------
-const { extractFromSource } = await import(dist('extraction/tree-sitter.js'));
-const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(dist('extraction/grammars.js'));
-const kernel = await import(dist('extraction/kernel/index.js'));
+// As file:// URLs: import() rejects a bare `C:\...` path on Windows
+// (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+const { extractFromSource } = await import(pathToFileURL(dist('extraction/tree-sitter.js')).href);
+const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(pathToFileURL(dist('extraction/grammars.js')).href);
+const kernel = await import(pathToFileURL(dist('extraction/kernel/index.js')).href);
 
 await initGrammars();
 await loadGrammarsForLanguages([...KERNEL_LANGS]);

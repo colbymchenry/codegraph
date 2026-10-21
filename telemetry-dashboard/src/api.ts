@@ -6,8 +6,8 @@
  * - **Rollups only.** Every panel is answered from `daily_*`, `machine_days` and
  *   `machine_first_seen`, which are kept forever. No panel reads raw `events`:
  *   D1 runs one query at a time per database, so one slow scan there fails every
- *   panel queued behind it. (/api/meta reads the table's first and last day, one
- *   indexed lookup each.)
+ *   panel queued behind it. (/api/meta reads the table's first and last day, and
+ *   `usage_daily`'s last, one indexed lookup each.)
  * - **Today is in range; uncounted days are not zeros.** Rolled-up numbers stop
  *   at the nightly rollup's last day and come back null after it, so a chart
  *   ending today draws a gap where the count has not happened yet, not a cliff.
@@ -214,6 +214,7 @@ interface MetaRow {
   earliest_active_day: string | null;
   earliest_raw_day: string | null;
   latest_raw_day: string | null;
+  latest_usage_day: string | null;
   machines_yesterday: number | null;
 }
 
@@ -246,6 +247,7 @@ async function meta(env: Env): Promise<ApiResult> {
             (SELECT min(day) FROM machine_days)       AS earliest_active_day,
             (SELECT min(day) FROM events)             AS earliest_raw_day,
             (SELECT max(day) FROM events)             AS latest_raw_day,
+            (SELECT max(day) FROM usage_daily)        AS latest_usage_day,
             (SELECT count(*) FROM machine_days WHERE day = ?) AS machines_yesterday`,
   )
     .bind(yesterday)
@@ -253,11 +255,22 @@ async function meta(env: Env): Promise<ApiResult> {
 
   const latestRollup = row?.latest_rollup_day ?? null;
   const latestRaw = row?.latest_raw_day ?? null;
+  const latestUsage = row?.latest_usage_day ?? null;
   const latestActive = row?.latest_active_day ?? null;
+  // Ingest stores lifecycle events in `events` and usage counters in `usage_daily`, so
+  // either one arriving means it is working — a day of usage and no installs or index
+  // runs is quiet, not stalled.
+  const latestIngest =
+    latestUsage !== null && (latestRaw === null || latestUsage > latestRaw) ? latestUsage : latestRaw;
 
-  // Nothing at all since before yesterday. (Client clocks may run a few minutes
-  // ahead, so the latest day can be tomorrow — that is fresh, not stale.)
-  const ingestStalled = latestRaw !== null && latestRaw < yesterday;
+  // Stalled: nothing stored since before yesterday. (Client clocks may run a few
+  // minutes ahead, so the latest day can be tomorrow — that is fresh, not stale.) Usage
+  // counters get a day more, because a client uploads a day's counters only once that
+  // day is over: just after midnight UTC the newest one can be the day before yesterday.
+  const ingestStalled =
+    latestIngest !== null &&
+    (latestRaw === null || latestRaw < yesterday) &&
+    (latestUsage === null || latestUsage < addDays(today, -2));
   // The 00:30 UTC run rolls up yesterday, so the day before that must always be in
   // by now. Only "behind" if there was activity after the last rolled-up day — a day
   // nobody used codegraph would be a silent rollup, not a missed one.
@@ -274,7 +287,12 @@ async function meta(env: Env): Promise<ApiResult> {
       latest_rollup_day: latestRollup,
       latest_active_day: latestActive,
       earliest_raw_day: row?.earliest_raw_day ?? null,
+      /** The last day of a stored lifecycle event (install, index, uninstall). */
       latest_raw_day: latestRaw,
+      /** The last day of a stored usage counter. */
+      latest_usage_day: latestUsage,
+      /** The later of the two: the last day ingest stored anything, which the stall banner names. */
+      latest_ingest_day: latestIngest,
       machines_yesterday: row?.machines_yesterday ?? 0,
       rollup_behind: rollupBehind,
       ingest_stalled: ingestStalled,
@@ -670,17 +688,18 @@ interface ActivationRow {
  * reinstalls does not re-enter the funnel, which is what makes this a
  * conversion rate rather than an install-event ratio.
  *
- * "Ran an index" is `machine_first_seen.first_index_day`, which the nightly rollup
- * keeps at the earliest day each machine indexed. That makes this a range read over
- * one small table. It used to be a join against raw `events` — on production volume
- * ~55 s per week of cohorts, which held D1's single query lane long enough to fail
- * every other panel waiting behind it. A first index day is never before the first
- * day (the ingest path keeps first_day at the machine's earliest event), so "within
- * the window" is just `first_index_day <= first_day + window`.
+ * "Ran an index" is `machine_first_seen.first_index_day`, the earliest day each
+ * machine indexed. The ingest worker lowers it as each index event is stored — so a
+ * run that uploads days late still counts — and the nightly rollup re-derives it from
+ * raw events. That makes this a range read over one small table. It used to be a
+ * join against raw `events` — on production volume ~55 s per week of cohorts, which
+ * held D1's single query lane long enough to fail every other panel waiting behind
+ * it. A first index day is never before the first day (the ingest path keeps
+ * first_day at the machine's earliest event), so "within the window" is just
+ * `first_index_day <= first_day + window`.
  *
- * Because first_index_day is rolled up, cohorts after the rollup's last day have no
- * conversions counted yet. They are left out of the totals and drawn as gaps —
- * counting them would show a drop in conversion that is only a lag.
+ * Cohorts after the rollup's last day are left out of the totals and drawn as gaps,
+ * like every other rolled-up number on the page.
  */
 async function activation(env: Env, url: URL, range: Range): Promise<ApiResult> {
   const rawWindow = url.searchParams.get('window');
