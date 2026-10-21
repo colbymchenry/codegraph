@@ -32,7 +32,7 @@ const DECLARATION_KINDS: ReadonlySet<string> = new Set([
 /** How far past a declaration's first line its head can run: a parameter list may take a line per parameter. */
 const HEAD_LINES = 40;
 
-const memos = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+const memos = new WeakMap<ResolutionContext, Map<string, ReadonlyMap<string, string | undefined>>>();
 
 /** Drop the memos (see ReferenceResolver.clearCaches). */
 export function clearTypeParameterMemos(context: ResolutionContext): void {
@@ -69,6 +69,23 @@ export function gateTypeParameter(resolved: ResolvedRef | null, ref: UnresolvedR
     if (!chosen) return null;
     result = { ...result, targetNodeId: chosen.id };
   }
+  // A C++ name qualified by a template parameter is a member of whatever type
+  // the template is instantiated with: rocksdb's `CacheShard::ComputeHash(…)`
+  // in `template <class CacheShard> class ShardedCache` is not the
+  // `ClockCacheShard::ComputeHash` a guess by name reaches. Only the
+  // parameter's default is known: protobuf's `Parser::ParseLoop(…)` under
+  // `template <typename Parser = TcParser>` is TcParser's for every caller
+  // that passes no parser.
+  if (ref.language === 'cpp') {
+    const qualifier = /^([A-Za-z_]\w*)::/.exec(ref.referenceName)?.[1];
+    if (qualifier) {
+      for (const declaration of enclosingDeclarations(ref, context)) {
+        const parameters = declaredTypeParameters(declaration, context);
+        if (!parameters.has(qualifier)) continue;
+        return isMemberOfDefault(result, parameters.get(qualifier), context) ? result : null;
+      }
+    }
+  }
   if (!GENERIC_LANGUAGES.has(ref.language) || !TYPE_REF_KINDS.has(ref.referenceKind)) return result;
   const name = ref.referenceName;
   if (!/^[A-Z][A-Za-z0-9_]*$/.test(name)) return result;
@@ -76,6 +93,14 @@ export function gateTypeParameter(resolved: ResolvedRef | null, ref: UnresolvedR
     if (declaredTypeParameters(declaration, context).has(name)) return null;
   }
   return result;
+}
+
+/** Whether the resolved target is a member of the class a C++ template parameter defaults to (`= TcParser`, `= std::allocator<T>`). */
+function isMemberOfDefault(result: ResolvedRef, fallback: string | undefined, context: ResolutionContext): boolean {
+  const type = fallback === undefined ? undefined : /([A-Za-z_]\w*)\s*(?:<[\s\S]*>)?\s*$/.exec(fallback)?.[1];
+  if (!type) return false;
+  const segments = context.getNodeById?.(result.targetNodeId)?.qualifiedName.split('::') ?? [];
+  return segments.length >= 2 && segments[segments.length - 2] === type;
 }
 
 const SCALA_OWNER_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'module', 'interface', 'struct', 'enum']);
@@ -129,7 +154,8 @@ function enclosingDeclarations(ref: UnresolvedRef, context: ResolutionContext): 
     .filter((n) => DECLARATION_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line);
 }
 
-function declaredTypeParameters(node: Node, context: ResolutionContext): ReadonlySet<string> {
+/** The type parameters a declaration declares, each with the default a C++ head gives it (`typename Parser = TcParser`). */
+function declaredTypeParameters(node: Node, context: ResolutionContext): ReadonlyMap<string, string | undefined> {
   let memo = memos.get(context);
   if (!memo) {
     memo = new Map();
@@ -137,12 +163,14 @@ function declaredTypeParameters(node: Node, context: ResolutionContext): Readonl
   }
   const hit = memo.get(node.id);
   if (hit) return hit;
-  const names = new Set<string>();
+  const names = new Map<string, string | undefined>();
   const lines = context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? null;
   if (lines) {
     const head = lines.slice(node.startLine - 1, Math.min(node.endLine, node.startLine - 1 + HEAD_LINES)).join('\n');
     const at = nameIndex(head, node.name);
-    if (at >= 0) {
+    // (C++ declares them only in a `template <…>` head, below: the `<…>` after
+    // a C++ class's name is a specialization's arguments.)
+    if (at >= 0 && node.language !== 'cpp') {
       // After the declared name: `Foo<T>`, `f[A]`.
       let open = at + node.name.length;
       while (open < head.length && /[ \t]/.test(head[open]!)) open++;
@@ -159,11 +187,13 @@ function declaredTypeParameters(node: Node, context: ResolutionContext): Readonl
       const receiver = /^\s*func\s*\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*[A-Za-z_]\w*\s*\[/.exec(head);
       if (receiver) collect(head, receiver[0].length - 1, names);
     }
-    // C++: `template <typename T, class U>` on the lines just above.
+    // C++: `template <typename T, class U>` on the lines just above. Each
+    // parameter is named last: `int N = 0`, `detail::fixed_string S` and
+    // `std::integral T` declare N, S and T.
     if (node.language === 'cpp') {
       const above = lines.slice(Math.max(0, node.startLine - 3), node.startLine).join('\n');
       const template = /\btemplate\s*</g;
-      for (let m = template.exec(above); m; m = template.exec(above)) collect(above, m.index + m[0].length - 1, names);
+      for (let m = template.exec(above); m; m = template.exec(above)) collect(above, m.index + m[0].length - 1, names, true);
     }
   }
   memo.set(node.id, names);
@@ -231,15 +261,26 @@ function nameIndex(head: string, name: string): number {
   return -1;
 }
 
-/** Add the parameter names of the bracket group opening at `open`. */
-function collect(text: string, open: number, names: Set<string>): void {
+/**
+ * Add the parameter names of the bracket group opening at `open`. With
+ * `lastWord` (C++), each is the last word before its default, which is kept.
+ */
+function collect(text: string, open: number, names: Map<string, string | undefined>, lastWord = false): void {
   const close = matchingBracket(text, open);
   if (close < 0) return;
   for (const item of splitTopLevel(text.slice(open + 1, close), text[open] === '<')) {
+    if (lastWord) {
+      const at = item.indexOf('=');
+      const param = /([A-Za-z_]\w*)\s*$/.exec(at < 0 ? item : item.slice(0, at))?.[1];
+      if (param && param !== 'typename' && param !== 'class' && param !== 'struct') {
+        names.set(param, at < 0 ? undefined : item.slice(at + 1).trim());
+      }
+      continue;
+    }
     // Past annotations (`@sp(Int, Long) A`, `@NonNull T`), variance and keywords.
     const bare = item.replace(/^\s*(?:@[\w.]+(?:\([^()]*\))?\s*)+/, '');
     const param = /^\s*(?:(?:in|out|reified|const|typename|class|struct)\s+|[+\-']\s*)*([A-Za-z_]\w*)/.exec(bare)?.[1];
-    if (param && param !== 'typename' && param !== 'class') names.add(param);
+    if (param && param !== 'typename' && param !== 'class' && !names.has(param)) names.set(param, undefined);
   }
 }
 

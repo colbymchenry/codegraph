@@ -100,15 +100,22 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
     if (current.type === 'qualified_identifier') return current;
     for (let i = 0; i < current.namedChildCount; i++) {
       const child = current.namedChild(i);
-      // Don't descend into parameters or the trailing return type — their types
-      // (`const std::string&`, `-> std::string`) aren't the function name.
-      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
+      // Don't descend into parameters, the trailing return type or the
+      // clauses after them — `const std::string&`, `-> std::string`,
+      // nlohmann/json's `noexcept(noexcept(JSONSerializer<U>::to_json(…)))`,
+      // `throw(std::bad_alloc)`, `requires std::integral<T>` name no function.
+      if (child && !DECLARATOR_NON_NAME_PARTS.has(child.type)) {
         queue.push(child);
       }
     }
   }
   return undefined;
 }
+
+/** The parts of a function declarator that hold types or expressions, never its name. */
+const DECLARATOR_NON_NAME_PARTS: ReadonlySet<string> = new Set([
+  'parameter_list', 'trailing_return_type', 'noexcept', 'throw_specifier', 'requires_clause',
+]);
 
 /**
  * Single-argument macros are ambiguous without their definition (#1373).

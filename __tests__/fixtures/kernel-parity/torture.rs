@@ -312,3 +312,24 @@ pub union Reg {
 }
 
 impl Base for Reg {}
+
+// Turbofish calls name the function they wrap: `s.get::<u32>()` is `s.get`,
+// and a path's type arguments drop (`TfPool::<u8>::new` is `TfPool::new`),
+// nested ones and a `->` inside them included.
+fn turbofish_calls(s: &TfStore, items: &[u8]) {
+    let _a = s.get::<u32>();
+    let _b = tf_free::<Vec<u8>>();
+    let _c = TfPool::<u8>::new();
+    let _d = TfPool::<Vec<u8>>::with_capacity::<u8>(4);
+    let _e = TfPool::<u8>::new().len();
+    let _f = TfPool::create::<u8>().len();
+    let _g = tf_run::<fn() -> u8>(tf_free);
+    let _h = items.iter().collect::<Vec<_>>();
+}
+
+impl TfStore {
+    fn turbofish_self(&self) {
+        self.get::<u16>();
+        self.cache.load::<u8>();
+    }
+}

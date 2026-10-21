@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -33,8 +33,9 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
+import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -45,6 +46,7 @@ import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
@@ -577,6 +579,7 @@ export class ReferenceResolver {
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
       clearCFeatureVariantMemos(this.context);
+      clearAmbientModuleMemos(this.context);
     }
   }
 
@@ -1230,6 +1233,97 @@ export class ReferenceResolver {
    * Calls that land on an alias binding then forward once to the callable
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
+  /**
+   * The failed python attribute-chain refs that an edit to `touched` makes
+   * resolvable now — what a sync retries after a factory or a base class
+   * changed in another file (`pythonAttrRefResolves` answers each one).
+   *
+   * The candidates are the refs in the files that import a touched file
+   * within a few hops, counted once per (calling symbol, name). When there
+   * are more than `ceiling` of them — an edit to a module most of the project
+   * imports — only those the edit can plausibly reach are kept: an attribute
+   * a touched file assigns, a call receiver it defines, a class that
+   * subclasses one of its classes, or an attribute assigned from a call to
+   * something it defines. Null when even that is over the ceiling; those refs
+   * wait for a full index.
+   *
+   * Past the ceiling, then, these become resolvable only at the next full
+   * index: a factory two hops from the edit, a subclass two hops away, and an
+   * attribute typed by an annotation — a parameter `c: Client`, or a
+   * class-level `c: Client` in a class that only gains the base or import that
+   * resolves `Client` in the touched file.
+   */
+  pythonAttrRetryCandidates(touched: string[], ceiling: number = 2000): UnresolvedReference[] | null {
+    const touchedSet = new Set(touched);
+    const closure = this.queries.getPythonImporterClosure(touched).filter((f) => !touchedSet.has(f));
+    // One answer per (calling symbol, name): the same call written twice in
+    // one function resolves the same way, so it is asked — and counted — once.
+    const keyOf = (ref: { fromNodeId: string; referenceName: string }) => `${ref.fromNodeId}\0${ref.referenceName}`;
+    const resolvable = (refs: UnresolvedReference[]) => {
+      const answers = new Map<string, boolean>();
+      return refs.filter((ref) => {
+        if (!ref.filePath || !ref.language) return false;
+        const key = keyOf(ref);
+        let ok = answers.get(key);
+        if (ok === undefined) answers.set(key, (ok = pythonAttrRefResolves(ref as UnresolvedRef, this.context)));
+        return ok;
+      });
+    };
+    const candidates = this.queries.getFailedPythonAttrRefKeys(closure);
+    const load = (keys: typeof candidates) => this.queries.getUnresolvedReferencesByIds(keys.map((k) => k.id));
+    if (new Set(candidates.map(keyOf)).size <= ceiling) return resolvable(load(candidates));
+
+    const assigned = new Set<string>();
+    const defined = new Set<string>();
+    const subclassing = new Set<string>();
+    const calling = new Set<string>();
+    for (const file of touched) {
+      const source = this.context.readFile(file);
+      if (source) {
+        const text = stripCommentsForRegex(source, 'python');
+        for (const m of text.matchAll(/\b(?:self|cls)\.(\w+)\s*(?::[^=\n]*)?=(?!=)|^[ \t]+(\w+)\s*(?::[^=\n]*)?=(?!=)/gm)) {
+          assigned.add((m[1] ?? m[2])!);
+        }
+      }
+      for (const n of this.context.getNodesInFile(file)) {
+        if (n.kind === 'class' || n.kind === 'function' || n.kind === 'method') defined.add(n.name);
+      }
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['extends'], ['class'])) subclassing.add(f);
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['calls', 'instantiates'], ['function', 'method', 'class'])) {
+        calling.add(f);
+      }
+    }
+
+    const callees = new Map<string, Map<string, Set<string>>>(); // file → attr → callee names
+    const assignedCallees = (file: string, attr: string): Set<string> => {
+      let byAttr = callees.get(file);
+      if (!byAttr) {
+        byAttr = new Map();
+        const source = this.context.readFile(file);
+        const text = source ? stripCommentsForRegex(source, 'python') : '';
+        for (const m of text.matchAll(/\b(\w+)\s*(?::[^=\n]*)?=(?!=)\s*(?:await\s+)?(?:[\w.]*\.)?(\w+)\s*\(/g)) {
+          let set = byAttr.get(m[1]!);
+          if (!set) byAttr.set(m[1]!, (set = new Set()));
+          set.add(m[2]!);
+        }
+        callees.set(file, byAttr);
+      }
+      return byAttr.get(attr) ?? new Set();
+    };
+
+    const kept = candidates.filter((ref) => {
+      const name = ref.referenceName;
+      if (name.includes('().')) return defined.has(name.split('().')[0]!.split('.').pop()!);
+      const segs = name.split('.');
+      if (segs.length !== 3 || !segs.every((seg) => /^[A-Za-z_]\w*$/.test(seg))) return false;
+      const attr = segs[1]!;
+      if (assigned.has(attr)) return true;
+      if (subclassing.has(ref.filePath) && (segs[0] === 'self' || segs[0] === 'cls')) return true;
+      return calling.has(ref.filePath) && [...assignedCallees(ref.filePath, attr)].some((c) => defined.has(c));
+    });
+    return new Set(kept.map(keyOf)).size <= ceiling ? resolvable(load(kept)) : null;
+  }
+
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
@@ -1261,6 +1355,19 @@ export class ReferenceResolver {
     if (resolved && isPythonFromImportModule(ref, this.context)) {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
+    }
+    // A name the calling JS/TS function binds itself (a parameter, a local) in
+    // scope at the reference is that binding even when the file imports the
+    // name, which the import resolver answers before the matcher's own check.
+    if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A declaration of a declaration file's `declare module 'x'` is reached
+    // through an import of `x`, never by its bare name from a file that
+    // reaches no `x` (see reachesAmbientModule).
+    if (resolved && resolved.resolvedBy !== 'import') {
+      const specifier = ambientModuleDeclarations(this.context).get(resolved.targetNodeId);
+      const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
+      if (declaringFile !== undefined && declaringFile !== ref.filePath &&
+          !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 

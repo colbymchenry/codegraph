@@ -1694,6 +1694,22 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
+                // TS `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+                // supertype is a `type` of the clause; a `generic_type` is named
+                // by its `name` field (`Store`, never `Store<T>`).
+                "extends_type_clause" => {
+                    let mut cursor = child.walk();
+                    let targets: Vec<Node<'t>> = child.children_by_field_name("type", &mut cursor).collect();
+                    for target in targets {
+                        let named = if target.kind() == "generic_type" {
+                            target.child_by_field_name("name").unwrap_or(target)
+                        } else {
+                            target
+                        };
+                        let name = self.text(named).to_string();
+                        self.push_ref(class_row, &name, extends_kind, target);
+                    }
+                }
                 // JS `class Foo extends Bar` — class_heritage holds a bare
                 // identifier without an extends_clause wrapper.
                 "identifier" | "type_identifier" if node.kind() == "class_heritage" => {

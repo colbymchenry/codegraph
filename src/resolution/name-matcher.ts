@@ -14,13 +14,14 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
-import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
+import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
 import { clearCppNamespaceMemos, cppMacroNamespaceFrames, cppMacroNamespaceHeads, cppNameMacros, cppNamespaceAliases } from './cpp-namespaces';
 import { clearCppRawStringMemos, cppLiteralsBlanked, cppNonCodeLines } from './cpp-raw-strings';
 import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
-import { isTestPath } from '../search/query-utils';
+import { isTestFile, isTestPath } from '../search/query-utils';
+import { inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
@@ -1531,6 +1532,87 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
     })();
   memo.set(filePath, sealed);
   return sealed;
+}
+
+/** A TypeScript or JavaScript source file, read as such (an SFC's markup is not). */
+const TS_JS_FILE = /\.[cm]?[jt]sx?$/i;
+
+/** Per-context memo: file → where it declares into the global scope (null when unreadable). */
+const TS_GLOBAL_SCOPES = new WeakMap<ResolutionContext, Map<string, GlobalScopeScan | null>>();
+
+/** scanGlobalScope of `file`, a CommonJS file's top level counting as its own. */
+function tsGlobalScope(file: string, context: ResolutionContext): GlobalScopeScan | null {
+  let memo = TS_GLOBAL_SCOPES.get(context);
+  if (!memo) TS_GLOBAL_SCOPES.set(context, (memo = new Map()));
+  let scope = memo.get(file);
+  if (scope === undefined) {
+    const source = context.readFile(file);
+    scope = source === null ? null : scanGlobalScope(source);
+    if (scope?.script && HAS_CJS_EXPORT.test(source!)) scope = { ...scope, script: false, globalWords: new Set() };
+    memo.set(file, scope);
+  }
+  return scope;
+}
+
+/**
+ * Whether a type written as a bare name the file doesn't import, in an ES
+ * module, may be `n`: a declaration of the file's own, or a global one — at a
+ * script's top level (a file with no import or export, a script `.d.ts`) or
+ * directly inside `declare global`. A module's own declaration, exported or
+ * not, is reached only through an import, which the import resolver has
+ * followed already, and a namespace's member is no global. So `extends
+ * Omit<…>` and `options: Omit<IPickOptions, 'canPickMany'>` are TypeScript's
+ * `Omit`, never vscode's `export type Omit` in quickInput.ts, and `extends
+ * Function` never terminal-suggest's `Fig.Function`.
+ *
+ * The globals project code relies on come from declaration files and
+ * `declare global` blocks. A script `.ts` is a sample or a fixture whose top
+ * level is global only to its own program — vscode's colorize fixtures
+ * declare `type T` and copilot's eslint fixtures `interface Node` — and a
+ * test's or fixture's globals are its tests' only, as its `declare module`
+ * blocks are (see ambient-modules.ts).
+ */
+function isTsTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
+  const scope = tsGlobalScope(n.filePath, context);
+  if (!scope) return true;
+  if ((scope.script && !isDeclarationFile(n.filePath)) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
+  return scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
+}
+
+/**
+ * Whether `ref` names a type by a bare name its ES module doesn't import
+ * (isTsTypeInScope): a supertype, or a type annotation's or type argument's
+ * name, which TS and JS files record as `references` and nothing else does.
+ * The last name of a qualified type, `vscode.TextDocument`, is no bare name,
+ * and neither is a name inside a `declare module 'x'` block, which is module
+ * `x`'s own: legend-state's augmentation of `'@legendapp/state/react'` writes
+ * that module's `FCReactive` without importing it. An `import X = ns.X`
+ * alias imports its name.
+ */
+function isTsBareTypeName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const typeRef = ref.referenceKind === 'references';
+  if (!(typeRef || isInheritanceRef(ref)) || !JS_FAMILY.has(ref.language) || !TS_JS_FILE.test(ref.filePath) ||
+      !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName) ||
+      context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) ||
+      (typeRef && isWrittenQualified(ref, context))) return false;
+  const scope = tsGlobalScope(ref.filePath, context);
+  const at = { startLine: ref.line, startColumn: ref.column };
+  return scope?.script === false && !scope.importAliases.has(ref.referenceName) &&
+    !scope.moduleBlocks.some((block) => inBlock(at, block));
+}
+
+/**
+ * Whether a name recorded alone was written after a `.`, as the last name of
+ * `ns.Type` or `import('x').Type` is. A column that doesn't find the name on
+ * its line counts as written so, which leaves the reference as it was.
+ */
+function isWrittenQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  if (!line.startsWith(ref.referenceName, ref.column)) return true;
+  let i = ref.column - 1;
+  while (i >= 0 && (line[i] === ' ' || line[i] === '\t')) i--;
+  return line[i] === '.';
 }
 
 /**
@@ -3935,20 +4017,29 @@ function isPythonProjectModule(module: string, fromFile: string, context: Resolu
  * method of the same name (#2599).
  */
 export function isPythonOutsideModuleReceiver(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.language !== 'python' || !/^\w+$/.test(name)) return false;
-  const outside = pythonNameScan(context, `outside\0${ref.filePath}\0${name}`, () => {
-    const keys = pythonImportKeys(name, ref.filePath, context);
+  if (ref.language !== 'python') return false;
+  return isPythonOutsideModuleName(name, ref.filePath, context) && !pythonBindsLocally(name, ref, context, false);
+}
+
+/**
+ * The module-scope half of isPythonOutsideModuleReceiver: `filePath` binds
+ * `name` only by importing it from outside the project, and never rebinds it
+ * at module scope.
+ */
+function isPythonOutsideModuleName(name: string, filePath: string, context: ResolutionContext): boolean {
+  if (!/^\w+$/.test(name)) return false;
+  return pythonNameScan(context, `outside\0${filePath}\0${name}`, () => {
+    const keys = pythonImportKeys(name, filePath, context);
     if (keys.size === 0) return false;
-    if (pythonGlobalBindings(name, ref.filePath, context).some((b) => b.kind !== 'import')) return false;
-    if (context.getNodesInFile(ref.filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    if (pythonGlobalBindings(name, filePath, context).some((b) => b.kind !== 'import')) return false;
+    if (context.getNodesInFile(filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
     // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
     // the module `a` tells that `x` comes from outside.
     return [...keys].every((key) => {
       const module = key.slice(0, key.indexOf(':'));
-      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, ref.filePath, context);
+      return !module.startsWith('.') && !isPythonProjectModuleAnyRoot(module, filePath, context);
     });
   });
-  return outside && !pythonBindsLocally(name, ref, context, false);
 }
 
 /**
@@ -8945,6 +9036,8 @@ interface RustImplHeader {
   self: string;
   /** The type names its arguments write (`Arc<Handle>` → `Handle`, `Pin<P>` → `P`). */
   selfArgs: string[];
+  /** The implementing type as written, path and arguments: `pubgrub::Range<Version>`. */
+  selfText: string;
   /** The impl's own type parameters (`impl<'a, P: DerefMut>` → `P`). */
   params: string[];
 }
@@ -8995,6 +9088,7 @@ function parseRustImplHeader(text: string): RustImplHeader | null {
     traitArgs: args(traitPart),
     self: head(selfPart),
     selfArgs: args(selfPart.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|dyn\s+)+/, '')),
+    selfText: selfPart.replace(/\{[\s\S]*$/, '').replace(/\bwhere\b[\s\S]*$/, '').trim(),
     params: params.map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined),
   };
 }
@@ -9234,6 +9328,35 @@ function matchRustSelfPath(name: string, ref: UnresolvedRef, context: Resolution
 }
 
 /**
+ * A Rust call through a generic type parameter of the function or `impl`
+ * around it — `Key::get(…)` in protobuf's `fn map_get<Key: MapKey>`, with
+ * `trait MapKey: FfiMapKey` — is to the method one of the traits its bounds
+ * name declares, or one of the traits they extend: `FfiMapKey::get`. Bounds
+ * only from outside the project (`T: Default`) name no project method, nor do
+ * two traits that both declare it: null. Undefined when `name` is no generic
+ * parameter there.
+ */
+function matchRustGenericPath(name: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return undefined;
+  const written: RustWrittenType = { text: name, file: ref.filePath, at: (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column) };
+  const bounds = rustGenericBounds(name, written, context);
+  if (bounds === undefined) return undefined;
+  const traits = bounds.filter((b) => !/^['?]/.test(b.trim()) && !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
+  if (traits.length === 0) return null;
+  const result = rustTraitsMethodCall(traits, written, method, ref, context);
+  if (result === 'unread') return null;
+  // (The bound names the trait, so its method is reached as a typed call is:
+  // its missing `pub` doesn't hide it from another module.)
+  if (result) {
+    let typed = RUST_TYPED_REFS.get(context);
+    if (!typed) RUST_TYPED_REFS.set(context, (typed = new WeakSet()));
+    typed.add(ref);
+  }
+  return result;
+}
+
+/**
  * Whether `candidate` is declared directly in an inline `mod <name> { … }` of
  * its own file — the only way a path through `name` reaches it, since an
  * inline module adds nothing to its items' qualified names. The module is the
@@ -9396,6 +9519,18 @@ interface RustWrittenType {
   self?: string;
   generics?: string;
   wrappers?: string[];
+  /**
+   * Generic parameters the type names that a call's value fixes, which
+   * nothing here says: `W` in `build<W: WriteColor>(…) -> Standard<W>`. A
+   * value that is one of them is unread, whatever its bound.
+   */
+  opaque?: string[];
+  /**
+   * What a declaration's own parameters are known by where the type is
+   * reached: through `self` in `impl<S: Store> Worker<S>`, the struct's `S`
+   * is the impl's, a `Store`. The traits are read where the impl is.
+   */
+  bounds?: ReadonlyMap<string, { traits: string[]; file: string; at: number }>;
 }
 
 /**
@@ -9773,6 +9908,13 @@ function rustReadType(written: RustWrittenType, ref: UnresolvedRef, context: Res
     return { kind: 'named', name: self.type, path: self.root ? [self.root] : [], args: '', wrappers, byRef, written };
   }
   if (segments.length === 0) {
+    if (written.opaque?.includes(name)) return { kind: 'unread' };
+    const known = written.bounds?.get(name);
+    if (known) {
+      const traits = known.traits.filter((b) => !/^['?]/.test(b.trim()) && !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
+      if (traits.length === 0) return { kind: 'unread' };
+      return { kind: 'traits', traits, wrappers, byRef, written: { text: written.text, file: known.file, at: known.at } };
+    }
     const bounds = rustGenericBounds(name, written, context);
     if (bounds !== undefined) {
       const traits = bounds.filter((b) => !RUST_MARKER_TRAITS.has(rustPathHead(b)?.name ?? ''));
@@ -9804,6 +9946,12 @@ function rustGenericBounds(name: string, written: RustWrittenType, context: Reso
 /** What the binding a Rust receiver names writes of its type, if it writes it. */
 function rustBindingType(binding: RustBinding, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
   if (binding.type !== undefined) return { text: binding.type, file: ref.filePath, at: binding.at };
+  if (binding.kind === 'for') {
+    // `for x in …`: an element of what the loop iterates; `for (k, v) in …` a field of that element.
+    const element = binding.scrutinee === undefined ? null : rustIteratedElement(binding.scrutinee, binding.at, scopes, ref, context, depth);
+    if (!element || !binding.site) return element;
+    return binding.site.path === '' && binding.site.index !== undefined ? rustTupleField(element, binding.site.index) : null;
+  }
   if (binding.init !== undefined) return rustValueType(binding.init, binding.at, scopes, ref, context, depth);
   if (binding.site) return rustSiteType(binding.site, binding.scrutinee, binding.at, scopes, ref, context, depth);
   return null;
@@ -9828,9 +9976,13 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
   if (depth > 3) return null;
   let v = value.trim();
   let unwraps = 0;
+  let awaits = 0;
   for (;;) {
     const before = v;
-    v = v.replace(/\s*\.\s*await$/, '');
+    if (/\.\s*await$/.test(v)) {
+      v = v.replace(/\s*\.\s*await$/, '');
+      awaits++;
+    }
     if (v.endsWith('?')) {
       v = v.slice(0, -1).trimEnd();
       unwraps++;
@@ -9880,13 +10032,17 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
     }
     return rustFunctionReturn(segments.slice(0, -1), last, unwraps, at, ref, context);
   }
-  // `x.clone()` is a value of `x`'s type.
-  if (call && call.args.trim() === '') {
-    const cloned = /^([a-z_]\w*)\s*\.\s*clone$/.exec(call.callee);
+  if (call) {
+    // `x.clone()` is a value of `x`'s type.
+    const cloned = call.args.trim() === '' ? /^([a-z_]\w*)\s*\.\s*clone$/.exec(call.callee) : null;
     if (cloned) return unwrapped(rustLocalType(cloned[1]!, at, scopes, ref, context, depth));
-    return null;
+    // `x.m(…)`, `self.m(…)`, `x.m(…)?.n(…)`: what the method it reaches returns.
+    const method = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*(?:::\s*<([^()]*)>)?$/.exec(call.callee);
+    return method ? rustMethodReturn(method[1]!, method[2]!, method[3], unwraps, awaits, at, scopes, ref, context, depth) : null;
   }
-  if (call) return null;
+  // `self.items`, `opts.config.port`, `pair.0`: the field's type as its struct declares it.
+  const access = /^([\s\S]+?)\s*\.\s*([A-Za-z_]\w*|\d+)$/.exec(v);
+  if (access && !/^\d/.test(v)) return unwrapped(rustFieldValue(access[1]!, access[2]!, at, scopes, ref, context, depth));
   const literal = /^((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)\s*(?:::\s*<[^{}]*>\s*)?\{/.exec(v);
   if (literal) {
     if (!rustGroupIsWhole(v.slice(v.indexOf('{')))) return null;
@@ -9968,10 +10124,27 @@ function rustFunctionReturn(modules: string[], fn: string, unwraps: number, at: 
   if (same.length > 0 && modules.length === 0) {
     fns = same;
   } else {
-    const used = modules.length > 0 ? undefined : rustUsePath(fn, ref.filePath, at, context);
-    if (modules.length === 0 && !used) return null;
-    const walked = (used ? used.slice(0, -1) : modules).filter((s) => s !== 'crate' && s !== 'self' && s !== 'super' && !rustProjectCrates(context).has(s));
-    if (walked.length > 0) fns = fns.filter((n) => rustModulesLead(walked, n));
+    // The path the call writes, its head as a `use` binds it (`oneshot::channel()`
+    // under tokio's `use crate::runtime::tests::loom_oneshot as oneshot`), or
+    // the one a `use` binds the bare name to.
+    let path: string[];
+    if (modules.length === 0) {
+      const used = rustUsePath(fn, ref.filePath, at, context);
+      if (!used) return null;
+      path = used;
+    } else {
+      const head = rustUsePath(modules[0]!, ref.filePath, at, context);
+      path = [...(head && head.length > 0 ? head : [modules[0]!]), ...modules.slice(1), fn];
+    }
+    // The function the project's modules walk to, else the one whose file's modules the path names.
+    const walked = rustWalkedItems(path, ref.filePath, at, context);
+    const named = walked === null ? [] : fns.filter((n) => walked.has(n.id));
+    if (named.length > 0) {
+      fns = named;
+    } else {
+      const segments = path.slice(0, -1).filter((s) => s !== 'crate' && s !== 'self' && s !== 'super' && !rustProjectCrates(context).has(s));
+      if (segments.length > 0) fns = fns.filter((n) => rustModulesLead(segments, n));
+    }
   }
   const returns = new Set(fns.map((f) => rustReturnText(f.signature) ?? ''));
   if (fns.length === 0 || returns.size !== 1) return null;
@@ -9982,12 +10155,345 @@ function rustFunctionReturn(modules: string[], fn: string, unwraps: number, at: 
 }
 
 /**
+ * What a method call's value is — `let b = builder.port(80)`, `let s =
+ * self.state()?`, `let n = conn.next_frame().await?` — read from the
+ * signature of the method the call reaches on its receiver's type
+ * (rustTypedMethodCall), where `Self` is that method's impl type. A receiver
+ * is a local, `self`, or another call's value. Null where any step can't be
+ * told: a receiver or a method from outside the project, a return type
+ * naming the impl's or the method's own generics, an `async fn` not awaited.
+ */
+function rustMethodReturn(
+  receiver: string, method: string, turbofish: string | undefined, unwraps: number, awaits: number, at: number,
+  scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  let memo = RUST_METHOD_RETURNS.get(context);
+  if (!memo) RUST_METHOD_RETURNS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${at}\0${receiver}\0${method}\0${turbofish ?? ''}\0${unwraps}\0${awaits}\0${depth}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const made = readRustMethodReturn(receiver, method, turbofish, unwraps, awaits, at, scopes, ref, context, depth);
+  if (memo.size >= 4096) memo.delete(memo.keys().next().value!);
+  memo.set(key, made);
+  return made;
+}
+
+const RUST_METHOD_RETURNS = new WeakMap<ResolutionContext, Map<string, RustWrittenType | null>>();
+
+function readRustMethodReturn(
+  receiver: string, method: string, turbofish: string | undefined, unwraps: number, awaits: number, at: number,
+  scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  const recv = receiver.trim();
+  let written: RustWrittenType | null;
+  if (recv === 'self') written = { text: 'Self', file: ref.filePath, at };
+  else if (/^[a-z_]\w*$/.test(recv)) written = rustLocalType(recv, at, scopes, ref, context, depth);
+  else if (/[)?]$|\.\s*(?:[A-Za-z_]\w*|\d+)$/.test(recv)) written = rustValueType(recv, at, scopes, ref, context, depth + 1);
+  else return null;
+  if (!written) return null;
+  const read = rustReadType(written, ref, context);
+  const result = rustTypedMethodCall(read, method, ref, context);
+  if (!result || result === 'unread') return null;
+  const target = context.getNodeById?.(result.targetNodeId);
+  const text = target ? rustReturnText(target.signature) : null;
+  if (!target || !text) return null;
+  let made: RustWrittenType | null = { text, file: target.filePath, at: rustSignatureOffset(target, context) };
+  made = rustReturnInstance(made, target, turbofish, read, at, ref, context);
+  // An `async fn`'s value is a future of what it returns; `.await` hands that out.
+  const isAsync = rustIsAsyncFn(target, context);
+  if (awaits > 1 || (awaits === 0 && isAsync)) return null;
+  if (awaits === 1 && !isAsync) made = rustFutureOutput(made);
+  return made && unwraps > 0 ? rustUnwrapped(made, unwraps) : made;
+}
+
+/**
+ * A method's return type as the call makes it, where it names a generic or
+ * `Self`: the method's own type parameters are what the call's turbofish
+ * writes (clap's `arg.get::<ArgValueCompleter>()` on `fn get<T: ArgExt>(&self)
+ * -> Option<&T>`), read where the call is, when the rest of the type is std's;
+ * a trait's provided method's `Self` is the receiver's own type. A parameter
+ * the call doesn't write, or one of the impl's, stays opaque: the type is
+ * still the one its head names (`Standard<W>` is a `Standard`), but a value
+ * that is the parameter itself is unread, the bound alone not telling.
+ */
+function rustReturnInstance(
+  made: RustWrittenType, target: Node, turbofish: string | undefined, read: RustTypeRead, at: number,
+  ref: UnresolvedRef, context: ResolutionContext,
+): RustWrittenType {
+  const names = [...made.text.matchAll(/(?<!['\w])([A-Za-z_]\w*)/g)].map((m) => m[1]!)
+    .filter((n) => !/^(?:mut|dyn|impl|const|for)$/.test(n));
+  const generics = names.filter((n) => n !== 'Self' && rustGenericBounds(n, made, context) !== undefined);
+  if (generics.length === 0) {
+    // `fn with_x(self) -> Self` in a trait: the value is the receiver's type, not the trait.
+    const bare = made.text.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '').trim();
+    if (bare === 'Self' && read.kind === 'named' && rustTraitOf(target, context) !== null) {
+      const typeText = [...read.path, read.name].join('::') + (read.args ? `<${read.args}>` : '');
+      return { text: made.text.replace(/Self\s*$/, typeText), file: read.written.file, at: read.written.at };
+    }
+    return made;
+  }
+  const opaque: RustWrittenType = { ...made, opaque: [...new Set(generics)] };
+  if (turbofish === undefined) return opaque;
+  const scopes = rustScopesOf(made.file, context);
+  const own = scopes ? rustFnAt(scopes, made.at) : undefined;
+  const params = own ? splitRustTopLevel(own.generics, ',').map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]).filter((p): p is string => p !== undefined) : [];
+  const args = splitRustTopLevel(turbofish, ',').map((a) => a.trim()).filter((a) => !a.startsWith("'"));
+  const bound = new Map<string, string>();
+  for (const g of new Set(generics)) {
+    const i = params.indexOf(g);
+    if (i < 0 || i >= args.length || args[i] === '_') return opaque;
+    bound.set(g, args[i]!);
+  }
+  // The type is then read where the call writes the turbofish: anything else it names must mean the same there.
+  if (names.some((n) => !bound.has(n) && (n === 'Self' || !(RUST_STD_TYPES.has(n) || RUST_PRELUDE.has(n) || RUST_PRIMITIVE_TYPES.has(n))))) return opaque;
+  const text = made.text.replace(/(?<!['\w])([A-Za-z_]\w*)/g, (n) => bound.get(n) ?? n);
+  return { text, file: ref.filePath, at };
+}
+
+/** Whether a Rust function is declared `async`, read off its source: the extractor's flag never says. */
+function rustIsAsyncFn(fn: Node, context: ResolutionContext): boolean {
+  const scopes = rustScopesOf(fn.filePath, context);
+  if (!scopes) return false;
+  const start = rustNodeOffset(fn, context);
+  const head = scopes.code.slice(start, start + 300);
+  const name = head.search(new RegExp(`\\bfn\\s+(?:r#)?${fn.name.replace(/^r#/, '')}\\b`));
+  return name >= 0 && /\basync\b/.test(head.slice(0, name));
+}
+
+/**
+ * What `.await` hands out of a value of a Rust future type: the `Output` of
+ * `impl Future<Output = T>` or a `Pin<Box<dyn Future<Output = T>>>`, the `T`
+ * of futures' `BoxFuture<'_, T>`. Null for any other type.
+ */
+function rustFutureOutput(written: RustWrittenType): RustWrittenType | null {
+  let t = written.text.trim();
+  for (const wrapper of [/^(?:(?:std|core)\s*::\s*pin\s*::\s*)?Pin\s*</, /^(?:(?:std|alloc)\s*::\s*boxed\s*::\s*)?Box\s*</]) {
+    const open = wrapper.exec(t);
+    if (open && rustAngleEnd(t, open[0].length - 1) === t.length - 1) t = t.slice(open[0].length, -1).trim();
+  }
+  const boxed = /^(?:[A-Za-z_]\w*\s*::\s*)*(?:BoxFuture|LocalBoxFuture)\s*</.exec(t);
+  if (boxed) {
+    if (rustAngleEnd(t, boxed[0].length - 1) !== t.length - 1) return null;
+    const args = splitRustTopLevel(t.slice(boxed[0].length, -1), ',').filter((a) => !/^'/.test(a.trim()));
+    return args.length === 1 ? { ...written, text: args[0]!.trim() } : null;
+  }
+  const future = /^(?:impl|dyn)\s+(?:(?:std|core)\s*::\s*future\s*::\s*)?(?:Future|IntoFuture)\s*</.exec(t);
+  if (!future) return null;
+  const end = rustAngleEnd(t, future[0].length - 1);
+  if (end < 0 || !/^\s*(?:\+[\s\S]*)?$/.test(t.slice(end + 1))) return null;
+  const output = splitRustTopLevel(t.slice(future[0].length, end), ',').map((a) => /^\s*Output\s*=\s*([\s\S]+)$/.exec(a)?.[1]).find((o) => o !== undefined);
+  return output ? { ...written, text: output.trim() } : null;
+}
+
+/**
+ * What a Rust field access is — `self.items`, `opts.config`, `pair.0` — as
+ * the receiver's struct declares the field, read where the struct is written
+ * (its own generics opaque, the field's type being whatever a value of it
+ * makes them). Null when the receiver isn't one struct of the project's.
+ */
+function rustFieldValue(
+  receiver: string, field: string, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number,
+): RustWrittenType | null {
+  const recv = receiver.trim();
+  let written: RustWrittenType | null;
+  if (recv === 'self') written = { text: 'Self', file: ref.filePath, at };
+  else if (/^[a-z_]\w*$/.test(recv)) written = rustLocalType(recv, at, scopes, ref, context, depth);
+  else written = rustValueType(recv, at, scopes, ref, context, depth + 1);
+  if (!written) return null;
+  const read = rustReadType(written, ref, context);
+  if (read.kind !== 'named') return null;
+  const lookup = rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at);
+  const structs = lookup.outside ? [] : lookup.nodes.filter((n) => n.kind === 'struct' || n.kind === 'union');
+  if (structs.length !== 1) return null;
+  const decl = structs[0]!;
+  const fields = rustDeclaredFields(decl, context);
+  const text = /^\d+$/.test(field) ? fields?.tuple?.[Number(field)] : fields?.named?.get(field);
+  if (!fields || !text) return null;
+  const value: RustWrittenType = { text, file: decl.filePath, at: rustNodeOffset(decl, context), self: decl.name, generics: fields.generics };
+  if (recv === 'self') {
+    const bounds = rustSelfParamBounds(fields.generics, scopes, at, ref.filePath);
+    if (bounds) value.bounds = bounds;
+  }
+  return value;
+}
+
+/**
+ * What the struct's own type parameters are known by inside the impl around
+ * `at`: the bounds of the impl's parameter each one is instantiated with,
+ * by position — `struct Worker<S>` under `impl<S: Store> Worker<S>` gives
+ * `S` → `Store`. Undefined where the impl's type arguments don't line up
+ * with the struct's parameters, or none is a bounded parameter of the impl.
+ */
+function rustSelfParamBounds(structGenerics: string, scopes: RustScopes, at: number, file: string): Map<string, { traits: string[]; file: string; at: number }> | undefined {
+  if (structGenerics.trim() === '') return undefined;
+  const block = rustImplAt(scopes, at);
+  if (!block || block.kind !== 'impl') return undefined;
+  // `impl<S: Store> [Trait for] Worker<S>`: the type after the impl's generics and a top-level ` for `.
+  let header = scopes.code.slice(block.at, block.from).replace(/^impl\b/, '').trim();
+  if (header.startsWith('<')) {
+    const end = rustAngleEnd(header, 0);
+    if (end < 0) return undefined;
+    header = header.slice(end + 1).trim();
+  }
+  let depth = 0;
+  for (let i = 0; i < header.length; i++) {
+    const c = header[i];
+    if (c === '<') depth++;
+    else if (c === '>' && header[i - 1] !== '-') depth--;
+    else if (depth === 0 && /\s/.test(c!) && /^for\s/.test(header.slice(i + 1))) {
+      header = header.slice(i + 4).trim();
+      break;
+    }
+  }
+  const self = rustPathHead(header.replace(/\bwhere\b[\s\S]*$/, '').trim());
+  if (!self) return undefined;
+  const args = splitRustTopLevel(self.args, ',').map((a) => a.trim()).filter((a) => a !== '');
+  const params = splitRustTopLevel(structGenerics, ',').map((p) => /^\s*(?:const\s+)?('?[A-Za-z_]\w*)/.exec(p)?.[1] ?? '');
+  if (params.length !== args.length) return undefined;
+  const own = new Set(splitRustTopLevel(block.generics, ',').map((p) => /^\s*(?:const\s+)?([A-Za-z_]\w*)/.exec(p)?.[1]));
+  const bounds = new Map<string, { traits: string[]; file: string; at: number }>();
+  params.forEach((p, i) => {
+    const arg = args[i]!;
+    if (p === '' || p.startsWith("'") || !own.has(arg)) return;
+    const traits = rustBoundsOf(arg, [{ generics: block.generics, where: block.where }]);
+    if (traits && traits.length > 0) bounds.set(p, { traits, file, at });
+  });
+  return bounds.size > 0 ? bounds : undefined;
+}
+
+/** The `index`th field of a Rust tuple type as written — `(K, V)` → `V` for 1 — through `&`; null for any other type. */
+function rustTupleField(written: RustWrittenType, index: number): RustWrittenType | null {
+  const t = written.text.trim().replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '');
+  if (!t.startsWith('(') || !rustGroupIsWhole(t)) return null;
+  const fields = splitRustTopLevel(t.slice(1, -1), ',').map((f) => f.trim()).filter((f) => f !== '');
+  return index < fields.length ? { ...written, text: fields[index]!, wrappers: undefined } : null;
+}
+
+/** Std adapters that hand on the items of what they are called on. */
+const RUST_ITEM_ADAPTERS: ReadonlySet<string> = new Set([
+  'iter', 'iter_mut', 'into_iter', 'drain', 'rev', 'copied', 'cloned', 'skip', 'take', 'step_by', 'peekable', 'by_ref', 'fuse',
+]);
+/** Std adapters that pick a map's keys or values, or number the items. */
+const RUST_ITEM_PROJECTIONS: ReadonlyMap<string, 'key' | 'value' | 'enumerate'> = new Map([
+  ['keys', 'key'], ['into_keys', 'key'], ['values', 'value'], ['values_mut', 'value'], ['into_values', 'value'], ['enumerate', 'enumerate'],
+]);
+
+/**
+ * What a Rust `for` loop binds, an item of what it iterates: `for a in
+ * cmd.get_arguments()` with `-> impl Iterator<Item = &Arg>` an `Arg`, `for x
+ * in &self.items` with `items: Vec<Item>` an `Item`, `for (i, v) in
+ * map.values().enumerate()` a `(usize, V)`. The std adapters that keep the
+ * items (`.iter()`, `.rev()`, `.skip(n)`) or project them (`.values()`,
+ * `.enumerate()`) are looked through only where the value they are called on
+ * is read: a project method of the name is read from its own signature.
+ */
+function rustIteratedElement(iter: string, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
+  let v = iter.trim();
+  const steps: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const value = rustValueType(v.replace(/^&\s*(?:mut\s+)?/, ''), at, scopes, ref, context, depth + 1);
+    if (value) return rustStepItems(value, steps.reverse(), context);
+    const call = rustTrailingCall(v);
+    const m = call ? /^([\s\S]+?)\s*\.\s*([a-z_]\w*)$/.exec(call.callee) : null;
+    if (!m || !(RUST_ITEM_ADAPTERS.has(m[2]!) || RUST_ITEM_PROJECTIONS.has(m[2]!))) return null;
+    steps.push(m[2]!);
+    v = m[1]!;
+  }
+  return null;
+}
+
+/** The items a value hands out through std adapters, innermost first. */
+function rustStepItems(value: RustWrittenType, steps: string[], context: ResolutionContext): RustWrittenType | null {
+  let projection: 'key' | 'value' | undefined;
+  let numbered = false;
+  for (const step of steps) {
+    const p = RUST_ITEM_PROJECTIONS.get(step);
+    if (p === 'enumerate') {
+      if (numbered) return null;
+      numbered = true;
+    } else if (p) {
+      if (numbered || projection) return null;
+      projection = p;
+    }
+  }
+  const item = rustItemOf(value, projection, context);
+  return item && numbered ? { ...item, text: `(usize, ${item.text})` } : item;
+}
+
+/** Std collections whose items are their one type argument. */
+const RUST_STD_SEQUENCES: ReadonlySet<string> = new Set([
+  'Vec', 'VecDeque', 'HashSet', 'BTreeSet', 'BinaryHeap', 'LinkedList', 'Option', 'IndexSet', 'SmallVec',
+]);
+const RUST_STD_MAPS: ReadonlySet<string> = new Set(['HashMap', 'BTreeMap', 'IndexMap']);
+/** Std iterator types by what they hand out: an item, a map's entry, key or value. */
+const RUST_STD_ITERATORS: ReadonlyMap<string, 'item' | 'entry' | 'key' | 'value'> = new Map([
+  ['Iter', 'entry'], ['IterMut', 'entry'], ['IntoIter', 'entry'], ['Drain', 'entry'],
+  ['Keys', 'key'], ['IntoKeys', 'key'], ['Values', 'value'], ['ValuesMut', 'value'], ['IntoValues', 'value'],
+]);
+const RUST_ITERATOR_TRAITS: ReadonlySet<string> = new Set(['Iterator', 'IntoIterator', 'DoubleEndedIterator', 'ExactSizeIterator']);
+
+/**
+ * The item type a value of a Rust type hands out when iterated: a std
+ * sequence's or a slice's element, a std map's `(K, V)` (its key or value
+ * through `.keys()` / `.values()`), a std iterator's item, an `impl Iterator<Item
+ * = T>`'s `T`, through `&` and the pointers that deref to what they hold.
+ * Read where the type is written. Null for any other type.
+ */
+function rustItemOf(written: RustWrittenType, projection: 'key' | 'value' | undefined, context: ResolutionContext): RustWrittenType | null {
+  let t = written.text.trim();
+  for (let i = 0; i < 6; i++) {
+    const before = t;
+    t = t.replace(/^&\s*(?:'\w+\s+)?(?:mut\s+)?/, '').trim();
+    const pointer = /^(?:(?:std|alloc|core)\s*::\s*(?:\w+\s*::\s*)*)?(?:Box|Rc|Arc|Cow|Ref|RefMut|MutexGuard|RwLockReadGuard|RwLockWriteGuard)\s*</.exec(t);
+    if (pointer && rustAngleEnd(t, pointer[0].length - 1) === t.length - 1) t = t.slice(pointer[0].length, -1).replace(/^\s*'\w+\s*,/, '').trim();
+    if (t === before) break;
+  }
+  const as = (text: string | undefined): RustWrittenType | null => (text ? { ...written, text: text.trim(), wrappers: undefined } : null);
+  const typeArgs = (args: string): string[] => splitRustTopLevel(args, ',').map((a) => a.trim()).filter((a) => a !== '' && !a.startsWith("'"));
+  const std = (name: string): boolean => !isRustProjectNamed(name, RUST_DECLARED_TYPE_KINDS, context);
+  if (t.startsWith('[')) {
+    if (!rustGroupIsWhole(t) || projection) return null;
+    return as(splitRustTopLevel(t.slice(1, -1), ';')[0]);
+  }
+  const object = /^(?:impl|dyn)\s+([\s\S]+)$/.exec(t);
+  if (object) {
+    if (projection) return null;
+    for (const bound of splitRustTopLevel(object[1]!, '+')) {
+      const head = rustPathHead(bound.trim());
+      if (!head || !RUST_ITERATOR_TRAITS.has(head.name)) continue;
+      return as(typeArgs(head.args).map((a) => /^Item\s*=\s*([\s\S]+)$/.exec(a)?.[1]).find((a) => a !== undefined));
+    }
+    return null;
+  }
+  const head = rustPathHead(t);
+  if (!head || !std(head.name)) return null;
+  const args = typeArgs(head.args);
+  if (RUST_STD_SEQUENCES.has(head.name)) return projection || args.length !== 1 ? null : as(args[0]);
+  if (RUST_STD_MAPS.has(head.name)) {
+    if (args.length < 2) return null;
+    return projection === 'key' ? as(args[0]) : projection === 'value' ? as(args[1]) : as(`(${args[0]}, ${args[1]})`);
+  }
+  const iterator = RUST_STD_ITERATORS.get(head.name);
+  if (!iterator) return null;
+  if (iterator === 'key' || iterator === 'value') return projection || args.length !== 2 ? null : as(args[iterator === 'key' ? 0 : 1]);
+  if (args.length === 1) return projection ? null : as(args[0]);
+  if (args.length === 2) return projection === 'key' ? as(args[0]) : projection === 'value' ? as(args[1]) : as(`(${args[0]}, ${args[1]})`);
+  return null;
+}
+
+/**
  * The type a name a pattern binds is: in `Some(x)` / `Ok(x)` / `Err(e)` what
  * the matched value's `Option` or `Result` holds; in a variant's or a
  * struct's pattern (`Commands::Build(opts)`, `Point { x, .. }`) the field's
  * type its declaration writes.
  */
 function rustSiteType(site: RustPatternSite, scrutinee: string | undefined, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
+  // `let (a, b) = …`, `(k, v) =>`: the matched tuple's field at the name's place.
+  if (site.path === '') {
+    if (site.index === undefined || !scrutinee) return null;
+    const value = rustValueType(scrutinee, at, scopes, ref, context, depth + 1);
+    return value ? rustTupleField(value, site.index) : null;
+  }
   const segments = site.path.split('::');
   const last = segments[segments.length - 1]!;
   if (segments.length === 1 && (last === 'Some' || last === 'Ok' || last === 'Err')) {
@@ -10386,10 +10892,21 @@ function rustOutsideTypeCall(name: string, args: string, byRef: boolean, method:
   // its name (`fn local_addr(&self) { Self::local_addr(self) }` in axum's
   // `impl Listener for TcpListener`) shows the type has that method itself,
   // which a call reaches first.
+  // An impl for a project type of the name is that type's, not the outside
+  // one's: tokio's `impl Kill for Child` in process/windows.rs is for its own
+  // `struct Child`, never `std::process::Child`. Its type is read as the impl
+  // writes it: hexpm's `impl LowestVersion for pubgrub::Range<Version>` is
+  // pubgrub's `Range`'s.
+  const forOutside = (m: Node): boolean => {
+    const written = rustTraitImplHeader(m, context)?.selfText.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '') ?? '';
+    const head = rustPathHead(written);
+    const lookup = rustTypeLookup(head?.name ?? name, head?.segments ?? [], m.filePath, context, rustNodeOffset(m, context));
+    return lookup.outside || !lookup.nodes.some((n) => RUST_OWNER_KINDS.has(n.kind));
+  };
   const impls = rustSpecialized(rustMethodsNamed(name, method, context).filter((m) => {
     const impl = rustTraitImplHeader(m, context);
     return impl !== null && impl.self === name && isRustProjectNamed(impl.trait, RUST_TRAIT_KIND, context) &&
-      isRustTraitInScope(impl.trait, ref, m, context) && !rustDelegatesToOwn(m, name, context);
+      isRustTraitInScope(impl.trait, ref, m, context) && !rustDelegatesToOwn(m, name, context) && forOutside(m);
   }), args, context);
   if (impls.length === 1) return { original: ref, targetNodeId: impls[0]!.id, confidence: 0.85, resolvedBy: 'instance-method' };
   if (impls.length > 1) {
@@ -10503,9 +11020,21 @@ function rustTypedMethodCall(read: RustTypeRead, method: string, ref: Unresolved
     if (traits.length > 1) traits = traits.filter((t) => isRustTraitCallable(t, ref, viaTraits.get(t)![0]!, context));
     // Two traits in scope with the method: Rust asks which.
     if (traits.length !== 1) return null;
-    const methods = rustSpecialized(viaTraits.get(traits[0]!)!, read.args, context);
-    // `impl From<A> for T` and `impl From<B> for T`: the argument decides.
-    if (new Set(methods.map((m) => rustTraitImplHeader(m, context)?.traitArgs.join(','))).size > 1) return null;
+    let methods = rustSpecialized(viaTraits.get(traits[0]!)!, read.args, context);
+    // `impl Encoder<Bytes> for C` and `impl Encoder<&[u8]> for C`: the call's
+    // argument decides, where its type is one impl's trait argument —
+    // tokio's `codec.encode(Bytes::from(…), &mut buf)`, axum's
+    // `router.call(request)` on a `request: Request<String>`.
+    const traitArgs = (m: Node): string => rustTraitImplHeader(m, context)?.traitArgs.join(',') ?? '';
+    if (new Set(methods.map(traitArgs)).size > 1) {
+      const fit = methods.filter((m) => {
+        const args = rustTraitImplHeader(m, context)?.traitArgs ?? [];
+        const head = args.find((a) => /^[A-Z]/.test(a)) ?? args[0];
+        return head !== undefined && rustFirstArgIs(head, ref, context);
+      });
+      if (fit.length === 0 || new Set(fit.map(traitArgs)).size > 1) return null;
+      methods = fit;
+    }
     return rustPickMethod(methods, typeFiles, ref, 0.9);
   }
   // An impl of an alias of the type, for the instantiation it names: gleam's
@@ -10546,6 +11075,32 @@ function matchRustTypedReceiverCall(receiver: string, method: string, ref: Unres
 
 /** The refs matchRustTypedReceiverCall resolved: through a typed receiver, a trait's own method is in reach. */
 const RUST_TYPED_REFS = new WeakMap<ResolutionContext, WeakSet<UnresolvedRef>>();
+
+/**
+ * A Rust call on a field of the enclosing impl's type — `self.inner.run()`,
+ * `self.0.len()` — as a call on the type the struct declares for the field:
+ * through `Arc`, `Box`, `Pin` and the lock guards, by a bounded generic's
+ * traits or a trait object's, with the struct's `use`s naming the type
+ * (rustFieldValue, rustTypedMethodCall). Undefined where the field's type
+ * can't be told: an enum's `self`, a trait's default method, a struct the
+ * index doesn't hold.
+ */
+function matchRustTypedSelfFieldCall(field: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (!/^(?:[A-Za-z_]\w*|\d+)$/.test(field)) return undefined;
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return undefined;
+  const at = (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column);
+  const written = rustFieldValue('self', field, at, scopes, ref, context, 0);
+  if (!written) return undefined;
+  const result = rustTypedMethodCall(rustReadType(written, ref, context), method, ref, context);
+  if (result === 'unread') return undefined;
+  if (result) {
+    let typed = RUST_TYPED_REFS.get(context);
+    if (!typed) RUST_TYPED_REFS.set(context, (typed = new WeakSet()));
+    typed.add(ref);
+  }
+  return result;
+}
 
 function rustTypedReceiverCall(receiver: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | { unread: number } | undefined {
   const scopes = rustScopesOf(ref.filePath, context);
@@ -10620,27 +11175,169 @@ export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: 
   let binds = memo.get(key);
   if (binds === undefined) {
     const text = jsFunctionCodeThrough(fn, filePath, line, context);
-    const { param } = localBindingPatterns(name, 'g');
     const n = name.replace(/\$/g, '\\$');
     // A plain declaration. Destructuring re-binds what a call returns under
     // the same name — `const { t } = useI18n()`, `const { getLabel } =
     // useProps(props)` — which is the same-named function more often than not.
-    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
-    // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
-    // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
-    // The leading `(?=\()` (every match opens a list) keeps the lookbehind to
-    // where one opens. Node 22's V8 stops optimizing the regexes a process
-    // compiles once it has generated about a megabyte of regex code, which a
-    // resolver pool worker soon has, and then tried the lookbehind at every
-    // position, each time reading back through the run of blanks before it:
-    // go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
-    // stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
-    // never resolved.
-    const parameter = new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
-    binds = declared || parameter.test(text);
+    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
+    binds = declared || jsParameterListPattern(name, '').test(text);
     memo.set(key, binds);
   }
   return binds;
+}
+
+/**
+ * A parameter list that names `name` (localBindingPatterns' `param`), never
+ * a control-flow head (`if (openMarkerClose) {`). A return type stays on its
+ * line, never a ternary's `: data.slice()` below `filter(canRowExpand)`, and
+ * may hold an object type, so the match ends at the body's `{`, not at the
+ * type's: `delta(…): { removed: T[]; added: T[] } {`.
+ * The leading `(?=\()` (every match opens a list) keeps the lookbehind to
+ * where one opens. Node 22's V8 stops optimizing the regexes a process
+ * compiles once it has generated about a megabyte of regex code, which a
+ * resolver pool worker soon has, and then tried the lookbehind at every
+ * position, each time reading back through the run of blanks before it:
+ * go-ethereum's graphiql.min.js, a 980 KB line whose last 962 KB the
+ * stripper blanks (it reads the `//` closing `/Trident\//` as a comment),
+ * never resolved.
+ */
+function jsParameterListPattern(name: string, flags: string): RegExp {
+  const { param } = localBindingPatterns(name, flags);
+  const returnType = `(?::(?:[^=;{}()\\n]|${PARAM_BRACE})*)?`;
+  return new RegExp(`(?=\\()(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', () => returnType)}`, flags);
+}
+
+/**
+ * Whether the JS/TS function a reference sits in binds its name in a scope
+ * that holds at the reference, not just somewhere in its text: a parameter
+ * list or a lone arrow parameter whose body is still open there (a
+ * function's or a `catch` clause's block, an arrow's block or expression),
+ * or a `var`/`let`/`const`, `function` or `class` whose block or `for`
+ * statement is. A `new Promise((resolve) => …)` executor's `resolve` is the
+ * calls inside it, not a `resolve(file)` after it, and a `const X =
+ * require('./x')` binds the import itself. A function too long to read
+ * again keeps the import.
+ */
+function jsBindingEnclosesReference(name: string, fn: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const through = jsFunctionCodeThrough(fn, ref.filePath, ref.line, context);
+  const cut = through.slice(0, through.lastIndexOf('\n') + 1 + ref.column);
+  if (cut.length > 100_000) return false;
+  // Brackets in strings, template literals and regex literals open no scope.
+  const regexes: number[] = [];
+  const chars = blankStringContents(cut, regexes).split('');
+  for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
+  const code = chars.join('');
+  const n = name.replace(/\$/g, '\\$');
+  const declaration = new RegExp(
+    `\\b(?:(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])(\\s*=\\s*(?:await\\s+)?(?:require|import)\\s*\\()?|(?:function|class)\\s+${n}(?![\\w$]))`,
+    'g'
+  );
+  for (const m of code.matchAll(declaration)) {
+    if (m[1]) continue;
+    const inForHead = /\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, m.index! - 16), m.index));
+    if (inForHead ? jsForStatementOpenAtEnd(code, m.index!) : jsBlockOpenAtEnd(code, m.index!)) return true;
+  }
+  for (const m of code.matchAll(jsParameterListPattern(name, 'g'))) {
+    const end = m.index! + m[0].length;
+    if (code[end - 1] === '{' ? jsBlockOpenAtEnd(code, end) : jsBodyOpenAtEnd(code, end)) return true;
+  }
+  // `new Promise<void>(resolve => { … })`: a lone parameter where an
+  // expression starts, never the name a return type ends with (`(): Bounds =>`).
+  const loneParameter = new RegExp(`(^|[(,=\\[{?:]|=>|\\b(?:return|async|default|yield|await))\\s*${n}\\s*=>`, 'g');
+  for (const m of code.matchAll(loneParameter)) {
+    if (m[1] === ':' && /\)\s*$/.test(code.slice(Math.max(0, m.index! - 200), m.index))) continue;
+    if (jsBodyOpenAtEnd(code, m.index! + m[0].length)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the block that holds `at` (just inside a body's `{`, or where a
+ * declaration starts) is still open at the end of `code`.
+ */
+function jsBlockOpenAtEnd(code: string, at: number): boolean {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    if (code[i] === '{') depth++;
+    else if (code[i] === '}' && --depth < 0) return false;
+  }
+  return true;
+}
+
+const JS_OPERAND_END = /[\w$)\]}'"`]/;
+const JS_OPERAND_START = /[\w$'"`]/;
+
+/**
+ * Whether the body that starts at `at` (an arrow's, after its `=>`, or a
+ * `for` statement's, after its head) is still open at the end of `code`: a
+ * `{…}` block, or an expression or statement, which a comma or a semicolon
+ * ends, or the bracket closing around it, or a line that starts another
+ * statement where no semicolon ends the last.
+ */
+function jsBodyOpenAtEnd(code: string, at: number): boolean {
+  let i = at;
+  while (i < code.length && WHITESPACE.test(code[i]!)) i++;
+  if (code[i] === '{') return jsBlockOpenAtEnd(code, i + 1);
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth < 0) return false;
+    } else if (depth === 0 && (c === ',' || c === ';')) {
+      return false;
+    } else if (depth === 0 && c === '\n') {
+      // `const f = (x) => x + 1` with no semicolon, above the reference: the
+      // line before ends an operand (a name, a closing bracket, a quote) and
+      // the next starts one (the reference itself, when the code ends there)
+      // rather than an operator or a `.` continuing the expression.
+      let before = i - 1;
+      while (before >= 0 && WHITESPACE.test(code[before]!)) before--;
+      let after = i + 1;
+      while (after < code.length && WHITESPACE.test(code[after]!)) after++;
+      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return false;
+      i = after - 1;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a declaration in a `for` head, at `at`, is still in scope at the
+ * end of `code`: in the head, or in the statement after it.
+ */
+function jsForStatementOpenAtEnd(code: string, at: number): boolean {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth < 0) return c === ')' && jsBodyOpenAtEnd(code, i + 1);
+  }
+  return true;
+}
+
+/**
+ * Whether an import-resolved `result` is the file's import of the reference's
+ * name while the calling JS/TS function binds that name itself, in a scope
+ * that holds at the reference (jsBindingEnclosesReference): bitwarden's
+ * `pick(…, isAvailable: (f: string) => boolean)` calling `isAvailable(f)`
+ * means its parameter, not the file's `import { isAvailable } from './sdk'`.
+ * The import resolver answers before matchReference's check, which reads the
+ * function's whole text — too coarse for an import, whose link is usually right.
+ */
+export function isImportShadowedByJsBinding(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language) || !JS_LOCAL_REF_KINDS.has(ref.referenceKind) || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return false;
+  const target = context.getNodeById?.(result.targetNodeId);
+  // (A parameter or local is a value: it hides no interface or type alias, `let coords: Bounds`.)
+  if (!target || target.name !== ref.referenceName || target.kind === 'interface' || target.kind === 'type_alias') return false;
+  const fn = context.getNodeById?.(ref.fromNodeId);
+  if (!fn || (fn.kind !== 'function' && fn.kind !== 'method') || fn.startLine > ref.line || fn.endLine < ref.line) return false;
+  if (target.filePath === ref.filePath && target.startLine >= fn.startLine && target.startLine <= fn.endLine) return false;
+  // No function binds a name its file never does (read once per file and name).
+  if (!isLocallyBoundJsName(ref.referenceName, ref.filePath, context)) return false;
+  if (ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
+  return jsBindingEnclosesReference(ref.referenceName, fn, ref, context);
 }
 
 /**
@@ -10725,28 +11422,50 @@ const JS_BINDING_NAME = /^[\w$]+$/;
 const ARROW_HEAD_CHAR = /[\w$.]/;
 const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
 
+// The balanced groups a parameter's type or default can hold, two levels deep.
+const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
+const PARAM_BRACE = '\\{(?:[^{}]|\\{[^{}]*\\})*\\}';
+const PARAM_BRACKET = '\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\]';
+const PARAM_ANGLE = '<(?!\\s)(?:=>|=(?!>)|[^<>=]|<(?:=>|=(?!>)|[^<>=])*>)*>';
+/**
+ * One piece of a parameter's type or default: a character other than a comma,
+ * or a balanced group, which may hold commas (`Map<K, V>`, `{ a: A, b: B }`,
+ * `(a: number, b: number) => number`). Every alternative starts with a
+ * character of its own — `=>` is the arrow of a function type, and a `<` or
+ * `>` spaced like an operator (`f.length > 0`) is no bracket — so a type has
+ * one parse.
+ */
+const PARAM_PART = `(?:=>|=(?!>)|[^,(){}\\[\\]<>=]|<(?=\\s)|>(?=[\\s=])|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET}|${PARAM_ANGLE})`;
+/** A TypeScript parameter property's modifiers: `constructor(private readonly store: Store)`. */
+const PARAM_MODIFIERS = '(?:(?:public|private|protected|readonly|override)\\s+)*';
+
 function localBindingPatterns(name: string, flags: string): LocalBindingPatterns {
   const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return {
     // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
     // not a shadow: the symbol lives in the other file and the call means it.
     decl: new RegExp(
-      '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+      '\\b(?:const|let|var)\\s+(?:' + n + '(?![\\w$])|[{\\[][^;=]*?\\b' + n + '(?![\\w$])[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
       flags
     ),
-    fn: new RegExp('\\b(?:function|class)\\s+' + n + '\\b', flags),
+    fn: new RegExp('\\b(?:function|class)\\s+' + n + '(?![\\w$])', flags),
     // a parameter: every token before the name in the list is itself a
-    // parameter (identifier, optional type, optional default) — so a string
-    // argument containing the word cannot match.
+    // parameter (identifier or destructuring, optional type, optional
+    // default) — so a string argument containing the word cannot match.
     // Each earlier parameter has exactly one parse: its first non-space
     // character after the identifier picks the type (`?`/`:`), default (`=`)
-    // or bare alternative. Written as `(type)?(default)?\s*`, the same
-    // strings split several ways per parameter, and a failing search
-    // backtracked through every combination — 30-40s per name on a vscode
-    // test file whose helper takes nine `name: T = value` parameters.
+    // or bare alternative, and a type or default runs to the comma. Written
+    // as `(type)?(default)?\s*`, the same strings split several ways per
+    // parameter, and a failing search backtracked through every combination
+    // — 30-40s per name on a vscode test file whose helper takes nine `name:
+    // T = value` parameters. A type or default may hold balanced groups
+    // (PARAM_PART): `isAvailable: (f: string) => boolean`, `cb: () => void`
+    // before the name, `compare = (a, b) => a - b`.
     param: new RegExp(
-      '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*(?:\\?\\s*)?:[^,()]+|\\s*=[^,()]+|\\s*),\\s*)*' +
-        n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)',
+      '\\(\\s*(?:(?:' + PARAM_MODIFIERS + '(?:\\.\\.\\.)?[\\w$]+|' + PARAM_BRACE + '|' + PARAM_BRACKET + ')' +
+        '(?:\\s*(?:\\?\\s*)?:' + PARAM_PART + '+|\\s*=' + PARAM_PART + '+|\\s*),\\s*)*' +
+        PARAM_MODIFIERS + n + '(?![\\w$])(?:\\s*\\??\\s*:' + PARAM_PART + '*)?(?:\\s*=' + PARAM_PART + '*)?' +
+        '(?:\\s*,(?:[^()]|' + PARAM_PAREN + ')*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)',
       flags
     ),
   };
@@ -10793,11 +11512,30 @@ function bindsAnywhere(source: string, name: string): boolean {
 }
 
 /**
+ * The `(` of the parenthesized list `source[at]` sits in, read back over the
+ * balanced groups before it (an earlier parameter's `cb: () => void` or `{ a,
+ * b }`), or -1 when the name sits in a block, an object or an array, after a
+ * statement's end, or too far back to be in a parameter list.
+ */
+function enclosingOpenParen(source: string, at: number): number {
+  let depth = 0;
+  for (let i = at - 1; i >= 0 && at - i <= 2000; i--) {
+    const c = source[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) return c === '(' ? i : -1;
+      depth--;
+    } else if (c === ';' && depth === 0) return -1;
+  }
+  return -1;
+}
+
+/**
  * bindsAnywhere for a plain identifier, tried only where a match can start:
  * a declaration at its keyword (in order, resuming past each match exactly as
- * the global search does), a parameter at the `(` its list opens with — the
- * last `(` before an occurrence of the name, with no `)` between, since no
- * earlier parameter can hold a parenthesis — and `name =>` at each arrow.
+ * the global search does), a parameter at the `(` its list opens with
+ * (enclosingOpenParen, from an occurrence of the name), and `name =>` at each
+ * arrow.
  */
 function bindsAtSites(source: string, name: string, sites: LocalBindingSites): boolean {
   let patterns = LOCAL_BINDING_PATTERNS.get(name);
@@ -10824,8 +11562,8 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
   }
   let tried = -1;
   for (let at = source.indexOf(name); at !== -1; at = source.indexOf(name, at + 1)) {
-    const open = at > 0 ? source.lastIndexOf('(', at - 1) : -1;
-    if (open < 0 || open === tried || source.lastIndexOf(')', at - 1) > open) continue;
+    const open = enclosingOpenParen(source, at);
+    if (open < 0 || open === tried) continue;
     tried = open;
     param.lastIndex = open;
     if (param.test(source)) return true;
@@ -10885,6 +11623,9 @@ export function matchByExactName(
   const valueRef = ref.referenceKind === 'references' || ref.referenceKind === 'function_ref';
   const importRef = ref.referenceKind === 'imports';
   const inheritanceRef = isInheritanceRef(ref);
+  // Read once, and only for a candidate in another file: it scans the file.
+  let bareTypeName: boolean | undefined;
+  const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
   const sameName = context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
@@ -10985,6 +11726,10 @@ export function matchByExactName(
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
     (!inheritanceRef || isSupertypeTarget(n)) &&
+    // And a supertype or type a TS/JS module names without importing it is
+    // its own or a global, never another module's — ahead of the ranking, so
+    // a global `interface Window` in a `declare global` still wins.
+    !(n.filePath !== ref.filePath && tsBareTypeName() && !isTsTypeInScope(n, ref, context)) &&
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
@@ -11120,7 +11865,7 @@ export function matchByQualifiedName(
     };
   }
 
-  let candidates = cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context);
+  let candidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context), ref, context);
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
   // That own using ends the lookup here, and resolveOne drops it (an import
@@ -11187,16 +11932,23 @@ export function matchByQualifiedName(
 
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
+  // The written name must start a scope of the candidate's: rocksdb's
+  // `CacheShard::ComputeHash` (a template parameter's) is no
+  // `clock_cache::ClockCacheShard::ComputeHash`. A namesake in the call's own
+  // language comes first: protobuf's C++ `DescriptorPool::generated_pool()`
+  // is never its Ruby `Google::Protobuf::DescriptorPool`'s.
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName)), ref, context);
-    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+    const partialCandidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
+      .filter((candidate) => endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context), ref, context);
+    const ownLanguage = partialCandidates.filter((candidate) => sameLanguageFamily(candidate.language, ref.language));
+    const pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
+    const chosen = preferCallSiteFile(pool, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
-        targetNodeId: cppFunctionOverload(chosen, partialCandidates, ref, context).id,
+        targetNodeId: cppFunctionOverload(chosen, pool, ref, context).id,
         confidence: 0.85,
         resolvedBy: 'qualified-name',
       };
@@ -11206,26 +11958,23 @@ export function matchByQualifiedName(
   return null;
 }
 
+/**
+ * Whether qualified name `qn` is `name`, or ends with it right after a scope
+ * separator: `::`, or the `.` of a dotted package, namespace, object path or
+ * config key. A name written from the global scope (`::Foo::bar`) is never
+ * the tail of a nested one.
+ */
+function endsAtScopeBoundary(qn: string, name: string): boolean {
+  if (qn === name) return true;
+  if (!qn.endsWith(name)) return false;
+  const before = qn.slice(0, qn.length - name.length);
+  return before.endsWith('::') || before.endsWith('.');
+}
+
 /** A node a `Receiver.method()` call can name as the method's owning type. */
 function isMethodOwnerKind(n: Node): boolean {
   return n.kind === 'class' || n.kind === 'struct' || n.kind === 'union' || n.kind === 'interface' ||
     (n.language === 'scala' && n.kind === 'module');
-}
-
-/**
- * Is `n` the method `name` of the class `cls` a receiver is taken to name
- * (the class-name and capitalized-receiver strategies of matchMethodCall)?
- * In C and C++, only one of exactly that class: protobuf's `arena.get()`
- * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
- * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
- * other languages, any method of the name whose qualified name has the
- * class's name in it, as before.
- */
-function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
-  if (n.kind !== 'method' || n.name !== name) return false;
-  return cls.language === 'c' || cls.language === 'cpp'
-    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
-    : n.qualifiedName.includes(cls.name);
 }
 
 /**
@@ -12005,6 +12754,62 @@ export function matchCollapsedObjectCall(ref: UnresolvedRef, context: Resolution
   return resolveObjectPathMember(host[2]!.replace(/[\s?]/g, ''), ref.referenceName, ref, context, host[1]!) ?? undefined;
 }
 
+/**
+ * The method `methodName` a TS/JS class or interface declared in `file` gets
+ * from its supertypes, found through that declaration's own extends and
+ * implements edges: the member a supertype's own declaration has, each
+ * supertype and then its own supertypes in the order they are written, as
+ * the walk by name goes. That walk (getSupertypes) unions the supertypes of
+ * every type sharing the name and looks the method up by its name again, so a
+ * supertype declared in many files — vscode's `IDisposable`, in eleven — gave
+ * whichever one came first, another app's included. Undefined when `file`
+ * declares no such type, or none of its supertypes has the member.
+ */
+function esInheritedMethod(typeName: string, methodName: string, file: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const supertypeNodes = context.getSupertypeNodes;
+  if (!supertypeNodes) return undefined;
+  const decls = context.getNodesByName(typeName).filter((n) => n.filePath === file && (n.kind === 'class' || n.kind === 'interface'));
+  const seen = new Set(decls.map((n) => n.id));
+  const inherited = (decl: Node, depth: number): Node | undefined => {
+    for (const base of supertypeNodes(decl.id)) {
+      if (seen.has(base.id)) continue;
+      seen.add(base.id);
+      const members = context.getMethodMatches?.(base.name, methodName, ref.language) ??
+        context.getNodesByName(methodName).filter((m) => m.kind === 'method' && m.qualifiedName.endsWith(`${base.name}::${methodName}`));
+      const own = members.find((m) => m.filePath === base.filePath && m.startLine >= base.startLine && m.endLine <= base.endLine);
+      if (own) return own;
+      const above = depth < 3 ? inherited(base, depth + 1) : undefined;
+      if (above) return above;
+    }
+    return undefined;
+  };
+  for (const decl of decls) {
+    const found = inherited(decl, 0);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The supertypes, by name, of the TS/JS classes named `typeName`: the walk by
+ * name without an interface's supertypes, which only esInheritedMethod reads,
+ * from the interface's own declaration. Through any interface of the name, a
+ * type from a package or a global namespace (vscode's `NodeJS.ReadableStream`)
+ * reached the supertypes of the project's own `ReadableStream`, and a type
+ * whose import doesn't resolve those of whichever app declares one.
+ */
+function esClassSupertypes(typeName: string, language: Language, context: ResolutionContext): string[] {
+  if (!context.getSupertypeNodes) return context.getSupertypes?.(typeName, language) ?? [];
+  const names = new Set<string>();
+  for (const n of context.getNodesByName(typeName)) {
+    if (n.language !== language || n.kind !== 'class') continue;
+    for (const s of context.getSupertypeNodes(n.id)) {
+      if (s.name && s.name !== typeName) names.add(s.name);
+    }
+  }
+  return [...names];
+}
+
 // Exported for the precedence unit tests (#1079): they assert the
 // preferredFqn → same-file → matches[0] ordering directly.
 export function resolveMethodOnType(
@@ -12072,7 +12877,16 @@ export function resolveMethodOnType(
     // a supertype), so a wrong inference produces no edge.
     if (depth < 4 && context.getSupertypes) {
       const viaSupers = nmTimedT('rmot-supers', ref, (): ResolvedRef | null => {
-        for (const supertype of context.getSupertypes!(typeName, ref.language)) {
+        // A TS/JS type whose declaration is known — the file it is imported
+        // from, or else the call's own — takes the member its own supertypes
+        // declare before any type of the same name elsewhere is asked.
+        const es = ES_IMPORT_LANGUAGES.has(ref.language);
+        if (depth === 0 && es) {
+          const inherited = esInheritedMethod(typeName, methodName, preferredFqn ?? ref.filePath, ref, context);
+          if (inherited) return { original: ref, targetNodeId: inherited.id, confidence, resolvedBy };
+        }
+        const supertypes = es ? esClassSupertypes(typeName, ref.language, context) : context.getSupertypes!(typeName, ref.language);
+        for (const supertype of supertypes) {
           const via = resolveMethodOnType(
             supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
           );
@@ -13062,7 +13876,28 @@ function cppClassParenDepths(
   return depths;
 }
 
-/** The lines of the functions and classes nested in the C++ class declaration `decl`, which ends on line `end`. */
+/**
+ * Is the C or C++ declaration `n` an anonymous union or struct, with no name
+ * and no declarator, whose members are those of the class it is declared in?
+ * C++ looks them up as that class's own: protobuf's generated messages hold
+ * their fields in `union { Impl_ _impl_; };`, and fmt's `value` its argument
+ * in a union of `string`, `custom` and the rest. Not one with a declarator,
+ * `union { … } u;`, whose members are `u`'s, nor a specialization the index
+ * keeps as `<anonymous>`, whose head names its template.
+ */
+function isCppAnonymousMembers(n: Node, context: ResolutionContext): boolean {
+  if (n.name !== '<anonymous>' || (n.kind !== 'union' && n.kind !== 'struct')) return false;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/);
+  const head = lines?.[n.startLine - 1]?.slice(n.startColumn ?? 0);
+  const foot = lines?.[(n.endLine ?? n.startLine) - 1];
+  return !!head && !!foot && /^\s*(?:union|struct)\s*\{/.test(head) && /\}\s*;\s*(?:\/\/.*)?$/.test(foot);
+}
+
+/**
+ * The lines of the functions and classes nested in the C++ class declaration
+ * `decl`, which ends on line `end` — not an anonymous union's or struct's,
+ * whose members are the class's own (isCppAnonymousMembers).
+ */
 function cppNestedSpans(decl: Node, end: number, context: ResolutionContext): Array<[number, number]> {
   let memo = CPP_NESTED_SPANS.get(context);
   if (!memo) CPP_NESTED_SPANS.set(context, (memo = new Map()));
@@ -13070,7 +13905,7 @@ function cppNestedSpans(decl: Node, end: number, context: ResolutionContext): Ar
   if (!spans) {
     spans = context.getNodesInFile(decl.filePath)
       .filter((n) => n.id !== decl.id && n.startLine >= decl.startLine && (n.endLine ?? n.startLine) <= end &&
-        (isCppFunctionNode(n) || CPP_CLASS_KINDS.has(n.kind)))
+        (isCppFunctionNode(n) || (CPP_CLASS_KINDS.has(n.kind) && !isCppAnonymousMembers(n, context))))
       .map((n): [number, number] => [n.startLine, n.endLine ?? n.startLine]);
     memo.set(decl.id, spans);
   }
@@ -13817,14 +14652,68 @@ function cppArrowTarget(
 
 /**
  * The element a container's iterator of the type `iterator` points at, read
- * from the container's template arguments (cppArrowTarget). Null for any
- * other type, and for an element a class template's own `begin()` or
+ * from the container's template arguments (cppArrowTarget), or what `->` on
+ * a value of one of the project's classes reaches (cppOperatorTarget). Null
+ * for any other type, and for an element a class template's own `begin()` or
  * `operator*` writes with its template parameter.
  */
 function cppIteratorTarget(iterator: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
   const container = CPP_ITERATOR_OF.exec(cppWithoutTypeKeywords(iterator.text))?.[1];
-  const element = container ? cppRangeElementOf({ ...iterator, text: container }, at, context, 1) : null;
+  const element = container ? cppRangeElementOf({ ...iterator, text: container }, at, context, 1) : cppOperatorTarget(iterator, at, context);
   return element && (element.scope === iterator.scope || !isCppTemplateParameterType(element)) ? element : null;
+}
+
+/**
+ * What `->` on a value of one of the project's classes of the type `type`
+ * reaches, as C++ reads `x->m`: what the class's `operator->` returns,
+ * through the pointer it is, or with `->` applied again to a class it is (a
+ * library holder's held type, or another of these); else what its
+ * `operator*` returns. The return type is read where the class declares it,
+ * with the class's own template parameters bound to the arguments `type` is
+ * written with (cppTemplateBound). rocksdb's `MultiGetContext::Range::Iterator`
+ * declares `KeyContext* operator->()`, its `UnownedPtr<DB>` a `T*
+ * operator->()`, a `DB*`, and its `FileSystemPtr` returns a
+ * `std::shared_ptr<FileSystem>`. Null when the class declares neither, or
+ * what it returns can't be read.
+ */
+function cppOperatorTarget(type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext, hops = 0): CppWrittenType | null {
+  const written = cppWithoutTypeKeywords(type.text);
+  if (hops > 2 || !written || isCppPointerType(written) || isCppLibraryType(written, context)) return null;
+  const found = cppClassWritten(written, type, at, context);
+  if (!found?.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return null;
+  const arrow = cppMethodsOf(found.node, 'operator->', at, context);
+  const returned = cppReturnTypeOf(arrow.length > 0 ? arrow : cppMethodsOf(found.node, 'operator*', at, context), context);
+  const bound = returned && cppTemplateBound(returned, found.node, { ...type, text: written }, at, context);
+  if (!bound) return null;
+  if (arrow.length === 0) return { ...bound, text: bound.text.replace(/&+\s*$/, '').trim() };
+  return cppPointee(bound) ?? cppOperatorTarget(bound, at, context, hops + 1);
+}
+
+/**
+ * The type `returned`, which the class template `cls` writes, with `cls`'s
+ * own template parameters bound to the arguments of `type`, a specialization
+ * of it: the `T*` of `UnownedPtr<T>` is a `DB*` for an `UnownedPtr<DB>`. An
+ * alias the class declares (`pointer`) is followed first, and an argument is
+ * looked up where `type` is written. A type of a class that is no template
+ * comes back as written; null for a parameter `type` doesn't bind.
+ */
+function cppTemplateBound(returned: CppWrittenType, cls: Node, type: CppWrittenType, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+  const params = cppOwnTemplateParameters(cls, context);
+  if (params.length === 0) return returned;
+  const args = cppTemplateArguments(type.text) ?? [];
+  const followed = cppFollowWrittenAliases(returned, at, context) ?? returned;
+  const core = followed.text.replace(/\b(?:const|volatile|typename)\b|[*&]/g, ' ').trim();
+  const index = params.indexOf(core);
+  if (index >= 0) {
+    const arg = args[index]?.trim();
+    return arg ? { ...type, text: followed.text.replace(new RegExp(`\\b${core}\\b`), arg) } : null;
+  }
+  let text = followed.text;
+  params.forEach((param, i) => {
+    const arg = args[i]?.trim();
+    if (param && arg) text = text.replace(new RegExp(`\\b${param}\\b`, 'g'), arg);
+  });
+  return { ...followed, text };
 }
 
 /**
@@ -14158,7 +15047,7 @@ function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: Resol
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
   const family = named.filter((n) => n.qualifiedName === want);
-  const own = cppSpecializationPool(family, ref, context);
+  const own = cppQualifierSpecializationPool(cppSpecializationPool(family, ref, context), ref, context);
   // Specializations of the class's own member template, none the call's:
   // what C++ finds is the template, which has no body here.
   if (own.length === 0 && family.length > 0) return null;
@@ -14751,6 +15640,79 @@ function cppSpecializationPool(candidates: Node[], ref: UnresolvedRef, context: 
   if (args === null) return others.length > 0 ? others : candidates;
   const named = candidates.filter((_, i) => written[i] !== null && cppTemplateArgumentsMatch(written[i]!, args));
   return named.length > 0 ? named : others;
+}
+
+/**
+ * The `candidates` a C++ call through a qualifier written with template
+ * arguments can mean: fmt's `formatter<int>::format(…)` is never the
+ * `format` a test defines for `formatter<incomplete_type>`, which the index
+ * names `fmt::formatter::format` like every other specialization's. A member
+ * defined out of line for a full specialization of its class stays only when
+ * that specialization's arguments are the call's; a template's own members,
+ * a partial specialization's and those defined in their class all stay. The
+ * candidates as they are when the qualifier is written without arguments.
+ */
+function cppQualifierSpecializationPool(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (ref.language !== 'cpp' || candidates.length === 0) return candidates;
+  const args = cppQualifierArguments(ref, context);
+  if (args === null) return candidates;
+  return candidates.filter((n) => {
+    const owner = cppSpecializationOwnerArguments(n, context);
+    return owner === null || cppTemplateArgumentsMatch(owner, args);
+  });
+}
+
+/** The template arguments a C++ call writes on the qualifier before its name: `int` for `formatter<int>::format(…)`, null for none. */
+function cppQualifierArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+  const segments = ref.referenceName.split('::');
+  if (segments.length < 2) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  return cppTemplateArgumentsAfter(lines.slice(ref.line - 1, ref.line + 3).join('\n'), segments[segments.length - 2]!, Math.max(0, ref.column));
+}
+
+/** Per context: a C++ member's id → the arguments of the full specialization it is defined out of line for (null: none). */
+const CPP_SPECIALIZATION_OWNER_ARGUMENTS = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+
+/**
+ * The arguments of the full specialization of its class a C++ member is
+ * defined out of line for: `incomplete_type` for fmt's `auto
+ * fmt::formatter<incomplete_type>::format(…)`. Null for a member defined in
+ * its class, and for one whose arguments name the template parameters around
+ * it, a template's own (`Foo<T>::bar`) or a partial specialization's
+ * (`Foo<T*>::bar`).
+ */
+function cppSpecializationOwnerArguments(n: Node, context: ResolutionContext): string[] | null {
+  if (n.language !== 'cpp' || (n.kind !== 'method' && n.kind !== 'function')) return null;
+  const segments = n.qualifiedName.split('::');
+  if (segments.length < 2) return null;
+  let memo = CPP_SPECIALIZATION_OWNER_ARGUMENTS.get(context);
+  if (!memo) CPP_SPECIALIZATION_OWNER_ARGUMENTS.set(context, (memo = new Map()));
+  const hit = memo.get(n.id);
+  if (hit !== undefined) return hit;
+  const owner = segments[segments.length - 2]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const name = n.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(n.startLine - 1, n.startLine + 11).join('\n').slice(n.startColumn);
+  let found: string[] | null = null;
+  // `Owner<args>::name`, the declarator's own qualifier.
+  for (const m of head.matchAll(new RegExp(`(?<![\\w$])${owner}<`, 'g'))) {
+    const open = m.index! + m[0].length - 1;
+    const end = cppTemplateArgumentsEnd(head, open);
+    if (end < 0 || !new RegExp(`^\\s*::\\s*~?${name}(?![\\w$])`).test(head.slice(end + 1))) continue;
+    const args = splitCppTopLevel(head.slice(open + 1, end)).map(cppTemplateArgumentKey);
+    // A `template <…>` with parameters on the definition makes it a template's
+    // own member or a partial specialization's, whatever the arguments say:
+    // abseil's `template <int max_words> … BigUnsigned<max_words>::FiveToTheNth(`.
+    const before = `${lines.slice(Math.max(0, n.startLine - 3), n.startLine - 1).join('\n')}\n${head.slice(0, m.index)}`;
+    const header = /\btemplate\s*<\s*(>)?(?![\s\S]*\btemplate\s*<)/.exec(before);
+    const parameters = [...cppTemplateParameters(n, context)];
+    const dependent = (header !== null && header[1] === undefined) ||
+      args.some((a) => parameters.some((p) => new RegExp(`(?<![\\w$])${p}(?![\\w$])`).test(a)));
+    found = dependent || args.length === 0 ? null : args;
+    break;
+  }
+  memo.set(n.id, found);
+  return found;
 }
 
 /** Per context: a C++ function's id → the template arguments it is an explicit specialization for (null: none). */
@@ -15491,6 +16453,125 @@ function noteCppDeclaration(found: CppReceiverDeclaration | undefined, raw: stri
 function isUndeclaredTypeName(typeName: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   return /^[A-Z]/.test(typeName) &&
     !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language));
+}
+
+/**
+ * Is the qualifier of a C++ `X::m()` call a class the index doesn't hold, as
+ * protobuf's `FeatureSet` is (declared in `descriptor.pb.h`, which is over the
+ * indexer's size cap)? A capitalized name that no C or C++ type, alias or
+ * namespace node has, and that the calling file makes nothing of itself
+ * (cppNamesBroughtIn).
+ */
+function isCppUndeclaredQualifier(qualifier: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!isUndeclaredTypeName(qualifier, ref, context) || cppTypesNamed(qualifier, context).length > 0 ||
+      context.getNodesByName(qualifier).some((n) => (n.language === 'cpp' || n.language === 'c') && (n.kind === 'namespace' || n.kind === 'module'))) return false;
+  const names = cppNamesBroughtIn(ref.filePath, context);
+  return !names.types.has(qualifier) && !names.namespaces.has(qualifier);
+}
+
+/**
+ * Is the qualifier of a C++ `x::m()` call a namespace, `absl` in
+ * `absl::StripPrefix(…)` or `fmt` in `fmt::ptr(p)`, and not a type? A
+ * lowercase name that no C or C++ type or alias node has, and that the
+ * calling file doesn't declare as a template parameter or an alias
+ * (cppNamesBroughtIn). A namespace holds functions and types, never a
+ * class's method.
+ */
+function isCppNamespaceQualifier(qualifier: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return /^[a-z_]/.test(qualifier) && cppTypesNamed(qualifier, context).length === 0 &&
+    !cppNamesBroughtIn(ref.filePath, context).types.has(qualifier);
+}
+
+/**
+ * Is `method` the constructor of the class a C++ call `ns::m(…)` names
+ * through its namespace? Its owner, right inside `ns`, is `m` itself or a
+ * specialization of the class template `m`, which the index holds without
+ * a name: protobuf's `internal::SourceWrapper<absl::Cord>(&data)` constructs
+ * the `struct SourceWrapper<absl::Cord>` in message_lite.cc, whose template
+ * is only declared. fmt's `template <> struct scanner<num>` is no `scan`.
+ */
+function isCppConstructorThrough(namespace: string, method: Node, context: ResolutionContext): boolean {
+  const parts = method.qualifiedName.split('::');
+  if (parts.length < 3 || parts[parts.length - 3] !== namespace) return false;
+  const owner = parts[parts.length - 2]!;
+  if (owner === method.name) return true;
+  if (owner !== '<anonymous>') return false;
+  const holder = context.getNodesByQualifiedName(parts.slice(0, -1).join('::')).find((n) =>
+    n.filePath === method.filePath && n.startLine <= method.startLine && (n.endLine ?? n.startLine) >= method.startLine);
+  const lines = holder ? context.getFileLines?.(holder.filePath) ?? context.readFile(holder.filePath)?.split(/\r?\n/) : undefined;
+  const head = holder && lines ? lines.slice(holder.startLine - 1, holder.startLine + 1).join(' ') : '';
+  return new RegExp(String.raw`\b(?:class|struct|union)\s+(?:[A-Za-z_]\w*\s+)*${method.name}\s*<`).test(head);
+}
+
+/** The names a C++ file makes something of itself, which the index holds no node for (see cppNamesBroughtIn). */
+interface CppFileNames {
+  /** Template parameters and aliases. */
+  types: ReadonlySet<string>;
+  /** The namespaces it opens, aliases or uses. */
+  namespaces: ReadonlySet<string>;
+}
+
+const CPP_FILE_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, CppFileNames>>();
+const CPP_MACRO_TYPE_NAMES = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+
+/**
+ * The names a C++ file makes types or namespaces of itself, which the index
+ * holds no node for: its template parameters (fmt's `Traits` of `typename
+ * Traits = buffer_traits`), the aliases it declares — in a function body
+ * too, or by expanding a macro that declares them — and the namespaces it
+ * names: opened, aliased or used (`using namespace …;`). googletest's typed
+ * tests declare `TypeParam` and `TestFixture`.
+ */
+function cppNamesBroughtIn(file: string, context: ResolutionContext): CppFileNames {
+  let memo = CPP_FILE_TYPE_NAMES.get(context);
+  if (!memo) CPP_FILE_TYPE_NAMES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = stripCommentsForRegex((context.readFile(file) ?? '').replace(/\\\r?\n/g, ' '), 'cpp');
+  const types = cppTypeNamesDeclared(text);
+  const namespaces = new Set<string>();
+  for (const m of text.matchAll(/\bnamespace\s+([^;{}()]{1,200}?)\s*[;{]/g)) {
+    for (const name of m[1]!.match(/[A-Za-z_]\w*/g) ?? []) namespaces.add(name);
+  }
+  for (const [macro, declared] of cppMacroTypeNames(context)) {
+    if (hasCppWord(text, macro)) for (const name of declared) types.add(name);
+  }
+  if (/\bTYPED_TEST(?:_P)?\s*\(/.test(text)) types.add('TypeParam').add('TestFixture');
+  const names = { types, namespaces };
+  memo.set(file, names);
+  return names;
+}
+
+/**
+ * The type names each of the project's macros declares where it is
+ * expanded: rocksdb's `IMPORT_RIBBON_IMPL_TYPES(T)` declares `using
+ * SimpleSoln = …;`, a vendored googletest's `TYPED_TEST` its `TestFixture`.
+ */
+function cppMacroTypeNames(context: ResolutionContext): Map<string, ReadonlySet<string>> {
+  const hit = CPP_MACRO_TYPE_NAMES.get(context);
+  if (hit) return hit;
+  const macros = new Map<string, ReadonlySet<string>>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|h\+\+|inl|inc|ipp|tcc)$/i.test(file)) continue;
+    const raw = context.readFile(file);
+    if (!raw || !raw.includes('define')) continue;
+    // Each `#define` with the lines it continues; only its body is stripped of comments.
+    for (const m of raw.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(?:\([^)\n]*\))?((?:[^\n\\]|\\\r?\n|\\(?!\r?\n))*)/gm)) {
+      if (macros.has(m[1]!) || !/\b(?:using|typedef|template)\b/.test(m[2]!)) continue;
+      const names = cppTypeNamesDeclared(stripCommentsForRegex(m[2]!.replace(/\\\r?\n/g, ' '), 'cpp'));
+      if (names.size > 0) macros.set(m[1]!, names);
+    }
+  }
+  CPP_MACRO_TYPE_NAMES.set(context, macros);
+  return macros;
+}
+
+/** Does `text` hold `word` as a whole identifier? */
+function hasCppWord(text: string, word: string): boolean {
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!/\w/.test(text[at - 1] ?? '') && !/\w/.test(text[at + word.length] ?? '')) return true;
+  }
+  return false;
 }
 
 function inferCppReceiverType(
@@ -16354,7 +17435,9 @@ export function tsImportedTypeFile(written: string, ref: UnresolvedRef, context:
     if (context.getImportMappings?.(ref.filePath, ref.language)?.some((i) => i.localName === binding)) {
       const imported = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
       const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-      if (node && node.kind !== 'file' && node.filePath !== ref.filePath) file = node.filePath;
+      // A type the blocks declaring one module merge (vscode's proposed API files add
+      // members to `vscode.d.ts`'s interfaces) has no one file that holds every member.
+      if (node && node.kind !== 'file' && node.filePath !== ref.filePath && !isMergedAmbientDeclaration(node, context)) file = node.filePath;
     }
     memo.set(key, file);
   }
@@ -16539,6 +17622,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_IMPORTED_TYPE_FILES.delete(context);
   TS_NAMED_CLASSES.delete(context);
   TS_AMBIENT_MODULE_FILES.delete(context);
+  TS_GLOBAL_SCOPES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -16556,6 +17640,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_SCOPES.delete(context);
   RUST_USE_PATHS.delete(context);
   RUST_WALKED_ITEMS.delete(context);
+  RUST_METHOD_RETURNS.delete(context);
   RUST_TRAIT_OF.delete(context);
   RUST_TRAIT_IMPLS.delete(context);
   RUST_TYPED_REFS.delete(context);
@@ -16584,6 +17669,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_FRAMES.delete(context);
   clearCppNamespaceMemos(context);
   clearCppRawStringMemos(context);
+  CPP_FILE_TYPE_NAMES.delete(context);
+  CPP_MACRO_TYPE_NAMES.delete(context);
   CPP_CLASSES_IN_FILE.delete(context);
   CPP_STEM_HEADERS.delete(context);
   TEST_SUITE_FILES.delete(context);
@@ -16668,6 +17755,13 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_CREATE_INSTANCE_DECLARED.delete(context);
   TS_NAMED_TYPES.delete(context);
   TARGET_LANGUAGE.delete(context);
+  PY_LINES.delete(context);
+  PY_ATTR_MEMO.delete(context);
+  PY_FACTORY_MEMO.delete(context);
+  PY_STATEMENTS_MEMO.delete(context);
+  PY_BASES_MEMO.delete(context);
+  PY_FILE_CLASSES.delete(context);
+  PY_ATTR_CALL_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -17065,7 +18159,11 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
   switch (cls.language) {
     case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
-    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
+    // A base built by a class's factory — Django's `class Manager(
+    // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
+    // qualifier is the supertype, not the method called on it.
+    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, '')
+      .replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
     case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
     case 'typescript': case 'tsx': case 'javascript': case 'jsx':
@@ -17633,7 +18731,9 @@ function resolveAwaitedCallType(
     referenceName: returned, referenceKind: 'references' as const };
   const typeImport = context.getImportMappings(declaring.filePath, declaring.language).some(m => m.localName === returned);
   const resolved = typeImport ? context.resolveImport?.(typeRef) : null;
-  const typeNode = resolved ? context.getNodeById?.(resolved.targetNodeId) :
+  const importedType = resolved ? context.getNodeById?.(resolved.targetNodeId) : null;
+  // A type the files declaring one module merge is no one declaration (see tsImportedTypeFile).
+  const typeNode = resolved ? (importedType && !isMergedAmbientDeclaration(importedType, context) ? importedType : null) :
     context.getNodesByName(returned).find(n => n.filePath === declaring.filePath &&
       ESM_FAMILY.has(n.language) && (n.kind === 'class' || n.kind === 'interface'));
   if (!typeNode || (typeNode.kind !== 'class' && typeNode.kind !== 'interface')) return unknown;
@@ -17724,6 +18824,9 @@ function inferPhpAssignedPropertyType(
   }
   return null;
 }
+
+/** Python attribute-chain refs being guessed by name after the type reader found nothing. */
+const PY_CHAIN_GUESSING = new WeakSet<UnresolvedRef>();
 
 /**
  * Try to resolve by method name on a class/object
@@ -17816,7 +18919,13 @@ export function matchMethodCall(
   const [, objectOrClass, methodName] = match;
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
-  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  // A python attribute receiver (`self.conn`, `cfg.client`) is not one: the
+  // python branch below owns it, and the shared inferrer would answer first by
+  // the assignment's leading name — `self.conn = Pool().acquire()` read as a
+  // `Pool`, `Session` read as the project's class under `from requests import
+  // Session` — skipping that branch's whole-value, rebinding and import checks.
+  const pythonAttrReceiver = ref.language === 'python' && !!dotMatch && objectOrClass!.includes('.');
+  const inferableReceiver = (dotMatch || luaColonMatch || rDollarMatch) && !pythonAttrReceiver;
   // A Go call of a standard method name — `String`, `Error`, `Len`, `Lock` —
   // on a plain variable: a name nearly every type carries, so the call says
   // nothing of the receiver's type.
@@ -18179,7 +19288,13 @@ export function matchMethodCall(
   // contain — whenever the field's type was external or merely shared a
   // method name with something nearby.
   if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
-    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+    // The field's type as the impl's struct declares it, read as any written
+    // type is (matchRustTypedSelfFieldCall); the plain-name reading below
+    // only where that can't be told.
+    const field = objectOrClass!.slice('self.'.length);
+    const typed = nmTimedT('mc-rustselffield', ref, () => matchRustTypedSelfFieldCall(field, methodName!, ref, context));
+    if (typed !== undefined) return typed;
+    return matchRustSelfFieldCall(field, methodName!, ref, context);
   }
 
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
@@ -18195,6 +19310,33 @@ export function matchMethodCall(
     objectOrClass!.startsWith('this.')
   ) {
     return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
+  }
+
+  // Python call through an attribute — `self.data.append(x)`,
+  // `cls.registry.lookup(k)`, `cfg.client.send(x)` — which the extractor emits
+  // with its receiver (`self.data.append`) instead of a bare method name. The
+  // type the class body gives the attribute decides when there is one: its
+  // method, or no edge for a builtin or outside type (a bare-name match is how
+  // `self.data.append(1)` bound to an unrelated class's `append`). With no
+  // such evidence the call is guessed by name below, as any receiver is. A
+  // dotted MODULE path (`pkg.mod.func()`) never gets here: import resolution
+  // claims it first, through the module the import names.
+  if (pythonAttrReceiver && !PY_CHAIN_GUESSING.has(ref)) {
+    const read = new Set<string>();
+    const typed = matchPythonAttrCall(objectOrClass!, methodName!, ref, context, read);
+    if (typed !== undefined) return typed;
+    // The guess records the files the type reader looked at, as a typed answer
+    // does (`typeFrom`): a sync that makes one of them type the attribute —
+    // a factory gaining `-> Client` — re-opens it.
+    PY_CHAIN_GUESSING.add(ref);
+    let guess: ResolvedRef | null;
+    try {
+      guess = matchMethodCall(ref, context);
+    } finally {
+      PY_CHAIN_GUESSING.delete(ref);
+    }
+    read.delete(ref.filePath);
+    return guess && read.size > 0 ? { ...guess, metadata: { ...guess.metadata, typeFrom: [...read].sort() } } : guess;
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -18245,6 +19387,11 @@ export function matchMethodCall(
     const own = matchRustSelfPath(methodName!, ref, context);
     if (own !== undefined) return own;
   }
+  // A Rust `T::x(…)` through a generic parameter: the method its bounds' traits declare (matchRustGenericPath).
+  if (ref.language === 'rust' && match === colonMatch && /^[A-Z]\w*$/.test(objectOrClass!) && objectOrClass !== 'Self') {
+    const bounded = matchRustGenericPath(objectOrClass!, methodName!, ref, context);
+    if (bounded !== undefined) return bounded;
+  }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
   // names a class that exists in several files (`Logger.log()` / `Logger::log()`
@@ -18268,9 +19415,17 @@ export function matchMethodCall(
     // staxrip's `FrameServerFactory.Create(…)` went to its AutoCrop tool's copy.
     if (ref.language === 'vbnet') classCandidates = preferVbProject(classCandidates, ref, context);
 
+    const productionCaller = !isTestPath(ref.filePath);
     for (const classNode of classCandidates) {
       // Skip cross-language class matches
       if (classNode.language !== ref.language) continue;
+      // A class declared inside a function is named only in there: a
+      // `File.write(…)` elsewhere is not the `File` a Django test declares.
+      if (!isLexicallyReachable(classNode, ref, context)) continue;
+      // Production code never names a test suite's class: Django's
+      // `manager.check()` in `Model._check_managers` is no test app's
+      // `Manager` model (whose `check` it inherits from `Model`).
+      if (productionCaller && isTestPath(classNode.filePath)) continue;
 
       // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
       // own, else one a base declares (cppMethodOf), never one of a class
@@ -18282,8 +19437,7 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+      const methodNode = classStrategyMethod(classNode, methodName!, context);
 
       if (methodNode) {
         return {
@@ -18301,6 +19455,12 @@ export function matchMethodCall(
     return null;
   });
   if (strat1) return strat1;
+  // A C++ call through a project class template's specialization written
+  // with its arguments, fmt's `formatter<std::tm, Char>::format(…)`, is a
+  // member of that specialization: when the template's members gave none, a
+  // method picked below by the receiver's name is another class's.
+  if (ref.language === 'cpp' && match === colonMatch && cppQualifierArguments(ref, context) !== null &&
+      context.getNodesByName(objectOrClass!).some((n) => n.language === 'cpp' && isMethodOwnerKind(n))) return null;
 
   // Built-in method names need a validated receiver (#1987). Typed, imported,
   // object-literal and direct class receivers have had their chance above;
@@ -18350,8 +19510,19 @@ export function matchMethodCall(
     return null;
   }
 
+  // A C++ name through a namespace, `absl::StripPrefix(…)` or `fmt::ptr(p)`,
+  // is a function or type of that namespace, never a class's method, which
+  // is all the strategies below find: protobuf's `absl::StripPrefix` went to
+  // `rust::MultiCasePrefixStripper::StripPrefix`, and fmt's `fmt::ptr` to a
+  // scanner's `ptr` method, past fmt's own `ptr`, which a namespace macro
+  // declares and is read after them. The one exception is the constructor of
+  // a class the call names in that namespace (isCppConstructorThrough).
+  // Asked only of a guess about to be made.
+  const throughCppNamespace = (): boolean =>
+    ref.language === 'cpp' && match === colonMatch && isCppNamespaceQualifier(objectOrClass!, ref, context);
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
-  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
+  // e.g., "permissionEngine" → look for a class named "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
@@ -18359,18 +19530,19 @@ export function matchMethodCall(
         withinCppTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
+      const productionCaller = !isTestPath(ref.filePath);
       for (const classNode of fuzzyClassCandidates) {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
+        // Nor a class declared inside another function, nor a test suite's
+        // class from production code (see Strategy 1).
+        if (!isLexicallyReachable(classNode, ref, context)) continue;
+        if (productionCaller && isTestPath(classNode.filePath)) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!) &&
-          // A Go standard method name is the type's own, not one of another
-          // type its name is part of: kubernetes' `status.String()` is no
-          // `RuntimeStatus::String` beside a `Status` type.
-          (!goStd || n.qualifiedName === `${classNode.name}::${methodName}`));
+        const methodNode = classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode) {
+          if (throughCppNamespace()) return null;
           return {
             original: ref,
             targetNodeId: methodNode.id,
@@ -18438,6 +19610,15 @@ export function matchMethodCall(
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
+    // Nor is it a method of a class another function declares: Django's
+    // `file.write(…)` in one test is not the `File` a serializer test
+    // declares in its body. The one method such a filter may leave is still
+    // only a guess by the receiver's name (the scoring below), never the
+    // only method of the name: `cache.aadd()` is `BaseCache`'s, while
+    // `value.split()` is no test model's `split`.
+    const reachable = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
+    const scopedOut = reachable.length !== targetMethods.length;
+    targetMethods = reachable;
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref
@@ -18448,13 +19629,19 @@ export function matchMethodCall(
       targetMethods = kept;
     }
 
+    // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
+    // only by the name of its last link, in the scoring below — Django's
+    // `self.client.get()` is its test `Client`'s — never as the one method of
+    // the name: `self.a.b.go()` is no `Leaf.go` the receiver says nothing of.
+    const pythonChain = ref.language === 'python' && objectOrClass!.includes('.');
+
     // If only one same-language method with this name exists, use it —
     // except in Ruby, where nothing types a receiver: there the one method
     // must also belong to something the receiver is named after
     // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
-    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+    if (targetMethods.length === 1 && !narrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -18469,6 +19656,7 @@ export function matchMethodCall(
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
+      if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, targetMethods[0]!, context)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -18478,11 +19666,16 @@ export function matchMethodCall(
     }
 
     // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1) {
+    if (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed)) {
       // What the receiver is named after is its last link: `builder.tokeniser`
-      // is a Tokeniser, `table.Columns` no kind of table.
-      const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
+      // is a Tokeniser, `table.Columns` no kind of table. In a python chain the
+      // last link as written: Django's `request.META` and `request.GET` are
+      // dicts, not constants of `request`'s type.
+      const link = pythonChain ? objectOrClass!.slice(objectOrClass!.lastIndexOf('.') + 1) : receiverLink(objectOrClass!);
+      const receiverWords = splitCamelCase(link);
       const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
+      const wholeReceiver = link.replace(/_/g, '').toLowerCase();
+      const singular = (w: string): string => w.toLowerCase().replace(/s$/, '');
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
       let tied: typeof targetMethods = [];
@@ -18497,6 +19690,12 @@ export function matchMethodCall(
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');
         const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
+        // An untyped python attribute chain is a guess only through its head
+        // noun: `self.session` names a `SessionBase` and `self.client` a
+        // `ClientMixin`, but mealie's `database.group_shopping_lists` no
+        // `GroupRepositoryAIProvider`, which only shares its `group`.
+        if (pythonChain && head !== undefined && !classWords.some((cw) => singular(cw) === singular(head)) &&
+            wholeReceiver !== classWords.join('').toLowerCase()) continue;
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
@@ -18508,6 +19707,11 @@ export function matchMethodCall(
         // The receiver's head noun naming the owner's: `bookPage` is a Page
         // before it is anything of a Book's.
         if (head !== undefined && head === classWords[classWords.length - 1]?.toLowerCase()) score += 1;
+        // The receiver spelling the owner's whole name: Django's
+        // `self.client` is a `Client` before a `RedisCacheClient`, which only
+        // ends in the word, and `self.nodelist` a `NodeList`, though no one
+        // word of it matches.
+        if (classWords.length > 0 && wholeReceiver === classWords.join('').toLowerCase()) score += 2;
         // Bonus for same language
         if (method.language === ref.language) score += 1;
         if (score > bestScore) {
@@ -18529,6 +19733,14 @@ export function matchMethodCall(
       // `$comment->delete()` — names the caller's own class only by a shared
       // word. The guess is the caller itself, so there is no guess.
       if (bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId) {
+        // Nor is there one for a C++ `X::m()` through a class the index
+        // doesn't hold: a class whose name only shares a word with `X` is
+        // another class, since one named `X` was looked for first.
+        // protobuf's `FeatureSet::descriptor()` went to
+        // `JavaFeatures_NestInFileClassFeature::descriptor`, its Python
+        // extension's `OneofOptions::default_instance()` to `CppFileOptions`'.
+        if (ref.language === 'cpp' && match === colonMatch && isCppUndeclaredQualifier(objectOrClass!, ref, context)) return null;
+        if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, bestMatch, context)) return null;
         return {
           original: ref,
           targetNodeId: bestMatch.id,
@@ -19303,6 +20515,1094 @@ function goDotImportDirs(filePath: string, context: ResolutionContext): string[]
   return dirs;
 }
 
+/** Python types whose methods are the runtime's, never a project symbol's. */
+const PYTHON_RUNTIME_TYPES: ReadonlySet<string> = new Set([
+  'list', 'dict', 'set', 'frozenset', 'tuple', 'str', 'bytes', 'bytearray',
+  'int', 'float', 'complex', 'bool', 'object', 'type', 'range', 'slice',
+  'List', 'Dict', 'Set', 'FrozenSet', 'Tuple', 'Sequence', 'Mapping',
+  'MutableMapping', 'MutableSequence', 'Iterable', 'Iterator', 'Callable',
+  'deque', 'defaultdict', 'OrderedDict', 'Counter',
+  'collections.deque', 'collections.defaultdict', 'collections.OrderedDict', 'collections.Counter',
+]);
+
+/**
+ * Per-context memos for the python attribute-type reader below: a file's
+ * comment-blanked lines, and the answers for `(class, attribute)` and
+ * `(file, factory)` together with the files each answer was read from. All are
+ * derived from file text, so they drop with the context's file caches
+ * (clearNameMatcherMemos). Answers are memoized only for top-level questions,
+ * never for a step inside a base-class walk, whose answer depends on the walk
+ * — a memo must not make a fresh index and a sync ask in a different order and
+ * get different edges.
+ */
+const PY_LINES = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+const PY_ATTR_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: PythonTypeAnswer | 'absent'; read: string[] }>>();
+const PY_FACTORY_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: PythonTypeAnswer; read: string[] }>>();
+/** Per class: what its own body says of an attribute, and its declared bases —
+ * each read from that class's file alone, so safe to memoize at any depth. */
+const PY_STATEMENTS_MEMO = new WeakMap<ResolutionContext, Map<string, { mentioned: boolean; evidence: PythonEvidence[] }>>();
+const PY_BASES_MEMO = new WeakMap<ResolutionContext, Map<string, Array<Node | null>>>();
+const PY_LINES_CAP = 1024;
+const PY_MEMO_CAP = 65536;
+
+function pyMemo<V>(store: WeakMap<ResolutionContext, Map<string, V>>, context: ResolutionContext): Map<string, V> {
+  let m = store.get(context);
+  if (!m) {
+    m = new Map();
+    store.set(context, m);
+  }
+  return m;
+}
+
+/** `filePath`'s lines with comments and docstrings blanked, memoized. */
+function pythonLines(context: ResolutionContext, filePath: string): string[] | null {
+  const memo = pyMemo(PY_LINES, context);
+  if (memo.has(filePath)) return memo.get(filePath)!;
+  const source = context.readFile(filePath);
+  const lines = source === null ? null : stripCommentsForRegex(source, 'python').split('\n');
+  if (memo.size >= PY_LINES_CAP) memo.delete(memo.keys().next().value!);
+  memo.set(filePath, lines);
+  return lines;
+}
+
+/**
+ * What one python statement says an attribute holds: a type it names, a
+ * factory whose result it holds (`Client.from_env()`, `make_client()`,
+ * `await connect()`), either of two answers (`A if c else B`), a builtin, or
+ * nothing usable (null).
+ */
+type PythonAttrEvidence =
+  // `classLevel`: assigned in the class body (`author = ForeignKey(Author)`),
+  // where a framework's descriptor may hand instances something else.
+  | { type: string; classLevel?: boolean }
+  | { factory: string; awaited: boolean }
+  | { arms: [PythonEvidence, PythonEvidence] }
+  | 'runtime'
+  | null;
+type PythonEvidence = Exclude<PythonAttrEvidence, null>;
+
+/**
+ * The type an annotation names — `Client`, `"Client"`, `Optional[Client]`,
+ * `Client | None`, `models.Client` — or 'runtime' for a builtin container, or
+ * null when it says nothing usable (`Any`, a generic of a project type).
+ */
+function pythonAnnotationEvidence(raw: string): PythonAttrEvidence {
+  let t = raw.trim().replace(/^['"]|['"]$/g, '').trim();
+  for (let i = 0; i < 4 && t; i++) {
+    const opt = t.match(/^(?:typing\.)?Optional\s*\[\s*(.+)\s*\]$/)
+      ?? t.match(/^(?:typing\.)?Union\s*\[\s*([^,\]]+?)\s*,\s*None\s*\]$/)
+      ?? t.match(/^(.+?)\s*\|\s*None$/)
+      ?? t.match(/^None\s*\|\s*(.+)$/);
+    if (!opt) break;
+    t = opt[1]!.trim().replace(/^['"]|['"]$/g, '').trim();
+  }
+  const head = t.split('[')[0]!.trim().replace(/^typing\./, '');
+  if (PYTHON_RUNTIME_TYPES.has(head)) return 'runtime';
+  if (t.includes('[') || !/^[A-Za-z_][\w.]*$/.test(t) || head === 'Any') return null;
+  return { type: t };
+}
+
+/**
+ * The top-level shape of a python expression: string literals collapse to
+ * `S` and everything inside brackets is dropped, so `Client(a, f(b))` reads
+ * `Client()`, `Pool().acquire()` stays `Pool().acquire()` and
+ * `Client() if t else Fake()` keeps its `if`. `open` says why there is no
+ * shape yet: a bracket or triple-quoted string still open, or a trailing `\`
+ * — the expression continues on the next line — versus a single-line string
+ * left open or a bracket closed that was never opened, which no further line
+ * can repair.
+ */
+function pythonExprScan(raw: string): { shape: string | null; open: 'none' | 'continues' | 'broken' } {
+  let out = '';
+  let depth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === '"' || c === "'") {
+      const triple = raw.startsWith(c.repeat(3), i);
+      const close = triple ? c.repeat(3) : c;
+      let j = i + close.length;
+      while (j < raw.length && !raw.startsWith(close, j)) j += raw[j] === '\\' ? 2 : 1;
+      if (j >= raw.length) return { shape: null, open: triple ? 'continues' : 'broken' };
+      if (depth === 0) out = out.replace(/[rbfuRBFU]{1,2}$/, '') + 'S';
+      i = j + close.length - 1;
+    } else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) out += c;
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth < 0) return { shape: null, open: 'broken' };
+      if (depth === 0) out += c;
+    } else if (depth === 0) {
+      out += c;
+    }
+  }
+  const shape = out.replace(/\s+/g, ' ').trim();
+  if (depth > 0 || shape.endsWith('\\')) return { shape: null, open: 'continues' };
+  return { shape, open: 'none' };
+}
+
+function pythonExprShape(raw: string): string | null {
+  return pythonExprScan(raw).shape;
+}
+
+/**
+ * The two arms of a top-level conditional expression — `A if c else B` →
+ * `[A, B]` — or null when `raw` is not one. Keywords inside brackets or
+ * strings do not count.
+ */
+function pythonConditionalArms(raw: string): [string, string] | null {
+  let depth = 0;
+  let ifAt = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === '"' || c === "'") {
+      const close = raw.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+      let j = i + close.length;
+      while (j < raw.length && !raw.startsWith(close, j)) j += raw[j] === '\\' ? 2 : 1;
+      i = j + close.length - 1;
+    } else if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    else if (depth === 0 && /\s/.test(raw[i - 1] ?? '')) {
+      if (ifAt < 0 && /^if\s/.test(raw.slice(i))) ifAt = i;
+      else if (ifAt >= 0 && /^else\s/.test(raw.slice(i))) {
+        return [raw.slice(0, ifAt).trim(), raw.slice(i + 4).trim()];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Same question for an assigned value: `Client(...)`, `[]`, `cap` (a
+ * parameter), or a call to something that is not a class — a factory, typed
+ * later by what it returns. A call counts only when it IS the whole value:
+ * `Pool().acquire()` holds what `acquire` returns and `Client().close()` what
+ * `close` returns, so neither is evidence of `Pool` or `Client`. A conditional
+ * `A if c else B` holds either arm; it is evidence only if both arms agree,
+ * which is decided once they are resolved.
+ */
+function pythonValueEvidence(raw: string, signature: string | null): PythonAttrEvidence {
+  let v = raw.trim();
+  const arms = pythonConditionalArms(v);
+  if (arms) {
+    const [a, b] = arms.map((arm) => pythonValueEvidence(arm, signature));
+    return a && b ? { arms: [a, b] } : null;
+  }
+  const awaited = /^await\s/.test(v);
+  if (awaited) v = v.replace(/^await\s+/, '');
+  const shape = pythonExprShape(v);
+  if (shape === null) return null;
+  if (/^(?:S(?: S)*|-?\d[\w.]*|True|False|\[\]|\{\}|\(\))$/.test(shape)) return awaited ? null : 'runtime';
+  const ctor = /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
+  if (ctor) {
+    if (PYTHON_RUNTIME_TYPES.has(ctor[1]!)) return awaited ? null : 'runtime';
+    // A capitalised callee constructs that class; anything else is a factory
+    // (`make_client()`, `Client.from_env()`) whose result its body decides.
+    if (/^[A-Z]/.test(ctor[1]!.split('.').pop()!)) return awaited ? null : { type: ctor[1]! };
+    return { factory: ctor[1]!, awaited };
+  }
+  // `self.cap = cap` — the parameter's annotation in the enclosing `def`.
+  if (!awaited && signature && /^[A-Za-z_]\w*$/.test(v)) {
+    const param = new RegExp(`[(,]\\s*\\*{0,2}${v}\\s*:\\s*([^,)=]+)`).exec(signature);
+    if (param) return pythonAnnotationEvidence(param[1]!);
+  }
+  return null;
+}
+
+/**
+ * The value starting at `first` on line `ln`, joined with the lines that
+ * continue it — an open bracket or triple-quoted string, or a trailing `\` —
+ * up to a small cap. Returns the text and the last line it used. A value that
+ * does not close within the cap, or cannot (a single-line string left open,
+ * a stray closing bracket), is returned as its first line alone with no line
+ * consumed: the lines after it are statements of their own and must still be
+ * read.
+ */
+function pythonJoinedValue(lines: string[], ln: number, first: string, lastLine: number): { text: string; end: number } {
+  if (pythonExprScan(first).open !== 'continues') return { text: first, end: ln };
+  let text = first;
+  for (let end = ln; end < lastLine && end - ln < 30; ) {
+    text = text.replace(/\\\s*$/, '') + ' ' + (lines[end] ?? '').trim();
+    end++;
+    const { open } = pythonExprScan(text);
+    if (open === 'none') return { text, end };
+    if (open === 'broken') break;
+  }
+  return { text: first, end: ln };
+}
+
+/**
+ * The names `value` calls as a whole expression or conditional arm —
+ * `Client(...)`, `make()` — whose local rebinding would make the evidence
+ * wrong.
+ */
+function pythonValueCallees(value: string): string[] {
+  const arms = pythonConditionalArms(value.trim());
+  if (arms) return arms.flatMap(pythonValueCallees);
+  const shape = pythonExprShape(value.trim().replace(/^await\s+/, ''));
+  const call = shape && /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
+  return call ? [call[1]!] : [];
+}
+
+/**
+ * `line` with the contents of its string literals blanked (quotes kept), so a
+ * string never reads as code: `log("a: return b")` holds no `return`,
+ * `print("Foo = %s")` no assignment. A quote left open blanks the rest of the
+ * line (a triple-quoted string continuing below).
+ */
+function pythonBlankStrings(line: string): string {
+  const out = line.split('');
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (c !== '"' && c !== "'") continue;
+    const q = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+    let j = i + q.length;
+    while (j < line.length && !line.startsWith(q, j)) j += line[j] === '\\' ? 2 : 1;
+    for (let k = i + q.length; k < Math.min(j, line.length); k++) out[k] = ' ';
+    i = Math.min(j + q.length, line.length) - 1;
+  }
+  return out.join('');
+}
+
+/**
+ * The assignment targets of one python statement (strings blanked): `a, (b,
+ * c) = …` → [`a, (b, c)`], `x: T = …` → [`x`], `x += …` → [`x`], `a = b = …` →
+ * [`a`, `b`], and the statement a one-line compound header guards (`if c: x =
+ * …`). A `=` inside brackets is a keyword argument or a default, `==` / `!=` /
+ * `<=` / `>=` compare, and a `lambda`'s defaults bind nothing here — none is a
+ * target.
+ */
+function pythonAssignTargets(statement: string): string[] {
+  const stmt = statement.replace(/^\s*(?:(?:el)?if|while|else|try|finally|except|with|for)\b[^:]*:(?!=)/, '');
+  const targets: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    else if (c === '=' && depth === 0) {
+      if (stmt[i + 1] === '=') { i++; continue; }
+      const prev = stmt[i - 1] ?? '';
+      if (prev === '!' || prev === ':') continue; // `!=`, walrus
+      if ((prev === '<' || prev === '>') && stmt[i - 2] !== prev) continue; // `<=`, `>=`
+      let seg = stmt.slice(from, i);
+      if (/\blambda\b/.test(seg)) break;
+      seg = seg.replace(/(?:\*\*|\/\/|>>|<<|[-+*/%&|^@])$/, '');
+      targets.push(seg.split(':')[0]!.trim());
+      from = i + 1;
+    }
+  }
+  return targets;
+}
+
+/**
+ * The statement-level lines of the `def` on line `defLine`, after its header
+ * and before line `upto`: each with its line number and its statements
+ * (strings blanked, split on `;`). A line that continues a bracketed or
+ * `\`-continued statement is not one — `client=client,` inside a call is a
+ * keyword argument — and neither is a line inside a nested `def` or `class`,
+ * whose header is reported as `nested` (its name is bound here).
+ */
+function pythonDefStatements(
+  lines: string[],
+  defLine: number,
+  upto: number,
+): { header: string; body: Array<{ line: number; statements: string[]; nested?: string }> } {
+  let header = '';
+  let ln = defLine;
+  for (; ln <= upto && ln <= lines.length; ln++) {
+    header += ' ' + (lines[ln - 1] ?? '').trim();
+    if (/\)\s*(?:->[^:]*)?:\s*$/.test(header)) break;
+  }
+  const body: Array<{ line: number; statements: string[]; nested?: string }> = [];
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let depth = 0;
+  let continued = false;
+  let nestedIndent = -1;
+  for (let k = ln + 1; k < upto; k++) {
+    const raw = lines[k - 1] ?? '';
+    if (!raw.trim()) continue;
+    const blanked = pythonBlankStrings(raw);
+    const inside = depth > 0 || continued;
+    for (const c of blanked) {
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    }
+    continued = /\\\s*$/.test(blanked);
+    if (inside) continue;
+    if (nestedIndent >= 0) {
+      if (indent(raw) > nestedIndent) continue;
+      nestedIndent = -1;
+    }
+    const text = blanked.trim();
+    const nested = /^(?:async\s+)?(?:def|class)\s+(\w+)/.exec(text);
+    if (nested) {
+      nestedIndent = indent(raw);
+      body.push({ line: k, statements: [], nested: nested[1]! });
+      continue;
+    }
+    body.push({ line: k, statements: text.split(';').map((t) => t.trim()).filter(Boolean) });
+  }
+  return { header, body };
+}
+
+/**
+ * Whether an assignment target binds `name` itself — `name`, `*name`, or an
+ * element of a tuple / list target (`a, (name, b)`, `[name, b]`). A target that
+ * only USES the name does not: `d[name] = 1` and `self._h[name] = c` store
+ * into a container, `name.attr = 1` sets an attribute.
+ */
+function pythonTargetBinds(target: string, name: string): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of target.matchAll(new RegExp(`(?<![.\\w])${n}\\b`, 'g'))) {
+    const after = target.slice(m.index! + name.length).trimStart();
+    if (after.startsWith('.') || after.startsWith('[') || after.startsWith('(')) continue;
+    // Inside a subscript (`d[name]`): a `[` opened right after a name, call or
+    // subscript, not a list display (`[name, b] = …`).
+    let inSubscript = false;
+    const stack: boolean[] = [];
+    for (let i = 0; i < m.index!; i++) {
+      const c = target[i]!;
+      if (c === '[') stack.push(/[\w)\]]\s*$/.test(target.slice(0, i)));
+      else if (c === ']') stack.pop();
+      else if (c === '(') stack.push(false);
+      else if (c === ')') stack.pop();
+    }
+    inSubscript = stack.some(Boolean);
+    if (!inSubscript) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether `name` is rebound inside the `def` on line `defLine`, before line
+ * `upto` — a parameter (unless `params` is false), an assignment target, a
+ * loop / `with` / `except` target, a walrus, a nested `def` / `class` of that
+ * name — so a call spelled `name(...)` there is NOT the module's class or
+ * function of that name, and a parameter read there no longer holds what its
+ * annotation says. `Signer = import_string(backend); return Signer()`
+ * constructs whatever the setting names, not the `Signer` class beside it.
+ *
+ * Not a rebinding: a keyword argument (`f(name=name)`, also across lines), an
+ * attribute (`obj.name = x`), a comparison, text in a string, a line inside a
+ * nested `def`, or an import of the name — the file's import mappings already
+ * include a function-local import, and every binding of a name must agree
+ * before it types anything.
+ */
+function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: string, params = true): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const { header, body } = pythonDefStatements(lines, defLine, upto);
+  if (params) {
+    const list = /\((.*)\)/.exec(header)?.[1] ?? '';
+    const paramNames = list.split(',').map((p) => p.trim().replace(/^\*{1,2}/, '').split(/[:=]/)[0]!.trim());
+    if (paramNames.includes(name)) return true;
+  }
+  const loop = new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()\\[\\]]*(?<![.\\w])${n}\\b[\\w\\s,()\\[\\]]*\\bin\\b`);
+  const as = new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`);
+  const walrus = new RegExp(`(?<![.\\w])${n}\\s*:=`);
+  for (const { statements, nested } of body) {
+    if (nested === name) return true;
+    for (const st of statements) {
+      if (pythonAssignTargets(st).some((t) => pythonTargetBinds(t, name))) return true;
+      if (loop.test(st) || walrus.test(st)) return true;
+      if (!/^(?:from|import)\b/.test(st) && as.test(st)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Every statement in `owner`'s body that assigns `attr` — a class-level
+ * declaration (`registry = Registry()`, `conn: Client`) or an assignment
+ * through `self` / `cls` (`self.cap = Capture()`, `self.cap: Capture`,
+ * `self.cap = cap` with `cap: Capture` in the signature) — and whether the body
+ * mentions it at all. An untyped statement (`self.cap = load()` of an unknown)
+ * contributes no evidence but still counts as a mention: it shadows any base.
+ *
+ * Comments and docstrings are blanked before reading, and nested classes are
+ * skipped, so neither can supply the type: a regex over raw class lines took a
+ * type from a docstring once and turned a correct edge into a wrong one.
+ */
+function pythonAttrStatements(
+  owner: Node,
+  attr: string,
+  context: ResolutionContext,
+): { mentioned: boolean; evidence: PythonEvidence[] } {
+  const memo = pyMemo(PY_STATEMENTS_MEMO, context);
+  const key = `${owner.id}\0${attr}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    hit = pythonAttrStatementsUncached(owner, attr, context);
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  return hit;
+}
+
+function pythonAttrStatementsUncached(
+  owner: Node,
+  attr: string,
+  context: ResolutionContext,
+): { mentioned: boolean; evidence: PythonEvidence[] } {
+  const lines = pythonLines(context, owner.filePath);
+  if (!lines) return { mentioned: false, evidence: [] };
+  const nested = context
+    .getNodesInFile(owner.filePath)
+    .filter((n) => n.kind === 'class' && n.id !== owner.id && n.startLine > owner.startLine && n.endLine <= owner.endLine);
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let bodyIndent = -1;
+  const a = attr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classLevel = new RegExp(`^${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=\\s*(.+?))?\\s*$`);
+  const viaSelf = new RegExp(`\\b(?:self|cls)\\.${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=(?!=)\\s*(.+?))?\\s*$`);
+  let signature: string | null = null;
+  let defStart = -1;
+  let nestedDefIndent = -1;
+  let mentioned = false;
+  const evidence: PythonEvidence[] = [];
+
+  for (let ln = owner.startLine + 1; ln <= owner.endLine; ln++) {
+    const line = lines[ln - 1];
+    if (!line || !line.trim()) continue;
+    if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
+    if (bodyIndent < 0) bodyIndent = indent(line);
+    const text = line.trim();
+    if (/^(?:async\s+)?def\s/.test(text) && indent(line) === bodyIndent) {
+      // The enclosing method's signature, possibly over several lines. A def
+      // nested in a method is not one: its parameters and locals are its own.
+      defStart = ln;
+      nestedDefIndent = -1;
+      signature = text;
+      for (let k = ln; k < owner.endLine && !/\)\s*(?:->[^:]*)?:\s*$/.test(signature); k++) {
+        signature += ' ' + (lines[k] ?? '').trim();
+      }
+      continue;
+    }
+    if (nestedDefIndent >= 0 && indent(line) <= nestedDefIndent) nestedDefIndent = -1;
+    if (nestedDefIndent < 0 && /^(?:async\s+)?def\s/.test(text) && indent(line) > bodyIndent) {
+      nestedDefIndent = indent(line);
+      continue;
+    }
+    const m = indent(line) === bodyIndent ? classLevel.exec(text) : viaSelf.exec(text);
+    if (!m || (!m[1] && !m[2])) continue;
+    mentioned = true;
+    // `self.x = c` inside a def nested in a method (a callback) reads that
+    // def's own parameters and locals, which the method's scope does not see:
+    // it shadows a base but says nothing usable here.
+    if (nestedDefIndent >= 0 && indent(line) > nestedDefIndent) continue;
+    const inDef = indent(line) !== bodyIndent && defStart > 0;
+    const at = ln;
+    let value = m[2];
+    if (!m[1] && value) {
+      const joined = pythonJoinedValue(lines, ln, value, owner.endLine);
+      value = joined.text;
+      ln = joined.end;
+    }
+    // A value read through a name the method rebinds first — `Backend =
+    // load(); self.b = Backend()`, or `box = wrap(box); self.box = box` for a
+    // `box: Box` parameter — is not what the module's class or the annotation
+    // says. That statement is no evidence.
+    if (!m[1] && inDef) {
+      const v = value!.trim();
+      const reads = pythonValueCallees(v).map((c) => c.split('.')[0]!);
+      if (reads.some((c) => pythonBoundInDef(lines, defStart, at, c))) continue;
+      if (/^[A-Za-z_]\w*$/.test(v) && pythonBoundInDef(lines, defStart, at, v, false)) continue;
+    }
+    const ev = m[1]
+      ? pythonAnnotationEvidence(m[1])
+      : pythonValueEvidence(value!, inDef ? signature : null);
+    if (ev) evidence.push(!m[1] && !inDef && typeof ev === 'object' && 'type' in ev ? { ...ev, classLevel: true } : ev);
+  }
+  return { mentioned, evidence };
+}
+
+/**
+ * The class `className` declared in the python module `modulePath` as seen
+ * from `fromFile` — `pkg.a` / `.a` / `..core` — or null. Relative paths are
+ * anchored at `fromFile`'s package; an absolute one may sit under a source root
+ * (`src/pkg/a.py`), so it matches by path suffix and must be unique. With
+ * `kind: 'function'` the same lookup finds a module-level function.
+ */
+function pythonModuleClass(
+  modulePath: string,
+  className: string,
+  fromFile: string,
+  context: ResolutionContext,
+  kind: 'class' | 'function' = 'class',
+): Node | null {
+  const dots = /^\.*/.exec(modulePath)![0].length;
+  let rel = modulePath.slice(dots).replace(/\./g, '/');
+  if (dots > 0) {
+    const dir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1);
+    for (let i = 1; i < dots; i++) {
+      if (dir.length === 0) return null;
+      dir.pop();
+    }
+    rel = [...dir, ...(rel ? [rel] : [])].join('/');
+  }
+  if (!rel) return null;
+  const wanted = [`${rel}.py`, `${rel}/__init__.py`, `${rel}.pyi`];
+  const hits = context.getNodesByName(className).filter((n) => {
+    if (n.kind !== kind || n.language !== 'python') return false;
+    if (kind === 'function' && n.qualifiedName !== n.name) return false; // module level only
+    const fp = n.filePath.replace(/\\/g, '/');
+    return wanted.some((w) => fp === w || (dots === 0 && fp.endsWith(`/${w}`)));
+  });
+  return hits.length === 1 ? hits[0]! : null;
+}
+
+/**
+ * The project class a python type name means in `fromFile`: the class in the
+ * module its import names, or the file's own declaration. An import that names
+ * a module outside the project (`requests.Session`) is null, never a same-named
+ * project class — that is the guess this whole path exists to stop. With
+ * `kind: 'function'` it answers the same question for a function name
+ * (`make_client`, `clients.build`).
+ */
+function pythonClassNamed(
+  typeName: string,
+  fromFile: string,
+  context: ResolutionContext,
+  kind: 'class' | 'function' = 'class',
+): Node | null {
+  const segs = typeName.split('.');
+  const className = segs[segs.length - 1]!;
+  const imports = context.getImportMappings(fromFile, 'python');
+  const candidates: Array<Node | null> = [];
+  for (const imp of imports) {
+    if (imp.isNamespace && segs.length > 1 && typeName.startsWith(`${imp.source}.`)) {
+      // `import pkg.models` then `pkg.models.User`.
+      const middle = typeName.slice(imp.source.length + 1).split('.').slice(0, -1);
+      candidates.push(pythonModuleClass([imp.source, ...middle].join('.'), className, fromFile, context, kind));
+    } else if (imp.localName === segs[0]) {
+      if (segs.length === 1) {
+        // `from pkg.a import Capture` / `... import Capture as C`.
+        candidates.push(imp.isNamespace ? null : pythonModuleClass(imp.source, imp.exportedName, fromFile, context, kind));
+      } else {
+        // `from pkg import models` then `models.User`; `import models as m` then `m.User`.
+        const base = imp.isNamespace
+          ? imp.source
+          : imp.source.endsWith('.') ? imp.source + imp.exportedName : `${imp.source}.${imp.exportedName}`;
+        candidates.push(pythonModuleClass([base, ...segs.slice(1, -1)].join('.'), className, fromFile, context, kind));
+      }
+    }
+  }
+  if (candidates.length > 0) {
+    // Every binding of the name must agree on one class.
+    const ids = new Set(candidates.map((c) => c?.id ?? ''));
+    return ids.size === 1 && candidates[0] ? candidates[0] : null;
+  }
+  if (segs.length > 1) return null;
+  const local = context
+    .getNodesByName(typeName)
+    .filter((n) =>
+      n.kind === kind && n.language === 'python' && n.filePath === fromFile &&
+      (kind === 'class' || n.qualifiedName === n.name));
+  return local.length === 1 ? local[0]! : null;
+}
+
+/**
+ * The bases `cls`'s own `class` line names, each resolved from `cls`'s file
+ * (null for one outside the project). Reading them off the header rather than
+ * the `extends` edges keeps this answerable in the first pass.
+ */
+function pythonClassBases(cls: Node, context: ResolutionContext): Array<Node | null> {
+  const memo = pyMemo(PY_BASES_MEMO, context);
+  let hit = memo.get(cls.id);
+  if (!hit) {
+    hit = pythonClassBasesUncached(cls, context);
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(cls.id, hit);
+  }
+  return hit;
+}
+
+function pythonClassBasesUncached(cls: Node, context: ResolutionContext): Array<Node | null> {
+  return pythonClassBaseNames(cls, context).map((b) => pythonClassNamed(b, cls.filePath, context));
+}
+
+/** The bases `cls`'s own `class` line names, as written (`Base`, `models.Model`). */
+function pythonClassBaseNames(cls: Node, context: ResolutionContext): string[] {
+  const lines = pythonLines(context, cls.filePath);
+  if (!lines) return [];
+  const header = lines.slice(cls.startLine - 1, cls.startLine + 4).join(' ');
+  const bases = new RegExp(`\\bclass\\s+${cls.name}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
+  return (bases ?? '')
+    .split(',')
+    .map((b) => b.trim())
+    .filter((b) => /^[A-Za-z_][\w.]*$/.test(b) && b !== 'object'); // `metaclass=...`, generics
+}
+
+/**
+ * Whether every base in `cls`'s hierarchy is known — a project class, whose
+ * bases are known in turn, or a class from outside the project. A base the
+ * reader cannot find (a name a package re-exports from elsewhere) may hold a
+ * method, so a class with one is no evidence that a method is missing.
+ */
+function pythonHierarchyKnown(cls: Node, context: ResolutionContext, seen: Set<string> = new Set()): boolean {
+  if (seen.has(cls.id) || seen.size >= 5) return true;
+  seen.add(cls.id);
+  const bases = pythonClassBases(cls, context);
+  return pythonClassBaseNames(cls, context).every((name, i) => {
+    const base = bases[i];
+    return base ? pythonHierarchyKnown(base, context, seen) : isPythonOutsideModuleName(name.split('.')[0]!, cls.filePath, context);
+  });
+}
+
+/**
+ * `method` on class `cls`, or on a base its own `class` line names, with
+ * whether it was inherited. Files whose text was read are added to `read`.
+ */
+function pythonFindMethod(
+  cls: Node,
+  methodName: string,
+  context: ResolutionContext,
+  read: Set<string>,
+  seen: Set<string> = new Set(),
+): { method: Node; inherited: boolean } | null {
+  if (seen.has(cls.id) || seen.size >= 5) return null;
+  seen.add(cls.id);
+  const own = context
+    .getNodesByName(methodName)
+    .find((m) =>
+      m.kind === 'method' && m.language === 'python' && m.filePath === cls.filePath &&
+      (m.qualifiedName === `${cls.name}::${methodName}` || m.qualifiedName.endsWith(`::${cls.name}::${methodName}`)));
+  if (own) return { method: own, inherited: false };
+
+  read.add(cls.filePath);
+  for (const base of pythonClassBases(cls, context)) {
+    const hit = base && pythonFindMethod(base, methodName, context, read, seen);
+    if (hit) return { method: hit.method, inherited: true };
+  }
+  return null;
+}
+
+/** `method` on class `cls` (or a declared base) as a resolution. */
+function pythonMethodOnClass(
+  cls: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): ResolvedRef | null {
+  const hit = pythonFindMethod(cls, methodName, context, read);
+  if (!hit) return null;
+  return { original: ref, targetNodeId: hit.method.id, confidence: hit.inherited ? 0.8 : 0.85, resolvedBy: 'instance-method' };
+}
+
+/**
+ * A base-typed attribute can hold a subclass-only method (#1820): the one
+ * descendant of `cls` that defines `methodName`, else nothing. Same rule as the
+ * method-value path in `matchMemberFunctionRef`; unrelated same-name methods
+ * never win.
+ */
+function pythonSubclassMethod(
+  cls: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const descendants = context.getNodesByName(methodName).filter((m) => {
+    if (m.kind !== 'method' || m.language !== 'python') return false;
+    const parent = context.getNodesInFile(m.filePath).find((c) =>
+      c.kind === 'class' && m.qualifiedName === `${c.qualifiedName}::${methodName}`);
+    return !!parent && pythonDerivesFrom(parent, cls, ref, context);
+  });
+  return descendants.length === 1
+    ? { original: ref, targetNodeId: descendants[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
+    : null;
+}
+
+/** A class, a builtin, or unknown/contested — what one piece of evidence comes to. */
+type PythonTypeAnswer = Node | 'runtime' | null;
+
+/** One answer from several: they must all agree, and a builtin is not a project class. */
+function pythonAgree(answers: PythonTypeAnswer[]): PythonTypeAnswer {
+  if (answers.length === 0 || answers.some((a) => a === null)) return null;
+  const keys = new Set(answers.map((a) => (a === 'runtime' ? '' : (a as Node).id)));
+  return keys.size === 1 ? answers[0]! : null;
+}
+
+/**
+ * The class one piece of evidence comes to, read from `fromFile`: a named type
+ * through the file's imports, a factory by what it produces, a conditional
+ * only when both arms agree. `cls(...)` is `clsIs` — the class a classmethod
+ * factory is called on — and unknown anywhere else.
+ */
+function pythonEvidenceClass(
+  ev: PythonEvidence,
+  fromFile: string,
+  context: ResolutionContext,
+  read: Set<string>,
+  depth: number,
+  clsIs: Node | null,
+): PythonTypeAnswer {
+  if (ev === 'runtime') return 'runtime';
+  if ('arms' in ev) {
+    return pythonAgree(ev.arms.map((arm) => pythonEvidenceClass(arm, fromFile, context, read, depth, clsIs)));
+  }
+  // A class from outside the project (`requests.Session()`, a `Session` from
+  // `from requests import Session`) is no project class either: like a
+  // builtin, none of its methods is the project's. Not in a class body, where
+  // Django's `author = models.ForeignKey(Author)` hands instances an Author.
+  if ('type' in ev) {
+    return pythonClassNamed(ev.type, fromFile, context) ??
+      (!ev.classLevel && isPythonOutsideModuleName(ev.type.split('.')[0]!, fromFile, context) ? 'runtime' : null);
+  }
+  if (ev.factory === 'cls') return ev.awaited ? null : clsIs;
+  return pythonFactoryType(ev.factory, ev.awaited, fromFile, context, read, depth);
+}
+
+/**
+ * The type a python factory call produces — `make_client()`,
+ * `clients.build()`, `Client.from_env()` — read from `fromFile`: the callee's
+ * `-> T` annotation (`Self` meaning the class it is called on), else what every
+ * `return` in its body produces, which must agree. `cls(...)` in a classmethod
+ * is the class the factory is CALLED on, not where it is defined. A generator,
+ * a coroutine used without `await`, or any return this cannot name is unknown
+ * (null) — the callee decides the type, so an unreadable callee is no evidence.
+ * Files whose text was read are added to `read`.
+ */
+function pythonFactoryType(
+  callee: string,
+  awaited: boolean,
+  fromFile: string,
+  context: ResolutionContext,
+  read: Set<string>,
+  depth = 0,
+): PythonTypeAnswer {
+  if (depth > 0) return pythonFactoryTypeUncached(callee, awaited, fromFile, context, read, depth);
+  const memo = pyMemo(PY_FACTORY_MEMO, context);
+  const key = `${fromFile}\0${callee}\0${awaited ? 1 : 0}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    hit = { answer: pythonFactoryTypeUncached(callee, awaited, fromFile, context, own, 0), read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer;
+}
+
+function pythonFactoryTypeUncached(
+  callee: string,
+  awaited: boolean,
+  fromFile: string,
+  context: ResolutionContext,
+  read: Set<string>,
+  depth: number,
+): PythonTypeAnswer {
+  if (depth > 3) return null;
+  const segs = callee.split('.');
+  const fname = segs[segs.length - 1]!;
+  const prefix = segs.slice(0, -1).join('.');
+
+  let fn: Node | null = null;
+  let receiver: Node | null = null;
+  if (prefix && /^[A-Z]/.test(segs[segs.length - 2]!)) {
+    receiver = pythonClassNamed(prefix, fromFile, context);
+    fn = receiver ? pythonFindMethod(receiver, fname, context, read)?.method ?? null : null;
+  } else {
+    fn = pythonClassNamed(callee, fromFile, context, 'function');
+  }
+  if (!fn) return null;
+  read.add(fn.filePath);
+
+  const lines = pythonLines(context, fn.filePath);
+  if (!lines) return null;
+  const defLine = (lines[fn.startLine - 1] ?? '').trim();
+  const isAsync = /^async\s+def\b/.test(defLine);
+  if (isAsync !== awaited) return null;
+
+  const returns = /->\s*(.+)$/.exec(fn.signature ?? '');
+  if (returns) {
+    const ann = pythonAnnotationEvidence(returns[1]!);
+    if (ann === 'runtime') return 'runtime';
+    if (!ann || !('type' in ann)) return null;
+    if (/^(?:typing(?:_extensions)?\.)?Self$/.test(ann.type)) return receiver;
+    return pythonClassNamed(ann.type, fn.filePath, context);
+  }
+
+  // No annotation: every `return` in the body, outside nested defs/classes.
+  const nested = context
+    .getNodesInFile(fn.filePath)
+    .filter((n) => n.id !== fn!.id && n.startLine > fn!.startLine && n.endLine <= fn!.endLine &&
+      (n.kind === 'function' || n.kind === 'method' || n.kind === 'class'));
+  let decorated = '';
+  for (let ln = fn.startLine - 2; ln >= 0 && /^\s*@/.test(lines[ln] ?? ''); ln--) decorated += lines[ln];
+  const isClassmethod = /@classmethod\b/.test(decorated);
+  const answers: PythonTypeAnswer[] = [];
+  for (let ln = fn.startLine + 1; ln <= fn.endLine; ln++) {
+    if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
+    const text = (lines[ln - 1] ?? '').trim();
+    // Keywords are read with string contents blanked: `log("note: return x")`
+    // and `print("will yield")` are not statements.
+    const code = pythonBlankStrings(text);
+    if (/^yield\b|[=(\s]yield\b/.test(code)) return null; // a generator yields, it does not return
+    // A return may follow a compound header or another statement on the same
+    // line — `if k: return A()`, `else: return B()`, `x = 1; return C()` — and
+    // every one of them must agree, so none may be skipped.
+    const ret = /(?:^|[:;]\s*)return\b\s*/.exec(code);
+    if (!ret) continue;
+    const at = ln;
+    const joined = pythonJoinedValue(lines, ln, text.slice(ret.index + ret[0].length), fn.endLine);
+    ln = joined.end;
+    const expr = joined.text.trim();
+    if (expr === '' || expr === 'None') continue;
+    // The same whole-expression rule as an assignment: `return Pool().acquire()`
+    // returns what `acquire` returns, `return A() if t else B()` either arm.
+    const ev = pythonValueEvidence(expr, null);
+    if (!ev) return null;
+    if (pythonValueCallees(expr).some((c) => c !== 'cls' && pythonBoundInDef(lines, fn.startLine, at, c.split('.')[0]!))) return null;
+    answers.push(pythonEvidenceClass(ev, fn.filePath, context, read, depth + 1, isClassmethod ? receiver : null));
+  }
+  return pythonAgree(answers);
+}
+
+/**
+ * The class `owner.attr` holds, or null. The owner's own body decides when it
+ * mentions the attribute at all (a typed statement, or an untyped one that
+ * shadows); otherwise every declared base that types it must agree — the
+ * attribute a subclass uses without assigning is the one a base's `__init__`
+ * set. A base outside the project contributes nothing. Files whose text was
+ * read are added to `read`.
+ */
+function pythonAttrClass(
+  owner: Node,
+  attr: string,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer | 'absent' {
+  const memo = pyMemo(PY_ATTR_MEMO, context);
+  const key = `${owner.id}\0${attr}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    hit = { answer: pythonAttrClassWalk(owner, attr, context, own, new Set()), read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer;
+}
+
+function pythonAttrClassWalk(
+  owner: Node,
+  attr: string,
+  context: ResolutionContext,
+  read: Set<string>,
+  seen: Set<string>,
+): PythonTypeAnswer | 'absent' {
+  if (seen.has(owner.id) || seen.size >= 5) return 'absent';
+  seen.add(owner.id);
+  read.add(owner.filePath);
+
+  const { mentioned, evidence } = pythonAttrStatements(owner, attr, context);
+  if (mentioned) {
+    // Untyped statements are no evidence either way — and a factory whose
+    // result cannot be read is one of them; the typed ones must agree. Two
+    // spellings of one class (`models.User()`, `User()`) agree.
+    const answers: PythonTypeAnswer[] = [];
+    for (const ev of evidence) {
+      const made = pythonEvidenceClass(ev, owner.filePath, context, read, 0, null);
+      if (made || ev === 'runtime' || !('factory' in ev)) answers.push(made);
+    }
+    const keys = new Set(answers.map((a) => (a === null ? '?' : a === 'runtime' ? '' : a.id)));
+    if (keys.size !== 1) return null;
+    return answers[0]!;
+  }
+
+  const fromBases: PythonTypeAnswer[] = [];
+  for (const base of pythonClassBases(owner, context)) {
+    if (!base) continue;
+    const got = pythonAttrClassWalk(base, attr, context, read, seen);
+    if (got !== 'absent') fromBases.push(got);
+  }
+  if (fromBases.length > 0) return pythonAgree(fromBases);
+  // No class of the project's in the hierarchy assigns it: a base from
+  // outside — Django's `TestCase` or `View` in an app — is where it comes
+  // from (`self.client`, `self.request`), and none of its methods is the
+  // project's.
+  return pythonHasOutsideBase(owner, context) ? 'runtime' : 'absent';
+}
+
+/** Bases that give a subclass no attributes: `ABC`, `Protocol`, an enum, an exception. */
+const PYTHON_ATTRLESS_BASE = /^(?:ABC|Protocol|NamedTuple|TypedDict|Enum|IntEnum|StrEnum|Flag|IntFlag|\w*(?:Error|Exception|Warning))$/;
+
+/** Whether `cls`'s own `class` line names a base from outside the project that could give it attributes. */
+function pythonHasOutsideBase(cls: Node, context: ResolutionContext): boolean {
+  return pythonClassBaseNames(cls, context)
+    .filter((b) => !PYTHON_ATTRLESS_BASE.test(b.split('.').pop()!))
+    .some((b) => isPythonOutsideModuleName(b.split('.')[0]!, cls.filePath, context));
+}
+
+/**
+ * Python call through one attribute of a class — `self.cap.stop()`,
+ * `cls.registry.lookup()`, `Svc.registry.lookup()`, `config.llm.rebuild()`.
+ * The class is the one the call sits in (`self` / `cls`), the one the receiver
+ * names, or the declared type of a local; the attribute's type comes from that
+ * class's body — directly, through a factory it calls, or from a base class
+ * that assigns it; the method is looked up on that type.
+ *
+ * Three answers. The method, when the attribute's type is a project class
+ * that has it. Null — no edge — when the evidence rules every project method
+ * out: the attribute holds a builtin (`self.data = []`) or a class from
+ * outside the project (`requests.Session()`), or the class it holds has no
+ * such method. Undefined when nothing here types the attribute — an untyped
+ * local, a factory whose result is unknowable, bases that disagree, an
+ * attribute no class body mentions, a deeper chain: the caller then guesses
+ * by name as for any other receiver, which is how Django's
+ * `self.client.get()` reaches its test `Client`. The edge records the other
+ * files the answer was read from (`typeFrom`), so a sync that edits one of
+ * them re-opens it.
+ */
+function matchPythonAttrCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string> = new Set(),
+): ResolvedRef | null | undefined {
+  const segs = receiver.split('.');
+  // A chain through a module — `os.path.exists()`, `np.linalg.norm()`, an
+  // `import utils` of the project's — is the module's: import resolution
+  // answers the project's own members, and no class method of the project's
+  // is a guess for one, not even `PathNotImplementedStorage.exists` by its
+  // shared word.
+  const root = segs[0]!;
+  if (isPythonOutsideModuleReceiver(root, ref, context) ||
+      (context.getImportMappings(ref.filePath, 'python').some((m) => m.isNamespace && m.localName === root) &&
+        !pythonBindsLocally(root, ref, context, false))) return null;
+  if (segs.length !== 2) return undefined;
+  const [head, attr] = segs as [string, string];
+
+  let owner: Node | null = null;
+  if (head === 'self' || head === 'cls') {
+    // The innermost class whose extent holds the call.
+    for (const n of pythonFileClasses(ref.filePath, context)) {
+      if (n.startLine > ref.line || n.endLine < ref.line) continue;
+      if (!owner || n.startLine > owner.startLine) owner = n;
+    }
+  } else if (/^[A-Z]/.test(head)) {
+    owner = pythonClassNamed(head, ref.filePath, context);
+  } else {
+    // A local or parameter whose own type the scope states — `config: Config`,
+    // `controller = Controller(...)` — then the attribute on that class.
+    const headType = inferLocalReceiverType(head, ref, context);
+    if (headType) owner = pythonClassNamed(headType, ref.filePath, context);
+  }
+  if (!owner) return undefined;
+
+  const hit = pythonAttrCallOn(owner, attr, methodName, ref, context, read);
+  if (!hit) return hit;
+  read.delete(ref.filePath);
+  return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
+/** Per context: a python file's classes, for the class around a `self.x.m()` call. */
+const PY_FILE_CLASSES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+function pythonFileClasses(filePath: string, context: ResolutionContext): Node[] {
+  const memo = pyMemo(PY_FILE_CLASSES, context);
+  let hit = memo.get(filePath);
+  if (!hit) {
+    hit = context.getNodesInFile(filePath).filter((n) => n.kind === 'class');
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(filePath, hit);
+  }
+  return hit;
+}
+
+/** Per context: owner + attribute + method → matchPythonAttrCall's answer for that class, and the files it read. */
+const PY_ATTR_CALL_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: ResolvedRef | null | undefined; read: string[] }>>();
+
+/**
+ * matchPythonAttrCall's answer once the owner class is known: the same for
+ * every call of `methodName` through `attr` of that class — Django's
+ * thousand `self.client.get()`s in one test class read it once.
+ */
+function pythonAttrCallOn(
+  owner: Node,
+  attr: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): ResolvedRef | null | undefined {
+  const memo = pyMemo(PY_ATTR_CALL_MEMO, context);
+  const key = `${owner.id}\0${attr}\0${methodName}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    const cls = pythonAttrClass(owner, attr, context, own);
+    let answer: ResolvedRef | null | undefined;
+    if (cls === 'runtime') answer = null;
+    else if (!cls || cls === 'absent') answer = undefined;
+    else {
+      // The class has no such method of the project's — unless a base the
+      // reader cannot find holds it: Django's `ComplexField(MultiValueField)`,
+      // its base imported from a package that re-exports it.
+      answer = pythonMethodOnClass(cls, methodName, ref, context, own) ?? pythonSubclassMethod(cls, methodName, ref, context) ??
+        (pythonHierarchyKnown(cls, context) ? null : undefined);
+    }
+    hit = { answer, read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer ? { ...hit.answer, original: ref } : hit.answer;
+}
+
+/**
+ * Python chained factory call — `Client.from_env().send()`,
+ * `make_client().send()`, `Client().send()` — the python instance of the #750
+ * chained-factory family. The receiver's class is what the factory produces
+ * (see `pythonFactoryType`), or the class itself for a constructor; a factory
+ * this cannot type is no edge. Records the files it read, like
+ * `matchPythonAttrCall`.
+ */
+function matchPythonFactoryChain(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = /^([A-Za-z_][\w.]*)\(\)\.(\w+)$/.exec(ref.referenceName);
+  if (!m) return null;
+  const [, callee, methodName] = m as unknown as [string, string, string];
+  // `Backend = load(); Backend().run()`, or a `make` parameter: the name the
+  // call spells is a local there, not the module's class or factory.
+  const lines = pythonLines(context, ref.filePath);
+  let fn: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if ((n.kind !== 'function' && n.kind !== 'method') || n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (!fn || n.startLine > fn.startLine) fn = n;
+  }
+  if (lines && fn && pythonBoundInDef(lines, fn.startLine, ref.line, callee.split('.')[0]!)) return null;
+  const read = new Set<string>();
+  const made: PythonTypeAnswer = /^[A-Z]/.test(callee.split('.').pop()!)
+    ? pythonClassNamed(callee, ref.filePath, context)
+    : pythonFactoryType(callee, false, ref.filePath, context, read);
+  if (!made || made === 'runtime') return null;
+  const hit = pythonMethodOnClass(made, methodName, ref, context, read);
+  if (!hit) return null;
+  read.delete(ref.filePath);
+  return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
+/**
+ * Whether a python attribute-chain ref — `self.client.send`,
+ * `Svc.registry.lookup`, `make().send` — resolves through the attribute-type
+ * reader now. That reader is the only answer a body-only edit in ANOTHER file
+ * can change (a factory's return, a base `__init__`), so a sync asks this of
+ * the failed refs such an edit could affect and retries only those that it
+ * now answers, instead of every one in the import fan-in of the edited file.
+ */
+export function pythonAttrRefResolves(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python') return false;
+  if (ref.referenceName.includes('().')) return matchPythonFactoryChain(ref, context) !== null;
+  const dot = ref.referenceName.lastIndexOf('.');
+  const receiver = dot > 0 ? ref.referenceName.slice(0, dot) : '';
+  if (!receiver.includes('.')) return false;
+  return !!matchPythonAttrCall(receiver, ref.referenceName.slice(dot + 1), ref, context);
+}
+
 /** Go builtin/primitive field types that can never carry a project method. */
 const GO_BUILTIN_FIELD_TYPES = new Set([
   'string', 'bool', 'byte', 'rune', 'error', 'any',
@@ -19593,22 +21893,18 @@ function rustTypeTextAt(text: string): string {
 
 /**
  * The type a Rust local or parameter is written with — `reader: Pin<&mut
- * R>`, `let timer: Option<Timer> = …` — read off its nearest declaration in
- * the calling function; null when that declaration writes none (`let f =
- * pin!(f)`).
+ * R>`, `let timer: Option<Timer> = …` — as its binding in scope at the call
+ * writes it (rustBindingAt: a block's own `let`, the latest shadow, never a
+ * struct literal's `reader: …` field); null when that binding writes none
+ * (`let f = pin!(f)`).
  */
 function rustDeclaredTypeText(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declared = new RegExp(`\\blet\\s+(?:mut\\s+)?${escaped}\\b(?:\\s*:(?!:)\\s*(.*))?|\\b${escaped}\\s*:(?!:)\\s*(.*)$`);
-  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
-    const m = declared.exec(lines[i] ?? '');
-    if (!m) continue;
-    const written = m[1] ?? m[2];
-    return written === undefined ? null : rustTypeTextAt(written);
-  }
-  return null;
+  const scopes = rustScopesOf(ref.filePath, context);
+  if (!scopes) return null;
+  const offset = (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column);
+  const found = rustBindingAt(scopes, name, offset);
+  if (!found || found.ambiguous || found.binding.type === undefined) return null;
+  return rustTypeTextAt(found.binding.type);
 }
 
 /**
@@ -20337,7 +22633,11 @@ function tsNamedType(
     // vscode's `ILogService` is also a constant, its dependency-injection
     // decorator, which the import may name first: the type is the interface
     // of that name beside it.
-    found = !node ? null : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
+    // A type the files declaring one module merge is no one declaration
+    // (see tsImportedTypeFile): copilot's `ChatResponseStream` methods are in
+    // vscode's proposed API files, not `vscode.d.ts`.
+    found = !node || isMergedAmbientDeclaration(node, context) ? null
+      : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
   } else if (!written.includes('.')) {
     found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
   }
@@ -20599,7 +22899,7 @@ function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: Res
   if (context.getImportMappings?.(from.filePath, from.language)?.some((i) => i.localName === name)) {
     const imported = context.resolveImport?.({ ...ref, filePath: from.filePath, language: from.language, referenceName: name, referenceKind: 'references' });
     const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-    if (node && (node.kind === 'class' || node.kind === 'component')) found = node;
+    if (node && (node.kind === 'class' || node.kind === 'component') && !isMergedAmbientDeclaration(node, context)) found = node;
   } else {
     found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
   }
@@ -20732,6 +23032,41 @@ function tsFieldCall(
     return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
   return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
+}
+
+/**
+ * The `method` named `methodName` declared on `classNode`, among the nodes of
+ * the class's file: the class's exact qualified name first, then the
+ * owner-by-name form the resolver uses elsewhere (`Logger::log`,
+ * `ns::Logger::log`). Never a substring test: `FileLogger::log` contains
+ * `Logger`.
+ *
+ * Known limitation — same-named NESTED classes: the owner-by-name form also
+ * matches `Outer::Logger::log`, and every same-named class is a candidate in
+ * the caller's loop, so a nested `Outer::Logger` can take a top-level
+ * `Logger.log()` (declared first, or the only one with the method). Choosing
+ * among them needs each language's scope rules.
+ */
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
+  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+  const exact = `${classNode.qualifiedName}::${methodName}`;
+  const byName = `${classNode.name}::${methodName}`;
+  return (
+    methods.find((n) => n.qualifiedName === exact) ??
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
+  );
+}
+
+/**
+ * The method a class-name or capitalized-receiver call reaches on `classNode`:
+ * its own (findOwnMethod), else the nearest one a declared supertype has, as a
+ * call on an instance of the class finds it. Django's `form.is_valid()` on
+ * `Form` reaches `BaseForm::is_valid`, which the substring test this replaced
+ * only found because `BaseForm` contains `Form`.
+ */
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext): Node | undefined {
+  return findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName) ??
+    inheritedClassMethod([classNode], methodName, context) ?? undefined;
 }
 
 /**
@@ -21598,6 +23933,7 @@ export function matchFuzzy(
       (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
+    !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareTypeName(ref, context) && !isTsTypeInScope(finalCandidates[0]!, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
@@ -22139,6 +24475,12 @@ function matchReferenceInner(
     ref.referenceName.includes('().') &&
     (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
   ) {
+    if (ref.language === 'python') {
+      // `Client.from_env().send()`, `make_client().send()` — the factory's own
+      // `-> T` or returns name the receiver (#750); otherwise still nothing.
+      const chained = nmTimed('pythonFactoryChain', ref, () => matchPythonFactoryChain(ref, context));
+      if (chained) return chained;
+    }
     return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
