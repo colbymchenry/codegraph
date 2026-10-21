@@ -91,15 +91,15 @@ function legacyWindowsConfigDir(): string | null {
   return path.resolve(legacy) === path.resolve(globalConfigDir()) ? null : legacy;
 }
 
-function configBaseDir(loc: Location): string {
-  return loc === 'global' ? globalConfigDir() : process.cwd();
+function configBaseDir(loc: Location, projectRoot?: string): string {
+  return loc === 'global' ? globalConfigDir() : (projectRoot ?? process.cwd());
 }
 
 // Pick existing .jsonc, then .json, default to .jsonc for new files.
 // opencode auto-creates .jsonc on first run, so that's the dominant
 // real-world case and the sensible default for greenfield installs.
-function configPath(loc: Location): string {
-  const dir = configBaseDir(loc);
+function configPath(loc: Location, projectRoot?: string): string {
+  const dir = configBaseDir(loc, projectRoot);
   const jsonc = path.join(dir, 'opencode.jsonc');
   const json = path.join(dir, 'opencode.json');
   if (fs.existsSync(jsonc)) return jsonc;
@@ -126,15 +126,19 @@ function parseConfig(text: string): Record<string, any> {
   return result as Record<string, any>;
 }
 
-function getOpencodeServerEntry(): {
+function getOpencodeServerEntry(projectPath?: string): {
   type: string;
   command: string[];
   disabled: boolean;
   codemode: boolean;
 } {
+  const command = ['codegraph', 'serve', '--mcp'];
+  if (projectPath) {
+    command.push('--path', projectPath);
+  }
   return {
     type: 'local',
-    command: ['codegraph', 'serve', '--mcp'],
+    command,
     disabled: false,
     // Keep codegraph_explore on the native tool list — OpenCode 2's
     // default Code Mode would otherwise hide the one-tool server (#1698).
@@ -210,8 +214,8 @@ class OpencodeTarget implements AgentTarget {
   }
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
-  const file = configPath(loc);
+function writeMcpEntry(loc: Location, projectRoot?: string): WriteResult['files'][number] {
+  const file = configPath(loc, projectRoot);
   const existed = fs.existsSync(file);
   let text = readConfigText(file);
 
@@ -224,7 +228,7 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
 
   const config = parseConfig(text);
   const before = config.mcp?.servers?.codegraph;
-  const after = getOpencodeServerEntry();
+  const after = getOpencodeServerEntry(projectRoot);
   const hasLegacy = !!config.mcp?.codegraph;
 
   // Native entry already matches and no v1 leftover → nothing to do.
@@ -342,6 +346,15 @@ function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
   const file = instructionsPath(loc);
   const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
   return { path: file, action };
+}
+
+/**
+ * Write a project-level opencode.jsonc with --path pointing to the project
+ * root. Used by `codegraph init` to ensure the MCP server can locate the
+ * .codegraph/ directory even when opencode uses a worktree sandbox.
+ */
+export function writeProjectMcpEntry(projectRoot: string): WriteResult['files'][number] {
+  return writeMcpEntry('local', projectRoot);
 }
 
 export const opencodeTarget: AgentTarget = new OpencodeTarget();
