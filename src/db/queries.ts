@@ -3106,7 +3106,7 @@ export class QueryBuilder {
    */
   getCrossFileIncomingEdgesWithTarget(
     filePath: string
-  ): Array<Edge & { targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
+  ): Array<Edge & { edgeId: number; targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
     const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
         src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
@@ -3120,6 +3120,7 @@ export class QueryBuilder {
     >;
     return rows.map(row => ({
       ...rowToEdge(row),
+      edgeId: row.id,
       targetName: row.target_name,
       targetKind: row.target_kind,
       sourceFilePath: row.source_file_path,
@@ -3160,6 +3161,43 @@ export class QueryBuilder {
       sourceLanguage: row.source_language,
       targetFilePath: row.target_file_path,
     }));
+  }
+
+  /**
+   * The resolution edges into `targetIds` — every edge into one of them but
+   * `contains` and synthesized (`provenance='heuristic'`) ones — with the
+   * source file and language a resurrection needs and the file of each target.
+   */
+  getResolutionEdgesInto(
+    targetIds: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const out: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> = [];
+    const unique = [...new Set(targetIds)];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE e.target IN (${placeholders})
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')`
+        )
+        .all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }>;
+      for (const row of rows) {
+        out.push({
+          ...rowToEdge(row),
+          edgeId: row.id,
+          sourceFilePath: row.source_file_path,
+          sourceLanguage: row.source_language,
+          targetFilePath: row.target_file_path,
+        });
+      }
+    }
+    return out;
   }
 
   /**

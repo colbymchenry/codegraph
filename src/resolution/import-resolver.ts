@@ -4430,6 +4430,31 @@ function localTypeBinding(receiver: string, ref: UnresolvedRef, context: Resolut
   return mappings.find((m) => m.localName === head);
 }
 
+/**
+ * The declaration a default import of `filePath` written in `language` binds
+ * — `X` in `import X from './x'` or `{ default as X }` — followed through the
+ * modules the file forwards its default from, or undefined when it has none.
+ * The lookup resolveViaImport makes for that binding, memoized with it.
+ */
+export function moduleDefaultExport(filePath: string, language: Language, context: ResolutionContext): Node | undefined {
+  return findExportedSymbol(filePath, { isDefault: true, isNamespace: false, exportedName: 'default', memberName: null }, language, context, new Set());
+}
+
+/** A `.js`/`.ts`-family file, the modules whose default an `export default` statement or the first exported declaration names. */
+export function isJsFamilyFile(filePath: string): boolean {
+  return JS_FAMILY_FILE.test(filePath);
+}
+
+/**
+ * Whether the name of an `imports` reference into a module's own file node is
+ * a binding the importing file holds on the module — `Y` of `import Y from
+ * './x'`, `{ default as Y }` or `import * as Y` — rather than the path it
+ * imports the module by.
+ */
+export function isModuleBindingName(name: string): boolean {
+  return IDENTIFIER.test(name);
+}
+
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 /** The receiver of a direct member reference: `store` of `store.get`, none of `store.get().then` or `a.b.c`. */
 const MEMBER_RECEIVER = /^([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*$/;

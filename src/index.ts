@@ -54,7 +54,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
-import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
+import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -1186,6 +1186,18 @@ export class CodeGraph {
               this.queries, importReader, this.projectRoot, result.changedFilePaths, edgesBeforeResolution
             );
             if (process.env.CODEGRAPH_SYNTH_TIMINGS && declared > 0) console.error(`[phase-timing] sync-declared-packages: ${declared} refs re-opened`);
+
+            // An edited module whose default export moved to another
+            // declaration, or went away, while the old one stayed declared:
+            // `new Y()` after `import Y from './x'` kept the old one, the node
+            // that replaced its target, and no name this sync's files carry
+            // changed. Read off the edges into the edited modules; an edit
+            // that leaves the default alone re-opens nothing.
+            const tDefaults = Date.now();
+            const movedDefaults = this.resolver.changedDefaultExports(modified, result.changedFilePaths, edgesBeforeResolution);
+            const throughDefaults = movedDefaults.length === 0 ? 0
+              : reopenReferencesThroughChangedDefaults(this.queries, importReader, movedDefaults, edgesBeforeResolution);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-default-exports: ${Date.now() - tDefaults}ms (${movedDefaults.length} defaults moved, ${throughDefaults} refs re-opened)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
