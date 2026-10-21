@@ -4228,10 +4228,11 @@ export function isBoundToOutOfRepoImport(
  *    default tail, is one the module never declares. So is a plain named
  *    import's (`import { useInvocation } from './context'`) when its module is
  *    a barrel (`context/index.ts`): the barrel declares none of the names it
- *    passes on, and an edit that gives it one declares nothing. A sync still
- *    looks a binding up by its own name as well: the file that declares it can
- *    be anywhere, and a binding its module never resolves is linked by the
- *    name alone.
+ *    passes on, and an edit that gives it one declares nothing. Whether a
+ *    module is one can't be told while it lacks the name, so every binding
+ *    waits for its module. A sync still looks a binding up by its own name as
+ *    well: the file that declares it can be anywhere, and a binding its
+ *    module never resolves is linked by the name alone.
  *  - a direct member of any binding, a named import's included
  *    (`NODE_PATH_EXCLUDELIST.includes(p)`, `store.get(k)`, `NS.make()`). It
  *    reaches the binding's declaration, or a member of it, through the module,
