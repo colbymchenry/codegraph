@@ -155,3 +155,19 @@ float drive() {
   (void)m;
   return r + f + flags + leg;
 }
+// A function named past its noexcept/throw/requires clauses.
+namespace clauses {
+template <template <typename, typename> class Ser>
+class Json {
+ public:
+  template <typename T, typename U = T>
+  Json(T&& val) noexcept(noexcept(Ser<U>::to_json(*this, val))) {
+    Ser<U>::to_json(*this, val);
+  }
+  void Reserve(int n) throw(std::bad_alloc) {}
+};
+template <typename T>
+T Twice(T v) requires std::integral<T> {
+  return v * 2;
+}
+}  // namespace clauses

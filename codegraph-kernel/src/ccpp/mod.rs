@@ -2455,8 +2455,10 @@ fn cpp_qualified_id_name(qid: Node) -> Option<Node> {
 }
 
 /// findDeclaratorQualifiedId (languages/c-cpp.ts:13): BFS for the declarator's
-/// `qualified_identifier`, skipping parameter_list + trailing_return_type so a
-/// qualified PARAMETER type can't be mistaken for the method name.
+/// `qualified_identifier`, skipping the parts that hold types or expressions
+/// (DECLARATOR_NON_NAME_PARTS: parameter_list, trailing_return_type, noexcept,
+/// throw_specifier, requires_clause) so a qualified PARAMETER type, or a call
+/// in `noexcept(…)`, can't be mistaken for the method name.
 fn find_declarator_qualified_id(declarator: Node) -> Option<Node> {
     let mut queue: VecDeque<Node> = VecDeque::new();
     queue.push_back(declarator);
@@ -2466,7 +2468,10 @@ fn find_declarator_qualified_id(declarator: Node) -> Option<Node> {
         }
         for i in 0..current.named_child_count() {
             if let Some(child) = current.named_child(i) {
-                if child.kind() != "parameter_list" && child.kind() != "trailing_return_type" {
+                if !matches!(
+                    child.kind(),
+                    "parameter_list" | "trailing_return_type" | "noexcept" | "throw_specifier" | "requires_clause"
+                ) {
                     queue.push_back(child);
                 }
             }
