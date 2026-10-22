@@ -360,4 +360,42 @@ end;`);
       expect(callsFrom(cg, 'THost::Fire')).toEqual(['Host.pas:THost::Fire::Calc', 'Host.pas:THost::Fire::Delete']);
     });
   });
+
+  it('gives a nested routine the constants it reads, not those its routine\'s body reads after it', async () => {
+    const code = `unit Values;
+
+interface
+
+const
+  MAX_DEPTH = 10;
+  OP_EXACTLY = 3;
+  OP_ANY = 4;
+
+function Parse(N: Integer): Integer;
+
+implementation
+
+function Parse(N: Integer): Integer;
+
+  function Unquote(C: Integer): Integer;
+  begin
+    Result := C + OP_ANY;
+  end;
+
+begin
+  if N > MAX_DEPTH then
+    Result := OP_EXACTLY
+  else
+    Result := Unquote(N);
+end;
+
+end.
+`;
+    await withIndex({ 'Values.pas': code }, (cg) => {
+      const reads = cg.getOutgoingEdges(routine(cg, 'Parse::Unquote').id)
+        .filter((e) => e.kind === 'references')
+        .map((e) => cg.getNode(e.target)!.name);
+      expect(reads).toEqual(['OP_ANY']);
+    });
+  });
 });

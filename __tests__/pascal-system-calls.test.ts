@@ -483,7 +483,7 @@ end.
   });
 
   it('sees the declarations of a used unit whose header the parser lost', async () => {
-    // The `{$IFDEF}` around a local `var` section costs the parse its `unit`
+    // An old-style `begin … end.` initialization costs the parse its `unit`
     // node; the unit is still the one its file is named after.
     const lib = `unit Lib;
 
@@ -500,14 +500,12 @@ function FileSize(const FileName: string): Int64;
 implementation
 
 function FileSize(const FileName: string): Int64;
-{$IFDEF MSWINDOWS}
-var
-  Handle: THandle;
-{$ENDIF}
 begin
   Result := 0;
 end;
 
+begin
+  crc32c := nil;
 end.
 `;
     const main = `unit Main;
@@ -606,16 +604,18 @@ end;
   });
 
   it('takes no member of a class such a unit\'s parse lost for a routine of the unit', async () => {
-    // The anonymous record ends the class early, so `Insert` comes out as a
-    // routine of the unit, indented as no routine of the unit is.
+    // The anonymous record holding a method, which the parser can't read,
+    // ends the class early, so `Insert` comes out as a routine of the unit,
+    // indented as no routine of the unit is.
     const lib = `unit Lib;
 
 interface
 
 type
   TClient = class
-    Items: array of record
+    Items: record
       Name: string;
+      procedure Clear;
     end;
     procedure Insert(Index: Integer; const S: string);
   end;
@@ -627,13 +627,10 @@ implementation
 procedure TClient.Insert(Index: Integer; const S: string); begin end;
 
 procedure Log(const S: string);
-{$IFDEF MSWINDOWS}
-var
-  Handle: THandle;
-{$ENDIF}
 begin
 end;
 
+begin
 end.
 `;
     const main = `unit Main;

@@ -1309,8 +1309,10 @@ export class TreeSitterExtractor {
       // live in the sibling. Pull it in. (A body as a next sibling of the scope
       // node is unique to Dart/Pascal among the value-ref languages — every other
       // grammar nests the body inside the function node — so this is inert
-      // elsewhere.)
-      const sib = scope.node.nextNamedSibling;
+      // elsewhere.) A Pascal routine nested in another is stored as its whole
+      // `defProc`, body included, and the `block` after it is the outer
+      // routine's body: its reads are not the nested routine's.
+      const sib = scope.node.type === 'defProc' ? null : scope.node.nextNamedSibling;
       if (sib && (sib.type === 'function_body' || sib.type === 'block')) stack.push(sib);
       let visited = 0;
       while (stack.length > 0 && visited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
