@@ -1330,14 +1330,38 @@ function resolveAliasedImport(
   return tryWithExt(importPath);
 }
 
-/** The file `basePath` names: with the language's extensions or index files, as is, or as an emitted `.js`. */
+/**
+ * The file `basePath` names: with the language's extensions or index files, as
+ * is, or as an emitted `.js` — each spelled as the index keys it
+ * (indexedSpelling).
+ */
 function tryWithExtensions(basePath: string, language: Language, context: ResolutionContext): string | null {
   for (const ext of EXTENSION_RESOLUTION[language] || []) {
-    const candidate = basePath + ext;
+    const candidate = indexedSpelling(basePath + ext, language);
     if (context.fileExists(candidate)) return candidate;
   }
-  if (context.fileExists(basePath)) return basePath;
-  return findSourceForEmittedSpecifier(basePath, language, context);
+  const asIs = indexedSpelling(basePath, language);
+  if (context.fileExists(asIs)) return asIs;
+  return findSourceForEmittedSpecifier(asIs, language, context);
+}
+
+/**
+ * A path as the index keys its files. The alias, workspace and direct-path
+ * branches join an import specifier as written, so `@/widgets/Chart/` made
+ * `src/widgets/Chart//index.tsx` and `src/widgets/./Chart` made
+ * `src/widgets/./Chart/index.tsx`. The disk check accepts either spelling, but
+ * no file node or `files` row is keyed by it, so the import linked nothing
+ * (#2577). An ES module specifier is read lexically — by Node, tsc and the
+ * bundlers alike — so `.` and empty segments drop out and `..` folds, here as
+ * there. A trailing slash still names a folder: `Chart/` gives
+ * `Chart/index.tsx`, never `Chart.tsx`. Other languages keep the path as
+ * found: a C include's `a/../b.h` follows the folder `a` on disk, symlinks
+ * included.
+ */
+function indexedSpelling(filePath: string, language: Language): string {
+  return ESM_IMPORT_LANGUAGES.has(language) && /\/\/|(?:^|\/)\.\.?(?:\/|$)/.test(filePath)
+    ? path.posix.normalize(filePath)
+    : filePath;
 }
 
 /**
