@@ -903,10 +903,12 @@ program
       try {
         // A live MCP daemon keeps SQLite handles open. Verify it by its socket
         // before stopping it so a stale pidfile can never signal another process.
-        const { stopDaemonAt } = await import('../mcp/daemon-registry');
-        const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath), { preserveUnverified: true });
+        // A lock left naming a process that isn't CodeGraph is cleared (#2770).
+        const { stopDaemonAt, daemonStopFailureMessage } = await import('../mcp/daemon-registry');
+        const realRoot = fs.realpathSync(projectPath);
+        const daemonStop = await stopDaemonAt(realRoot, { preserveUnverified: true });
         if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
-          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon stop` to stop it, then retry `codegraph index`.');
+          throw new Error(await daemonStopFailureMessage(realRoot, daemonStop));
         }
 
         // Keep the writer slot through recreation AND indexing. A reconnecting
