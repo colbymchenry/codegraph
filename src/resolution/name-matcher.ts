@@ -17712,6 +17712,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PYTHON_IMPORTED_FILES.delete(context);
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
+  OUTER_SCAN_FILES.delete(context);
   TS_IMPORTED_TYPE_FILES.delete(context);
   TS_NAMED_CLASSES.delete(context);
   TS_AMBIENT_MODULE_FILES.delete(context);
@@ -18679,6 +18680,155 @@ export function inferLocalReceiverType(
   return null;
 }
 
+/**
+ * Per JS/TS file, for the outer-scope receiver check below: the names some
+ * `const` / `let` / `var` declares with a written type, and — read only for
+ * a file that has one the check asks about — its lines with comments
+ * stripped (line breaks kept) and the innermost function or method node over
+ * each line. Kept for the last few files, since references arrive file by file.
+ */
+type OuterScanFile = {
+  typedNames: Set<string>;
+  scopes?: { stripped: string[]; owner: (Node | undefined)[] };
+  receivers: Map<string, OuterReceiverLines>;
+};
+/** A receiver name's typed `const` / `let` / `var` lines, and the lines that use it other than as a read (outerReceiverUseIsRead). */
+type OuterReceiverLines = { typed: number[]; unread: number[] };
+const OUTER_SCAN_FILES = new WeakMap<ResolutionContext, Map<string, OuterScanFile>>();
+
+function outerScanFile(ref: UnresolvedRef, lines: string[], context: ResolutionContext): OuterScanFile {
+  let files = OUTER_SCAN_FILES.get(context);
+  if (!files) OUTER_SCAN_FILES.set(context, (files = new Map()));
+  const hit = files.get(ref.filePath);
+  if (hit) return hit;
+  const typedNames = new Set<string>();
+  for (const line of lines) {
+    if (line.length > 10_000) continue;
+    for (const m of line.matchAll(/(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*:/g)) typedNames.add(m[1]!);
+  }
+  const file: OuterScanFile = { typedNames, receivers: new Map() };
+  if (files.size >= 16) files.delete(files.keys().next().value!);
+  files.set(ref.filePath, file);
+  return file;
+}
+
+function outerScopes(file: OuterScanFile, ref: UnresolvedRef, lines: string[], context: ResolutionContext): NonNullable<OuterScanFile['scopes']> {
+  if (file.scopes) return file.scopes;
+  const stripped = stripCommentsForRegex(lines.join('\n'), 'typescript').split('\n');
+  const owner: (Node | undefined)[] = new Array(lines.length);
+  // Outer nodes first, so a node nested in another overwrites its lines.
+  const fns = context.getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && n.language === ref.language)
+    .sort((a, b) => a.startLine - b.startLine || (b.endLine ?? b.startLine) - (a.endLine ?? a.startLine));
+  for (const n of fns) {
+    for (let i = n.startLine - 1; i <= (n.endLine ?? n.startLine) - 1 && i < lines.length; i++) owner[i] = n;
+  }
+  return (file.scopes = { stripped, owner });
+}
+
+/**
+ * Is this use of a receiver name, at `at` in `line`, one that can only read
+ * or assign it: a member read (`root.x`, `root!.x`, `root?.x`), a negation, a
+ * comparison or logical operand, a `return`, or the target of an assignment
+ * statement. Anything else may bind the name — a parameter, a declarator, a
+ * destructured name, a `catch` — and regex can't tell those from the reads
+ * they look like, so a scan that meets one decides nothing.
+ */
+function outerReceiverUseIsRead(line: string, at: number, name: string, previous: string | undefined): boolean {
+  const before = line.slice(0, at);
+  const after = line.slice(at + name.length);
+  if (/(?:\?\.|\.)\s*$/.test(before) && !/\.\.\.\s*$/.test(before)) return true; // a property of something else
+  if (/^\s*(?:!\s*)?(?:\?\.|\.(?!\.))/.test(after)) return true;
+  if (/!\s*$/.test(before) || (/(?<![\w$])return\s+$/.test(before) && !/^\s*=>/.test(after))) return true;
+  if (/^\s*(?:&&|\|\||\?\?(?!=)|[=!]==?)/.test(after)) return true;
+  // `root = …;` as a statement of its own, not a declarator continued from
+  // the line above (`const a = 1,` / `let`) nor a destructuring default
+  // (`{ root = x }`, `[root = x]`): a `{` before it opens a block.
+  return /^\s*=(?![=>])/.test(after) && /(?:^|;|\)|(?:\)|=>|(?<![\w$])(?:else|try|finally|do))\s*\{)\s*$/.test(before) &&
+    !(/^\s*$/.test(before) && previous !== undefined && /(?:[,([{]|(?<![\w$])(?:const|let|var|using))\s*$/.test(previous));
+}
+
+function outerReceiverLines(receiver: string, file: OuterScanFile, stripped: string[], lines: string[]): OuterReceiverLines {
+  const hit = file.receivers.get(receiver);
+  if (hit) return hit;
+  const r = escapeRegExp(receiver);
+  const use = new RegExp(`(?<![\\w$])${r}(?![\\w$])`, 'g');
+  const typedDecl = new RegExp(`(?<![\\w$.])(?:const|let|var)\\s+${r}\\s*:`);
+  const found: OuterReceiverLines = { typed: [], unread: [] };
+  let previous: string | undefined;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const bare = stripped[i] ?? '';
+    if (!line.includes(receiver)) {
+      if (bare.trim()) previous = bare;
+      continue;
+    }
+    // Too long to read: whatever it does with the name decides nothing.
+    if (line.length > 10_000) { found.unread.push(i); continue; }
+    // Uses are read off the source as written, so one in a comment or a
+    // string can only make the scan decide less.
+    let typed = false;
+    for (const m of line.matchAll(use)) {
+      if (outerReceiverUseIsRead(line, m.index!, receiver, previous)) continue;
+      // The declaration itself; written in a comment it declares nothing.
+      if (!typed && typedDecl.test(line) && typedDecl.test(bare)) typed = true;
+      else { found.unread.push(i); break; }
+    }
+    if (typed) found.typed.push(i);
+    if (bare.trim()) previous = bare;
+  }
+  file.receivers.set(receiver, found);
+  return found;
+}
+
+/**
+ * Is a JS/TS receiver the calling function doesn't bind declared, in a
+ * function around it or at the module's top level, with a type from outside
+ * the project: one a package's import names (`let root: Root | null` after
+ * `import { type Root } from "react-dom/client"`, `let r: RD.Root`), or a
+ * built-in (`Map`, `Promise`) the project declares no namesake of? Then no
+ * project method is the one called (#2589). The nearest `const` / `let` /
+ * `var` of the name written with a type, on a line no function away from the
+ * call holds, decides — and only when every line from there to the call uses
+ * the name to read or assign it (outerReceiverUseIsRead). The answer only
+ * ever drops a call: a project type found this way is not used to resolve
+ * one, so a misread scope costs a guess, never adds an edge.
+ */
+function isOuterDeclaredOutsideReceiver(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^[A-Za-z_$][\w$]*$/.test(receiver) || receiver === 'this' || receiver === 'super') return false;
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return false;
+  const file = outerScanFile(ref, lines, context);
+  if (!file.typedNames.has(receiver)) return false;
+  if (context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === receiver)) return false;
+  const { stripped, owner } = outerScopes(file, ref, lines, context);
+  const { typed, unread } = outerReceiverLines(receiver, file, stripped, lines);
+  const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const holdsCall = (n: Node): boolean => n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line;
+  let declIdx = -1;
+  for (let k = typed.length - 1; k >= 0; k--) {
+    const i = typed[k]!;
+    if (i >= callIdx) continue;
+    // A line inside a function that doesn't hold the call is another scope's.
+    const at = owner[i];
+    if (at && !holdsCall(at)) continue;
+    declIdx = i;
+    break;
+  }
+  if (declIdx < 0 || unread.some((i) => i > declIdx && i <= callIdx)) return false;
+  for (const re of localReceiverTypePatterns(ref.language, escapeRegExp(receiver))) {
+    const raw = lines[declIdx]!.match(re)?.[1];
+    if (!raw) continue;
+    const head = raw.split(/[.<\[\s]/)[0]!;
+    if (isOutOfRepoBinding(head, ref, context)) return true;
+    const type = normalizeInferredTypeName(raw);
+    return type !== null && head === type && JS_BUILT_INS.has(type) && isUndeclaredTypeName(type, ref, context);
+  }
+  return false;
+}
+
 /** Infer only a visible awaited binding and its actual local/imported callee.
  * The signature already carries the return annotation in both extractors, so
  * multiline declarations and neighboring declarations cannot donate a type.
@@ -19137,6 +19287,12 @@ export function matchMethodCall(
         inferredType = null;
       }
     }
+    // A JS/TS receiver the calling function doesn't bind may be a `let` /
+    // `const` / `var` of a function around it or of the module, declared
+    // there with a package's type: react-dom's `root.render(…)` on a module's
+    // `let root: Root | null` went to the project's one class `render()` (#2589).
+    if (!inferredType && ESM_FAMILY.has(ref.language) && dotMatch &&
+        nmTimedT('mc-outerdecl', ref, () => isOuterDeclaredOutsideReceiver(objectOrClass!, ref, context))) return null;
     // An Objective-C receiver the calling method doesn't declare may be an
     // instance variable or a property of its class (objcMemberReceiverType).
     if (!inferredType && ref.language === 'objc' && dotMatch) {
