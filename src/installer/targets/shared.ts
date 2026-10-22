@@ -78,10 +78,35 @@ export function readJsonFile(filePath: string): Record<string, any> {
  *
  * Prevents corruption if the process crashes mid-write. The temp
  * file is cleaned up on rename failure.
+ *
+ * A symbolic link is written through, never replaced (#2721). Renaming
+ * onto the link's own path swapped the link for a regular copy, so a
+ * `~/.codex/AGENTS.md -> ~/dotfiles/AGENTS.md` kept in a dotfiles repo
+ * stopped reaching the shared file. The write lands on the file at the end
+ * of the link instead, and the link itself, relative or absolute, is left
+ * as it was. A link to a file that doesn't exist yet gets that file
+ * created, but only in a folder that already exists, as writing through it
+ * in a shell would: no folder is ever created where a link points. When the
+ * linked file can't be written, the error names the link and nothing
+ * changes.
  */
 export function atomicWriteFileSync(filePath: string, content: string): void {
+  if (!isSymbolicLink(filePath)) {
+    writeThenRename(filePath, content, true);
+    return;
+  }
+  let target = filePath;
+  try {
+    target = linkTarget(filePath);
+    writeThenRename(target, content, false);
+  } catch (err) {
+    throw linkWriteError(filePath, target, err);
+  }
+}
+
+function writeThenRename(filePath: string, content: string, createFolder: boolean): void {
   const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
+  if (createFolder && !fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const tmpPath = filePath + '.tmp.' + process.pid;
@@ -92,6 +117,65 @@ export function atomicWriteFileSync(filePath: string, content: string): void {
     try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     throw err;
   }
+}
+
+/** True when `p` itself is a symbolic link (on Windows, also a junction). */
+function isSymbolicLink(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The file a symbolic link ends at, through any chain of links. It may not
+ * exist yet: each hop of a dangling chain is resolved from the real folder
+ * that holds the link, as the OS resolves it, not by joining names.
+ */
+function linkTarget(link: string): string {
+  try {
+    return fs.realpathSync(link);
+  } catch {
+    let current = link;
+    for (let hop = 0; hop < 40 && isSymbolicLink(current); hop++) {
+      current = path.resolve(fs.realpathSync(path.dirname(current)), fs.readlinkSync(current));
+    }
+    if (isSymbolicLink(current)) {
+      throw Object.assign(new Error('too many levels of symbolic links'), { code: 'ELOOP' });
+    }
+    return current;
+  }
+}
+
+function linkWriteError(link: string, target: string, cause: unknown): Error {
+  const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+  const why = code === 'ENOENT' ? 'its folder does not exist'
+    : code === 'EACCES' || code === 'EROFS' ? 'it is read-only'
+    : code === 'EPERM' || code === 'EBUSY' ? 'it is read-only or in use'
+    : cause instanceof Error ? cause.message : String(cause);
+  const message = target === link
+    ? `${link} is a symbolic link that can't be followed (${why}).`
+    : `${link} is a symbolic link to ${target}, which can't be written (${why}).`;
+  return Object.assign(
+    new Error(`${message} CodeGraph writes through links and never replaces one with a copy: fix the link or make its file writable, then run this again.`, { cause }),
+    { code },
+  );
+}
+
+/**
+ * Delete a file that codegraph's change left with nothing of the user's in
+ * it. A symbolic link is kept instead and `emptied` is written through it:
+ * the link is the user's, usually into a shared dotfiles folder, and
+ * deleting it would leave codegraph's entry behind in the shared file
+ * (#2721).
+ */
+export function removeFileUnlessLinked(filePath: string, emptied: string): void {
+  if (isSymbolicLink(filePath)) {
+    atomicWriteFileSync(filePath, emptied);
+    return;
+  }
+  try { fs.unlinkSync(filePath); } catch { /* ignore */ }
 }
 
 /**
@@ -344,7 +428,8 @@ export function stripMarkedSections(content: string, startMarker: string, endMar
  * Inverse of `replaceOrAppendMarkedSection`. Strips the marker
  * block from `filePath` if present. If the file becomes empty after
  * removal, deletes the file entirely (matches the existing Claude
- * uninstall behavior).
+ * uninstall behavior) — unless it is a symbolic link, which is kept
+ * and emptied through.
  *
  * Returns `removed` when content was stripped, `not-found` when
  * the markers weren't present, `kept` when the file didn't exist.
@@ -367,7 +452,7 @@ export function removeMarkedSection(
   if (rest === null) return 'not-found';
 
   if (isBlank(rest)) {
-    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+    removeFileUnlessLinked(filePath, rest);
   } else {
     atomicWriteFileSync(filePath, rest);
   }

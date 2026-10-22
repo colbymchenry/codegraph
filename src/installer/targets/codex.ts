@@ -42,6 +42,7 @@ import {
 import {
   atomicWriteFileSync,
   getMcpServerConfig,
+  removeFileUnlessLinked,
   removeMarkedSection,
   upsertInstructionsEntry,
 } from './shared';
@@ -134,7 +135,7 @@ class CodexTarget implements AgentTarget {
       const { content: nextContent, action } = removeTomlTable(content, TOML_HEADER);
       if (action === 'removed') {
         if (nextContent.trim() === '') {
-          try { fs.unlinkSync(tomlPath); } catch { /* ignore */ }
+          removeFileUnlessLinked(tomlPath, '');
         } else {
           atomicWriteFileSync(tomlPath, nextContent.trimEnd() + '\n');
         }

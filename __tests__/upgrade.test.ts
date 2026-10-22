@@ -896,6 +896,90 @@ describe('post-upgrade refresh keeps the user\'s instructions files (#2506)', ()
 });
 
 // ---------------------------------------------------------------------------
+// A symbolic link the refresh can't write through (#2721)
+// ---------------------------------------------------------------------------
+
+/** File symlinks need Developer Mode or admin rights on Windows. */
+function canCreateFileSymlink(): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-symlink-probe-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'target'), '');
+    fs.symlinkSync(path.join(dir, 'target'), path.join(dir, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+const FILE_SYMLINKS = canCreateFileSymlink();
+
+describe.skipIf(!FILE_SYMLINKS)(`post-upgrade refresh with a link it can't write through (#2721)${FILE_SYMLINKS ? '' : ' — skipped: creating a file symlink needs Developer Mode or admin rights on Windows'}`, () => {
+  const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-2721-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('warns, keeps the link, and still refreshes every other agent', async () => {
+    // Codex and Gemini configured globally. Codex's AGENTS.md is a link into a
+    // dotfiles folder that isn't there; Gemini's block is out of date.
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), '[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp"]\n');
+    const agentsMd = path.join(home, '.codex', 'AGENTS.md');
+    const missing = path.join(home, 'dotfiles', 'AGENTS.md');
+    fs.symlinkSync(missing, agentsMd, 'file');
+    fs.mkdirSync(path.join(home, '.gemini'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.gemini', 'settings.json'), JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2) + '\n');
+    const geminiMd = path.join(home, '.gemini', 'GEMINI.md');
+    fs.writeFileSync(geminiMd, '<!-- CODEGRAPH_START -->\n## CodeGraph\n\nPrefer `codegraph_search` over grep.\n<!-- CODEGRAPH_END -->\n');
+
+    const work = path.join(home, 'work');
+    fs.mkdirSync(work);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      APPDATA: path.join(home, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_TELEMETRY: '0',
+      CODEGRAPH_NO_UPDATE_CHECK: '1',
+      DO_NOT_TRACK: '1',
+      NO_COLOR: '1',
+    };
+    for (const key of ['CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'CLAUDE_CONFIG_DIR', 'CODEGRAPH_NO_INSTALL_REFRESH']) delete env[key];
+
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    let refreshOutput = '';
+    deps.run = (cmd, args, runEnv) => {
+      calls.runs.push({ cmd, args, env: runEnv });
+      if (cmd !== 'codegraph') return 0;
+      const r = spawnSync(process.execPath, [BIN, ...args], { cwd: work, env, encoding: 'utf-8', timeout: 60_000 });
+      refreshOutput = `${r.stdout}\n${r.stderr}`;
+      return r.status ?? -1;
+    };
+
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(calls.logs.join('\n')).toMatch(/Could not refresh the installed agent surfaces/);
+    expect(refreshOutput).toMatch(/Codex CLI: could not refresh — .*AGENTS\.md is a symbolic link to .*its folder does not exist/);
+    expect(fs.lstatSync(agentsMd).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.dirname(missing))).toBe(false);
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toBe(CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+  }, 90_000);
+});
+
+// ---------------------------------------------------------------------------
 // Post-upgrade version probe — does the PATH-resolved `codegraph` serve the
 // version we just installed, in THIS terminal?
 // ---------------------------------------------------------------------------

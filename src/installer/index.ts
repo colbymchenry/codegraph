@@ -22,7 +22,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId } from './targets/types';
+import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
@@ -380,13 +380,13 @@ export function uninstallTargets(
   });
 }
 
-export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported' | 'failed';
 
 /**
  * Per-target outcome of a refresh sweep. `refreshed` means at least one
  * filesystem entry was created, updated, or removed; `unchanged` means the target was
- * already current (every write reported byte-identical); the other two
- * mirror `UninstallStatus`.
+ * already current (every write reported byte-identical); `failed` means a
+ * write threw (`error` says why); the other two mirror `UninstallStatus`.
  */
 export interface RefreshReport {
   id: TargetId;
@@ -395,6 +395,8 @@ export interface RefreshReport {
   status: RefreshStatus;
   /** Absolute paths created, updated, or removed by the refresh. */
   changedPaths: string[];
+  /** Why the refresh of this target failed (status `failed` only). */
+  error?: string;
 }
 
 /**
@@ -428,7 +430,16 @@ export function refreshTargets(
     if (!target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    let result: WriteResult;
+    try {
+      result = target.install(location, { autoAllow: false, promptHook: undefined });
+    } catch (err) {
+      // One agent's file that can't be written (a symbolic link to a
+      // read-only file, say: #2721) must not stop the rest of the sweep
+      // `codegraph upgrade` runs.
+      const error = err instanceof Error ? err.message : String(err);
+      return { ...base, status: 'failed' as const, changedPaths: [], error };
+    }
     const changedPaths = result.files
       .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
       .map((f) => f.path);

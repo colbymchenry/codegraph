@@ -1988,6 +1988,295 @@ describe('Installer — install --refresh keeps each agent\'s instructions file 
   }
 });
 
+// ---------------------------------------------------------------------------
+// A symbolic link is written through, never replaced (#2721)
+//
+// Instructions and config files are often symbolic links into a dotfiles or
+// team repo (`~/.codex/AGENTS.md -> ~/dotfiles/AGENTS.md`). Every installer
+// write went to `<path>.tmp.<pid>` and was renamed onto the path, and a
+// rename replaces the link itself: install left a detached copy, so the
+// shared file never got CodeGraph's entry and later edits to it never reached
+// the agent. Uninstall deleted a link whose file it had emptied.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this machine can create a file symlink. On Windows that needs
+ * Developer Mode or admin rights; where it can't, the link tests are skipped,
+ * with the reason in their name, rather than passing without running.
+ */
+function canCreateFileSymlink(): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-symlink-probe-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'target'), '');
+    fs.symlinkSync(path.join(dir, 'target'), path.join(dir, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+const FILE_SYMLINKS = canCreateFileSymlink();
+const NO_FILE_SYMLINKS = ' — skipped: creating a file symlink needs Developer Mode or admin rights on Windows';
+
+describe.skipIf(!FILE_SYMLINKS)(`Installer — a symbolic link is written through, never replaced (#2721)${FILE_SYMLINKS ? '' : NO_FILE_SYMLINKS}`, () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+  let restoreWritable: Array<() => void>;
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('link-home');
+    tmpCwd = mkTmpDir('link-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+    restoreWritable = [];
+  });
+
+  afterEach(() => {
+    for (const restore of restoreWritable) restore();
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const isLink = (p: string): boolean => {
+    try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; }
+  };
+  /** Make `linkPath` a file symlink whose text is `text`, creating the folder that holds it. */
+  function link(linkPath: string, text: string): void {
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fs.symlinkSync(text, linkPath, 'file');
+  }
+  /** A file in the shared folder the links point into, written with `content` when given. */
+  function sharedFile(name: string, content?: string): string {
+    const file = path.join(tmpHome, 'dotfiles', name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (content !== undefined) fs.writeFileSync(file, content);
+    return file;
+  }
+
+  // Every file each agent's install writes, at both locations: whatever the
+  // installer does, it never replaces or removes a link.
+  for (const target of ALL_TARGETS) {
+    for (const location of (['global', 'local'] as const).filter((l) => target.supportsLocation(l))) {
+      it(`${target.id} (${location}): install and uninstall keep every one of its files that is a link`, () => {
+        const links = target.describePaths(location).map((p, i) => {
+          const dest = sharedFile(`${i}-${path.basename(p)}`);
+          link(p, dest);
+          return { path: p, dest };
+        });
+
+        const result = target.install(location, { autoAllow: true });
+        for (const l of links) {
+          expect(isLink(l.path), l.path).toBe(true);
+          expect(fs.readlinkSync(l.path)).toBe(l.dest);
+        }
+        for (const f of result.files.filter((x) => x.action === 'created' || x.action === 'updated')) {
+          const written = links.find((l) => l.path === f.path);
+          expect(written, f.path).toBeDefined();
+          expect(fs.existsSync(written!.dest), written!.dest).toBe(true);
+        }
+        expect(target.detect(location).alreadyConfigured).toBe(true);
+
+        target.uninstall(location);
+        for (const l of links) {
+          expect(isLink(l.path), l.path).toBe(true);
+          expect(fs.readlinkSync(l.path)).toBe(l.dest);
+        }
+        expect(target.detect(location).alreadyConfigured).toBe(false);
+      });
+    }
+  }
+
+  it('the shared files get CodeGraph\'s entries next to the user\'s own, and uninstall takes only those out again', () => {
+    const files = {
+      claudeJson: sharedFile('claude.json', '{\n  "numStartups": 3\n}\n'),
+      claudeMd: sharedFile('CLAUDE.md', '# my claude notes\n'),
+      agentsMd: sharedFile('AGENTS.md', '# shared rules\n\nBe terse.\n'),
+      codexToml: sharedFile('codex.toml', 'model = "o3"\n'),
+      opencode: sharedFile('opencode.jsonc', '{\n  // my theme\n  "theme": "tokyonight"\n}\n'),
+      cursor: sharedFile('cursor-mcp.json', '{\n  "mcpServers": {\n    "other": {\n      "command": "x"\n    }\n  }\n}\n'),
+    };
+    const original = Object.fromEntries(Object.entries(files).map(([k, f]) => [k, fs.readFileSync(f, 'utf-8')]));
+    link(path.join(tmpHome, '.claude.json'), files.claudeJson);
+    link(path.join(tmpHome, '.claude', 'CLAUDE.md'), files.claudeMd);
+    // Two agents sharing one instructions file.
+    link(path.join(tmpHome, '.codex', 'AGENTS.md'), files.agentsMd);
+    link(path.join(tmpHome, '.config', 'opencode', 'AGENTS.md'), files.agentsMd);
+    link(path.join(tmpHome, '.codex', 'config.toml'), files.codexToml);
+    link(path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc'), files.opencode);
+    link(path.join(tmpHome, '.cursor', 'mcp.json'), files.cursor);
+    const ids = ['claude', 'codex', 'opencode', 'cursor'] as const;
+
+    for (const id of ids) getTarget(id)!.install('global', { autoAllow: false });
+
+    const read = (f: string) => fs.readFileSync(f, 'utf-8');
+    expect(JSON.parse(read(files.claudeJson))).toMatchObject({ numStartups: 3, mcpServers: { codegraph: {} } });
+    expect(read(files.claudeMd)).toBe(`# my claude notes\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(read(files.agentsMd)).toBe(`# shared rules\n\nBe terse.\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(read(files.codexToml)).toContain('model = "o3"');
+    expect(read(files.codexToml)).toContain('[mcp_servers.codegraph]');
+    expect(read(files.opencode)).toContain('// my theme');
+    expect(parseJsonc(read(files.opencode)).mcp.servers.codegraph).toBeDefined();
+    expect(JSON.parse(read(files.cursor)).mcpServers).toMatchObject({ other: { command: 'x' }, codegraph: {} });
+    // Re-running is a no-op through the links too.
+    for (const id of ids) {
+      for (const f of getTarget(id)!.install('global', { autoAllow: false }).files) expect(f.action, f.path).toBe('unchanged');
+    }
+
+    for (const id of ids) getTarget(id)!.uninstall('global');
+
+    expect(JSON.parse(read(files.claudeJson))).toEqual({ numStartups: 3 });
+    expect(read(files.claudeMd)).toBe(original.claudeMd);
+    expect(read(files.agentsMd)).toBe(original.agentsMd);
+    expect(read(files.codexToml)).toBe(original.codexToml);
+    expect(parseJsonc(read(files.opencode))).toEqual({ $schema: 'https://opencode.ai/config.json', theme: 'tokyonight' });
+    expect(read(files.opencode)).toContain('// my theme');
+    expect(JSON.parse(read(files.cursor))).toEqual({ mcpServers: { other: { command: 'x' } } });
+  });
+
+  it('a relative link keeps its text, and is followed from the folder that really holds it', () => {
+    // `~/.codex` is itself a folder link into the dotfiles repo, and the
+    // config inside it points one level up, relative to the real folder.
+    const realCodex = path.join(tmpHome, 'dotfiles', 'codex');
+    fs.mkdirSync(realCodex, { recursive: true });
+    fs.symlinkSync(realCodex, path.join(tmpHome, '.codex'), 'junction');
+    const agentsText = path.join('..', 'AGENTS.md');
+    const tomlText = path.join('..', 'codex.toml');
+    link(path.join(realCodex, 'AGENTS.md'), agentsText);
+    link(path.join(realCodex, 'config.toml'), tomlText);
+    fs.writeFileSync(path.join(tmpHome, 'dotfiles', 'codex.toml'), 'model = "o3"\n');
+    // Only the AGENTS.md target is missing, so it is created where the link
+    // really points: dotfiles/AGENTS.md, not a lexical ~/AGENTS.md.
+
+    getTarget('codex')!.install('global', { autoAllow: false });
+
+    expect(fs.readlinkSync(path.join(realCodex, 'AGENTS.md'))).toBe(agentsText);
+    expect(fs.readlinkSync(path.join(realCodex, 'config.toml'))).toBe(tomlText);
+    expect(isLink(path.join(tmpHome, '.codex'))).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, 'dotfiles', 'AGENTS.md'), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(fs.existsSync(path.join(tmpHome, 'AGENTS.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(tmpHome, 'dotfiles', 'codex.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+  });
+
+  it('a link into a folder that does not exist is an error naming the link, and nothing is created', () => {
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    const missing = path.join(tmpHome, 'dotfiles-not-cloned-yet', 'AGENTS.md');
+    link(agentsMd, missing);
+
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(
+      /AGENTS\.md is a symbolic link to .*dotfiles-not-cloned-yet.*its folder does not exist.*never replaces one with a copy/,
+    );
+    expect(isLink(agentsMd)).toBe(true);
+    expect(fs.readlinkSync(agentsMd)).toBe(missing);
+    expect(fs.existsSync(path.dirname(missing))).toBe(false);
+  });
+
+  // POSIX refuses the write in a read-only folder, except to root; Windows
+  // refuses replacing a file whose read-only attribute is set.
+  const POSIX_ROOT = process.platform !== 'win32' && process.getuid?.() === 0;
+  it.skipIf(POSIX_ROOT)(`a link to a read-only file is an error naming the link; the file is unchanged and no temp file is left${POSIX_ROOT ? ' — skipped: root can write into a read-only folder' : ''}`, () => {
+    const shared = sharedFile(path.join('managed', 'AGENTS.md'), '# managed by home-manager\n');
+    const lock = process.platform === 'win32' ? shared : path.dirname(shared);
+    fs.chmodSync(lock, process.platform === 'win32' ? 0o444 : 0o555);
+    restoreWritable.push(() => fs.chmodSync(lock, process.platform === 'win32' ? 0o666 : 0o755));
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    link(agentsMd, shared);
+
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(/AGENTS\.md is a symbolic link to .*it is read-only/);
+    expect(isLink(agentsMd)).toBe(true);
+    expect(fs.readFileSync(shared, 'utf-8')).toBe('# managed by home-manager\n');
+    expect(fs.readdirSync(path.dirname(shared)).filter((n) => n.includes('.tmp.'))).toEqual([]);
+  });
+
+  it('uninstall empties a linked file that held only CodeGraph\'s part, instead of deleting the link', () => {
+    const agentsMd = sharedFile('AGENTS.md');
+    const codexToml = sharedFile('codex.toml');
+    const copilot = sharedFile('copilot.json');
+    link(path.join(tmpHome, '.codex', 'AGENTS.md'), agentsMd);
+    link(path.join(tmpHome, '.codex', 'config.toml'), codexToml);
+    link(path.join(tmpHome, '.copilot', 'mcp-config.json'), copilot);
+    getTarget('codex')!.install('global', { autoAllow: false });
+    getTarget('copilot-cli')!.install('global', { autoAllow: false });
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    getTarget('codex')!.uninstall('global');
+    getTarget('copilot-cli')!.uninstall('global');
+
+    for (const p of ['.codex/AGENTS.md', '.codex/config.toml', '.copilot/mcp-config.json']) {
+      expect(isLink(path.join(tmpHome, p)), p).toBe(true);
+    }
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe('');
+    expect(fs.readFileSync(codexToml, 'utf-8')).toBe('');
+    expect(JSON.parse(fs.readFileSync(copilot, 'utf-8'))).toEqual({});
+  });
+
+  it('a link that can\'t be written fails only its own agent in a refresh: the others are still refreshed', () => {
+    getTarget('codex')!.install('global', { autoAllow: false });
+    getTarget('gemini')!.install('global', { autoAllow: false });
+    // Codex's instructions file is now a link into a folder that is gone,
+    // and Gemini's block is stale.
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    fs.unlinkSync(agentsMd);
+    link(agentsMd, path.join(tmpHome, 'gone', 'AGENTS.md'));
+    const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
+    fs.writeFileSync(geminiMd, `${LEGACY_BLOCK}\n`);
+
+    const reports = refreshTargets(ALL_TARGETS, 'global');
+
+    const codex = reports.find((r) => r.id === 'codex')!;
+    expect(codex.status).toBe('failed');
+    expect(codex.error).toMatch(/AGENTS\.md is a symbolic link to .*gone.*its folder does not exist/);
+    const gemini = reports.find((r) => r.id === 'gemini')!;
+    expect(gemini.status).toBe('refreshed');
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(isLink(agentsMd)).toBe(true);
+  });
+});
+
+describe('Installer — a config folder that is a link keeps working (#2721)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('dirlink-home');
+    tmpCwd = mkTmpDir('dirlink-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // A folder link needs no special rights: a junction on Windows, a symlink elsewhere.
+  it('~/.codex as a folder link: files are written inside the real folder and the link stays', () => {
+    const real = path.join(tmpHome, 'dotfiles', 'codex');
+    fs.mkdirSync(real, { recursive: true });
+    const dirLink = path.join(tmpHome, '.codex');
+    fs.symlinkSync(real, dirLink, 'junction');
+
+    getTarget('codex')!.install('global', { autoAllow: false });
+    expect(fs.lstatSync(dirLink).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(real, 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(real, 'AGENTS.md'), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    getTarget('codex')!.uninstall('global');
+    expect(fs.lstatSync(dirLink).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(real, 'AGENTS.md'))).toBe(false);
+  });
+});
+
 describe('Installer — detection never writes (#1870)', () => {
   let tmpHome: string;
   let tmpCwd: string;
