@@ -821,15 +821,26 @@ impl<'t> Walker<'t> {
         self.push_ref(caller, &callee, calls_kind, line, col);
 
         // Capitalized constant receiver (`Klass.static_call`, `RETRY_MAX.times`)
-        // → an ADDITIONAL references ref at the RECEIVER's position.
-        // (scope_resolution receivers get none — type ≠ constant.)
-        if !skip && receiver.kind() == "constant" {
-            self.push_ref_at(
-                caller,
-                &receiver_name.to_string(),
-                edge_kind_index("references").unwrap(),
-                receiver,
-            );
+        // → an ADDITIONAL references ref at the RECEIVER's position. A namespaced
+        // receiver (`Billing::ChargeCard.call`) references the class under its
+        // qualified name (a leading `::` dropped), so `Billing::Create` and
+        // `Users::Create` resolve apart; it needs a capitalized last segment.
+        if !skip {
+            let constant_name = receiver_name.trim_start_matches("::");
+            let last = constant_name.rsplit("::").next().unwrap_or(constant_name);
+            let is_constant = match receiver.kind() {
+                "constant" => true,
+                "scope_resolution" => last.starts_with(|c: char| c.is_ascii_uppercase()),
+                _ => false,
+            };
+            if is_constant {
+                self.push_ref_at(
+                    caller,
+                    &constant_name.to_string(),
+                    edge_kind_index("references").unwrap(),
+                    receiver,
+                );
+            }
         }
     }
 

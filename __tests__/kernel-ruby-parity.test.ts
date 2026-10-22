@@ -107,6 +107,22 @@ describe.skipIf(!kernelBuilt)('kernel Ruby extraction parity', () => {
     assertParity('fixtures/torture.rb (crlf)', crlf, 30);
   });
 
+  // Namespaced and `::`-rooted constant receivers (#2503): both backends emit
+  // the same references ref, under the qualified name minus a leading `::`.
+  it('namespaced and ::-rooted constant receivers', () => {
+    const src = [
+      'class Callers',
+      '  def a = Billing::Create.call',
+      '  def b = Users::Create&.call',
+      '  def c = ::Billing::Create.call',
+      '  def d = ::Foo.call',
+      '  def e = Deep::Op.call',
+      'end',
+      '',
+    ].join('\n');
+    assertParity('src/callers.rb', src);
+  });
+
   it('mixin implements refs carry filePath through the v2 ref-flag wire path', () => {
     const src = 'class Widget\n  include Comparable\nend\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
