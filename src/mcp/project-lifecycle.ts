@@ -118,6 +118,10 @@ function ready(root: string, project: Project): Promise<void> {
 
 async function activate(root: string, project: Project): Promise<void> {
   if (!isInitialized(root)) return;
+  // Rebuild what an interrupted bulk load dropped (off this thread, #1887)
+  // before writing: a sync's writes would wait out the rebuild's write lock
+  // with this thread blocked.
+  if (project.cg.hasPendingIndexRecovery?.()) await project.cg.recoverIndexes();
   const writer = tryAcquireWriterLock(root, 'fallback');
   if (writer.kind === 'taken') {
     // Keep a real daemon session, so its idle timeout cannot strand this reader.

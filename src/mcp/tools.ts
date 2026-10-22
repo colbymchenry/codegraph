@@ -2425,7 +2425,9 @@ export class ToolHandler {
       }
     }
 
-    const open = () => loadCodeGraph().openSync(canonicalRoot);
+    // Indexes an interrupted bulk load dropped are rebuilt off this thread,
+    // before the project is served (awaitIndexRecovery, #1887).
+    const open = () => loadCodeGraph().openSync(canonicalRoot, { deferIndexRecovery: true });
     const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
     this.projectCache.set(canonicalRoot, cg);
     this.projectUsedAt.set(canonicalRoot, Date.now());
@@ -2458,6 +2460,25 @@ export class ToolHandler {
     } catch {
       // An index we can't read is no evidence the repository is excluded.
       return null;
+    }
+  }
+
+  /**
+   * Wait for a project to finish rebuilding, off this thread, the secondary
+   * indexes an interrupted bulk load dropped (#1887). Not time-boxed like the
+   * catch-up gate: without them a read scans whole tables, which on a large
+   * index stalls the thread the rebuild was moved off. Never throws: a failed
+   * rebuild leaves reads correct, and the next call tries again.
+   */
+  private async awaitIndexRecovery(cg: CodeGraph): Promise<void> {
+    if (!cg.hasPendingIndexRecovery?.()) return;
+    try {
+      await cg.recoverIndexes();
+    } catch (err) {
+      process.stderr.write(
+        `[CodeGraph MCP] Could not restore the indexes an interrupted indexing run left out of ${cg.getProjectRoot()}: ` +
+        `${err instanceof Error ? err.message : String(err)}. Queries still work, more slowly; the next call tries again.\n`
+      );
     }
   }
 
@@ -2906,6 +2927,7 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      await this.awaitIndexRecovery(project);
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).

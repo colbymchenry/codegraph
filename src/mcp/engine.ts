@@ -246,12 +246,23 @@ export class MCPEngine {
         this.cg = null;
       }
       assertNoRebuild(resolvedRoot);
-      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
+      // Indexes an interrupted bulk load dropped are rebuilt off this thread
+      // (#1887); the catch-up and tool calls wait for them.
+      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly, deferIndexRecovery: true });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
-      this.maybeStartPool(resolvedRoot);
+      // The pool's workers open the project themselves: start them on a
+      // rebuilt one, not racing the rebuild for its write lock.
+      const opened = this.cg;
+      if (opened?.hasPendingIndexRecovery()) {
+        void opened.recoverIndexes().catch(() => { /* reported by the tool call waiting on it */ }).then(() => {
+          if (this.cg === opened) this.maybeStartPool(resolvedRoot);
+        });
+      } else {
+        this.maybeStartPool(resolvedRoot);
+      }
     } catch (err) {
       // Still failing — caller will try again on the next tool call.
       this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
