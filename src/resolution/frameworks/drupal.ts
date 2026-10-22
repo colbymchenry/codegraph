@@ -21,6 +21,17 @@
  *    canonical `hook_X` name, linking implementations to the hook when `codegraph_callers`
  *    is invoked.
  *
+ * 4. **Service definitions** — parses `*.services.yml` files. Each service id becomes a
+ *    `component` node (`qualifiedName` = `filePath::service:<id>`), with a `references`
+ *    edge to its `class:` FQCN and additional `references` edges to each `@other.service`
+ *    argument. This wires Drupal's dependency-injection container into the graph.
+ *
+ * 5. **Plugin definitions** — scans `.php` files for Drupal plugin definitions, both
+ *    Drupal 11 PHP 8 attributes (`#[Block(id: 'foo')]`, `#[FieldType(...)]`, …) and the
+ *    legacy docblock annotations (`@Block(id = "foo")`, `@FieldType(...)`, …). Each becomes
+ *    a `component` node (`qualifiedName` = `filePath::plugin:<Type>:<id>`) with a
+ *    `references` edge to the annotated/attributed class.
+ *
  * ## Design decisions (review in future iterations)
  *
  * - Hook graph resolution (v1): hook references are stored as UnresolvedRef pointing to the
@@ -29,9 +40,20 @@
  *   `codegraph_search("form_alter")`. Full hook-node creation (virtual nodes for every hook)
  *   is deferred to a future iteration.
  *
- * - Services / plugins (out of scope for v1): `*.services.yml` service definitions and plugin
- *   annotations (`@Block`, `@FormElement`, etc.) are not extracted. Add a TODO below when
- *   ready to implement.
+ * - Service / plugin node kind: there is no dedicated `service` or `plugin` NodeKind, so
+ *   both reuse the generic `component` kind (the catch-all for framework-registered units,
+ *   like routes do with `route`). They stay distinguishable by their `qualifiedName`
+ *   prefix (`service:<id>` vs `plugin:<Type>:<id>`).
+ *
+ * - Service id shapes: service ids are matched as `[A-Za-z][\w.]*` keys, which excludes DI
+ *   directive keys (`_defaults`, `_instanceof` — leading `_`) and the rare class-FQCN-as-id
+ *   shorthand (`Drupal\My\Service: ~` — contains `\`). The FQCN-as-id form is a known,
+ *   uncommon gap left unhandled on purpose.
+ *
+ * - Plugin attributes vs annotations: Drupal 11 is attribute-first (`#[Block(...)]`) but a
+ *   large body of contrib/legacy code still uses docblock annotations (`@Block(...)`). Both
+ *   are parsed. Only the `id` is captured (the one stable, cross-version identifier); other
+ *   attribute/annotation arguments (`admin_label`, `label`, …) are intentionally ignored.
  *
  * - Twig templates (out of scope for v1): `.twig` files are tracked as file nodes but no
  *   symbol extraction is performed (no tree-sitter Twig grammar). Implement when a Twig
@@ -39,9 +61,6 @@
  *
  * ## TODOs for future iterations
  *
- * - TODO: Extract service definitions from `*.services.yml` files (class → service-id edges).
- * - TODO: Extract plugin annotations (`@Block`, `@FormElement`, `@Field`, etc.) from PHP
- *   docblocks and emit plugin nodes with references to the annotated class.
  * - TODO: Add Twig symbol extraction when a tree-sitter Twig grammar becomes available.
  * - TODO: Improve hook resolution: create virtual `hook_*` nodes so `codegraph_callers`
  *   returns all implementations even when Drupal core is not indexed.
@@ -195,6 +214,363 @@ function extractDrupalRoutes(
   }
 
   flushRoute();
+  return { nodes, references };
+}
+
+// ---------------------------------------------------------------------------
+// Service definition helpers (*.services.yml)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract service-container definitions from a Drupal `*.services.yml` file.
+ *
+ * Drupal services YAML format:
+ *
+ *   services:
+ *     my_module.foo:
+ *       class: Drupal\my_module\Foo
+ *       arguments: ['@other.service', '@another.service']
+ *       tags:
+ *         - { name: backend_overridable }
+ *
+ * For each service id we emit a `component` node and:
+ *   - a `references` edge to its `class:` FQCN (resolved to the class node), and
+ *   - a `references` edge to each `@service` argument (resolved to that service node).
+ *
+ * Parsed with the same line-based shape as `extractDrupalRoutes` — service ids sit at a
+ * single, fixed indent under the top-level `services:` key.
+ */
+function extractDrupalServices(
+  filePath: string,
+  content: string
+): { nodes: Node[]; references: UnresolvedRef[] } {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+
+  const lines = content.split('\n');
+
+  // Indent of the service-id keys (the first key under `services:`). Drupal uses 2 spaces
+  // but we detect it so an oddly-formatted file still parses.
+  let inServices = false;
+  let serviceIndent: number | null = null;
+
+  let current: { node: Node } | null = null;
+
+  const indentOf = (line: string): number => line.length - line.trimStart().length;
+
+  // Strip a trailing YAML comment from a value, respecting that a `#` inside quotes is
+  // literal. Service ids/args don't contain quoted `#`, so a simple "first unquoted #" cut
+  // is enough and keeps us from capturing @tokens that live in an explanatory comment.
+  const stripComment = (value: string): string => {
+    let inSingle = false;
+    let inDouble = false;
+    for (let j = 0; j < value.length; j++) {
+      const c = value[j]!;
+      if (c === "'" && !inDouble) inSingle = !inSingle;
+      else if (c === '"' && !inSingle) inDouble = !inDouble;
+      else if (c === '#' && !inSingle && !inDouble) return value.slice(0, j);
+    }
+    return value;
+  };
+
+  const pushArgRefs = (fromId: string, lineNum: number, raw: string) => {
+    // raw is the inside of `arguments: [...]` (or a single value). Pull every '@service'
+    // token, ignoring anything in a trailing comment.
+    const argMatches = stripComment(raw).match(/@[?]?[\w.]+/g);
+    if (!argMatches) return;
+    for (const a of argMatches) {
+      const svcId = a.replace(/^@[?]?/, '');
+      if (!svcId) continue;
+      references.push({
+        fromNodeId: fromId,
+        referenceName: svcId,
+        referenceKind: 'references',
+        line: lineNum,
+        column: 0,
+        filePath,
+        language: 'yaml',
+      });
+    }
+  };
+
+  // A service-id key: `my_module.foo:` (value-less, optional trailing comment) at the
+  // service indent. Directive keys begin with `_` (`_defaults`, `_instanceof`) and class
+  // FQCN keys contain `\` — neither is a service id, so the `\w`-anchored pattern excludes
+  // both. (FQCN-as-id service shorthand is a known, rare gap — see the header docblock.)
+  const SERVICE_ID = /^([A-Za-z][\w.]*):\s*(#.*)?$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const indent = indentOf(line);
+
+    // Top-level `services:` key.
+    if (indent === 0) {
+      inServices = /^services:\s*$/.test(trimmed);
+      serviceIndent = null;
+      current = null;
+      continue;
+    }
+    if (!inServices) continue;
+
+    // The first indented line under `services:` fixes the service-id indent (whether that
+    // first key is value-less or carries an inline value).
+    if (serviceIndent === null) {
+      serviceIndent = indent;
+    }
+
+    // A service-id line at the service indent.
+    const idMatch = indent === serviceIndent ? trimmed.match(SERVICE_ID) : null;
+    if (idMatch) {
+      const id = idMatch[1]!;
+      const node: Node = {
+        id: `component:${filePath}:${i + 1}:service:${id}`,
+        kind: 'component',
+        name: id,
+        qualifiedName: `${filePath}::service:${id}`,
+        filePath,
+        startLine: i + 1,
+        endLine: i + 1,
+        startColumn: 0,
+        endColumn: 0,
+        language: 'yaml',
+        updatedAt: now,
+      };
+      nodes.push(node);
+      current = { node };
+      continue;
+    }
+
+    if (!current) continue;
+
+    // class: Drupal\...\Foo
+    const classMatch = trimmed.match(/^class:\s*['"]?\\?([^'"#\n]+?)['"]?\s*(?:#.*)?$/);
+    if (classMatch) {
+      references.push({
+        fromNodeId: current.node.id,
+        referenceName: classMatch[1]!.trim(),
+        referenceKind: 'references',
+        line: current.node.startLine,
+        column: 0,
+        filePath,
+        language: 'yaml',
+      });
+      continue;
+    }
+
+    // arguments: — two forms:
+    //   inline:     arguments: ['@a', '@b']
+    //   block list: arguments:
+    //                 - '@a'
+    //                 - '@b'
+    const argsMatch = trimmed.match(/^arguments:\s*(.*)$/);
+    if (argsMatch) {
+      const inline = argsMatch[1]!.trim();
+      if (inline && !inline.startsWith('#')) {
+        // Inline form (or a single scalar value).
+        pushArgRefs(current.node.id, current.node.startLine, inline);
+      } else {
+        // Block-list form: consume the following deeper `- '@svc'` lines.
+        const argsIndent = indent;
+        for (let k = i + 1; k < lines.length; k++) {
+          const next = lines[k]!;
+          const nextTrim = next.trim();
+          if (!nextTrim || nextTrim.startsWith('#')) continue;
+          if (indentOf(next) <= argsIndent) break; // back out to a sibling/parent key
+          if (nextTrim.startsWith('-')) {
+            pushArgRefs(current.node.id, current.node.startLine, nextTrim.slice(1));
+          }
+          i = k; // advance the outer loop past consumed lines
+        }
+      }
+      continue;
+    }
+  }
+
+  return { nodes, references };
+}
+
+// ---------------------------------------------------------------------------
+// Plugin definition helpers (PHP 8 attributes + legacy annotations)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plugin-attribute / -annotation names we treat as Drupal plugin definitions. Drupal has
+ * dozens of plugin types; this is the common set seen across core + contrib. The list keeps
+ * us from mistaking unrelated PHP attributes (e.g. PHPUnit's `#[DataProvider]`, `#[Group]`)
+ * for plugins. A name not on this list is ignored — silent-and-correct beats false plugins.
+ */
+const DRUPAL_PLUGIN_TYPES = new Set([
+  'Action',
+  'Block',
+  'Condition',
+  'Constraint',
+  'ConfigEntityType',
+  'ContentEntityType',
+  'DataParser',
+  'DataType',
+  'EntityType',
+  'EntityReferenceSelection',
+  'FieldFormatter',
+  'FieldType',
+  'FieldWidget',
+  'Filter',
+  'FormElement',
+  'JsonLdEntity',
+  'JsonLdSource',
+  'MigrateSource',
+  'MigrateProcessPlugin',
+  'MigrateDestination',
+  'Mail',
+  'Menu',
+  'QueueWorker',
+  'RenderElement',
+  'RestResource',
+  'SearchApiProcessor',
+  'SectionStorage',
+  'UrlGenerator',
+  'ViewsArgument',
+  'ViewsField',
+  'ViewsFilter',
+  'ViewsSort',
+]);
+
+/**
+ * A plugin definition decorates the class declaration immediately following it (only
+ * blank lines, `use` statements, or other attributes intervene). Anything farther than
+ * this is not the decorated class — binding to it would be a wrong-target edge. The
+ * window is generous enough for a stack of sibling attributes plus a short `use` list.
+ */
+const PLUGIN_CLASS_MAX_GAP = 600;
+
+/**
+ * Find the name of the `class`/`interface`/`trait`/`enum` declared right after `fromIndex`
+ * in `content`, but only within `PLUGIN_CLASS_MAX_GAP` characters. Returns `{ name, line }`
+ * or null when no class declaration sits close enough — which keeps a plugin-shaped token
+ * found inside a method body or a string from binding to an unrelated later class.
+ */
+function findFollowingClass(
+  content: string,
+  fromIndex: number
+): { name: string; line: number } | null {
+  const re = /\b(?:final\s+|abstract\s+|readonly\s+)*(?:class|interface|trait|enum)\s+(\w+)/g;
+  re.lastIndex = fromIndex;
+  const m = re.exec(content);
+  if (!m) return null;
+  if (m.index - fromIndex > PLUGIN_CLASS_MAX_GAP) return null;
+  return { name: m[1]!, line: content.slice(0, m.index).split('\n').length };
+}
+
+/**
+ * Given the index of the `(` that opens a plugin attribute/annotation argument list,
+ * return the substring between it and its MATCHING close paren (handling nested parens
+ * like `@Translation(...)` or `new TranslatableMarkup(...)`), plus the index just past the
+ * close. Returns null when the parens are unbalanced. A hand-rolled balanced scan is needed
+ * because a lazy `\)`-anchored regex stops at the first nested close and would miss an `id`
+ * that appears after a nested annotation (`label = @Translation(...), id = "x"`).
+ */
+function readBalancedParens(
+  content: string,
+  openIndex: number
+): { body: string; endIndex: number } | null {
+  let depth = 0;
+  for (let j = openIndex; j < content.length; j++) {
+    const c = content[j]!;
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return { body: content.slice(openIndex + 1, j), endIndex: j + 1 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract Drupal plugin definitions from a PHP file. Handles both:
+ *   a. PHP 8 attributes:  `#[Block(id: 'foo')]` / `#[FieldType(id: "bar", ...)]`
+ *   b. Legacy annotations: `@Block(id = "foo")` / `@FieldType(id = "bar", ...)` in a docblock
+ *
+ * Only the plugin `id` is captured (the stable cross-version identifier). Each definition
+ * emits a `component` node and a `references` edge to the class it decorates.
+ */
+function extractDrupalPlugins(
+  filePath: string,
+  content: string
+): { nodes: Node[]; references: UnresolvedRef[] } {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+  const seen = new Set<string>();
+
+  const emit = (pluginType: string, id: string, matchIndex: number, searchFrom: number) => {
+    if (!DRUPAL_PLUGIN_TYPES.has(pluginType)) return;
+    const cls = findFollowingClass(content, searchFrom);
+    if (!cls) return;
+    const line = content.slice(0, matchIndex).split('\n').length;
+    const dedupeKey = `${pluginType}:${id}:${cls.name}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+
+    const node: Node = {
+      id: `component:${filePath}:${line}:plugin:${pluginType}:${id}`,
+      kind: 'component',
+      name: id,
+      qualifiedName: `${filePath}::plugin:${pluginType}:${id}`,
+      filePath,
+      startLine: line,
+      endLine: line,
+      startColumn: 0,
+      endColumn: 0,
+      language: 'php',
+      updatedAt: now,
+    };
+    nodes.push(node);
+    references.push({
+      fromNodeId: node.id,
+      referenceName: cls.name,
+      referenceKind: 'references',
+      line: cls.line,
+      column: 0,
+      filePath,
+      language: 'php',
+    });
+  };
+
+  // (a) PHP 8 attributes: #[PluginType( ... id: 'foo' ... )]
+  //     The id may use single or double quotes; the attribute may span multiple lines and
+  //     contain nested calls (`new TranslatableMarkup(...)`), so the body is read by
+  //     balanced-paren scan rather than a lazy regex.
+  const attrOpen = /#\[\s*(\w+)\s*\(/g;
+  let am: RegExpExecArray | null;
+  while ((am = attrOpen.exec(content)) !== null) {
+    const type = am[1]!;
+    if (!DRUPAL_PLUGIN_TYPES.has(type)) continue;
+    const parens = readBalancedParens(content, attrOpen.lastIndex - 1);
+    if (!parens) continue;
+    const idMatch = parens.body.match(/\bid:\s*['"]([^'"]+)['"]/);
+    if (!idMatch) continue;
+    emit(type, idMatch[1]!, am.index, parens.endIndex);
+  }
+
+  // (b) Legacy docblock annotations: @PluginType( ... id = "foo" ... )
+  //     The body is read by balanced-paren scan so an `id` that follows a nested annotation
+  //     (`label = @Translation(...), id = "x"`) is still captured. `@Translation(...)` and
+  //     other nested annotations are not plugin types, so they're skipped before scanning.
+  const annotationOpen = /@(\w+)\s*\(/g;
+  let nm: RegExpExecArray | null;
+  while ((nm = annotationOpen.exec(content)) !== null) {
+    const type = nm[1]!;
+    if (!DRUPAL_PLUGIN_TYPES.has(type)) continue;
+    const parens = readBalancedParens(content, annotationOpen.lastIndex - 1);
+    if (!parens) continue;
+    const idMatch = parens.body.match(/\bid\s*=\s*['"]([^'"]+)['"]/);
+    if (!idMatch) continue;
+    emit(type, idMatch[1]!, nm.index, parens.endIndex);
+  }
+
   return { nodes, references };
 }
 
@@ -381,6 +757,27 @@ export const drupalResolver: FrameworkResolver = {
       }
     }
 
+    // Service-argument id (`path_alias.repository`, `database`, `entity_type.manager`): a
+    // bare service name emitted from a *.services.yml `arguments:` list. Resolve to the
+    // matching service `component` node so the DI graph links service → service.
+    //
+    // Scoped to refs that ORIGINATE in a *.services.yml file: routing.yml entity-handler
+    // refs (`_entity_form: node.default`) are also bare dotted names, and resolving those
+    // to a same-named DI service would be a wrong-target flow (silent beats wrong).
+    if (
+      ref.filePath.endsWith('.services.yml') &&
+      !name.includes('\\') &&
+      !name.includes('::') &&
+      /^[\w.]+$/.test(name)
+    ) {
+      const svc = context
+        .getNodesByName(name)
+        .find((n) => n.kind === 'component' && n.qualifiedName.includes('::service:'));
+      if (svc) {
+        return { original: ref, targetNodeId: svc.id, confidence: 0.85, resolvedBy: 'framework' };
+      }
+    }
+
     // hook_X — find any function whose name ends in _{hookSuffix} in a hook file
     if (name.startsWith('hook_')) {
       const hookSuffix = name.slice(5); // strip 'hook_'
@@ -405,8 +802,17 @@ export const drupalResolver: FrameworkResolver = {
       return extractDrupalRoutes(filePath, content);
     }
 
+    if (filePath.endsWith('.services.yml')) {
+      return extractDrupalServices(filePath, content);
+    }
+
     if (isDrupalHookFile(filePath) || filePath.endsWith('.php')) {
-      return extractDrupalHooks(filePath, content);
+      const hooks = extractDrupalHooks(filePath, content);
+      const plugins = extractDrupalPlugins(filePath, content);
+      return {
+        nodes: [...hooks.nodes, ...plugins.nodes],
+        references: [...hooks.references, ...plugins.references],
+      };
     }
 
     return { nodes: [], references: [] };
