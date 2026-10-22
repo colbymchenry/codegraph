@@ -25,7 +25,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
-import { DatabaseConnection } from '../src/db';
+import { DatabaseConnection, DatabaseOpenError } from '../src/db';
 import { WslSharedIndexError, isSqliteIoError, toWslSharedIndexError } from '../src/db/wsl-shared-index';
 import { codeGraphDirNameFor, findNearestCodeGraphRoot, getCodeGraphDir, isInitialized } from '../src/directory';
 import { __setWslWindowsDriveForTests, isWslWindowsDrive } from '../src/sync/watch-policy';
@@ -252,7 +252,7 @@ describe.runIf(process.platform !== 'win32')('a real SQLite I/O error on open', 
     expect((thrown as Error).message).toContain('CODEGRAPH_DIR=.codegraph-wsl');
   });
 
-  it('stays the raw SQLite error everywhere else', () => {
+  it('stays the SQLite error everywhere else, named and placed', () => {
     __setWslWindowsDriveForTests(() => false);
     let thrown: unknown;
     try {
@@ -260,9 +260,11 @@ describe.runIf(process.platform !== 'win32')('a real SQLite I/O error on open', 
     } catch (err) {
       thrown = err;
     }
-    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).toBeInstanceOf(DatabaseOpenError);
     expect(thrown).not.toBeInstanceOf(WslSharedIndexError);
-    expect((thrown as Error).message).toBe('disk I/O error');
+    // SQLite's own failure with the path, not the WSL guidance.
+    expect((thrown as Error).message).toContain(`${dbPath}: disk I/O error (SQLITE_IOERR).`);
+    expect((thrown as Error).message).not.toContain('CODEGRAPH_DIR');
   });
 
   describe('through the MCP engine', () => {

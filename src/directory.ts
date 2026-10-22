@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
+import { loadNodeSqlite } from './db/node-sqlite';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -214,10 +215,11 @@ function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
  * second connection opened and closed here leaves the first one's locks alone.
  */
 function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { DatabaseSync } = require('node:sqlite');
   let db: any = null;
   try {
+    // A runtime without node:sqlite can't inspect the file: `unknown`, so the
+    // command goes on to open it and reports why that is impossible.
+    const { DatabaseSync } = loadNodeSqlite();
     db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
     return row !== undefined ? 'schema' : 'no-schema';

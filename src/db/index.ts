@@ -10,8 +10,11 @@ import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 import { getCodeGraphDir, statInode } from '../directory';
+import { toDatabaseOpenError } from './open-error';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
+export { DatabaseOpenError } from './open-error';
+export { NodeSqliteUnavailableError } from './node-sqlite';
 
 /**
  * Apply connection-level PRAGMAs. Shared by `initialize` and `open` so the two
@@ -42,6 +45,22 @@ function configureConnection(db: SqliteDatabase, readOnly = false): void {
   // the file back down. Killed-process leftovers are handled separately by
   // healOversizedWal() at open. (#1431)
   db.pragma(`journal_size_limit = ${WAL_HEAL_THRESHOLD_BYTES}`);
+}
+
+/**
+ * Run the rest of an open on the connection `db`. Its first statements read
+ * the file, so a database SQLite cannot use (locked, damaged, not a database,
+ * an I/O error) fails here as well as when the connection is made. Such a
+ * failure names SQLite's code and the path ({@link DatabaseOpenError}), and
+ * leaves no connection open.
+ */
+function withOpenFailures<T>(db: SqliteDatabase, dbPath: string, finish: () => T): T {
+  try {
+    return finish();
+  } catch (err) {
+    try { db.close(); } catch { /* the open's failure is the one to report */ }
+    throw toDatabaseOpenError(err, dbPath);
+  }
 }
 
 /**
@@ -107,9 +126,12 @@ export class DatabaseConnection {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    // Create and configure database
     const { db, backend } = createDatabase(dbPath);
+    return withOpenFailures(db, dbPath, () => DatabaseConnection.initializeOn(db, backend, dbPath));
+  }
 
+  /** The rest of {@link initialize}: configure the connection and create the schema. */
+  private static initializeOn(db: SqliteDatabase, backend: SqliteBackend, dbPath: string): DatabaseConnection {
     configureConnection(db);
 
     // Run schema initialization, splitting FTS5 from the rest so
@@ -175,7 +197,16 @@ export class DatabaseConnection {
     }
 
     const { db, backend } = createDatabase(dbPath, options);
+    return withOpenFailures(db, dbPath, () => DatabaseConnection.openOn(db, backend, dbPath, options));
+  }
 
+  /** The rest of {@link open}: configure the connection, then migrate and repair a writable one. */
+  private static openOn(
+    db: SqliteDatabase,
+    backend: SqliteBackend,
+    dbPath: string,
+    options: { readOnly?: boolean; deferIndexRecovery?: boolean },
+  ): DatabaseConnection {
     configureConnection(db, options.readOnly);
 
     // Detect FTS5 availability for search fallback (#1532)
