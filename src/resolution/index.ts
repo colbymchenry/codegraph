@@ -45,7 +45,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
-import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
+import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
@@ -365,6 +365,9 @@ export class ReferenceResolver {
    * Initialize the resolver (detect frameworks, etc.)
    */
   initialize(): void {
+    // A full index resolves by the package.json files on disk now, as the
+    // fingerprint it stamps says, even in a process that read them earlier.
+    this.workspacePackages = undefined;
     this.frameworks = detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
     this.clearCaches();
@@ -706,7 +709,7 @@ export class ReferenceResolver {
       // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
       // `node_modules`, topcoder's `config` package on its `config/` folder.
       isOutOfRepoImport: (source, fromFile, language) => {
-        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false, fromFile })) return false;
         const resolved = resolveImportPath(source, fromFile, language, this.context);
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
@@ -2848,6 +2851,35 @@ export class ReferenceResolver {
    */
   getPythonRootFingerprint(): string {
     return pythonRootFingerprint(this.diskContext());
+  }
+
+  /**
+   * The workspace packages and path dependencies as package.json files
+   * declare them now, read again from disk, and their fingerprint (see
+   * `workspaceFingerprint`). The resolver keeps the map for its lifetime, so
+   * a sync calls this to see a manifest edit; when the map moved, the
+   * resolver takes the new one and drops every memo resolved through the old
+   * one, and the caller re-opens what was linked by it.
+   */
+  refreshWorkspacePackages(): string {
+    const fresh = loadWorkspacePackages(this.projectRoot);
+    const fingerprint = workspaceFingerprint(fresh);
+    if (this.workspacePackages === undefined || workspaceFingerprint(this.workspacePackages) !== fingerprint) {
+      this.workspacePackages = fresh;
+      this.clearCaches();
+    }
+    return fingerprint;
+  }
+
+  /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
+  getWorkspaceFingerprint(): string {
+    return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */
+  workspacePackageDirOf(file: string): string | null {
+    const ws = this.context.getWorkspacePackages?.();
+    return ws ? workspacePackageDirOf(ws, file) : null;
   }
 
   /** What a sync must re-open after these Python files were added or removed (see `pythonReopenScope`). */

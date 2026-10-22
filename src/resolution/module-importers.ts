@@ -161,6 +161,9 @@ export function reopenReferencesThroughRemovedFiles(
 /** Resolves a module specifier written in `fromFile` as its import does: the project file it names, or null. */
 export type ModuleResolver = (specifier: string, fromFile: string, language: Language) => string | null;
 
+/** The folder of the project's own package (a workspace member, a path dependency) `file` is in, or null. */
+export type PackageDirOf = (file: string) => string | null;
+
 /**
  * The other half: after a sync's retries, re-open the references the files
  * importing any of `added` make through those imports — the edges a name
@@ -170,8 +173,10 @@ export type ModuleResolver = (specifier: string, fromFile: string, language: Lan
  * them. (The failed-import retry looks those up by the module's name, and
  * skips a name as common as `models` or `test`.) With `resolveModule`, also an
  * import that resolved to a file beside an added one that now outranks it
- * (`./button` to `button.vue` while `button.ts` was missing), and what that
- * statement binds. Returns the number re-opened.
+ * (`./button` to `button.vue` while `button.ts` was missing), or, with
+ * `packageDirOf`, to another file of the package an added file is in (see
+ * outrankedImports), and what that statement binds. Returns the number
+ * re-opened.
  */
 export function reopenReferencesThroughAddedFiles(
   queries: QueryBuilder,
@@ -179,8 +184,9 @@ export function reopenReferencesThroughAddedFiles(
   added: ReadonlyArray<{ path: string; language: Language }>,
   resolvedUpToEdgeId: number,
   resolveModule?: ModuleResolver,
+  packageDirOf?: PackageDirOf,
 ): number {
-  const outranked = resolveModule ? outrankedImports(queries, added, resolveModule) : [];
+  const outranked = resolveModule ? outrankedImports(queries, added, resolveModule, packageDirOf) : [];
   const bindings = bindingsOf(importersOf(queries, added, reader, outranked), reader);
   const failed = [...bindings].flatMap(([file, { modules, names }]) => queries.getFailedReferencesThrough(file, modules, names));
   return reopenModuleEdges(queries, outranked) +
@@ -430,17 +436,38 @@ interface OutrankedImport {
  * another extension of its name, or its folder's own entry — when the
  * import's specifier now names the added file: `./button` resolved to
  * `button.vue` while `button.ts` was missing, and `button.ts` comes first.
+ * With `packageDirOf`, also the imports of a package by its name into any
+ * file of the package an added file is in: the entry its manifest declares
+ * (`./src/index.ts`, or the source of `./dist/index.js`), or the source of a
+ * path into its build output, outranks the file an import fell back to while
+ * it was missing, such as the folder's own index (#2502).
  */
 function outrankedImports(
   queries: QueryBuilder,
   added: ReadonlyArray<{ path: string; language: Language }>,
   resolveModule: ModuleResolver,
+  packageDirOf?: PackageDirOf,
 ): OutrankedImport[] {
   const out: OutrankedImport[] = [];
+  const packageImports = new Map<string, ReturnType<QueryBuilder['getModuleImportsUnder']>>();
   for (const file of added) {
     if (!BINDING_LANGUAGES.has(file.language)) continue;
     const { dir, name } = importedName(file.path);
-    for (const edge of queries.getModuleImportsNamed(dir, name)) {
+    const edges = queries.getModuleImportsNamed(dir, name);
+    const packageDir = packageDirOf?.(file.path);
+    if (packageDir) {
+      let imports = packageImports.get(packageDir);
+      if (!imports) {
+        imports = queries.getModuleImportsUnder(packageDir).filter((edge) => {
+          const specifier = edge.metadata?.refName;
+          return typeof specifier === 'string' && !specifier.startsWith('.') && !specifier.startsWith('/');
+        });
+        packageImports.set(packageDir, imports);
+      }
+      const seen = new Set(edges.map((edge) => edge.edgeId));
+      for (const edge of imports) if (!seen.has(edge.edgeId)) edges.push(edge);
+    }
+    for (const edge of edges) {
       const specifier = edge.metadata?.refName;
       if (edge.targetFilePath === file.path || typeof specifier !== 'string') continue;
       if (resolveModule(specifier, edge.sourceFilePath, edge.sourceLanguage) === file.path) {

@@ -3404,6 +3404,37 @@ export class QueryBuilder {
   }
 
   /**
+   * The module edges (`imports` edges into a file node) into any file under
+   * the folder `dir` (projectRoot-relative, no trailing slash), with the
+   * source file and language a resurrection needs: where an import of a
+   * package by its name can land, whichever file of the package its manifest
+   * or the folder's index makes the entry.
+   */
+  getModuleImportsUnder(
+    dir: string
+  ): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    // `dir/` up to `dir0` ('0' is the byte after '/').
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file' AND tgt.file_path >= ? AND tgt.file_path < ?`
+      )
+      .all(`${dir}/`, `${dir}0`) as Array<
+        EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
+      >;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      targetFilePath: row.target_file_path,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /**
    * The module edges (`imports` edges into a file node) into the files an
    * import of `dir/name` can find instead of a file added there: `dir/name.*`
    * under another extension, and the folder's own entry, `dir/name/index.*`
