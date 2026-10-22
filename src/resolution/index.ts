@@ -153,6 +153,9 @@ const GO_BUILT_INS = new Set([
   'string', 'bool', 'byte', 'rune', 'any',
 ]);
 
+/** What a Pascal typecast's name resolves to: `TFoo(x)` casts, it doesn't call (see createEdges). */
+const PASCAL_CAST_TARGET_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'type_alias']);
+
 const PASCAL_UNIT_PREFIXES = [
   'System.', 'Winapi.', 'Vcl.', 'Fmx.', 'Data.', 'Datasnap.',
   'Soap.', 'Xml.', 'Web.', 'REST.', 'FireDAC.', 'IBX.',
@@ -1760,6 +1763,19 @@ export class ReferenceResolver {
       if (kind === 'calls' && ref.original.language === 'go') {
         const targetNode = this.nodeById(ref.targetNodeId);
         if (targetNode && GO_TYPE_KINDS.has(targetNode.kind)) kind = 'references';
+      }
+
+      // A Pascal call written with a bare name that resolves to a type is a
+      // typecast: `TButton(Sender).Caption`, `PInt64Rec(P)^.Lo`, `F :=
+      // TFoo(Obj)`. Delphi builds an object only through a constructor
+      // (`TFoo.Create`), so the code refers to the type and creates nothing.
+      if (
+        kind === 'calls' &&
+        ref.original.language === 'pascal' &&
+        !ref.original.referenceName.includes('.') &&
+        PASCAL_CAST_TARGET_KINDS.has(this.nodeById(ref.targetNodeId)?.kind ?? '')
+      ) {
+        kind = 'references';
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a

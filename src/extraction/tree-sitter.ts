@@ -8560,9 +8560,13 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract function calls from a Pascal expression
+   * Extract function calls from a Pascal expression. A `receiverLink` call is
+   * a link inside another call's receiver chain (#2547): it is recorded only
+   * when it can be named precisely — `Obj.Method`, a bare routine, or a
+   * `TFoo.Factory().Method` chain — never as the bare method name a longer
+   * chain like `Client.New.BaseURL(…)` would leave, which matches namesakes.
    */
-  private extractPascalCall(node: SyntaxNode): void {
+  private extractPascalCall(node: SyntaxNode, receiverLink = false): void {
     if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
@@ -8613,7 +8617,8 @@ export class TreeSitterExtractor {
       calleeName = getNodeText(firstChild, this.source);
     }
 
-    if (calleeName) {
+    const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
+    if (calleeName && !vagueLink) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
@@ -8623,6 +8628,12 @@ export class TreeSitterExtractor {
       });
     }
 
+    // The calls in the callee itself: a chained call's receiver, like
+    // `MD5FileSized(…)` in `MD5FileSized(…).IsSame(AKey)` (#2547), or the call
+    // whose result is called in `GetHandler()(X)`.
+    if (firstChild.type === 'exprDot') this.extractPascalReceiverCalls(firstChild.namedChild(0));
+    else if (firstChild.type !== 'identifier') this.extractPascalReceiverCalls(firstChild);
+
     // Also visit arguments for nested calls
     const args = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'exprArgs'
@@ -8630,6 +8641,46 @@ export class TreeSitterExtractor {
     if (args) {
       this.visitPascalBlock(args);
     }
+  }
+
+  /**
+   * The calls inside the receiver of a Pascal call or member access, which
+   * the outer reference doesn't cover (#2547): `MD5FileSized(…)` and the
+   * `TMeta.ExtendedPath(APath)` in its arguments for
+   * `MD5FileSized(TMeta.ExtendedPath(APath)).IsSame(AKey)`, `A(1)` in
+   * `A(1).B.C`, `GetIndex(x)` in `List[GetIndex(x)].Free`. A paren'd call
+   * there is a call like any other. A paren-less link (`.B`) may read a field
+   * or property, so it is not one. A typecast (`TButton(Sender)`) is written
+   * like a call; resolution tells it apart by what the name resolves to.
+   */
+  private extractPascalReceiverCalls(node: SyntaxNode | null): void {
+    if (!node) return;
+    switch (node.type) {
+      case 'identifier':
+        return;
+      case 'exprCall':
+        this.extractPascalReceiverCall(node, true);
+        return;
+      case 'exprDot':
+      case 'exprTpl':
+        this.extractPascalReceiverCalls(node.namedChild(0));
+        return;
+      case 'exprSubscript': {
+        this.extractPascalReceiverCalls(node.namedChild(0));
+        const index = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+        if (index) this.visitPascalBlock(index);
+        return;
+      }
+      default:
+        this.visitPascalBlock(node);
+    }
+  }
+
+  /** A receiver call, read as any call is, its arguments' routine values included (#756). */
+  private extractPascalReceiverCall(call: SyntaxNode, receiverLink: boolean): void {
+    this.extractPascalCall(call, receiverLink);
+    const args = call.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+    if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
   }
 
   /**
@@ -8671,10 +8722,11 @@ export class TreeSitterExtractor {
       if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) {
         calleeName = `${innerCallee}().${method}`;
         // The T/I-prefixed inner is itself a real call — record it too.
-        if (receiver.type === 'exprCall') this.extractPascalCall(receiver);
+        if (receiver.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
         else this.extractPascalParenlessCall(receiver);
       } else {
         calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
+        this.extractPascalReceiverCalls(receiver); // `MD5FileSized(…).Reset;` (#2547)
       }
     } else {
       // Simple: `Obj.Method` → the dotted name (resolves via the receiver / bare name).
@@ -8682,6 +8734,7 @@ export class TreeSitterExtractor {
         .filter((c: SyntaxNode) => c.type === 'identifier')
         .map((id: SyntaxNode) => getNodeText(id, this.source))
         .join('.');
+      this.extractPascalReceiverCalls(receiver); // `List[GetIndex(x)].Free;`
     }
 
     if (calleeName) {
@@ -8716,16 +8769,15 @@ export class TreeSitterExtractor {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
         // expression) a bare exprDot is ambiguous with a field/property access,
-        // so there we only descend for paren'd inner calls.
+        // so there we only read the paren'd calls in its receiver chain
+        // (`X := A(1).B.C` reads `A(1)`); a call right before the read is
+        // named as any call is.
         if (node.type === 'statement') {
           this.extractPascalParenlessCall(child);
         } else {
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild?.type === 'exprCall') {
-              this.extractPascalCall(grandchild);
-            }
-          }
+          const receiver = child.namedChild(0);
+          if (receiver?.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
+          else this.extractPascalReceiverCalls(receiver);
         }
       } else {
         this.visitPascalBlock(child);
