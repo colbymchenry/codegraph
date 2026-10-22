@@ -122,3 +122,23 @@ describe('bundled launchers (#1278)', () => {
     }
   });
 });
+
+describe('bundled Node runtime (#2617)', () => {
+  it('ships a Node 24 release with the fix for the Windows abort at exit', () => {
+    // The release workflow passes only the target, so the recipe's default
+    // version is the Node every release bundles.
+    const workflow = fs.readFileSync(path.resolve('.github/workflows/release.yml'), 'utf8');
+    const calls = workflow.match(/build-bundle\.sh[^\r\n]*/g) ?? [];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.trim()).toBe('build-bundle.sh "$t"');
+
+    const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
+    expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
+    const [major, minor] = pin!.slice(1, 3).map(Number);
+    // The CLI refuses to run on Node 25 and later.
+    expect(major).toBe(24);
+    // Node 24 before 24.20.0 can abort on Windows as the process exits, after
+    // the command's work is done (0xC0000409, nodejs/node#56645).
+    expect(minor).toBeGreaterThanOrEqual(20);
+  });
+});

@@ -13,7 +13,7 @@
 #   scripts/build-bundle.sh <target> [node-version]
 #     target:        darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64
 #                  | win32-x64 | win32-arm64
-#     node-version:  e.g. v24.16.0 (default below; pin for reproducible builds)
+#     node-version:  e.g. v24.21.0 (default below; pin for reproducible builds)
 #
 # Output:
 #   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
@@ -21,7 +21,13 @@
 set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
-NODE_VERSION="${2:-v24.16.0}"
+# The release workflow passes no version, so this default is the Node every
+# release bundles. Keep it on 24.x (the CLI refuses Node 25+) and at 24.20.0 or
+# later: older 24.x releases can abort on Windows just as the process exits,
+# after its work is done, with 0xC0000409 and "Assertion failed:
+# !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c" (nodejs/node#56645,
+# fixed by nodejs/node#61999 in 24.20.0; issue #2617).
+NODE_VERSION="${2:-v24.21.0}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release"
