@@ -1,6 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
-import { classifyTsClassMember } from './typescript';
+import { classifyTsClassMember, hasStaticModifier } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
@@ -77,6 +77,9 @@ export const javascriptExtractor: LanguageExtractor = {
     }
     return false;
   },
+  // A `static` method or field, as in TypeScript (#2761): without it every JS
+  // class member read as an instance one.
+  isStatic: hasStaticModifier,
   isConst: (node) => {
     if (node.type === 'lexical_declaration') {
       for (let i = 0; i < node.childCount; i++) {

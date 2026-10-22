@@ -823,6 +823,13 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'arkts',
 ]);
 /**
+ * Languages whose static and instance methods override only their own kind:
+ * a JS/TS class's statics are inherited and overridden by the subclass's
+ * statics, its instance methods by instance methods (#2761). tsx and jsx
+ * follow the same rule, though this pass doesn't walk their classes today.
+ */
+const STATIC_SPLIT_LANGS: ReadonlySet<string> = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+/**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
  * declared, never synthesized (go-implements writes those), into a struct, an
  * interface or a defined type, and out of an interface only into an interface.
@@ -1671,6 +1678,11 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         for (const m of impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
+          // A JS/TS static method overrides only a static one, and an
+          // instance method only an instance one (#2761): B's `s()` and the
+          // `static s()` of `class A extends B` are unrelated, and a call to
+          // one never runs the other.
+          if (STATIC_SPLIT_LANGS.has(m.language) && (bm.isStatic === true) !== (m.isStatic === true)) continue;
           const key = `${bm.id}>${m.id}`;
           if (seen.has(key)) continue;
           seen.add(key);

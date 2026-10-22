@@ -42,7 +42,7 @@ impl Variant {
         }
     }
     /// TS-family (typescript/tsx): type annotations, interfaces, enums,
-    /// aliases, visibility, isStatic. The JS family lacks all of those hooks.
+    /// aliases, visibility. The JS family lacks all of those hooks.
     fn is_ts(self) -> bool {
         matches!(self, Variant::Typescript | Variant::Tsx)
     }
@@ -1072,13 +1072,10 @@ impl<'t> Walker<'t> {
         self.has_keyword_child(node, "async")
     }
 
-    /// TS has an isStatic hook; JS does not (None = field absent).
+    /// A member's own `static` keyword: the isStatic hook TS and JS share
+    /// (hasStaticModifier, #2761).
     fn is_static(&self, node: Node) -> Option<bool> {
-        if self.variant.is_ts() {
-            Some(self.has_keyword_child(node, "static"))
-        } else {
-            None
-        }
+        Some(self.has_keyword_child(node, "static"))
     }
 
     fn is_const_decl(&self, node: Node) -> bool {
