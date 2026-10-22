@@ -15,6 +15,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { readWriterLock, releaseWriterLock, tryAcquireWriterLock } from '../src/mcp/writer-lock';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -99,6 +100,29 @@ describe('codegraph install --init / init --yes (#1578)', () => {
     expect(r.status, r.stdout + r.stderr).toBe(0);
     expect(r.stdout).toContain('Initialized in');
     expect(fs.existsSync(path.join(tempDir, '.codegraph', 'codegraph.db'))).toBe(true);
+    expect(readWriterLock(tempDir)).toBeNull();
+    expect(readWriterLock(tempDir, 'rebuild.pid')).toBeNull();
+  });
+
+  describe.each([
+    ['init', '--yes'],
+    ['install', '--yes', '--target', 'none', '--init'],
+  ])('%s respects initial-index ownership', (...args) => {
+    it.each(['writer.pid', 'rebuild.pid'] as const)('refuses a live %s before creating the database', lockName => {
+      expect(tryAcquireWriterLock(tempDir, 'direct', lockName).kind).toBe('acquired');
+      const owner = readWriterLock(tempDir, lockName);
+      try {
+        const r = runCodegraph(args, tempDir);
+        expect(r.status, r.stdout + r.stderr).toBe(1);
+        expect(r.stdout + r.stderr).toMatch(/writer lock held|index rebuild is already in progress/);
+        expect(fs.existsSync(path.join(tempDir, '.codegraph', 'codegraph.db'))).toBe(false);
+        expect(readWriterLock(tempDir, lockName)).toEqual(owner);
+        const otherLock = lockName === 'writer.pid' ? 'rebuild.pid' : 'writer.pid';
+        expect(readWriterLock(tempDir, otherLock)).toBeNull();
+      } finally {
+        releaseWriterLock(tempDir, lockName);
+      }
+    });
   });
 
   it('documents the new flags in --help', () => {

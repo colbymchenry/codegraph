@@ -721,63 +721,82 @@ async function runInit(
     if (hasSchemalessDb(projectPath)) {
       clack.log.warn(`Found a codegraph.db without the codegraph schema in ${getCodeGraphDir(projectPath)} (left by an interrupted init?) — rebuilding it.`);
     }
-    const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-    const cg = await CodeGraph.init(projectPath, { index: false });
-    clack.log.success(`Initialized in ${projectPath}`);
-    // A fresh index on a Windows drive under WSL gets its own directory (#995).
-    // It isn't the documented name, so say where it went and why.
-    const dataDir = path.basename(getCodeGraphDir(projectPath));
-    if (dataDir !== codeGraphDirName()) {
-      clack.log.info(
-        `The index is in ${dataDir}/: this project is on a Windows drive, so WSL keeps its own index ` +
-        `rather than share ${DEFAULT_CODEGRAPH_DIR}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.`
-      );
-    }
-
-    // Indexing runs by default now. The legacy -i/--index flag is still
-    // accepted (so existing muscle memory and scripts don't break) but is a
-    // no-op — initializing always builds the initial index.
-    // Supervise the index: self-terminate if orphaned or wedged (#999).
-    // The DB + WAL paths let the liveness watchdog tell a slow store on
-    // degraded storage from a true wedge (#1231).
-    // A closure so we can re-run the exact same supervised, progress-rendered
-    // index if the user opts gitignored child repos in below (#1156).
-    const dbPath = getDatabasePath(projectPath);
-    const runIndex = async (): Promise<IndexResult> => {
-      const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
-      try {
-        if (options.verbose) {
-          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
-        }
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
-        await progress.stop();
-        return r;
-      } finally {
-        supervision.stop();
-      }
-    };
-    const result = await runIndex();
-    printIndexResult(clack, result, projectPath);
-    await recordIndexTelemetry(cg, result);
-
-    // An empty graph at a git super-repo usually means `.gitignore` excludes
-    // the child repos that hold the code — surface them and offer to opt in
-    // rather than leaving the user with a silent 0-node "Done". (#1156)
-    // Under --yes the offer prints its one-line opt-in snippet instead of
-    // prompting (same as a non-TTY run).
-    if (result.nodesCreated === 0) {
-      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
-    }
-
+    const { tryAcquireWriterLock, releaseWriterLock, writerLockHeldMessage } = await import('../mcp/writer-lock');
+    // Fence MCP opens before the database exists: agents connected to an
+    // uninitialized project can discover it as soon as init creates its schema.
+    // Keep both slots until indexing and database cleanup have finished.
+    const rebuild = tryAcquireWriterLock(projectPath, 'rebuild', 'rebuild.pid');
+    if (rebuild.kind === 'taken') throw new Error('Another index rebuild is already in progress.');
     try {
-      const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: options.yes });
-    } catch { /* non-fatal */ }
+      const writer = tryAcquireWriterLock(projectPath, 'rebuild');
+      if (writer.kind === 'taken') throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+      try {
+        const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+        const cg = await CodeGraph.init(projectPath, { index: false });
+        try {
+          clack.log.success(`Initialized in ${projectPath}`);
+          // A fresh index on a Windows drive under WSL gets its own directory (#995).
+          // It isn't the documented name, so say where it went and why.
+          const dataDir = path.basename(getCodeGraphDir(projectPath));
+          if (dataDir !== codeGraphDirName()) {
+            clack.log.info(
+              `The index is in ${dataDir}/: this project is on a Windows drive, so WSL keeps its own index ` +
+              `rather than share ${DEFAULT_CODEGRAPH_DIR}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.`
+            );
+          }
 
-    clack.outro('Done');
-    cg.destroy();
+          // Indexing runs by default now. The legacy -i/--index flag is still
+          // accepted (so existing muscle memory and scripts don't break) but is a
+          // no-op — initializing always builds the initial index.
+          // Supervise the index: self-terminate if orphaned or wedged (#999).
+          // The DB + WAL paths let the liveness watchdog tell a slow store on
+          // degraded storage from a true wedge (#1231).
+          // A closure so we can re-run the exact same supervised, progress-rendered
+          // index if the user opts gitignored child repos in below (#1156).
+          const dbPath = getDatabasePath(projectPath);
+          const runIndex = async (): Promise<IndexResult> => {
+            const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
+            try {
+              if (options.verbose) {
+                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+              }
+              process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+              const progress = createShimmerProgress();
+              const r = await cg.indexAll({ onProgress: progress.onProgress });
+              await progress.stop();
+              return r;
+            } finally {
+              supervision.stop();
+            }
+          };
+          const result = await runIndex();
+          printIndexResult(clack, result, projectPath);
+          await recordIndexTelemetry(cg, result);
+
+          // An empty graph at a git super-repo usually means `.gitignore` excludes
+          // the child repos that hold the code — surface them and offer to opt in
+          // rather than leaving the user with a silent 0-node "Done". (#1156)
+          // Under --yes the offer prints its one-line opt-in snippet instead of
+          // prompting (same as a non-TTY run).
+          if (result.nodesCreated === 0) {
+            await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
+          }
+
+          try {
+            const { offerWatchFallback } = await import('../installer');
+            await offerWatchFallback(clack, projectPath, { yes: options.yes });
+          } catch { /* non-fatal */ }
+
+          clack.outro('Done');
+        } finally {
+          cg.destroy();
+        }
+      } finally {
+        releaseWriterLock(projectPath);
+      }
+    } finally {
+      releaseWriterLock(projectPath, 'rebuild.pid');
+    }
   } catch (err) {
     clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
