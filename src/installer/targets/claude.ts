@@ -35,6 +35,7 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  removeFileUnlessLinked,
   removeMarkedSection,
   writeJsonFile,
   upsertInstructionsEntry,
@@ -295,7 +296,7 @@ function cleanupLegacyLocalMcp(): WriteResult['files'][number] | null {
   delete config.mcpServers.codegraph;
   if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
   if (Object.keys(config).length === 0) {
-    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    removeFileUnlessLinked(file, '{}\n');
   } else {
     writeJsonFile(file, config);
   }

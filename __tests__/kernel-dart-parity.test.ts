@@ -37,8 +37,10 @@
  * TortureAnnotatedComments.dart: the comments between annotations and their
  * declaration, stepped over by the decorator scan; TortureDirectives.dart /
  * TorturePartOfName.dart: `part` as an import of the part's file, `part of`
- * as nothing, and the arguments of annotated directives) and their CRLF
- * variants (derived in-memory — #1329), plus defer and generated-file pins.
+ * as nothing, and the arguments of annotated directives;
+ * TortureTypedefs.dart: the types a typedef aliases, in every form) and
+ * their CRLF variants (derived in-memory — #1329), plus defer and
+ * generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
  * with --max-deferral 0.3); this suite keeps the invariant alive in
@@ -167,6 +169,11 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     ['TortureDirectives.dart', 20],
     // `part of` a library named by its library name records nothing.
     ['TorturePartOfName.dart', 3],
+    // Typedefs reference the types they alias (#2327), new style and legacy
+    // (named by its own name, not its return type), with type parameters —
+    // the typedef's own and a generic function type's — skipped, prefixed,
+    // annotated, commented and wrapped declarations.
+    ['TortureTypedefs.dart', 40],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {

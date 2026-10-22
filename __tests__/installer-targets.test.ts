@@ -22,8 +22,14 @@ import { spawnSync } from 'child_process';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
-import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
+import { upsertTomlTable, removeTomlTable, buildTomlTable, tomlDefinesTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
+import {
+  CODEGRAPH_INSTRUCTIONS_BLOCK,
+  CODEGRAPH_SECTION_END,
+  CODEGRAPH_SECTION_START,
+} from '../src/installer/instructions-template';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -796,33 +802,28 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cliAfter.mcpServers.codegraph).toBeDefined();
   });
 
-  it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
+  it('hermes: install adds the codegraph MCP server and leaves platform_toolsets alone, preserving existing yaml (#2485)', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');
     fs.mkdirSync(path.dirname(config), { recursive: true });
-    fs.writeFileSync(config, [
-      'model:',
-      '  default: qwen-3.7',
-      'mcp_servers:',
-      '  other:',
-      '    command: other',
+    const toolsets = [
       'platform_toolsets:',
       '  cli:',
       '    - hermes-cli',
       '  discord:',
       '    - hermes-discord',
       '',
-    ].join('\n'));
+    ].join('\n');
+    fs.writeFileSync(config, ['model:', '  default: qwen-3.7', 'mcp_servers:', '  other:', '    command: other', toolsets].join('\n'));
 
     const result = hermes.install('global', { autoAllow: true });
     expect(result.files[0].action).toBe('updated');
     const body = fs.readFileSync(config, 'utf-8');
     expect(body).toContain('model:\n  default: qwen-3.7');
-    expect(body).toContain('mcp_servers:\n  other:\n    command: other');
-    expect(body).toContain('  codegraph:\n    command: codegraph');
-    expect(body).toContain('    - hermes-cli');
-    expect(body).toContain('    - mcp-codegraph');
-    expect(body).toContain('  discord:\n    - hermes-discord');
+    expect(body).toContain('mcp_servers:\n  other:\n    command: other\n  codegraph:\n    command: codegraph');
+    // No toolset entry: a list naming no MCP server loads every enabled one.
+    expect(body.endsWith(toolsets)).toBe(true);
+    expect(body).not.toContain('mcp-codegraph');
 
     const second = hermes.install('global', { autoAllow: true });
     expect(second.files[0].action).toBe('unchanged');
@@ -846,13 +847,14 @@ describe('Installer targets — partial-state idempotency', () => {
   // Regression for #456: PyYAML's default block style writes list items at the
   // SAME indent as the parent key (`cli:` and its `- hermes-cli` are both at
   // indent 2). The pre-fix line-based patcher mistook that first list item for
-  // the next sibling key, truncated the cli block, and spliced `- mcp-codegraph`
-  // at indent 4 BEFORE the existing items — producing unparseable YAML.
-  it('hermes: install preserves PyYAML-default list-at-same-indent style (issue #456)', () => {
+  // the next sibling key and truncated the cli block. Install no longer adds to
+  // that list (#2485), but it still has to read it to take out the
+  // `- mcp-codegraph` line an earlier install appended there.
+  it('hermes: install reads the PyYAML-default list-at-same-indent style (issue #456)', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');
     fs.mkdirSync(path.dirname(config), { recursive: true });
-    const original = [
+    const lines = [
       'model:',
       '  default: gpt-4o',
       'platform_toolsets:',
@@ -867,28 +869,19 @@ describe('Installer targets — partial-state idempotency', () => {
       '  discord:',
       '  - hermes-discord',
       '',
-    ].join('\n');
-    fs.writeFileSync(config, original);
+    ];
+    // As an earlier install left it: our entry appended at the items' indent.
+    fs.writeFileSync(config, [...lines.slice(0, 9), '  - mcp-codegraph', ...lines.slice(9)].join('\n'));
 
     hermes.install('global', { autoAllow: true });
     const body = fs.readFileSync(config, 'utf-8');
 
-    // mcp-codegraph appended at the same 2-space indent as existing items
-    expect(body).toContain('\n  - mcp-codegraph\n');
-    // hermes-cli preserved
-    expect(body).toContain('\n  - hermes-cli\n');
-    // Sibling sections kept their indent — `telegram:` is still a key under
-    // platform_toolsets, not promoted up.
-    expect(body).toContain('\n  telegram:\n  - hermes-telegram\n');
-    expect(body).toContain('\n  discord:\n  - hermes-discord\n');
+    // The old entry is gone and every other line is where it was.
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body.startsWith(lines.join('\n'))).toBe(true);
     // No list items leaked to the platform_toolsets level (indent 0).
     expect(body).not.toMatch(/^- browser/m);
     expect(body).not.toMatch(/^- hermes-telegram/m);
-
-    // The whole platform_toolsets block extracted by line search should
-    // start with `cli:` and not contain a stray 4-space `mcp-codegraph`
-    // appearing before the rest of the existing items.
-    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
 
     // Idempotent
     const second = hermes.install('global', { autoAllow: true });
@@ -912,15 +905,15 @@ describe('Installer targets — partial-state idempotency', () => {
 
     hermes.install('global', { autoAllow: true });
     const installed = fs.readFileSync(config, 'utf-8');
-    expect(installed).toContain('- mcp-codegraph');
+    expect(installed).not.toContain('mcp-codegraph');
+    expect(installed.startsWith(original)).toBe(true);
     expect(installed).toContain('codegraph:');
 
     hermes.uninstall('global');
     const body = fs.readFileSync(config, 'utf-8');
     expect(body).not.toContain('mcp-codegraph');
     expect(body).not.toContain('command: codegraph');
-    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
-    expect(body).toContain('  telegram:\n  - hermes-telegram');
+    expect(body.startsWith(original)).toBe(true);
   });
 
   it('opencode: uninstall removes only mcp.servers.codegraph, preserves comments and siblings', () => {
@@ -1613,6 +1606,394 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The Codex table is found however it is written (#2562)
+//
+// The header search matched only a column-0 `[mcp_servers.codegraph]`, so an
+// indented one (valid TOML, and what formatters that indent sub-tables
+// write) was taken for absent and a second table was appended: a table
+// defined twice is invalid TOML, and Codex then loaded none of its config.
+// ---------------------------------------------------------------------------
+describe('Installer — the Codex table is found however it is written (#2562)', () => {
+  const HEADER = 'mcp_servers.codegraph';
+  const BLOCK = buildTomlTable(HEADER, { command: 'codegraph', args: ['serve', '--mcp'] });
+  const OLD_BODY = 'command = "codegraph"\nargs = ["serve"]';
+  const BS = String.fromCharCode(92);
+  const crlf = (s: string) => s.replace(/\n/g, '\r\n');
+  const top = 'model = "o3"';
+  const other = '[mcp_servers.other]\ncommand = "other-server"';
+
+  it.each([
+    ['indented with spaces (the report)', '  [mcp_servers.codegraph]', '    command = "codegraph"\n    args = ["serve"]'],
+    ['indented with a tab', '\t[mcp_servers.codegraph]', OLD_BODY],
+    ['spaces inside the brackets', '[ mcp_servers.codegraph ]', OLD_BODY],
+    ['spaces around the dot', '[mcp_servers . codegraph]', OLD_BODY],
+    ['a quoted key', '[mcp_servers."codegraph"]', OLD_BODY],
+    ['a literal-quoted key', "['mcp_servers'.codegraph]", OLD_BODY],
+    ['an escape in a quoted key', `[mcp_servers."code${BS}u0067raph"]`, OLD_BODY],
+    ['a comment after it', '[mcp_servers.codegraph] # added by hand', OLD_BODY],
+  ])('a header written with %s is replaced in place, once, and removed', (_form, header, body) => {
+    const input = `${top}\n\n[mcp_servers]\n\n${header}\n${body}\n\n${other}\n`;
+
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.action).toBe('replaced');
+    expect(up.content).toBe(`${top}\n\n[mcp_servers]\n\n${BLOCK}\n\n${other}\n`);
+    expect(upsertTomlTable(up.content, HEADER, BLOCK).action).toBe('unchanged');
+
+    const rm = removeTomlTable(input, HEADER);
+    expect(rm.action).toBe('removed');
+    expect(rm.content).toBe(`${top}\n\n[mcp_servers]\n\n${other}\n`);
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+
+  it('a CRLF file stays CRLF, and an up-to-date CRLF table is unchanged', () => {
+    const input = crlf(`${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n${other}\n`);
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.content).toBe(crlf(`${top}\n\n${BLOCK}\n\n${other}\n`));
+    expect(upsertTomlTable(up.content, HEADER, BLOCK).action).toBe('unchanged');
+    expect(removeTomlTable(up.content, HEADER).content).toBe(crlf(`${top}\n\n${other}\n`));
+    // Inserting into a CRLF file uses CRLF too.
+    expect(upsertTomlTable(crlf(`${top}\n`), HEADER, BLOCK).content).toBe(crlf(`${top}\n\n${BLOCK}\n`));
+  });
+
+  it('a second table, as the old bug appended, is removed: the file parses again', () => {
+    const input = `${top}\n\n  [mcp_servers.codegraph]\n    command = "codegraph"\n    args = ["serve"]\n\n${other}\n\n${BLOCK}\n`;
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.action).toBe('replaced');
+    expect(up.content).toBe(`${top}\n\n${BLOCK}\n\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n${other}\n`);
+  });
+
+  it('look-alikes are never taken for the table: other names, and header-shaped text inside values', () => {
+    const lookalikes = [
+      top,
+      '',
+      '[mcp_servers.codegraph2]',
+      'command = "x"',
+      '',
+      '[mcp_servers.other]',
+      'note = """',
+      '[mcp_servers.codegraph]',
+      '"""',
+      "literal = '''",
+      '[mcp_servers.codegraph]',
+      "'''",
+      'args = [',
+      '  "[mcp_servers.codegraph]",',
+      ']',
+      '',
+    ].join('\n');
+    const up = upsertTomlTable(lookalikes, HEADER, BLOCK);
+    expect(up.action).toBe('inserted');
+    expect(up.content).toBe(`${lookalikes.trimEnd()}\n\n${BLOCK}\n`);
+    expect(removeTomlTable(lookalikes, HEADER)).toEqual({ content: lookalikes, action: 'not-found' });
+    expect(tomlDefinesTable(lookalikes, HEADER)).toBe(false);
+  });
+
+  it('a sub-table such as [mcp_servers.codegraph.env] is kept by install and removed with the table', () => {
+    const env = '[mcp_servers.codegraph.env]\nCODEGRAPH_MCP_TOOLS = "all"';
+    const input = `${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n${env}\n\n${other}\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).content).toBe(`${top}\n\n${BLOCK}\n\n${env}\n\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n${other}\n`);
+    // Only the sub-table left (a server with no command): install adds the table.
+    expect(tomlDefinesTable(`${top}\n\n${env}\n`, HEADER)).toBe(true);
+    expect(upsertTomlTable(`${top}\n\n${env}\n`, HEADER, BLOCK).content).toBe(`${top}\n\n${env}\n\n${BLOCK}\n`);
+  });
+
+  it('a comment heading the next table stays with it', () => {
+    const input = `${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n# the other server, set up by hand\n${other}\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).content).toBe(`${top}\n\n${BLOCK}\n\n# the other server, set up by hand\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n# the other server, set up by hand\n${other}\n`);
+  });
+
+  it.each([
+    ['dotted keys at the top level', `mcp_servers.codegraph.command = "codegraph"\nmcp_servers.codegraph.args = ["serve", "--mcp"]\n${top}\n\n${other}\n`, 1, 'dotted keys', `${top}\n\n${other}\n`],
+    ['dotted keys under [mcp_servers]', `${top}\n\n[mcp_servers]\ncodegraph.command = "codegraph"\ncodegraph.args = [\n  "serve",\n  "--mcp",\n]\nother.command = "x"\n`, 4, 'dotted keys', `${top}\n\n[mcp_servers]\nother.command = "x"\n`],
+    ['an inline table under [mcp_servers]', `${top}\n\n[mcp_servers]\ncodegraph = { command = "codegraph", args = ["serve", "--mcp"] }\n`, 4, 'an inline table', `${top}\n\n[mcp_servers]\n`],
+    ['[[mcp_servers.codegraph]]', `${top}\n\n[[mcp_servers.codegraph]]\ncommand = "codegraph"\n`, 3, 'an array of tables', `${top}\n`],
+  ])('written with %s: install leaves it as is (no second table), uninstall removes it', (_form, input, line, form, removed) => {
+    expect(upsertTomlTable(input, HEADER, BLOCK)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ kind: 'defined', line, form }),
+    });
+    const rm = removeTomlTable(input, HEADER);
+    expect(rm.action).toBe('removed');
+    expect(rm.content).toBe(removed);
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+
+  it.each([
+    ['mcp_servers as an inline table', `${top}\nmcp_servers = { other = { command = "x" } }\n`, 'an inline table'],
+    ['mcp_servers as an array of tables', `${top}\n\n[[mcp_servers]]\nname = "other"\n`, 'an array of tables'],
+  ])('%s: a [mcp_servers.codegraph] table can\'t be added, so nothing is', (_form, input, form) => {
+    expect(upsertTomlTable(input, HEADER, BLOCK)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ kind: 'blocked', key: 'mcp_servers', form }),
+    });
+    expect(removeTomlTable(input, HEADER).action).toBe('not-found');
+    expect(tomlDefinesTable(input, HEADER)).toBe(false);
+  });
+
+  it('codegraph inside an inline mcp_servers table is reported, never edited', () => {
+    const input = `${top}\nmcp_servers = { codegraph = { command = "codegraph", args = ["serve", "--mcp"] } }\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).action).toBe('conflict');
+    expect(removeTomlTable(input, HEADER)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ key: 'mcp_servers', form: 'an inline table', line: 2 }),
+    });
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+});
+
+describe('Installer — Codex install, re-install, refresh and uninstall find the table however it is written (#2562)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('codex2562-home');
+    tmpCwd = mkTmpDir('codex2562-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const configToml = () => path.join(tmpHome, '.codex', 'config.toml');
+  function writeConfig(text: string): void {
+    fs.mkdirSync(path.dirname(configToml()), { recursive: true });
+    fs.writeFileSync(configToml(), text);
+  }
+  const block = buildTomlTable('mcp_servers.codegraph', { command: 'codegraph', args: ['serve', '--mcp'] });
+
+  it('the reported indented table: detected, replaced once, unchanged after, refreshed in place, removed by uninstall', () => {
+    const siblings = 'model = "o3"\n\n[mcp_servers]\n\n  [mcp_servers.other]\n    command = "other-server"\n';
+    writeConfig(`${siblings}\n  [mcp_servers.codegraph]\n    command = "codegraph"\n    args = ["serve", "--mcp"]\n`);
+    const codex = getTarget('codex')!;
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+
+    const first = codex.install('global', { autoAllow: false });
+    expect(first.files.find((f) => f.path === configToml())!.action).toBe('updated');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(`${siblings}\n${block}\n`);
+    expect(codex.install('global', { autoAllow: false }).files.find((f) => f.path === configToml())!.action).toBe('unchanged');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'codex')!.status).toBe('unchanged');
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(siblings);
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('a CRLF config keeps CRLF through install and uninstall', () => {
+    writeConfig('model = "o3"\r\n\r\n[mcp_servers.codegraph]\r\ncommand = "codegraph"\r\nargs = ["serve"]\r\n');
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(`model = "o3"\r\n\r\n${block.replace(/\n/g, '\r\n')}\r\n`);
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe('model = "o3"\r\n');
+  });
+
+  it('an entry written with dotted keys is left as written, with a note; uninstall removes it', () => {
+    const input = 'model = "o3"\n\n[mcp_servers]\ncodegraph.command = "codegraph"\ncodegraph.args = ["serve", "--mcp"]\n';
+    writeConfig(input);
+    const codex = getTarget('codex')!;
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+
+    const result = codex.install('global', { autoAllow: false });
+    expect(result.files.find((f) => f.path === configToml())!.action).toBe('unchanged');
+    expect(result.notes?.join('\n')).toMatch(/Left the mcp_servers\.codegraph entry in .*config\.toml as you wrote it \(dotted keys, line 4\)/);
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+    expect(fs.readFileSync(path.join(tmpHome, '.codex', 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'codex')!.status).toBe('unchanged');
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe('model = "o3"\n\n[mcp_servers]\n');
+  });
+
+  it('mcp_servers as an inline table: install refuses with a clear error and changes nothing', () => {
+    const input = 'model = "o3"\nmcp_servers = { other = { command = "x" } }\n';
+    writeConfig(input);
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(
+      /config\.toml sets mcp_servers as an inline table \(line 2\), so a \[mcp_servers\.codegraph\] table can't be added without breaking the file\. Nothing was changed/,
+    );
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+  });
+
+  it('codegraph inside an inline mcp_servers table: uninstall says it can\'t remove it, and leaves the file alone', () => {
+    const input = 'model = "o3"\nmcp_servers = { codegraph = { command = "codegraph", args = ["serve", "--mcp"] } }\n';
+    writeConfig(input);
+    const [report] = uninstallTargets([getTarget('codex')!], 'global');
+    expect(report!.notes.join('\n')).toMatch(/sets mcp_servers\.codegraph inside mcp_servers \(an inline table, line 2\), which CodeGraph can't edit safely/);
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hermes: no toolset entry, and the user's MCP entry is theirs (#2485)
+//
+// Install and refresh appended `mcp-codegraph` to `platform_toolsets.cli`.
+// Hermes up to 0.22.2 rejects that name at startup ("Unknown toolsets"), and
+// 0.22.4 reads it as naming codegraph, which turns the list into an MCP
+// allowlist and hides every other server from CLI sessions
+// (hermes_cli/tools_config.py `_merge_mcp_servers`). No entry is needed: a
+// list that names no MCP server loads every enabled one. The refresh also
+// replaced the whole `mcp_servers.codegraph` block with CodeGraph's template,
+// undoing an absolute command path, timeouts, `enabled: false` and env.
+// ---------------------------------------------------------------------------
+describe('Installer — Hermes never writes platform_toolsets and keeps the user\'s MCP entry (#2485)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('hermes2485-home');
+    tmpCwd = mkTmpDir('hermes2485-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const hermes = getTarget('hermes')!;
+  const config = () => path.join(tmpHome, '.hermes', 'config.yaml');
+  function writeConfig(text: string): void {
+    fs.mkdirSync(path.dirname(config()), { recursive: true });
+    fs.writeFileSync(config(), text);
+  }
+  const read = () => fs.readFileSync(config(), 'utf-8');
+  const codegraphKeys = (text: string) => text.split(/\r?\n/).filter((l) => /^\s*["']?codegraph["']?\s*:/.test(l)).length;
+  const OTHERS = 'mcp_servers:\n  agentmail:\n    command: npx\n    args:\n    - -y\n    - agentmail-mcp\n';
+  const ENTRY = '  codegraph:\n    command: codegraph\n    args:\n      - serve\n      - --mcp\n    timeout: 120\n    connect_timeout: 60\n    enabled: true\n';
+
+  it('a fresh install writes the server and no platform_toolsets', () => {
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`mcp_servers:\n${ENTRY}`);
+    expect(hermes.install('global', { autoAllow: false }).files[0]!.action).toBe('unchanged');
+    expect(hermes.printConfig('global')).not.toContain('platform_toolsets');
+  });
+
+  it('the mcp-codegraph line an earlier install added is taken out, so every server loads again; a second refresh is unchanged', () => {
+    const before = `model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - browser\n`;
+    writeConfig(`model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - browser\n  - mcp-codegraph\n`);
+    const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!;
+    expect(report.status).toBe('refreshed');
+    expect(read()).toBe(before);
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+  });
+
+  it('a line the user removed is not put back', () => {
+    const text = `model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n`;
+    writeConfig(text);
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+    expect(read()).toBe(text);
+  });
+
+  it('in an allowlist of MCP servers, mcp-codegraph becomes codegraph, the name every Hermes version reads', () => {
+    writeConfig(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n    - hermes-cli\n    - agentmail\n    - mcp-codegraph # added by codegraph\n`);
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n    - hermes-cli\n    - agentmail\n    - codegraph\n`);
+  });
+
+  it('an allowlist that leaves CodeGraph out is left alone, with a note', () => {
+    const text = `${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n`;
+    writeConfig(text);
+    const result = hermes.install('global', { autoAllow: false });
+    expect(result.files[0]!.action).toBe('unchanged');
+    expect(result.notes?.join('\n')).toMatch(/platform_toolsets\.cli in .*config\.yaml names MCP servers, so CLI sessions load only those\. Add `codegraph`/);
+    expect(read()).toBe(text);
+  });
+
+  it('a customized entry is kept byte-for-byte by install and refresh', () => {
+    const text = `model: big\n${OTHERS}  codegraph:\n    command: /home/u/.local/bin/codegraph\n    args: [serve, --mcp]\n    timeout: 300\n    connect_timeout: 90\n    enabled: false\n    env:\n      CODEGRAPH_MCP_TOOLS: all\n`;
+    writeConfig(text);
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+    expect(hermes.install('global', { autoAllow: false }).files[0]!.action).toBe('unchanged');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+    expect(read()).toBe(text);
+  });
+
+  it('an entry missing command or args gets only those, at its own indent', () => {
+    writeConfig('mcp_servers:\n  codegraph:\n    enabled: true\n    timeout: 300\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe('mcp_servers:\n  codegraph:\n    enabled: true\n    timeout: 300\n    command: codegraph\n    args: [serve, --mcp]\n');
+  });
+
+  it('a 4-space-indented mcp_servers gets the new entry at 4 spaces', () => {
+    writeConfig('mcp_servers:\n    agentmail:\n        command: npx\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe([
+      'mcp_servers:', '    agentmail:', '        command: npx',
+      '    codegraph:', '        command: codegraph', '        args:', '            - serve', '            - --mcp',
+      '        timeout: 120', '        connect_timeout: 60', '        enabled: true', '',
+    ].join('\n'));
+  });
+
+  it('an entry written on one line or with a quoted key is found, so no second codegraph key is added', () => {
+    for (const entry of ['  codegraph: {command: /opt/bin/codegraph, args: [serve, --mcp]}\n', '  "codegraph":\n    command: /opt/bin/codegraph\n    args: [serve, --mcp]\n']) {
+      const text = `mcp_servers:\n${entry}`;
+      writeConfig(text);
+      expect(hermes.detect('global').alreadyConfigured).toBe(true);
+      hermes.install('global', { autoAllow: false });
+      expect(read()).toBe(text);
+      hermes.uninstall('global');
+      expect(codegraphKeys(read())).toBe(0);
+    }
+  });
+
+  it('mcp_servers written as a one-line mapping: install refuses with a clear error and changes nothing; {} becomes a block', () => {
+    const text = 'model: big\nmcp_servers: {agentmail: {command: npx, args: [-y, agentmail-mcp]}}\n';
+    writeConfig(text);
+    expect(() => hermes.install('global', { autoAllow: false })).toThrow(
+      /config\.yaml writes mcp_servers as a one-line mapping \(line 2\), so CodeGraph can't add its server without rewriting it\. Nothing was changed/,
+    );
+    expect(read()).toBe(text);
+
+    writeConfig('model: big\nmcp_servers: {}\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`model: big\nmcp_servers:\n${ENTRY}`);
+  });
+
+  it('codegraph inside a one-line mcp_servers mapping is left as written; uninstall says it can\'t remove it', () => {
+    const text = 'mcp_servers: {codegraph: {command: codegraph, args: [serve, --mcp]}}\n';
+    writeConfig(text);
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+    const result = hermes.install('global', { autoAllow: false });
+    expect(result.notes?.join('\n')).toMatch(/Left the mcp_servers\.codegraph entry in .*config\.yaml \(line 1\) as you wrote it/);
+    const removed = hermes.uninstall('global');
+    expect(removed.notes?.join('\n')).toMatch(/inside a one-line mcp_servers mapping \(line 1\), which CodeGraph can't edit safely/);
+    expect(read()).toBe(text);
+  });
+
+  it('a CRLF config stays CRLF', () => {
+    writeConfig(`model: big\r\nplatform_toolsets:\r\n  cli:\r\n  - hermes-cli\r\n  - mcp-codegraph\r\n`);
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`model: big\r\nplatform_toolsets:\r\n  cli:\r\n  - hermes-cli\r\n\r\nmcp_servers:\r\n${ENTRY.replace(/\n/g, '\r\n')}`);
+  });
+
+  it('uninstall removes the server and any codegraph toolset name, and keeps the rest', () => {
+    writeConfig(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n  - codegraph\n  telegram:\n  - hermes-telegram\n`);
+    hermes.uninstall('global');
+    expect(read()).toBe(`${OTHERS}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n  telegram:\n  - hermes-telegram\n`);
+    expect(hermes.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
 describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -1798,6 +2179,479 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
   });
 });
 
+// ---------------------------------------------------------------------------
+// The instructions block never touches anything outside its markers (#2506)
+//
+// `codegraph upgrade` runs `install --refresh`, which rewrites the block in
+// every configured agent's instructions file. The write paired the FIRST
+// start marker with the FIRST end marker anywhere in the file, so one stray
+// start marker above the real block — an older block whose end marker was
+// deleted by hand, or the marker quoted in the user's own notes — made the
+// refresh replace everything between the two. With the stray marker on the
+// first line, the reported global AGENTS.md came back as just the block.
+// ---------------------------------------------------------------------------
+describe('Installer — the instructions block keeps everything outside its markers (#2506)', () => {
+  const START = CODEGRAPH_SECTION_START;
+  const END = CODEGRAPH_SECTION_END;
+  const BLOCK = CODEGRAPH_INSTRUCTIONS_BLOCK;
+  const BOM = String.fromCharCode(0xfeff);
+  const crlf = (s: string) => s.replace(/\n/g, '\r\n');
+  // A maintained guidance file like the reporter's, with text below the block too.
+  const NOTES = [
+    '# Global agent guidance',
+    '',
+    '## Toolset inventory',
+    '- ripgrep, fd, jq',
+    '',
+    '## Commit policy',
+    '- conventional commits',
+  ].join('\n');
+  const MORE = ['## Runtime notes', '', '- prefer the sandbox'].join('\n');
+  // What is left of an older block whose end marker was deleted by hand.
+  const STRAY = `${START}\n## CodeGraph\n\n`;
+
+  let dir: string;
+  let file: string;
+  beforeEach(() => {
+    dir = mkTmpDir('marked');
+    file = path.join(dir, 'AGENTS.md');
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function upsert(content: string): { action: string; after: string } {
+    fs.writeFileSync(file, content);
+    const action = replaceOrAppendMarkedSection(file, BLOCK, START, END);
+    return { action, after: fs.readFileSync(file, 'utf-8') };
+  }
+  function upsertAgain(): { action: string; after: string } {
+    const action = replaceOrAppendMarkedSection(file, BLOCK, START, END);
+    return { action, after: fs.readFileSync(file, 'utf-8') };
+  }
+  function remove(content: string): { action: string; after: string | null } {
+    fs.writeFileSync(file, content);
+    const action = removeMarkedSection(file, START, END);
+    return { action, after: fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : null };
+  }
+
+  it('a stray start marker on the first line no longer reduces the file to the block (the report)', () => {
+    const { action, after } = upsert(`${STRAY}${NOTES}\n\n${LEGACY_BLOCK}\n`);
+    expect(action).toBe('updated');
+    expect(after).toBe(`${STRAY}${NOTES}\n\n${BLOCK}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a stray start marker with no block after it: the block is appended, and the next run keeps the text below the stray marker', () => {
+    const content = `${NOTES}\n\n${STRAY}old text, end marker deleted\n\n${MORE}\n`;
+    const first = upsert(content);
+    expect(first.action).toBe('appended');
+    expect(first.after).toBe(`${content}\n${BLOCK}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after: first.after });
+  });
+
+  it('the start marker quoted in a sentence of the user\'s is their text, not the edge of a block', () => {
+    const prose = `Keep your own notes above the ${START} line.\n\n`;
+    const { after } = upsert(`${prose}${NOTES}\n\n${LEGACY_BLOCK}\n`);
+    expect(after).toBe(`${prose}${NOTES}\n\n${BLOCK}\n`);
+  });
+
+  it('a lone end marker no longer makes every run append another block', () => {
+    const content = `${NOTES}\n\nold text, start marker deleted\n${END}\n\n${MORE}\n`;
+    const first = upsert(content);
+    expect(first.after).toBe(`${content}\n${BLOCK}\n`);
+    const second = upsertAgain();
+    expect(second).toEqual({ action: 'unchanged', after: first.after });
+  });
+
+  it('two blocks: the first is refreshed, the duplicate removed, and the text between them kept', () => {
+    const { action, after } = upsert(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n\n${LEGACY_BLOCK}\n`);
+    expect(action).toBe('updated');
+    expect(after).toBe(`${NOTES}\n\n${BLOCK}\n\n${MORE}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a CRLF file stays CRLF: the text around the block is untouched and the block takes the file\'s line breaks', () => {
+    const { action, after } = upsert(crlf(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n`));
+    expect(action).toBe('updated');
+    expect(after).toBe(crlf(`${NOTES}\n\n${BLOCK}\n\n${MORE}\n`));
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a CRLF file that already holds the current block is left alone', () => {
+    const content = crlf(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(content)).toEqual({ action: 'unchanged', after: content });
+  });
+
+  it('a file without a trailing newline keeps that shape', () => {
+    expect(upsert(`${NOTES}\n\n${LEGACY_BLOCK}`).after).toBe(`${NOTES}\n\n${BLOCK}`);
+  });
+
+  it('appending keeps every existing byte: nothing is trimmed, only line breaks are added', () => {
+    expect(upsert(NOTES).after).toBe(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${NOTES}\n`).after).toBe(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${NOTES}\n\n\n`).after).toBe(`${NOTES}\n\n\n${BLOCK}\n`);
+    expect(upsert(crlf(`${NOTES}\n`)).after).toBe(crlf(`${NOTES}\n\n${BLOCK}\n`));
+  });
+
+  it('a byte-order mark survives', () => {
+    expect(upsert(`${BOM}${NOTES}\n\n${LEGACY_BLOCK}\n`).after).toBe(`${BOM}${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${BOM}${LEGACY_BLOCK}\n\n${NOTES}\n`).after).toBe(`${BOM}${BLOCK}\n\n${NOTES}\n`);
+  });
+
+  it('uninstall removes only the block, never the text after a stray start marker', () => {
+    const { action, after } = remove(`${STRAY}${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n`);
+    expect(action).toBe('removed');
+    expect(after).toBe(`${STRAY}${NOTES}\n\n${MORE}\n`);
+  });
+
+  it('uninstall removes every block, keeps CRLF, and leaves a file holding only stray markers alone', () => {
+    expect(remove(crlf(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n\n${LEGACY_BLOCK}\n`)).after).toBe(crlf(`${NOTES}\n\n${MORE}\n`));
+    const strays = `${NOTES}\n${START}\n${MORE}\n${END}x\n`;
+    expect(remove(strays)).toEqual({ action: 'not-found', after: strays });
+    // A file that held nothing but the block is deleted, as before.
+    expect(remove(`${LEGACY_BLOCK}\n`)).toEqual({ action: 'removed', after: null });
+  });
+});
+
+describe('Installer — install --refresh keeps each agent\'s instructions file (#2506)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('rf2506-home');
+    tmpCwd = mkTmpDir('rf2506-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // Every target that writes an instructions file, at its global path.
+  const INSTRUCTIONS: Array<[string, (home: string) => string]> = [
+    ['claude', (home) => path.join(home, '.claude', 'CLAUDE.md')],
+    ['codex', (home) => path.join(home, '.codex', 'AGENTS.md')],
+    ['gemini', (home) => path.join(home, '.gemini', 'GEMINI.md')],
+    ['opencode', (home) => path.join(home, '.config', 'opencode', 'AGENTS.md')],
+  ];
+  const USER = `${CODEGRAPH_SECTION_START}\n## CodeGraph\n\n# My notes\n\nAlways run the tests first.\n\n`;
+
+  for (const [id, instructionsFile] of INSTRUCTIONS) {
+    it(`${id}: the refresh rewrites only the block, and uninstall removes only the block`, () => {
+      const target = getTarget(id)!;
+      target.install('global', { autoAllow: false });
+      const file = instructionsFile(tmpHome);
+      fs.writeFileSync(file, `${USER}${LEGACY_BLOCK}\n`);
+
+      const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!;
+      expect(report.status).toBe('refreshed');
+      expect(report.changedPaths).toContain(file);
+      expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER}${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+      expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!.status).toBe('unchanged');
+
+      target.uninstall('global');
+      expect(fs.readFileSync(file, 'utf-8')).toBe(USER.trimEnd() + '\n');
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A symbolic link is written through, never replaced (#2721)
+//
+// Instructions and config files are often symbolic links into a dotfiles or
+// team repo (`~/.codex/AGENTS.md -> ~/dotfiles/AGENTS.md`). Every installer
+// write went to `<path>.tmp.<pid>` and was renamed onto the path, and a
+// rename replaces the link itself: install left a detached copy, so the
+// shared file never got CodeGraph's entry and later edits to it never reached
+// the agent. Uninstall deleted a link whose file it had emptied.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this machine can create a file symlink. On Windows that needs
+ * Developer Mode or admin rights; where it can't, the link tests are skipped,
+ * with the reason in their name, rather than passing without running.
+ */
+function canCreateFileSymlink(): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-symlink-probe-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'target'), '');
+    fs.symlinkSync(path.join(dir, 'target'), path.join(dir, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+const FILE_SYMLINKS = canCreateFileSymlink();
+const NO_FILE_SYMLINKS = ' — skipped: creating a file symlink needs Developer Mode or admin rights on Windows';
+
+describe.skipIf(!FILE_SYMLINKS)(`Installer — a symbolic link is written through, never replaced (#2721)${FILE_SYMLINKS ? '' : NO_FILE_SYMLINKS}`, () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+  let restoreWritable: Array<() => void>;
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('link-home');
+    tmpCwd = mkTmpDir('link-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+    restoreWritable = [];
+  });
+
+  afterEach(() => {
+    for (const restore of restoreWritable) restore();
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const isLink = (p: string): boolean => {
+    try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; }
+  };
+  /** Make `linkPath` a file symlink whose text is `text`, creating the folder that holds it. */
+  function link(linkPath: string, text: string): void {
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fs.symlinkSync(text, linkPath, 'file');
+  }
+  /** A file in the shared folder the links point into, written with `content` when given. */
+  function sharedFile(name: string, content?: string): string {
+    const file = path.join(tmpHome, 'dotfiles', name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (content !== undefined) fs.writeFileSync(file, content);
+    return file;
+  }
+
+  // Every file each agent's install writes, at both locations: whatever the
+  // installer does, it never replaces or removes a link.
+  for (const target of ALL_TARGETS) {
+    for (const location of (['global', 'local'] as const).filter((l) => target.supportsLocation(l))) {
+      it(`${target.id} (${location}): install and uninstall keep every one of its files that is a link`, () => {
+        const links = target.describePaths(location).map((p, i) => {
+          const dest = sharedFile(`${i}-${path.basename(p)}`);
+          link(p, dest);
+          return { path: p, dest };
+        });
+
+        const result = target.install(location, { autoAllow: true });
+        for (const l of links) {
+          expect(isLink(l.path), l.path).toBe(true);
+          expect(fs.readlinkSync(l.path)).toBe(l.dest);
+        }
+        for (const f of result.files.filter((x) => x.action === 'created' || x.action === 'updated')) {
+          const written = links.find((l) => l.path === f.path);
+          expect(written, f.path).toBeDefined();
+          expect(fs.existsSync(written!.dest), written!.dest).toBe(true);
+        }
+        expect(target.detect(location).alreadyConfigured).toBe(true);
+
+        target.uninstall(location);
+        for (const l of links) {
+          expect(isLink(l.path), l.path).toBe(true);
+          expect(fs.readlinkSync(l.path)).toBe(l.dest);
+        }
+        expect(target.detect(location).alreadyConfigured).toBe(false);
+      });
+    }
+  }
+
+  it('the shared files get CodeGraph\'s entries next to the user\'s own, and uninstall takes only those out again', () => {
+    const files = {
+      claudeJson: sharedFile('claude.json', '{\n  "numStartups": 3\n}\n'),
+      claudeMd: sharedFile('CLAUDE.md', '# my claude notes\n'),
+      agentsMd: sharedFile('AGENTS.md', '# shared rules\n\nBe terse.\n'),
+      codexToml: sharedFile('codex.toml', 'model = "o3"\n'),
+      opencode: sharedFile('opencode.jsonc', '{\n  // my theme\n  "theme": "tokyonight"\n}\n'),
+      cursor: sharedFile('cursor-mcp.json', '{\n  "mcpServers": {\n    "other": {\n      "command": "x"\n    }\n  }\n}\n'),
+    };
+    const original = Object.fromEntries(Object.entries(files).map(([k, f]) => [k, fs.readFileSync(f, 'utf-8')]));
+    link(path.join(tmpHome, '.claude.json'), files.claudeJson);
+    link(path.join(tmpHome, '.claude', 'CLAUDE.md'), files.claudeMd);
+    // Two agents sharing one instructions file.
+    link(path.join(tmpHome, '.codex', 'AGENTS.md'), files.agentsMd);
+    link(path.join(tmpHome, '.config', 'opencode', 'AGENTS.md'), files.agentsMd);
+    link(path.join(tmpHome, '.codex', 'config.toml'), files.codexToml);
+    link(path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc'), files.opencode);
+    link(path.join(tmpHome, '.cursor', 'mcp.json'), files.cursor);
+    const ids = ['claude', 'codex', 'opencode', 'cursor'] as const;
+
+    for (const id of ids) getTarget(id)!.install('global', { autoAllow: false });
+
+    const read = (f: string) => fs.readFileSync(f, 'utf-8');
+    expect(JSON.parse(read(files.claudeJson))).toMatchObject({ numStartups: 3, mcpServers: { codegraph: {} } });
+    expect(read(files.claudeMd)).toBe(`# my claude notes\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(read(files.agentsMd)).toBe(`# shared rules\n\nBe terse.\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(read(files.codexToml)).toContain('model = "o3"');
+    expect(read(files.codexToml)).toContain('[mcp_servers.codegraph]');
+    expect(read(files.opencode)).toContain('// my theme');
+    expect(parseJsonc(read(files.opencode)).mcp.servers.codegraph).toBeDefined();
+    expect(JSON.parse(read(files.cursor)).mcpServers).toMatchObject({ other: { command: 'x' }, codegraph: {} });
+    // Re-running is a no-op through the links too.
+    for (const id of ids) {
+      for (const f of getTarget(id)!.install('global', { autoAllow: false }).files) expect(f.action, f.path).toBe('unchanged');
+    }
+
+    for (const id of ids) getTarget(id)!.uninstall('global');
+
+    expect(JSON.parse(read(files.claudeJson))).toEqual({ numStartups: 3 });
+    expect(read(files.claudeMd)).toBe(original.claudeMd);
+    expect(read(files.agentsMd)).toBe(original.agentsMd);
+    expect(read(files.codexToml)).toBe(original.codexToml);
+    expect(parseJsonc(read(files.opencode))).toEqual({ $schema: 'https://opencode.ai/config.json', theme: 'tokyonight' });
+    expect(read(files.opencode)).toContain('// my theme');
+    expect(JSON.parse(read(files.cursor))).toEqual({ mcpServers: { other: { command: 'x' } } });
+  });
+
+  it('a relative link keeps its text, and is followed from the folder that really holds it', () => {
+    // `~/.codex` is itself a folder link into the dotfiles repo, and the
+    // config inside it points one level up, relative to the real folder.
+    const realCodex = path.join(tmpHome, 'dotfiles', 'codex');
+    fs.mkdirSync(realCodex, { recursive: true });
+    fs.symlinkSync(realCodex, path.join(tmpHome, '.codex'), 'junction');
+    const agentsText = path.join('..', 'AGENTS.md');
+    const tomlText = path.join('..', 'codex.toml');
+    link(path.join(realCodex, 'AGENTS.md'), agentsText);
+    link(path.join(realCodex, 'config.toml'), tomlText);
+    fs.writeFileSync(path.join(tmpHome, 'dotfiles', 'codex.toml'), 'model = "o3"\n');
+    // Only the AGENTS.md target is missing, so it is created where the link
+    // really points: dotfiles/AGENTS.md, not a lexical ~/AGENTS.md.
+
+    getTarget('codex')!.install('global', { autoAllow: false });
+
+    expect(fs.readlinkSync(path.join(realCodex, 'AGENTS.md'))).toBe(agentsText);
+    expect(fs.readlinkSync(path.join(realCodex, 'config.toml'))).toBe(tomlText);
+    expect(isLink(path.join(tmpHome, '.codex'))).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, 'dotfiles', 'AGENTS.md'), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(fs.existsSync(path.join(tmpHome, 'AGENTS.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(tmpHome, 'dotfiles', 'codex.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+  });
+
+  it('a link into a folder that does not exist is an error naming the link, and nothing is created', () => {
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    const missing = path.join(tmpHome, 'dotfiles-not-cloned-yet', 'AGENTS.md');
+    link(agentsMd, missing);
+
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(
+      /AGENTS\.md is a symbolic link to .*dotfiles-not-cloned-yet.*its folder does not exist.*never replaces one with a copy/,
+    );
+    expect(isLink(agentsMd)).toBe(true);
+    expect(fs.readlinkSync(agentsMd)).toBe(missing);
+    expect(fs.existsSync(path.dirname(missing))).toBe(false);
+  });
+
+  // POSIX refuses the write in a read-only folder, except to root; Windows
+  // refuses replacing a file whose read-only attribute is set.
+  const POSIX_ROOT = process.platform !== 'win32' && process.getuid?.() === 0;
+  it.skipIf(POSIX_ROOT)(`a link to a read-only file is an error naming the link; the file is unchanged and no temp file is left${POSIX_ROOT ? ' — skipped: root can write into a read-only folder' : ''}`, () => {
+    const shared = sharedFile(path.join('managed', 'AGENTS.md'), '# managed by home-manager\n');
+    const lock = process.platform === 'win32' ? shared : path.dirname(shared);
+    fs.chmodSync(lock, process.platform === 'win32' ? 0o444 : 0o555);
+    restoreWritable.push(() => fs.chmodSync(lock, process.platform === 'win32' ? 0o666 : 0o755));
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    link(agentsMd, shared);
+
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(/AGENTS\.md is a symbolic link to .*it is read-only/);
+    expect(isLink(agentsMd)).toBe(true);
+    expect(fs.readFileSync(shared, 'utf-8')).toBe('# managed by home-manager\n');
+    expect(fs.readdirSync(path.dirname(shared)).filter((n) => n.includes('.tmp.'))).toEqual([]);
+  });
+
+  it('uninstall empties a linked file that held only CodeGraph\'s part, instead of deleting the link', () => {
+    const agentsMd = sharedFile('AGENTS.md');
+    const codexToml = sharedFile('codex.toml');
+    const copilot = sharedFile('copilot.json');
+    link(path.join(tmpHome, '.codex', 'AGENTS.md'), agentsMd);
+    link(path.join(tmpHome, '.codex', 'config.toml'), codexToml);
+    link(path.join(tmpHome, '.copilot', 'mcp-config.json'), copilot);
+    getTarget('codex')!.install('global', { autoAllow: false });
+    getTarget('copilot-cli')!.install('global', { autoAllow: false });
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    getTarget('codex')!.uninstall('global');
+    getTarget('copilot-cli')!.uninstall('global');
+
+    for (const p of ['.codex/AGENTS.md', '.codex/config.toml', '.copilot/mcp-config.json']) {
+      expect(isLink(path.join(tmpHome, p)), p).toBe(true);
+    }
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe('');
+    expect(fs.readFileSync(codexToml, 'utf-8')).toBe('');
+    expect(JSON.parse(fs.readFileSync(copilot, 'utf-8'))).toEqual({});
+  });
+
+  it('a link that can\'t be written fails only its own agent in a refresh: the others are still refreshed', () => {
+    getTarget('codex')!.install('global', { autoAllow: false });
+    getTarget('gemini')!.install('global', { autoAllow: false });
+    // Codex's instructions file is now a link into a folder that is gone,
+    // and Gemini's block is stale.
+    const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
+    fs.unlinkSync(agentsMd);
+    link(agentsMd, path.join(tmpHome, 'gone', 'AGENTS.md'));
+    const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
+    fs.writeFileSync(geminiMd, `${LEGACY_BLOCK}\n`);
+
+    const reports = refreshTargets(ALL_TARGETS, 'global');
+
+    const codex = reports.find((r) => r.id === 'codex')!;
+    expect(codex.status).toBe('failed');
+    expect(codex.error).toMatch(/AGENTS\.md is a symbolic link to .*gone.*its folder does not exist/);
+    const gemini = reports.find((r) => r.id === 'gemini')!;
+    expect(gemini.status).toBe('refreshed');
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(isLink(agentsMd)).toBe(true);
+  });
+});
+
+describe('Installer — a config folder that is a link keeps working (#2721)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('dirlink-home');
+    tmpCwd = mkTmpDir('dirlink-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // A folder link needs no special rights: a junction on Windows, a symlink elsewhere.
+  it('~/.codex as a folder link: files are written inside the real folder and the link stays', () => {
+    const real = path.join(tmpHome, 'dotfiles', 'codex');
+    fs.mkdirSync(real, { recursive: true });
+    const dirLink = path.join(tmpHome, '.codex');
+    fs.symlinkSync(real, dirLink, 'junction');
+
+    getTarget('codex')!.install('global', { autoAllow: false });
+    expect(fs.lstatSync(dirLink).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(real, 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(real, 'AGENTS.md'), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    getTarget('codex')!.uninstall('global');
+    expect(fs.lstatSync(dirLink).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(real, 'AGENTS.md'))).toBe(false);
+  });
+});
+
 describe('Installer — detection never writes (#1870)', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -1945,6 +2799,17 @@ describe('Installer — Cursor rules file cleanup on uninstall', () => {
     // Our tool-usage block is gone.
     expect(after).not.toContain('codegraph_search');
     expect(after).not.toContain('CODEGRAPH_START');
+  });
+
+  it('a stray start marker above the block never takes the user\'s rules with it (#2506)', () => {
+    fs.mkdirSync(path.dirname(rulesFile()), { recursive: true });
+    const userRules = `${CODEGRAPH_SECTION_START}\n## My own rule\nkeep me\n`;
+    fs.writeFileSync(rulesFile(), `${MDC_FRONTMATTER}${userRules}\n${LEGACY_BLOCK}\n`);
+
+    cursor.uninstall('local');
+
+    expect(fs.existsSync(rulesFile())).toBe(true);
+    expect(fs.readFileSync(rulesFile(), 'utf-8')).toBe(`${MDC_FRONTMATTER}${userRules}`);
   });
 });
 

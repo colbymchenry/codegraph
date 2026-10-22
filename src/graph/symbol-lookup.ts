@@ -25,6 +25,7 @@
  */
 
 import type { Node } from '../types';
+import type { GoPackageOf } from './go-package';
 
 /** Rust path prefixes that name no directory (`crate::x`, `super::y`). */
 export const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
@@ -57,9 +58,11 @@ function canonicalScope(text: string): string {
  * Bare queries match the name. Qualified queries are checked against the
  * qualifiedName under both separator conventions, then — for languages whose
  * hierarchy lives in the file path rather than the name (Rust modules, Python
- * packages) — against the path.
+ * packages, Go packages) — against the path, and last as a package followed by
+ * the scope inside it. `goPackageOf` gives a Go file's declared package, for a
+ * package qualifier that names no directory.
  */
-export function matchesSymbol(node: Node, symbol: string): boolean {
+export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackageOf): boolean {
   // Erlang arity spelling (`fn/3`, `mod:fn/3`): when the node's qualifiedName
   // carries an arity (#1610) the written arity must match exactly, and the rest
   // of the comparison runs on the arity-less spelling. A node with no arity
@@ -109,9 +112,61 @@ export function matchesSymbol(node: Node, symbol: string): boolean {
   const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
   if (containerHints.length === 0) return false;
   const segments = node.filePath.split('/').filter((s) => s.length > 0);
-  return containerHints.every((hint) =>
-    segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
-  );
+  const inPath = (hint: string): boolean =>
+    segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint);
+  if (containerHints.every(inPath)) return true;
+
+  // Stage 3: a package, then the scope inside it. `refresh.Discovery.refresh` is
+  // method `refresh` of type `Discovery` in Go package `refresh` (a Python
+  // `pkg.mod.Class.method` reads the same way): the type is in the
+  // qualifiedName and the package in the path, so neither stage above reads the
+  // whole name. The leading qualifiers must name the package as stage 2 does,
+  // the rest must end the node's scope.
+  const scope = canonicalScope(node.qualifiedName).split('.').slice(0, -1);
+  const splits: number[] = [];
+  for (let k = 1; k < containerHints.length; k++) {
+    const inner = containerHints.slice(k);
+    const offset = scope.length - inner.length;
+    if (offset < 0 || !inner.every((hint, i) => scope[offset + i] === hint)) continue;
+    if (containerHints.slice(0, k).every(inPath)) return true;
+    splits.push(k);
+  }
+
+  // Last, a Go qualifier names the package the file DECLARES: its directory as a
+  // rule, but a module's root package has no directory (gin's `context.go` is
+  // `package gin`), and a `v2/` directory keeps its parent's name. The clause
+  // is read only where it can decide — a top-level function (`gin.New`), or a
+  // node whose scope already ends with the written type — so a common name's
+  // hundreds of definitions cost no file reads.
+  if (node.language !== 'go' || !goPackageOf || (scope.length > 0 && splits.length === 0)) return false;
+  const declared = goPackageOf(node.filePath);
+  if (!declared) return false;
+  const namesPackage = (hint: string): boolean => hint === declared || inPath(hint);
+  if (scope.length === 0 && containerHints.every(namesPackage)) return true;
+  return splits.some((k) => containerHints.slice(0, k).every(namesPackage));
+}
+
+/**
+ * The nodes a QUALIFIED query names, in search-rank order: the full-text
+ * search's top hits that satisfy the matcher, else every exact-name definition
+ * of the last part that does. The search ranks and truncates, so a definition
+ * can sit below its cut: for gin's `binding.Default` it returned three
+ * `binding/default_validator*.go` files and not the function, and the query
+ * named nothing. The exact-name index is complete.
+ */
+export function qualifiedSymbolMatches(
+  cg: SymbolLookupHost,
+  symbol: string,
+  goPackageOf?: GoPackageOf
+): Node[] {
+  const tail = lastQualifierPart(symbol);
+  let hits = cg.searchNodes(symbol, { limit: 50 });
+  // FTS strips colons, so `stage_apply::run` searches the literal
+  // `stage_applyrun` and finds nothing: search the bare last part instead.
+  if (hits.length === 0 && tail && tail !== symbol) hits = cg.searchNodes(tail, { limit: 50 });
+  const ranked = hits.map((h) => h.node).filter((n) => matchesSymbol(n, symbol, goPackageOf));
+  if (ranked.length > 0 || !tail) return ranked;
+  return cg.getNodesByName(tail).filter((n) => matchesSymbol(n, symbol, goPackageOf));
 }
 
 /** The slice of CodeGraph a symbol lookup needs — keeps this module testable. */
@@ -170,17 +225,21 @@ export function groupDefinitions(
  * happened to rank first. FTS candidates still have to satisfy the matcher;
  * partial or mistyped names must never select the top fuzzy hit (#1473).
  */
-export function lookupSymbolNodes(cg: SymbolLookupHost, symbol: string): SymbolLookupResult {
+export function lookupSymbolNodes(
+  cg: SymbolLookupHost,
+  symbol: string,
+  goPackageOf?: GoPackageOf
+): SymbolLookupResult {
   const qualified = isQualifiedSymbol(symbol);
 
   // Exact-name index, then filter by the qualifier the user actually wrote.
   const tail = qualified ? lastQualifierPart(symbol) : symbol;
   let nodes = tail ? cg.getNodesByName(tail) : [];
-  if (qualified) nodes = nodes.filter((n) => matchesSymbol(n, symbol));
+  if (qualified) nodes = nodes.filter((n) => matchesSymbol(n, symbol, goPackageOf));
 
   if (nodes.length === 0) {
     const hits = cg.searchNodes(symbol, { limit: 50 }).map((h) => h.node);
-    const exact = hits.filter((n) => matchesSymbol(n, symbol));
+    const exact = hits.filter((n) => matchesSymbol(n, symbol, goPackageOf));
     if (exact.length > 0) {
       nodes = exact;
     }

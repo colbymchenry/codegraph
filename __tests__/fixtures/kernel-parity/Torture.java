@@ -31,6 +31,7 @@ public class TortureService extends BaseService implements Runnable, AutoCloseab
     }
   };
   private final Runnable fieldMethodRef = TortureService::compute;
+  private static final List<Runnable> FIELD_TABLE = List.of(TortureService::compute);
 
   /** Ctor javadoc. */
   public TortureService(List<String> names) {

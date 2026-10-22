@@ -22,7 +22,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId } from './targets/types';
+import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
@@ -380,13 +380,13 @@ export function uninstallTargets(
   });
 }
 
-export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported' | 'failed';
 
 /**
  * Per-target outcome of a refresh sweep. `refreshed` means at least one
  * filesystem entry was created, updated, or removed; `unchanged` means the target was
- * already current (every write reported byte-identical); the other two
- * mirror `UninstallStatus`.
+ * already current (every write reported byte-identical); `failed` means a
+ * write threw (`error` says why); the other two mirror `UninstallStatus`.
  */
 export interface RefreshReport {
   id: TargetId;
@@ -395,6 +395,8 @@ export interface RefreshReport {
   status: RefreshStatus;
   /** Absolute paths created, updated, or removed by the refresh. */
   changedPaths: string[];
+  /** Why the refresh of this target failed (status `failed` only). */
+  error?: string;
 }
 
 /**
@@ -428,7 +430,16 @@ export function refreshTargets(
     if (!target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    let result: WriteResult;
+    try {
+      result = target.install(location, { autoAllow: false, promptHook: undefined });
+    } catch (err) {
+      // One agent's file that can't be written (a symbolic link to a
+      // read-only file, say: #2721) must not stop the rest of the sweep
+      // `codegraph upgrade` runs.
+      const error = err instanceof Error ? err.message : String(err);
+      return { ...base, status: 'failed' as const, changedPaths: [], error };
+    }
     const changedPaths = result.files
       .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
       .map((f) => f.path);
@@ -506,10 +517,14 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
         clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
       }
     } else if (r.status === 'not-configured') {
-      clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+      clack.log.info(r.notes.length > 0 ? `${r.displayName}: nothing removed` : `${r.displayName}: not configured — nothing to remove`);
     } else {
       clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+      continue;
     }
+    // What a target couldn't remove on its own (e.g. a Codex entry inside
+    // an inline table, #2562).
+    for (const note of r.notes) clack.log.warn(`${r.displayName}: ${note}`);
   }
 
   // Step 4: for local uninstall, the index dir is separate — point at
@@ -718,6 +733,13 @@ export async function offerWatchFallback(
     clack.log.warn(
       `Could not install git hooks${result.skipped ? ` (${result.skipped})` : ''}. ` +
       'Run `codegraph sync` after changes instead.',
+    );
+  }
+  if (result.unsupported && result.unsupported.length > 0) {
+    clack.log.warn(
+      `Left your ${result.unsupported.join(', ')} hook${result.unsupported.length > 1 ? 's' : ''} unchanged — ` +
+      `${result.unsupported.length > 1 ? 'they are' : 'it is'} not a shell script. ` +
+      `Add \`codegraph sync ${projectPath}\` to ${result.unsupported.length > 1 ? 'them' : 'it'} to refresh the index there too.`,
     );
   }
 }

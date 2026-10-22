@@ -27,6 +27,7 @@
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { escapeRegExp } from '../utils';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
 
@@ -229,7 +230,7 @@ function writtenName(ref: UnresolvedRef, context: ResolutionContext): string {
     const before = QUALIFIER_BEFORE.exec(text.slice(Math.max(0, column - 240), column));
     return before ? clean(before[1]!) : name;
   }
-  const chain = new RegExp(String.raw`^((?:${QUALIFIER_SEGMENT})+)${name.replace(/[$\\]/g, '\\$&')}\b`).exec(text.slice(ref.column, ref.column + 240));
+  const chain = new RegExp(String.raw`^((?:${QUALIFIER_SEGMENT})+)${escapeRegExp(name)}\b`).exec(text.slice(ref.column, ref.column + 240));
   return chain ? clean(chain[1]!) : name;
 }
 

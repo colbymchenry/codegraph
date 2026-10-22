@@ -190,7 +190,8 @@ describe('Go framework heuristics pick only in the package Go reads the name fro
   });
 
   it('a conversion and a composite literal still reach their own package’s struct', () => {
-    expect(linksFrom('errors.go', 'Error', { name: '_' })).toEqual(['instantiates errors.go:Error']);
+    // `(*Error)(nil)` is a conversion: a use of the type, not an instantiation (#2581).
+    expect(linksFrom('errors.go', 'Error', { name: '_' })).toEqual(['references errors.go:Error']);
     expect(linksFrom('errors.go', 'Error', { name: 'newError' })).toEqual([
       'instantiates errors.go:Error',
       'references errors.go:Error',

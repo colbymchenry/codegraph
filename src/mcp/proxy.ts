@@ -41,6 +41,13 @@ import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 const DEFAULT_PPID_POLL_MS = 5000;
 
 /**
+ * How long a probe waits for a daemon's hello once connected. A healthy daemon
+ * sends it the moment it accepts; one whose main thread is blocked accepts at
+ * the OS level and never sends it.
+ */
+export const DAEMON_HELLO_TIMEOUT_MS = 3_000;
+
+/**
  * How long a proxy serving in-process waits before trying the shared daemon
  * again, doubling after each miss up to the cap (#2277). Tunable through
  * `CODEGRAPH_DAEMON_RETRY_MS` (`0` turns retrying off) and
@@ -153,11 +160,13 @@ export async function runProxy(
  * release ({@link isOlderRelease}; the launcher replaces it, #2335) and
  * `'version-mismatch'` for any other version, which is left alone. Unlike
  * {@link runProxy} it does NOT pipe — the caller owns the socket. Used by the
- * local-handshake proxy's background connect.
+ * local-handshake proxy's background connect. `helloTimeoutMs` bounds the wait
+ * for the hello, so a caller with a deadline can spend no more than it has.
  */
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
+  helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS,
 ): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
@@ -172,7 +181,7 @@ export async function connectWithHello(
   // AF_UNIX-over-DrvFs (WSL2 /mnt drives). A no-op guard makes the error
   // recoverable: the follow-up 'close' drives the caller's normal fallback.
   socket.on('error', () => { /* absorbed — see #974; 'close' drives the fallback */ });
-  const hello = await readHelloLine(socket).catch(() => null);
+  const hello = await readHelloLine(socket, helloTimeoutMs).catch(() => null);
   if (!hello) {
     socket.destroy();
     return null; // no daemon yet — caller should keep polling
@@ -601,10 +610,10 @@ function startPpidWatchdogNoSocket(onDeath: () => void): void {
 /**
  * Read one CRLF/LF-terminated JSON line from the socket, parse it as the
  * daemon hello, and return it. Bounded to {@link MAX_HELLO_LINE_BYTES} so a
- * malicious or broken peer can't OOM us. Times out at 3s — a healthy daemon
- * sends hello immediately on accept.
+ * malicious or broken peer can't OOM us. Times out after `timeoutMs` (3s by
+ * default) — a healthy daemon sends hello immediately on accept.
  */
-function readHelloLine(socket: net.Socket): Promise<DaemonHello> {
+function readHelloLine(socket: net.Socket, timeoutMs: number = DAEMON_HELLO_TIMEOUT_MS): Promise<DaemonHello> {
   return new Promise((resolve, reject) => {
     let buffer = '';
     const cleanup = () => {
@@ -647,7 +656,7 @@ function readHelloLine(socket: net.Socket): Promise<DaemonHello> {
     const timer = setTimeout(() => {
       cleanup();
       reject(new Error('timed out waiting for daemon hello'));
-    }, 3000);
+    }, timeoutMs);
     timer.unref?.();
     socket.on('data', onData);
     socket.on('error', onError);

@@ -232,6 +232,17 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
+ * Escape `text` to match itself literally inside a regular expression.
+ * Symbol names are not always plain words: C++'s `operator++` and
+ * `operator()`, Scala's `++`, a Kotlin name in backticks. Pass every name
+ * through this before writing it into a `new RegExp(…)` pattern, or the name
+ * is read as pattern syntax and may not compile at all.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Cross-process file lock using a lock file with PID tracking.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from

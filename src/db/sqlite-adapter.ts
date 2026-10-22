@@ -10,6 +10,8 @@
  * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
+import { loadNodeSqlite } from './node-sqlite';
+import { toDatabaseOpenError } from './open-error';
 import { toWslSharedIndexError } from './wsl-shared-index';
 
 export interface SqliteStatement {
@@ -57,8 +59,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
   private readonly _dbPath: string;
 
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { DatabaseSync } = require('node:sqlite');
+    const { DatabaseSync } = loadNodeSqlite();
     this._dbPath = dbPath;
     this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
   }
@@ -200,15 +201,8 @@ export function createDatabase(dbPath: string, opts?: { readOnly?: boolean }): {
   try {
     return { db: new NodeSqliteAdapter(dbPath, opts), backend: 'node-sqlite' };
   } catch (error) {
-    // node:sqlite loaded and SQLite itself failed — not a missing-module case.
-    const shared = toWslSharedIndexError(error, dbPath);
-    if (shared) throw shared;
-    const msg = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      'Failed to open SQLite via the built-in node:sqlite module.\n' +
-      'CodeGraph requires node:sqlite (Node.js 22.5+). Install the self-contained\n' +
-      'CodeGraph release (it bundles a compatible Node), or run on Node 22.5+.\n' +
-      `Underlying error: ${msg}`
-    );
+    // A runtime without node:sqlite says so (NodeSqliteUnavailableError);
+    // anything SQLite itself reported names its code and the path.
+    throw toDatabaseOpenError(error, dbPath);
   }
 }

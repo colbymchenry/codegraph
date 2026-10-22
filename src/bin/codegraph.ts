@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -72,6 +72,7 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -1511,11 +1512,14 @@ program
 
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
-      // Desktop reminders are hook metadata, not part of the user's query (#2635).
-      const prompt = String(input.prompt || '')
-        .replace(/<system-reminder(?:\s[^>]*)?>[\s\S]*?<\/system-reminder>/g, '').trim();
-      // System envelopes are not user prompts: exit before the gate or project lookup.
-      if (!prompt || isTaskNotification(prompt) || isAgentMessage(prompt)) return;
+      // The desktop app's <system-reminder> blocks are host status, not what
+      // the user typed: gate, pick the project and explore on the rest
+      // (#2635).
+      const prompt = stripSystemReminders(String(input.prompt || ''));
+      // System-injected task notifications, subagent hand-backs and messages
+      // from other sessions are not user prompts, and neither is nothing:
+      // exit before any project lookup or explore work (#1832, #2184, #2635).
+      if (!prompt || isTaskNotification(prompt) || isAgentMessage(prompt) || isCrossSessionMessage(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
@@ -2332,7 +2336,7 @@ for (const direction of ['callers', 'callees'] as const) {
         const cg = await CodeGraph.open(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
-          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
           if (targets.length === 0) {
             info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
             return;
@@ -2456,7 +2460,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
-        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
         if (targets.length === 0) {
           info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
           return;
@@ -2736,17 +2740,25 @@ program
         ? [opts.location as 'global' | 'local']
         : ['global', 'local'];
       let changed = 0;
+      let failed = 0;
       for (const loc of locs) {
         for (const report of refreshTargets(ALL_TARGETS, loc)) {
+          if (report.status === 'failed') {
+            failed += 1;
+            error(`${report.displayName}: could not refresh — ${report.error}`);
+          }
           for (const p of report.changedPaths) {
             changed += 1;
             console.log(`  ${report.displayName}: refreshed ${p}`);
           }
         }
       }
-      if (changed === 0) {
+      if (changed === 0 && failed === 0) {
         console.log('All configured agent surfaces are already current.');
       }
+      // Non-zero so `codegraph upgrade` tells the user to look; every other
+      // agent was still refreshed.
+      if (failed > 0) process.exitCode = 1;
       return;
     }
 

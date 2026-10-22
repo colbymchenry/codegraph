@@ -293,12 +293,13 @@ export const kotlinExtractor: LanguageExtractor = {
       // grammar makes a following SIBLING rather than a child; those bodies used
       // to attribute to the enclosing class. Consumed here so the accessor
       // branch below can skip them without any cross-node state.
-      const inits = created
-        ? [...kotlinPropertyInitializers(node), ...kotlinFollowingAccessors(node)]
-        : [];
-      if (created && inits.length > 0) {
+      // The initializers are walked as such, so the dispatcher's
+      // function-as-value scan of the property skips them: it would take each
+      // function value again for the enclosing file or class.
+      if (created) {
         ctx.pushScope(created.id);
-        for (const init of inits) ctx.visitFunctionBody(init, created.id);
+        for (const init of kotlinPropertyInitializers(node)) ctx.walkInitializer(init, created.id);
+        for (const accessor of kotlinFollowingAccessors(node)) ctx.visitFunctionBody(accessor, created.id);
         ctx.popScope();
       }
       return true;

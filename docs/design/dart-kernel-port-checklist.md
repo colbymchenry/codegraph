@@ -226,7 +226,12 @@ Grammar-shape facts the config leans on (all probed, `mini-cst.txt` /
   keyword node, identifier, on-types as bare type_identifiers, class_body).
   `enum_declaration`: `name:` + `body:` (enum_body); `enum_constant.name` ✓.
   `type_alias` has NO fields (both modern `typedef X = T` and legacy
-  `typedef void X(int)` are node `type_alias`).
+  `typedef void X(int)` are node `type_alias`). Its name is the last direct
+  `type_identifier` before the `=`, `type_parameters` or
+  `formal_parameter_list` child: a legacy return type comes first (`typedef
+  Report X(int n)`), and until 2026-10-21 the first-identifier fallback
+  named such a typedef after its return type (`dartTypeAliasName` /
+  `type_alias_name` now, via resolveName).
   `initialized_variable_definition`: `name:` + one-or-more `value:` fields
   (the RHS postfix chain is FLATTENED into multiple value-fielded siblings).
 - **In-class member shapes:** methods/getters/setters/operators/factories
@@ -472,7 +477,7 @@ Registration: `EXTRACTORS.dart` (languages/index.ts:56), `FN_REF_SPECS.dart`
 | `mixin_declaration`, `extension_declaration` | extraClassNodeTypes:1022 | extractClass(node) → kind **`class`** |
 | `method_signature`, `constructor_signature` | methodTypes:1027 | **NOT class-gated at the ladder** — extractMethod:1737 runs anywhere; its own gate :1747 (not class-like, no methodsAreTopLevel, no receiver) falls back: parent `object`/`object_expression`? (never in dart) else **extractFunction** — this is how extension-TYPE members and any stray non-class method_signature become plain `function` nodes (pinned: `extension type MetersT` → function `km`, bare QN) |
 | `enum_declaration` | enumTypes:1064 → extractEnum:1914 | §Class family |
-| `type_alias` | typeAliasTypes:1071 → extractTypeAlias:2890 | plain type_alias node; `getChildByField(node,'value')` → **null** (no fields) → **NO refs from the aliased type** (`typedef MapAlias = Map<String, WidgetT>` emits nothing); returns false → children re-visited (function_type/formal_parameter_list children match nothing) |
+| `type_alias` | typeAliasTypes:1071 → extractTypeAlias:2890 | type_alias node named by the resolveName hook (§Extractor config); `getChildByField(node,'value')` → **null** (no fields), so the dart branch — `pushDartTypeAliasRefs` / `type_alias_refs`, since 2026-10-21 (#2327; nothing before) — emits a `references` ref from the node for each type named in every named child but the name and `annotation`s, through the isDartTypeName gate (`typedef MapAlias = Map<String, WidgetT>` → `Map`, `WidgetT`). A type parameter in scope is skipped unless written `p.T`: the typedef's own, and those of any node that declares `type_parameters` (a generic `function_type`, an old-style generic function-typed `formal_parameter`) within it. Returns false → children re-visited (they match nothing type-related; an annotated typedef's arguments are fn-ref capture points) |
 | `import_or_export`, `part_directive` | importTypes:1209 → extractImport:3170 | §Extractor config. No skipChildren: the directive's children are still recursed, so an annotated directive's arguments are fn-ref capture points (`@Tag(f) import 'a.dart';` captures `f`). The kernel arm recurses too — since 2026-10-06; before, its `import_or_export` arm returned and missed those (TortureDirectives.dart pins both) |
 | `new_expression` | INSTANTIATION_KINDS:1255 (`new_expression` ∈ :354-361) | extractInstantiation:4610 → ctor field lookups null → namedChild(0) = type_identifier → `instantiates` ref from stack top; `<`-strip + last-`.`-segment apply (`new p.Foo<T>()` → `Foo`). findAnonymousClassBody → always null for dart. Children still recursed |
 | `function_body` (sibling of a consumed signature) | **no branch** | recursed → THE DOUBLE-WALK (§below) |
@@ -1299,8 +1304,9 @@ NO unwrap, NO ungatedModes, NO addressOfOnly. Pins:
    sealed/base modifiers (plain classes); enum (simple + enhanced: ctor'd
    constants at constant positions, args unwalked, `with` GAP vs
    `implements` ✓, members after `;`); typedef ×3 (modern/legacy/generic —
-   zero refs); extension type (container invisible, **members leak as bare
-   `function`s**); the FULL call matrix (§Calls rows verbatim — incl.
+   zero refs until 2026-10-21, the aliased types since; every form is in
+   TortureTypedefs.dart); extension type (container invisible, **members
+   leak as bare `function`s**); the FULL call matrix (§Calls rows verbatim — incl.
    cascade invisibility, `?.`, const-object args, chain re-encodes,
    interpolation calls, `$x` vs `${x}`); static reads (`X.member`,
    `X.method()` double-emission, 3-segment nothing, case-pattern GAP);

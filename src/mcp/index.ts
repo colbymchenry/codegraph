@@ -49,7 +49,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
-import { connectWithHello, runLocalHandshakeProxy } from './proxy';
+import { connectWithHello, DAEMON_HELLO_TIMEOUT_MS, runLocalHandshakeProxy } from './proxy';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
@@ -163,20 +163,74 @@ function makeFallbackEngine(root: string): MCPEngine {
 }
 
 /**
- * How long a launcher waits for a freshly-spawned daemon to bind its socket
- * before giving up and running in-process. The daemon binds the socket *before*
- * the (backgrounded) engine/grammar warm-up, so this only needs to cover node
- * process startup. 60 × 100ms = 6s of headroom for a cold/slow box; on the
- * common path the socket appears within a few rounds.
+ * How long a launcher waits for a freshly-spawned daemon to answer before
+ * giving up and running in-process. The daemon binds the socket *before* the
+ * (backgrounded) engine/grammar warm-up, so this only needs to cover node
+ * process startup: 6s of headroom for a cold/slow box; on the common path the
+ * socket appears within a few rounds.
+ *
+ * A budget of wall time, not a count of probes. A process that holds the pipe
+ * but never says hello — in practice a daemon whose main thread is blocked —
+ * makes every probe wait out its whole hello timeout, so the old 240 probes
+ * held a session's first tool call for about 12 minutes. Spent, the session is
+ * served in-process exactly as when the daemon never binds, and the proxy keeps
+ * retrying with backoff (#2277): a daemon its liveness watchdog kills (60s by
+ * default) is replaced by the next retry, never bypassed for good.
  */
+const DAEMON_CONNECT_BUDGET_MS = 6_000;
 // Poll finely (25ms) so the proxy attaches the instant the freshly-spawned
 // daemon binds, instead of waiting up to a coarse 100ms after — shaves the
-// cold-start handshake (the window the headless agent races). Same ~6s total
-// give-up budget (240 × 25ms), just finer granularity; socket-connect probes
-// are cheap. Paired with deferring the CodeGraph load (engine.ts) off the bind
-// path, this narrows the "No such tool available" race window.
-const DAEMON_CONNECT_MAX_RETRIES = 240;
+// cold-start handshake (the window the headless agent races); socket-connect
+// probes are cheap. Paired with deferring the CodeGraph load (engine.ts) off the
+// bind path, this narrows the "No such tool available" race window.
 const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
+
+/**
+ * Probe the daemon's socket candidates in order (the in-project path first);
+ * the first that answers wins. With a `deadline`, no hello wait runs past it.
+ * The connect and the clock are injectable for tests.
+ */
+export async function connectAnyDaemonCandidate(
+  candidates: readonly string[],
+  deadline = Infinity,
+  connect: typeof connectWithHello = connectWithHello,
+  now: () => number = Date.now,
+): Promise<Awaited<ReturnType<typeof connectWithHello>>> {
+  for (const candidate of candidates) {
+    const left = deadline - now();
+    if (left <= 0) return null;
+    const s = await connect(candidate, CodeGraphPackageVersion, Math.min(DAEMON_HELLO_TIMEOUT_MS, left));
+    // A wrong-version daemon IS up — definitive; propagate so the caller
+    // replaces it (an older release) or serves in-process instead of
+    // spawning + polling for 6s. Don't keep probing fallbacks past it.
+    if (s) return s;
+  }
+  return null;
+}
+
+/**
+ * Probe for a daemon every `retryDelayMs` until one answers or `budgetMs` of
+ * wall time is spent. `probe` gets the deadline, and caps its own hello wait to
+ * it. Resolves the socket, or null once the budget is spent or a daemon of
+ * another version answers. The clock is injectable for tests.
+ */
+export async function pollForDaemon<S>(
+  probe: (deadline: number) => Promise<S | 'older-version' | 'version-mismatch' | null>,
+  budgetMs: number = DAEMON_CONNECT_BUDGET_MS,
+  retryDelayMs: number = DAEMON_CONNECT_RETRY_DELAY_MS,
+  clock: { now(): number; sleep(ms: number): Promise<void> } = { now: Date.now, sleep },
+): Promise<S | null> {
+  const deadline = clock.now() + budgetMs;
+  for (;;) {
+    await clock.sleep(retryDelayMs);
+    if (clock.now() >= deadline) return null;
+    const answer = await probe(deadline);
+    // Another version answering, older or not, waits for the next retry: one
+    // replacement per attempt, so this can never loop.
+    if (answer === 'older-version' || answer === 'version-mismatch') return null;
+    if (answer) return answer;
+  }
+}
 
 /** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
 function daemonOptOutSet(): boolean {
@@ -684,16 +738,7 @@ export class MCPServer {
     // bound with zero coordination. The in-project candidate is tried first, so a
     // normal repo pays nothing extra (it connects on the very first probe).
     const candidates = getDaemonSocketCandidates(root);
-    const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
-      for (const candidate of candidates) {
-        const s = await connectWithHello(candidate);
-        // A wrong-version daemon IS up — definitive; propagate so the caller
-        // replaces it (an older release) or serves in-process instead of
-        // spawning + polling for 6s. Don't keep probing fallbacks past it.
-        if (s) return s;
-      }
-      return null;
-    };
+    const connectAnyCandidate = (deadline?: number) => connectAnyDaemonCandidate(candidates, deadline);
     const getDaemonSocket = async () => {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
@@ -710,15 +755,9 @@ export class MCPServer {
       // replacement this launcher holds the writer slot for it meanwhile.
       try {
         spawnDetachedDaemon(root, older === 'stopped');
-        for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-          await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-          const s = await connectAnyCandidate();
-          // Another version answering now, older or not, waits for the next
-          // retry: one replacement per attempt, so this can never loop.
-          if (s === 'older-version' || s === 'version-mismatch') return null;
-          if (s) return s;
-        }
-        return null; // never bound — the proxy serves this session in-process
+        // Null when nothing answered in time — never bound, or a holder that
+        // never says hello: the proxy serves this session in-process.
+        return await pollForDaemon(connectAnyCandidate);
       } finally {
         // The new daemon has taken the slot over, or never came; a no-op unless still ours.
         if (older === 'stopped') releaseWriterLock(root);

@@ -61,3 +61,16 @@ def bucket_chains(d, k, v):
     make().run()
     (lambda: make)()().run()
     obj.make().run().again()
+
+
+# --- non-call, non-identifier receivers (#66) ---------------------------------
+def fabrication_shapes(rows_by_file, key):
+    # Attribute chain and subscript. Each must keep its receiver text as a
+    # qualifier — a bare `append`/`get` exact-matches an unrelated project
+    # function of that name. (The call-chain shape lives in bucket_chains
+    # above, which #1748 encodes as `<inner>().<method>` instead.)
+    self_like = rows_by_file
+    self_like.rows.append({"x": 1})
+    rows_by_file[key].append(2)
+    rows_by_file[key].get(key, None)
+    return rows_by_file

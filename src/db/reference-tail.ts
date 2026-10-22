@@ -143,9 +143,9 @@ export function importPathKeys(filePath: string): string[] {
  * same path through its folder. A sync looks them up for the files it adds
  * AND the ones it changes: a route renders the component its module exports,
  * so an edit that gives the module one is what the route waited for. So does
- * a reference through an import binding the module declares under another
- * name, and a direct member reference through any binding
- * (`importBindingTail`), which are parked under the same keys.
+ * a reference through an import binding of the module, and a direct member
+ * reference through any binding (`importBindingTail`), which are parked under
+ * the same keys.
  */
 export function moduleReferenceKeys(filePath: string): string[] {
   const keys = importPathKeys(filePath);
