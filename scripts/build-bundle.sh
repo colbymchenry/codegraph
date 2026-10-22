@@ -21,7 +21,7 @@
 set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
-NODE_VERSION="${2:-v24.16.0}"
+NODE_VERSION="${2:-v24.19.0}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release"
