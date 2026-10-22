@@ -11324,12 +11324,17 @@ function jsBindingEnclosesReference(name: string, fn: Node, ref: UnresolvedRef, 
  * declaration starts) is still open at the end of `code`.
  */
 function jsBlockOpenAtEnd(code: string, at: number): boolean {
+  return jsBlockEnd(code, at) === code.length;
+}
+
+/** Where the block that holds `at` closes: its `}`, or the end of `code`. */
+function jsBlockEnd(code: string, at: number): number {
   let depth = 0;
   for (let i = at; i < code.length; i++) {
     if (code[i] === '{') depth++;
-    else if (code[i] === '}' && --depth < 0) return false;
+    else if (code[i] === '}' && --depth < 0) return i;
   }
-  return true;
+  return code.length;
 }
 
 const JS_OPERAND_END = /[\w$)\]}'"`]/;
@@ -11343,18 +11348,23 @@ const JS_OPERAND_START = /[\w$'"`]/;
  * statement where no semicolon ends the last.
  */
 function jsBodyOpenAtEnd(code: string, at: number): boolean {
+  return jsBodyEnd(code, at) === code.length;
+}
+
+/** Where the body that starts at `at` (see jsBodyOpenAtEnd) ends, or the end of `code`. */
+function jsBodyEnd(code: string, at: number): number {
   let i = at;
   while (i < code.length && WHITESPACE.test(code[i]!)) i++;
-  if (code[i] === '{') return jsBlockOpenAtEnd(code, i + 1);
+  if (code[i] === '{') return jsBlockEnd(code, i + 1);
   let depth = 0;
   for (; i < code.length; i++) {
     const c = code[i]!;
     if (c === '(' || c === '[' || c === '{') {
       depth++;
     } else if (c === ')' || c === ']' || c === '}') {
-      if (--depth < 0) return false;
+      if (--depth < 0) return i;
     } else if (depth === 0 && (c === ',' || c === ';')) {
-      return false;
+      return i;
     } else if (depth === 0 && c === '\n') {
       // `const f = (x) => x + 1` with no semicolon, above the reference: the
       // line before ends an operand (a name, a closing bracket, a quote) and
@@ -11364,11 +11374,11 @@ function jsBodyOpenAtEnd(code: string, at: number): boolean {
       while (before >= 0 && WHITESPACE.test(code[before]!)) before--;
       let after = i + 1;
       while (after < code.length && WHITESPACE.test(code[after]!)) after++;
-      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return false;
+      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return i;
       i = after - 1;
     }
   }
-  return true;
+  return code.length;
 }
 
 /**
@@ -17815,6 +17825,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
   LOCAL_BINDING_SITES.delete(context);
+  DYNAMIC_IMPORT_SCANS.delete(context);
   SELECTOR_NAMES.delete(context);
   GET_STATE_FILES.delete(context);
   DESTRUCTURED_FILES.delete(context);
@@ -19881,12 +19892,111 @@ export function reExportSource(name: string, ref: UnresolvedRef, context: Resolu
 /**
  * Does the file bind `name` by importing it from outside the repository? So
  * does a barrel's `export { name } from 'pkg'`: its `imports` reference names
- * the package's export.
+ * the package's export. So does a dynamic import in scope at the reference
+ * (dynamicImportSource), which wins over the file's static one, as an inner
+ * binding does.
  */
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
-  const source = binding?.source ?? (ref.referenceKind === 'imports' ? reExportSource(name, ref, context) : undefined);
+  const source = dynamicImportSource(name, ref, context) ?? binding?.source ??
+    (ref.referenceKind === 'imports' ? reExportSource(name, ref, context) : undefined);
   return source !== undefined && context.isOutOfRepoImport?.(source, ref.filePath, ref.language) === true;
+}
+
+/**
+ * A file's dynamic `import()` bindings: what each one binds, from which
+ * module, and the stretch of the file it is in scope for (offsets in the
+ * file's text). Read once per file; kept for the last few files, since
+ * references arrive file by file.
+ */
+interface DynamicImportScan {
+  names: ReadonlySet<string>;
+  lineStarts: number[];
+  bindings: Array<{ names: string[]; source: string; at: number; scopeEnd: number }>;
+}
+const DYNAMIC_IMPORT_SCANS = new WeakMap<ResolutionContext, Map<string, DynamicImportScan>>();
+const DYNAMIC_IMPORT_SCANS_KEEP = 64;
+const NO_DYNAMIC_IMPORTS: DynamicImportScan = { names: new Set(), lineStarts: [], bindings: [] };
+/** `const { a, b: c, default: d } = await import('x')`. */
+const DYNAMIC_IMPORT_DECLARATION = /\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*await\s+import\s*\(\s*(['"])([^'"\n]+)\2\s*\)/g;
+/** `import('x').then(({ a }) => …)`, or a `function ({ a }) {…}` callback. */
+const DYNAMIC_IMPORT_CALLBACK =
+  /\bimport\s*\(\s*(['"])([^'"\n]+)\1\s*\)\s*\.\s*then\s*\(\s*(?:async\s+)?(?:function\s*[\w$]*\s*)?\(\s*\{([^{}]*)\}\s*\)\s*(=>|\{)/g;
+
+/** The local names a destructuring list binds: `a`, `b: c` (c), `default: d` (d), `e = 1` (e). */
+function destructuredLocals(list: string): string[] {
+  const out: string[] = [];
+  for (const part of list.split(',')) {
+    const binding = part.replace(/=[\s\S]*$/, '').trim();
+    if (binding.startsWith('...')) continue;
+    const colon = binding.indexOf(':');
+    const local = (colon >= 0 ? binding.slice(colon + 1) : binding).trim();
+    if (/^[A-Za-z_$][\w$]*$/.test(local)) out.push(local);
+  }
+  return out;
+}
+
+function dynamicImportScan(filePath: string, context: ResolutionContext): DynamicImportScan {
+  let cache = DYNAMIC_IMPORT_SCANS.get(context);
+  if (!cache) DYNAMIC_IMPORT_SCANS.set(context, (cache = new Map()));
+  let scan = cache.get(filePath);
+  if (scan) return scan;
+  scan = NO_DYNAMIC_IMPORTS;
+  const source = context.readFile(filePath) ?? '';
+  const dynamic = /\bimport\s*\(/.test(source);
+  const declarations = dynamic ? [...source.matchAll(DYNAMIC_IMPORT_DECLARATION)] : [];
+  const callbacks = dynamic ? [...source.matchAll(DYNAMIC_IMPORT_CALLBACK)] : [];
+  if (declarations.length > 0 || callbacks.length > 0) {
+    // Offsets survive both passes. A match in a comment or a string binds
+    // nothing, and brackets in strings, template literals and regex literals
+    // open no scope.
+    const regexes: number[] = [];
+    const chars = blankStringContents(stripCommentsForRegex(source, 'javascript'), regexes).split('');
+    for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
+    const code = chars.join('');
+    const bindings: DynamicImportScan['bindings'] = [];
+    for (const m of declarations) {
+      if (code[m.index!] !== source[m.index!]) continue;
+      bindings.push({ names: destructuredLocals(m[1]!), source: m[3]!, at: m.index!, scopeEnd: jsBlockEnd(code, m.index!) });
+    }
+    for (const m of callbacks) {
+      if (code[m.index!] !== source[m.index!]) continue;
+      const body = m.index! + m[0].length;
+      const scopeEnd = m[4] === '{' ? jsBlockEnd(code, body) : jsBodyEnd(code, body);
+      bindings.push({ names: destructuredLocals(m[3]!), source: m[2]!, at: m.index!, scopeEnd });
+    }
+    if (bindings.length > 0) {
+      const lineStarts = [0];
+      for (let i = source.indexOf('\n'); i !== -1; i = source.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+      scan = { names: new Set(bindings.flatMap((b) => b.names)), lineStarts, bindings };
+    }
+  }
+  if (cache.size >= DYNAMIC_IMPORT_SCANS_KEEP) cache.delete(cache.keys().next().value!);
+  cache.set(filePath, scan);
+  return scan;
+}
+
+/**
+ * The module a dynamic import binds `name` from, where the reference sits:
+ * vite's `const { createServer } = await import('node:http'); return
+ * createServer(app)` means node's `createServer`, never the project's. Only a
+ * binding in scope there counts — declared earlier in a block that is still
+ * open (a top-level `await import()` binds the whole module), or a parameter
+ * of the `import('x').then(({ a }) => …)` callback the reference is in:
+ * nitro's `async function createWebSocketProxy()` imports crossws's
+ * `createWebSocketProxy` inside itself, while the file's other calls mean
+ * the function. Of several in scope, the innermost: the last to start.
+ */
+function dynamicImportSource(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!JS_FAMILY.has(ref.language)) return undefined;
+  const scan = dynamicImportScan(ref.filePath, context);
+  if (!scan.names.has(name)) return undefined;
+  const at = (scan.lineStarts[ref.line - 1] ?? Number.POSITIVE_INFINITY) + ref.column;
+  let found: DynamicImportScan['bindings'][number] | undefined;
+  for (const binding of scan.bindings) {
+    if (binding.at < at && at <= binding.scopeEnd && binding.names.includes(name) && (!found || binding.at > found.at)) found = binding;
+  }
+  return found?.source;
 }
 
 /** A module a bundler loads as data, not code: a stylesheet, an image, a GraphQL document, JSON, a font. */
