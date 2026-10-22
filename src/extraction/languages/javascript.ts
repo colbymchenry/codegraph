@@ -1,6 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
-import { classifyTsClassMember } from './typescript';
+import { classifyTsClassMember, typescriptExtractor } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
@@ -9,6 +9,10 @@ export const javascriptExtractor: LanguageExtractor = {
   // JS `field_definition` ≙ TS `public_field_definition`: plain fields are
   // properties, function-valued fields are methods (#808).
   classifyMethodNode: classifyTsClassMember,
+  // `static` is the same keyword child in both grammars. Without it every JS
+  // method was stored as an instance method, and a static `s()` paired with
+  // the instance `s()` of a subclass as an override (#2761).
+  isStatic: typescriptExtractor.isStatic,
   interfaceTypes: [],
   structTypes: [],
   enumTypes: [],

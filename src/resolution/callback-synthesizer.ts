@@ -1668,6 +1668,9 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         for (const m of impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
+          // A static method and an instance method of one name are not an
+          // override pair: a call to one never runs the other (#2761).
+          if ((bm.isStatic ?? false) !== (m.isStatic ?? false)) continue;
           const key = `${bm.id}>${m.id}`;
           if (seen.has(key)) continue;
           seen.add(key);

@@ -1072,13 +1072,10 @@ impl<'t> Walker<'t> {
         self.has_keyword_child(node, "async")
     }
 
-    /// TS has an isStatic hook; JS does not (None = field absent).
+    /// Both extractors read the `static` keyword child — JS's hook is TS's
+    /// since #2761.
     fn is_static(&self, node: Node) -> Option<bool> {
-        if self.variant.is_ts() {
-            Some(self.has_keyword_child(node, "static"))
-        } else {
-            None
-        }
+        Some(self.has_keyword_child(node, "static"))
     }
 
     fn is_const_decl(&self, node: Node) -> bool {
