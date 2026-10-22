@@ -11,16 +11,29 @@
  *   at the `[` and every member declared after it in the class was lost.
  *   The extractor reads nothing from an attribute, and a signature still
  *   shows it: Pascal signatures read the source as written.
+ * - The inline variable of a `for … in` loop (Delphi 10.3): `for var lItem in
+ *   AList do`, `for var lHandle: THandle in lHandles do`. The grammar's for-in
+ *   rule takes a plain variable, so the whole loop became an error and no
+ *   call in its body was read. Blanking `var` and the type leaves the loop
+ *   the grammar knows. The resolver still finds the type: it reads a
+ *   receiver's declaration from the source as written.
  */
 
 const MODIFIERS: ReadonlySet<string> = new Set(['const', 'var', 'out', 'constref']);
 const ROUTINE_KEYWORDS: ReadonlySet<string> = new Set(['procedure', 'function', 'constructor', 'destructor', 'operator']);
 /** An attribute group longer than this is not one (and keeps the scan linear). */
 const MAX_ATTRIBUTE_LENGTH = 2000;
+/** A for-in loop variable's type longer than this is not one. */
+const MAX_LOOP_TYPE_LENGTH = 500;
+/** Words that end a for-in variable's type without an `in`: not the for-in form. */
+const NOT_A_FOR_IN: ReadonlySet<string> = new Set(['do', 'to', 'downto', 'begin', 'end']);
+/** Whether a file can hold a `for var … in` loop at all (the scan below decides). */
+const FOR_VAR = /\bfor\s+var\b/i;
 
 const CH_TAB = 9, CH_LF = 10, CH_CR = 13, CH_SPACE = 32, CH_AMP = 38, CH_QUOTE = 39;
 const CH_LPAREN = 40, CH_RPAREN = 41, CH_STAR = 42, CH_DOT = 46, CH_SLASH = 47;
-const CH_SEMI = 59, CH_LT = 60, CH_GT = 62, CH_LBRACKET = 91, CH_RBRACKET = 93, CH_LBRACE = 123;
+const CH_COLON = 58, CH_SEMI = 59, CH_LT = 60, CH_EQ = 61, CH_GT = 62;
+const CH_LBRACKET = 91, CH_RBRACKET = 93, CH_LBRACE = 123;
 
 /** Identifier characters, `&` (Delphi's keyword escape) and any non-ASCII letter. */
 function isIdentStart(c: number): boolean {
@@ -199,6 +212,62 @@ function scanParameterList(s: string, open: number, ranges: number[]): number {
   return i;
 }
 
+/** The word starting at `i`, lowercased, or '' when no word starts there. */
+function lowerWordAt(s: string, i: number): string {
+  return isIdentStart(s.charCodeAt(i)) ? s.slice(i, wordEnd(s, i + 1)).toLowerCase() : '';
+}
+
+/**
+ * After a `for` keyword ending at `forEnd`, recognize `var Name in` or
+ * `var Name: Type in` and push the `var` range and the `: Type` range onto
+ * `ranges`. The type runs to the `in` at nesting depth 0, so generic types
+ * (`TPair<string, TList<Integer>>`) and dotted names are whole. Any other
+ * shape (`for var i := 0 to …`, which the grammar parses, or no `in`) adds
+ * nothing. Returns the index to resume scanning from.
+ */
+function scanForInVariable(s: string, forEnd: number, ranges: number[]): number {
+  const varStart = skipTrivia(s, forEnd);
+  if (lowerWordAt(s, varStart) !== 'var') return forEnd;
+  const varEnd = varStart + 3;
+  const nameStart = skipTrivia(s, varEnd);
+  if (!isIdentStart(s.charCodeAt(nameStart))) return forEnd;
+  let i = skipTrivia(s, wordEnd(s, nameStart + 1));
+  let typeStart = -1;
+  if (s.charCodeAt(i) === CH_COLON && s.charCodeAt(i + 1) !== CH_EQ) {
+    typeStart = i;
+    const limit = Math.min(s.length, i + MAX_LOOP_TYPE_LENGTH);
+    let depth = 0;
+    i++;
+    for (;;) {
+      if (i >= limit) return forEnd;
+      const k = commentOrStringEnd(s, i);
+      if (k >= 0) {
+        i = k;
+        continue;
+      }
+      const c = s.charCodeAt(i);
+      if (c === CH_LT || c === CH_LPAREN || c === CH_LBRACKET) {
+        depth++;
+      } else if (c === CH_GT || c === CH_RPAREN || c === CH_RBRACKET) {
+        if (--depth < 0) return forEnd;
+      } else if (c === CH_SEMI || c === CH_EQ) {
+        return forEnd; // `for var i: Integer := 0 to …`, or no loop at all
+      } else if (isIdentStart(c)) {
+        const word = lowerWordAt(s, i);
+        if (depth === 0 && word === 'in') break;
+        if (NOT_A_FOR_IN.has(word)) return forEnd;
+        i = wordEnd(s, i + 1);
+        continue;
+      }
+      i++;
+    }
+  }
+  if (lowerWordAt(s, i) !== 'in') return forEnd;
+  ranges.push(varStart, varEnd);
+  if (typeStart >= 0) ranges.push(typeStart, i);
+  return i;
+}
+
 /** `s` with every `[from, to)` range in `ranges` blanked to spaces, newlines kept. */
 function blankRanges(s: string, ranges: number[]): string {
   if (ranges.length === 0) return s;
@@ -225,7 +294,7 @@ function followsClass(s: string, i: number): boolean {
  * the source unchanged when there is nothing to blank.
  */
 export function preParsePascal(source: string): string {
-  if (source.indexOf('[') < 0) return source;
+  if (source.indexOf('[') < 0 && !FOR_VAR.test(source)) return source;
   const ranges: number[] = [];
   const n = source.length;
   let i = 0;
@@ -248,6 +317,9 @@ export function preParsePascal(source: string): string {
           i = scanParameterList(source, open, ranges);
           continue;
         }
+      } else if (len === 3 && source.slice(i, e).toLowerCase() === 'for') {
+        i = scanForInVariable(source, e, ranges);
+        continue;
       }
       i = e;
     } else if (c >= 48 && c <= 57) {
