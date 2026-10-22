@@ -378,7 +378,7 @@ end.
       expect(callsFrom(cg, 'TConn::Connect')).toEqual(['24: TOciLib::HandleAlloc']);
       // A parameter and a nested routine, not the properties named so.
       expect(callsFrom(cg, 'Hash')).toEqual([]);
-      expect(callsFrom(cg, 'Test')).toEqual([]);
+      expect(callsFrom(cg, 'Test')).toEqual(['39: Test::Direct']);
     });
   });
 

@@ -8670,59 +8670,101 @@ export class TreeSitterExtractor {
     if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
-    // Visit the block for calls
-    const block = node.namedChildren.find(
-      (c: SyntaxNode) => c.type === 'block'
-    );
-    if (block) {
-      // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
-      // with their constraints (`TList<T: class>`).
-      const owner = fullName.includes('.') ? fullName.replace(/<[^>]*>/g, '').split('.').slice(0, -1).join('::') : null;
-      this.pascalScopes.push({
-        locals: this.pascalRoutineLocals(node),
-        classQn: owner,
-        routine: shortNameKey.replace(/<.*$/, ''),
-        startLine: node.startPosition.row + 1,
-      });
-      this.nodeStack.push(parentId);
-      this.visitPascalBlock(block);
-      this.nodeStack.pop();
-      this.pascalScopes.pop();
+    // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
+    // with their constraints (`TList<T: class>`).
+    const owner = fullName.includes('.') ? fullName.replace(/<[^>]*>/g, '').split('.').slice(0, -1).join('::') : null;
+    const routineId = parentId;
+    // What a routine nested in this one is qualified under: the routine's
+    // node, or its name as written when the implementation matched none.
+    const qualifiedName = (): string => {
+      const routine = this.nodes.find((n) => n.id === routineId);
+      return routine && routine.kind !== 'file' ? routine.qualifiedName : fullName.replace(/<[^>]*>/g, '').split('.').join('::');
+    };
+    this.walkPascalRoutine(node, routineId, owner, shortNameKey.replace(/<.*$/, ''), qualifiedName);
+  }
+
+  /**
+   * A routine's declarations and body, walked for its calls with the routine
+   * as their caller. A routine nested in it (`procedure Inner;` between its
+   * header and `begin`) is a function of its own, qualified under it
+   * (`TFoo::Bar::Inner`), whose calls are its own; it sees the names the
+   * routine declares above it, as the routine's body sees them all.
+   */
+  private walkPascalRoutine(node: SyntaxNode, routineId: string, classQn: string | null, routine: string, qualifiedName: () => string): void {
+    const locals = this.pascalRoutineLocals(node, true);
+    this.pascalScopes.push({ locals, classQn, routine, startLine: node.startPosition.row + 1 });
+    this.nodeStack.push(routineId);
+    let block: SyntaxNode | null = null;
+    const misplaced: SyntaxNode[] = [];
+    const broken = node.hasError;
+    for (const c of node.namedChildren) {
+      if (c.type === 'declVars' || c.type === 'declConsts') {
+        for (const decl of c.namedChildren) this.declarePascalLocal(locals, decl);
+      } else if (c.type === 'defProc') {
+        // A nested routine comes before the body. Where the routine's tree
+        // has errors, its parse can swallow the unit's routines after it,
+        // which start their lines where it does: those are the unit's.
+        if (block || (broken && c.startPosition.column <= node.startPosition.column)) misplaced.push(c);
+        else this.extractPascalNestedRoutine(c, classQn, qualifiedName());
+      } else if (c.type === 'block' && !block) {
+        // The first: `{$IFDEF}`s around two bodies leave a second.
+        block = c;
+      }
     }
+    if (block) this.visitPascalBlock(block);
+    this.nodeStack.pop();
+    this.pascalScopes.pop();
+    for (const c of misplaced) this.extractPascalDefProc(c);
+  }
+
+  /** A routine nested in another (see walkPascalRoutine), under the qualified name of the one it is nested in. */
+  private extractPascalNestedRoutine(node: SyntaxNode, classQn: string | null, outerQualifiedName: string): void {
+    const declProc = node.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+    const nameNode = declProc ? getChildByField(declProc, 'name') : null;
+    if (!declProc || nameNode?.type !== 'identifier') return;
+    const name = getNodeText(nameNode, this.source);
+    const qualifiedName = `${outerQualifiedName}::${name}`;
+    const fn = this.createNode('function', name, node, {
+      qualifiedName,
+      signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
+    });
+    if (!fn) return;
+    this.walkPascalRoutine(node, fn.id, classQn, name.toLowerCase(), () => qualifiedName);
   }
 
   /**
    * The names a routine (a `defProc`) or an anonymous method (a `lambda`)
    * declares before its body, lowercased, with the class or record type each
    * is declared with (null when it has none, or none a name can stand for):
-   * parameters, `var`/`const` sections, nested routines and `Result`. The
-   * body's inline declarations join as the walk reaches them
+   * parameters, `var`/`const` sections and `Result` (with `headerOnly`, the
+   * parameters and `Result`; walkPascalRoutine adds the sections in order).
+   * The body's inline declarations join as the walk reaches them
    * (`declarePascalInline`). A bare name among them is the routine's own,
-   * never a call.
+   * never a call. A nested routine's name is not: it is a routine to call.
    */
-  private pascalRoutineLocals(routine: SyntaxNode): Map<string, string | null> {
+  private pascalRoutineLocals(routine: SyntaxNode, headerOnly = false): Map<string, string | null> {
     const names = new Map<string, string | null>();
     const header = routine.type === 'lambda' ? routine : routine.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
     names.set('result', this.pascalTypeName(header?.namedChildren.find((c: SyntaxNode) => c.type === 'typeref')));
-    const declare = (decl: SyntaxNode): void => {
-      const type = this.pascalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
-      for (const c of decl.namedChildren) {
-        if (c.type === 'identifier') names.set(getNodeText(c, this.source).toLowerCase(), type);
-      }
-    };
     const args = header?.namedChildren.find((c: SyntaxNode) => c.type === 'declArgs');
     for (const arg of args?.namedChildren ?? []) {
-      if (arg.type === 'declArg') declare(arg);
+      if (arg.type === 'declArg') this.declarePascalLocal(names, arg);
     }
+    if (headerOnly) return names;
     for (const c of routine.namedChildren) {
       if (c.type === 'declVars' || c.type === 'declConsts') {
-        for (const decl of c.namedChildren) declare(decl);
-      } else if (c.type === 'defProc') {
-        const name = getChildByField(c.namedChildren.find((x: SyntaxNode) => x.type === 'declProc') ?? c, 'name');
-        if (name?.type === 'identifier') names.set(getNodeText(name, this.source).toLowerCase(), null);
+        for (const decl of c.namedChildren) this.declarePascalLocal(names, decl);
       }
     }
     return names;
+  }
+
+  /** The names a parameter, `var` or `const` declaration declares, with the type it gives them (see pascalRoutineLocals). */
+  private declarePascalLocal(names: Map<string, string | null>, decl: SyntaxNode): void {
+    const type = this.pascalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
+    for (const c of decl.namedChildren) {
+      if (c.type === 'identifier') names.set(getNodeText(c, this.source).toLowerCase(), type);
+    }
   }
 
   /**

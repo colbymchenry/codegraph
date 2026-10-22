@@ -29,7 +29,8 @@ import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformance
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
-  clearPascalScopeMemos, gatePascalDataCall, isPascalParenlessRef, isPascalSystemCall, matchPascalParenlessRef, matchPascalSystemCall,
+  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalNestedCall,
+  matchPascalParenlessRef, matchPascalSystemCall,
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
@@ -1424,9 +1425,10 @@ export class ReferenceResolver {
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
-    // A Pascal call to data runs only a routine the data holds, in scope (see
-    // gatePascalDataCall).
-    const call = ref.language === 'pascal' ? gatePascalDataCall(resolved, ref, this.context) : resolved;
+    // A Pascal call to data runs only a routine the data holds, in scope, and
+    // one to a routine nested in another comes only from inside that one (see
+    // gatePascalCall).
+    const call = ref.language === 'pascal' ? gatePascalCall(resolved, ref, this.context) : resolved;
     if (!call) return null;
 
     const target = this.nodeById(call.targetNodeId);
@@ -1462,6 +1464,11 @@ export class ReferenceResolver {
     // meaning to (`SizeOf`, `TypeInfo`, `length(S)`, `Pointer(P)`), whatever
     // its case: only a declaration in the call's scope shadows it.
     if (isPascalSystemCall(ref, this.context)) return matchPascalSystemCall(ref, this.context);
+    // A bare Pascal call to a routine nested where it is made (`Inner(1)` in
+    // the routine that declares `procedure Inner(N: Integer);`) is that one,
+    // and one made in a nested routine is what its scope declares first.
+    const nested = matchPascalNestedCall(ref, this.context);
+    if (nested) return nested;
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);

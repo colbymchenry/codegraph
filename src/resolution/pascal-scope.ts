@@ -144,8 +144,11 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
 }
 
 /**
- * A Pascal call another strategy resolved to data — a field, a property, a
- * variable, a constant — runs what the data holds, so it stands only for data
+ * What a Pascal call another strategy resolved stands for, when it landed on
+ * data or on a routine nested in another (see gatePascalNestedTarget).
+ *
+ * A call resolved to data — a field, a property, a variable, a constant —
+ * runs what the data holds, so it stands only for data
  * whose declared type is a routine's. A bare name is what its scope declares
  * (`FOnChange(Self)` in the class that declares its own `FOnChange`): the
  * routine or the routine-holding data there, whichever namesake the strategy
@@ -157,9 +160,16 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * or a declaration the parse put in the wrong place: it stands for the one
  * routine-holding field or variable the project declares by that name.
  */
-export function gatePascalDataCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const target = context.getNodeById?.(result.targetNodeId);
-  if (!target || !DATA_KINDS.has(target.kind)) return result;
+  if (!target) return result;
+  if (DATA_KINDS.has(target.kind)) return gatePascalDataCall(target, result, ref, context);
+  if (isNestedRoutine(target, context)) return gatePascalNestedTarget(result, ref, context);
+  return result;
+}
+
+/** See gatePascalCall: a call resolved to data. */
+function gatePascalDataCall(target: Node, result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   if (!isBareCall(ref, context)) return target.language === 'pascal' && isProceduralData(target, context) ? result : null;
   const lower = ref.referenceName.toLowerCase();
   if (declaredInRoutine(lower, ref, context)) return null;
@@ -310,13 +320,120 @@ function nameInScope(name: string, cls: Node | null, ref: UnresolvedRef, context
 }
 
 /**
+ * The routine nested in the calling routine, or in one around it, that a
+ * bare name there names (`procedure Inner;` between `procedure TFoo.Bar;`
+ * and its `begin`, `TFoo::Bar::Inner`): the innermost one declared above the
+ * call, the calling routine itself among them. It comes before anything of
+ * the class or the unit. Null when none is.
+ */
+function nestedRoutineInScope(lower: string, ref: UnresolvedRef, context: ResolutionContext): Found | null {
+  // Most names no nested routine has: settled before any other lookup.
+  const named = pascalNamed(lower, context);
+  if (!named.some((n) => n.kind === 'function' && n.qualifiedName.includes('::'))) return null;
+  const memo = memos(context).nestedInScope;
+  const key = `${ref.fromNodeId}|${lower}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let found: Found | null = null;
+  const caller = routineNode(ref.fromNodeId, context);
+  if (caller && caller.language === 'pascal') {
+    const chain = caller.qualifiedName.toLowerCase();
+    let best: Node | null = null;
+    let depth = -1;
+    for (const n of named) {
+      if (n.filePath !== caller.filePath || n.startLine > ref.line || !isNestedRoutine(n, context)) continue;
+      const outer = ownerOf(n);
+      // Nested in the caller, or in a routine the caller is nested in.
+      if (chain !== outer && !chain.startsWith(`${outer}::`)) continue;
+      if (outer.length > depth || (outer.length === depth && n.startLine < best!.startLine)) {
+        best = n;
+        depth = outer.length;
+      }
+    }
+    if (best) found = { node: best, resolvedBy: 'exact-match', confidence: 0.95 };
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * Whether a node is a routine nested in another (see nestedRoutineInScope):
+ * a Pascal function qualified under a routine, which no code outside the one
+ * it is nested in can call.
+ */
+function isNestedRoutine(node: Node, context: ResolutionContext): boolean {
+  if (node.kind !== 'function' || node.language !== 'pascal') return false;
+  const cut = node.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const outer = node.qualifiedName.slice(0, cut);
+  const memo = memos(context).routineQns;
+  let routine = memo.get(outer);
+  if (routine === undefined) {
+    routine = context.getNodesByQualifiedName(outer).some((n) => n.language === 'pascal' && isRoutine(n));
+    memo.set(outer, routine);
+  }
+  return routine;
+}
+
+/** The routine a reference comes from, or null when it comes from a file or anything else. */
+function routineNode(id: string, context: ResolutionContext): Node | null {
+  const memo = memos(context).routineNodes;
+  if (memo.has(id)) return memo.get(id)!;
+  const node = context.getNodeById?.(id) ?? null;
+  const routine = node && isRoutine(node) ? node : null;
+  memo.set(id, routine);
+  return routine;
+}
+
+/**
+ * A bare Pascal call (`Inner(1)`) to a routine nested where the call is (see
+ * nestedRoutineInScope). Made inside a nested routine, it reaches the rest of
+ * that routine's scope the same way: the class of the method it is nested in
+ * (`GetNext(Run)` in a tree method's nested routine is the tree's), its unit,
+ * the units it uses. Undefined when that scope holds no routine of the name,
+ * for the other strategies to resolve.
+ */
+export function matchPascalNestedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | undefined {
+  if (ref.language !== 'pascal' || ref.referenceKind !== 'calls' || !isBareCall(ref, context)) return undefined;
+  const lower = ref.referenceName.toLowerCase();
+  let found = nestedRoutineInScope(lower, ref, context);
+  if (!found) {
+    const caller = routineNode(ref.fromNodeId, context);
+    if (!caller || !isNestedRoutine(caller, context)) return undefined;
+    const decl = declarationInScope(lower, classOfCall(ref, context), ref, context);
+    if (!decl || !(isRoutine(decl.node) || (DATA_KINDS.has(decl.node.kind) && isProceduralData(decl.node, context)))) return undefined;
+    found = decl;
+  }
+  context.rememberNode?.(found.node);
+  return { original: ref, targetNodeId: found.node.id, confidence: found.confidence, resolvedBy: found.resolvedBy };
+}
+
+/**
+ * A Pascal call another strategy resolved to a routine nested in some other
+ * routine, which nothing outside that routine can call: a bare name is then
+ * what the call's scope declares, a routine or data holding one (mORMot's
+ * `StrLen` variable), and any other call links nothing.
+ */
+function gatePascalNestedTarget(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (!isBareCall(ref, context)) return null;
+  const lower = ref.referenceName.toLowerCase();
+  const decl = declarationInScope(lower, classOfCall(ref, context), ref, context);
+  if (!decl || (!isRoutine(decl.node) && !(DATA_KINDS.has(decl.node.kind) && isProceduralData(decl.node, context)))) return null;
+  if (decl.node.id === result.targetNodeId) return result;
+  context.rememberNode?.(decl.node);
+  return { ...result, targetNodeId: decl.node.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy };
+}
+
+/**
  * The first declaration a bare name reaches from a routine of class `cls`
- * (null: a free routine), whatever it declares: a member of the class or its
- * ancestors, then a declaration of the unit, then of the units it uses, last
- * first. Null when the project declares none of them, as for the System
- * unit's names.
+ * (null: a free routine), whatever it declares: a routine nested in the
+ * calling routine or one around it, a member of the class or its ancestors,
+ * then a declaration of the unit, then of the units it uses, last first.
+ * Null when the project declares none of them, as for the System unit's
+ * names.
  */
 function declarationInScope(lower: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): Found | null {
+  const nested = nestedRoutineInScope(lower, ref, context);
+  if (nested) return nested;
   const memo = memos(context).inScope;
   const key = `${cls?.id ?? ''}|${ref.filePath}|${lower}`;
   if (memo.has(key)) return memo.get(key)!;
@@ -413,6 +530,9 @@ interface Memos {
   headerClasses: Map<string, Array<{ line: number; classQn: string | null; routine: boolean }>>;
   outlines: Map<string, { classes: Node[]; imports: Node[]; routineColumn: number }>;
   conditionDepths: Map<string, number[]>;
+  nestedInScope: Map<string, Found | null>;
+  routineNodes: Map<string, Node | null>;
+  routineQns: Map<string, boolean>;
 }
 const MEMOS = new WeakMap<ResolutionContext, Memos>();
 
@@ -424,6 +544,7 @@ function memos(context: ResolutionContext): Memos {
       ancestors: new Map(), usedFiles: new Map(), classByName: new Map(), unitFiles: new Map(), hierarchy: new Map(),
       memberTypes: new Map(), keywords: new Map(), procedural: new Map(), headerClasses: new Map(), outlines: new Map(),
       conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
+      nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(),
     };
     MEMOS.set(context, m);
   }
