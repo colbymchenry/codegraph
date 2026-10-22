@@ -30,7 +30,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
-import { QueryBuilder } from './db/queries';
+import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
@@ -218,24 +218,47 @@ export class CodeGraph {
     // on the pattern array's identity, which the cache keeps stable.
     let cachedPatterns: string[] | undefined;
     let cachedMatcher: ReturnType<typeof ignore> | undefined;
-    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+    // The compiled matcher for the patterns `codegraph.json` holds right now,
+    // or null when there are none.
+    const currentMatcher = (): ReturnType<typeof ignore> | null => {
+      const patterns = loadDeprioritizePatterns(this.projectRoot);
+      if (patterns.length === 0) return null;
+      if (patterns !== cachedPatterns) {
+        cachedPatterns = patterns;
+        cachedMatcher = ignore().add(patterns);
+      }
+      return cachedMatcher!;
+    };
+    const matches = (matcher: ReturnType<typeof ignore> | null, filePath: string): boolean => {
+      if (!matcher) return false;
+      const rel = path.isAbsolute(filePath)
+        ? path.relative(this.projectRoot, filePath)
+        : filePath;
+      if (!rel || rel.startsWith('..')) return false;
+      return matcher.ignores(rel.split(path.sep).join('/'));
+    };
+    const deprioritized: DeprioritizedPathMatcher = (filePath: string): boolean => {
       try {
-        const patterns = loadDeprioritizePatterns(this.projectRoot);
-        if (patterns.length === 0) return false;
-        if (patterns !== cachedPatterns) {
-          cachedPatterns = patterns;
-          cachedMatcher = ignore().add(patterns);
-        }
-        const rel = path.isAbsolute(filePath)
-          ? path.relative(this.projectRoot, filePath)
-          : filePath;
-        if (!rel || rel.startsWith('..')) return false;
-        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+        return matches(currentMatcher(), filePath);
       } catch {
         // Ranking must never take the search down with it.
         return false;
       }
-    });
+    };
+    // One `stat` for a whole loop of candidates instead of one per candidate
+    // (#2620): a search reads the config once, then asks the frozen matcher.
+    deprioritized.snapshot = () => {
+      let matcher: ReturnType<typeof ignore> | null = null;
+      try { matcher = currentMatcher(); } catch { matcher = null; }
+      return (filePath: string): boolean => {
+        try {
+          return matches(matcher, filePath);
+        } catch {
+          return false;
+        }
+      };
+    };
+    this.queries.setDeprioritizedPathMatcher(deprioritized);
 
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
