@@ -1051,6 +1051,16 @@ export function formatGapMarker(
 }
 
 /**
+ * The note a body cut short carries where it is cut: which of its lines were
+ * left out, and the explore query that returns them. A line range is a query
+ * explore renders as exactly that span, so the rest is one call away; asking
+ * for the symbol by name again would return the same window (#2486).
+ */
+export function elidedBodyNote(filePath: string, name: string, from: number, to: number): string {
+  return `\n… lines ${from}-${to} of \`${name}\` elided — codegraph_explore \`${filePath}:${from}-${to}\` returns them`;
+}
+
+/**
  * Join rendered parts with gap markers that name whatever the trim skipped.
  *
  * `spareChars` is what naming may cost beyond bare markers. Cluster selection
@@ -2147,6 +2157,19 @@ export class ToolHandler {
   private isToolAllowed(name: string): boolean {
     const allow = this.toolAllowlist();
     return !allow || allow.has(name.replace(/^codegraph_/, ''));
+  }
+
+  /**
+   * Whether a tool is on the surface `tools/list` shows: the allowlist when one
+   * is set, the default surface otherwise. Not the same question as
+   * `isToolAllowed` (with no allowlist, every defined tool may still be
+   * called). Explore names a follow-up tool only when the agent can see it:
+   * `codegraph_node` is not on the default surface (#2486).
+   */
+  private isToolServed(name: string): boolean {
+    const short = name.replace(/^codegraph_/, '');
+    const allow = this.toolAllowlist();
+    return allow ? allow.has(short) : DEFAULT_MCP_TOOLS.has(short);
   }
 
   /**
@@ -3674,7 +3697,7 @@ export class ToolHandler {
       '',
       ...notes,
       '',
-      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      `> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore${this.isToolServed('node') ? ' or codegraph_node' : ''} on a candidate; source for the sites above is included below.`,
       '',
     ].join('\n');
   }
@@ -5819,7 +5842,17 @@ export class ToolHandler {
       // renders. Parts are SPAN-KEYED: every part carries the exact line range
       // its text was sliced from (see `buildSection`).
       const SPINE_WINDOW = 28; // lines each side of a focus line (the next-hop call site)
-      type SectionPart = { range: ExploreLineRange; text: string };
+      type SectionPart = {
+        range: ExploreLineRange;
+        text: string;
+        /**
+         * Set on a part a ceiling window cut inside a member's body: the member's
+         * name and lines. Its `text` then ends with the note `noteCutBodies`
+         * writes, and `renoteCutBodies` rewrites that note when the part after it
+         * is dropped.
+         */
+        cut?: { host: string; hostStart: number; hostEnd: number };
+      };
       /**
        * Bounded overshoot for one cluster's render (CG-30).
        *
@@ -6162,9 +6195,7 @@ export class ToolHandler {
             const windows = bodyWindows.get(n.id)!;
             windows.forEach((w, k) => {
               const holeEnd = (windows[k + 1]?.start ?? n.endLine + 1) - 1;
-              const hole = holeEnd > w.end
-                ? `\n… lines ${w.end + 1}-${holeEnd} of \`${n.name}\` elided — codegraph_explore \`${filePath}:${w.end + 1}-${holeEnd}\` returns them`
-                : '';
+              const hole = holeEnd > w.end ? elidedBodyNote(filePath, n.name, w.end + 1, holeEnd) : '';
               skel.push({ range: w, text: renderSpan(w) + hole });
             });
             coveredUntil = n.endLine;
@@ -6453,7 +6484,13 @@ export class ToolHandler {
       // qualified `SQLCompiler.as_sql` is no longer outranked by a denser cluster
       // around `SQLInsertCompiler.as_sql` that merely matched the bare name.
       const EXACT_IMPORTANCE = 11;
-      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string }> = [...rangeNodes.values()]
+      const ranges: Array<{
+        start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string;
+        /** A definition the query spelled by name, not one its search only matched. */
+        named?: boolean;
+        /** A symbol's own range, as opposed to an edge line or an anchored span. */
+        definition?: boolean;
+      }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
@@ -6468,7 +6505,11 @@ export class ToolHandler {
           // processRunExecutionData, the named flow ENTRY at L1562, is a large
           // low-density method that lost the budget to denser blocks and got cut, so
           // the agent Read it back — the very thing explore exists to prevent).
-          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName };
+          return {
+            start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance,
+            spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName,
+            named: namedSeedIds.has(n.id) || flow.namedNodeIds.has(n.id), definition: true,
+          };
         });
 
       // Add edge source locations in this file — captures template references
@@ -6764,11 +6805,22 @@ export class ToolHandler {
         // ahead of spine because the exact branch below keeps members in this
         // order until the cap: a long spine method first would price out the
         // body the agent singled out.
+        //
+        // Among members of one importance, a definition the query spelled by
+        // name goes ahead of one its search only matched, and only then does the
+        // shorter span win. The first member is the one kept however big it is,
+        // so this decides which symbol that guarantee covers. Shorter-first gave
+        // it to `path = build_report()` — a search hit on its signature, one
+        // line — and `build_report`, the 200-line function the query named,
+        // then no longer fit and the section was the file's last six lines
+        // (#2486).
         const byImportance = [...c.members].sort((a, b) =>
           (guarded ? Number(isProtectedMember(b)) - Number(isProtectedMember(a)) : 0)
           || Number(b.importance >= EXACT_IMPORTANCE) - Number(a.importance >= EXACT_IMPORTANCE)
           || (b.spine ? 1 : 0) - (a.spine ? 1 : 0)
-          || b.importance - a.importance || (a.end - a.start) - (b.end - b.start) || a.start - b.start);
+          || b.importance - a.importance
+          || Number(!!b.named) - Number(!!a.named)
+          || (a.end - a.start) - (b.end - b.start) || a.start - b.start);
         const keep: ExploreRange[] = [];
         if (c.maxImportance >= EXACT_IMPORTANCE) {
           // An EXACT target prices EVERY member in rendered chars, protected
@@ -6798,13 +6850,23 @@ export class ToolHandler {
           // exact cost of the protected set; each incidental member then adds its
           // own padded span, an over-estimate that errs toward the cluster below.
           let rendered: number | undefined;
+          // The best-ranked member dropped for size that the query asked for:
+          // one it named, or — in a file it pinned by path and named nothing in
+          // this cluster of — a definition. See below the loop. Not the second
+          // kind while a cluster below is owed room (`guarded`): nothing here
+          // outranks what that cluster's named members are waiting for.
+          const askedForInFile = !guarded && pinnedSet.has(filePath) && !c.members.some(isProtectedMember);
+          let droppedAskedFor: ExploreRange | undefined;
           for (const r of byImportance) {
             const sz = sizeOf(r) + GAP_MARKER.length;
             // Always keep the most important range, even if it alone is oversize —
             // an empty section sends the agent to Read, which costs far more. How
             // far it may overshoot is bounded by the caller's ceiling (CG-30), which
             // windows a runaway member instead of dropping it.
-            if (keep.length > 0 && kept + sz > cap) continue;
+            if (keep.length > 0 && kept + sz > cap) {
+              if (!droppedAskedFor && (r.named || (askedForInFile && r.definition))) droppedAskedFor = r;
+              continue;
+            }
             if (guarded && keep.length > 0 && !isProtectedMember(r)) {
               rendered ??= sectionText(dedupeSpans(partsOfMembers(keep)).parts).length;
               const cost = paddedCost(r) + GAP_MARKER.length;
@@ -6813,6 +6875,18 @@ export class ToolHandler {
             }
             keep.push(r);
             kept += sz;
+          }
+          // A fragment does not spend the guarantee above. When what was kept
+          // renders to less than a readable slice, the member it priced out is
+          // kept the way a first-ranked one is, and the caller's ceiling windows
+          // it. Two shapes reach this: the query names a one-liner beside the
+          // long function it also names (`build_report path`), and a file asked
+          // for by path, where every definition ranks below the bare edge lines
+          // (importance 1 against 2) — `report_gen.py` kept `path = build_report()`
+          // and its call edge and dropped the function around them (#2486).
+          if (droppedAskedFor
+              && sectionText(dedupeSpans(partsOfMembers(keep)).parts).length < EXPLORE_ALLOCATION.MIN_CHARS) {
+            keep.push(droppedAskedFor);
           }
         }
         if (keep.length === c.members.length) return null;
@@ -6842,6 +6916,66 @@ export class ToolHandler {
           .filter((n): n is Node => !!n && n.filePath === filePath && n.startLine >= c.start && n.endLine <= c.end)
           .flatMap((n) => bodyFocusLines(n));
         return [...exactFocus, ...(c.spineCallLine ? [c.spineCallLine] : []), ...named];
+      };
+
+      /**
+       * The note a part's `cut` reads as, for the part's lines ending at `end`:
+       * the member's lines from there to the next part shown, or to its end.
+       */
+      const cutNoteOf = (p: SectionPart, next: SectionPart | undefined, end: number): string => {
+        const cut = p.cut!;
+        const holeEnd = Math.min(cut.hostEnd, next ? next.range.start - 1 : Infinity);
+        return holeEnd > end ? elidedBodyNote(filePath, cut.host, end + 1, holeEnd) : '';
+      };
+      /**
+       * Each cut part's note written again from its `cut`, for after a part
+       * behind it was dropped: the hole it names now runs on to the next part
+       * that is left.
+       */
+      const renoteCutBodies = (parts: ReadonlyArray<SectionPart>): SectionPart[] =>
+        parts.map((p, i) => (p.cut ? { ...p, text: renderSpan(p.range) + cutNoteOf(p, parts[i + 1], p.range.end) } : p));
+      /**
+       * `windowed` (a ceiling window of `original`) with a note wherever the
+       * window cut a part short inside a member's body. The innermost member
+       * wins, so a method cut inside a class names the method. A part that ends
+       * where its source part ends was not cut, so a gap the member shrink left
+       * between whole members is never noted: its gap marker names it already.
+       *
+       * Each note is paid by the part it ends, which gives up lines from its end
+       * until it is no longer than it was — never its member's first line, a
+       * focus line, a line of a window's minimum, or a line of a member the part
+       * shows whole (a class's note must not cut a method inside it that was
+       * complete). So a note costs a line or two of the body it is cut from and
+       * nothing anywhere else: the window's spare room is what the files below
+       * draw on, and on a saturated response it is spoken for. A part that
+       * cannot pay goes out as it was, without a note.
+       */
+      const noteCutBodies = (
+        windowed: ReadonlyArray<SectionPart>, original: ReadonlyArray<SectionPart>,
+        c: ExploreCluster, focus: ReadonlyArray<number>,
+      ): SectionPart[] => {
+        const marked = windowed.map((w): SectionPart => {
+          const source = original.find((p) => p.range.start <= w.range.start && w.range.end <= p.range.end);
+          if (!source || w.range.end >= source.range.end) return w;
+          const host = c.members
+            .filter((m) => m.definition && m.start <= w.range.end && m.end > w.range.end)
+            .sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+          return host ? { ...w, cut: { host: host.name, hostStart: host.start, hostEnd: host.end } } : w;
+        });
+        return marked.map((p, i) => {
+          if (!p.cut) return p;
+          let lowest = Math.max(p.range.start + MIN_WINDOW_LINES - 1, p.cut.hostStart);
+          for (const l of focus) if (l >= p.range.start && l <= p.range.end) lowest = Math.max(lowest, l);
+          for (const m of c.members) {
+            if (m.definition && m.start >= p.range.start && m.end <= p.range.end) lowest = Math.max(lowest, m.end);
+          }
+          for (let end = p.range.end; end >= lowest; end--) {
+            const range = { start: p.range.start, end };
+            const text = renderSpan(range) + cutNoteOf(p, marked[i + 1], end);
+            if (text.length <= p.text.length) return { range, text, cut: p.cut };
+          }
+          return { range: p.range, text: p.text };
+        });
       };
 
       /**
@@ -6892,7 +7026,12 @@ export class ToolHandler {
           if (!Number.isFinite(ceiling) || sectionText(r.parts).length <= ceiling) return r;
           // Windows are subsets of spans dedupeSpans already cleared, so the record
           // still only ever claims source that was actually sent.
-          const parts = windowToCeiling(r.parts, ceiling, focusLinesOf(c));
+          // A body the window cuts says so where it is cut, with the query for
+          // the rest (#2486): the agent otherwise learns of the cut only from a
+          // footer whose advice — ask for the symbol by name — returns this same
+          // window.
+          const focus = focusLinesOf(c);
+          const parts = noteCutBodies(windowToCeiling(r.parts, ceiling, focus), r.parts, c, focus);
           return { parts, covered: r.covered, shrunk: true };
         };
         if (sectionText(base.parts).length <= Math.min(cap, guard ?? Infinity)) {
@@ -7252,6 +7391,9 @@ export class ToolHandler {
               if (!holdsFocus(reshrunk.parts[k]!)) { drop = k; break; }
             }
             reshrunk.parts.splice(drop, 1);
+            // The part before the dropped one may have noted a cut that now runs
+            // on through the dropped part's lines.
+            reshrunk.parts = renoteCutBodies(reshrunk.parts);
             reshrunk.shrunk = true;
           }
           renderedClusters.set(idx, reshrunk);
@@ -7414,7 +7556,7 @@ export class ToolHandler {
       ? exploreCompletenessNotes(filesIncluded, trimmedShown, [...renderedFilePaths, ...fileGroups.keys()])
         .map((note) => ['', '---', note])
       : anyFileTrimmed || trimmedShown.length > 0
-        ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]]
+        ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\`${this.isToolServed('node') ? ' (or `codegraph_node`)' : ''} with those exact names for their source.`]]
         : [];
     /** Whether a trimmed section survives in `text` — picks a fallback note's wording after a cut. */
     const trimmedIn = (text: string): boolean =>
