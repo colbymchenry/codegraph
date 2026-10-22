@@ -2200,6 +2200,7 @@ export class TreeSitterExtractor {
       // descends into this subtree. (#528)
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
+      this.visitParameterDefaults(node, body);
       if (body) {
         this.visitFunctionBody(body, '');
       }
@@ -2248,10 +2249,68 @@ export class TreeSitterExtractor {
     this.nodeStack.push(funcNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    this.visitParameterDefaults(node, body);
     if (body) {
       this.visitFunctionBody(body, funcNode.id);
     }
     this.nodeStack.pop();
+  }
+
+  /**
+   * A parameter's default value is code the function runs, each time a call
+   * leaves that argument out (#2588): `function render(note = buildNote())`
+   * calls buildNote as surely as `const note = buildNote()` in its body would.
+   * Each default, and a computed key in a destructured parameter, is walked as
+   * the body is, with the same scope on the stack, so its calls and `new`
+   * attribute to the function. The names a parameter binds and its type
+   * annotation are not walked. TS/JS only: elsewhere a default may run once,
+   * when the definition does (Python). A function with no body never runs.
+   * Mirrored in the kernel (tsjs/extractors.rs visit_parameter_defaults).
+   */
+  private visitParameterDefaults(fn: SyntaxNode, body: SyntaxNode | null | undefined): void {
+    if (!body || !TS_JS_CHAIN_LANGUAGES.has(this.language)) return;
+    // A class field holds its function: `onPick = (item = first()) => {…}`.
+    const owner = fn.type === 'public_field_definition' || fn.type === 'field_definition' ? body.parent : fn;
+    const params = owner ? getChildByField(owner, 'parameters') : null;
+    if (params) this.visitPatternDefaults(params);
+  }
+
+  /** The defaults in a parameter list or a destructuring pattern, in source order. */
+  private visitPatternDefaults(node: SyntaxNode): void {
+    switch (node.type) {
+      case 'formal_parameters':
+      case 'object_pattern':
+      case 'array_pattern':
+      case 'rest_pattern':
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitPatternDefaults(child);
+        }
+        return;
+      case 'required_parameter':
+      case 'optional_parameter': {
+        const pattern = getChildByField(node, 'pattern');
+        if (pattern) this.visitPatternDefaults(pattern);
+        const value = getChildByField(node, 'value');
+        if (value) this.visitFunctionBody(value, '');
+        return;
+      }
+      case 'assignment_pattern':
+      case 'object_assignment_pattern': {
+        const left = getChildByField(node, 'left');
+        if (left) this.visitPatternDefaults(left);
+        const right = getChildByField(node, 'right');
+        if (right) this.visitFunctionBody(right, '');
+        return;
+      }
+      case 'pair_pattern': {
+        const key = getChildByField(node, 'key');
+        if (key?.type === 'computed_property_name') this.visitFunctionBody(key, '');
+        const value = getChildByField(node, 'value');
+        if (value) this.visitPatternDefaults(value);
+        return;
+      }
+    }
   }
 
   /**
@@ -2355,6 +2414,7 @@ export class TreeSitterExtractor {
     if (innerFn) {
       const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
         ?? getChildByField(innerFn, this.extractor.bodyField);
+      this.visitParameterDefaults(innerFn, body);
       if (body) this.visitFunctionBody(body, compNode.id);
     } else {
       const value = getChildByField(declarator, 'value');
@@ -2422,6 +2482,7 @@ export class TreeSitterExtractor {
             // `styled(Box)(({ theme }) => …)` for a function of its own).
             const body = this.extractor!.resolveBody?.(arg, this.extractor!.bodyField)
               ?? getChildByField(arg, this.extractor!.bodyField);
+            this.visitParameterDefaults(arg, body);
             if (body) this.visitFunctionBody(body, '');
           } else {
             this.visitFunctionBody(arg, '');
@@ -2556,6 +2617,7 @@ export class TreeSitterExtractor {
       if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
         const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
           ?? getChildByField(node, this.extractor.bodyField);
+        this.visitParameterDefaults(node, body);
         if (body) {
           this.visitFunctionBody(body, '');
         }
@@ -2631,6 +2693,7 @@ export class TreeSitterExtractor {
     this.nodeStack.push(methodNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    this.visitParameterDefaults(node, body);
     if (body) {
       this.visitFunctionBody(body, methodNode.id);
     }

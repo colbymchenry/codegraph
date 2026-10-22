@@ -280,3 +280,18 @@ export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a:
   const [a, b] = [() => 1, () => 2];
   return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
 }
+
+// --- parameter defaults are the function's code (#2588) ----------------------
+export function defaultsOf(note = formatLabel('x'), { a = parseLabel('a'), b: { c = new FieldDelegator({}, []) } = {} as any }: any = {}, [first = formatLabel('f')]: string[] = [], { [parseLabel('k')]: keyed }: any = {}) { return [note, a, c, first, keyed]; }
+export const defaultArrow = (cb = (e: unknown) => formatLabel(String(e)), typed: ReturnType<typeof parseLabel> = parseLabel('t')) => cb(typed);
+export class DefaultsHolder {
+  constructor(private readonly delegate = new FieldDelegator({ send: (m: string) => m }, [])) {}
+  pick(item = formatLabel('i')) { return item; }
+  onPick = (item = parseLabel('p')) => item;
+  wrappedPick = withBatchedUpdates((item = formatLabel('w')) => item);
+}
+export const DefaultsApi = { load(note = formatLabel('l')) { return note; }, save: (note = parseLabel('s')) => note };
+export const DefaultsRef = forwardRef(function DefaultsRef({ size = parseLabel('z') }: any, ref: any) { return <b ref={ref}>{size}</b>; });
+export const DefaultsBox = styled.div.attrs((p = formatLabel('b')) => ({ p }))`color: red;`;
+export function overloadedDefault(x: string): string;
+export function overloadedDefault(x: string = formatLabel('o')): string { return x; }
