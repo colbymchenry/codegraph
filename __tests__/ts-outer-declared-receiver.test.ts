@@ -88,6 +88,26 @@ export function viaWrapper() { wrapped.render(); }
 // let commented: Root;
 let commented = makeBoundary();
 export function afterComment() { commented.render(); }
+
+let quoted = makeBoundary();
+const snippet = \`
+let quoted: Root;
+\`;
+export function afterString() { quoted.render(); return snippet; }
+
+let blockRoot: Root | null = null;
+export function inBlock(el: HTMLElement) {
+  if (!blockRoot) {
+    blockRoot = createRoot(el);
+  }
+  blockRoot.render(<div />);
+}
+`,
+  'src/MapView.ts': `export default class MapView { draw() { return 1; } }
+`,
+  'src/map.ts': `import Map from "./MapView";
+let map: Map;
+export function viaMap() { map.draw(); }
 `,
 };
 
@@ -142,6 +162,19 @@ export function viaNamespace() { qualified!.render(); }
 `,
 };
 
+/** A project file declares the package, adding to its `Root`. */
+const AUGMENTED: Record<string, string> = {
+  'package.json': JSON.stringify({ name: 'app', dependencies: { 'react-dom': '^19.0.0' } }),
+  'src/aug.d.ts': `declare module "react-dom/client" {
+  interface Root { extra(): void }
+}
+`,
+  'src/use.ts': `import type { Root } from "react-dom/client";
+let augmented: Root;
+export function viaAugmentation() { augmented.extra(); }
+`,
+};
+
 async function indexed(files: Record<string, string>): Promise<CodeGraph> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ts-outer-receiver-'));
   roots.push(dir);
@@ -164,12 +197,14 @@ describe('JS/TS: a receiver typed in a scope around the call', () => {
     const cg = await indexed(FILES);
     try {
       const callers = callersOf(cg, 'src/Boundary.tsx', 'Boundary::render');
-      for (const outside of ['showPopup', 'a1', 'renderPopup', 'typedHere']) {
+      for (const outside of ['showPopup', 'a1', 'renderPopup', 'typedHere', 'inBlock']) {
         expect(callers.has(outside), outside).toBe(false);
       }
-      for (const project of ['ownTyped', 'ownNew', 'ownCall', 'shadowed', 'arrowParam', 'destructured', 'caught', 'injected', 'untypedOuter', 'afterSibling', 'viaWrapper', 'afterComment']) {
+      for (const project of ['ownTyped', 'ownNew', 'ownCall', 'shadowed', 'arrowParam', 'destructured', 'caught', 'injected', 'untypedOuter', 'afterSibling', 'viaWrapper', 'afterComment', 'afterString']) {
         expect(callers.has(project), project).toBe(true);
       }
+      // A project class imported under a built-in's name is the project's.
+      expect(callersOf(cg, 'src/MapView.ts', 'MapView::draw').has('viaMap')).toBe(true);
     } finally {
       cg.close();
     }
@@ -183,6 +218,17 @@ describe('JS/TS: a receiver typed in a scope around the call', () => {
       for (const nearer of ['fnExpr', 'laterDeclarator', 'multiLine', 'declaratorBelow', 'destructDefault', 'multiDefault', 'commentedDeclarator', 'returnsArrow']) {
         expect(callers.has(nearer), nearer).toBe(true);
       }
+    } finally {
+      cg.close();
+    }
+  });
+
+  it("leaves a package type the project declares to the project's declaration", async () => {
+    const cg = await indexed(AUGMENTED);
+    try {
+      const extra = cg.getNodesInFile('src/aug.d.ts').find((n) => n.name === 'extra')!;
+      expect(extra).toBeDefined();
+      expect(cg.getIncomingEdgesTo([extra.id], ['calls']).map((e) => cg.getNode(e.source)?.name)).toContain('viaAugmentation');
     } finally {
       cg.close();
     }

@@ -18683,8 +18683,8 @@ export function inferLocalReceiverType(
 /**
  * Per JS/TS file, for the outer-scope receiver check below: the names some
  * `const` / `let` / `var` declares with a written type, and — read only for
- * a file that has one the check asks about — its lines with comments
- * stripped (line breaks kept) and the innermost function or method node over
+ * a file that has one the check asks about — its lines with comments and
+ * string contents blanked (line breaks kept) and the innermost function or method node over
  * each line. Kept for the last few files, since references arrive file by file.
  */
 type OuterScanFile = {
@@ -18714,7 +18714,7 @@ function outerScanFile(ref: UnresolvedRef, lines: string[], context: ResolutionC
 
 function outerScopes(file: OuterScanFile, ref: UnresolvedRef, lines: string[], context: ResolutionContext): NonNullable<OuterScanFile['scopes']> {
   if (file.scopes) return file.scopes;
-  const stripped = stripCommentsForRegex(lines.join('\n'), 'typescript').split('\n');
+  const stripped = blankStringContents(stripCommentsForRegex(lines.join('\n'), 'typescript')).split('\n');
   const owner: (Node | undefined)[] = new Array(lines.length);
   // Outer nodes first, so a node nested in another overwrites its lines.
   const fns = context.getNodesInFile(ref.filePath)
@@ -18743,9 +18743,11 @@ function outerReceiverUseIsRead(line: string, at: number, name: string, previous
   if (/^\s*(?:&&|\|\||\?\?(?!=)|[=!]==?)/.test(after)) return true;
   // `root = …;` as a statement of its own, not a declarator continued from
   // the line above (`const a = 1,` / `let`) nor a destructuring default
-  // (`{ root = x }`, `[root = x]`): a `{` before it opens a block.
+  // (`{ root = x }`, `[root = x]`): a `{` before it opens a block, as one
+  // ending the line above does unless a pattern starts there (`const {`).
   return /^\s*=(?![=>])/.test(after) && /(?:^|;|\)|(?:\)|=>|(?<![\w$])(?:else|try|finally|do))\s*\{)\s*$/.test(before) &&
-    !(/^\s*$/.test(before) && previous !== undefined && /(?:[,([{]|(?<![\w$])(?:const|let|var|using))\s*$/.test(previous));
+    !(/^\s*$/.test(before) && previous !== undefined &&
+      /(?:[,([]|(?<![\w$])(?:const|let|var|using)|(?:[=(,:]|(?<![\w$])(?:const|let|var|using))\s*\{)\s*$/.test(previous));
 }
 
 function outerReceiverLines(receiver: string, file: OuterScanFile, stripped: string[], lines: string[]): OuterReceiverLines {
@@ -18770,7 +18772,7 @@ function outerReceiverLines(receiver: string, file: OuterScanFile, stripped: str
     let typed = false;
     for (const m of line.matchAll(use)) {
       if (outerReceiverUseIsRead(line, m.index!, receiver, previous)) continue;
-      // The declaration itself; written in a comment it declares nothing.
+      // The declaration itself; written in a comment or a string it declares nothing.
       if (!typed && typedDecl.test(line) && typedDecl.test(bare)) typed = true;
       else { found.unread.push(i); break; }
     }
@@ -18821,10 +18823,16 @@ function isOuterDeclaredOutsideReceiver(receiver: string, ref: UnresolvedRef, co
   for (const re of localReceiverTypePatterns(ref.language, escapeRegExp(receiver))) {
     const raw = lines[declIdx]!.match(re)?.[1];
     if (!raw) continue;
-    const head = raw.split(/[.<\[\s]/)[0]!;
-    if (isOutOfRepoBinding(head, ref, context)) return true;
     const type = normalizeInferredTypeName(raw);
-    return type !== null && head === type && JS_BUILT_INS.has(type) && isUndeclaredTypeName(type, ref, context);
+    if (!type) return false;
+    // As for a receiver typed in the calling function: a type the file
+    // imports from the project is the project's, whatever its name; one a
+    // package's import names is outside it unless a project file declares
+    // that package (`declare module 'pkg'`).
+    if (tsImportedTypeFile(raw, ref, context) !== undefined) return false;
+    const outside = tsOutsideTypeDeclaration(raw, type, ref, context);
+    if (outside !== undefined) return outside === null;
+    return raw.split(/[.<\[\s]/)[0] === type && JS_BUILT_INS.has(type) && isUndeclaredTypeName(type, ref, context);
   }
   return false;
 }
