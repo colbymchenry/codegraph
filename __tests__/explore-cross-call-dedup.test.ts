@@ -264,12 +264,39 @@ describe('a second call against a real index', () => {
     // Every file whose source the second call withheld carries a pointer, and
     // the pointer names it.
     expect(second).toContain(POINTER);
-    for (const [file, lines] of before) {
-      const repeated = [...(after.get(file) ?? [])].filter((n) => lines.has(n));
-      if (repeated.length === 0) continue;
-      // The only sanctioned repeat is the anti-abandonment restore, which fires
-      // ONLY when the call found nothing new to say — and this one did.
-      throw new Error(`call 2 re-sent ${file} lines ${repeated.slice(0, 5).join(',')}`);
+
+    // Whether call 2 had anything new to say is a fact about the FIXTURE, not
+    // about dedup: the budget is counted in bytes, so an LF checkout (CI) fits
+    // the whole fixture into the first call where a CRLF one does not. When
+    // nothing was left to send, the anti-abandonment restore puts exactly ONE
+    // withheld file back in full — see `suppressedFallback` in tools.ts.
+    const freshLines = [...after.entries()].reduce(
+      (sum, [file, lines]) => sum + [...lines].filter((n) => !(before.get(file)?.has(n))).length,
+      0,
+    );
+
+    const repeats = [...before.entries()]
+      .map(([file, lines]) => [
+        file,
+        [...(after.get(file) ?? [])].filter((n) => lines.has(n)),
+      ] as const)
+      .filter(([, repeated]) => repeated.length > 0);
+
+    if (freshLines === 0) {
+      expect(repeats.length).toBe(1);
+      return;
+    }
+
+    for (const [file, repeated] of repeats) {
+      // A covered run shorter than MIN_COVERED_LINES is emitted on purpose
+      // ("cut chunks, not slivers" — an 8-line run is the shortest pointer worth
+      // its own ~140 chars). What must never come back is a whole served run,
+      // and that is what this catches.
+      if (repeated.length >= EXPLORE_DEDUP.MIN_COVERED_LINES) {
+        throw new Error(
+          `call 2 re-sent ${file} lines ${repeated.slice(0, 5).join(',')} (${repeated.length} lines)`,
+        );
+      }
     }
   }, 120_000);
 
