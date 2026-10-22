@@ -34,6 +34,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { declaredSupertypes } from './name-matcher';
+import { PASCAL_SYSTEM_NAMES } from '../extraction/languages/pascal-system';
 
 type Mode = 'call' | 'read' | 'ref' | 'recv';
 interface Found {
@@ -50,6 +51,15 @@ const UNIT_KINDS: ReadonlySet<string> = new Set([
 ]);
 /** What a class declares as its members. */
 const MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'field', 'property', 'constant', 'variable']);
+/** Declarations that hold a value rather than run code. */
+const DATA_KINDS: ReadonlySet<string> = new Set(['field', 'property', 'variable', 'constant', 'enum_member']);
+/**
+ * The RTL's routine types whose names don't say so (`TProc`, `TFunc<T>`),
+ * lowercased; the project's own are read from their declarations.
+ */
+const RTL_PROCEDURAL_TYPES: ReadonlySet<string> = new Set([
+  'tproc', 'tfunc', 'tpredicate', 'tcomparison', 'tthreadprocedure', 'tlistsortcompare', 'tstringlistsortcompare',
+]);
 const MAX_HIERARCHY_DEPTH = 8;
 
 /** Whether `ref` is a paren-less Pascal name (see the file comment), which only this module resolves. */
@@ -97,6 +107,194 @@ export function matchPascalParenlessRef(ref: UnresolvedRef, context: ResolutionC
   };
 }
 
+/** Whether `ref` is a bare Pascal call to one of the System unit's names (see PASCAL_SYSTEM_NAMES). */
+export function isPascalSystemCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return ref.language === 'pascal' && ref.referenceKind === 'calls' && PASCAL_SYSTEM_NAMES.has(ref.referenceName.toLowerCase()) &&
+    isBareCall(ref, context);
+}
+
+/**
+ * Whether a Pascal call named by a bare name is written bare: its expression
+ * starts with the name (`Reset(F)`). The last call of a chain is named bare
+ * too (`Reset` in `GetKey(P).Reset`), and its scope is its receiver's type.
+ */
+function isBareCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  const line = fileLines(ref.filePath!, context)[ref.line - 1] ?? '';
+  return /^[A-Za-z_]\w*/.exec(line.slice(ref.column ?? 0))?.[0].toLowerCase() === ref.referenceName.toLowerCase();
+}
+
+/**
+ * A call to one of the System unit's names is the System unit's, which the
+ * project doesn't hold, unless a declaration in the call's scope shadows it:
+ * a member of the class (`Delete(I)` in a list class), a routine of the unit
+ * or the units it uses. A project type of that name is a typecast. Data of
+ * that name runs only when it holds a routine (see isProceduralData). A unit
+ * that declares one under a condition stands in for compilers without it
+ * (`{$IFNDEF UNICODE} UnicodeString = WideString; {$ENDIF}`): the code is
+ * most likely built with one that has it.
+ */
+export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const decl = declarationInScope(ref.referenceName.toLowerCase(), classOfCall(ref, context), ref, context);
+  if (!decl) return null;
+  if (DATA_KINDS.has(decl.node.kind) && !isProceduralData(decl.node, context)) return null;
+  if (!decl.node.qualifiedName.includes('::') && declaredUnderCondition(decl.node, context)) return null;
+  context.rememberNode?.(decl.node);
+  return { original: ref, targetNodeId: decl.node.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy };
+}
+
+/**
+ * A Pascal call another strategy resolved to data — a field, a property, a
+ * variable, a constant — runs what the data holds, so it stands only for data
+ * whose declared type is a routine's. A bare name is what its scope declares
+ * (`FOnChange(Self)` in the class that declares its own `FOnChange`): the
+ * routine or the routine-holding data there, whichever namesake the strategy
+ * chose. Any other is a namesake: `length(S)` was a record's `length` field,
+ * `Pointer(P)` a property named `Pointer`. A name the calling routine
+ * declares itself, as a parameter, a local or a nested routine, is that
+ * declaration, which the graph doesn't hold. A name its scope doesn't
+ * declare at all is a `with` object's member (`with OCI do HandleAlloc(...)`)
+ * or a declaration the parse put in the wrong place: it stands for the one
+ * routine-holding field or variable the project declares by that name.
+ */
+export function gatePascalDataCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target || !DATA_KINDS.has(target.kind)) return result;
+  if (!isBareCall(ref, context)) return target.language === 'pascal' && isProceduralData(target, context) ? result : null;
+  const lower = ref.referenceName.toLowerCase();
+  if (declaredInRoutine(lower, ref, context)) return null;
+  const decl = declarationInScope(lower, classOfCall(ref, context), ref, context);
+  if (!decl) {
+    const only = target.language === 'pascal' && pascalNamed(lower, context).every((n) => n.id === target.id || n.kind === 'import');
+    return only && isProceduralData(target, context) ? result : null;
+  }
+  if (!isRoutine(decl.node) && !(DATA_KINDS.has(decl.node.kind) && isProceduralData(decl.node, context))) return null;
+  if (decl.node.id === target.id) return result;
+  context.rememberNode?.(decl.node);
+  return { ...result, targetNodeId: decl.node.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy };
+}
+
+/**
+ * Whether the routine making a call declares the called name itself, as a
+ * parameter, a local or a nested routine (`function Hash(Item: Pointer;
+ * Hasher: THasher)` calling `Hasher(0, Item, 4)`): from the routine's header
+ * down to the call.
+ */
+function declaredInRoutine(lower: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = fileLines(ref.filePath!, context);
+  // The header in the text: a method's node may start at its declaration in
+  // the class, above the fields and the unit's variables.
+  const from = routineHeaderAt(ref.filePath!, ref.line, context);
+  const name = escapeRegExp(lower);
+  const mentions = new RegExp(`\\b${name}\\b`, 'i');
+  const declares = new RegExp(`\\b(?:procedure|function)\\s+${name}\\b|\\b${name}\\s*(?:,\\s*[A-Za-z_]\\w*\\s*)*:(?!=)`, 'i');
+  for (let i = Math.max(1, from); i <= ref.line && i <= lines.length; i++) {
+    const text = lines[i - 1]!;
+    if (mentions.test(text) && declares.test(text.replace(/\/\/.*$|\{[^}]*\}|'[^']*'/g, ' '))) return true;
+  }
+  return false;
+}
+
+/** The line of the nearest routine header at column 0 at or above a line, else the line itself. */
+function routineHeaderAt(filePath: string, line: number, context: ResolutionContext): number {
+  headerClassAt(filePath, line, context);
+  const headers = memos(context).headerClasses.get(filePath) ?? [];
+  let found = line;
+  for (const h of headers) {
+    if (h.line > line) break;
+    if (h.routine) found = h.line;
+  }
+  return found;
+}
+
+/**
+ * Whether a declaration is inside an `{$IFDEF}`, `{$IFNDEF}`, `{$IF}` or
+ * `{$IFOPT}` block, or its `{$ELSE}`.
+ */
+function declaredUnderCondition(node: Node, context: ResolutionContext): boolean {
+  const memo = memos(context).conditionDepths;
+  let depths = memo.get(node.filePath);
+  const lines = fileLines(node.filePath, context);
+  if (!depths) {
+    depths = [];
+    let depth = 0;
+    for (const text of lines) {
+      depths.push(depth);
+      if (text.includes('{$')) depth = conditionDepthAfter(text, depth);
+    }
+    memo.set(node.filePath, depths);
+  }
+  const line = lines[node.startLine - 1] ?? '';
+  return conditionDepthAfter(line.slice(0, node.startColumn), depths[node.startLine - 1] ?? 0) > 0;
+}
+
+/** The depth of conditional blocks after a line's directives (`{$IFDEF X}` opens one, `{$ENDIF}` closes it). */
+function conditionDepthAfter(text: string, depth: number): number {
+  for (const m of text.matchAll(/\{\$(ifdef|ifndef|ifopt|ifend|endif|if)\b/gi)) {
+    const directive = m[1]!.toLowerCase();
+    depth = directive === 'endif' || directive === 'ifend' ? Math.max(0, depth - 1) : depth + 1;
+  }
+  return depth;
+}
+
+/**
+ * The class whose method makes a call: the one the nearest method header
+ * above the call names in the source text (`procedure TFoo.Bar;`), which holds
+ * where the tree had errors and gave the code to the file, or to a routine
+ * that swallowed the ones after it; else the reference's method's class.
+ */
+function classOfCall(ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const qn = headerClassAt(ref.filePath!, ref.line, context);
+  const cls = qn ? classByQualifiedName(qn, ref.filePath!, context) : null;
+  if (cls) return cls;
+  const routine = context.getNodeById?.(ref.fromNodeId);
+  return routine?.kind === 'method' ? classOfRoutine(routine, context) : null;
+}
+
+/**
+ * The class the nearest routine header at or above a line names
+ * (`procedure TFoo.Bar;` → `TFoo`), or null when it is a free routine's, or
+ * the unit's code resumes there: after an `end;` that starts its line, or at
+ * `initialization`.
+ */
+function headerClassAt(filePath: string, line: number, context: ResolutionContext): string | null {
+  const memo = memos(context).headerClasses;
+  let headers = memo.get(filePath);
+  if (!headers) {
+    headers = [];
+    const lines = fileLines(filePath, context);
+    const header = /^(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+([A-Za-z_][\w.<>, ]*?)\s*[(:;]/i;
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i]!;
+      // Each starts its line with one of c, d, e, f, i, o, p (either case).
+      const first = text.charCodeAt(0) | 0x20;
+      if (first !== 0x63 && first !== 0x64 && first !== 0x65 && first !== 0x66 && first !== 0x69 && first !== 0x6f && first !== 0x70) continue;
+      if (/^(?:end;|(?:initialization|finalization)\b)/i.test(text)) {
+        headers.push({ line: i + 1, classQn: null, routine: false });
+        continue;
+      }
+      const m = header.exec(text);
+      if (!m) continue;
+      const parts = m[1]!.replace(/<[^>]*>/g, '').replace(/\s+/g, '').split('.');
+      headers.push({ line: i + 1, classQn: parts.length > 1 ? parts.slice(0, -1).join('::') : null, routine: true });
+    }
+    memo.set(filePath, headers);
+  }
+  let lo = 0;
+  let hi = headers.length - 1;
+  let hit: string | null = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (headers[mid]!.line <= line) {
+      hit = headers[mid]!.classQn;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return hit;
+}
+
 // ---------------------------------------------------------------------------
 // Scope lookup
 // ---------------------------------------------------------------------------
@@ -105,27 +303,36 @@ function isRoutine(node: Node): boolean {
   return node.kind === 'method' || node.kind === 'function';
 }
 
-/** A bare name, looked up the way Delphi looks it up from a routine of class `cls` (null: a free routine). */
+/** A bare name, looked up the way Delphi looks it up from a routine of class `cls` (null: a free routine): a routine, or null. */
 function nameInScope(name: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): Found | null {
-  const lower = name.toLowerCase();
+  const decl = declarationInScope(name.toLowerCase(), cls, ref, context);
+  return decl && isRoutine(decl.node) ? decl : null;
+}
+
+/**
+ * The first declaration a bare name reaches from a routine of class `cls`
+ * (null: a free routine), whatever it declares: a member of the class or its
+ * ancestors, then a declaration of the unit, then of the units it uses, last
+ * first. Null when the project declares none of them, as for the System
+ * unit's names.
+ */
+function declarationInScope(lower: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): Found | null {
   const memo = memos(context).inScope;
   const key = `${cls?.id ?? ''}|${ref.filePath}|${lower}`;
   if (memo.has(key)) return memo.get(key)!;
   let found: Found | null = null;
   const member = cls ? memberInHierarchy(cls, lower, context) : null;
   if (member) {
-    if (isRoutine(member)) found = { node: member, resolvedBy: 'instance-method', confidence: 0.9 };
+    found = { node: member, resolvedBy: 'instance-method', confidence: 0.9 };
   } else {
-    const own = unitDeclaration(ref.filePath!, lower, context);
+    const own = ownUnitDeclaration(ref.filePath!, lower, context);
     if (own) {
-      if (isRoutine(own)) found = { node: own, resolvedBy: 'exact-match', confidence: 0.9 };
+      found = { node: own, resolvedBy: 'exact-match', confidence: 0.9 };
     } else {
       const used = usedUnitFiles(ref.filePath!, context);
-      for (let i = used.length - 1; i >= 0; i--) {
-        const decl = unitDeclaration(used[i]!, lower, context);
-        if (!decl) continue;
-        if (isRoutine(decl)) found = { node: decl, resolvedBy: 'import', confidence: 0.85 };
-        break;
+      for (let i = used.length - 1; i >= 0 && !found; i--) {
+        const decl = unitDeclaration(used[i]!, lower, context, ref.filePath!);
+        if (decl) found = { node: decl, resolvedBy: 'import', confidence: 0.85 };
       }
     }
   }
@@ -141,7 +348,7 @@ function memberThroughPath(path: string[], cls: Node | null, ref: UnresolvedRef,
   let rest = path.slice(1);
   if (head.unitFile) {
     // `UnitName.Routine`, `UnitName.GlobalVar.Method`.
-    const decl = unitDeclaration(head.unitFile, rest[0]!.toLowerCase(), context);
+    const decl = unitDeclaration(head.unitFile, rest[0]!.toLowerCase(), context, ref.filePath!);
     if (!decl) return null;
     if (rest.length === 1) return isRoutine(decl) ? { node: decl, resolvedBy: 'import', confidence: 0.9 } : null;
     type = typeOfMember(decl, context);
@@ -170,8 +377,9 @@ function headOf(name: string, cls: Node | null, ref: UnresolvedRef, context: Res
     const member = memberInHierarchy(cls, lower, context);
     if (member) return { type: typeOfMember(member, context) };
   }
-  const decl = unitDeclaration(ref.filePath!, lower, context) ??
-    usedUnitFiles(ref.filePath!, context).reduceRight<Node | undefined>((hit, file) => hit ?? unitDeclaration(file, lower, context), undefined);
+  const decl = ownUnitDeclaration(ref.filePath!, lower, context) ??
+    usedUnitFiles(ref.filePath!, context).reduceRight<Node | undefined>(
+      (hit, file) => hit ?? unitDeclaration(file, lower, context, ref.filePath!), undefined);
   if (decl) return { type: CLASS_KINDS.has(decl.kind) ? decl : typeOfMember(decl, context) };
   const unitFile = unitFileNamed(lower, ref.filePath!, context);
   return unitFile ? { type: null, unitFile } : null;
@@ -191,10 +399,20 @@ interface Memos {
   usedFiles: Map<string, string[]>;
   classByName: Map<string, Node | null>;
   unitsByName?: Map<string, string[]>;
+  genericTypes?: Map<string, Node[]>;
+  projectFiles?: { byName: Map<string, string[]>; pascal: string[] };
+  includes: Map<string, string[]>;
+  includers: Map<string, string | null>;
+  ownFiles: Map<string, string[]>;
+  unitFileSets: Map<string, string[]>;
   unitFiles: Map<string, string | null>;
   hierarchy: Map<string, Node | null>;
   memberTypes: Map<string, Node | null>;
   keywords: Map<string, string | null>;
+  procedural: Map<string, boolean>;
+  headerClasses: Map<string, Array<{ line: number; classQn: string | null; routine: boolean }>>;
+  outlines: Map<string, { classes: Node[]; imports: Node[]; routineColumn: number }>;
+  conditionDepths: Map<string, number[]>;
 }
 const MEMOS = new WeakMap<ResolutionContext, Memos>();
 
@@ -204,7 +422,8 @@ function memos(context: ResolutionContext): Memos {
     m = {
       named: new Map(), inScope: new Map(), classOfRoutine: new Map(), classByQn: new Map(),
       ancestors: new Map(), usedFiles: new Map(), classByName: new Map(), unitFiles: new Map(), hierarchy: new Map(),
-      memberTypes: new Map(), keywords: new Map(),
+      memberTypes: new Map(), keywords: new Map(), procedural: new Map(), headerClasses: new Map(), outlines: new Map(),
+      conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
     };
     MEMOS.set(context, m);
   }
@@ -248,11 +467,13 @@ function classByQualifiedName(qualifiedName: string, filePath: string, context: 
   if (memo.has(key)) return memo.get(key)!;
   const exact = context.getNodesByQualifiedName(qualifiedName).filter((n) => n.language === 'pascal' && CLASS_KINDS.has(n.kind));
   const lower = qualifiedName.toLowerCase();
-  const cls = declarationOf(exact.filter((n) => n.filePath === filePath)) ??
-    declarationOf(context.getNodesInFile(filePath).filter((n) =>
-      CLASS_KINDS.has(n.kind) && n.qualifiedName.replace(/<[^>]*>/g, '').toLowerCase() === lower)) ??
-    declarationOf(exact) ??
-    classNamed(qualifiedName.split('::').pop()!, filePath, context);
+  let cls: Node | null = null;
+  for (const file of ownUnitFiles(filePath, context)) {
+    cls = declarationOf(exact.filter((n) => n.filePath === file)) ??
+      declarationOf(outlineOf(file, context).classes.filter((n) => n.qualifiedName.replace(/<[^>]*>/g, '').toLowerCase() === lower));
+    if (cls) break;
+  }
+  cls ??= declarationOf(exact) ?? classNamed(qualifiedName.split('::').pop()!, filePath, context);
   memo.set(key, cls);
   return cls;
 }
@@ -334,30 +555,182 @@ function memberInHierarchy(cls: Node, lower: string, context: ResolutionContext)
   return found;
 }
 
-/** A unit's top-level declaration of a name (its enum values included). */
-function unitDeclaration(filePath: string, lower: string, context: ResolutionContext): Node | undefined {
+/**
+ * A unit's top-level declaration of a name (its enum values included), as
+ * code in `fromFile` sees it: another unit's member that its parse lost (see
+ * unitRoutineColumn) is not one, while in its own unit it is most likely the
+ * member the code calls.
+ */
+function unitDeclaration(filePath: string, lower: string, context: ResolutionContext, fromFile = filePath): Node | undefined {
   const decls = pascalNamed(lower, context).filter((n) =>
-    n.filePath === filePath && UNIT_KINDS.has(n.kind) && (n.kind === 'enum_member' || !n.qualifiedName.includes('::')));
+    n.filePath === filePath && UNIT_KINDS.has(n.kind) && (n.kind === 'enum_member' || !n.qualifiedName.includes('::')) &&
+    !(fromFile !== filePath && n.kind === 'function' && n.startColumn > unitRoutineColumn(filePath, context)));
   // A routine declared in the interface and defined in the implementation is
   // one name; of overloads, one called without arguments first.
   return decls.find((n) => !isRoutine(n)) ?? decls.find((n) => !needsArguments(n)) ?? decls[0];
 }
 
-/** The files of the units a file uses, in the order its `uses` clauses name them. */
-function usedUnitFiles(filePath: string, context: ResolutionContext): string[] {
-  const memo = memos(context).usedFiles;
-  const hit = memo.get(filePath);
-  if (hit) return hit;
-  const files: string[] = [];
-  const imports = context.getNodesInFile(filePath)
-    .filter((n) => n.kind === 'import' && n.language === 'pascal')
-    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn);
-  for (const imp of imports) {
-    const file = unitFileNamed(imp.name.toLowerCase(), filePath, context);
-    if (file && file !== filePath && !files.includes(file)) files.push(file);
+/**
+ * How far a unit's own routines are indented at most. In a unit whose
+ * `unit` header the parser lost, the members of a class it couldn't read
+ * come out as routines of the unit, indented deeper than the unit's own
+ * (`function Http: IHttpClient;` in a class body); elsewhere, any.
+ */
+function unitRoutineColumn(filePath: string, context: ResolutionContext): number {
+  return outlineOf(filePath, context).routineColumn;
+}
+
+/** What scope lookups need of a file's nodes, read once: its classes, its `uses` in order, unitRoutineColumn. */
+function outlineOf(filePath: string, context: ResolutionContext): { classes: Node[]; imports: Node[]; routineColumn: number } {
+  const memo = memos(context).outlines;
+  let outline = memo.get(filePath);
+  if (!outline) {
+    const nodes = context.getNodesInFile(filePath);
+    let routineColumn = Infinity;
+    if (!nodes.some((n) => n.kind === 'module')) {
+      for (const n of nodes) {
+        if (n.kind === 'function' && !n.qualifiedName.includes('::')) routineColumn = Math.min(routineColumn, n.startColumn);
+      }
+    }
+    outline = {
+      classes: nodes.filter((n) => CLASS_KINDS.has(n.kind)),
+      imports: nodes.filter((n) => n.kind === 'import' && n.language === 'pascal')
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn),
+      routineColumn,
+    };
+    memo.set(filePath, outline);
   }
-  memo.set(filePath, files);
+  return outline;
+}
+
+/** The files of the units a file uses, in the order its `uses` clauses name them. */
+function usedUnitFiles(fromFile: string, context: ResolutionContext): string[] {
+  const memo = memos(context).usedFiles;
+  const hit = memo.get(fromFile);
+  if (hit) return hit;
+  // The unit's `uses` clauses, then those of the files it includes: mORMot's
+  // `.inc` files open the unit's implementation with one.
+  const unit = unitFilesOf(fromFile, context);
+  const files: string[] = [];
+  for (const own of unit) {
+    for (const imp of outlineOf(own, context).imports) {
+      const file = unitFileNamed(imp.name.toLowerCase(), own, context);
+      if (file && !unit.includes(file) && !files.includes(file)) files.push(file);
+    }
+  }
+  memo.set(fromFile, files);
   return files;
+}
+
+/** The unit's own declaration of a name, seen from one of its files (see ownUnitFiles). */
+function ownUnitDeclaration(fromFile: string, lower: string, context: ResolutionContext): Node | undefined {
+  for (const file of ownUnitFiles(fromFile, context)) {
+    const decl = unitDeclaration(file, lower, context);
+    if (decl) return decl;
+  }
+  return undefined;
+}
+
+/**
+ * The files whose declarations are a file's unit's own, the file first: the
+ * unit is its own file and the include files it pulls in, so code in
+ * `mormot.core.os.pas` sees a variable `mormot.core.os.posix.inc` declares,
+ * and that file's code sees the unit's (see unitFilesOf).
+ */
+function ownUnitFiles(filePath: string, context: ResolutionContext): string[] {
+  const memo = memos(context).ownFiles;
+  let own = memo.get(filePath);
+  if (!own) {
+    const unit = unitFilesOf(filePath, context);
+    own = unit[0] === filePath ? unit : [filePath, ...unit.filter((f) => f !== filePath)];
+    memo.set(filePath, own);
+  }
+  return own;
+}
+
+/**
+ * The files one unit is made of: its own file, then the include files it
+ * pulls in (`{$I name.inc}`, `{$INCLUDE name}`), nested ones too. For an
+ * include file, the unit that includes it, nearest it when several do.
+ */
+function unitFilesOf(filePath: string, context: ResolutionContext): string[] {
+  const m = memos(context);
+  const hit = m.unitFileSets.get(filePath);
+  if (hit) return hit;
+  let root = filePath;
+  for (let i = 0; i < 3 && /\.inc$/i.test(root); i++) {
+    const up = includerOf(root, context);
+    if (!up || up === filePath) break;
+    root = up;
+  }
+  const files = [root];
+  for (let i = 0; i < files.length && files.length < 32; i++) {
+    for (const inc of includesOf(files[i]!, context)) if (!files.includes(inc)) files.push(inc);
+  }
+  if (!files.includes(filePath)) files.push(filePath);
+  m.unitFileSets.set(filePath, files);
+  return files;
+}
+
+/** The include files a Pascal file pulls in (`{$I name.inc}`, `{$INCLUDE name}`), each the one of that name nearest it. */
+function includesOf(filePath: string, context: ResolutionContext): string[] {
+  const m = memos(context);
+  let includes = m.includes.get(filePath);
+  if (includes) return includes;
+  includes = [];
+  if (PASCAL_SOURCE.test(filePath)) {
+    for (const text of fileLines(filePath, context)) {
+      if (!text.includes('{$') || !/\{\$i(?:nclude)?\s/i.test(text)) continue;
+      for (const match of text.matchAll(/\{\$(?:I|INCLUDE)\s+['"]?([^'"}\s*]+)/gi)) {
+        let name = match[1]!.replace(/\\/g, '/');
+        name = name.slice(name.lastIndexOf('/') + 1).toLowerCase();
+        if (!name.includes('.')) name += '.inc';
+        const inc = nearest(projectFiles(context).byName.get(name) ?? [], filePath);
+        if (inc && inc !== filePath && !includes.includes(inc)) includes.push(inc);
+      }
+    }
+  }
+  m.includes.set(filePath, includes);
+  return includes;
+}
+
+/** The Pascal file that includes an include file: of the forty nearest it, the nearest whose text does. */
+function includerOf(incFile: string, context: ResolutionContext): string | null {
+  const m = memos(context);
+  if (m.includers.has(incFile)) return m.includers.get(incFile)!;
+  // The files of its directory first, those named most like it first of
+  // them (`mormot.core.os.pas` for `mormot.core.os.posix.inc`): how many
+  // characters of its path a file shares, the directory counting first.
+  const shared = (f: string): number => {
+    let n = 0;
+    while (n < f.length && n < incFile.length && f.charCodeAt(n) === incFile.charCodeAt(n)) n++;
+    return f.lastIndexOf('/', n - 1) * 1000 + n;
+  };
+  const candidates = projectFiles(context).pascal.filter((f) => f !== incFile)
+    .map((f) => ({ f, n: shared(f) })).sort((a, b) => b.n - a.n).slice(0, 40);
+  const includer = candidates.find(({ f }) => includesOf(f, context).includes(incFile))?.f ?? null;
+  m.includers.set(incFile, includer);
+  return includer;
+}
+
+const PASCAL_SOURCE = /\.(?:pas|dpr|dpk|lpr|inc)$/i;
+
+/** The project's files by lowercased name, and its Pascal sources. */
+function projectFiles(context: ResolutionContext): { byName: Map<string, string[]>; pascal: string[] } {
+  const m = memos(context);
+  if (!m.projectFiles) {
+    const byName = new Map<string, string[]>();
+    const pascal: string[] = [];
+    for (const file of context.getAllFiles()) {
+      const base = file.slice(file.lastIndexOf('/') + 1).toLowerCase();
+      const same = byName.get(base);
+      if (same) same.push(file);
+      else byName.set(base, [file]);
+      if (PASCAL_SOURCE.test(file)) pascal.push(file);
+    }
+    m.projectFiles = { byName, pascal };
+  }
+  return m.projectFiles;
 }
 
 /** The file of the unit a name names, nearest to `fromFile` when several units share it. */
@@ -366,14 +739,25 @@ function unitFileNamed(lower: string, fromFile: string, context: ResolutionConte
   const key = `${fromFile}|${lower}`;
   if (m.unitFiles.has(key)) return m.unitFiles.get(key)!;
   if (!m.unitsByName) {
-    m.unitsByName = new Map();
+    const units = new Map<string, string[]>();
+    const add = (name: string, file: string): void => {
+      const files = units.get(name);
+      if (files) files.push(file);
+      else units.set(name, [file]);
+    };
+    const headed = new Set<string>();
     for (const n of context.getNodesByKind('module')) {
       if (n.language !== 'pascal') continue;
-      const name = n.name.toLowerCase();
-      const files = m.unitsByName.get(name);
-      if (files) files.push(n.filePath);
-      else m.unitsByName.set(name, [n.filePath]);
+      add(n.name.toLowerCase(), n.filePath);
+      headed.add(n.filePath);
     }
+    // A unit's file is named after it, which Delphi enforces: one whose
+    // `unit` header the parser lost to an error is the unit its file names.
+    for (const file of context.getAllFiles()) {
+      if (headed.has(file) || !/\.pas$/i.test(file)) continue;
+      add(file.slice(file.lastIndexOf('/') + 1, -'.pas'.length).toLowerCase(), file);
+    }
+    m.unitsByName = units;
   }
   const file = nearest(m.unitsByName.get(lower) ?? [], fromFile);
   m.unitFiles.set(key, file);
@@ -381,22 +765,41 @@ function unitFileNamed(lower: string, fromFile: string, context: ResolutionConte
 }
 
 /** A class (or record or interface) a type name names, seen from `fromFile`. */
-function classNamed(typeName: string, fromFile: string, context: ResolutionContext): Node | null {
+function classNamed(typeName: string, fromFile: string, context: ResolutionContext, depth = 0): Node | null {
   const simple = typeName.split('.').pop()!.toLowerCase();
   const memo = memos(context).classByName;
   const key = `${fromFile}|${simple}`;
   if (memo.has(key)) return memo.get(key)!;
-  const candidates = pascalNamed(simple, context).filter((n) => CLASS_KINDS.has(n.kind));
-  let cls = declarationOf(candidates.filter((n) => n.filePath === fromFile));
-  if (!cls && candidates.length > 0) {
-    // The unit used last declares the name Delphi sees; else the one unit that does.
+  const named = pascalNamed(simple, context);
+  const visible = (kinds: ReadonlySet<string>): Node[] => {
+    // In the unit's own files, then in the unit used last, which declares the
+    // name Delphi sees; else in the one unit that does.
+    const candidates = named.filter((n) => kinds.has(n.kind));
+    for (const file of ownUnitFiles(fromFile, context)) {
+      const own = candidates.filter((n) => n.filePath === file);
+      if (own.length > 0) return own;
+    }
     const used = usedUnitFiles(fromFile, context);
-    for (let i = used.length - 1; i >= 0 && !cls; i--) cls = declarationOf(candidates.filter((n) => n.filePath === used[i]));
-    if (!cls && candidates.every((n) => n.filePath === candidates[0]!.filePath)) cls = declarationOf(candidates);
+    for (let i = used.length - 1; i >= 0; i--) {
+      const there = candidates.filter((n) => n.filePath === used[i]);
+      if (there.length > 0) return there;
+    }
+    return candidates.length > 0 && candidates.every((n) => n.filePath === candidates[0]!.filePath) ? candidates : [];
+  };
+  let cls = declarationOf(visible(CLASS_KINDS));
+  if (!cls && depth < 4) {
+    // A type alias names the class it stands for: `TVTAncestor = TVTAncestorVcl;`.
+    for (const alias of visible(ALIAS_KINDS)) {
+      const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, '');
+      const target = /=\s*([A-Za-z_][\w.]*)\s*;/.exec(line)?.[1];
+      if (target && (cls = classNamed(target, alias.filePath, context, depth + 1))) break;
+    }
   }
   memo.set(key, cls);
   return cls;
 }
+
+const ALIAS_KINDS: ReadonlySet<string> = new Set(['type_alias']);
 
 /** The file whose path shares the longest directory prefix with `from`. */
 function nearest(files: string[], from: string): string | null {
@@ -436,17 +839,118 @@ function typeOfMember(member: Node, context: ResolutionContext): Node | null {
   if (member.kind === 'method' || member.kind === 'function') {
     typeName = member.returnType ?? /:\s*([A-Za-z_][\w.]*)\s*;?\s*$/.exec(member.signature ?? '')?.[1];
   } else {
-    const line = fileLines(member.filePath, context)[member.startLine - 1] ?? '';
-    const name = escapeRegExp(member.name);
-    const re = member.kind === 'property'
-      ? new RegExp(`\\bproperty\\s+${name}\\s*(?:\\[[^\\]]*\\])?\\s*:\\s*([A-Za-z_][\\w.]*)`, 'i')
-      : new RegExp(`\\b${name}\\b(?:\\s*,\\s*[A-Za-z_]\\w*)*\\s*:\\s*([A-Za-z_][\\w.]*)`, 'i');
-    typeName = re.exec(line)?.[1];
+    typeName = /^([A-Za-z_][\w.]*)/.exec(declaredTypeText(member, context))?.[1];
   }
   const type = typeName ? classNamed(typeName, member.filePath, context) : null;
   memo.set(member.id, type);
   return type;
 }
+
+/**
+ * The text of the type a field, variable, constant or property declares,
+ * from its declaration on: `TFoo; // the foo` for `FFoo: TFoo; // the foo`.
+ * A name in a comma list (`FOnLoad,` above `FOnSave: TSaveEvent;`) takes the
+ * type the list ends with, a few lines down. Empty when none is written, as
+ * for a published `property OnClick;`.
+ */
+function declaredTypeText(node: Node, context: ResolutionContext): string {
+  const lines = fileLines(node.filePath, context);
+  const name = escapeRegExp(node.name);
+  const re = node.kind === 'property'
+    ? new RegExp(`\\bproperty\\s+${name}\\s*(?:\\[[^\\]]*\\])?\\s*:\\s*(.*)$`, 'i')
+    : new RegExp(`\\b${name}\\b(?:\\s*,\\s*[A-Za-z_]\\w*)*\\s*,?\\s*:(?!=)\\s*(.*)$`, 'i');
+  let text = '';
+  for (let i = node.startLine - 1; i < node.startLine + 5 && i < lines.length; i++) {
+    text += ' ' + lines[i]!.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)/g, ' ');
+    const m = re.exec(text);
+    if (m) return m[1]!.trim();
+    // A list goes on only after a comma.
+    if (node.kind === 'property' || !/,\s*$/.test(text)) break;
+  }
+  return '';
+}
+
+/**
+ * Whether data holds a routine, by its declared type: one written in place
+ * (`FProc: procedure of object`, `F: reference to function: Integer`), a
+ * project type declared as one (`TOnLog = procedure(...) of object;`), or a
+ * type the project doesn't declare that the RTL's names say is one
+ * (`TNotifyEvent`, `TWndMethod`, `TProc<T>`).
+ */
+function isProceduralData(node: Node, context: ResolutionContext): boolean {
+  const memo = memos(context).procedural;
+  const hit = memo.get(node.id);
+  if (hit !== undefined) return hit;
+  const procedural = isProceduralTypeText(declaredTypeText(node, context), context, 0);
+  memo.set(node.id, procedural);
+  return procedural;
+}
+
+/**
+ * Whether a written type is a routine's: written out
+ * (`reference to function: Integer`), or named, with the name's declaration
+ * saying so, through an alias to another such name
+ * (`TFormatter = TFunc<Exception, string>;`). A name the project doesn't
+ * declare is a routine type when the RTL's names say so: `TProc`, `TFunc<T>`,
+ * and the names Delphi gives them (`TNotifyEvent`, `TWndMethod`).
+ */
+function isProceduralTypeText(text: string, context: ResolutionContext, depth: number): boolean {
+  if (PROCEDURAL_TYPE.test(text)) return true;
+  const typeName = /^(?:type\s+)?([A-Za-z_][\w.]*)/i.exec(text)?.[1]?.split('.').pop()?.toLowerCase();
+  if (!typeName || depth > 3) return false;
+  const types = typesNamed(typeName, context);
+  if (types.length === 0) return RTL_PROCEDURAL_TYPES.has(typeName) || /^t\w*(?:event|proc|method|callback)$/.test(typeName);
+  return types.some((t) => t.kind === 'type_alias' && isProceduralTypeText(aliasedTypeText(t, context), context, depth + 1));
+}
+
+/**
+ * The project's Pascal types a name names, generic ones by the name before
+ * their parameters: `TSetParams<T: class>` for `TSetParams`.
+ */
+function typesNamed(lower: string, context: ResolutionContext): Node[] {
+  const m = memos(context);
+  if (!m.genericTypes) {
+    const generic = new Map<string, Node[]>();
+    const add = (n: Node): void => {
+      const open = n.name.indexOf('<');
+      if (n.language !== 'pascal' || open <= 0 || !(n.kind === 'type_alias' || CLASS_KINDS.has(n.kind))) return;
+      const base = n.name.slice(0, open).trim().toLowerCase();
+      const list = generic.get(base);
+      if (list) list.push(n);
+      else generic.set(base, [n]);
+    };
+    const kinds = ['type_alias', 'class', 'struct', 'interface'] as const;
+    // The names alone first, where the index can tell them, to fetch only
+    // the generic types.
+    const names = context.getNodeNamesOfKinds?.('pascal', kinds);
+    if (names) {
+      for (const name of new Set(names)) if (name.includes('<')) context.getNodesByName(name).forEach(add);
+    } else {
+      for (const kind of kinds) for (const n of context.iterateNodesByKind?.(kind) ?? context.getNodesByKind(kind)) add(n);
+    }
+    m.genericTypes = generic;
+  }
+  return pascalNamed(lower, context).filter((t) => t.kind === 'type_alias' || CLASS_KINDS.has(t.kind))
+    .concat(m.genericTypes.get(lower) ?? []);
+}
+
+/**
+ * What a type declaration says after its `=`, which may start on the next
+ * line: `procedure(...) of object` for `TOnHelper =` above it.
+ */
+function aliasedTypeText(alias: Node, context: ResolutionContext): string {
+  const lines = fileLines(alias.filePath, context);
+  let text = '';
+  for (let i = alias.startLine - 1; i < alias.startLine + 2 && i < lines.length; i++) {
+    text += ' ' + lines[i]!.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)/g, ' ');
+    const eq = text.indexOf('=');
+    if (eq >= 0 && text.slice(eq + 1).trim()) return text.slice(eq + 1).trim();
+  }
+  return '';
+}
+
+/** A routine type written out: `procedure(...) of object`, `function: T`, `reference to procedure`. */
+const PROCEDURAL_TYPE = /^(?:reference\s+to\s+)?(?:procedure|function)\b/i;
 
 /** Whether a routine has a parameter without a default value, which a call must pass. */
 function needsArguments(routine: Node): boolean {

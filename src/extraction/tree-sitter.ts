@@ -32,6 +32,7 @@ import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
+import { PASCAL_SYSTEM_NAMES } from './languages/pascal-system';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
@@ -8834,7 +8835,11 @@ export class TreeSitterExtractor {
     }
 
     const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
-    if (calleeName && !vagueLink) {
+    // In a `with` body a bare `Delete(I)` or `Assign(X)` may be the `with`
+    // object's member rather than the System unit's or the class's: which one
+    // the object's type would have to say (see resolution/pascal-scope).
+    const withMember = this.pascalWithDepth > 0 && firstChild.type === 'identifier' && PASCAL_SYSTEM_NAMES.has(calleeName.toLowerCase());
+    if (calleeName && !vagueLink && !withMember) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,

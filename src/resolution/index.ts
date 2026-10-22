@@ -28,7 +28,9 @@ import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
-import { clearPascalScopeMemos, isPascalParenlessRef, matchPascalParenlessRef } from './pascal-scope';
+import {
+  clearPascalScopeMemos, gatePascalDataCall, isPascalParenlessRef, isPascalSystemCall, matchPascalParenlessRef, matchPascalSystemCall,
+} from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
@@ -161,12 +163,18 @@ const PASCAL_CAST_TARGET_KINDS: ReadonlySet<string> = new Set(['class', 'struct'
 /** The values a TypeScript type may share its name with in its file, which a call or `new` of the name means. */
 const TYPE_COMPANION_VALUE_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'component', 'constant', 'variable']);
 
+/**
+ * The RTL's unit namespaces, as it spells them. Spelled otherwise, a
+ * receiver is most likely a variable that hides one (`data.GetObjectFrom`,
+ * `rest.EngineAdd`); only `system.` is the System unit's in any case.
+ */
 const PASCAL_UNIT_PREFIXES = [
   'System.', 'Winapi.', 'Vcl.', 'Fmx.', 'Data.', 'Datasnap.',
   'Soap.', 'Xml.', 'Web.', 'REST.', 'FireDAC.', 'IBX.',
   'IdHTTP', 'IdTCP', 'IdSSL',
 ];
 
+/** Lowercased: Pascal names ignore case. */
 const PASCAL_BUILT_INS = new Set([
   'System', 'SysUtils', 'Classes', 'Types', 'Variants', 'StrUtils',
   'Math', 'DateUtils', 'IOUtils', 'Generics.Collections', 'Generics.Defaults',
@@ -185,7 +193,7 @@ const PASCAL_BUILT_INS = new Set([
   'TList', 'TStringList', 'TStrings', 'TStream', 'TMemoryStream', 'TFileStream',
   'Exception', 'EAbort', 'EConvertError', 'EAccessViolation',
   'IInterface', 'IUnknown',
-]);
+].map((name) => name.toLowerCase()));
 
 const C_BUILT_INS = new Set([
   // Standard C library functions
@@ -1416,19 +1424,23 @@ export class ReferenceResolver {
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
+    // A Pascal call to data runs only a routine the data holds, in scope (see
+    // gatePascalDataCall).
+    const call = ref.language === 'pascal' ? gatePascalDataCall(resolved, ref, this.context) : resolved;
+    if (!call) return null;
 
-    const target = this.nodeById(resolved.targetNodeId);
-    if (!target) return resolved;
+    const target = this.nodeById(call.targetNodeId);
+    if (!target) return call;
 
     const dot = ref.referenceName.lastIndexOf('.');
     const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
     const forwarded = resolveAliasBinding(target, memberName, this.context);
-    if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
+    if (!forwarded || forwarded.id === call.targetNodeId) return call;
 
     return this.gateLanguage({
-      ...resolved,
+      ...call,
       targetNodeId: forwarded.id,
-      confidence: Math.min(resolved.confidence, 0.85),
+      confidence: Math.min(call.confidence, 0.85),
     }, ref);
   }
 
@@ -1446,6 +1458,10 @@ export class ReferenceResolver {
     // routine its scope reaches, or through a receiver to a method of the
     // receiver's declared type; data of that name links nothing.
     if (isPascalParenlessRef(ref)) return matchPascalParenlessRef(ref, this.context);
+    // So does a Pascal call to a name the compiler or the System unit gives
+    // meaning to (`SizeOf`, `TypeInfo`, `length(S)`, `Pointer(P)`), whatever
+    // its case: only a declaration in the call's scope shadows it.
+    if (isPascalSystemCall(ref, this.context)) return matchPascalSystemCall(ref, this.context);
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
@@ -3281,12 +3297,14 @@ export class ReferenceResolver {
       }
     }
 
-    // Pascal/Delphi built-ins and standard library units
+    // Pascal/Delphi built-ins, whatever their case: Pascal names ignore it
+    // (`length(S)`, `system.TypeInfo(T)`). And standard library units.
     if (ref.language === 'pascal') {
-      if (PASCAL_UNIT_PREFIXES.some((p) => name.startsWith(p))) {
+      const lower = name.toLowerCase();
+      if (PASCAL_UNIT_PREFIXES.some((p) => name.startsWith(p)) || lower.startsWith('system.')) {
         return true;
       }
-      if (PASCAL_BUILT_INS.has(name)) {
+      if (PASCAL_BUILT_INS.has(lower)) {
         return true;
       }
     }
