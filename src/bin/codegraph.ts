@@ -2558,6 +2558,29 @@ program
  *   codegraph affected src/lib/components/Editor.svelte src/routes/+page.svelte
  */
 program
+  .command('hotspots')
+  .description('Rank source complexity and graph fan-in')
+  .option('-p, --path <path>', 'Project path')
+  .option('--changed <files...>', 'Changed indexed file paths')
+  .option('--threshold <number>', 'Strict score threshold', '50')
+  .option('--limit <number>', 'Maximum displayed symbols', '20')
+  .option('--strict', 'Exit with status 1 when a scored symbol reaches the threshold')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { path?: string; changed?: string[]; threshold: string; limit: string; strict?: boolean; json?: boolean }) => {
+    const { default: CodeGraph } = await loadCodeGraph();
+    const graph = await CodeGraph.open(resolveProjectPath(options.path));
+    try {
+      const report = await graph.getRiskHotspots({ changedFiles: options.changed, threshold: Number(options.threshold), maxItems: Number(options.limit) });
+      if (options.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        for (const item of report.items) console.log(item.score + ' ' + item.node.qualifiedName + ' ' + item.node.filePath + ':' + item.node.startLine);
+        console.log(report.scoredSymbols + ' scored, ' + report.aboveThreshold + ' at threshold, ' + report.skippedFiles.length + ' skipped; truncated=' + report.truncated);
+      }
+      if (options.strict && report.aboveThreshold > 0) process.exitCode = 1;
+    } finally { await graph.close(); }
+  });
+
+program
   .command('affected [files...]')
   .description('Find test files affected by changed source files')
   .option('-p, --path <path>', 'Project path')

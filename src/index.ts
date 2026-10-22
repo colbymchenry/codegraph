@@ -46,6 +46,10 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
+import { riskHotspots, type RiskHotspotOptions, type RiskHotspotReport } from './graph/hotspot-report';
+export type { RiskHotspotOptions, RiskHotspotReport } from './graph/hotspot-report';
+export type { HotspotRow } from './graph/hotspots';
+
 import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
 import {
   ReferenceResolver,
@@ -2477,9 +2481,12 @@ export class CodeGraph {
     return this.queries.hasFilesUnder(dir);
   }
 
-  /**
-   * Get all tracked files
-   */
+  /** Rank indexed callables by source decisions, fan-in and related test evidence. */
+  getRiskHotspots(options: RiskHotspotOptions = {}): Promise<RiskHotspotReport> {
+    return riskHotspots(this, options);
+  }
+
+  /** Get all tracked files. */
   getFiles(): FileRecord[] {
     return this.queries.getAllFiles();
   }
