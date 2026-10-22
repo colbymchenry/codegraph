@@ -150,6 +150,8 @@ interface NodeRow {
   decorators: string | null;
   type_parameters: string | null;
   return_type: string | null;
+  /** Absent on rows read through a stale prepared statement. */
+  metadata?: string | null;
   updated_at: number;
 }
 
@@ -216,6 +218,7 @@ function rowToNode(row: NodeRow): Node {
     decorators: row.decorators ? safeJsonParse(row.decorators, undefined) : undefined,
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
     returnType: row.return_type ?? undefined,
+    metadata: row.metadata ? safeJsonParse(row.metadata, undefined) : undefined,
     updatedAt: row.updated_at,
   };
 }
@@ -548,13 +551,13 @@ export class QueryBuilder {
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, return_type, updated_at
+          decorators, type_parameters, return_type, metadata, updated_at
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
           @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @returnType, @updatedAt
+          @decorators, @typeParameters, @returnType, @metadata, @updatedAt
         )
       `);
     }
@@ -598,6 +601,7 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       returnType: node.returnType ?? null,
+      metadata: node.metadata ? JSON.stringify(node.metadata) : null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
 
@@ -677,6 +681,7 @@ export class QueryBuilder {
           node.decorators ? JSON.stringify(node.decorators) : null,
           node.typeParameters ? JSON.stringify(node.typeParameters) : null,
           node.returnType ?? null,
+          node.metadata ? JSON.stringify(node.metadata) : null,
           node.updatedAt ?? Date.now(),
         ]);
         if (this.isSegmentableKind(node.kind)) this.collectNameSegmentRows(node.name, segmentRows);
@@ -688,9 +693,9 @@ export class QueryBuilder {
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, return_type, updated_at
+          decorators, type_parameters, return_type, metadata, updated_at
         ) VALUES `,
-        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         rows
       );
       this.runBatched(
@@ -792,6 +797,7 @@ export class QueryBuilder {
           decorators = @decorators,
           type_parameters = @typeParameters,
           return_type = @returnType,
+          metadata = @metadata,
           updated_at = @updatedAt
         WHERE id = @id
       `);
@@ -827,6 +833,7 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       returnType: node.returnType ?? null,
+      metadata: node.metadata ? JSON.stringify(node.metadata) : null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
 
