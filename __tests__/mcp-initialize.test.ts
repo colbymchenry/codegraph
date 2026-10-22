@@ -239,15 +239,17 @@ describe('AOSP tools addendum in the initialize instructions', () => {
   let tempDir: string | null = null;
   let child: ChildProcessWithoutNullStreams | null = null;
 
-  afterEach(() => {
+  afterEach(async () => {
     if (ORIGINAL_ENV === undefined) delete process.env.CODEGRAPH_MCP_TOOLS;
     else process.env.CODEGRAPH_MCP_TOOLS = ORIGINAL_ENV;
-    if (child && !child.killed) {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, 'close');
       child.kill('SIGKILL');
-      child = null;
+      await closed;
     }
+    child = null;
     if (tempDir) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      await removeWhenReleased(tempDir);
       tempDir = null;
     }
   });
