@@ -98,6 +98,26 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('preserves static modifiers on methods and fields: %s (#2761)', (ext, language) => {
+    const result = assertParity(`static.${ext}`, `export class Flags {
+  static create() {}
+  run() {}
+  static handler = () => {};
+  callback = () => {};
+  static count = 0;
+  value = 0;
+  static() {}
+}
+`, language);
+    expect(result.nodes.filter((n) => n.kind === 'method' || n.kind === 'property')
+      .map((n) => [n.name, n.isStatic])).toEqual([
+      ['create', true], ['run', false], ['handler', true], ['callback', false],
+      ['count', true], ['value', false], ['static', false],
+    ]);
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('named object literals own their members: %s (#2300)', (ext, language) => {
     const source = [
       '/* é😀 */ const Api = { read() { helper(); }, close: () => helper(), gen: function* () { yield 1; }, \'quoted-key\': function () {}, [dyn()]() { helper(); }, eager: helper(), alias: helper, helper };',

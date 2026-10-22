@@ -1,6 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
-import { classifyTsClassMember } from './typescript';
+import { classifyTsClassMember, typescriptExtractor } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
@@ -77,6 +77,7 @@ export const javascriptExtractor: LanguageExtractor = {
     }
     return false;
   },
+  isStatic: typescriptExtractor.isStatic,
   isConst: (node) => {
     if (node.type === 'lexical_declaration') {
       for (let i = 0; i < node.childCount; i++) {

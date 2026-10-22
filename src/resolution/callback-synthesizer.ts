@@ -1671,6 +1671,8 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
         for (const m of impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
+          if ((base.language === 'javascript' || base.language === 'typescript') &&
+              (bm.isStatic ?? false) !== (m.isStatic ?? false)) continue;
           const key = `${bm.id}>${m.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
