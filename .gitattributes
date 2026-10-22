@@ -1,0 +1,4 @@
+# Tree-sitter grammars vendored into the native kernel (see codegraph-kernel/build.rs).
+# Their parser.c files are generated and third-party; keep them out of GitHub's
+# language stats and collapse them in diffs.
+codegraph-kernel/grammars/** linguist-vendored linguist-generated
