@@ -3354,9 +3354,21 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
  * exported name from anywhere, an unexported one only inside its own package,
  * which is a directory. By the name's first letter, not the extractor's flag:
  * the flag is unset for every Go method, exported or not.
+ *
+ * A package's external tests (`package a_test` beside `package a`) share its
+ * directory but are a package of their own: a name one of them declares at
+ * the top level reaches the other only through an import, written `a.Real`,
+ * or bare after `import . "…/a"`, and then only an exported one. A test
+ * helper `corpus` in `package a_test` is not package `a`'s `corpus` (#2581).
  */
-function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
-  return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+function isGoNameVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const dir = goPackageDir(candidate.filePath);
+  if (dir !== goPackageDir(ref.filePath)) return /^[A-Z]/.test(candidate.name);
+  if (candidate.filePath === ref.filePath || TYPE_MEMBER_KINDS.has(candidate.kind) || ref.referenceName.includes('.')) return true;
+  const own = goPackageClause(ref.filePath, context);
+  const theirs = goPackageClause(candidate.filePath, context);
+  if (own === null || theirs === null || own === theirs) return true;
+  return /^[A-Z]/.test(candidate.name) && goDotImports(ref.filePath, context).dirs.includes(dir);
 }
 
 /**
@@ -3457,7 +3469,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // no `.mm` file's `vector`. (A class is the runtime's, wherever it is
   // written.)
   if (isObjcFileLocalElsewhere(candidate, ref)) return false;
-  if (lang === 'go') return isGoNameVisible(candidate, ref);
+  if (lang === 'go') return isGoNameVisible(candidate, ref, context);
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
     if (isRustTraitImplMethod(candidate, context)) return true;
@@ -11805,7 +11817,7 @@ export function matchByExactName(
     // And a Go name that isn't exported, only its own package's: prometheus
     // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
     // same (a child package's directory shares as much of the path) and won.
-    (n.language !== 'go' || isGoNameVisible(n, ref)) &&
+    (n.language !== 'go' || isGoNameVisible(n, ref, context)) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -20447,6 +20459,206 @@ function goPackageClause(filePath: string, context: ResolutionContext): string |
   }
   memo.set(filePath, name);
   return name;
+}
+
+/** What `go build` is asked to build for. */
+interface GoBuildTarget {
+  goos: string;
+  goarch: string;
+}
+
+/** The operating systems and architectures go/build reads from a file name (its syslist). */
+const GO_KNOWN_OS: ReadonlySet<string> = new Set([
+  'aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios', 'js', 'linux', 'nacl', 'netbsd',
+  'openbsd', 'plan9', 'solaris', 'wasip1', 'windows', 'zos',
+]);
+const GO_KNOWN_ARCH: ReadonlySet<string> = new Set([
+  '386', 'amd64', 'amd64p32', 'arm', 'armbe', 'arm64', 'arm64be', 'loong64', 'mips', 'mipsle', 'mips64', 'mips64le',
+  'mips64p32', 'mips64p32le', 'ppc', 'ppc64', 'ppc64le', 'riscv', 'riscv64', 's390', 's390x', 'sparc', 'sparc64', 'wasm',
+]);
+/** The systems the `unix` build tag holds for. */
+const GO_UNIX_OS: ReadonlySet<string> = new Set([
+  'aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios', 'linux', 'netbsd', 'openbsd', 'solaris',
+]);
+
+/**
+ * The targets a Go name with build-constrained twins is read for, the most
+ * typical first: a Linux server, a Mac, Windows, then every other system on
+ * its usual architecture and Linux on every other architecture.
+ */
+const GO_BUILD_TARGETS: readonly GoBuildTarget[] = (() => {
+  const usual: Record<string, string> = { js: 'wasm', wasip1: 'wasm', ios: 'arm64', android: 'arm64', aix: 'ppc64', zos: 's390x', hurd: '386' };
+  const targets: GoBuildTarget[] = [
+    { goos: 'linux', goarch: 'amd64' }, { goos: 'darwin', goarch: 'arm64' }, { goos: 'windows', goarch: 'amd64' },
+    { goos: 'linux', goarch: 'arm64' }, { goos: 'darwin', goarch: 'amd64' }, { goos: 'freebsd', goarch: 'amd64' },
+  ];
+  const add = (goos: string, goarch: string): void => {
+    if (!targets.some((t) => t.goos === goos && t.goarch === goarch)) targets.push({ goos, goarch });
+  };
+  for (const goos of GO_KNOWN_OS) add(goos, usual[goos] ?? 'amd64');
+  for (const goarch of GO_KNOWN_ARCH) add('linux', goarch);
+  return targets;
+})();
+
+/**
+ * Whether a build tag holds for a target, as the go command sets them by
+ * default: the system and architecture (`android` is also `linux`, `ios`
+ * `darwin`, `illumos` `solaris`), `unix` on a Unix system, the `gc` compiler,
+ * cgo, and every `go1.N` release. Any other tag (`ignore`, `purego`, a
+ * project's `integration`) is unset.
+ */
+function goBuildTagHolds(tag: string, t: GoBuildTarget): boolean {
+  if (tag === t.goos || tag === t.goarch) return true;
+  switch (tag) {
+    case 'unix': return GO_UNIX_OS.has(t.goos);
+    case 'linux': return t.goos === 'android';
+    case 'darwin': return t.goos === 'ios';
+    case 'solaris': return t.goos === 'illumos';
+    case 'gc': return true;
+    case 'cgo': return t.goos !== 'js' && t.goos !== 'wasip1';
+    default: return /^go1\.\d+$/.test(tag);
+  }
+}
+
+type GoBuildConstraint = (t: GoBuildTarget) => boolean;
+
+/** A `//go:build` expression (`unix && !(linux || darwin)`) as a test of a target, or null when it can't be read. */
+function goParseBuildExpr(text: string): GoBuildConstraint | null {
+  const tokens = text.match(/&&|\|\||[()!]|[A-Za-z0-9_.]+|\S/g) ?? [];
+  let i = 0;
+  const or = (): GoBuildConstraint | null => {
+    let left = and();
+    while (left && tokens[i] === '||') {
+      i++;
+      const a = left, b = and();
+      left = b && ((t) => a(t) || b(t));
+    }
+    return left;
+  };
+  const and = (): GoBuildConstraint | null => {
+    let left = not();
+    while (left && tokens[i] === '&&') {
+      i++;
+      const a = left, b = not();
+      left = b && ((t) => a(t) && b(t));
+    }
+    return left;
+  };
+  const not = (): GoBuildConstraint | null => {
+    const tok = tokens[i++];
+    if (tok === '!') {
+      const inner = not();
+      return inner && ((t) => !inner(t));
+    }
+    if (tok === '(') {
+      const inner = or();
+      return tokens[i++] === ')' ? inner : null;
+    }
+    return tok !== undefined && /^[A-Za-z0-9_.]+$/.test(tok) ? (t) => goBuildTagHolds(tok, t) : null;
+  };
+  const expr = or();
+  return expr && i === tokens.length ? expr : null;
+}
+
+/** A legacy `// +build` line's options (`linux,amd64 darwin`, `!plan9`) as a test of a target, or null when it can't be read. */
+function goParsePlusBuild(text: string): GoBuildConstraint | null {
+  const options = text.trim().split(/\s+/).filter(Boolean).map((option) => option.split(',').map((term) => {
+    const neg = term.startsWith('!');
+    const tag = neg ? term.slice(1) : term;
+    return /^[A-Za-z0-9_.]+$/.test(tag) ? { neg, tag } : null;
+  }));
+  if (options.length === 0 || options.some((terms) => terms.some((term) => term === null))) return null;
+  return (t) => options.some((terms) => terms.every((term) => goBuildTagHolds(term!.tag, t) !== term!.neg));
+}
+
+const GO_BUILD_CONSTRAINTS = new WeakMap<ResolutionContext, Map<string, GoBuildConstraint | null>>();
+
+/**
+ * The targets a Go file builds for, as go/build reads them: a `_linux`,
+ * `_amd64` or `_windows_arm64` suffix on its name (before `_test`), and the
+ * `//go:build` line above its package clause, or the legacy `// +build` lines
+ * when it has none. Null for a file that builds everywhere, or whose
+ * constraint can't be read.
+ */
+function goFileConstraint(filePath: string, context: ResolutionContext): GoBuildConstraint | null {
+  let memo = GO_BUILD_CONSTRAINTS.get(context);
+  if (!memo) GO_BUILD_CONSTRAINTS.set(context, (memo = new Map()));
+  if (memo.has(filePath)) return memo.get(filePath)!;
+  const parts: GoBuildConstraint[] = [];
+  // go/build ignores what comes before the name's first `_`, so `linux.go` names no system.
+  const base = path.posix.basename(filePath.replace(/\\/g, '/')).replace(/\..*$/, '');
+  const suffix = base.includes('_') ? base.slice(base.indexOf('_') + 1).split('_') : [];
+  if (suffix[suffix.length - 1] === 'test') suffix.pop();
+  const last = suffix[suffix.length - 1];
+  const prev = suffix[suffix.length - 2];
+  if (prev !== undefined && GO_KNOWN_OS.has(prev) && last !== undefined && GO_KNOWN_ARCH.has(last)) {
+    parts.push((t) => goBuildTagHolds(prev, t) && goBuildTagHolds(last, t));
+  } else if (last !== undefined && (GO_KNOWN_OS.has(last) || GO_KNOWN_ARCH.has(last))) {
+    parts.push((t) => goBuildTagHolds(last, t));
+  }
+  // The constraint comes before the package clause, after only blank lines and line comments.
+  let goBuild: string | undefined;
+  const plusBuild: string[] = [];
+  for (const line of (context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? []).slice(0, 200)) {
+    // (Past a byte-order mark.)
+    const text = (line.charCodeAt(0) === 0xfeff ? line.slice(1) : line).trim();
+    if (text === '') continue;
+    if (!text.startsWith('//')) break;
+    const go = /^\/\/go:build\s+(.*)$/.exec(text);
+    if (go && goBuild === undefined) goBuild = go[1];
+    const plus = /^\/\/\s*\+build\s+(.*)$/.exec(text);
+    if (plus) plusBuild.push(plus[1]!);
+  }
+  const header = goBuild !== undefined ? [goParseBuildExpr(goBuild)] : plusBuild.map(goParsePlusBuild);
+  let readable = true;
+  for (const c of header) {
+    if (c) parts.push(c);
+    else readable = false;
+  }
+  const constraint: GoBuildConstraint | null = !readable || parts.length === 0 ? null : (t) => parts.every((c) => c(t));
+  memo.set(filePath, constraint);
+  return constraint;
+}
+
+const GO_BUILD_TWINS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+/**
+ * The definition Go builds, of a name its package defines more than once for
+ * different targets — `sep` in `sep_unix.go` (`//go:build unix`) and
+ * `sep_other.go` (`//go:build !unix`), a method in `file_linux.go` and
+ * `file_windows.go`. Name matching took whichever came first, so a Linux
+ * caller's `sep()` reached the `!unix` file and the Unix definition showed no
+ * caller (#2581). The definition kept is the one that builds for the most
+ * typical target the reference's own file builds for: Linux on amd64 first,
+ * then a Mac, then Windows and the rest (GO_BUILD_TARGETS), so a file that
+ * only builds for Windows reaches the Windows definition. The result stands
+ * when no twin builds for those targets, or two do.
+ */
+export function preferGoBuildTwin(result: ResolvedRef | null, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (!result || ref.language !== 'go') return result;
+  const target = context.getNodeById?.(result.targetNodeId);
+  // A file that builds everywhere can have no twin: the package would declare the name twice.
+  if (!target || target.language !== 'go' || !goFileConstraint(target.filePath, context)) return result;
+  let memo = GO_BUILD_TWINS.get(context);
+  if (!memo) GO_BUILD_TWINS.set(context, (memo = new Map()));
+  let twins = memo.get(target.id);
+  if (!twins) {
+    const dir = goPackageDir(target.filePath);
+    const clause = goPackageClause(target.filePath, context);
+    twins = context.getNodesByName(target.name).filter((n) =>
+      n.language === 'go' && n.kind === target.kind && n.qualifiedName === target.qualifiedName &&
+      goPackageDir(n.filePath) === dir && goPackageClause(n.filePath, context) === clause);
+    memo.set(target.id, twins);
+  }
+  if (twins.length < 2) return result;
+  const own = goFileConstraint(ref.filePath, context);
+  for (const t of GO_BUILD_TARGETS) {
+    if (own && !own(t)) continue;
+    const built = twins.filter((n) => goFileConstraint(n.filePath, context)?.(t) ?? true);
+    if (built.length === 1) return built[0]!.id === target.id ? result : { ...result, targetNodeId: built[0]!.id };
+    if (built.length > 1) return result;
+  }
+  return result;
 }
 
 /**
