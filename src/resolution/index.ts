@@ -158,6 +158,9 @@ const GO_BUILT_INS = new Set([
 /** What a Pascal typecast's name resolves to: `TFoo(x)` casts, it doesn't call (see createEdges). */
 const PASCAL_CAST_TARGET_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'type_alias']);
 
+/** The values a TypeScript type may share its name with in its file, which a call or `new` of the name means. */
+const TYPE_COMPANION_VALUE_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'component', 'constant', 'variable']);
+
 const PASCAL_UNIT_PREFIXES = [
   'System.', 'Winapi.', 'Vcl.', 'Fmx.', 'Data.', 'Datasnap.',
   'Soap.', 'Xml.', 'Web.', 'REST.', 'FireDAC.', 'IBX.',
@@ -3707,6 +3710,21 @@ export class ReferenceResolver {
           !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
     }
 
+    // A TypeScript interface or type alias is no value: nothing calls one or
+    // makes an instance of it. A strategy that found one by name meant the
+    // value its file declares beside it (`interface Ok` and `function Ok` in a
+    // result module); with none there, the name is a value from elsewhere
+    // that the project only types (`new Response()`, `new Worker()`), and
+    // links nothing.
+    if ((ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && ESM_IMPORT_LANGUAGES.has(ref.language)) {
+      const target = this.nodeById(result.targetNodeId);
+      if (target && (target.kind === 'interface' || target.kind === 'type_alias')) {
+        const value = this.sameNamedValueOfType(target);
+        if (!value) return null;
+        result = { ...result, targetNodeId: value.id };
+      }
+    }
+
     // An `imports` reference names something importable — never a member that
     // only exists inside a type, nor its own import statement. A module path
     // that names no file (`./missing`, `stdio.h`, `pkg.mod`, a C# `using` of
@@ -3948,6 +3966,19 @@ export class ReferenceResolver {
   }
 
   /** The one supertype-kind node a TypeScript value shares its name and file with. */
+  /**
+   * The value a file declares beside a type of the same name — `export
+   * function Ok()` beside `export interface Ok`, a class merged with an
+   * interface — which a call or `new` written with the name reaches. The
+   * first by position; null when the file declares none.
+   */
+  private sameNamedValueOfType(type: Node): Node | null {
+    return this.context
+      .getNodesInFile(type.filePath)
+      .filter((n) => n.name === type.name && TYPE_COMPANION_VALUE_KINDS.has(n.kind))
+      .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null;
+  }
+
   private sameNamedTypeOfValue(value: Node): Node | null {
     if (value.kind !== 'constant' && value.kind !== 'variable') return null;
     if (value.language !== 'typescript' && value.language !== 'tsx') return null;
