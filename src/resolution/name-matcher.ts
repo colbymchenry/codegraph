@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
+import { escapeRegExp } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
@@ -412,7 +413,7 @@ function pythonMembers(cls: Node, member: string, ref: UnresolvedRef, context: R
   seen.add(cls.id);
   // Instance assignments also shadow methods, even though they are not nodes.
   const body = pythonMemberLines(cls.filePath, context).slice(cls.startLine - 1, cls.endLine).join('\n');
-  if (new RegExp(`^\\s*(?:(?:self|cls)\\.)?${member}\\s*(?:=|:)`, 'm').test(body)) return [cls];
+  if (new RegExp(`^\\s*(?:(?:self|cls)\\.)?${escapeRegExp(member)}\\s*(?:=|:)`, 'm').test(body)) return [cls];
   const own = context.getNodesByQualifiedName(`${cls.qualifiedName}::${member}`).filter(n => n.filePath === cls.filePath);
   if (own.length) return own;
   return [...new Map(pythonBases(cls, ref, context).flatMap(p => pythonMembers(p, member, ref, context, seen)).map(n => [n.id, n])).values()];
@@ -563,7 +564,7 @@ function pythonLineBindings(lines: string[], index: number, statements: boolean[
     return out;
   }
   if (!line.includes(name)) return out;
-  const word = new RegExp(`(?<![\\w.])${name}\\b(?!\\s*[.\\[])`);
+  const word = new RegExp(`(?<![\\w.])${escapeRegExp(name)}\\b(?!\\s*[.\\[])`);
   if (!word.test(line)) return out;
   const declared = line.match(/^\s*(global|nonlocal)\s+([\w\s,]+)$/);
   if (declared) {
@@ -576,19 +577,19 @@ function pythonLineBindings(lines: string[], index: number, statements: boolean[
     const assignment = pythonAssignment(line);
     if (assignment) {
       const target = assignment.targets.length === 1 && !assignment.augmented ? assignment.targets[0]!.trim() : '';
-      const annotated = target.match(new RegExp(`^${name}\\s*:\\s*["']?([\\w.]+)["']?$`));
+      const annotated = target.match(new RegExp(`^${escapeRegExp(name)}\\s*:\\s*["']?([\\w.]+)["']?$`));
       if (target === name || annotated) {
         out.push({ kind: 'assign', type: annotated?.[1] ?? null, value: assignment.value.trim(), line: index });
       } else if (assignment.targets.some(t => word.test(t))) {
         out.push({ kind: 'other' });
       }
     } else {
-      const annotated = line.match(new RegExp(`^\\s*${name}\\s*:\\s*["']?([\\w.]+)["']?\\s*$`));
+      const annotated = line.match(new RegExp(`^\\s*${escapeRegExp(name)}\\s*:\\s*["']?([\\w.]+)["']?\\s*$`));
       if (annotated) out.push({ kind: 'assign', type: annotated[1]!, value: '', line: index });
       else if (new RegExp(`^\\s*del\\b`).test(line)) out.push({ kind: 'other' });
     }
   }
-  if (new RegExp(`\\b${name}[ \\t]*:=|\\bas[ \\t]+${name}\\b`).test(line)) out.push({ kind: 'other' });
+  if (new RegExp(`\\b${escapeRegExp(name)}[ \\t]*:=|\\bas[ \\t]+${escapeRegExp(name)}\\b`).test(line)) out.push({ kind: 'other' });
   for (const loop of line.matchAll(/\bfor\s+([^:]+?)\s+in\b/g)) if (word.test(loop[1]!)) out.push({ kind: 'other' });
   for (const lambda of line.matchAll(/\blambda\b([^:]*):/g)) if (word.test(lambda[1]!)) out.push({ kind: 'other' });
   return out;
@@ -603,7 +604,7 @@ function pythonLineBindings(lines: string[], index: number, statements: boolean[
 function pythonBindsLocally(name: string, ref: UnresolvedRef, context: ResolutionContext, importsBind: boolean): boolean {
   const lines = pythonMemberLines(ref.filePath, context);
   const statements = pythonStatementStarts(ref.filePath, context);
-  const param = new RegExp(`[(,]\\s*\\*{0,2}${name}\\s*[:=,)]`);
+  const param = new RegExp(`[(,]\\s*\\*{0,2}${escapeRegExp(name)}\\s*[:=,)]`);
   const scopes = context.getNodesInFile(ref.filePath).filter(n =>
     (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
     .sort((a, b) => b.startLine - a.startLine);
@@ -785,7 +786,7 @@ function pythonModuleAliases(filePath: string, moduleFile: string, context: Reso
     if (!files.includes(moduleFile)) continue;
     // The mapping cannot tell `import a.b` from `import a.b as b`; the source line can.
     // Exactly this module (not `other.a.b`), outside string literals.
-    const explicit = new RegExp(`\\bimport\\s[^\\n]*(?<![\\w.])${m.source.replace(/\./g, '\\.')}\\s+as\\s+${m.localName}\\b`);
+    const explicit = new RegExp(`\\bimport\\s[^\\n]*(?<![\\w.])${escapeRegExp(m.source)}\\s+as\\s+${escapeRegExp(m.localName)}\\b`);
     const plainDotted = m.isNamespace && m.source.includes('.') && m.localName === m.source.split('.').pop() &&
       !pythonMemberLines(filePath, context).some(line => explicit.test(blankPythonStrings(line)));
     (files.length === 1 ? aliases : ambiguous).add(plainDotted ? m.source : m.localName);
@@ -858,9 +859,9 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
       const spell = (names: string[]) => `(?:${names.map(escape).join('|')})`;
       // Test files: any receiver (the double may sit on any spelling of the module).
       const receiver = test ? '[\\w.]+' : spell([...aliases, ...ambiguous]);
-      const target = new RegExp(`(?<![\\w.])${receiver}\\.${name}\\b(?!\\s*[.\\[(])`);
-      const exact = new RegExp(`^${test ? receiver : spell(aliases.length ? aliases : ['\\0'])}\\.${name}(?:\\s*:[^=]*)?$`);
-      const dynamic = new RegExp(`\\b(?:setattr|patch\\.object)\\s*\\(\\s*${receiver}\\s*,\\s*['"]${name}['"]` +
+      const target = new RegExp(`(?<![\\w.])${receiver}\\.${escapeRegExp(name)}\\b(?!\\s*[.\\[(])`);
+      const exact = new RegExp(`^${test ? receiver : spell(aliases.length ? aliases : ['\\0'])}\\.${escapeRegExp(name)}(?:\\s*:[^=]*)?$`);
+      const dynamic = new RegExp(`\\b(?:setattr|patch\\.object)\\s*\\(\\s*${receiver}\\s*,\\s*['"]${escapeRegExp(name)}['"]` +
         `|(?<![\\w.])${receiver}\\.__dict__\\s*(?:\\[|\\.\\s*update\\s*\\()`);
       const lines = pythonMemberLines(file, context);
       const statements = pythonStatementStarts(file, context);
@@ -1061,8 +1062,8 @@ function pythonConstructorCall(text: string): string | null {
 function pythonFieldType(receiver: string, owner: Node, ref: UnresolvedRef, context: ResolutionContext): string | null {
   const lines = pythonMemberLines(ref.filePath, context);
   const field = receiver.split('.')[1]!;
-  const assignment = new RegExp(`^\\s*(?:self|cls)\\.${field}\\s*(?::\\s*["']?([\\w.]+)["']?)?\\s*=\\s*(.*)$`);
-  const annotation = new RegExp(`^\\s*(?:(?:self|cls)\\.)?${field}\\s*:\\s*["']?([\\w.]+)`);
+  const assignment = new RegExp(`^\\s*(?:self|cls)\\.${escapeRegExp(field)}\\s*(?::\\s*["']?([\\w.]+)["']?)?\\s*=\\s*(.*)$`);
+  const annotation = new RegExp(`^\\s*(?:(?:self|cls)\\.)?${escapeRegExp(field)}\\s*:\\s*["']?([\\w.]+)`);
   const methods = context.getNodesInFile(ref.filePath).filter(n => n.kind === 'method' &&
     n.qualifiedName.startsWith(`${owner.qualifiedName}::`));
   const types = new Set<string>();
@@ -1998,7 +1999,7 @@ function luaLocalDecl(name: string, file: string, line: number, context: Resolut
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
   if (fn && (!best || best.startLine < fn.startLine)) {
     const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
-    const decl = new RegExp(`^\\s*local\\s+${name}\\s*=\\s*(.+?)\\s*$`);
+    const decl = new RegExp(`^\\s*local\\s+${escapeRegExp(name)}\\s*=\\s*(.+?)\\s*$`);
     for (let at = line - 1; at > fn.startLine; at--) {
       const m = decl.exec(lines[at - 1] ?? '');
       if (!m) continue;
@@ -2093,7 +2094,7 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext, d
   const source = (context.readFile(file) ?? '')
     .replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, (c) => c.replace(/[^\n]/g, ''))
     .replace(/--[^\n]*/g, '');
-  const exported = new RegExp(`(?:^|[\\s{,.])${member}\\s*=\\s*([A-Za-z_]\\w*(?:\\s*\\.\\s*[A-Za-z_]\\w*)*)\\s*(?:[,;}]|$)`, 'm').exec(source);
+  const exported = new RegExp(`(?:^|[\\s{,.])${escapeRegExp(member)}\\s*=\\s*([A-Za-z_]\\w*(?:\\s*\\.\\s*[A-Za-z_]\\w*)*)\\s*(?:[,;}]|$)`, 'm').exec(source);
   if (exported && exported[1] !== member) {
     const rhs = exported[1]!;
     const line = source.slice(0, exported.index).split('\n').length + 1;
@@ -3221,8 +3222,8 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
     const segs = candidate.qualifiedName.split('::');
     const enumName = segs[segs.length - 2] ?? '';
     const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-    const name = ref.referenceName.replace(/\$/g, '\\$');
-    if (new RegExp(`\\bcase\\b[^:;]*\\b${name}\\b`).test(line) || new RegExp(`\\b${enumName}\\s*\\.\\s*${name}\\b`).test(line)) return true;
+    const name = escapeRegExp(ref.referenceName);
+    if (new RegExp(`\\bcase\\b[^:;]*\\b${name}\\b`).test(line) || new RegExp(`\\b${escapeRegExp(enumName)}\\s*\\.\\s*${name}\\b`).test(line)) return true;
     const here = javaFileScope(ref.filePath, context);
     const enumFqn = [javaFileScope(candidate.filePath, context).pkg, ...segs.slice(1, -1)].filter((p) => p !== '').join('.');
     return here.single.has(`${enumFqn}.${ref.referenceName}`) || here.demand.has(enumFqn);
@@ -3238,9 +3239,9 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   // inner class's `outer.new Inner()` — the qualifier says which: the owner
   // (or the package) of this candidate.
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  if (new RegExp(`\\.\\s*new\\s+${ref.referenceName.replace(/\$/g, '\\$')}\\b`).test(line)) return true;
+  if (new RegExp(`\\.\\s*new\\s+${escapeRegExp(ref.referenceName)}\\b`).test(line)) return true;
   // (A type annotation may sit between them: jsoup's `Range.@Nullable Spans`.)
-  const qualifiers = [...line.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\.\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s+)*${ref.referenceName.replace(/\$/g, '\\$')}\\b`, 'g'))].map((m) => m[1]!);
+  const qualifiers = [...line.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\.\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s+)*${escapeRegExp(ref.referenceName)}\\b`, 'g'))].map((m) => m[1]!);
   // Nested only inside a type the file declares; a class local to a method is
   // the lexical rule's to judge.
   const ownerQn = segs.slice(0, -1).join('::');
@@ -3304,7 +3305,7 @@ function isScalaPackageObjectMemberVisible(candidate: Node, ref: UnresolvedRef, 
   const here = scalaPackageClauses(text).join('.');
   if (here === objectPkg || here.startsWith(`${objectPkg}.`)) return true;
   const last = objectPkg.split('.').pop()!;
-  return new RegExp(`^\\s*import\\s+[^\\n]*\\b${last.replace(/\$/g, '\\$')}\\b`, 'm').test(text);
+  return new RegExp(`^\\s*import\\s+[^\\n]*\\b${escapeRegExp(last)}\\b`, 'm').test(text);
 }
 
 const SFC_SCRIPT_RANGES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; exported: boolean }>>>();
@@ -3575,7 +3576,7 @@ function isCollapsedSelfRecursion(chain: { root: string; links: string[] }, ref:
   if (!cls) return false;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const body = lines.slice(cls.startLine - 1, cls.endLine).join('\n');
-  const f = field.replace(/\$/g, '\\$');
+  const f = escapeRegExp(field);
   const declared = new RegExp(`(?:^|[\\s(,])#?${f}\\s*[?!]?\\s*:\\s*([A-Za-z_$][\\w$]*)`, 'm').exec(body)?.[1] ??
     new RegExp(`\\bthis\\.${f}\\s*=\\s*new\\s+([A-Za-z_$][\\w$]*)`).exec(body)?.[1];
   return declared === owner;
@@ -3890,7 +3891,7 @@ function pythonFixtureReturnType(receiver: string, ref: UnresolvedRef, context: 
   // The receiver must be the test's own parameter.
   const signature = caller && (caller.kind === 'function' || caller.kind === 'method')
     ? lines.slice(caller.startLine - 1, caller.startLine + 4).join(' ').split(/\)\s*(?:->[^:]*)?:/)[0] ?? '' : '';
-  if (new RegExp(`[(,]\\s*${receiver}\\s*(?:[:=,)]|$)`).test(signature)) {
+  if (new RegExp(`[(,]\\s*${escapeRegExp(receiver)}\\s*(?:[:=,)]|$)`).test(signature)) {
     const fixtures = context.getNodesByName(receiver)
       .filter((n) => n.kind === 'function' && n.language === 'python' && isFixtureInReach(n, ref.filePath, context))
       .sort((a, b) => (a.filePath === ref.filePath ? -1 : 0) - (b.filePath === ref.filePath ? -1 : 0) || b.filePath.length - a.filePath.length);
@@ -3974,7 +3975,7 @@ function pythonLocalBinding(name: string, ref: UnresolvedRef, context: Resolutio
     PY_LOCAL_FILE.set(context, (file = { filePath: ref.filePath, lines, module: new Map() }));
   }
   const lines = file.lines;
-  const n = name;
+  const n = escapeRegExp(name);
   const assigns = new RegExp(`^\\s*(?:[\\w\\s,*()\\[\\]]*,\\s*)?\\(?\\*?${n}\\)?\\s*(?:,[\\w\\s,*()\\[\\]]*)?(?::[^=]+)?=(?!=)`);
   const targets = new RegExp(`\\bfor\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\s+in\\b|\\bas\\s+${n}\\b`);
   const params = new RegExp(`[(,]\\s*\\*{0,2}${n}\\s*(?:[:=,)]|$)`);
@@ -4220,9 +4221,8 @@ function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
-  const escape = (name: string): string => name.replace(/\$/g, '\\$');
   const constructor = owner !== '' &&
-    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escape(owner)}\s*\.\s*${escape(n.name)}(?![\w$])`).test(head);
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${escapeRegExp(n.name)}(?![\w$])`).test(head);
   memo.set(n.id, constructor);
   return constructor;
 }
@@ -4439,8 +4439,8 @@ function dartTypeCallPrefix(typeName: string, member: string, ref: UnresolvedRef
   if (prefixes.size === 0) return null;
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1];
   if (line === undefined) return null;
-  const written = new RegExp(String.raw`(?<![\w$.])([A-Za-z_$][\w$]*)\s*\.\s*${typeName.replace(/\$/g, '\\$')}\s*` +
-    String.raw`(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*\.\s*${member.replace(/\$/g, '\\$')}(?![\w$])`, 'g');
+  const written = new RegExp(String.raw`(?<![\w$.])([A-Za-z_$][\w$]*)\s*\.\s*${escapeRegExp(typeName)}\s*` +
+    String.raw`(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*\.\s*${escapeRegExp(member)}(?![\w$])`, 'g');
   // The one at the reference's column, else the first: a column counted in bytes misses after non-ASCII text.
   const found = [...line.matchAll(written)].filter((m) => prefixes.has(m[1]!));
   return (found.find((m) => m.index === ref.column) ?? found[0])?.[1] ?? null;
@@ -5182,7 +5182,7 @@ function dartNameUses(code: DartCode, filePath: string, name: string, context: R
   const key = `${filePath}|${name}`;
   const hit = memo.get(key);
   if (hit) return hit;
-  const uses = [...code.text.matchAll(new RegExp(`(?<![\\w$.])${name.replace(/\$/g, '\\$')}(?![\\w$])`, 'g'))].map((m) => m.index!);
+  const uses = [...code.text.matchAll(new RegExp(`(?<![\\w$.])${escapeRegExp(name)}(?![\\w$])`, 'g'))].map((m) => m.index!);
   if (memo.size >= 4096) memo.delete(memo.keys().next().value!);
   memo.set(key, uses);
   return uses;
@@ -5223,7 +5223,7 @@ function dartConstantType(constant: Node, ref: UnresolvedRef, context: Resolutio
   const code = dartCodeOf(constant.filePath, context);
   const from = code?.lineStarts[constant.startLine - 1];
   if (!code || from === undefined) return null;
-  const head = new RegExp(`\\b(?:const|final|var)\\s+(?:([A-Za-z_$][\\w$.]*)\\s*(?:<[^;=]*>)?\\s*\\??\\s+)?${constant.name.replace(/\$/g, '\\$')}\\s*=(?![=>])`)
+  const head = new RegExp(`\\b(?:const|final|var)\\s+(?:([A-Za-z_$][\\w$.]*)\\s*(?:<[^;=]*>)?\\s*\\??\\s+)?${escapeRegExp(constant.name)}\\s*=(?![=>])`)
     .exec(code.text.slice(from, from + 600));
   if (!head) return null;
   if (head[1] && !DART_NON_TYPE_WORDS.has(head[1])) return dartSimpleTypeName(head[1]);
@@ -5244,7 +5244,7 @@ function dartFieldType(typeName: string, name: string, ref: UnresolvedRef, conte
       const declared = classMemberType(decl, name, context);
       if (declared) return dartSimpleTypeName(declared);
       // An abstract getter mints no node: `ProviderElement? get _listenedElement;`.
-      const getter = new RegExp(String.raw`(?:^|[\s;{}])([A-Za-z_$][\w$]*)\s*(?:<[^;{}=]*>)?\s*\??\s+get\s+${name.replace(/\$/g, '\\$')}\s*;`);
+      const getter = new RegExp(String.raw`(?:^|[\s;{}])([A-Za-z_$][\w$]*)\s*(?:<[^;{}=]*>)?\s*\??\s+get\s+${escapeRegExp(name)}\s*;`);
       for (const { text } of classMemberLines(decl, context)) {
         const m = text.includes(name) ? getter.exec(text) : null;
         if (m && !DART_NON_TYPE_WORDS.has(m[1]!)) return dartSimpleTypeName(m[1]!);
@@ -5253,7 +5253,7 @@ function dartFieldType(typeName: string, name: string, ref: UnresolvedRef, conte
       const from = code?.lineStarts[decl.startLine - 1];
       const to = code?.lineStarts[decl.endLine];
       if (!code || from === undefined) continue;
-      const init = new RegExp(`\\b(?:final|var|late)\\s+${name.replace(/\$/g, '\\$')}\\s*=(?![=>])`).exec(code.text.slice(from, to));
+      const init = new RegExp(`\\b(?:final|var|late)\\s+${escapeRegExp(name)}\\s*=(?![=>])`).exec(code.text.slice(from, to));
       if (init) {
         const site: UnresolvedRef = { ...ref, filePath: decl.filePath, line: decl.startLine, column: 0 };
         return dartInitializerType(code.text, from + init.index + init[0].length, site, context, depth + 1);
@@ -5379,7 +5379,7 @@ function isDartGetter(n: Node, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   // The declaration from its start, and the next line for a return type that wraps.
   const head = `${(lines[n.startLine - 1] ?? '').slice(n.startColumn)} ${lines[n.startLine] ?? ''}`;
-  const getter = new RegExp(String.raw`^[^={;]*?\bget\s+${n.name.replace(/\$/g, '\\$')}(?![\w$])`).test(head);
+  const getter = new RegExp(String.raw`^[^={;]*?\bget\s+${escapeRegExp(n.name)}(?![\w$])`).test(head);
   memo.set(n.id, getter);
   return getter;
 }
@@ -5394,7 +5394,7 @@ function isDartSetter(n: Node, context: ResolutionContext): boolean {
   const hit = memo.get(n.id);
   if (hit !== undefined) return hit;
   const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [])[n.startLine - 1] ?? '';
-  const setter = new RegExp(String.raw`^[^={;]*?\bset\s+${n.name.replace(/\$/g, '\\$')}\s*\(`).test(line.slice(n.startColumn));
+  const setter = new RegExp(String.raw`^[^={;]*?\bset\s+${escapeRegExp(n.name)}\s*\(`).test(line.slice(n.startColumn));
   memo.set(n.id, setter);
   return setter;
 }
@@ -5678,7 +5678,7 @@ function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shap
   let line = lines?.[ref.line - 1];
   if (line === undefined) return null;
   const name = ref.referenceName;
-  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:\\(|::<|!)`);
+  const at = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\s*(?:\\(|::<|!)`);
   let start = line.startsWith(name, ref.column) ? ref.column : -1;
   if (start < 0) {
     const m = at.exec(line);
@@ -5981,13 +5981,13 @@ function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): st
   const name = ref.referenceName;
   let start = line.startsWith(name, ref.column) ? ref.column : -1;
   if (start < 0) {
-    const m = new RegExp(`(?<![\\w$])${name}\\s*[({]`).exec(line);
+    const m = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\s*[({]`).exec(line);
     start = m ? m.index : -1;
   }
   if (start < 0) {
     // An infix call on an expression — `alias(libs.x) apply false` — whose
     // receiver the extractor could not name.
-    const infix = new RegExp(`(?<=[\\w)\\]"'}]\\s+)${name}\\s+(?=[^\\s=])`).exec(line);
+    const infix = new RegExp(`(?<=[\\w)\\]"'}]\\s+)${escapeRegExp(name)}\\s+(?=[^\\s=])`).exec(line);
     return infix ? rustGoReceiverName(line.slice(0, infix.index).trimEnd()) : null;
   }
   const before = line.slice(0, start);
@@ -6017,7 +6017,7 @@ function isReceiverLessKotlinCall(ref: UnresolvedRef, context: ResolutionContext
   const name = ref.referenceName;
   let start = line.startsWith(name, ref.column) && !/[\w$]/.test(line[ref.column - 1] ?? '') ? ref.column : -1;
   if (start < 0) {
-    const m = new RegExp(`(?<![\\w$])${name.replace(/\$/g, '\\$')}\\s*[({<]`).exec(line);
+    const m = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\s*[({<]`).exec(line);
     start = m ? m.index : -1;
   }
   return start >= 0 && !/[.:]\s*$/.test(line.slice(0, start));
@@ -6371,7 +6371,7 @@ function swiftCallShape(ref: UnresolvedRef, context: ResolutionContext): SwiftCa
   const name = ref.referenceName;
   let start = line.startsWith(name, ref.column) && !/[\w$]/.test(line[ref.column - 1] ?? '') ? ref.column : -1;
   if (start < 0) {
-    const m = new RegExp(`(?<![\\w$])${name}\\s*[({<[]`).exec(line);
+    const m = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\s*[({<[]`).exec(line);
     start = m ? m.index : -1;
   }
   if (start < 0) return null;
@@ -6407,7 +6407,7 @@ function swiftDeclaresLabel(n: Node, label: string, context: ResolutionContext):
   if (label === '' || SWIFT_STD_LABELS.has(label)) return false;
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   const head = lines.slice(n.startLine - 1, n.startLine + 3).join(' ');
-  return new RegExp(`\\bfunc\\s+${n.name}\\s*(?:<[^>]*>)?\\s*\\(\\s*${label}\\b`).test(head);
+  return new RegExp(`\\bfunc\\s+${escapeRegExp(n.name)}\\s*(?:<[^>]*>)?\\s*\\(\\s*${escapeRegExp(label)}\\b`).test(head);
 }
 
 /**
@@ -6685,7 +6685,7 @@ function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionCo
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return true;
   const name = ref.referenceName;
-  const at = new RegExp(`(?<![\\w$])${name.replace(/[$]/g, '\\$')}\\b`).exec(line);
+  const at = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\b`).exec(line);
   if (!at) return true;
   const before = line.slice(0, at.index);
   if (/\.\s*$/.test(before)) {
@@ -6807,7 +6807,7 @@ function scalaLocalBinder(name: string, ref: UnresolvedRef, context: ResolutionC
   if (!scope) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
   const text = lines.slice(scope.startLine - 1, ref.line).join('\n');
-  const n = name.replace(/[$]/g, '\\$');
+  const n = escapeRegExp(name);
   const binder = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`, 'g');
   if (fn) return binder.test(text) ? fn : null;
   // In a class body, a binder counts only inside a block still open at the site —
@@ -6986,7 +6986,7 @@ function csharpSupertypesOf(typeName: string, context: ResolutionContext): strin
       else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
       else if (depth === 0) flat += ch;
     }
-    const bases = new RegExp(`\\b${typeName}\\s*:\\s*(.*?)(?:\\bwhere\\b|$)`).exec(flat)?.[1] ?? '';
+    const bases = new RegExp(`\\b${escapeRegExp(typeName)}\\s*:\\s*(.*?)(?:\\bwhere\\b|$)`).exec(flat)?.[1] ?? '';
     for (const m of bases.matchAll(/([A-Za-z_][\w.]*)/g)) names.push(m[1]!.split('.').pop()!);
   }
   memo.set(typeName, names);
@@ -7233,7 +7233,7 @@ function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call'
   if (line === undefined) return null;
   const name = ref.referenceName.split(':')[0]!;
   if (!name) return null;
-  const at = new RegExp(`(?<![\\w.])${name}\\b`, 'g');
+  const at = new RegExp(`(?<![\\w.])${escapeRegExp(name)}\\b`, 'g');
   let m: RegExpExecArray | null;
   let shape: 'c-call' | 'self-send' | 'super-send' | null = null;
   while ((m = at.exec(line))) {
@@ -7353,7 +7353,7 @@ function objcReceiverReaches(receiver: string, method: Node, context: Resolution
 /** The classes the `@property … Type *name` declarations of `name` give. */
 function objcPropertyTypes(name: string, context: ResolutionContext): string[] {
   const types = new Set<string>();
-  const decl = new RegExp(`@property\\s*(?:\\([^)]*\\)\\s*)?([A-Z]\\w*)\\s*(?:<[^;]*>\\s*)?\\*\\s*(?:_Nullable\\s+|_Nonnull\\s+)?${name}\\b`);
+  const decl = new RegExp(`@property\\s*(?:\\([^)]*\\)\\s*)?([A-Z]\\w*)\\s*(?:<[^;]*>\\s*)?\\*\\s*(?:_Nullable\\s+|_Nonnull\\s+)?${escapeRegExp(name)}\\b`);
   for (const n of context.getNodesByName(name)) {
     if (n.kind !== 'property' || n.language !== 'objc') continue;
     const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split('\n')[n.startLine - 1] ?? '';
@@ -7504,7 +7504,7 @@ function objcClassFiles(name: string, ref: UnresolvedRef, context: ResolutionCon
   if (hit) return hit;
   const decls = context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'objc');
   const primary = new Set<string>();
-  const own = new RegExp(`@interface\\s+${name}\\b(?!\\s*\\()`);
+  const own = new RegExp(`@interface\\s+${escapeRegExp(name)}\\b(?!\\s*\\()`);
   for (const decl of decls) {
     const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
     if (lines.slice(decl.startLine - 1, decl.endLine).some((l) => own.test(l))) primary.add(decl.filePath);
@@ -8890,7 +8890,7 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // whatever path the line writes elsewhere.
   const pathed = line === undefined || viaSelf ? null
     : (line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column)) ? /((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)?\s*::\s*$/.exec(line.slice(0, ref.column))
-      : !new RegExp(`(?<![\\w$:])${name}\\b`).test(line) ? new RegExp(`((?:[A-Za-z_]\\w*\\s*::\\s*)*)([A-Za-z_]\\w*)\\s*::\\s*${name}\\b`).exec(line) : null);
+      : !new RegExp(`(?<![\\w$:])${escapeRegExp(name)}\\b`).test(line) ? new RegExp(`((?:[A-Za-z_]\\w*\\s*::\\s*)*)([A-Za-z_]\\w*)\\s*::\\s*${escapeRegExp(name)}\\b`).exec(line) : null);
   if (pathed) {
     // Through a path: `crate::` / `self::` / `super::` look it up relatively;
     // `io::Result` is the `io` module's — tokio's `runtime/task` alias is not —
@@ -8967,7 +8967,7 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // `runtime::context::Context`. (A method call `.env(…)` is no imported name.)
   if (uses.external.has(name) && !uses.bound.has(name) && line !== undefined) {
     // Not on its line at all: a later link of a chain written across lines (`Arg::new(…)\n.env(…)`).
-    const at = new RegExp(`(?<![\\w$])${name}\\b`).exec(line.slice(Math.max(0, ref.column)));
+    const at = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\b`).exec(line.slice(Math.max(0, ref.column)));
     if (at && !/\.\s*$/.test(line.slice(0, Math.max(0, ref.column) + at.index))) return false;
   }
   if (!RUST_PRELUDE.has(name)) {
@@ -9187,7 +9187,7 @@ function rustFirstArgIs(type: string, ref: UnresolvedRef, context: ResolutionCon
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const method = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf(':'), ref.referenceName.lastIndexOf('.')) + 1);
   const text = [(lines[ref.line - 1] ?? '').slice(Math.max(0, ref.column)), ...lines.slice(ref.line, ref.line + 4)].join(' ');
-  const open = new RegExp(`\\b${method}\\s*\\(`).exec(text);
+  const open = new RegExp(`\\b${escapeRegExp(method)}\\s*\\(`).exec(text);
   // Not where the reference says: nothing to read, so nothing to veto.
   if (!open) return true;
   let depth = 0;
@@ -9201,10 +9201,10 @@ function rustFirstArgIs(type: string, ref: UnresolvedRef, context: ResolutionCon
     } else if (ch === ',' && depth === 0) break;
   }
   const arg = text.slice(open.index + open[0].length, end).trim().replace(/^(?:&\s*(?:mut\s+)?|\*)+/, '').replace(/\.clone\(\)$/, '');
-  if (new RegExp(`^(?:[A-Za-z_]\\w*::)*${type}\\b`).test(arg)) return true;
+  if (new RegExp(`^(?:[A-Za-z_]\\w*::)*${escapeRegExp(type)}\\b`).test(arg)) return true;
   if (!/^[A-Za-z_]\w*$/.test(arg)) return false;
-  const declared = new RegExp(`\\b${arg}\\s*:\\s*&?\\s*(?:'\\w+\\s+)?(?:mut\\s+)?(?:[A-Za-z_]\\w*::)*${type}\\b`);
-  const built = new RegExp(`\\blet\\s+(?:mut\\s+)?${arg}\\s*=\\s*&?\\s*(?:[A-Za-z_]\\w*::)*${type}\\b`);
+  const declared = new RegExp(`\\b${arg}\\s*:\\s*&?\\s*(?:'\\w+\\s+)?(?:mut\\s+)?(?:[A-Za-z_]\\w*::)*${escapeRegExp(type)}\\b`);
+  const built = new RegExp(`\\blet\\s+(?:mut\\s+)?${arg}\\s*=\\s*&?\\s*(?:[A-Za-z_]\\w*::)*${escapeRegExp(type)}\\b`);
   for (let i = ref.line - 1; i >= 0; i--) {
     const line = lines[i] ?? '';
     if (arg === 'self' && /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/.test(line)) {
@@ -9510,7 +9510,7 @@ function isRustTypeParam(name: string, ref: UnresolvedRef, context: ResolutionCo
     let from = open.index + open[0].length;
     for (let i = from - 1; i < header.length; i++) {
       const ch = header[i];
-      const param = (): boolean => new RegExp(`^\\s*(?:const\\s+)?${name}\\b`).test(header.slice(from, i));
+      const param = (): boolean => new RegExp(`^\\s*(?:const\\s+)?${escapeRegExp(name)}\\b`).test(header.slice(from, i));
       if (ch === '<') depth++;
       else if (ch === '>' && header[i - 1] !== '-' && --depth === 0) return param();
       else if (ch === ',' && depth === 1) {
@@ -10312,7 +10312,7 @@ function rustIsAsyncFn(fn: Node, context: ResolutionContext): boolean {
   if (!scopes) return false;
   const start = rustNodeOffset(fn, context);
   const head = scopes.code.slice(start, start + 300);
-  const name = head.search(new RegExp(`\\bfn\\s+(?:r#)?${fn.name.replace(/^r#/, '')}\\b`));
+  const name = head.search(new RegExp(`\\bfn\\s+(?:r#)?${escapeRegExp(fn.name.replace(/^r#/, ''))}\\b`));
   return name >= 0 && /\basync\b/.test(head.slice(0, name));
 }
 
@@ -10618,7 +10618,7 @@ function readRustDeclaredFields(decl: Node, context: ResolutionContext, generics
   if (!scopes) return null;
   const code = scopes.code;
   const start = rustNodeOffset(decl, context);
-  const name = new RegExp(`\\b${decl.name}\\b`).exec(code.slice(start, start + 512));
+  const name = new RegExp(`\\b${escapeRegExp(decl.name)}\\b`).exec(code.slice(start, start + 512));
   if (!name) return null;
   let p = start + name.index + decl.name.length;
   while (p < code.length && /\s/.test(code[p]!)) p++;
@@ -10854,7 +10854,7 @@ function rustHasBody(method: Node, context: ResolutionContext): boolean {
 
 /** What `impl Deref for Name { type Target = … }` makes a value of the type `name` hand calls on to. */
 function rustDerefTarget(name: string, typeFiles: Iterable<string>, context: ResolutionContext): RustWrittenType | null {
-  const header = new RegExp(String.raw`\bimpl\b\s*(?:<[^{;]*?>)?\s*(?:(?:std|core)\s*::\s*ops\s*::\s*|ops\s*::\s*)?Deref\s+for\s+(?:[\w:]+::)?${name}\b[^{;]*\{`, 'g');
+  const header = new RegExp(String.raw`\bimpl\b\s*(?:<[^{;]*?>)?\s*(?:(?:std|core)\s*::\s*ops\s*::\s*|ops\s*::\s*)?Deref\s+for\s+(?:[\w:]+::)?${escapeRegExp(name)}\b[^{;]*\{`, 'g');
   for (const file of typeFiles) {
     const code = rustScopesOf(file, context)?.code ?? '';
     if (!code.includes('Deref')) continue;
@@ -10872,7 +10872,7 @@ function rustAliasTarget(alias: Node, context: ResolutionContext): RustWrittenTy
   const scopes = rustScopesOf(alias.filePath, context);
   if (!scopes) return null;
   const start = rustNodeOffset(alias, context);
-  const m = new RegExp(String.raw`\btype\s+${alias.name}\b\s*(?:<([^=;]*?)>)?\s*=\s*([^;]+);`).exec(scopes.code.slice(Math.max(0, start - 64), start + 2000));
+  const m = new RegExp(String.raw`\btype\s+${escapeRegExp(alias.name)}\b\s*(?:<([^=;]*?)>)?\s*=\s*([^;]+);`).exec(scopes.code.slice(Math.max(0, start - 64), start + 2000));
   return m ? { text: m[2]!.trim(), file: alias.filePath, at: start, generics: m[1] ?? '' } : null;
 }
 
@@ -10890,7 +10890,7 @@ function rustTraitMethods(traits: Node[], method: string, context: ResolutionCon
     // `trait Name<…>: Super + Other where … {`
     const scopes = rustScopesOf(trait.filePath, context);
     const start = rustNodeOffset(trait, context);
-    const header = scopes ? new RegExp(String.raw`\btrait\s+${trait.name}\b\s*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*:([^{;]*?)(?:\bwhere\b[^{]*)?\{`).exec(scopes.code.slice(start, start + 2000)) : null;
+    const header = scopes ? new RegExp(String.raw`\btrait\s+${escapeRegExp(trait.name)}\b\s*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\s*:([^{;]*?)(?:\bwhere\b[^{]*)?\{`).exec(scopes.code.slice(start, start + 2000)) : null;
     if (!header) continue;
     for (const bound of splitRustTopLevel(header[1]!, '+')) {
       const head = rustPathHead(bound);
@@ -10932,7 +10932,7 @@ function rustDelegatesToOwn(method: Node, typeName: string, context: ResolutionC
   if (!scopes) return false;
   const start = scopes.lineStarts[method.startLine - 1] ?? 0;
   const end = scopes.lineStarts[method.endLine ?? method.startLine] ?? scopes.code.length;
-  return new RegExp(String.raw`\b(?:Self|${typeName})\s*::\s*${method.name}\s*\(`).test(scopes.code.slice(start, end));
+  return new RegExp(String.raw`\b(?:Self|${escapeRegExp(typeName)})\s*::\s*${escapeRegExp(method.name)}\s*\(`).test(scopes.code.slice(start, end));
 }
 
 /**
@@ -11231,7 +11231,7 @@ export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: 
   let binds = memo.get(key);
   if (binds === undefined) {
     const text = jsFunctionCodeThrough(fn, filePath, line, context);
-    const n = name.replace(/\$/g, '\\$');
+    const n = escapeRegExp(name);
     // A plain declaration. Destructuring re-binds what a call returns under
     // the same name — `const { t } = useI18n()`, `const { getLabel } =
     // useProps(props)` — which is the same-named function more often than not.
@@ -11283,7 +11283,7 @@ function jsBindingEnclosesReference(name: string, fn: Node, ref: UnresolvedRef, 
   const chars = blankStringContents(cut, regexes).split('');
   for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
   const code = chars.join('');
-  const n = name.replace(/\$/g, '\\$');
+  const n = escapeRegExp(name);
   const declaration = new RegExp(
     `\\b(?:(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])(\\s*=\\s*(?:await\\s+)?(?:require|import)\\s*\\()?|(?:function|class)\\s+${n}(?![\\w$]))`,
     'g'
@@ -15936,6 +15936,8 @@ const CPP_CHAR_TYPES: ReadonlySet<string> = new Set(['char', 'wchar_t', 'char8_t
 const CPP_NUMBER_TYPES: ReadonlySet<string> = new Set([
   'int', 'unsigned', 'signed', 'short', 'long', 'float', 'double', 'size_t', 'ssize_t', 'ptrdiff_t',
   'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t', 'intptr_t', 'uintptr_t',
+  // A container's own integer aliases, by convention: nlohmann/json's `operator[](size_type idx)`.
+  'size_type', 'difference_type',
 ]);
 const CPP_STRING_TYPES: ReadonlySet<string> = new Set(['string', 'wstring', 'string_view', 'wstring_view', 'basic_string', 'basic_string_view']);
 
@@ -16553,7 +16555,7 @@ function isCppConstructorThrough(namespace: string, method: Node, context: Resol
     n.filePath === method.filePath && n.startLine <= method.startLine && (n.endLine ?? n.startLine) >= method.startLine);
   const lines = holder ? context.getFileLines?.(holder.filePath) ?? context.readFile(holder.filePath)?.split(/\r?\n/) : undefined;
   const head = holder && lines ? lines.slice(holder.startLine - 1, holder.startLine + 1).join(' ') : '';
-  return new RegExp(String.raw`\b(?:class|struct|union)\s+(?:[A-Za-z_]\w*\s+)*${method.name}\s*<`).test(head);
+  return new RegExp(String.raw`\b(?:class|struct|union)\s+(?:[A-Za-z_]\w*\s+)*${escapeRegExp(method.name)}\s*<`).test(head);
 }
 
 /** The names a C++ file makes something of itself, which the index holds no node for (see cppNamesBroughtIn). */
@@ -18090,7 +18092,7 @@ function bindsNameItself(fn: Node, name: string, context: ResolutionContext): bo
   if (hit !== undefined) return hit;
   const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
   const body = lines.slice(fn.startLine - 1, fn.endLine).join('\n');
-  const r = name.replace(/\$/g, '\\$');
+  const r = escapeRegExp(name);
   const binds = new RegExp(`\\b(?:var|val|let|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body);
   memo.set(key, binds);
   return binds;
@@ -18169,7 +18171,7 @@ function angleArguments(text: string): string[] {
 function declaredTypeParameters(decl: Node, context: ResolutionContext): string[] {
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
   const head = lines.slice(decl.startLine - 1, decl.startLine + 3).join(' ');
-  const at = new RegExp(`\\b${decl.name}\\s*<`).exec(head);
+  const at = new RegExp(`\\b${escapeRegExp(decl.name)}\\s*<`).exec(head);
   if (!at) return [];
   return angleArguments(head.slice(at.index)).map((p) => /([A-Za-z_]\w*)\s*(?:extends\b.*|:.*)?$/.exec(p.replace(/^(?:in|out|reified)\s+/, ''))?.[1] ?? '');
 }
@@ -18178,7 +18180,7 @@ function declaredTypeParameters(decl: Node, context: ResolutionContext): string[
 function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): string[] {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
   const head = lines.slice(cls.startLine - 1, cls.startLine + 8).join(' ').split('{')[0]!;
-  const at = new RegExp(`(?:[:,]|\\bextends|\\bimplements)\\s*(?:[\\w.]+\\.)?${sup}\\s*<`).exec(head);
+  const at = new RegExp(`(?:[:,]|\\bextends|\\bimplements)\\s*(?:[\\w.]+\\.)?${escapeRegExp(sup)}\\s*<`).exec(head);
   if (!at) return [];
   return angleArguments(head.slice(at.index)).map((a) => a.replace(/<[\s\S]*$/, '').split('.').pop()!.trim());
 }
@@ -18318,7 +18320,7 @@ function classMemberType(cls: Node, name: string, context: ResolutionContext): s
   }
   const key = `${cls.id}|${name}`;
   if (memo.has(key)) return memo.get(key)!;
-  const r = name.replace(/\$/g, '\\$');
+  const r = escapeRegExp(name);
   const pattern = cls.language === 'kotlin' || cls.language === 'swift'
     ? new RegExp(`\\b(?:val|var|let)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
     : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
@@ -19839,7 +19841,7 @@ function isVueComponentMethod(n: Node): boolean {
 function isThisCallInOwnFile(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (n.filePath !== ref.filePath) return false;
   const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1] ?? '';
-  return new RegExp(String.raw`\bthis\s*\??\.\s*${n.name.replace(/\$/g, '\\$')}\s*\(`).test(line);
+  return new RegExp(String.raw`\bthis\s*\??\.\s*${escapeRegExp(n.name)}\s*\(`).test(line);
 }
 
 /** Is the root of a member call's receiver (`CameraManager` in `CameraManager.x`) one of the file's imports? */
@@ -22002,7 +22004,7 @@ function pythonClassBaseNames(cls: Node, context: ResolutionContext): string[] {
   const lines = pythonLines(context, cls.filePath);
   if (!lines) return [];
   const header = lines.slice(cls.startLine - 1, cls.startLine + 4).join(' ');
-  const bases = new RegExp(`\\bclass\\s+${cls.name}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
+  const bases = new RegExp(`\\bclass\\s+${escapeRegExp(cls.name)}\\s*\\(([^)]*)\\)`).exec(header)?.[1];
   return (bases ?? '')
     .split(',')
     .map((b) => b.trim())
@@ -22671,7 +22673,7 @@ function matchRustSelfCall(
   // `(self.into_route)(state)` calls what a field holds, no method: axum's
   // `MakeErasedHandler::into_route` went to itself.
   const at = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1]?.slice(ref.column);
-  if (at?.startsWith('(') && new RegExp(`^\\(\\s*self\\s*\\.\\s*${methodName}\\s*\\)`).test(at)) return null;
+  if (at?.startsWith('(') && new RegExp(`^\\(\\s*self\\s*\\.\\s*${escapeRegExp(methodName)}\\s*\\)`).test(at)) return null;
   // In a trait impl, `fn wake(self) { self.wake() }` hands the call on to the
   // type's own `wake`: its inherent one, or for a type from outside the
   // project one the index doesn't hold (tokio's `impl WakerRef for Waker`) —
@@ -22858,7 +22860,7 @@ function matchRustAsMutChainCall(ref: UnresolvedRef, context: ResolutionContext)
   // The call's expression starts at its column with the whole chain:
   // `self.delay.as_mut().reset(` — `?` after `as_mut()` taking what an
   // `Option` / `Result` holds back out (`self.client.as_mut()?.next()`).
-  const lent = new RegExp(`^(self|[a-z_]\\w*)(?:\\s*\\.\\s*([a-z_]\\w*))?\\s*\\.\\s*as_(?:mut|ref)\\s*\\(\\s*\\)\\s*(\\?)?\\s*\\.\\s*${name}\\s*(?:\\(|::<)`)
+  const lent = new RegExp(`^(self|[a-z_]\\w*)(?:\\s*\\.\\s*([a-z_]\\w*))?\\s*\\.\\s*as_(?:mut|ref)\\s*\\(\\s*\\)\\s*(\\?)?\\s*\\.\\s*${escapeRegExp(name)}\\s*(?:\\(|::<)`)
     .exec(line.slice(Math.max(0, ref.column)));
   if (!lent) return undefined;
   const [, base, field, question] = lent;
@@ -22942,7 +22944,7 @@ function rustCallOnType(type: string, name: string, ref: UnresolvedRef, context:
 function rustProjectsSelf(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-  const bound = new RegExp(`\\blet\\s+(?:mut\\s+)?${name}\\b\\s*=\\s*(.*)$`);
+  const bound = new RegExp(`\\blet\\s+(?:mut\\s+)?${escapeRegExp(name)}\\b\\s*=\\s*(.*)$`);
   for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
     const m = bound.exec(lines[i] ?? '');
     if (m) return /^self\s*(?:\.\s*as_mut\s*\(\s*\)\s*)?\.\s*project\s*\(\s*\)/.test(m[1]!);
@@ -22964,7 +22966,7 @@ function rustFieldDeclaration(owner: string, field: string, ref: UnresolvedRef, 
     .map((s) => fileLines(s.filePath).slice(s.startLine - 1, s.endLine));
   if (spans.length === 0) {
     const lines = fileLines(ref.filePath);
-    const header = new RegExp(`\\bstruct\\s+${owner}\\b`);
+    const header = new RegExp(`\\bstruct\\s+${escapeRegExp(owner)}\\b`);
     const at = lines.findIndex((l) => header.test(l.replace(/\/\/.*$/, '')));
     if (at >= 0) {
       let depth = 0;
@@ -22978,7 +22980,7 @@ function rustFieldDeclaration(owner: string, field: string, ref: UnresolvedRef, 
       spans.push(lines.slice(at, end + 1));
     }
   }
-  const declared = new RegExp(`(?:^|[\\s{(,])(?:pub(?:\\([^)]*\\))?\\s+)?${field}\\s*:(?!:)\\s*(.*)$`);
+  const declared = new RegExp(`(?:^|[\\s{(,])(?:pub(?:\\([^)]*\\))?\\s+)?${escapeRegExp(field)}\\s*:(?!:)\\s*(.*)$`);
   for (const span of spans) {
     for (let i = 0; i < span.length; i++) {
       const line = (span[i] ?? '').replace(/\/\/.*$/, '');
@@ -23649,7 +23651,7 @@ function tsIndexedPropertyType(
 function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
   const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ').split('{')[0]!;
-  const open = new RegExp(`\\b${cls.name.replace(/\$/g, '\\$')}\\s*<`).exec(head);
+  const open = new RegExp(`\\b${escapeRegExp(cls.name)}\\s*<`).exec(head);
   if (!open) return false;
   // The parameters between the `<` after the name and its own `>`, split
   // at their top level: `T`, `K extends keyof T = never`.
@@ -24344,7 +24346,7 @@ function destructuredKeyTarget(calleeName: string, key: string, ref: UnresolvedR
   if (!callee || !sameLanguageFamily(callee.language, ref.language)) return null;
   const calleeText = (context.getFileLines?.(callee.filePath) ?? context.readFile(callee.filePath)?.split('\n') ?? [])
     .slice(callee.startLine - 1, callee.endLine).join('\n');
-  if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${key}\\b`).test(calleeText)) return null;
+  if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${escapeRegExp(key)}\\b`).test(calleeText)) return null;
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
   const inFile = context.getNodesInFile(callee.filePath);
   const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
@@ -24943,7 +24945,7 @@ export function matchReference(
 function otherSupertypeNamed(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const name = ref.referenceName.split(/::|\./).pop()!;
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  const written = new RegExp(`^\\s*((?:[\\w$]+\\.)+)${name.replace(/\$/g, '\\$')}\\b`).exec(line.slice(Math.max(0, ref.column)));
+  const written = new RegExp(`^\\s*((?:[\\w$]+\\.)+)${escapeRegExp(name)}\\b`).exec(line.slice(Math.max(0, ref.column)));
   const qualifier = written ? written[1]!.slice(0, -1) : '';
   const candidates = context.getNodesByName(name).filter((n) =>
     n.id !== ref.fromNodeId && isSupertypeTarget(n) && sameLanguageFamily(n.language, ref.language) &&
@@ -25570,7 +25572,7 @@ function cppParenListAfter(file: string, line: number, column: number, name: str
 
 /** The `( … )` that follows `name` in `text`, from `column` on, without its parentheses. */
 function cppParenListIn(text: string, column: number, name: string): string | null {
-  const at = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
+  const at = new RegExp(`\\b${escapeRegExp(name)}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
   if (!at) return null;
   const open = column + at.index + at[0].length - 1;
   let depth = 0;
@@ -25640,7 +25642,7 @@ function cppOverloadParameters(n: Node, name: string, context: ResolutionContext
       .filter((p) => p !== 'void')
       .map((p) => normalizeCppTypeName(cppParameterType(p)) ?? p);
     const want = types(own);
-    const word = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*\\(`);
+    const word = new RegExp(`\\b${escapeRegExp(name)}\\s*\\(`);
     search: for (const cls of classes) {
       const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
       for (let line = cls.startLine; line <= Math.min(lines.length, cls.endLine ?? cls.startLine); line++) {

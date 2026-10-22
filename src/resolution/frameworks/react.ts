@@ -11,6 +11,7 @@ import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
 import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
+import { escapeRegExp } from '../../utils';
 import { FN_KINDS, makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
@@ -316,7 +317,7 @@ function constantPathValue(expr: string, fromFile: string, context: ResolutionCo
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
-  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${escapeRegExp(name)}\\b`))));
   return open < 0 ? null : readObjectPath(text, open, keys);
 }
 
@@ -348,7 +349,7 @@ export function configHrefExpression(expr: string, fromFile: string, context: Re
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
-  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${escapeRegExp(name)}\\b`))));
   if (open < 0) return null;
   let value = readObjectValue(text, open, keys);
   if (value === null) return null;
@@ -611,7 +612,7 @@ function ownExport(source: string, name: string): string | null {
   if (name === 'default') {
     const declared = defaultExportedName(source);
     if (declared) return declared;
-  } else if (new RegExp(String.raw`\bexport\s+(?:async\s+)?(?:const|let|var|function|class)\s+${name.replace(/\$/g, '\\$')}(?![\w$])`).test(source)) {
+  } else if (new RegExp(String.raw`\bexport\s+(?:async\s+)?(?:const|let|var|function|class)\s+${escapeRegExp(name)}(?![\w$])`).test(source)) {
     return name;
   }
   return extractLocalExportAliases(source).find((a) => a.exportedName === name)?.localName ?? null;
@@ -2112,7 +2113,7 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     } else local = /\bexport\s*\{[^}]*?\b([A-Za-z_$][\w$]*)\s+as\s+default\b/.exec(safe)?.[1] ?? '';
   } else {
     // `export { appRoutes as routes }`
-    const alias = new RegExp(`\\bexport\\s*\\{[^}]*?\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${exported.replace(/\$/g, '\\$')}\\b`).exec(safe);
+    const alias = new RegExp(`\\bexport\\s*\\{[^}]*?\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${escapeRegExp(exported)}\\b`).exec(safe);
     if (alias) local = alias[1]!;
   }
   // What a module exports is declared at its top level.
@@ -2143,7 +2144,7 @@ function declaredTable(
   call: boolean,
   visible: (keywords: number[]) => number | undefined
 ): TableSite[] {
-  const id = name.replace(/\$/g, '\\$');
+  const id = escapeRegExp(name);
   const decls = [...safe.matchAll(new RegExp(`(?:^|[^\\w$.])((?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*)`, 'g'))];
   const chosen = decls.length > 0 ? visible(decls.map((d) => d.index + d[0].length - d[1]!.length)) : undefined;
   const decl = chosen === undefined ? undefined : decls[chosen];

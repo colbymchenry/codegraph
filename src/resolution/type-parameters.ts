@@ -16,6 +16,7 @@
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { escapeRegExp } from '../utils';
 
 const GENERIC_LANGUAGES: ReadonlySet<string> = new Set([
   'scala', 'java', 'kotlin', 'csharp', 'typescript', 'tsx', 'swift', 'rust', 'dart', 'go', 'cpp', 'vbnet', 'arkts',
@@ -143,7 +144,7 @@ function scalaMemberInScope(result: ResolvedRef, ref: UnresolvedRef, context: Re
   // Imported: `import cats.data.FreeT.FlatMapped._`, `Owner.{A, B}`, `Owner.*`.
   const text = context.readFile(ref.filePath) ?? '';
   const imports = new RegExp(
-    String.raw`\bimport\s+[\w.]*\b${owner.name}\.(?:_|\*|given\b|\{[^}]*\b(?:_|\*|${target.name})\b[^}]*\}|${target.name}\b)`,
+    String.raw`\bimport\s+[\w.]*\b${escapeRegExp(owner.name)}\.(?:_|\*|given\b|\{[^}]*\b(?:_|\*|${escapeRegExp(target.name)})\b[^}]*\}|${escapeRegExp(target.name)}\b)`,
   );
   return /^[A-Za-z_]\w*$/.test(owner.name) && /^[A-Za-z_]\w*$/.test(target.name) ? imports.test(text) : true;
 }

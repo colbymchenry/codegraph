@@ -26,6 +26,7 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
+import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
@@ -183,7 +184,7 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
     );
     if (chDispatchers.length === 0) continue;
-    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
+    const argRe = new RegExp(`${escapeRegExp(reg.node.name)}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
     for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -2078,7 +2079,7 @@ function writtenBare(src: string, name: string): boolean {
  * a parameter or local of a function elsewhere in the file binds nothing here.
  */
 function ownLinesBind(name: string, src: string): boolean {
-  const n = name.replace(/\$/g, '\\$');
+  const n = escapeRegExp(name);
   return new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(src);
 }
 
@@ -2828,7 +2829,7 @@ function constantEventName(expr: string, file: string, ctx: ResolutionContext, m
       const from = importedFile(owner);
       decls = from
         ? declaredIn(from)
-        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${owner}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
+        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${escapeRegExp(owner)}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
     }
     const values = new Set(decls.map(read).filter((v): v is string => v !== null));
     value = values.size === 1 ? [...values][0]! : null;

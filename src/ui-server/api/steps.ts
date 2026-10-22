@@ -50,6 +50,7 @@ import { nextRouteForFile } from '../../resolution/frameworks/nextjs';
 import { splitRouteName } from './routes';
 import { HUB_THRESHOLD, UNCERTAIN_BELOW, toNodeRef, type WireNodeRef } from './wire';
 import { isTestPath } from '../../search/query-utils';
+import { escapeRegExp } from '../../utils';
 
 // =============================================================================
 // Wire shapes
@@ -507,7 +508,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
         if ((n.kind !== 'field' && n.kind !== 'property' && n.kind !== 'variable' && n.kind !== 'parameter') || !n.signature) continue;
         const sig = n.signature.replace(/\s+/g, ' ').trim();
         // `OwnerRepository owners`, `private final OwnerRepository owners`, `owners: OwnerRepository`, `val owners: OwnerRepository`.
-        const typed = new RegExp(`(?:^|\\s)([A-Z][\\w<>,?. ]*?)\\s+${n.name}\\b`).exec(sig) ?? new RegExp(`\\b${n.name}\\s*:\\s*([A-Z][\\w<>,?. ]*)`).exec(sig);
+        const typed = new RegExp(`(?:^|\\s)([A-Z][\\w<>,?. ]*?)\\s+${escapeRegExp(n.name)}\\b`).exec(sig) ?? new RegExp(`\\b${escapeRegExp(n.name)}\\s*:\\s*([A-Z][\\w<>,?. ]*)`).exec(sig);
         if (typed && !types.has(n.name)) types.set(n.name, typed[1]!.trim());
       }
       fileTypes.set(caller.filePath, types);

@@ -26,6 +26,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext } from './types';
 import { directiveLines } from './cpp-macro-visibility';
+import { escapeRegExp } from '../utils';
 
 /** Three-valued: true / false / undefined = the build may go either way. */
 type Truth = boolean | undefined;
@@ -130,7 +131,7 @@ function isOff(groups: Directive[][], file: FileDirectives, scope: string[], con
     if (name.startsWith('_') || PLATFORM_FLAGS.has(name) || file.defines.has(name)) return undefined;
     let named = memo.named.get(name);
     // A word of its own, or a compiler flag's `-DX` / `/DX`.
-    if (!named) memo.named.set(name, (named = new RegExp(`(?:^|[^\\w]|[-/]D)${name}\\b`, 'm')));
+    if (!named) memo.named.set(name, (named = new RegExp(`(?:^|[^\\w]|[-/]D)${escapeRegExp(name)}\\b`, 'm')));
     if (dirs.some((dir) => named!.test(buildTextOf(dir, context, memo)))) return undefined;
     const components = new Set(scope.map((f) => componentOf(dirOf(f), context, memo)));
     return [...components].some((component) => isDefinedIn(name, component, context, memo)) ? undefined : false;
@@ -299,7 +300,7 @@ function isDefinedIn(name: string, component: string, context: ResolutionContext
   if (hit !== undefined) return hit;
   memo.cFiles ??= context.getAllFiles().filter((file) => C_FAMILY_FILE.test(file));
   const prefix = component ? `${component}/` : '';
-  const define = new RegExp(`^[ \\t]*#[ \\t]*define[ \\t]+${name}\\b`, 'm');
+  const define = new RegExp(`^[ \\t]*#[ \\t]*define[ \\t]+${escapeRegExp(name)}\\b`, 'm');
   const defined = memo.cFiles.some((file) =>
     file.startsWith(prefix) &&
     (context.fileContains ? context.fileContains(file, name) : true) &&

@@ -52,6 +52,7 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import { enclosingFn } from './synth-utils';
+import { escapeRegExp } from '../utils';
 import { blankGoCode, goLocalDeclarationAt, GO_TYPE_KINDS } from './name-matcher';
 
 /** One field of a Go struct, in declaration order. */
@@ -686,7 +687,7 @@ export async function goFuncFieldEdges(
     // The literal's `{` is on its type's line: Go puts no line break between them.
     const lineStart = f.lineStarts[lit.line - 1] ?? 0;
     const lineText = f.text.slice(lineStart, f.lineStarts[lit.line] ?? f.text.length);
-    const typeRe = new RegExp(String.raw`(?<![\w.])(?:(${IDENT})\s*\.\s*)?${s.name}\s*(?:\[[^\]{}]*\])?\s*\{`, 'g');
+    const typeRe = new RegExp(String.raw`(?<![\w.])(?:(${IDENT})\s*\.\s*)?${escapeRegExp(s.name)}\s*(?:\[[^\]{}]*\])?\s*\{`, 'g');
     let open = -1;
     let nearest = Infinity;
     for (let m = typeRe.exec(lineText); m; m = typeRe.exec(lineText)) {
