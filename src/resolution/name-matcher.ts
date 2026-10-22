@@ -11632,15 +11632,7 @@ function enclosingOpenParen(source: string, at: number): number {
  * arrow.
  */
 function bindsAtSites(source: string, name: string, sites: LocalBindingSites): boolean {
-  let patterns = LOCAL_BINDING_PATTERNS.get(name);
-  if (!patterns) {
-    patterns = localBindingPatterns(name, 'y');
-    if (LOCAL_BINDING_PATTERNS.size >= LOCAL_BINDING_PATTERNS_CAP) {
-      LOCAL_BINDING_PATTERNS.delete(LOCAL_BINDING_PATTERNS.keys().next().value!);
-    }
-    LOCAL_BINDING_PATTERNS.set(name, patterns);
-  }
-  const { decl, fn, param } = patterns;
+  const { decl, fn, param } = stickyBindingPatterns(name);
   let from = 0;
   for (const at of sites.varDecls) {
     if (at < from) continue;
@@ -17848,6 +17840,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_FN_LOCAL_MEMO.delete(context);
   JS_CODE_BINDS.delete(context);
   JS_FN_CODE.delete(context);
+  JS_SCOPE_FILES.delete(context);
+  JS_MODULE_VALUES.delete(context);
+  REACT_LIFECYCLE_MEMO.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TS_PASS_THROUGH_WRAPPERS.delete(context);
@@ -17874,6 +17869,13 @@ function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
   PATTERN_MEMO.set(key, patterns);
   return patterns;
 }
+
+/**
+ * The type a TS annotation writes, captured: `Logger`, `Repository<User>` (as
+ * `Repository`), and with brackets after it whole — `Item[]`, `Element["ids"]`
+ * — for matchMethodCall to read (arrayElementType, tsIndexedPropertyType).
+ */
+const TS_ANNOTATED_TYPE = '([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)';
 
 export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
   return memoPatterns(`${language}|${r}`, () => buildLocalReceiverTypePatterns(language, r));
@@ -17908,7 +17910,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // can tell an array of it (`items: Item[]`, `items: Item<K>[]`), whose
         // own methods aren't an element's (arrayElementType), from one of its
         // properties (`groupIds: Element["groupIds"]`), which isn't it.
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)`), // lg: Logger  (annotation or typed param)
+        new RegExp(`\\b${r}\\b\\s*:\\s*${TS_ANNOTATED_TYPE}`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -18840,6 +18842,373 @@ function resolveAwaitedCallType(
 }
 
 /**
+ * A JS/TS file's code read for the bindings its names have (jsBindingAt):
+ * comments, strings, template literals and regex literals blanked; where each
+ * line starts; its braces as a tree of scopes, the first the file's own; and
+ * where a `const`/`let`/`var`, a `function`/`class` or an arrow can start.
+ * Per name, the bindings jsBindingSites finds.
+ */
+interface JsScopeFile {
+  code: string;
+  lineStarts: number[];
+  scopes: { start: number; end: number; parent: number }[];
+  varDecls: number[];
+  fnDecls: number[];
+  arrows: number[];
+  bindings: Map<string, JsBindingSite[]>;
+}
+
+/**
+ * A binding of a name: where it holds (`from`, its block's `{` or its body's
+ * start, through `to`) and where it is written (`at`). A `const`/`let`/`var`
+ * of the name alone is a declaration, a parameter list's name a parameter,
+ * a `function` or `class` declaration a function. Any other binding — a
+ * destructuring, a `for` head, a lone or destructured arrow parameter — says
+ * nothing of the value. `reading` keeps what the binding says
+ * (jsBindingReading).
+ */
+interface JsBindingSite {
+  from: number;
+  to: number;
+  at: number;
+  kind: 'declaration' | 'parameter' | 'function' | 'other';
+  reading?: JsBindingReading | null;
+}
+
+/**
+ * What a binding says its value is: an instance of the type it is written
+ * with, or of the class its whole value makes with `new` (`raw` as written,
+ * on `line`).
+ */
+type JsBindingReading = { type: string; raw: string; line: number };
+
+/** Per context, the files jsScopeFile read last, most recent last. */
+const JS_SCOPE_FILES = new WeakMap<ResolutionContext, Map<string, JsScopeFile | null>>();
+const JS_SCOPE_FILES_KEEP = 16;
+
+function jsScopeFile(filePath: string, context: ResolutionContext): JsScopeFile | null {
+  let files = JS_SCOPE_FILES.get(context);
+  if (!files) JS_SCOPE_FILES.set(context, (files = new Map()));
+  let file = files.get(filePath);
+  if (file !== undefined) {
+    files.delete(filePath);
+  } else {
+    file = null;
+    const source = context.readFile(filePath);
+    // A bundle's names are nothing a person declares a receiver with.
+    if (source !== null && source.length <= 1_000_000 && !isMinifiedContent(filePath, source)) {
+      const regexes: number[] = [];
+      const chars = blankStringContents(stripCommentsForRegex(source, 'javascript'), regexes).split('');
+      for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
+      const code = chars.join('');
+      const lineStarts = [0];
+      const scopes = [{ start: -1, end: code.length, parent: -1 }];
+      const open = [0];
+      for (let i = 0; i < code.length; i++) {
+        const c = code[i];
+        if (c === '\n') lineStarts.push(i + 1);
+        else if (c === '{') {
+          scopes.push({ start: i, end: code.length, parent: open[open.length - 1]! });
+          open.push(scopes.length - 1);
+        } else if (c === '}' && open.length > 1) scopes[open.pop()!]!.end = i;
+      }
+      const offsets = (re: RegExp): number[] => Array.from(code.matchAll(re), (m) => m.index!);
+      const arrows: number[] = [];
+      for (let a = code.indexOf('=>'); a !== -1; a = code.indexOf('=>', a + 2)) arrows.push(a);
+      file = { code, lineStarts, scopes, varDecls: offsets(VAR_DECL_SITE), fnDecls: offsets(FN_DECL_SITE), arrows, bindings: new Map() };
+    }
+    if (files.size >= JS_SCOPE_FILES_KEEP) files.delete(files.keys().next().value!);
+  }
+  files.set(filePath, file);
+  return file;
+}
+
+/** The innermost scope of `file` that holds `offset`. */
+function jsScopeAt(file: JsScopeFile, offset: number): number {
+  const { scopes } = file;
+  let lo = 0, hi = scopes.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (scopes[mid]!.start < offset) lo = mid; else hi = mid;
+  }
+  while (lo > 0 && scopes[lo]!.end < offset) lo = scopes[lo]!.parent;
+  return lo;
+}
+
+/** localBindingPatterns, sticky, by name. */
+function stickyBindingPatterns(name: string): LocalBindingPatterns {
+  let patterns = LOCAL_BINDING_PATTERNS.get(name);
+  if (!patterns) {
+    patterns = localBindingPatterns(name, 'y');
+    if (LOCAL_BINDING_PATTERNS.size >= LOCAL_BINDING_PATTERNS_CAP) {
+      LOCAL_BINDING_PATTERNS.delete(LOCAL_BINDING_PATTERNS.keys().next().value!);
+    }
+    LOCAL_BINDING_PATTERNS.set(name, patterns);
+  }
+  return patterns;
+}
+
+/** Every binding of `name` in the file, read once per file and name. */
+function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
+  const known = file.bindings.get(name);
+  if (known) return known;
+  const sites: JsBindingSite[] = [];
+  const { code } = file;
+  const { decl, fn, param } = stickyBindingPatterns(name);
+  const blockOf = (at: number) => {
+    const scope = file.scopes[jsScopeAt(file, at)]!;
+    return { from: scope.start, to: scope.end };
+  };
+  let resume = 0;
+  for (const at of file.varDecls) {
+    if (at < resume) continue;
+    decl.lastIndex = at;
+    const m = decl.exec(code);
+    if (!m) continue;
+    resume = at + m[0].length;
+    if (/\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at))) {
+      // A `for` head's binding holds in the head and the statement after it.
+      sites.push({ from: code.lastIndexOf('(', at), to: jsForStatementEnd(code, at), at, kind: 'other' });
+      continue;
+    }
+    // `const x = require('./x')` binds an import, which the file's imports answer for.
+    const plain = !/^(?:const|let|var)\s+[{[]/.test(m[0]) && !IMPORT_BINDING_VALUE.test(m[1] ?? '');
+    sites.push({ ...blockOf(at), at, kind: plain ? 'declaration' : 'other' });
+  }
+  for (const at of file.fnDecls) {
+    fn.lastIndex = at;
+    if (fn.test(code)) sites.push({ ...blockOf(at), at, kind: 'function' });
+  }
+  const n = escapeRegExp(name);
+  const paramName = new RegExp(`(?:^\\(|,)\\s*${PARAM_MODIFIERS}(?:\\.\\.\\.)?(${n})(?![\\w$])`);
+  let tried = -1;
+  for (let at = code.indexOf(name); at !== -1; at = code.indexOf(name, at + 1)) {
+    // A whole name, and no member's (`el.root`), though a rest parameter's (`...root`) is one.
+    if ((at > 0 && /[\w$]/.test(code[at - 1]!)) || /[\w$]/.test(code[at + name.length] ?? '') ||
+        (code[at - 1] === '.' && code.slice(Math.max(0, at - 3), at) !== '...')) continue;
+    const open = enclosingOpenParen(code, at);
+    // A control-flow head, `if (root) {`, binds nothing.
+    if (open >= 0 && /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(Math.max(0, open - 12), open))) continue;
+    if (open < 0) {
+      // A destructured parameter: `({ root }) => …`, `function f([root]) {`.
+      const body = destructuredParameterBody(code, at);
+      if (body) sites.push({ ...body, at, kind: 'other' });
+      continue;
+    }
+    if (open === tried) continue;
+    tried = open;
+    param.lastIndex = open;
+    const m = param.exec(code);
+    if (!m) continue;
+    const end = open + m[0].length;
+    const own = paramName.exec(m[0]);
+    sites.push({
+      ...(code[end - 1] === '{' ? { from: end - 1, to: jsBlockEnd(code, end) } : { from: end, to: jsBodyEnd(code, end) }),
+      at: own ? open + own.index + own[0].length - name.length : at,
+      kind: 'parameter',
+    });
+  }
+  // `name =>`: the name ends where the whitespace before the arrow starts.
+  for (const arrow of file.arrows) {
+    let end = arrow;
+    while (end > 0 && WHITESPACE.test(code[end - 1]!)) end--;
+    const start = end - name.length;
+    if (start >= 0 && code.startsWith(name, start) && (start === 0 || !ARROW_HEAD_CHAR.test(code[start - 1]!))) {
+      sites.push({ from: arrow + 2, to: jsBodyEnd(code, arrow + 2), at: start, kind: 'other' });
+    }
+  }
+  file.bindings.set(name, sites);
+  return sites;
+}
+
+/** Where a `for` statement whose head holds `at` ends: past the statement after its head. */
+function jsForStatementEnd(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth < 0) return c === ')' ? jsBodyEnd(code, i + 1) : i;
+  }
+  return code.length;
+}
+
+/**
+ * The body of the function whose parameter list destructures the name at
+ * `at` (`({ a, b: [root] }) => …`), or null when the name is in no
+ * parameter list: read back out of the braces and brackets around it to the
+ * `(` that opens the list, which a `=>` or a body's `{` follows (past a
+ * return type) and no `if`, `while`, `for`, `switch` or `with` heads.
+ */
+function destructuredParameterBody(code: string, at: number): { from: number; to: number } | null {
+  let depth = 0;
+  let nested = false;
+  let open = -1;
+  for (let i = at - 1; i >= 0 && at - i <= 2000; i--) {
+    const c = code[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) {
+        depth--;
+      } else if (c === '(') {
+        open = i;
+        break;
+      } else {
+        nested = true;
+      }
+    } else if (c === ';' && depth === 0) {
+      return null;
+    }
+  }
+  if (!nested || open < 0 || /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(Math.max(0, open - 12), open))) return null;
+  let close = open + 1;
+  for (let d = 1; close < code.length && d > 0; close++) {
+    if (code[close] === '(') d++;
+    else if (code[close] === ')') d--;
+  }
+  const head = /^\s*(?::(?:[^=;{}()\n]|\{(?:[^{}]|\{[^{}]*\})*\})*)?(=>|\{)/.exec(code.slice(close, close + 2000));
+  if (!head) return null;
+  const end = close + head[0].length;
+  return head[1] === '{' ? { from: end - 1, to: jsBlockEnd(code, end) } : { from: end, to: jsBodyEnd(code, end) };
+}
+
+/**
+ * The binding of `name` in scope at `offset` of a JS/TS file: the one whose
+ * scope holds it innermost, and of two in one scope the declaration nearest
+ * before it. Null when no binding of the name holds there.
+ */
+function jsBindingAt(name: string, file: JsScopeFile, offset: number): JsBindingSite | null {
+  let best: JsBindingSite | null = null;
+  for (const site of jsBindingSites(name, file)) {
+    if (site.from > offset || site.to < offset) continue;
+    if (!best || site.from > best.from ||
+        (site.from === best.from && (site.at <= offset ? best.at > offset || site.at > best.at : best.at > offset && site.at < best.at))) {
+      best = site;
+    }
+  }
+  return best;
+}
+
+/**
+ * What a binding of `name` says its value is (JsBindingReading), or null when
+ * it says nothing: a declaration or a parameter written with a type, or a
+ * declaration whose whole value is a `new` of a class.
+ */
+function jsBindingReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  if (site.reading === undefined) {
+    site.reading = site.kind === 'parameter' ? jsParameterReading(name, site, file)
+      : site.kind === 'declaration' ? jsDeclarationReading(name, site, file)
+      : null;
+  }
+  return site.reading;
+}
+
+/** The 1-based line of an offset in `file`. */
+function jsLineOf(file: JsScopeFile, offset: number): number {
+  let lo = 0, hi = file.lineStarts.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (file.lineStarts[mid]! <= offset) lo = mid; else hi = mid;
+  }
+  return lo + 1;
+}
+
+/** The type a parameter is written with (`root: Root`, `svc?: Store`). */
+function jsParameterReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  const typed = new RegExp(`${escapeRegExp(name)}(?![\\w$])\\s*\\??\\s*:\\s*${TS_ANNOTATED_TYPE}`, 'y');
+  typed.lastIndex = site.at;
+  const raw = typed.exec(file.code)?.[1];
+  const type = raw ? normalizeInferredTypeName(raw) : null;
+  return raw && type ? { type, raw, line: jsLineOf(file, site.at) } : null;
+}
+
+/**
+ * What a `const`/`let`/`var` says its value is: the type it is written with,
+ * or the class its whole value makes with `new` — not a `new` of a
+ * parameter or variable (`new Backend(root)`), which names no class.
+ */
+function jsDeclarationReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  const { code } = file;
+  const head = new RegExp(`(?:const|let|var)\\s+${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
+  head.lastIndex = site.at;
+  const m = head.exec(code);
+  if (!m) return null;
+  const valueAt = site.at + m[0].length;
+  const rest = code.slice(valueAt, valueAt + 400);
+  // An object literal is its own members' (resolveObjectPathMember), whatever
+  // type it is written with: vite's `const server: ViteDevServer = { … }` is
+  // the `close` it declares, not the interface's.
+  if (/^[^=;]*=(?![=>])\s*\{/.test(rest)) return null;
+  const line = jsLineOf(file, site.at);
+  if (m[1]) {
+    const type = normalizeInferredTypeName(m[1]);
+    return type ? { type, raw: m[1], line } : null;
+  }
+  const made = /^\s*=\s*new\s+([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*(?:<[^;(){}]*>\s*)?\(/.exec(rest);
+  if (!made) return null;
+  const className = made[1]!.replace(/\s+/g, '');
+  const bound = jsBindingAt(className.split('.')[0]!, file, valueAt);
+  if (bound && bound.kind !== 'function') return null;
+  // The `new` is the whole value: no member, index, call or operator follows it.
+  let close = valueAt + made[0].length;
+  let depth = 1;
+  for (const limit = close + 5000; close < code.length && close < limit && depth > 0; close++) {
+    if (code[close] === '(') depth++;
+    else if (code[close] === ')') depth--;
+  }
+  if (depth > 0 || !/^[ \t]*(?:[;,)}]|\r?\n(?![ \t]*(?:[.(\[?:]|\?\?|\|\||&&|as\b))|$)/.test(code.slice(close, close + 200))) return null;
+  const type = normalizeInferredTypeName(className);
+  return type ? { type, raw: className, line } : null;
+}
+
+/**
+ * Per context and file: how many functions and methods hold each line, and
+ * the names the file's module scope gives a variable or constant node.
+ */
+const JS_MODULE_VALUES = new WeakMap<ResolutionContext, Map<string, { depth: Int32Array; names: Set<string> }>>();
+
+/**
+ * Whether the binding a call's receiver has may lie outside the function
+ * making the call, where the calling function's own declarations, which the
+ * receiver reader has read already, can't say what it is: in a function
+ * around that one, or at module scope, which declares the name. Code outside
+ * any function was read from the file's start.
+ */
+function jsMayBindOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  let files = JS_MODULE_VALUES.get(context);
+  if (!files) JS_MODULE_VALUES.set(context, (files = new Map()));
+  let scope = files.get(ref.filePath);
+  if (!scope) {
+    const nodes = context.getNodesInFile(ref.filePath);
+    const functions = nodes.filter((n) => n.kind === 'function' || n.kind === 'method');
+    const depth = new Int32Array(functions.reduce((last, n) => Math.max(last, n.endLine), 0) + 2);
+    for (const n of functions) {
+      depth[n.startLine]!++;
+      depth[n.endLine + 1]!--;
+    }
+    for (let line = 1; line < depth.length; line++) depth[line]! += depth[line - 1]!;
+    const names = new Set(nodes.filter((n) => (n.kind === 'variable' || n.kind === 'constant') && n.qualifiedName === n.name).map((n) => n.name));
+    if (files.size >= 64) files.delete(files.keys().next().value!);
+    files.set(ref.filePath, (scope = { depth, names }));
+  }
+  const around = scope.depth[ref.line] ?? 0;
+  return around > 1 || (around === 1 && scope.names.has(name));
+}
+
+/**
+ * A JS/TS receiver the calling function doesn't type, read by its binding in
+ * scope at the call (#2589): a module's `let root: Root | null`, a `let
+ * popupRoot: Root` in the function around the one calling, or an outer
+ * function's typed parameter. Null when the binding says nothing of its value.
+ */
+function jsReceiverBindingReading(receiver: string, ref: UnresolvedRef, context: ResolutionContext): JsBindingReading | null {
+  if (!jsMayBindOutside(receiver, ref, context)) return null;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const site = jsBindingAt(receiver, file, (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column);
+  return site ? jsBindingReading(receiver, site, file) : null;
+}
+
+/**
  * Patterns that recover a PHP class property's declared type for a
  * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
  * property-shaped declarations qualify —
@@ -19191,6 +19560,22 @@ export function matchMethodCall(
     if (awaited) {
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
+    }
+    // A TS/JS receiver the calling function doesn't type is read by its
+    // binding in scope at the call (#2589): a module's `let root: Root |
+    // null`, a `let popupRoot: Root` in the function around the one calling,
+    // or an outer function's typed parameter types it, as the calling
+    // function's own declaration would.
+    if (!inferredType && !awaited && dotMatch && /^[A-Za-z_$][\w$]*$/.test(objectOrClass!) &&
+        (ref.language === 'typescript' || ref.language === 'tsx' || ref.language === 'javascript' || ref.language === 'jsx') &&
+        objectOrClass !== 'this' && objectOrClass !== 'super' && !isImportBinding(objectOrClass!, ref, context) &&
+        isLocallyBoundJsName(objectOrClass!, ref.filePath, context)) {
+      const reading = nmTimedT('mc-jsbinding', ref, () => jsReceiverBindingReading(objectOrClass!, ref, context));
+      if (reading) {
+        inferredType = reading.type;
+        decl.raw = reading.raw;
+        decl.line = reading.line;
+      }
     }
     // A TS annotation with brackets after the type. An array of it (`items:
     // Item[]`): a method arrays have is the array's, which no project class
@@ -19731,6 +20116,14 @@ export function matchMethodCall(
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // A React class component's `render()` and lifecycle methods are React's
+    // to call (#2589): react-dom's `root.render(<App />)` is no error
+    // boundary's `render`, whatever holds the root.
+    if (JS_FAMILY.has(ref.language) && objectOrClass !== 'this' && objectOrClass !== 'super') {
+      const kept = targetMethods.filter((m) => !isReactLifecycleMethod(m, context));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
     // only by the name of its last link, in the scoring below — Django's
@@ -19869,6 +20262,36 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
   return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** The methods React calls on a class component itself. */
+const REACT_LIFECYCLE_METHODS: ReadonlySet<string> = new Set([
+  'render', 'componentDidMount', 'componentDidUpdate', 'componentWillUnmount', 'shouldComponentUpdate',
+  'getSnapshotBeforeUpdate', 'componentDidCatch', 'componentWillMount', 'componentWillReceiveProps',
+  'componentWillUpdate', 'UNSAFE_componentWillMount', 'UNSAFE_componentWillReceiveProps', 'UNSAFE_componentWillUpdate',
+]);
+const REACT_LIFECYCLE_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A lifecycle method (`render`, `componentDidMount`, …) of a class that
+ * extends React's `Component` or `PureComponent` (or Preact's), read from the
+ * class's head.
+ */
+function isReactLifecycleMethod(n: Node, context: ResolutionContext): boolean {
+  if (n.kind !== 'method' || !REACT_LIFECYCLE_METHODS.has(n.name)) return false;
+  let memo = REACT_LIFECYCLE_MEMO.get(context);
+  if (!memo) REACT_LIFECYCLE_MEMO.set(context, (memo = new Map()));
+  let hit = memo.get(n.id);
+  if (hit === undefined) {
+    const ownerName = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split('::').pop();
+    const owner = ownerName ? context.getNodesInFile(n.filePath).find((c) =>
+      c.kind === 'class' && c.name === ownerName && c.startLine <= n.startLine && c.endLine >= n.endLine) : undefined;
+    const lines = owner ? context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [] : [];
+    const head = owner ? lines.slice(owner.startLine - 1, Math.min(owner.startLine + 3, n.startLine)).join(' ').split('{')[0]! : '';
+    hit = /\bextends\s+(?:React\s*\.\s*)?(?:Pure)?Component\b/.test(head);
+    memo.set(n.id, hit);
+  }
+  return hit;
 }
 
 /** A method a Vue Options API component declares for itself (`index::handleLogin` in `index.vue`). */
