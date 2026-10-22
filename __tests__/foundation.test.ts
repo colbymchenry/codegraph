@@ -35,13 +35,18 @@ function pragmaValue(raw: unknown, key: string): unknown {
 
 describe('CodeGraph Foundation', () => {
   let tempDir: string;
+  let savedLocalGitignore: string | undefined;
 
   beforeEach(() => {
     tempDir = createTempDir();
+    savedLocalGitignore = process.env.CODEGRAPH_LOCAL_GITIGNORE;
+    delete process.env.CODEGRAPH_LOCAL_GITIGNORE;
   });
 
   afterEach(() => {
     cleanupTempDir(tempDir);
+    if (savedLocalGitignore === undefined) delete process.env.CODEGRAPH_LOCAL_GITIGNORE;
+    else process.env.CODEGRAPH_LOCAL_GITIGNORE = savedLocalGitignore;
   });
 
   describe('Initialization', () => {
@@ -66,6 +71,20 @@ describe('CodeGraph Foundation', () => {
       // files (db, daemon.pid, sockets, logs) never show up in git. (#492, #484)
       expect(content).toContain('*');
       expect(content).toContain('!.gitignore');
+
+      cg.close();
+    });
+
+    it('can create a local-only .codegraph/.gitignore', () => {
+      process.env.CODEGRAPH_LOCAL_GITIGNORE = '1';
+      const cg = CodeGraph.initSync(tempDir);
+
+      const gitignorePath = path.join(getCodeGraphDir(tempDir), '.gitignore');
+      expect(fs.existsSync(gitignorePath)).toBe(true);
+
+      const content = fs.readFileSync(gitignorePath, 'utf-8');
+      expect(content).toContain('*');
+      expect(content).not.toContain('!.gitignore');
 
       cg.close();
     });
