@@ -8,8 +8,9 @@
  *     canonical installer script (single source of truth) so the download /
  *     version-resolution / PATH logic never drifts between first-install and
  *     upgrade.
- *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`. Upgrading
- *     shells out to npm.
+ *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`, or into a
+ *     project. Upgrading shells out to npm (for a project, in that project).
+ *     A pnpm, yarn or bun install is named, with that manager's command.
  *   - **npx** — ephemeral; nothing to upgrade (next `npx` fetches latest).
  *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
  *
@@ -43,8 +44,15 @@ export const INSTALL_PS1_URL = `${RAW_BASE}/install.ps1`;
 
 export type InstallMethod =
   | { kind: 'bundle'; os: 'unix' | 'windows'; bundleRoot: string; installDir: string | null }
-  | { kind: 'npm'; scope: 'global' | 'local' }
+  | {
+      kind: 'npm';
+      scope: 'global' | 'local';
+      /** Local only: the project folder whose node_modules holds this install, where npm runs. */
+      root?: string;
+    }
   | { kind: 'npx' }
+  /** Installed by another package manager, which has to upgrade it (npm can't). */
+  | { kind: 'package-manager'; manager: 'pnpm' | 'yarn' | 'bun'; global: boolean }
   | { kind: 'source'; root: string }
   | { kind: 'unknown'; reason: string };
 
@@ -52,7 +60,11 @@ export interface DetectInput {
   /** `__filename` of the running CLI module — `<…>/dist/bin/codegraph.js`. */
   filename: string;
   platform: NodeJS.Platform;
-  cwd: string;
+  /**
+   * The folder `upgrade` runs from. Detection doesn't read it: where an
+   * install lives says how it was installed, from any folder (#2477).
+   */
+  cwd?: string;
   /** Injectable existence probe (defaults to fs.existsSync) — for tests. */
   exists?: (p: string) => boolean;
 }
@@ -120,10 +132,31 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
     return { kind: 'npx' };
   }
 
-  // npm install (global or local): lives under a node_modules tree.
-  if (norm.includes('/node_modules/')) {
-    const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
-    return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
+  // npm install (global or local): lives under a node_modules tree. Which of
+  // the two is read from npm's own layout, never from cwd (#2477). A global
+  // prefix often sits inside the home folder — Windows `%APPDATA%\npm`, nvm,
+  // fnm, `~/.npm-global` — so "the running file is under cwd" took every such
+  // global install for a local one whenever `upgrade` ran from home: `npm
+  // install` without -g left the global copy stale and dropped a stray local
+  // one into the home folder.
+  const nodeModulesAt = norm.indexOf('/node_modules/');
+  if (nodeModulesAt !== -1) {
+    // The folder holding the outermost node_modules (the same offset in
+    // `filename`, which `toPosix` only changes slash by slash): the global
+    // prefix on Windows, `<prefix>/lib` on POSIX, or the project root.
+    let owner = input.filename.slice(0, nodeModulesAt);
+    if (owner === '' || /^[A-Za-z]:$/.test(owner)) owner += P.sep; // a tree at a filesystem/drive root
+    // pnpm, yarn and bun keep their global packages in a folder that looks
+    // like an npm project (a package.json beside node_modules); running npm
+    // there, or a second copy through npm, is never the upgrade.
+    const manager = otherPackageManager(norm, owner, P, exists);
+    if (manager) return manager;
+    if (isNpmGlobalTree(owner, P, isWin, exists)) return { kind: 'npm', scope: 'global' };
+    // A project's install is upgraded in that project, whatever folder
+    // `upgrade` runs from: npm run anywhere else — outside the project, or in
+    // another project inside it, as in a home folder that is itself one —
+    // installs a second copy there and leaves this one as it was.
+    return { kind: 'npm', scope: 'local', root: P.resolve(owner) };
   }
 
   // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
@@ -143,6 +176,50 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   }
 
   return { kind: 'unknown', reason: `unrecognized install layout at ${input.filename}` };
+}
+
+/** A pnpm, yarn or bun install, from its `.pnpm` layout or its lockfile beside node_modules. */
+function otherPackageManager(
+  norm: string,
+  owner: string,
+  P: path.PlatformPath,
+  exists: (p: string) => boolean,
+): Extract<InstallMethod, { kind: 'package-manager' }> | null {
+  const where = toPosix(owner).toLowerCase();
+  if (norm.includes('/node_modules/.pnpm/') || exists(P.join(owner, 'pnpm-lock.yaml'))) {
+    return { kind: 'package-manager', manager: 'pnpm', global: /\/pnpm\/global\//.test(where + '/') };
+  }
+  if (exists(P.join(owner, 'yarn.lock'))) {
+    return { kind: 'package-manager', manager: 'yarn', global: /\/yarn\/(?:data\/)?global$/.test(where) };
+  }
+  if (exists(P.join(owner, 'bun.lockb')) || exists(P.join(owner, 'bun.lock'))) {
+    return { kind: 'package-manager', manager: 'bun', global: /\/\.bun\/install\/global$/.test(where) };
+  }
+  return null;
+}
+
+/**
+ * Whether the node_modules tree in `owner` is npm's global one, read from
+ * where npm put the launcher: beside a global tree — `<prefix>\codegraph.cmd`
+ * on Windows, `<prefix>/bin/codegraph` next to `<prefix>/lib/node_modules` on
+ * POSIX — and in `node_modules/.bin` of a project folder (one with a
+ * package.json) for a local install. A tree with neither is taken for
+ * global, since no project owns it.
+ */
+function isNpmGlobalTree(
+  owner: string,
+  P: path.PlatformPath,
+  isWin: boolean,
+  exists: (p: string) => boolean,
+): boolean {
+  const globalLauncher = isWin
+    ? exists(P.join(owner, 'codegraph.cmd'))
+    : P.basename(owner) === 'lib' && exists(P.join(P.dirname(owner), 'bin', 'codegraph'));
+  if (globalLauncher) return true;
+  const bin = P.join(owner, 'node_modules', '.bin');
+  const local = exists(P.join(bin, 'codegraph')) || exists(P.join(bin, 'codegraph.cmd'))
+    || exists(P.join(owner, 'package.json'));
+  return !local;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +368,7 @@ export interface UpgradeDeps {
   method: InstallMethod;
   resolveLatest: (pin?: string) => Promise<string>;
   /** Run a command inheriting stdio; returns its exit code (-1 = spawn failed). */
-  run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv) => number;
+  run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv, cwd?: string) => number;
   /** Run a command capturing stdout (nothing reaches the terminal); null = spawn failed. */
   capture: (cmd: string, args: string[]) => { code: number; stdout: string } | null;
   hasCommand: (cmd: string) => boolean;
@@ -393,6 +470,17 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
       deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));
       deps.log(c.dim(`Force a fresh fetch with: npx ${NPM_PACKAGE}@latest`));
       return 0;
+    case 'package-manager': {
+      const pkg = `${NPM_PACKAGE}@${opts.version ? stripV(latest) : 'latest'}`;
+      const command = {
+        pnpm: method.global ? `pnpm add -g ${pkg}` : `pnpm add ${pkg}`,
+        yarn: method.global ? `yarn global add ${pkg}` : `yarn add ${pkg}`,
+        bun: method.global ? `bun add -g ${pkg}` : `bun add ${pkg}`,
+      }[method.manager];
+      deps.warn(`This CodeGraph was installed with ${method.manager}, so npm can't upgrade it.`);
+      deps.log(c.dim(`Upgrade it with:  ${command}`));
+      return 1;
+    }
     case 'source':
       deps.warn(`Running from a source checkout at ${method.root}.`);
       deps.log(c.dim('Upgrade it with: git pull && npm run build'));
@@ -485,8 +573,18 @@ export function verifyResolvedVersion(latest: string, deps: UpgradeDeps): Versio
 function reportResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
   const { method } = deps;
   // A project-local npm install isn't served by PATH's `codegraph` (that
-  // would be some other install) — a probe could only false-alarm.
-  if (method.kind === 'npm' && method.scope === 'local') return 'inconclusive';
+  // would be some other install) — a probe could only false-alarm. Read the
+  // version npm left in the project instead, so a no-op install isn't
+  // reported as an upgrade (#2477).
+  if (method.kind === 'npm' && method.scope === 'local') {
+    const installed = method.root ? readInstalledVersion(method.root) : null;
+    if (installed && parseSemver(installed) && compareVersions(installed, latest) === 0) {
+      deps.log(c.green(`✓ ${method.root} now has CodeGraph ${latest}.`));
+    } else if (installed) {
+      deps.warn(`npm finished, but ${method.root} still has CodeGraph ${normalizeVersion(installed)}.`);
+    }
+    return 'inconclusive';
+  }
   const probe = verifyResolvedVersion(latest, deps);
   switch (probe) {
     case 'match':
@@ -772,9 +870,12 @@ function upgradeNpm(
   const args = method.scope === 'global'
     ? ['install', '-g', `${NPM_PACKAGE}@${versionSpec}`]
     : ['install', `${NPM_PACKAGE}@${versionSpec}`];
-  deps.log(c.dim(`Running: npm ${args.join(' ')}`));
+  // A local install is upgraded in the project it belongs to: npm run from
+  // any other folder would install a second, stray copy there.
+  const where = method.scope === 'local' ? method.root : undefined;
+  deps.log(c.dim(`Running: npm ${args.join(' ')}${where ? ` (in ${where})` : ''}`));
   const inv = npmInvocation(deps.platform, args);
-  const code = deps.run(inv.cmd, inv.args, process.env);
+  const code = deps.run(inv.cmd, inv.args, process.env, where);
   if (code !== 0) {
     deps.error(`npm exited with code ${code}.`);
     if (method.scope === 'global') {
@@ -820,10 +921,21 @@ export function hasCommand(cmd: string): boolean {
   return false;
 }
 
-export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv): number {
-  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true });
+export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv, cwd?: string): number {
+  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true, cwd });
   if (r.error) return -1;
   return r.status ?? -1;
+}
+
+/** The CodeGraph version installed in `root/node_modules`, or null. */
+function readInstalledVersion(root: string): string | null {
+  try {
+    const manifest = path.join(root, 'node_modules', ...NPM_PACKAGE.split('/'), 'package.json');
+    const version: unknown = JSON.parse(fs.readFileSync(manifest, 'utf-8')).version;
+    return typeof version === 'string' ? version : null;
+  } catch {
+    return null;
+  }
 }
 
 export function defaultCapture(cmd: string, args: string[]): { code: number; stdout: string } | null {
