@@ -359,6 +359,7 @@ export class QueryBuilder {
     getDominantFile?: SqliteStatement;
     getChangeStamp?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
+    unseenName?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
   } = {};
@@ -1879,6 +1880,42 @@ export class QueryBuilder {
       candidates: [...new Set(names.map(r => r.name))].slice(0, 12),
       limited,
     };
+  }
+
+  /**
+   * Which of `names` the index has never seen: no node is called that, in any
+   * case, and no indexed name, qualified name, signature or docstring has a
+   * word starting with it. A file's path is its qualified name, so a folder or
+   * file named that counts as seen too. Explore uses this to say plainly that
+   * a name the query spelled is not in the index (#2462).
+   *
+   * A qualified name (`app.handle`, `pkg::run`) is asked about by its last
+   * segment: the index does not always record the receiver it was written on
+   * — express's `app.handle = function handle(…)` is indexed as `handle` — so
+   * only a member it has never seen makes the whole name unseen.
+   *
+   * Bounded like `getExploreMissDiagnostics`: two index probes per name (the
+   * lower(name) index and FTS postings), never a source scan, at most 16 names.
+   */
+  getUnseenNames(names: readonly string[]): string[] {
+    const checked = [...new Set(names)].filter((n) => n.length > 0 && n.length <= 128).slice(0, 16);
+    if (checked.length === 0) return [];
+    if (!this.stmts.unseenName) {
+      this.stmts.unseenName = this.db.prepare(`
+        SELECT EXISTS (SELECT 1 FROM nodes WHERE lower(name) = lower(?))
+          OR EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH ?) AS seen
+      `);
+    }
+    const stmt = this.stmts.unseenName;
+    return checked.filter((name) => {
+      const member = name.split(/::|\./).pop()!;
+      // FTS splits the phrase on everything but letters and digits, so a
+      // snake_case name is matched as the words it is made of.
+      const phrase = member.replace(/"/g, '');
+      if (phrase.length === 0) return false;
+      const row = stmt.get(member, `{name qualified_name signature docstring} : "${phrase}"*`) as { seen: number };
+      return !row.seen;
+    });
   }
 
   /**

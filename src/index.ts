@@ -2120,6 +2120,14 @@ export class CodeGraph {
   }
 
   /**
+   * Which of `names` the index has never seen, by name, path, signature or
+   * docstring — the names explore reports as not in the index (#2462).
+   */
+  getUnseenNames(names: readonly string[]): string[] {
+    return this.queries.getUnseenNames(names);
+  }
+
+  /**
    * The COBOL copybooks a query names (`CVACT01Y`, `MYCOPYBOOK`): each
    * member's indexed copybook file(s) and every `COPY` / `EXEC SQL INCLUDE`
    * statement that includes it. Empty for a query that names none.

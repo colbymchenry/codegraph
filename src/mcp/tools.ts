@@ -1061,6 +1061,54 @@ export function elidedBodyNote(filePath: string, name: string, from: number, to:
 }
 
 /**
+ * The symbol-shaped tokens of an explore query, the way its named-symbol
+ * seeding reads them: split on spaces, commas and brackets, a source-file
+ * extension dropped (`Program.cs` names `Program`), at least 3 characters,
+ * plain or qualified identifiers only, deduped, at most 16.
+ */
+export function exploreQueryTokens(query: string): string[] {
+  const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+  return [...new Set(
+    query.split(/[\s,()[\]]+/)
+      .map((t) => t.replace(FILE_EXT, '').trim())
+      .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+  )].slice(0, 16);
+}
+
+/**
+ * A query token written the way code names things — `ChangelogParser`,
+ * `addFeatures`, `build_report`, `Session.request`, `pkg::run` — rather than
+ * a single word, which may just as well be English (`How`, `Parser`, `main`).
+ * Only these are named back as missing from the index (#2462): a question's
+ * ordinary words must never be reported as code the index lacks.
+ */
+export function isIdentifierShapedToken(token: string): boolean {
+  return /[a-z][A-Z]/.test(token)
+    || /[A-Za-z0-9]_[A-Za-z0-9]/.test(token)
+    || /[A-Za-z_$][\w$]*(?:\.|::)[A-Za-z_$]/.test(token);
+}
+
+/**
+ * The note explore gives for names the query spelled that the index has never
+ * seen (#2462). With results, they match the query's other words, and an agent
+ * reading them as the answer to the missing names reads the wrong code. It
+ * points at what decides the answer — whether those files are indexed — and
+ * never at Read. Including a skipped folder is worded as the user's choice:
+ * indexing scope is the user's call, never the agent's (AGENTS.md).
+ */
+export function notInIndexNote(names: readonly string[], withResults: boolean): string {
+  const one = names.length === 1;
+  const list = names.map((n) => `\`${n}\``).join(', ');
+  const effect = withResults
+    ? `, so the code below matches the query's other words, not ${one ? 'it' : 'them'}.`
+    : '.';
+  return `> **Not in the index:** ${list}. No indexed symbol, file, signature or comment uses ${one ? 'this name' : 'these names'}${effect}`
+    + ` If ${one ? 'it is' : 'they are'} defined in this project, the file${one ? '' : 's'} defining ${one ? 'it' : 'them'} ${one ? 'is' : 'are'} not indexed:`
+    + ` \`codegraph status\` shows what is. If ${one ? 'it lives' : 'they live'} in a folder skipped by default, like \`build/\` or \`dist/\`,`
+    + ' the user can include that folder by adding a re-include such as `!/build/` to `.gitignore`.';
+}
+
+/**
  * Join rendered parts with gap markers that name whatever the trim skipped.
  *
  * `spareChars` is what naming may cost beyond bare markers. Cluster selection
@@ -4330,6 +4378,12 @@ export class ToolHandler {
         explanation += miss.candidates.length > 0
           ? `\nCandidates to retry with codegraph_explore (shared words, not confirmed answers): ${cappedList(miss.candidates, 350)}`
           : '\nNo shared-word symbol candidates found; retry codegraph_explore with literal symbol/file names or code terms.';
+        // Names written like code that the index has never seen may live in
+        // files it does not index (#2462): say which, and where to look.
+        const named = exploreQueryTokens(matchQuery).filter(isIdentifierShapedToken);
+        let unseen: string[] = [];
+        try { unseen = named.length > 0 ? cg.getUnseenNames(named) : []; } catch { /* never fail an explore call */ }
+        if (unseen.length > 0) explanation += `\n\n${notInIndexNote(unseen, false)}`;
       }
       const empty = `No relevant code found for "${query}"${missNote}${explanation}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
@@ -4420,8 +4474,10 @@ export class ToolHandler {
     // Files declaring a TYPE the query named by name — the counter-case guard
     // for the declaration-only penalty (CG-28). Populated in the token loop.
     const namedTypeFiles = new Set<string>();
+    // Tokens written like code names that resolved to no node at all, not even
+    // a camel-infix definer: candidates for the "not in the index" note (#2462).
+    const unresolvedNamedTokens: string[] = [];
     {
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       // Variables/constants seed too: in Svelte/React a `$state` variable
       // (`chatAtBottom`, `feedAtBottom`) is exactly the kind of symbol an agent
@@ -4433,11 +4489,7 @@ export class ToolHandler {
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
       const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
-      const tokens = [...new Set(
-        matchQuery.split(/[\s,()[\]]+/)
-          .map((t) => t.replace(FILE_EXT, '').trim())
-          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
-      )].slice(0, 16);
+      const tokens = exploreQueryTokens(matchQuery);
       // PascalCase tokens in the query are type/file disambiguators — when the
       // agent writes "DataRequest task validate", the `task`/`validate` it wants
       // are DataRequest's, NOT the same-named overloads in Validation.swift /
@@ -4548,6 +4600,7 @@ export class ToolHandler {
             .sort((a, b) => a.name.length - b.name.length)
             .slice(0, 3);
         }
+        if (raw.length === 0 && cands.length === 0 && isIdentifierShapedToken(t)) unresolvedNamedTokens.push(t);
         // Bare lowercase words only seed defs their query-siblings corroborate
         // (see the NL-stopword guard above). Filtering CANDS (not picks) applies
         // the guard uniformly to both branches below, including the >3-def
@@ -5119,6 +5172,19 @@ export class ToolHandler {
       '',
     ];
     const summaryLineIdx = 2;
+
+    // Names the query spelled that the index has never seen (#2462): said
+    // first, under the summary, because the code below then answers the
+    // query's other words. A query for a root `build/` folder's tools, which
+    // the default skip list leaves unindexed, came back as an unrelated
+    // `Program.Main` and a C++ `Parser`, read as the answer.
+    let unseenNames: string[] = [];
+    if (unresolvedNamedTokens.length > 0) {
+      try {
+        unseenNames = cg.getUnseenNames(unresolvedNamedTokens);
+      } catch { /* the note must never fail an explore call */ }
+    }
+    if (unseenNames.length > 0) lines.push(notInIndexNote(unseenNames, true), '');
 
     // A named COBOL copybook's include sites, ALL of them (#2342) — the source
     // below has room for a few include windows, and "what includes X" is the
