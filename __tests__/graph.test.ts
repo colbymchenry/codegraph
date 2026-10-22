@@ -4,11 +4,11 @@
  * Tests for graph traversal and query functionality.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import CodeGraph from '../src/index';
+import CodeGraph, { DatabaseConnection, getDatabasePath, QueryBuilder } from '../src/index';
 import { Node, Edge } from '../src/types';
 import { GraphTraverser } from '../src/graph/traversal';
 
@@ -728,5 +728,92 @@ describe('findPath enqueue-once (#1359)', () => {
     expect(cg.findPath('start', 'missing')).toBeNull();
     expect(cg.findPath('missing', 'missing')).toBeNull();
     expect(cg.findPath('start', 'end', ['imports'])).toBeNull();
+  });
+});
+
+describe('public type hierarchy traverses both directions', () => {
+  let root: string;
+  let cg: CodeGraph;
+  const node = (name: string) => cg.getNodesByName(name).find(n => n.kind === 'class' || n.kind === 'interface')!;
+  const names = (name: string) => [...cg.getTypeHierarchy(node(name).id).nodes.values()].map(n => n.name).sort();
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-type-descendants-'));
+    fs.writeFileSync(path.join(root, 'types.ts'), [
+      'export interface BaseContract {}',
+      'export interface ChildContract {}',
+      'export class BaseType implements BaseContract {}',
+      'export class MiddleType extends BaseType implements ChildContract {}',
+      'export class LeafType extends MiddleType implements BaseContract {}',
+      'export class UnrelatedType {}',
+      'export class CycleA {}',
+      'export class CycleB {}',
+    ].join('\n'));
+    // A real repository's hierarchy, indexed through the same public API.
+    fs.copyFileSync(path.join(__dirname, '../src/errors.ts'), path.join(root, 'errors.ts'));
+    cg = await CodeGraph.init(root, { index: true });
+  });
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('includes all descendants of a base class and interface', () => {
+    expect(cg.getBackend()).toBe('node-sqlite');
+    expect(names('BaseType')).toEqual(['BaseContract', 'BaseType', 'LeafType', 'MiddleType']);
+    expect(names('BaseContract')).toEqual(['BaseContract', 'BaseType', 'LeafType', 'MiddleType']);
+  });
+
+  it('includes both ancestors and descendants when the focus is in the middle', () => {
+    expect(names('MiddleType')).toEqual(['BaseContract', 'BaseType', 'ChildContract', 'LeafType', 'MiddleType']);
+  });
+
+  it('keeps both ancestor edges when a diamond reaches an already collected type', () => {
+    const hierarchy = cg.getTypeHierarchy(node('LeafType').id);
+    const toContract = hierarchy.edges.filter(e => e.target === node('BaseContract').id);
+    expect(toContract.map(e => cg.getNode(e.source)!.name).sort()).toEqual(['BaseType', 'LeafType']);
+    expect(hierarchy.edges).toHaveLength(5);
+  });
+
+  it('returns all six subclasses from CodeGraph’s error definitions', () => {
+    const base = node('CodeGraphError');
+    expect(cg.getIncomingEdges(base.id).filter(e => e.kind === 'extends')).toHaveLength(6);
+    expect(names('CodeGraphError')).toEqual([
+      'CodeGraphError', 'ConfigError', 'DatabaseError', 'FileError', 'ParseError', 'SearchError', 'VectorError',
+    ]);
+    expect(cg.getTypeHierarchy(base.id).edges).toHaveLength(6);
+  });
+
+  it('expands descendants in public context even when ordinary traversal is disabled', async () => {
+    const context = await cg.findRelevantContext('MiddleType', {
+      searchLimit: 1, traversalDepth: 0, maxNodes: 30, seedNames: [],
+    });
+    expect([...context.nodes.values()].map(n => n.name)).toContain('LeafType');
+    expect(context.edges.some(e => e.source === node('LeafType').id && e.target === node('MiddleType').id)).toBe(true);
+  });
+
+  it('does not collect unrelated types and preserves missing-node behavior', () => {
+    expect(names('UnrelatedType')).toEqual(['UnrelatedType']);
+    const absent = cg.getTypeHierarchy('missing-type');
+    expect(absent.nodes.size).toBe(0);
+    expect(absent.edges).toEqual([]);
+    expect(absent.roots).toEqual([]);
+  });
+
+  it('terminates on a cyclic stored hierarchy and records each edge once', () => {
+    // Embedded consumers can write graphs through the exported storage API.
+    const db = DatabaseConnection.open(getDatabasePath(root));
+    try {
+      const queries = new QueryBuilder(db.getDb());
+      queries.insertEdge({ source: node('CycleA').id, target: node('CycleB').id, kind: 'extends', line: 7 });
+      queries.insertEdge({ source: node('CycleB').id, target: node('CycleA').id, kind: 'extends', line: 8 });
+    } finally {
+      db.close();
+    }
+    const hierarchy = cg.getTypeHierarchy(node('CycleA').id);
+    expect([...hierarchy.nodes.values()].map(n => n.name).sort()).toEqual(['CycleA', 'CycleB']);
+    expect(hierarchy.edges).toHaveLength(2);
+    expect(hierarchy.roots).toEqual([node('CycleA').id]);
   });
 });
