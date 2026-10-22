@@ -747,6 +747,9 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
+  // The source as the file has it, kept when this instance's preParse changed
+  // it, for an extractor whose signatures read it (`signatureAsWritten`).
+  private sourceAsWritten: string | null = null;
 
   constructor(
     filePath: string,
@@ -760,6 +763,11 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+  }
+
+  /** The text `getSignature` reads: the source as written when the extractor asks for it. */
+  private get signatureSource(): string {
+    return this.sourceAsWritten ?? this.source;
   }
 
   /**
@@ -811,7 +819,9 @@ export class TreeSitterExtractor {
       // saw (identical outside the blanked directive lines). Skipped when the
       // kernel route point already applied it (sourceIsPreParsed).
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
-        this.source = this.extractor.preParse(this.source, this.filePath);
+        const preParsed = this.extractor.preParse(this.source, this.filePath);
+        if (preParsed !== this.source && this.extractor.signatureAsWritten) this.sourceAsWritten = this.source;
+        this.source = preParsed;
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -2160,7 +2170,7 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
@@ -2521,7 +2531,7 @@ export class TreeSitterExtractor {
     }
 
     const docstring = this.docstringFor(node);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
@@ -4088,7 +4098,7 @@ export class TreeSitterExtractor {
     docstring?: string
   ): void {
     if (!this.extractor) return;
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const extra: Partial<Node> = { docstring, signature };
     if (receiver) extra.qualifiedName = this.composeReceiverQualifiedName(receiver, name);
     else extra.isExported = this.extractor.isExported?.(node, this.source);
@@ -4291,7 +4301,7 @@ export class TreeSitterExtractor {
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
         const methodNode = this.createNode('method', mname, m, {
-          signature: this.extractor?.getSignature?.(m, this.source),
+          signature: this.extractor?.getSignature?.(m, this.signatureSource),
         });
         if (methodNode) {
           for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
@@ -8525,7 +8535,7 @@ export class TreeSitterExtractor {
     // free routines, so there's no duplicate.
     if (!parentId && !fullName.includes('.')) {
       const fnNode = this.createNode('function', fullName, declProc, {
-        signature: this.extractor?.getSignature?.(declProc, this.source),
+        signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
       if (fnNode) {

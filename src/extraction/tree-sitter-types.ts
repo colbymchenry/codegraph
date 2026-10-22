@@ -97,6 +97,13 @@ export interface LanguageExtractor {
    * language id serves several dialects (C++ also parses `.metal` shaders).
    */
   preParse?: (source: string, filePath?: string) => string;
+  /**
+   * Read `getSignature` from the source as the file has it, not from
+   * `preParse`'s output, when the preParse blanks syntax a reader of the
+   * signature still wants: a Delphi parameter's attribute, `const [ref] AValue`
+   * or `const [MVCFromBody] Person` (#2545). Offsets are the same in both.
+   */
+  signatureAsWritten?: boolean;
 
   // --- Node type mappings ---
 
