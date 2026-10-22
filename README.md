@@ -2,6 +2,8 @@
 
 # CodeGraph
 
+<p><a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a></p>
+
 Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
