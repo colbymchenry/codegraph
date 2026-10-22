@@ -22,7 +22,7 @@ import { spawnSync } from 'child_process';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
-import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
+import { upsertTomlTable, removeTomlTable, buildTomlTable, tomlDefinesTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 import { replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
 import {
@@ -1616,6 +1616,237 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
 
     expect(upserted.content).toBe(`${block}\n\n${historyTable}`);
     expect(removed.content).toBe(historyTable);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Codex table is found however it is written (#2562)
+//
+// The header search matched only a column-0 `[mcp_servers.codegraph]`, so an
+// indented one (valid TOML, and what formatters that indent sub-tables
+// write) was taken for absent and a second table was appended: a table
+// defined twice is invalid TOML, and Codex then loaded none of its config.
+// ---------------------------------------------------------------------------
+describe('Installer — the Codex table is found however it is written (#2562)', () => {
+  const HEADER = 'mcp_servers.codegraph';
+  const BLOCK = buildTomlTable(HEADER, { command: 'codegraph', args: ['serve', '--mcp'] });
+  const OLD_BODY = 'command = "codegraph"\nargs = ["serve"]';
+  const BS = String.fromCharCode(92);
+  const crlf = (s: string) => s.replace(/\n/g, '\r\n');
+  const top = 'model = "o3"';
+  const other = '[mcp_servers.other]\ncommand = "other-server"';
+
+  it.each([
+    ['indented with spaces (the report)', '  [mcp_servers.codegraph]', '    command = "codegraph"\n    args = ["serve"]'],
+    ['indented with a tab', '\t[mcp_servers.codegraph]', OLD_BODY],
+    ['spaces inside the brackets', '[ mcp_servers.codegraph ]', OLD_BODY],
+    ['spaces around the dot', '[mcp_servers . codegraph]', OLD_BODY],
+    ['a quoted key', '[mcp_servers."codegraph"]', OLD_BODY],
+    ['a literal-quoted key', "['mcp_servers'.codegraph]", OLD_BODY],
+    ['an escape in a quoted key', `[mcp_servers."code${BS}u0067raph"]`, OLD_BODY],
+    ['a comment after it', '[mcp_servers.codegraph] # added by hand', OLD_BODY],
+  ])('a header written with %s is replaced in place, once, and removed', (_form, header, body) => {
+    const input = `${top}\n\n[mcp_servers]\n\n${header}\n${body}\n\n${other}\n`;
+
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.action).toBe('replaced');
+    expect(up.content).toBe(`${top}\n\n[mcp_servers]\n\n${BLOCK}\n\n${other}\n`);
+    expect(upsertTomlTable(up.content, HEADER, BLOCK).action).toBe('unchanged');
+
+    const rm = removeTomlTable(input, HEADER);
+    expect(rm.action).toBe('removed');
+    expect(rm.content).toBe(`${top}\n\n[mcp_servers]\n\n${other}\n`);
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+
+  it('a CRLF file stays CRLF, and an up-to-date CRLF table is unchanged', () => {
+    const input = crlf(`${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n${other}\n`);
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.content).toBe(crlf(`${top}\n\n${BLOCK}\n\n${other}\n`));
+    expect(upsertTomlTable(up.content, HEADER, BLOCK).action).toBe('unchanged');
+    expect(removeTomlTable(up.content, HEADER).content).toBe(crlf(`${top}\n\n${other}\n`));
+    // Inserting into a CRLF file uses CRLF too.
+    expect(upsertTomlTable(crlf(`${top}\n`), HEADER, BLOCK).content).toBe(crlf(`${top}\n\n${BLOCK}\n`));
+  });
+
+  it('a second table, as the old bug appended, is removed: the file parses again', () => {
+    const input = `${top}\n\n  [mcp_servers.codegraph]\n    command = "codegraph"\n    args = ["serve"]\n\n${other}\n\n${BLOCK}\n`;
+    const up = upsertTomlTable(input, HEADER, BLOCK);
+    expect(up.action).toBe('replaced');
+    expect(up.content).toBe(`${top}\n\n${BLOCK}\n\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n${other}\n`);
+  });
+
+  it('look-alikes are never taken for the table: other names, and header-shaped text inside values', () => {
+    const lookalikes = [
+      top,
+      '',
+      '[mcp_servers.codegraph2]',
+      'command = "x"',
+      '',
+      '[mcp_servers.other]',
+      'note = """',
+      '[mcp_servers.codegraph]',
+      '"""',
+      "literal = '''",
+      '[mcp_servers.codegraph]',
+      "'''",
+      'args = [',
+      '  "[mcp_servers.codegraph]",',
+      ']',
+      '',
+    ].join('\n');
+    const up = upsertTomlTable(lookalikes, HEADER, BLOCK);
+    expect(up.action).toBe('inserted');
+    expect(up.content).toBe(`${lookalikes.trimEnd()}\n\n${BLOCK}\n`);
+    expect(removeTomlTable(lookalikes, HEADER)).toEqual({ content: lookalikes, action: 'not-found' });
+    expect(tomlDefinesTable(lookalikes, HEADER)).toBe(false);
+  });
+
+  it('a sub-table such as [mcp_servers.codegraph.env] is kept by install and removed with the table', () => {
+    const env = '[mcp_servers.codegraph.env]\nCODEGRAPH_MCP_TOOLS = "all"';
+    const input = `${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n${env}\n\n${other}\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).content).toBe(`${top}\n\n${BLOCK}\n\n${env}\n\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n${other}\n`);
+    // Only the sub-table left (a server with no command): install adds the table.
+    expect(tomlDefinesTable(`${top}\n\n${env}\n`, HEADER)).toBe(true);
+    expect(upsertTomlTable(`${top}\n\n${env}\n`, HEADER, BLOCK).content).toBe(`${top}\n\n${env}\n\n${BLOCK}\n`);
+  });
+
+  it('a comment heading the next table stays with it', () => {
+    const input = `${top}\n\n[mcp_servers.codegraph]\n${OLD_BODY}\n\n# the other server, set up by hand\n${other}\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).content).toBe(`${top}\n\n${BLOCK}\n\n# the other server, set up by hand\n${other}\n`);
+    expect(removeTomlTable(input, HEADER).content).toBe(`${top}\n\n# the other server, set up by hand\n${other}\n`);
+  });
+
+  it.each([
+    ['dotted keys at the top level', `mcp_servers.codegraph.command = "codegraph"\nmcp_servers.codegraph.args = ["serve", "--mcp"]\n${top}\n\n${other}\n`, 1, 'dotted keys', `${top}\n\n${other}\n`],
+    ['dotted keys under [mcp_servers]', `${top}\n\n[mcp_servers]\ncodegraph.command = "codegraph"\ncodegraph.args = [\n  "serve",\n  "--mcp",\n]\nother.command = "x"\n`, 4, 'dotted keys', `${top}\n\n[mcp_servers]\nother.command = "x"\n`],
+    ['an inline table under [mcp_servers]', `${top}\n\n[mcp_servers]\ncodegraph = { command = "codegraph", args = ["serve", "--mcp"] }\n`, 4, 'an inline table', `${top}\n\n[mcp_servers]\n`],
+    ['[[mcp_servers.codegraph]]', `${top}\n\n[[mcp_servers.codegraph]]\ncommand = "codegraph"\n`, 3, 'an array of tables', `${top}\n`],
+  ])('written with %s: install leaves it as is (no second table), uninstall removes it', (_form, input, line, form, removed) => {
+    expect(upsertTomlTable(input, HEADER, BLOCK)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ kind: 'defined', line, form }),
+    });
+    const rm = removeTomlTable(input, HEADER);
+    expect(rm.action).toBe('removed');
+    expect(rm.content).toBe(removed);
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+
+  it.each([
+    ['mcp_servers as an inline table', `${top}\nmcp_servers = { other = { command = "x" } }\n`, 'an inline table'],
+    ['mcp_servers as an array of tables', `${top}\n\n[[mcp_servers]]\nname = "other"\n`, 'an array of tables'],
+  ])('%s: a [mcp_servers.codegraph] table can\'t be added, so nothing is', (_form, input, form) => {
+    expect(upsertTomlTable(input, HEADER, BLOCK)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ kind: 'blocked', key: 'mcp_servers', form }),
+    });
+    expect(removeTomlTable(input, HEADER).action).toBe('not-found');
+    expect(tomlDefinesTable(input, HEADER)).toBe(false);
+  });
+
+  it('codegraph inside an inline mcp_servers table is reported, never edited', () => {
+    const input = `${top}\nmcp_servers = { codegraph = { command = "codegraph", args = ["serve", "--mcp"] } }\n`;
+    expect(upsertTomlTable(input, HEADER, BLOCK).action).toBe('conflict');
+    expect(removeTomlTable(input, HEADER)).toEqual({
+      content: input,
+      action: 'conflict',
+      conflict: expect.objectContaining({ key: 'mcp_servers', form: 'an inline table', line: 2 }),
+    });
+    expect(tomlDefinesTable(input, HEADER)).toBe(true);
+  });
+});
+
+describe('Installer — Codex install, re-install, refresh and uninstall find the table however it is written (#2562)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('codex2562-home');
+    tmpCwd = mkTmpDir('codex2562-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const configToml = () => path.join(tmpHome, '.codex', 'config.toml');
+  function writeConfig(text: string): void {
+    fs.mkdirSync(path.dirname(configToml()), { recursive: true });
+    fs.writeFileSync(configToml(), text);
+  }
+  const block = buildTomlTable('mcp_servers.codegraph', { command: 'codegraph', args: ['serve', '--mcp'] });
+
+  it('the reported indented table: detected, replaced once, unchanged after, refreshed in place, removed by uninstall', () => {
+    const siblings = 'model = "o3"\n\n[mcp_servers]\n\n  [mcp_servers.other]\n    command = "other-server"\n';
+    writeConfig(`${siblings}\n  [mcp_servers.codegraph]\n    command = "codegraph"\n    args = ["serve", "--mcp"]\n`);
+    const codex = getTarget('codex')!;
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+
+    const first = codex.install('global', { autoAllow: false });
+    expect(first.files.find((f) => f.path === configToml())!.action).toBe('updated');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(`${siblings}\n${block}\n`);
+    expect(codex.install('global', { autoAllow: false }).files.find((f) => f.path === configToml())!.action).toBe('unchanged');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'codex')!.status).toBe('unchanged');
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(siblings);
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('a CRLF config keeps CRLF through install and uninstall', () => {
+    writeConfig('model = "o3"\r\n\r\n[mcp_servers.codegraph]\r\ncommand = "codegraph"\r\nargs = ["serve"]\r\n');
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(`model = "o3"\r\n\r\n${block.replace(/\n/g, '\r\n')}\r\n`);
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe('model = "o3"\r\n');
+  });
+
+  it('an entry written with dotted keys is left as written, with a note; uninstall removes it', () => {
+    const input = 'model = "o3"\n\n[mcp_servers]\ncodegraph.command = "codegraph"\ncodegraph.args = ["serve", "--mcp"]\n';
+    writeConfig(input);
+    const codex = getTarget('codex')!;
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+
+    const result = codex.install('global', { autoAllow: false });
+    expect(result.files.find((f) => f.path === configToml())!.action).toBe('unchanged');
+    expect(result.notes?.join('\n')).toMatch(/Left the mcp_servers\.codegraph entry in .*config\.toml as you wrote it \(dotted keys, line 4\)/);
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+    expect(fs.readFileSync(path.join(tmpHome, '.codex', 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'codex')!.status).toBe('unchanged');
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe('model = "o3"\n\n[mcp_servers]\n');
+  });
+
+  it('mcp_servers as an inline table: install refuses with a clear error and changes nothing', () => {
+    const input = 'model = "o3"\nmcp_servers = { other = { command = "x" } }\n';
+    writeConfig(input);
+    expect(() => getTarget('codex')!.install('global', { autoAllow: false })).toThrow(
+      /config\.toml sets mcp_servers as an inline table \(line 2\), so a \[mcp_servers\.codegraph\] table can't be added without breaking the file\. Nothing was changed/,
+    );
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+  });
+
+  it('codegraph inside an inline mcp_servers table: uninstall says it can\'t remove it, and leaves the file alone', () => {
+    const input = 'model = "o3"\nmcp_servers = { codegraph = { command = "codegraph", args = ["serve", "--mcp"] } }\n';
+    writeConfig(input);
+    const [report] = uninstallTargets([getTarget('codex')!], 'global');
+    expect(report!.notes.join('\n')).toMatch(/sets mcp_servers\.codegraph inside mcp_servers \(an inline table, line 2\), which CodeGraph can't edit safely/);
+    expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
   });
 });
 

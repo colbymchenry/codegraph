@@ -517,10 +517,14 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
         clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
       }
     } else if (r.status === 'not-configured') {
-      clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+      clack.log.info(r.notes.length > 0 ? `${r.displayName}: nothing removed` : `${r.displayName}: not configured — nothing to remove`);
     } else {
       clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+      continue;
     }
+    // What a target couldn't remove on its own (e.g. a Codex entry inside
+    // an inline table, #2562).
+    for (const note of r.notes) clack.log.warn(`${r.displayName}: ${note}`);
   }
 
   // Step 4: for local uninstall, the index dir is separate — point at
