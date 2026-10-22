@@ -802,33 +802,28 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cliAfter.mcpServers.codegraph).toBeDefined();
   });
 
-  it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
+  it('hermes: install adds the codegraph MCP server and leaves platform_toolsets alone, preserving existing yaml (#2485)', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');
     fs.mkdirSync(path.dirname(config), { recursive: true });
-    fs.writeFileSync(config, [
-      'model:',
-      '  default: qwen-3.7',
-      'mcp_servers:',
-      '  other:',
-      '    command: other',
+    const toolsets = [
       'platform_toolsets:',
       '  cli:',
       '    - hermes-cli',
       '  discord:',
       '    - hermes-discord',
       '',
-    ].join('\n'));
+    ].join('\n');
+    fs.writeFileSync(config, ['model:', '  default: qwen-3.7', 'mcp_servers:', '  other:', '    command: other', toolsets].join('\n'));
 
     const result = hermes.install('global', { autoAllow: true });
     expect(result.files[0].action).toBe('updated');
     const body = fs.readFileSync(config, 'utf-8');
     expect(body).toContain('model:\n  default: qwen-3.7');
-    expect(body).toContain('mcp_servers:\n  other:\n    command: other');
-    expect(body).toContain('  codegraph:\n    command: codegraph');
-    expect(body).toContain('    - hermes-cli');
-    expect(body).toContain('    - mcp-codegraph');
-    expect(body).toContain('  discord:\n    - hermes-discord');
+    expect(body).toContain('mcp_servers:\n  other:\n    command: other\n  codegraph:\n    command: codegraph');
+    // No toolset entry: a list naming no MCP server loads every enabled one.
+    expect(body.endsWith(toolsets)).toBe(true);
+    expect(body).not.toContain('mcp-codegraph');
 
     const second = hermes.install('global', { autoAllow: true });
     expect(second.files[0].action).toBe('unchanged');
@@ -852,13 +847,14 @@ describe('Installer targets — partial-state idempotency', () => {
   // Regression for #456: PyYAML's default block style writes list items at the
   // SAME indent as the parent key (`cli:` and its `- hermes-cli` are both at
   // indent 2). The pre-fix line-based patcher mistook that first list item for
-  // the next sibling key, truncated the cli block, and spliced `- mcp-codegraph`
-  // at indent 4 BEFORE the existing items — producing unparseable YAML.
-  it('hermes: install preserves PyYAML-default list-at-same-indent style (issue #456)', () => {
+  // the next sibling key and truncated the cli block. Install no longer adds to
+  // that list (#2485), but it still has to read it to take out the
+  // `- mcp-codegraph` line an earlier install appended there.
+  it('hermes: install reads the PyYAML-default list-at-same-indent style (issue #456)', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');
     fs.mkdirSync(path.dirname(config), { recursive: true });
-    const original = [
+    const lines = [
       'model:',
       '  default: gpt-4o',
       'platform_toolsets:',
@@ -873,28 +869,19 @@ describe('Installer targets — partial-state idempotency', () => {
       '  discord:',
       '  - hermes-discord',
       '',
-    ].join('\n');
-    fs.writeFileSync(config, original);
+    ];
+    // As an earlier install left it: our entry appended at the items' indent.
+    fs.writeFileSync(config, [...lines.slice(0, 9), '  - mcp-codegraph', ...lines.slice(9)].join('\n'));
 
     hermes.install('global', { autoAllow: true });
     const body = fs.readFileSync(config, 'utf-8');
 
-    // mcp-codegraph appended at the same 2-space indent as existing items
-    expect(body).toContain('\n  - mcp-codegraph\n');
-    // hermes-cli preserved
-    expect(body).toContain('\n  - hermes-cli\n');
-    // Sibling sections kept their indent — `telegram:` is still a key under
-    // platform_toolsets, not promoted up.
-    expect(body).toContain('\n  telegram:\n  - hermes-telegram\n');
-    expect(body).toContain('\n  discord:\n  - hermes-discord\n');
+    // The old entry is gone and every other line is where it was.
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body.startsWith(lines.join('\n'))).toBe(true);
     // No list items leaked to the platform_toolsets level (indent 0).
     expect(body).not.toMatch(/^- browser/m);
     expect(body).not.toMatch(/^- hermes-telegram/m);
-
-    // The whole platform_toolsets block extracted by line search should
-    // start with `cli:` and not contain a stray 4-space `mcp-codegraph`
-    // appearing before the rest of the existing items.
-    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
 
     // Idempotent
     const second = hermes.install('global', { autoAllow: true });
@@ -918,15 +905,15 @@ describe('Installer targets — partial-state idempotency', () => {
 
     hermes.install('global', { autoAllow: true });
     const installed = fs.readFileSync(config, 'utf-8');
-    expect(installed).toContain('- mcp-codegraph');
+    expect(installed).not.toContain('mcp-codegraph');
+    expect(installed.startsWith(original)).toBe(true);
     expect(installed).toContain('codegraph:');
 
     hermes.uninstall('global');
     const body = fs.readFileSync(config, 'utf-8');
     expect(body).not.toContain('mcp-codegraph');
     expect(body).not.toContain('command: codegraph');
-    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
-    expect(body).toContain('  telegram:\n  - hermes-telegram');
+    expect(body.startsWith(original)).toBe(true);
   });
 
   it('opencode: uninstall removes only mcp.servers.codegraph, preserves comments and siblings', () => {
@@ -1847,6 +1834,163 @@ describe('Installer — Codex install, re-install, refresh and uninstall find th
     const [report] = uninstallTargets([getTarget('codex')!], 'global');
     expect(report!.notes.join('\n')).toMatch(/sets mcp_servers\.codegraph inside mcp_servers \(an inline table, line 2\), which CodeGraph can't edit safely/);
     expect(fs.readFileSync(configToml(), 'utf-8')).toBe(input);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hermes: no toolset entry, and the user's MCP entry is theirs (#2485)
+//
+// Install and refresh appended `mcp-codegraph` to `platform_toolsets.cli`.
+// Hermes up to 0.22.2 rejects that name at startup ("Unknown toolsets"), and
+// 0.22.4 reads it as naming codegraph, which turns the list into an MCP
+// allowlist and hides every other server from CLI sessions
+// (hermes_cli/tools_config.py `_merge_mcp_servers`). No entry is needed: a
+// list that names no MCP server loads every enabled one. The refresh also
+// replaced the whole `mcp_servers.codegraph` block with CodeGraph's template,
+// undoing an absolute command path, timeouts, `enabled: false` and env.
+// ---------------------------------------------------------------------------
+describe('Installer — Hermes never writes platform_toolsets and keeps the user\'s MCP entry (#2485)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('hermes2485-home');
+    tmpCwd = mkTmpDir('hermes2485-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const hermes = getTarget('hermes')!;
+  const config = () => path.join(tmpHome, '.hermes', 'config.yaml');
+  function writeConfig(text: string): void {
+    fs.mkdirSync(path.dirname(config()), { recursive: true });
+    fs.writeFileSync(config(), text);
+  }
+  const read = () => fs.readFileSync(config(), 'utf-8');
+  const codegraphKeys = (text: string) => text.split(/\r?\n/).filter((l) => /^\s*["']?codegraph["']?\s*:/.test(l)).length;
+  const OTHERS = 'mcp_servers:\n  agentmail:\n    command: npx\n    args:\n    - -y\n    - agentmail-mcp\n';
+  const ENTRY = '  codegraph:\n    command: codegraph\n    args:\n      - serve\n      - --mcp\n    timeout: 120\n    connect_timeout: 60\n    enabled: true\n';
+
+  it('a fresh install writes the server and no platform_toolsets', () => {
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`mcp_servers:\n${ENTRY}`);
+    expect(hermes.install('global', { autoAllow: false }).files[0]!.action).toBe('unchanged');
+    expect(hermes.printConfig('global')).not.toContain('platform_toolsets');
+  });
+
+  it('the mcp-codegraph line an earlier install added is taken out, so every server loads again; a second refresh is unchanged', () => {
+    const before = `model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - browser\n`;
+    writeConfig(`model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - browser\n  - mcp-codegraph\n`);
+    const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!;
+    expect(report.status).toBe('refreshed');
+    expect(read()).toBe(before);
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+  });
+
+  it('a line the user removed is not put back', () => {
+    const text = `model: big\n${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n`;
+    writeConfig(text);
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+    expect(read()).toBe(text);
+  });
+
+  it('in an allowlist of MCP servers, mcp-codegraph becomes codegraph, the name every Hermes version reads', () => {
+    writeConfig(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n    - hermes-cli\n    - agentmail\n    - mcp-codegraph # added by codegraph\n`);
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n    - hermes-cli\n    - agentmail\n    - codegraph\n`);
+  });
+
+  it('an allowlist that leaves CodeGraph out is left alone, with a note', () => {
+    const text = `${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n`;
+    writeConfig(text);
+    const result = hermes.install('global', { autoAllow: false });
+    expect(result.files[0]!.action).toBe('unchanged');
+    expect(result.notes?.join('\n')).toMatch(/platform_toolsets\.cli in .*config\.yaml names MCP servers, so CLI sessions load only those\. Add `codegraph`/);
+    expect(read()).toBe(text);
+  });
+
+  it('a customized entry is kept byte-for-byte by install and refresh', () => {
+    const text = `model: big\n${OTHERS}  codegraph:\n    command: /home/u/.local/bin/codegraph\n    args: [serve, --mcp]\n    timeout: 300\n    connect_timeout: 90\n    enabled: false\n    env:\n      CODEGRAPH_MCP_TOOLS: all\n`;
+    writeConfig(text);
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+    expect(hermes.install('global', { autoAllow: false }).files[0]!.action).toBe('unchanged');
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'hermes')!.status).toBe('unchanged');
+    expect(read()).toBe(text);
+  });
+
+  it('an entry missing command or args gets only those, at its own indent', () => {
+    writeConfig('mcp_servers:\n  codegraph:\n    enabled: true\n    timeout: 300\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe('mcp_servers:\n  codegraph:\n    enabled: true\n    timeout: 300\n    command: codegraph\n    args: [serve, --mcp]\n');
+  });
+
+  it('a 4-space-indented mcp_servers gets the new entry at 4 spaces', () => {
+    writeConfig('mcp_servers:\n    agentmail:\n        command: npx\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe([
+      'mcp_servers:', '    agentmail:', '        command: npx',
+      '    codegraph:', '        command: codegraph', '        args:', '            - serve', '            - --mcp',
+      '        timeout: 120', '        connect_timeout: 60', '        enabled: true', '',
+    ].join('\n'));
+  });
+
+  it('an entry written on one line or with a quoted key is found, so no second codegraph key is added', () => {
+    for (const entry of ['  codegraph: {command: /opt/bin/codegraph, args: [serve, --mcp]}\n', '  "codegraph":\n    command: /opt/bin/codegraph\n    args: [serve, --mcp]\n']) {
+      const text = `mcp_servers:\n${entry}`;
+      writeConfig(text);
+      expect(hermes.detect('global').alreadyConfigured).toBe(true);
+      hermes.install('global', { autoAllow: false });
+      expect(read()).toBe(text);
+      hermes.uninstall('global');
+      expect(codegraphKeys(read())).toBe(0);
+    }
+  });
+
+  it('mcp_servers written as a one-line mapping: install refuses with a clear error and changes nothing; {} becomes a block', () => {
+    const text = 'model: big\nmcp_servers: {agentmail: {command: npx, args: [-y, agentmail-mcp]}}\n';
+    writeConfig(text);
+    expect(() => hermes.install('global', { autoAllow: false })).toThrow(
+      /config\.yaml writes mcp_servers as a one-line mapping \(line 2\), so CodeGraph can't add its server without rewriting it\. Nothing was changed/,
+    );
+    expect(read()).toBe(text);
+
+    writeConfig('model: big\nmcp_servers: {}\n');
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`model: big\nmcp_servers:\n${ENTRY}`);
+  });
+
+  it('codegraph inside a one-line mcp_servers mapping is left as written; uninstall says it can\'t remove it', () => {
+    const text = 'mcp_servers: {codegraph: {command: codegraph, args: [serve, --mcp]}}\n';
+    writeConfig(text);
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+    const result = hermes.install('global', { autoAllow: false });
+    expect(result.notes?.join('\n')).toMatch(/Left the mcp_servers\.codegraph entry in .*config\.yaml \(line 1\) as you wrote it/);
+    const removed = hermes.uninstall('global');
+    expect(removed.notes?.join('\n')).toMatch(/inside a one-line mcp_servers mapping \(line 1\), which CodeGraph can't edit safely/);
+    expect(read()).toBe(text);
+  });
+
+  it('a CRLF config stays CRLF', () => {
+    writeConfig(`model: big\r\nplatform_toolsets:\r\n  cli:\r\n  - hermes-cli\r\n  - mcp-codegraph\r\n`);
+    hermes.install('global', { autoAllow: false });
+    expect(read()).toBe(`model: big\r\nplatform_toolsets:\r\n  cli:\r\n  - hermes-cli\r\n\r\nmcp_servers:\r\n${ENTRY.replace(/\n/g, '\r\n')}`);
+  });
+
+  it('uninstall removes the server and any codegraph toolset name, and keeps the rest', () => {
+    writeConfig(`${OTHERS}${ENTRY}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n  - codegraph\n  telegram:\n  - hermes-telegram\n`);
+    hermes.uninstall('global');
+    expect(read()).toBe(`${OTHERS}platform_toolsets:\n  cli:\n  - hermes-cli\n  - agentmail\n  telegram:\n  - hermes-telegram\n`);
+    expect(hermes.detect('global').alreadyConfigured).toBe(false);
   });
 });
 
