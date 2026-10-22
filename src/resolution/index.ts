@@ -28,6 +28,7 @@ import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
+import { clearPascalScopeMemos, isPascalParenlessRef, matchPascalParenlessRef } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
@@ -587,6 +588,7 @@ export class ReferenceResolver {
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);
       clearVbnetReceiverMemos(this.context);
+      clearPascalScopeMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
       clearCppTypeAliasMemos(this.context);
@@ -907,6 +909,12 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByLowerName(lowerName);
         this.lowerNameCache.set(lowerName, result);
         return result;
+      },
+
+      getNodeNamesOfKinds: (language, kinds) => this.queries.getNodeNamesOfKinds(language, kinds),
+
+      rememberNode: (node: Node) => {
+        if (!this.nodeByIdCache.has(node.id)) this.nodeByIdCache.set(node.id, node);
       },
 
       getNodeById: (id: string) => {
@@ -1428,6 +1436,10 @@ export class ReferenceResolver {
     // ./cpp-supertypes).
     if (isCppSupertypeRef(ref)) return matchCppSupertype(ref, this.context);
 
+    // A Pascal name written without parentheses (#2514) links only to a
+    // routine its scope reaches, or through a receiver to a method of the
+    // receiver's declared type; data of that name links nothing.
+    if (isPascalParenlessRef(ref)) return matchPascalParenlessRef(ref, this.context);
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);

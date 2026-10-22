@@ -4023,6 +4023,15 @@ export class QueryBuilder {
     return rows.map((r) => r.name);
   }
 
+  /** The names of a language's nodes of the given kinds (repeats included), decoding nothing else. */
+  getNodeNamesOfKinds(language: Language, kinds: readonly NodeKind[]): string[] {
+    // `+language`: the kind index narrows further than the language one.
+    const rows = this.db
+      .prepare(`SELECT name FROM nodes WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND +language = ?`)
+      .all(...kinds, language) as Array<{ name: string }>;
+    return rows.map((r) => r.name);
+  }
+
   /**
    * The import node of every C / C++ `#include`, narrowed to the path it
    * spells and where it is written: the include graph reads nothing else, and

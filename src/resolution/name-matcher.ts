@@ -18233,7 +18233,7 @@ function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): 
 const DECLARED_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
 const INHERITED_METHODS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
 
-function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+export function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
   let memo = DECLARED_SUPERS.get(context);
   if (!memo) DECLARED_SUPERS.set(context, (memo = new Map()));
   const hit = memo.get(cls.id);
@@ -18257,7 +18257,7 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
   const names = (text: string | undefined): string[] =>
     text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
   switch (cls.language) {
-    case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
+    case 'pascal': return names(/=\s*class\s*(?:sealed|abstract)?\s*\(([^)]*)\)/i.exec(head)?.[1]);
     // A base built by a class's factory — Django's `class Manager(
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.

@@ -147,6 +147,17 @@ export interface ResolutionContext {
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
   /**
+   * The names of a language's nodes of the given kinds, nothing else decoded:
+   * a cheap pre-filter before lookups by name. Optional for external/test
+   * contexts.
+   */
+  getNodeNamesOfKinds?(language: Language, kinds: readonly Node['kind'][]): string[];
+  /**
+   * Hands the resolver a node a resolution found by other means, so the gates
+   * after it don't fetch it again by id. Optional for external/test contexts.
+   */
+  rememberNode?(node: Node): void;
+  /**
    * Direct supertypes of the type named `typeName` (same language): the classes
    * it extends and the interfaces / protocols / traits it implements/conforms to,
    * by simple name. Backed by the resolved `implements`/`extends` edges, so it is

@@ -649,6 +649,32 @@ function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
  */
 const REACT_HANDLER_HOOKS = /^(?:React\.)?use(?:Callback|EffectEvent|Event)$/;
 
+/** Bare Pascal names that are never a project routine's call (#2514), lowercased. */
+const PASCAL_NOT_ROUTINES: ReadonlySet<string> = new Set(['self', 'result', 'true', 'false', 'nil', 'exit', 'break', 'continue']);
+
+/** A routine header of the Pascal source text, for a broken tree's regions (#2514). */
+interface PascalTextRoutine {
+  line: number;
+  classQn: string | null;
+  routine: string | null;
+  locals: Map<string, string | null>;
+}
+
+/**
+ * How a Pascal name written without parentheses may run a routine (#2514):
+ * as a statement (`call`), for its value (`read`), as an event's method
+ * (`ref`), or as a receiver or an indexed value (`recv`). See
+ * resolution/pascal-scope.
+ */
+type PascalNameMode = 'call' | 'read' | 'ref' | 'recv';
+
+/**
+ * Names Delphi's conventions give to data, never to a routine: a field
+ * (`FCount`), a type (`TList`, `EAbort`), a constant (`MAX_PATH`, `CRLF`).
+ * A C library's functions keep their own case (`ERR_get_error`).
+ */
+const PASCAL_DATA_NAME = /^(?:F[A-Z][a-z]|[TE][A-Z][a-z]|[A-Z][A-Z0-9_]*$)/;
+
 export class TreeSitterExtractor {
   /**
    * The node's prose, from either place it can live: a preceding comment
@@ -728,6 +754,27 @@ export class TreeSitterExtractor {
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  // Paren-less Pascal names (#2514): the names each routine or anonymous
+  // method being walked declares itself (innermost last), the class the
+  // routine belongs to, how many `with` bodies the walk is inside (a bare name
+  // there may be the `with` object's), and per class the names its own data
+  // and the unit's data take (lowercased).
+  private pascalScopes: Array<{
+    locals: Map<string, string | null>;
+    classQn: string | null;
+    routine: string | null;
+    /** The line of the routine's header (0: none), for a broken tree's regions. */
+    startLine: number;
+  }> = [];
+  /** The routine headers of the source text, by line, for a broken tree's regions (#2514). */
+  private pascalTextRoutines: PascalTextRoutine[] | null = null;
+  private pascalSourceLines: string[] | null = null;
+  private pascalWithDepth = 0;
+  private pascalDataNameSets = new Map<string, Set<string>>();
+  /** Bare names read in an expression, kept until the file shows which are variables (#2514). */
+  private pascalReads: Array<{ ref: UnresolvedReference; scope: string; name: string }> = [];
+  /** Per routine class (`''`: none), the names the file assigns to or passes to `Inc`/`Dec`. */
+  private pascalAssigned = new Map<string, Set<string>>();
   // Function-as-value capture (#756): per-language spec + candidates collected
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
   // (see flushFnRefCandidates).
@@ -870,6 +917,7 @@ export class TreeSitterExtractor {
       // nodes and import refs are complete and the file node is still pushed.
       this.flushFnRefCandidates();
       this.flushValueRefs();
+      this.flushPascalReads();
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
@@ -8331,9 +8379,19 @@ export class TreeSitterExtractor {
       return true;
     }
 
-    // block (begin..end) → visit for calls
-    if (nodeType === 'block') {
-      this.visitPascalBlock(node);
+    // block (begin..end) → visit for calls. Outside a routine — a program's
+    // main block, `initialization` and `finalization` — the names in it are
+    // the unit's (#2514). Where the tree has errors, a block outside a routine
+    // (a `blockTr` there) may be the body of one whose header didn't parse;
+    // the source text says whose it is.
+    if (nodeType === 'block' || nodeType === 'blockTr' || nodeType === 'initialization' || nodeType === 'finalization') {
+      const outside = this.pascalScopes.length === 0;
+      if (outside) {
+        this.pascalScopes.push({ locals: new Map([['result', null]]), classQn: null, routine: null, startLine: 0 });
+      }
+      // A `blockTr` may also hold declarations, which are walked as they always were.
+      this.visitPascalBlock(node, nodeType === 'blockTr');
+      if (outside) this.pascalScopes.pop();
       return true;
     }
 
@@ -8553,10 +8611,105 @@ export class TreeSitterExtractor {
       (c: SyntaxNode) => c.type === 'block'
     );
     if (block) {
+      // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
+      // with their constraints (`TList<T: class>`).
+      const owner = fullName.includes('.') ? fullName.replace(/<[^>]*>/g, '').split('.').slice(0, -1).join('::') : null;
+      this.pascalScopes.push({
+        locals: this.pascalRoutineLocals(node),
+        classQn: owner,
+        routine: shortNameKey.replace(/<.*$/, ''),
+        startLine: node.startPosition.row + 1,
+      });
       this.nodeStack.push(parentId);
       this.visitPascalBlock(block);
       this.nodeStack.pop();
+      this.pascalScopes.pop();
     }
+  }
+
+  /**
+   * The names a routine (a `defProc`) or an anonymous method (a `lambda`)
+   * declares before its body, lowercased, with the class or record type each
+   * is declared with (null when it has none, or none a name can stand for):
+   * parameters, `var`/`const` sections, nested routines and `Result`. The
+   * body's inline declarations join as the walk reaches them
+   * (`declarePascalInline`). A bare name among them is the routine's own,
+   * never a call.
+   */
+  private pascalRoutineLocals(routine: SyntaxNode): Map<string, string | null> {
+    const names = new Map<string, string | null>();
+    const header = routine.type === 'lambda' ? routine : routine.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+    names.set('result', this.pascalTypeName(header?.namedChildren.find((c: SyntaxNode) => c.type === 'typeref')));
+    const declare = (decl: SyntaxNode): void => {
+      const type = this.pascalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
+      for (const c of decl.namedChildren) {
+        if (c.type === 'identifier') names.set(getNodeText(c, this.source).toLowerCase(), type);
+      }
+    };
+    const args = header?.namedChildren.find((c: SyntaxNode) => c.type === 'declArgs');
+    for (const arg of args?.namedChildren ?? []) {
+      if (arg.type === 'declArg') declare(arg);
+    }
+    for (const c of routine.namedChildren) {
+      if (c.type === 'declVars' || c.type === 'declConsts') {
+        for (const decl of c.namedChildren) declare(decl);
+      } else if (c.type === 'defProc') {
+        const name = getChildByField(c.namedChildren.find((x: SyntaxNode) => x.type === 'declProc') ?? c, 'name');
+        if (name?.type === 'identifier') names.set(getNodeText(name, this.source).toLowerCase(), null);
+      }
+    }
+    return names;
+  }
+
+  /**
+   * A name a routine's body declares where it stands — an inline `var`, a
+   * `for` or `for … in` loop's variable, an `on E: EFoo do` handler's — joins
+   * the routine's locals before the code that uses it is walked.
+   */
+  private declarePascalInline(node: SyntaxNode): void {
+    const locals = this.pascalScopes[this.pascalScopes.length - 1]?.locals;
+    if (!locals) return;
+    const declare = (id: SyntaxNode | null | undefined, type: string | null): void => {
+      if (id?.type !== 'identifier') return;
+      const name = getNodeText(id, this.source).toLowerCase();
+      // A loop over a variable the `var` section declares keeps its type.
+      if (type !== null || !locals.has(name)) locals.set(name, type);
+    };
+    switch (node.type) {
+      case 'varAssignDef':
+      case 'varDef': {
+        let type = this.pascalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref' || c.type === 'type'));
+        const value = node.parent?.type === 'assignment' ? node.parent.namedChild(node.parent.namedChildCount - 1) : null;
+        if (!type && value?.type === 'exprDot') {
+          // `var List := TStringList.Create;`
+          const [cls, ctor] = [value.namedChild(0), value.namedChild(value.namedChildCount - 1)];
+          if (cls?.type === 'identifier' && ctor?.type === 'identifier' && /^create$/i.test(getNodeText(ctor, this.source))) {
+            type = getNodeText(cls, this.source);
+          }
+        }
+        declare(node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier'), type);
+        return;
+      }
+      case 'foreach':
+        declare(getChildByField(node, 'iterator'), null);
+        return;
+      case 'for':
+        declare(node.namedChildren.find((c: SyntaxNode) => c.type === 'assignment')?.namedChild(0), null);
+        return;
+      case 'exceptionHandler':
+        declare(getChildByField(node, 'variable'), this.pascalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref')));
+        return;
+    }
+  }
+
+  /** The class or record name a declared type (`type`/`typeref`) stands for: `TFoo`, `Sys.TFoo` → `TFoo`, `TList<T>` → `TList`. */
+  private pascalTypeName(type: SyntaxNode | null | undefined): string | null {
+    let ref = type?.type === 'type' ? type.namedChild(0) : type;
+    if (ref?.type !== 'typeref') return null;
+    ref = ref.namedChild(0);
+    if (ref?.type === 'typerefDot') ref = ref.namedChild(ref.namedChildCount - 1);
+    else if (ref?.type === 'typerefTpl') ref = ref.namedChild(0);
+    return ref?.type === 'identifier' ? getNodeText(ref, this.source) : null;
   }
 
   /**
@@ -8649,24 +8802,31 @@ export class TreeSitterExtractor {
    * `TMeta.ExtendedPath(APath)` in its arguments for
    * `MD5FileSized(TMeta.ExtendedPath(APath)).IsSame(AKey)`, `A(1)` in
    * `A(1).B.C`, `GetIndex(x)` in `List[GetIndex(x)].Free`. A paren'd call
-   * there is a call like any other. A paren-less link (`.B`) may read a field
-   * or property, so it is not one. A typecast (`TButton(Sender)`) is written
-   * like a call; resolution tells it apart by what the name resolves to.
+   * there is a call like any other. A paren-less link (`B` in `A.B.C`, `GetList`
+   * in `GetList.Count`) is read for its value, which a function gives
+   * (#2514): it is recorded as a paren-less name. A typecast
+   * (`TButton(Sender)`) is written like a call; resolution tells it apart by
+   * what the name resolves to.
    */
-  private extractPascalReceiverCalls(node: SyntaxNode | null): void {
+  private extractPascalReceiverCalls(node: SyntaxNode | null, names = true): void {
     if (!node) return;
     switch (node.type) {
       case 'identifier':
+        if (names) this.extractPascalParenlessName(node, null);
         return;
       case 'exprCall':
         this.extractPascalReceiverCall(node, true);
         return;
       case 'exprDot':
+        if (names) this.extractPascalParenlessName(node, null);
+        this.extractPascalReceiverCalls(node.namedChild(0), names);
+        return;
       case 'exprTpl':
-        this.extractPascalReceiverCalls(node.namedChild(0));
+        // `TList<Integer>.Create`: a generic type's name, not a value's.
+        this.extractPascalReceiverCalls(node.namedChild(0), false);
         return;
       case 'exprSubscript': {
-        this.extractPascalReceiverCalls(node.namedChild(0));
+        this.extractPascalReceiverCalls(node.namedChild(0), names);
         const index = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
         if (index) this.visitPascalBlock(index);
         return;
@@ -8749,16 +8909,23 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Recursively visit a Pascal block/statement tree for call expressions
+   * Recursively visit a Pascal block/statement tree for call expressions.
+   * With `declarations`, a declaration in it is visited as a declaration.
    */
-  private visitPascalBlock(node: SyntaxNode): void {
+  private visitPascalBlock(node: SyntaxNode, declarations = false): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
+      if (declarations && /^(?:decl|defProc$|interface$|implementation$)/.test(child.type)) {
+        this.visitNode(child);
+        continue;
+      }
       // Function-as-value capture (#756): Pascal bodies are walked here, not
       // in visitNode/visitForCallsAndStructure, so the capture hook fires here
       // — assignment RHS is the Delphi event-wiring idiom (`OnFire := Handler`).
       this.maybeCaptureFnRefs(child, child.type);
+      this.declarePascalInline(child);
+      this.learnPascalVariable(child);
       if (child.type === 'exprCall') {
         this.extractPascalCall(child);
         // The walker doesn't descend into a call's arguments — dispatch the
@@ -8773,16 +8940,342 @@ export class TreeSitterExtractor {
         // (`X := A(1).B.C` reads `A(1)`); a call right before the read is
         // named as any call is.
         if (node.type === 'statement') {
-          this.extractPascalParenlessCall(child);
+          // Where the tree has errors, `procedure TFoo.Bar;` may parse as
+          // one: a routine's header calls nothing (#2514).
+          if (!this.isPascalHeaderName(child)) {
+            this.extractPascalParenlessCall(child);
+          }
         } else {
           const receiver = child.namedChild(0);
           if (receiver?.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
           else this.extractPascalReceiverCalls(receiver);
+          this.extractPascalParenlessName(child, node);
         }
+      } else if (child.type === 'identifier') {
+        this.extractPascalParenlessName(child, node);
+      } else if (child.type === 'with') {
+        this.pascalWithDepth++;
+        this.visitPascalBlock(child, declarations);
+        this.pascalWithDepth--;
+      } else if (child.type === 'lambda') {
+        const outer = this.pascalScopes[this.pascalScopes.length - 1];
+        this.pascalScopes.push({
+          locals: this.pascalRoutineLocals(child),
+          classQn: outer?.classQn ?? null,
+          routine: null,
+          startLine: outer?.startLine ?? 0,
+        });
+        this.visitPascalBlock(child, declarations);
+        this.pascalScopes.pop();
       } else {
-        this.visitPascalBlock(child);
+        // A `begin … end` block in it holds statements only, as it always has.
+        this.visitPascalBlock(child, declarations && child.type !== 'block');
       }
     }
+  }
+
+  /**
+   * A name written without parentheses where a parameterless routine may be
+   * called (#2514): `Before;`, `Result := FProvider.Value + 1`, `if Ready
+   * then`, `OnGet := Handler`, `GetList.Count`. Recorded as a `references`
+   * ref named `{mode}.Name` or `{mode}.Receiver.Name`, with the routine's
+   * class after an `@` (see resolution/pascal-scope), which links only a
+   * routine the name reaches, or nothing. A null `parent` marks a receiver's
+   * link. Names the routine declares itself and names the class's or unit's
+   * own data takes are left out here; a receiver the routine declares is
+   * written as its declared type (`{read}.:TProvider.Value`), or left out
+   * when it has none.
+   */
+  private extractPascalParenlessName(name: SyntaxNode, parent: SyntaxNode | null): void {
+    const scope = this.pascalScopeAt(name.startPosition.row + 1);
+    if (!scope) return;
+    // Where the tree has errors, a routine's header may parse as statements
+    // (`procedure Foo;`): the name it declares is no call.
+    if (this.isPascalHeaderName(name)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+    // Most bare names are the routine's own or the class's data: settled
+    // before what the name's place in the tree says.
+    if (name.type === 'identifier') {
+      const lower = getNodeText(name, this.source).toLowerCase();
+      if (PASCAL_NOT_ROUTINES.has(lower) || this.pascalLocalType(lower, scope.locals) !== undefined) return;
+      if (this.pascalDataNames(scope.classQn).has(lower)) return;
+    }
+    const mode: PascalNameMode | null = parent ? this.pascalNameMode(name, parent) : 'recv';
+    if (!mode) return;
+    // In a `with` body a name may be the `with` object's member, which the
+    // object's type would have to say. Only the method an event is given is
+    // linked there (`OnClick := ButtonClick`), the form's, as it is written.
+    if (this.pascalWithDepth > 0 && (mode !== 'ref' || name.type !== 'identifier')) return;
+    let path: string[];
+    if (name.type === 'identifier') {
+      path = [getNodeText(name, this.source)];
+    } else {
+      const links = this.pascalIdentifierPath(name);
+      if (!links) return;
+      path = links;
+    }
+    const head = path[0]!;
+    const lower = head.toLowerCase();
+    const local = this.pascalLocalType(lower, scope.locals);
+    // Read for its value, a name Delphi's conventions give to data is never a
+    // routine's: lowercase words are locals, fields and enum values (`clRed`),
+    // where a C library's functions aren't (`mach_absolute_time`), and see
+    // PASCAL_DATA_NAME. A statement on its own runs a routine, and an event is
+    // given one, whatever its name (`btnOKClick`).
+    const read = mode !== 'call' && mode !== 'ref';
+    if (read && PASCAL_DATA_NAME.test(path[path.length - 1]!)) return;
+    if (path.length === 1) {
+      if (PASCAL_NOT_ROUTINES.has(lower) || local !== undefined) return;
+      if (read && /^[a-z][A-Za-z]*$/.test(head)) return;
+      if (this.pascalDataNames(scope.classQn).has(lower)) return;
+    } else if (local !== undefined) {
+      // A local's declared class stands for it; a pointer type (`PNode`),
+      // which no class node declares, can't. A local's member as a receiver
+      // is left out: what it reaches is almost always data.
+      if (local === null || mode === 'recv' || /^P[A-Z]/.test(local)) return;
+      path[0] = `:${local}`;
+    } else if (lower !== 'self' && PASCAL_NOT_ROUTINES.has(lower)) {
+      return;
+    }
+    // The routine's class rides along: the reference's own node may be the
+    // file when the implementation matched no declaration.
+    const ref: UnresolvedReference = {
+      fromNodeId: callerId,
+      referenceName: `{${mode}${scope.classQn ? `@${scope.classQn}` : ''}}.${path.join('.')}`,
+      referenceKind: 'references',
+      line: name.startPosition.row + 1,
+      column: name.startPosition.column,
+    };
+    if (path.length === 1 && mode !== 'call') this.pascalReads.push({ ref, scope: scope.classQn ?? '', name: lower });
+    else this.unresolvedReferences.push(ref);
+  }
+
+  /**
+   * A bare name the code assigns to (`Run := 0`) or passes to `Inc`/`Dec` is
+   * a variable, a field or a property wherever the same class's code reads it
+   * (#2514), unless the routine declares it, or it is the function's own name
+   * (its result, in the old style), or a `with` object may hold it.
+   */
+  private learnPascalVariable(node: SyntaxNode): void {
+    if (this.pascalWithDepth > 0) return;
+    let target: SyntaxNode | null = null;
+    if (node.type === 'assignment') {
+      target = node.namedChild(0);
+    } else if (node.type === 'exprCall') {
+      const callee = node.namedChild(0);
+      if (callee?.type === 'identifier' && /^(?:inc|dec)$/i.test(getNodeText(callee, this.source))) {
+        target = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs')?.namedChild(0) ?? null;
+      }
+    }
+    if (target?.type !== 'identifier') return;
+    const scope = this.pascalScopeAt(target.startPosition.row + 1);
+    if (!scope) return;
+    const name = getNodeText(target, this.source).toLowerCase();
+    if (name === scope.routine || this.pascalLocalType(name, scope.locals) !== undefined) return;
+    const key = scope.classQn ?? '';
+    let names = this.pascalAssigned.get(key);
+    if (!names) this.pascalAssigned.set(key, (names = new Set()));
+    names.add(name);
+  }
+
+  /** The bare names read in an expression, less those the file shows are variables of their class. */
+  private flushPascalReads(): void {
+    for (const { ref, scope, name } of this.pascalReads) {
+      if (!this.pascalAssigned.get(scope)?.has(name)) this.unresolvedReferences.push(ref);
+    }
+    this.pascalReads = [];
+  }
+
+  /**
+   * Whether a node is the name a routine's header declares (`TFoo.Bar` in
+   * `procedure TFoo.Bar;`), which a tree with errors may parse as a statement.
+   */
+  private isPascalHeaderName(node: SyntaxNode): boolean {
+    if (!this.tree?.rootNode.hasError) return false;
+    const line = (this.pascalSourceLines ??= this.source.split(/\r?\n/))[node.startPosition.row] ?? '';
+    return /^\s*(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+$/i.test(line.slice(0, node.startPosition.column));
+  }
+
+  /**
+   * The declared type of a name the enclosing routines declare (null: none it
+   * can be named by), or undefined when none does. `textLocals` are the
+   * declarations the source text gives a broken tree's routine.
+   */
+  private pascalLocalType(lower: string, textLocals?: Map<string, string | null> | null): string | null | undefined {
+    for (let i = this.pascalScopes.length - 1; i >= 0; i--) {
+      const locals = this.pascalScopes[i]!.locals;
+      if (locals.has(lower)) return locals.get(lower);
+    }
+    return textLocals?.has(lower) ? textLocals.get(lower) : undefined;
+  }
+
+  /**
+   * The class and routine a name at `line` belongs to; null outside any code.
+   * Where the tree has errors, a routine whose header didn't parse is a block
+   * outside any routine, or part of the routine above it, so the source text
+   * says: a header between the tree's routine and the name is the name's,
+   * with the declarations the text gives it.
+   */
+  private pascalScopeAt(line: number): { classQn: string | null; routine: string | null; locals: Map<string, string | null> | null } | null {
+    const scope = this.pascalScopes[this.pascalScopes.length - 1];
+    if (!scope) return null;
+    const own = { classQn: scope.classQn, routine: scope.routine, locals: null };
+    if (!this.tree?.rootNode.hasError) return own;
+    const routines = (this.pascalTextRoutines ??= this.readPascalTextRoutines());
+    let lo = 0;
+    let hi = routines.length - 1;
+    let hit = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (routines[mid]!.line <= line) {
+        hit = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const text = hit >= 0 ? routines[hit]! : null;
+    // Inside a routine the tree parsed, only a later header overrides it.
+    if (!text || text.line <= scope.startLine || (scope.startLine > 0 && text.routine === null)) return own;
+    return text;
+  }
+
+  /**
+   * Each routine header of the source text (`procedure TFoo.Bar(…)`), with
+   * its class, its name and what it declares before its body — parameters,
+   * `Result`'s type, `var` and `const` sections — and where the unit's own
+   * code resumes: after an `end;` that starts its line, which closes a
+   * routine, and at `initialization` and `finalization`. An indented header
+   * is a routine nested in the one above, whose class and names it shares.
+   */
+  private readPascalTextRoutines(): PascalTextRoutine[] {
+    const lines = (this.pascalSourceLines ??= this.source.split(/\r?\n/));
+    const header = /^(\s*)(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+([A-Za-z_]\w*(?:<[^>]*>)?(?:\.[A-Za-z_]\w*(?:<[^>]*>)?)*)/i;
+    const routines: PascalTextRoutine[] = [];
+    let outer: PascalTextRoutine | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i]!;
+      if (/^(?:end;|\s*(?:initialization|finalization)\b)/i.test(text)) {
+        routines.push({ line: i + 1, classQn: null, routine: null, locals: new Map() });
+        outer = null;
+        continue;
+      }
+      const m = header.exec(text);
+      if (!m) continue;
+      const nested: boolean = m[1] !== '' && outer !== null;
+      const parts = m[2]!.replace(/<[^>]*>/g, '').split('.');
+      const routine = parts.pop()!.toLowerCase();
+      let decl = text.slice(m.index + m[0].length);
+      for (let j = i + 1; j < lines.length && j <= i + 200 && !/^\s*(?:begin|asm)\b/i.test(lines[j]!) && !header.test(lines[j]!); j++) {
+        decl += '\n' + lines[j];
+      }
+      decl = decl.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
+      const locals: Map<string, string | null> = new Map(nested ? outer!.locals : []);
+      const result = /^\s*(?:\([^)]*\))?\s*:\s*([A-Za-z_][\w.]*)/.exec(decl);
+      locals.set('result', result ? result[1]!.split('.').pop()! : null);
+      for (const d of decl.matchAll(/([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:(?!=)\s*([A-Za-z_][\w.]*)?/g)) {
+        const type = d[2] ? d[2].split('.').pop()! : null;
+        for (const name of d[1]!.split(',')) locals.set(name.trim().toLowerCase(), type);
+      }
+      if (nested) {
+        // The outer routine's body follows its nested ones: it keeps the
+        // outer routine's class and name, and sees the names of both.
+        routines.push({ line: i + 1, classQn: outer!.classQn, routine: outer!.routine, locals });
+      } else {
+        outer = { line: i + 1, classQn: parts.length > 0 ? parts.join('::') : null, routine, locals };
+        routines.push(outer);
+      }
+    }
+    return routines;
+  }
+
+  /**
+   * How a name in `parent` may run a parameterless routine: `call` as a
+   * statement of its own, `read` for its value in an expression or an
+   * argument, `ref` as the method an event is given, `recv` as what is
+   * indexed; null where it can't (an assignment's target, a case label, a
+   * set literal, a type).
+   */
+  private pascalNameMode(name: SyntaxNode, parent: SyntaxNode): PascalNameMode | null {
+    const is = (field: string): boolean => parent.childForFieldName(field)?.id === name.id;
+    switch (parent.type) {
+      case 'statement':
+        return parent.namedChildCount === 1 && name.type === 'identifier' ? 'call' : null;
+      case 'exprSubscript':
+        return parent.namedChild(0)?.id === name.id ? 'recv' : null;
+      case 'assignment': {
+        const target = parent.namedChild(0);
+        if (!target || target.id === name.id) return null;
+        const last = target.type === 'exprDot'
+          ? target.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop()
+          : target;
+        return last && /^F?On[A-Z]/.test(getNodeText(last, this.source)) ? 'ref' : 'read';
+      }
+      case 'exprArgs':
+        return parent.parent?.type === 'exprCall' || parent.parent?.type === 'exprSubscript' || parent.parent?.type === 'inherited' ? 'read' : null;
+      case 'exprBinary': {
+        const op = parent.namedChildren.find((c: SyntaxNode) => c.id !== name.id && /^k[A-Z]/.test(c.type));
+        return op && (op.type === 'kIs' || op.type === 'kAs') && parent.namedChild(0)?.id !== name.id ? null : 'read';
+      }
+      case 'exprUnary':
+        return parent.child(0)?.type === 'kAt' ? null : 'read';
+      case 'if':
+      case 'ifElse':
+      case 'while':
+      case 'repeat':
+        return is('condition') ? 'read' : null;
+      case 'case':
+        return 'read';
+      case 'foreach':
+        return is('iterable') ? 'read' : null;
+      case 'for':
+        return is('end') ? 'read' : null;
+      case 'exprParens':
+        return 'read';
+      default:
+        return null;
+    }
+  }
+
+  /** The identifiers of a plain dotted name (`FProvider.Value`, `Self.A.B`), or null. */
+  private pascalIdentifierPath(dot: SyntaxNode): string[] | null {
+    const links: string[] = [];
+    let n: SyntaxNode | null = dot;
+    while (n?.type === 'exprDot') {
+      const last = n.namedChild(n.namedChildCount - 1);
+      if (last?.type !== 'identifier') return null;
+      links.unshift(getNodeText(last, this.source));
+      n = n.namedChild(0);
+    }
+    if (n?.type !== 'identifier') return null;
+    links.unshift(getNodeText(n, this.source));
+    return links;
+  }
+
+  /**
+   * The names data takes for a routine of class `classQn`, lowercased: the
+   * class's fields, properties and constants, and the unit's variables and
+   * constants. A bare name among them reads that data.
+   */
+  private pascalDataNames(classQn: string | null): Set<string> {
+    const key = classQn ?? '';
+    let names = this.pascalDataNameSets.get(key);
+    if (names) return names;
+    names = new Set();
+    const prefix = classQn ? `${classQn.toLowerCase()}::` : null;
+    for (const n of this.nodes) {
+      if (n.kind === 'enum_member') {
+        names.add(n.name.toLowerCase()); // enum values are visible unqualified
+        continue;
+      }
+      if (n.kind !== 'field' && n.kind !== 'property' && n.kind !== 'constant' && n.kind !== 'variable') continue;
+      const qn = n.qualifiedName.replace(/<[^>]*>/g, '').toLowerCase();
+      const own = prefix !== null && qn.startsWith(prefix) && qn.indexOf('::', prefix.length) < 0;
+      if (own || !qn.includes('::')) names.add(n.name.toLowerCase());
+    }
+    this.pascalDataNameSets.set(key, names);
+    return names;
   }
 }
 
