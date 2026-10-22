@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { CODEGRAPH_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
 import {
   detectInstallMethod,
   deriveInstallDir,
@@ -822,6 +824,75 @@ describe('post-upgrade refresh of installed agent surfaces', () => {
     expect(calls.runs.filter((r) => r.cmd === 'codegraph')).toHaveLength(0);
     expect(calls.logs.join('\n')).toMatch(/run `codegraph install --refresh` once the PATH is fixed/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The refresh an upgrade runs keeps the user's instructions files (#2506)
+// ---------------------------------------------------------------------------
+
+describe('post-upgrade refresh keeps the user\'s instructions files (#2506)', () => {
+  const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-2506-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('an npm upgrade refreshes the block in the global opencode AGENTS.md and keeps every line around it', async () => {
+    // opencode configured globally, as a previous `codegraph install` left it.
+    const dir = path.join(home, '.config', 'opencode');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'opencode.jsonc'), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: { servers: { codegraph: { type: 'local', command: ['codegraph', 'serve', '--mcp'], disabled: false, codemode: false } } },
+    }, null, 2) + '\n');
+    // The user's maintained guidance, opening with what is left of an older
+    // block whose end marker was deleted, and an old block at the end.
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    const notes = '<!-- CODEGRAPH_START -->\n## CodeGraph\n\n# Toolset\n\n- ripgrep, fd\n\n## Commit policy\n\n- conventional commits\n\n';
+    const oldBlock = '<!-- CODEGRAPH_START -->\n## CodeGraph\n\nPrefer `codegraph_search` over grep.\n<!-- CODEGRAPH_END -->\n';
+    fs.writeFileSync(agentsMd, notes + oldBlock);
+
+    const work = path.join(home, 'work');
+    fs.mkdirSync(work);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      APPDATA: path.join(home, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_TELEMETRY: '0',
+      CODEGRAPH_NO_UPDATE_CHECK: '1',
+      DO_NOT_TRACK: '1',
+    };
+    for (const key of ['CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'CLAUDE_CONFIG_DIR', 'CODEGRAPH_NO_INSTALL_REFRESH']) delete env[key];
+
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    // `npm install -g` succeeds without running; the refresh it is followed
+    // by runs the real CLI against the private home.
+    deps.run = (cmd, args, runEnv) => {
+      calls.runs.push({ cmd, args, env: runEnv });
+      if (cmd !== 'codegraph') return 0;
+      const r = spawnSync(process.execPath, [BIN, ...args], { cwd: work, env, encoding: 'utf-8', timeout: 60_000 });
+      return r.status ?? -1;
+    };
+
+    expect(await runUpgrade({}, deps)).toBe(0);
+    const refresh = calls.runs[calls.runs.length - 1];
+    expect(refresh?.cmd).toBe('codegraph');
+    expect(refresh?.args).toEqual(['install', '--refresh']);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+  }, 90_000);
 });
 
 // ---------------------------------------------------------------------------

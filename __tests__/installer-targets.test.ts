@@ -24,6 +24,12 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
+import {
+  CODEGRAPH_INSTRUCTIONS_BLOCK,
+  CODEGRAPH_SECTION_END,
+  CODEGRAPH_SECTION_START,
+} from '../src/installer/instructions-template';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -1798,6 +1804,190 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
   });
 });
 
+// ---------------------------------------------------------------------------
+// The instructions block never touches anything outside its markers (#2506)
+//
+// `codegraph upgrade` runs `install --refresh`, which rewrites the block in
+// every configured agent's instructions file. The write paired the FIRST
+// start marker with the FIRST end marker anywhere in the file, so one stray
+// start marker above the real block — an older block whose end marker was
+// deleted by hand, or the marker quoted in the user's own notes — made the
+// refresh replace everything between the two. With the stray marker on the
+// first line, the reported global AGENTS.md came back as just the block.
+// ---------------------------------------------------------------------------
+describe('Installer — the instructions block keeps everything outside its markers (#2506)', () => {
+  const START = CODEGRAPH_SECTION_START;
+  const END = CODEGRAPH_SECTION_END;
+  const BLOCK = CODEGRAPH_INSTRUCTIONS_BLOCK;
+  const BOM = String.fromCharCode(0xfeff);
+  const crlf = (s: string) => s.replace(/\n/g, '\r\n');
+  // A maintained guidance file like the reporter's, with text below the block too.
+  const NOTES = [
+    '# Global agent guidance',
+    '',
+    '## Toolset inventory',
+    '- ripgrep, fd, jq',
+    '',
+    '## Commit policy',
+    '- conventional commits',
+  ].join('\n');
+  const MORE = ['## Runtime notes', '', '- prefer the sandbox'].join('\n');
+  // What is left of an older block whose end marker was deleted by hand.
+  const STRAY = `${START}\n## CodeGraph\n\n`;
+
+  let dir: string;
+  let file: string;
+  beforeEach(() => {
+    dir = mkTmpDir('marked');
+    file = path.join(dir, 'AGENTS.md');
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function upsert(content: string): { action: string; after: string } {
+    fs.writeFileSync(file, content);
+    const action = replaceOrAppendMarkedSection(file, BLOCK, START, END);
+    return { action, after: fs.readFileSync(file, 'utf-8') };
+  }
+  function upsertAgain(): { action: string; after: string } {
+    const action = replaceOrAppendMarkedSection(file, BLOCK, START, END);
+    return { action, after: fs.readFileSync(file, 'utf-8') };
+  }
+  function remove(content: string): { action: string; after: string | null } {
+    fs.writeFileSync(file, content);
+    const action = removeMarkedSection(file, START, END);
+    return { action, after: fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : null };
+  }
+
+  it('a stray start marker on the first line no longer reduces the file to the block (the report)', () => {
+    const { action, after } = upsert(`${STRAY}${NOTES}\n\n${LEGACY_BLOCK}\n`);
+    expect(action).toBe('updated');
+    expect(after).toBe(`${STRAY}${NOTES}\n\n${BLOCK}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a stray start marker with no block after it: the block is appended, and the next run keeps the text below the stray marker', () => {
+    const content = `${NOTES}\n\n${STRAY}old text, end marker deleted\n\n${MORE}\n`;
+    const first = upsert(content);
+    expect(first.action).toBe('appended');
+    expect(first.after).toBe(`${content}\n${BLOCK}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after: first.after });
+  });
+
+  it('the start marker quoted in a sentence of the user\'s is their text, not the edge of a block', () => {
+    const prose = `Keep your own notes above the ${START} line.\n\n`;
+    const { after } = upsert(`${prose}${NOTES}\n\n${LEGACY_BLOCK}\n`);
+    expect(after).toBe(`${prose}${NOTES}\n\n${BLOCK}\n`);
+  });
+
+  it('a lone end marker no longer makes every run append another block', () => {
+    const content = `${NOTES}\n\nold text, start marker deleted\n${END}\n\n${MORE}\n`;
+    const first = upsert(content);
+    expect(first.after).toBe(`${content}\n${BLOCK}\n`);
+    const second = upsertAgain();
+    expect(second).toEqual({ action: 'unchanged', after: first.after });
+  });
+
+  it('two blocks: the first is refreshed, the duplicate removed, and the text between them kept', () => {
+    const { action, after } = upsert(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n\n${LEGACY_BLOCK}\n`);
+    expect(action).toBe('updated');
+    expect(after).toBe(`${NOTES}\n\n${BLOCK}\n\n${MORE}\n`);
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a CRLF file stays CRLF: the text around the block is untouched and the block takes the file\'s line breaks', () => {
+    const { action, after } = upsert(crlf(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n`));
+    expect(action).toBe('updated');
+    expect(after).toBe(crlf(`${NOTES}\n\n${BLOCK}\n\n${MORE}\n`));
+    expect(upsertAgain()).toEqual({ action: 'unchanged', after });
+  });
+
+  it('a CRLF file that already holds the current block is left alone', () => {
+    const content = crlf(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(content)).toEqual({ action: 'unchanged', after: content });
+  });
+
+  it('a file without a trailing newline keeps that shape', () => {
+    expect(upsert(`${NOTES}\n\n${LEGACY_BLOCK}`).after).toBe(`${NOTES}\n\n${BLOCK}`);
+  });
+
+  it('appending keeps every existing byte: nothing is trimmed, only line breaks are added', () => {
+    expect(upsert(NOTES).after).toBe(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${NOTES}\n`).after).toBe(`${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${NOTES}\n\n\n`).after).toBe(`${NOTES}\n\n\n${BLOCK}\n`);
+    expect(upsert(crlf(`${NOTES}\n`)).after).toBe(crlf(`${NOTES}\n\n${BLOCK}\n`));
+  });
+
+  it('a byte-order mark survives', () => {
+    expect(upsert(`${BOM}${NOTES}\n\n${LEGACY_BLOCK}\n`).after).toBe(`${BOM}${NOTES}\n\n${BLOCK}\n`);
+    expect(upsert(`${BOM}${LEGACY_BLOCK}\n\n${NOTES}\n`).after).toBe(`${BOM}${BLOCK}\n\n${NOTES}\n`);
+  });
+
+  it('uninstall removes only the block, never the text after a stray start marker', () => {
+    const { action, after } = remove(`${STRAY}${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n`);
+    expect(action).toBe('removed');
+    expect(after).toBe(`${STRAY}${NOTES}\n\n${MORE}\n`);
+  });
+
+  it('uninstall removes every block, keeps CRLF, and leaves a file holding only stray markers alone', () => {
+    expect(remove(crlf(`${NOTES}\n\n${LEGACY_BLOCK}\n\n${MORE}\n\n${LEGACY_BLOCK}\n`)).after).toBe(crlf(`${NOTES}\n\n${MORE}\n`));
+    const strays = `${NOTES}\n${START}\n${MORE}\n${END}x\n`;
+    expect(remove(strays)).toEqual({ action: 'not-found', after: strays });
+    // A file that held nothing but the block is deleted, as before.
+    expect(remove(`${LEGACY_BLOCK}\n`)).toEqual({ action: 'removed', after: null });
+  });
+});
+
+describe('Installer — install --refresh keeps each agent\'s instructions file (#2506)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('rf2506-home');
+    tmpCwd = mkTmpDir('rf2506-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // Every target that writes an instructions file, at its global path.
+  const INSTRUCTIONS: Array<[string, (home: string) => string]> = [
+    ['claude', (home) => path.join(home, '.claude', 'CLAUDE.md')],
+    ['codex', (home) => path.join(home, '.codex', 'AGENTS.md')],
+    ['gemini', (home) => path.join(home, '.gemini', 'GEMINI.md')],
+    ['opencode', (home) => path.join(home, '.config', 'opencode', 'AGENTS.md')],
+  ];
+  const USER = `${CODEGRAPH_SECTION_START}\n## CodeGraph\n\n# My notes\n\nAlways run the tests first.\n\n`;
+
+  for (const [id, instructionsFile] of INSTRUCTIONS) {
+    it(`${id}: the refresh rewrites only the block, and uninstall removes only the block`, () => {
+      const target = getTarget(id)!;
+      target.install('global', { autoAllow: false });
+      const file = instructionsFile(tmpHome);
+      fs.writeFileSync(file, `${USER}${LEGACY_BLOCK}\n`);
+
+      const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!;
+      expect(report.status).toBe('refreshed');
+      expect(report.changedPaths).toContain(file);
+      expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER}${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+      expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!.status).toBe('unchanged');
+
+      target.uninstall('global');
+      expect(fs.readFileSync(file, 'utf-8')).toBe(USER.trimEnd() + '\n');
+    });
+  }
+});
+
 describe('Installer — detection never writes (#1870)', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -1945,6 +2135,17 @@ describe('Installer — Cursor rules file cleanup on uninstall', () => {
     // Our tool-usage block is gone.
     expect(after).not.toContain('codegraph_search');
     expect(after).not.toContain('CODEGRAPH_START');
+  });
+
+  it('a stray start marker above the block never takes the user\'s rules with it (#2506)', () => {
+    fs.mkdirSync(path.dirname(rulesFile()), { recursive: true });
+    const userRules = `${CODEGRAPH_SECTION_START}\n## My own rule\nkeep me\n`;
+    fs.writeFileSync(rulesFile(), `${MDC_FRONTMATTER}${userRules}\n${LEGACY_BLOCK}\n`);
+
+    cursor.uninstall('local');
+
+    expect(fs.existsSync(rulesFile())).toBe(true);
+    expect(fs.readFileSync(rulesFile(), 'utf-8')).toBe(`${MDC_FRONTMATTER}${userRules}`);
   });
 });
 
