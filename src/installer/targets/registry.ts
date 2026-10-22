@@ -12,6 +12,7 @@ import { claudeTarget } from './claude';
 import { cursorTarget } from './cursor';
 import { codexTarget } from './codex';
 import { opencodeTarget } from './opencode';
+import { droidTarget } from './droid';
 import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
 import { antigravityTarget } from './antigravity';
@@ -25,6 +26,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   cursorTarget,
   codexTarget,
   opencodeTarget,
+  droidTarget,
   hermesTarget,
   geminiTarget,
   antigravityTarget,

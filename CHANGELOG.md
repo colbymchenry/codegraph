@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` now detects and configures Factory Droid: it adds the CodeGraph MCP server to `~/.factory/mcp.json` (or the project's `.factory/mcp.json`, which is designed to be committed and shared with the team) plus a short CodeGraph section in `AGENTS.md`, and Droid picks the server up automatically with no restart.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
