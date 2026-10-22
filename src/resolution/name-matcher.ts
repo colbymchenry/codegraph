@@ -1736,6 +1736,22 @@ function isTestSuitePath(filePath: string): boolean {
   return /(?:^|\/)(?:tests?|__tests__|specs?|e2e|unittests|[\w.]+[-_]unittests?)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
 }
 
+/** A Jest or Vitest manual mock: a file under a `__mocks__/` directory. */
+export function isManualMockPath(filePath: string): boolean {
+  return /(?:^|\/)__mocks__\//.test(filePath.replace(/\\/g, '/').toLowerCase());
+}
+
+/**
+ * Whether a definition in `candidatePath` is a manual mock that a reference
+ * from `fromPath`, which is no test code, cannot mean (#2455): the rule the
+ * resolver's mock-free view applies to name matching, for the passes that
+ * pick a component or a handler by name. A production `<Chart />` never
+ * renders a mock's `Chart`.
+ */
+export function isManualMockHiddenFrom(candidatePath: string, fromPath: string): boolean {
+  return isManualMockPath(candidatePath) && !isTestPath(fromPath);
+}
+
 const fileStem = (filePath: string): string => {
   const name = filePath.slice(filePath.lastIndexOf('/') + 1);
   const dot = name.lastIndexOf('.');

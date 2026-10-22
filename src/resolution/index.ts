@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, isManualMockPath } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -51,6 +51,7 @@ import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { LRUCache } from './lru-cache';
+import { isTestPath } from '../search/query-utils';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
 import { parse as parseJsonc } from 'jsonc-parser';
@@ -551,6 +552,9 @@ export class ReferenceResolver {
    * Clear internal caches
    */
   clearCaches(): void {
+    this.mocklessContext = null;
+    this.mocklessBase = null;
+    this.manualMocks = undefined;
     this.nodeCache.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
@@ -1335,6 +1339,22 @@ export class ReferenceResolver {
   }
 
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    // Production code is resolved as if the project's manual mocks were not
+    // indexed (see mocklessContextFor); every strategy below reads the graph
+    // through this.context, so it answers for that view.
+    const outer = this.context;
+    const base = outer === this.mocklessContext && this.mocklessBase ? this.mocklessBase : outer;
+    const context = this.mocklessContextFor(ref, base) ?? base;
+    if (context === outer) return this.resolveOneIn(ref);
+    this.context = context;
+    try {
+      return this.resolveOneIn(ref);
+    } finally {
+      this.context = outer;
+    }
+  }
+
+  private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
@@ -3728,6 +3748,89 @@ export class ReferenceResolver {
     if (!target) return result;
     if (bare && !isRustNameInScope(target, ref, this.context)) return null;
     return ref.referenceKind === 'calls' && !isRustForeignImplCallable(target, ref, this.context) ? null : result;
+  }
+
+  /**
+   * The context production code is resolved in when the project has Jest or
+   * Vitest manual mocks (`__mocks__/`): the graph without them. A mock
+   * re-declares its module's names by design and stands in for the module
+   * only while a test runs, so production code means what it would mean were
+   * the mocks not there (#2455): `formatLabel(name)`, whose import of a
+   * workspace package was not followed, is the package's `formatLabel`, never
+   * the nearer mock's. Adding or deleting a mock then changes nothing for
+   * production code, as a fresh index would have it. Test code, a mock
+   * included, keeps the whole graph: a mock is what Jest hands it. Null when
+   * the whole graph applies.
+   */
+  private mocklessContextFor(ref: UnresolvedRef, base: ResolutionContext): ResolutionContext | null {
+    if (isTestPath(ref.filePath)) return null;
+    const mocks = this.manualMockNames();
+    if (!mocks) return null;
+    if (this.mocklessContext && this.mocklessBase === base) return this.mocklessContext;
+    const isMock = (n: Node): boolean => isManualMockPath(n.filePath);
+    const real = (nodes: Node[]): Node[] => (nodes.some(isMock) ? nodes.filter((n) => !isMock(n)) : nodes);
+    // Only a name some mock declares can lose a node: other lookups pass
+    // straight through, and the filtered answers are kept.
+    const byName = new Map<string, Node[]>();
+    const byLowerName = new Map<string, Node[]>();
+    const byKind = new Map<Node['kind'], Node[]>();
+    const getMethodMatches = base.getMethodMatches;
+    const iterateNodesByKind = base.iterateNodesByKind;
+    this.mocklessBase = base;
+    this.mocklessContext = {
+      ...base,
+      getNodesByName: (name) => {
+        if (!mocks.names.has(name)) return base.getNodesByName(name);
+        let nodes = byName.get(name);
+        if (!nodes) byName.set(name, (nodes = real(base.getNodesByName(name))));
+        return nodes;
+      },
+      getNodesByLowerName: (lowerName) => {
+        if (!mocks.lowerNames.has(lowerName)) return base.getNodesByLowerName(lowerName);
+        let nodes = byLowerName.get(lowerName);
+        if (!nodes) byLowerName.set(lowerName, (nodes = real(base.getNodesByLowerName(lowerName))));
+        return nodes;
+      },
+      getNodesByQualifiedName: (qualifiedName) => real(base.getNodesByQualifiedName(qualifiedName)),
+      getNodesByKind: (kind) => {
+        let nodes = byKind.get(kind);
+        if (!nodes) byKind.set(kind, (nodes = real(base.getNodesByKind(kind))));
+        return nodes;
+      },
+      getMethodMatches: getMethodMatches
+        ? (typeName, methodName, language) => {
+          const nodes = getMethodMatches(typeName, methodName, language);
+          return mocks.names.has(methodName) ? real(nodes) : nodes;
+        }
+        : undefined,
+      iterateNodesByKind: iterateNodesByKind
+        ? function* (kind) {
+          for (const n of iterateNodesByKind(kind)) if (!isMock(n)) yield n;
+        }
+        : undefined,
+    };
+    return this.mocklessContext;
+  }
+
+  /** Built on first use from `mocklessBase`; clearCaches drops it, and the memos keyed by it go with it. */
+  private mocklessContext: ResolutionContext | null = null;
+  private mocklessBase: ResolutionContext | null = null;
+  /** The names the project's manual mocks declare, null when it has none; read once per cache window. */
+  private manualMocks: { names: Set<string>; lowerNames: Set<string> } | null | undefined;
+
+  private manualMockNames(): { names: Set<string>; lowerNames: Set<string> } | null {
+    if (this.manualMocks !== undefined) return this.manualMocks;
+    const files = [...(this.knownFiles ?? this.queries.getAllFilePaths())].filter(isManualMockPath);
+    const names = new Set<string>();
+    const lowerNames = new Set<string>();
+    if (files.length > 0) {
+      for (const n of this.queries.getNodesByFiles(files)) {
+        names.add(n.name);
+        lowerNames.add(n.name.toLowerCase());
+      }
+    }
+    this.manualMocks = names.size > 0 ? { names, lowerNames } : null;
+    return this.manualMocks;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */
