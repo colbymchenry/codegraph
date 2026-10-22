@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES } from './tree-sitter-helpers';
-import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
+import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
@@ -732,7 +732,9 @@ export class TreeSitterExtractor {
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
   // (see flushFnRefCandidates).
   private fnRefSpec: FnRefSpec | undefined;
-  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
+  // A Go candidate also keeps the value container it came from: the flush
+  // reads its scope from there when the function shadows the name (#2596).
+  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string; goNode?: SyntaxNode }> = [];
   // Memoized "is this a Vue store file" verdict (per-extractor = per-file).
   private vueStoreFile: boolean | null = null;
   // An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`) is
@@ -928,8 +930,9 @@ export class TreeSitterExtractor {
     if (!rule || this.nodeStack.length === 0) return;
     const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
     if (!fromNodeId) return;
+    const goNode = this.language === 'go' ? node : undefined;
     for (const cand of captureFnRefCandidates(node, rule, spec, this.source)) {
-      this.fnRefCandidates.push({ ...cand, fromNodeId });
+      this.fnRefCandidates.push({ ...cand, fromNodeId, goNode });
     }
   }
 
@@ -1024,7 +1027,7 @@ export class TreeSitterExtractor {
 
     const ungated = this.fnRefSpec?.ungatedModes;
     const addressOfOnly = this.fnRefSpec?.addressOfOnly === true;
-    const seen = new Set<string>();
+    const survivors: typeof candidates = [];
     for (const c of candidates) {
       const atFileScope = c.fromNodeId.startsWith('file:');
       // C++ (addressOfOnly): a BARE identifier qualifies only inside a
@@ -1062,7 +1065,18 @@ export class TreeSitterExtractor {
           continue;
         }
       }
-      const key = `${c.fromNodeId}|${c.name}`;
+      survivors.push(c);
+    }
+
+    // One reference per function and name, at its first use. In Go, a
+    // function that binds the name itself gets one per scope instead (#2596):
+    // its first use may be the local, which resolution drops, while a later
+    // use in another scope is the package function.
+    const goScopes = this.language === 'go' ? goScopedFnRefScopes(survivors, this.source) : null;
+    const seen = new Set<string>();
+    for (const c of survivors) {
+      const scope = goScopes?.get(c);
+      const key = scope === undefined ? `${c.fromNodeId}|${c.name}` : `${c.fromNodeId}|${c.name}|${scope}`;
       if (seen.has(key)) continue;
       seen.add(key);
       this.unresolvedReferences.push({
