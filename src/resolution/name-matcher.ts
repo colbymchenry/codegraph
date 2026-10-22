@@ -12256,11 +12256,17 @@ export function matchByExactName(
   // A member of the caller's own class (or what it inherits / is nested in)
   // is what the name means there, however far away it is declared.
   const member = matchEnclosingScopeMember(ref, candidates, context);
-  // C++ overloads of one free function in the caller's namespace are not the
-  // scope's to pick: the one the arguments fit, else the nearest, is chosen below.
-  if (member && !((ref.language === 'cpp' || ref.language === 'c') && member.kind === 'function' &&
-      candidates.some((c) => c !== member && c.qualifiedName === member.qualifiedName))) {
-    return { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'exact-match' };
+  // The scope names the member, not the overload: when the class (or, in C++,
+  // the caller's namespace) declares the name more than once, the one the
+  // arguments fit, else the nearest, is chosen below — among those overloads
+  // only, so a sibling class's namesake stays out of it.
+  let pool = candidates;
+  if (member) {
+    const overloads = candidates.filter((c) => c.qualifiedName === member.qualifiedName && c.filePath === member.filePath);
+    if (overloads.length <= 1) {
+      return { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'exact-match' };
+    }
+    pool = overloads;
   }
 
   // Ubiquitous-name ceiling (#999): above it, picking one target among K
@@ -12268,13 +12274,13 @@ export function matchByExactName(
   // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
   // Decline; the precise strategies (qualified-name, import, class-name) already
   // ran. Falls through to fuzzy, which itself only resolves a UNIQUE candidate.
-  if (candidates.length > AMBIGUOUS_NAME_CEILING) {
+  if (pool.length > AMBIGUOUS_NAME_CEILING) {
     return null;
   }
 
   // Multiple matches - try to narrow down
-  const nearest = findBestMatch(ref, candidates, context);
-  const bestMatch = nearest && cppFunctionOverload(nearest, candidates, ref, context);
+  const nearest = findBestMatch(ref, pool, context);
+  const bestMatch = nearest && cppFunctionOverload(nearest, pool, ref, context);
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
