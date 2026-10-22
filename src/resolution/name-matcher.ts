@@ -20497,8 +20497,8 @@ function goAssertedType(ref: UnresolvedRef, context: ResolutionContext): string 
 }
 
 interface GoChainLink {
-  kind: 'operand' | 'select' | 'assert' | 'call' | 'index';
-  /** An operand's or selector's name, an assertion's type, what a call's or an index's brackets hold. */
+  kind: 'operand' | 'select' | 'assert' | 'call' | 'index' | 'composite';
+  /** An operand's or selector's name, an assertion's type, what a call's, an index's or a composite literal's brackets hold. */
   text: string;
 }
 
@@ -20507,8 +20507,10 @@ interface GoChainLink {
  * or a parenthesized expression), then each selector, type assertion, call
  * and index. A line break ends it, except right after a `.`, where Go
  * inserts no semicolon. `end.at` receives the offset reading stopped at.
+ * With `composite`, a composite literal's braces right after a type
+ * (`GitOracle{}`, `query.Card{…}`, `List[int]{}`) are a link too.
  */
-function goChainLinks(text: string, start: number, end?: { at: number }): GoChainLink[] {
+function goChainLinks(text: string, start: number, end?: { at: number }, composite = false): GoChainLink[] {
   const links: GoChainLink[] = [];
   const NAME = /[A-Za-z_]\w*/y;
   let i = start;
@@ -20548,6 +20550,13 @@ function goChainLinks(text: string, start: number, end?: { at: number }): GoChai
       const inner = group();
       if (inner === null) break;
       link.text = inner;
+    } else if (
+      composite && text[i] === '{' && text[start] !== '(' && links.length <= 3 &&
+      links.every((l) => l.kind === 'operand' || l.kind === 'select' || l.kind === 'index')
+    ) {
+      const inner = group();
+      if (inner === null) break;
+      links.push({ kind: 'composite', text: inner });
     } else break;
   }
   if (end) end.at = i;
@@ -20765,6 +20774,50 @@ export function matchGoIndexedCall(ref: UnresolvedRef, context: ResolutionContex
 }
 
 /**
+ * A Go method called on a receiver the extractor keeps no name for — a
+ * fluent chain's later link (`model.WithContext(0).Where(1).First()`), a
+ * call on what a function returns (`time.Now().UTC().Format(…)`,
+ * `query.Use(db).User.Where(…)`), a composite literal (`GitOracle{}.Worktree()`,
+ * `(MsgPack{data}).Render(w)`) or a field three links deep — arrives by its
+ * bare name, at the column where its chain starts (#2543). Name matching
+ * then picked one of the project's methods of that name by proximity: a
+ * GORM-style chain's `Where` and `First` went to another query type's, and
+ * a standard-library chain's `Format` to the only project `Format`.
+ *
+ * The receiver is typed as matchGoIndexedCall types one, and further: a
+ * call gives its function's or method's first result (goCalledType,
+ * goMethodResultType), a conversion `T(x)` and a composite literal their
+ * type. The method is then the one Go selects on that type, or nothing when
+ * the type comes from outside the project. A receiver that can't be typed
+ * — a func value's call, a generic result, a receiver the index doesn't
+ * hold — links nothing either: guessing by the name is what picked the
+ * wrong query type. Undefined only when the call is not such a chain link.
+ */
+export function matchGoChainedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return undefined;
+  const index = goScopeIndex(ref.filePath, context);
+  if (!index || ref.column < 0) return undefined;
+  const at = (index.lineStarts[ref.line - 1] ?? index.code.length) + ref.column;
+  const code = index.code;
+  // A column inside a name is no expression's start, and a call written at
+  // its own name calls a function.
+  if (at > 0 && /\w/.test(code[at - 1]!)) return undefined;
+  const name = ref.referenceName;
+  if (code.startsWith(name, at) && /^\s*\(/.test(code.slice(at + name.length, at + name.length + 16))) return undefined;
+  // Every call of a chain shares its column. A first link the extractor
+  // names (`x.M`, `a.b.M`, `F().M`) arrives under that name, so a bare one
+  // of the same name is a later link: the last `.name(…)` is read.
+  const links = goChainLinks(code, at, undefined, true);
+  let k = -1;
+  for (let i = links.length - 2; i > 0 && k < 0; i--) {
+    if (links[i]!.kind === 'select' && links[i]!.text === name && links[i + 1]!.kind === 'call') k = i;
+  }
+  if (k < 0) return undefined;
+  const receiver = goReceiverChainType(links.slice(0, k), code[at] === '(', at, ref.filePath, index, context, 0);
+  return receiver ? goMethodOnElement(receiver, ref, context) ?? null : null;
+}
+
+/**
  * The method `ref` names on the type of its receiver. A pointer's is the
  * type pointed to's.
  */
@@ -20904,41 +20957,177 @@ function goNamedTypeDecls(t: GoTypeText, context: ResolutionContext): { name: st
  * reads. `paren` says the first link is a parenthesized expression.
  */
 function goReceiverChainType(
-  links: GoChainLink[], paren: boolean, at: number, filePath: string, index: GoScopeIndex,
+  links: GoChainLink[], paren: boolean, at: number, filePath: string, index: GoScopeIndex | null,
   context: ResolutionContext, depth: number,
+  /** Which result of the chain's last link, a call returning several values, is wanted. */
+  result = 0,
 ): GoTyped {
   const head = links[0];
   if (!head || head.kind !== 'operand' || depth > GO_VALUE_DEPTH) return undefined;
-  // A call's result (`x.Items()[0]`) isn't typed here.
-  if (links.some((l) => l.kind === 'call')) return undefined;
+  // The result a call link gives: the one asked for when it ends the chain.
+  const resultOf = (k: number): number => (k === links.length - 1 ? result : 0);
   let t: GoTyped;
   let i = 1;
-  if (paren) {
+  if (paren && links[1]?.kind === 'call' && /^\*?\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?$/.test(head.text.trim())) {
+    // `(*pb.T)(r)`: a conversion to the type the parentheses hold, when they hold one.
+    const type = goTypeTextAt(head.text, filePath, at, index, context);
+    const decls = goNamedTypeDecls({ ...type, text: type.text.replace(/^\*/, '') }, context);
+    if (decls === null) return null;
+    if (!decls) return undefined;
+    t = type;
+    i = 2;
+  } else if (paren) {
     t = goExprType(head.text, at, filePath, index, context, depth + 1);
   } else {
-    const decl = goLocalDeclAt(index, head.text, at);
-    if (decl) {
+    const decl = index ? goLocalDeclAt(index, head.text, at) : undefined;
+    if (decl && index) {
+      // A func value's call (`run(x).M()`) is not typed here.
+      if (links[1]?.kind === 'call') return undefined;
       t = goDeclaredValueType(decl, filePath, index, context, depth + 1);
     } else if (context.getImportMappings(filePath, 'go').some((m) => m.localName === head.text)) {
-      // `pkg.Var`: a package-level variable of the package imported.
+      // `pkg.Var`, `pkg.New(…)`, `pkg.T{…}`, `pkg.T(x)`: a package-level
+      // variable, function or type of the package imported.
       if (links[1]?.kind !== 'select') return undefined;
       const dir = goImportPackageDir(head.text, filePath, context);
       if (dir == null) return dir === null && isGoOutsidePackage(head.text, filePath, context) ? null : undefined;
-      t = goPackageVarTypeText(links[1].text, dir, filePath, true, context, depth + 1);
-      i = 2;
+      // Type arguments written at the call or the literal: `pkg.F[T](…)`, `pkg.List[int]{…}`.
+      const args = goTypeArgsLink(links, 2);
+      const written = `${head.text}.${links[1].text}${args}`;
+      const at2 = args ? 3 : 2;
+      const next = links[at2]?.kind;
+      if (next === 'composite') t = goTypeTextAt(written, filePath, at, index, context);
+      else if (next === 'call') t = goCalledType(links[1].text, dir, written, filePath, true, at, index, context, depth + 1, resultOf(at2));
+      else t = goPackageVarTypeText(links[1].text, dir, filePath, true, context, depth + 1);
+      i = next === 'composite' || next === 'call' ? at2 + 1 : 2;
+    } else if (links[1]?.kind === 'composite' || (links[1]?.kind === 'index' && links[2]?.kind === 'composite')) {
+      // `T{…}`, `List[int]{…}`.
+      const args = goTypeArgsLink(links, 1);
+      t = goTypeTextAt(`${head.text}${args}`, filePath, at, index, context);
+      i = args ? 3 : 2;
+    } else if (links[1]?.kind === 'call' || (links[1]?.kind === 'index' && links[2]?.kind === 'call')) {
+      // `new(T)`, `make(T, …)`, `append(xs, …)`, a function of the package,
+      // one given its type arguments (`F[T](…)`), a conversion `T(x)`.
+      const args = goTypeArgsLink(links, 1);
+      t = !args && /^(?:new|make|append)$/.test(head.text)
+        ? goExprType(`${head.text}(${links[1].text})`, at, filePath, index, context, depth + 1)
+        : goCalledType(head.text, goPackageDir(filePath), `${head.text}${args}`, filePath, false, at, index, context, depth + 1, resultOf(args ? 2 : 1));
+      i = args ? 3 : 2;
     } else {
       t = goPackageVarTypeText(head.text, goPackageDir(filePath), filePath, false, context, depth + 1);
     }
   }
+  if (result > 0 && links[links.length - 1]?.kind !== 'call') return undefined;
   for (; i < links.length && t; i++) {
     const link = links[i]!;
-    if (link.kind === 'select') t = goFieldTypeOf(t, link.text, context, depth + 1);
+    if (link.kind === 'select' && links[i + 1]?.kind === 'call') {
+      // `x.M(…)`: what the method returns.
+      t = goMethodResultType(t, link.text, filePath, context, depth + 1, resultOf(i + 1));
+      i++;
+    } else if (link.kind === 'select') t = goFieldTypeOf(t, link.text, context, depth + 1);
     else if (link.kind === 'index') t = goIsSliceIndex(link.text) ? goSlicedType(t, context, depth + 1) : goElementOf(t, context, depth + 1);
     // `.(T)` is a T, written where the expression is.
     else if (link.kind === 'assert' && link.text !== 'type') t = goTypeTextAt(link.text, filePath, at, index, context);
     else return undefined;
   }
   return t;
+}
+
+/**
+ * The type arguments a Go chain's link `k` gives the function or type before
+ * it, `[T]` of `F[T](…)` or `[int]` of `List[int]{…}`: an index link a call
+ * or a composite literal follows. Empty for any other link.
+ */
+function goTypeArgsLink(links: GoChainLink[], k: number): string {
+  const link = links[k];
+  const next = links[k + 1]?.kind;
+  return link?.kind === 'index' && (next === 'call' || next === 'composite') ? `[${link.text}]` : '';
+}
+
+/**
+ * The type a Go call `name(…)` gives, `name` read in the package in `dir`
+ * (`written` as the call spells it): its function's first result, or the
+ * type itself for a conversion `T(x)`. A package's declarations of the
+ * function must agree (build tags); null for a function from outside the
+ * project, undefined for one the index doesn't hold or a result written
+ * with the function's type parameters.
+ */
+function goCalledType(
+  name: string, dir: string, written: string, fromFile: string, imported: boolean, at: number, index: GoScopeIndex | null,
+  context: ResolutionContext, depth: number, result = 0,
+): GoTyped {
+  if (depth > GO_VALUE_DEPTH) return undefined;
+  const clause = imported ? undefined : goPackageClause(fromFile, context);
+  const testFile = (f: string): boolean => /_test\.go$/.test(f);
+  const fns = context.getNodesByName(name).filter((n) =>
+    n.language === 'go' && n.kind === 'function' && goPackageDir(n.filePath) === dir &&
+    (imported ? !testFile(n.filePath) : goPackageClause(n.filePath, context) === clause && (testFile(fromFile) || !testFile(n.filePath))));
+  if (fns.length === 0) {
+    // `T(x)`: a conversion, when the package declares the type.
+    return result === 0 && goPackageTypes(name, dir, context).length > 0 ? goTypeTextAt(written, fromFile, at, index, context) : undefined;
+  }
+  let found: GoTyped;
+  for (const fn of fns) {
+    const t = goSignatureResultType(fn, context, result);
+    if (t === undefined || (found !== undefined && found?.text !== t.text)) return undefined;
+    found = t;
+  }
+  return found;
+}
+
+/**
+ * The type a Go method call `x.name(…)` gives on an `x` of type t: the first
+ * result of the method Go selects (goMethodOnElement). Null when the method
+ * is no project type's (t comes from outside the project, or a project type
+ * gets it from an embedded outside one): what it returns is unknown to the
+ * project too.
+ */
+function goMethodResultType(t: GoTypeText, name: string, filePath: string, context: ResolutionContext, depth: number, result = 0): GoTyped {
+  if (depth > GO_VALUE_DEPTH) return undefined;
+  const probe: UnresolvedRef = {
+    fromNodeId: '', referenceName: name, referenceKind: 'calls', line: 1, column: 0, filePath, language: 'go',
+  };
+  const method = goMethodOnElement(t, probe, context);
+  if (!method) return method;
+  const node = context.getNodeById?.(method.targetNodeId);
+  return node ? goSignatureResultType(node, context, result) : undefined;
+}
+
+/**
+ * The first result type of a Go function or method node, read in its own
+ * file: `CardDo` of `(value int) CardDo`, `*Response` of `(ctx context.Context)
+ * (*Response, error)`, `int` of `() (n int, err error)`. Undefined for none.
+ * The indexed signature leaves a generic function's `[T any]` out, so the
+ * type parameters in scope at its declaration are read there and kept with
+ * the result: `T` of `func Get[T any]() T` is no package's type, while
+ * `Set[T]` is a `Set`.
+ */
+function goSignatureResultType(fn: Node, context: ResolutionContext, result = 0): GoTypeText | undefined {
+  const sig = fn.signature?.trim();
+  if (!sig || sig[0] !== '(') return undefined;
+  const close = goClosingBracket(sig, 0);
+  if (close < 0) return undefined;
+  let text = sig.slice(close + 1).trim();
+  if (!text) return undefined;
+  if (text[0] === '(') {
+    const end = goClosingBracket(text, 0);
+    if (end < 0) return undefined;
+    const parts = goSplitTopLevel(text.slice(1, end), ',').map((p) => p.trim()).filter(Boolean);
+    // Named results (`n int, err error`) share a type with the names before
+    // it (`a, b T`): a name's type is the first one written from it on.
+    const named = (p: string): string | undefined => {
+      const m = /^([A-Za-z_]\w*)\s+(\S[\s\S]*)$/.exec(p);
+      return m && !/^(?:chan|func|map|struct|interface)$/.test(m[1]!) ? m[2] : undefined;
+    };
+    let wanted: string | undefined;
+    if (parts.some((p) => named(p) !== undefined)) {
+      for (let r = result; r < parts.length && wanted === undefined; r++) wanted = named(parts[r]!);
+    } else wanted = parts[result];
+    if (!wanted) return undefined;
+    text = wanted.trim();
+  } else if (result > 0) return undefined;
+  const index = goScopeIndex(fn.filePath, context);
+  const params = index ? goTypeParamsAt(index, fn.filePath, index.lineStarts[fn.startLine - 1] ?? 0, context) : undefined;
+  return { text: goNormalizeType(text), file: fn.filePath, params };
 }
 
 /** A type written at offset `at` of a file, or at package level for no `index`. */
@@ -20953,9 +21142,19 @@ function goTypeTextAt(text: string, filePath: string, at: number, index: GoScope
  */
 function goExprType(
   expr: string, at: number, filePath: string, index: GoScopeIndex | null, context: ResolutionContext, depth: number,
+  /** For a call that returns several values, the one wanted. */
+  result = 0,
 ): GoTyped {
   const s = expr.trim();
   if (!s || depth > GO_VALUE_DEPTH) return undefined;
+  if (result > 0) {
+    // Only a call's results are counted: `v, ok := m[k]` is no call's.
+    if (!/\)\s*$/.test(s)) return undefined;
+    const end = { at: 0 };
+    const links = goChainLinks(s, 0, end, true);
+    if (end.at !== s.length || links[links.length - 1]?.kind !== 'call') return undefined;
+    return goReceiverChainType(links, s.startsWith('('), at, filePath, index, context, depth + 1, result);
+  }
   if (s.startsWith('&')) {
     const t = goExprType(s.slice(1), at, filePath, index, context, depth + 1);
     return t ? { ...t, text: `*${t.text}` } : t;
@@ -20983,14 +21182,19 @@ function goExprType(
     while (s[j] === ' ' || s[j] === '\t') j++;
     if ((s[j] === '{' || s[j] === '(') && goClosingBracket(s, j) === s.length - 1) {
       const type = goTypeTextAt(s.slice(0, typeEnd), filePath, at, index, context);
-      // `T(x)` is a conversion only when T is a type, not a function.
-      return s[j] === '{' || GO_TYPE_LITERAL.test(type.text) || goNamedTypeDecls(type, context) ? type : undefined;
+      if (s[j] === '{' || GO_TYPE_LITERAL.test(type.text)) return type;
+      // `T(x)` is a conversion only when T is a type. A name from a package
+      // outside the project, type or function, gives a value of an outside
+      // type; any other call is read as a call below.
+      const decls = goNamedTypeDecls(type, context);
+      if (decls) return type;
+      if (decls === null && /^[A-Za-z_]\w*\.[A-Za-z_]\w*$/.test(type.text)) return null;
     }
   }
-  if (!index) return undefined;
-  // A name, a field, an element, an assertion.
+  // A name, a field, an element, an assertion, a call, a composite literal's:
+  // at package level (no `index`) a name is never a local.
   const end = { at: 0 };
-  const links = goChainLinks(s, 0, end);
+  const links = goChainLinks(s, 0, end, true);
   if (end.at !== s.length) return undefined;
   return goReceiverChainType(links, s.startsWith('('), at, filePath, index, context, depth + 1);
 }
@@ -21013,7 +21217,10 @@ function goDeclaredValueType(decl: GoDecl, filePath: string, index: GoScopeIndex
     const values = goSplitTopLevel(rhs, ',');
     // `v, ok := m[key]`, `v, ok := x.(T)`.
     const value = values.length === n ? values[k] : values.length === 1 && n === 2 && k === 0 && /[\])]\s*$/.test(rhs) ? rhs : undefined;
-    return value === undefined ? undefined : goExprType(value, decl.at, filePath, index, context, depth + 1);
+    if (value !== undefined) return goExprType(value, decl.at, filePath, index, context, depth + 1);
+    // `c, err := f()`, `_, cli := newClient(…)`: the call's k-th result.
+    if (values.length === 1 && n > 1 && /\)\s*$/.test(rhs)) return goExprType(rhs, decl.at, filePath, index, context, depth + 1, k);
+    return undefined;
   }
   if (decl.type === undefined) return undefined;
   // A variadic `xs ...T` is a `[]T`.
@@ -21085,6 +21292,12 @@ function goFieldTypeOf(t: GoTypeText, name: string, context: ResolutionContext, 
       if (!struct) continue;
       const own = struct.members.fields.get(name);
       if (own !== undefined) found.push({ text: goNormalizeType(own), file: struct.file, params: struct.members.params });
+      // An embedded field is named after its type: `client.KV` for `struct { KV; … }`.
+      for (const e of struct.members.embedded) {
+        if (goNormalizeType(e).replace(/^\*/, '').replace(/\[[\s\S]*\]$/, '').replace(/^[A-Za-z_]\w*\./, '') === name) {
+          found.push({ text: goNormalizeType(e), file: struct.file, params: struct.members.params });
+        }
+      }
       for (const e of struct.members.embedded) {
         if (seen.has(`${struct.file}\0${e}`)) continue;
         seen.add(`${struct.file}\0${e}`);
@@ -21285,7 +21498,8 @@ function goTypeParamsAt(index: GoScopeIndex, filePath: string, at: number, conte
   if (!params) {
     params = new Map();
     const lineStart = index.lineStarts[fn.startLine - 1] ?? 0;
-    const head = index.code.slice(lineStart, index.lineStarts[Math.min(fn.endLine, fn.startLine + 40) - 1] ?? index.code.length);
+    // Through the end line: a one-line function's head is its only line.
+    const head = index.code.slice(lineStart, index.lineStarts[Math.min(fn.endLine, fn.startLine + 40)] ?? index.code.length);
     // `func Name[T any](`, or `func (s *Set[T, U]) Name(`, whose type
     // arguments name its type's parameters, constrained where the type is.
     const generic = /^\s*func\s*(?:\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)\s*(\[)|[A-Za-z_]\w*\s*(\[))/.exec(head);
