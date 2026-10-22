@@ -257,6 +257,12 @@ function rowToFileRecord(row: FileRow): FileRecord {
  * under-count nodes per file and pick that plan, and a few huge files (a
  * generated R.java) then cost ~100 s (#2571). Ties go to the path, so the
  * plan never decides between equal counts.
+ *
+ * Every file, not a top-N window: the test and generated files the caller
+ * drops can fill any window, and then the real dominant file, or its
+ * runner-up, was never among the rows (#2578). The window saved nothing
+ * either: ORDER BY needs every group, so the aggregate runs to the end
+ * whatever the LIMIT; only the rows handed back differ, one per file.
  */
 export const DOMINANT_FILE_SQL = `
   SELECT n.file_path AS file_path, COUNT(*) AS edge_count
@@ -266,8 +272,14 @@ export const DOMINANT_FILE_SQL = `
   WHERE n.file_path = m.file_path
   GROUP BY n.file_path
   ORDER BY edge_count DESC, n.file_path
-  LIMIT 20
 `;
+
+/**
+ * Ranked candidates the low-value filter is asked about at a time, in
+ * `computeDominantFile`: the generated flag is a database lookup, so it is
+ * made per batch rather than for every file with an in-file edge.
+ */
+const DOMINANT_FILE_BATCH = 20;
 
 /**
  * Query builder for the knowledge graph database
@@ -1189,8 +1201,8 @@ export class QueryBuilder {
 
   private computeDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
     if (!this.stmts.getDominantFile) {
-      // Pull top 20 candidates; we then filter out test/generated files
-      // in code (regex-grade matching that SQL LIKE can't express). The
+      // Every file ranked; test/generated files are then filtered out in
+      // code (regex-grade matching that SQL LIKE can't express). The
       // generated-file filter is critical — without it, etcd's
       // `api/etcdserverpb/rpc.pb.go` (1916 in-file edges, generated
       // protobuf stub) outranks the real `server/etcdserver/server.go`
@@ -1200,13 +1212,26 @@ export class QueryBuilder {
       this.stmts.getDominantFile = this.db.prepare(DOMINANT_FILE_SQL);
     }
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
-    const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
-    const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
-    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
+    // The first two files the filter keeps, in rank order: the dominant file
+    // and its runner-up. Filtering a 20-row window instead returned null once
+    // 20 test files outranked the real code, and an understated runner-up
+    // (0) once 19 did, which passes the caller's "3x the next file" test for
+    // a file that is not dominant at all (#2578).
+    const kept: Array<{ file_path: string; edge_count: number }> = [];
+    for (let i = 0; i < rows.length && kept.length < 2; i += DOMINANT_FILE_BATCH) {
+      const batch = rows.slice(i, i + DOMINANT_FILE_BATCH);
+      const generated = this.getGeneratedPathsAmong(batch.map(r => r.file_path));
+      for (const r of batch) {
+        if (isLowValueFile(r.file_path, generated)) continue;
+        kept.push(r);
+        if (kept.length === 2) break;
+      }
+    }
+    if (kept.length === 0 || kept[0]!.edge_count < 20) return null;
     return {
-      filePath: filtered[0]!.file_path,
-      edgeCount: filtered[0]!.edge_count,
-      nextEdgeCount: filtered[1]?.edge_count ?? 0,
+      filePath: kept[0]!.file_path,
+      edgeCount: kept[0]!.edge_count,
+      nextEdgeCount: kept[1]?.edge_count ?? 0,
     };
   }
 
@@ -1221,6 +1246,12 @@ export class QueryBuilder {
    * Excludes test/generated files from candidacy. Returns null if there
    * are fewer than 3 non-test routes total, or if no file holds at least
    * 30% of them (diffuse routing → no single answer file).
+   *
+   * Every route file is counted. A 20-row window, filtered afterwards,
+   * returned null once 20 test files held more routes than the app's own,
+   * and measured the 30% share against the routes of those 20 files rather
+   * than of the project (#2578). One row per file that has a route, so the
+   * window saved next to nothing.
    */
   getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
     if (!this.stmts.getTopRouteFile) {
@@ -1229,8 +1260,7 @@ export class QueryBuilder {
         FROM nodes
         WHERE kind = 'route'
         GROUP BY file_path
-        ORDER BY cnt DESC
-        LIMIT 20
+        ORDER BY cnt DESC, file_path
       `);
     }
     const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
@@ -3455,11 +3485,12 @@ export class QueryBuilder {
   /**
    * Which of `filePaths` the index flagged as tool-generated (schema v9+).
    *
-   * Bounded-lookup by design: every consumer already holds a short candidate
-   * list (a ranked file group, an FTS result page, a LIMIT-20 aggregate), so
-   * this stays a partial-index probe over a handful of paths — no whole-repo
-   * set to materialize, and no cache to invalidate, which means a ranking call
-   * can never serve a verdict the last sync already replaced.
+   * Bounded-lookup by design: every consumer already holds a candidate list
+   * (a ranked file group, an FTS result page, a batch of the dominant-file
+   * ranking, the files that hold a route), so this stays a partial-index
+   * probe over those paths — no whole-repo set to materialize, and no cache
+   * to invalidate, which means a ranking call can never serve a verdict the
+   * last sync already replaced.
    *
    * Returns ONLY the content/index signal; callers union it with
    * {@link isGeneratedFile} so pre-v9 databases (column present, all zeros
