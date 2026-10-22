@@ -791,6 +791,30 @@ export const CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT = 10_000;
 export const PROMPT_HOOK_INJECTION_MAX = 9_000;
 
 /**
+ * The injection cap for this run (#2435). `CODEGRAPH_PROMPT_HOOK_MAX_CHARS`
+ * can only LOWER it: hook output stays in the conversation and is re-read on
+ * every later model call until compaction, so a user on long sessions may
+ * want a smaller one. A value that isn't a positive whole number, or is above
+ * {@link PROMPT_HOOK_INJECTION_MAX} (which keeps the payload inline), falls
+ * back to the default.
+ */
+export function promptHookInjectionMax(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CODEGRAPH_PROMPT_HOOK_MAX_CHARS?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return PROMPT_HOOK_INJECTION_MAX;
+  const n = Number(raw);
+  return n > 0 && n <= PROMPT_HOOK_INJECTION_MAX ? n : PROMPT_HOOK_INJECTION_MAX;
+}
+
+/**
+ * `CODEGRAPH_PROMPT_HOOK_MODE=nudge` (#2435): never inject explore's source;
+ * name the matching indexed symbols and let the agent write the query — the
+ * MEDIUM tier's shape, for every prompt that passes the gate.
+ */
+export function isPromptHookNudgeMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CODEGRAPH_PROMPT_HOOK_MODE?.trim().toLowerCase() === 'nudge';
+}
+
+/**
  * Cap explore text for the prompt-hook injection, preserving the existing
  * "call codegraph_explore for the rest" notice when truncated.
  */
