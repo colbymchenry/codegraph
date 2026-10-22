@@ -2558,6 +2558,25 @@ program
  *   codegraph affected src/lib/components/Editor.svelte src/routes/+page.svelte
  */
 program
+  .command('contracts [externalName]')
+  .description('Find explicit serde and Go JSON field aliases')
+  .option('-p, --path <path>', 'Project path')
+  .option('--file <file>', 'Exact indexed file path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (externalName: string | undefined, options: { path?: string; file?: string; json?: boolean }) => {
+    const { default: CodeGraph } = await loadCodeGraph();
+    const graph = await CodeGraph.open(resolveProjectPath(options.path));
+    try {
+      const report = await graph.getSerializationAliases({ externalName, filePath: options.file });
+      if (options.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        for (const item of report.items) console.log(item.externalName + ' -> ' + item.owner + '::' + item.fieldName + ' (' + item.direction + ') ' + item.filePath + ':' + item.line);
+        console.log(report.total + ' declarations in ' + report.scannedFiles + ' files; ' + report.skippedFiles.length + ' skipped; truncated=' + report.truncated);
+      }
+    } finally { await graph.close(); }
+  });
+
+program
   .command('affected [files...]')
   .description('Find test files affected by changed source files')
   .option('-p, --path <path>', 'Project path')
