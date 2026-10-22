@@ -301,7 +301,8 @@ describe('AOSP tools addendum in the initialize instructions', () => {
   it('is appended to the initialize instructions payload end-to-end', async () => {
     process.env.CODEGRAPH_MCP_TOOLS = 'explore,jni_bridge';
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-aosp-init-'));
-    await CodeGraph.init(tempDir, { index: true });
+    const cg = await CodeGraph.init(tempDir, { index: true });
+    cg.close();
 
     child = spawnServer(tempDir);
     const events = tagStreams(child);
