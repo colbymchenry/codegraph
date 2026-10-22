@@ -5325,6 +5325,64 @@ import 'package:flutter/material.dart';
       expect(vars).toContain('heading');
     });
 
+    /* `{% capture name %}…{% endcapture %}` declares a variable as `assign`
+       does; only assigns were read (#2498). */
+    it.each([
+      ['{% capture captured %}Hello{% endcapture %}', 'captured', 1, 0],
+      ['{%- capture trimmed -%}Hi{%- endcapture -%}', 'trimmed', 1, 0],
+      ['{% capture tight-%}Hi{% endcapture %}', 'tight', 1, 0],
+      ["<p>{% capture 'single' %}Hi{% endcapture %}</p>", 'single', 1, 3],
+      ['{% capture "double" %}Hi{% endcapture %}', 'double', 1, 0],
+      ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
+      ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
+      ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+    ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
+      const result = extractFromSource('sections/card.liquid', code);
+      const variables = result.nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.qualifiedName, n.startLine, n.startColumn]))
+        .toEqual([[name, `sections/card.liquid::${name}`, line, column]]);
+      const file = result.nodes.find((n) => n.kind === 'file')!;
+      expect(result.edges).toContainEqual({ source: file.id, target: variables[0]!.id, kind: 'contains' });
+    });
+
+    it('reads no capture from comments, raw regions, prose or a tag without a name', () => {
+      const code = [
+        '{% comment %}{% capture ghost %}x{% endcapture %}{% endcomment %}',
+        '{%- raw -%}{% capture ghost %}x{% endcapture %}{%- endraw -%}',
+        '{% # capture ghost %}',
+        '{% liquid', '  # capture ghost', '  comment', '  capture ghost', '  endcomment', '%}',
+        '{% capture %}x{% endcapture %}',
+        '<p>We capture ghost moments.</p>',
+        '{% assign text = "{% capture ghost %}" %}',
+      ].join('\n');
+      const result = extractFromSource('sections/card.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
+    });
+
+    it('never cuts a capture name short', () => {
+      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
+      // either; such a name gets no node rather than a wrong one.
+      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+      expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
+    });
+
+    it('keeps an assign and captures of the same name on one line apart', () => {
+      const code = '{% assign title = 1 %}{% capture title %}one{% endcapture %}{% capture title %}two{% endcapture %}';
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startColumn]))
+        .toEqual([['title', 0], ['title', code.indexOf('{% capture')], ['title', code.lastIndexOf('{% capture')]]);
+      expect(new Set(variables.map((n) => n.id)).size).toBe(3);
+      // The assign keeps the id it had before captures were read.
+      expect(variables[0]!.id).toBe(generateNodeId('sections/card.liquid', 'variable', 'title', 1));
+    });
+
+    it('still reads the tags inside a capture', () => {
+      const code = "{% capture card_html %}{% render 'card' %}{% assign inner = 1 %}{% endcapture %}";
+      const result = extractFromSource('sections/product.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name).sort()).toEqual(['card_html', 'inner']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['snippets/card.liquid']);
+    });
+
     it('should extract section inside a {% liquid %} block', () => {
       const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
       const result = extractFromSource('layout/theme.liquid', code);
@@ -7535,6 +7593,24 @@ describe('Liquid Shopify JSON template section resolution', () => {
         .toBe(name !== 'ghost');
     }
     expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
+  });
+
+  it('indexes capture declarations as variables that search finds, in or out of a Shopify theme', async () => {
+    // A captured variable could not be found, while an assigned one could (#2498).
+    fs.mkdirSync(path.join(tempDir, '_includes'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, '_includes/card.liquid'), [
+      "{% assign existing = 'ok' %}",
+      '{% capture captured %}Hello{% endcapture %}',
+      '{% liquid', '  capture bare_capture', "    echo 'x'", '  endcapture', '%}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    for (const [name, line] of [['existing', 1], ['captured', 2], ['bare_capture', 4]] as const) {
+      const hit = cg.searchNodes(name, { kinds: ['variable'] }).find((r) => r.node.name === name);
+      expect(hit?.node, name).toMatchObject({ filePath: '_includes/card.liquid', language: 'liquid', startLine: line });
+      expect(cg.getIncomingEdges(hit!.node.id)).toContainEqual(expect.objectContaining({ kind: 'contains' }));
+    }
   });
 
   it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {

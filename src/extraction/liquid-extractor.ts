@@ -11,6 +11,7 @@ import { generateNodeId, NodeIdAllocator } from './tree-sitter-helpers';
  *   ({% sections 'header-group' %} → `sections/header-group.json`)
  * - Snippet references ({% render 'name' %} and {% include 'name' %})
  * - Schema blocks ({% schema %}...{% endschema %})
+ * - Variables declared with {% assign %} and {% capture %}
  * - The sections a Shopify JSON template or section group lists
  */
 export class LiquidExtractor {
@@ -55,7 +56,7 @@ export class LiquidExtractor {
         // Extract schema block
         this.extractSchema(fileNode.id);
 
-        // Extract assign statements as variables
+        // Extract assign and capture declarations as variables
         this.extractAssignments(fileNode.id);
       }
     } catch (error) {
@@ -459,40 +460,53 @@ export class LiquidExtractor {
   }
 
   /**
-   * Extract {% assign var = value %} statements
+   * Extract {% assign var = value %} and {% capture var %}…{% endcapture %}
+   * declarations as variables
    */
   private extractAssignments(fileNodeId: string): void {
     // Both spellings. Most of a modern theme's assigns are the bare kind.
     for (const match of this.findTagOccurrences('assign', `(\\w+)\\s*=`)) {
-      const variableName = match.groups[1];
-      const line = this.getLineNumber(match.index);
-
-      // Create a variable node
-      const nodeId = this.nodeIds.generate(this.filePath, 'variable', variableName!, line, match.index - this.getLineStart(line));
-
-      const node: Node = {
-        id: nodeId,
-        kind: 'variable',
-        name: variableName!,
-        qualifiedName: `${this.filePath}::${variableName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + match.fullMatch.length,
-        updatedAt: Date.now(),
-      };
-
-      this.nodes.push(node);
-
-      // Add containment edge from file
-      this.edges.push({
-        source: fileNodeId,
-        target: nodeId,
-        kind: 'contains',
-      });
+      this.addVariable(fileNodeId, match.groups[1]!, match);
     }
+    // A capture declares its name as an assign does, and Liquid reads a quoted
+    // name (`{% capture 'title' %}`) as the name inside the quotes. A name that
+    // goes on with `-` or `.`, which the assign rule doesn't read either, gets
+    // no node rather than a cut-short one. Captures come after assigns, so an
+    // assign keeps its id when a capture of the same name shares its line.
+    for (const match of this.findTagOccurrences('capture', `(?:'(\\w+)'|"(\\w+)"|(\\w+))(?=\\s|-?%\\}|$)`)) {
+      const [, singleQuoted, doubleQuoted, bare] = match.groups;
+      this.addVariable(fileNodeId, (singleQuoted ?? doubleQuoted ?? bare)!, match);
+    }
+  }
+
+  /** A `variable` node, contained by the file, for a declaration that `findTagOccurrences` found. */
+  private addVariable(fileNodeId: string, variableName: string, match: { fullMatch: string; index: number }): void {
+    const line = this.getLineNumber(match.index);
+    const column = match.index - this.getLineStart(line);
+    const nodeId = this.nodeIds.generate(this.filePath, 'variable', variableName, line, column);
+
+    const node: Node = {
+      id: nodeId,
+      kind: 'variable',
+      name: variableName,
+      qualifiedName: `${this.filePath}::${variableName}`,
+      filePath: this.filePath,
+      language: 'liquid',
+      startLine: line,
+      endLine: line,
+      startColumn: column,
+      endColumn: column + match.fullMatch.length,
+      updatedAt: Date.now(),
+    };
+
+    this.nodes.push(node);
+
+    // Add containment edge from file
+    this.edges.push({
+      source: fileNodeId,
+      target: nodeId,
+      kind: 'contains',
+    });
   }
 
   /**
