@@ -136,10 +136,12 @@ const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
 /**
  * What a file's own `export default` statement exports: the node it declares
- * or names, `'anonymous'` for a function or class with no name (no node
- * stands for it), `'unstated'` when the file says nothing a node answers.
+ * or names, the import that binds a name it declares nothing of (what that
+ * import brings, not one of the file's own nodes), `'anonymous'` for a
+ * function or class with no name (no node stands for it), `'unstated'` when
+ * the file says nothing a node answers.
  */
-type StatedDefault = Node | 'anonymous' | 'unstated';
+type StatedDefault = Node | { imported: ImportMapping } | 'anonymous' | 'unstated';
 
 const EXPORT_DEFAULT_HEAD = /^[ \t]*export\s+default\s+/gm;
 /** `[async] function[*] [NAME]` / `[abstract] class [NAME]`; the name is group 1 or 2. */
@@ -234,11 +236,19 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
         stated = node;
         break;
       }
+      // `import Resolver from './resolver'; export default Resolver`: the
+      // default is what the import brings, so no function of this file is it.
+      if (!value.declared && stated === 'unstated') {
+        // Every JS-family language reads imports alike (extractImportMappings).
+        const imported = context.getImportMappings(filePath, 'typescript').find((i) => i.localName === value.name);
+        if (imported) stated = { imported };
+      }
     }
   }
   idx.statedDefault = stated ?? 'unstated';
   return idx.statedDefault;
 }
+
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
 /**
@@ -291,17 +301,47 @@ function nodesInFileNamed(filePath: string, name: string, context: ResolutionCon
 
 /**
  * The declaration a module default-exports: what its own `export default`
- * statement declares or names (see {@link statedDefaultExport}), and nothing
- * for an anonymous default. Only a default the statement leaves unnamed
- * (`export default memo(Card)`, `new Service()`), or a module with no
- * statement, falls back: to the component a single-file component file is,
- * else to the first exported function or class.
+ * statement declares or names (see {@link statedDefaultExport}), followed
+ * into the module an import it names comes from, and nothing for an anonymous
+ * default or an import from outside the project. Only a default the statement
+ * leaves unnamed (`export default memo(Card)`, `new Service()`), or a module
+ * with no statement, falls back: to the component a single-file component
+ * file is, else to the first exported function or class.
  */
-function esmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
+function esmDefaultExport(
+  filePath: string,
+  idx: FileExportIndex,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
   const stated = statedDefaultExport(filePath, idx, context);
   if (stated === 'anonymous') return undefined;
-  if (stated !== 'unstated') return stated;
-  return idx.defaultComponent ?? idx.defaultFnClass;
+  if (stated === 'unstated') return idx.defaultComponent ?? idx.defaultFnClass;
+  return 'imported' in stated ? importedDefault(filePath, stated.imported, language, context, visited, depth) : stated;
+}
+
+/**
+ * What the import a module default-exports binds, in the module it comes
+ * from: `import Resolver from './resolver'; export default Resolver` is
+ * `resolver.ts`'s own default. Nothing for a namespace (`import * as Sentry`,
+ * an object no node stands for) or an import from outside the project.
+ */
+function importedDefault(
+  filePath: string,
+  imported: ImportMapping,
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
+  if (imported.isNamespace) return undefined;
+  const next = resolveImportPath(imported.source, filePath, language, context);
+  if (!next) return undefined;
+  const isDefault = imported.isDefault || imported.exportedName === 'default';
+  const want = { isDefault, isNamespace: false, exportedName: isDefault ? 'default' : imported.exportedName, memberName: null };
+  return findExportedSymbol(next, want, language, context, visited, depth + 1);
 }
 
 /**
@@ -4013,15 +4053,19 @@ function findExportedSymbolWalk(
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
     // What the file's own `export default` statement exports beats any
-    // guess; an anonymous default is no node at all, and no neighbour is it.
-    if (statedDefaultExport(filePath, exportIndex, context) === 'anonymous') return undefined;
+    // guess; an anonymous default is no node at all, and no neighbour is it,
+    // nor is any of them a default the file imports.
+    const stated = statedDefaultExport(filePath, exportIndex, context);
+    if (stated === 'anonymous') return undefined;
     // Svelte/Vue single-file components ARE the module's default export,
     // but are extracted as kind 'component' (not function/class), so the
     // fallback prefers the component node. Without it, an `export { default
     // as X } from './X.svelte'` barrel never resolves and the component shows
     // a false 0 callers (#629).
-    const direct = esmDefaultExport(filePath, exportIndex, context);
+    const direct = esmDefaultExport(filePath, exportIndex, language, context, visited, depth);
     if (direct) return direct;
+    // A default the module imports is that import's, found or not.
+    if (typeof stated === 'object' && 'imported' in stated) return undefined;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
     const commonJs = commonJsDefaultExport(filePath, context);
     if (commonJs?.source) {
@@ -4052,7 +4096,7 @@ function findExportedSymbolWalk(
       ESM_IMPORT_LANGUAGES.has(language) &&
       hasEsmDefaultExport(filePath, exportIndex, context)
     ) {
-      const esmDefault = esmDefaultExport(filePath, exportIndex, context);
+      const esmDefault = esmDefaultExport(filePath, exportIndex, language, context, visited, depth);
       if (esmDefault) return esmDefault;
     }
   }
@@ -4102,7 +4146,11 @@ function findExportedSymbolWalk(
   }
 
   // 3. Wildcard re-export: `export * from './other'` — try every
-  //    forwarding source. This is the barrel-of-barrels case.
+  //    forwarding source. This is the barrel-of-barrels case. An ES module's
+  //    `export *` never hands on a default: a default import of a barrel that
+  //    has none of its own has none, not the first function a module it
+  //    forwards exports.
+  if (want.isDefault && !PYTHON_MODULE_FILE.test(filePath)) return undefined;
   for (const rex of reExports) {
     if (rex.kind === 'wildcard') {
       const next = resolveImportPath(rex.source, filePath, language, context);
