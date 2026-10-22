@@ -176,6 +176,13 @@ export interface ResolutionContext {
    */
   getSupertypeNodes?(id: string): Node[];
   /**
+   * The classes one class declaration extends, through its own resolved
+   * `extends` edges alone: the parent a `super.m()` call reaches, never an
+   * interface or a class it only implements (#2497). Optional so
+   * external/test contexts compile without it.
+   */
+  getSuperclassNodes?(id: string): Node[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile

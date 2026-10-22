@@ -39,6 +39,7 @@ import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
+import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -306,6 +307,8 @@ export class ReferenceResolver {
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
   // getSupertypeNodes' memo, by node id, under the same generation tag.
   private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
+  // getSuperclassNodes' memo (`extends` edges alone), the same way.
+  private superclassNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -314,6 +317,7 @@ export class ReferenceResolver {
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
     if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
+    if (this.superclassNodeMemo.size > 50_000) this.superclassNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -584,6 +588,7 @@ export class ReferenceResolver {
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
     this.supertypeNodeMemo.clear();
+    this.superclassNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -987,6 +992,18 @@ export class ReferenceResolver {
           if (target) nodes.push(target);
         }
         this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
+      },
+
+      getSuperclassNodes: (id: string) => {
+        const hit = this.superclassNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, ['extends'])) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.superclassNodeMemo.set(id, { gen: this.supertypeGen, nodes });
         return nodes;
       },
 
@@ -1498,6 +1515,12 @@ export class ReferenceResolver {
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
     const themeFile = matchShopifyThemeFile(ref, this.context);
     if (themeFile !== undefined) return themeFile;
+
+    // A TS/JS `super.run(…)` runs the method of the class's parent or a
+    // nearer ancestor, or one outside the project: never a method found by
+    // its name alone (see ./js-super-calls).
+    const superCall = matchJsSuperCall(ref, this.context);
+    if (superCall !== undefined) return superCall;
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
@@ -3810,6 +3833,9 @@ export class ReferenceResolver {
    */
   private gateSuperSelfCall(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result || ref.referenceKind !== 'calls' || result.targetNodeId !== ref.fromNodeId) return result;
+    // A TS/JS call is read where it starts, so a `this.run()` that shares its
+    // line with a `super.run()` keeps its edge (#2497).
+    if (isJsSuperCallLanguage(ref.language)) return isJsSuperCallSite(ref, this.context) ? null : result;
     const name = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf('.'), ref.referenceName.lastIndexOf(':')) + 1);
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) return result;
     const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
