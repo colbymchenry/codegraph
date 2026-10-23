@@ -711,6 +711,26 @@ ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
 from some result sets outright — `deprioritize` only ever changes rank. Reach
 for `exclude` when you want something gone.
 
+### Large source files
+
+CodeGraph skips source files larger than 1 MiB by default. For large
+hand-written modules, commit a shared limit in `codegraph.json` at the project root:
+
+```json
+{ "maxSourceFileSizeBytes": 4194304 }
+```
+
+The value must be a positive safe integer in bytes. CLI indexing, background sync,
+resolution and freshness checks all read this setting. Run `codegraph sync` after
+changing it; unchanged files skipped under the old limit are reconsidered, along
+with their callers. Lowering the limit excludes files that no longer fit. Higher
+limits can increase parsing time and memory usage.
+
+`codegraph status` and the MCP status tool show the effective limit and number of
+files excluded by size. JSON status exposes these under `coverage`; a completed
+indexing run can still contain excluded files. Explore responses include a short
+coverage notice while any files remain excluded.
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

@@ -681,7 +681,7 @@ export function renderTable(report: ExploreDiagnosticReport): string {
   const out: string[] = [];
   out.push('');
   out.push(`codegraph explore diagnostic — "${report.query}"`);
-  out.push(`  project ${report.projectRoot} · ${num(report.indexedFileCount)} files indexed`);
+  out.push(`  project ${report.projectRoot} · ${num(report.indexedFileCount)} files tracked`);
   if (report.note) out.push(`  note: ${report.note}`);
   if (report.session) {
     const s = report.session;

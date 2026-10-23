@@ -35,7 +35,7 @@ describe('resolution file reads', () => {
     const fd = fs.openSync(archive, 'w');
     try {
       fs.writeSync(fd, Buffer.from([0x1f, 0x8b]));
-      fs.ftruncateSync(fd, 2 * 1024 * 1024);
+      fs.ftruncateSync(fd, MAX_SOURCE_FILE_SIZE_BYTES + 1);
     } finally {
       fs.closeSync(fd);
     }
@@ -54,10 +54,19 @@ describe('resolution file reads', () => {
     expect(context.readFile(relative)).toBeNull();
     expect(context.readFile(relative)).toBeNull();
     expect(read).not.toHaveBeenCalled();
-    expect(stat).toHaveBeenCalledTimes(1);
+    expect(stat.mock.calls.filter(([file]) => file === path.join(root, relative))).toHaveLength(1);
     fs.writeFileSync(path.join(root, relative), 'export const repaired = true;');
     resolver.clearCaches();
     expect(context.readFile(relative)).toBe('export const repaired = true;');
+  });
+
+  it('uses the shared project size limit during resolution', () => {
+    const file = path.join(root, 'large.ts');
+    fs.writeFileSync(file, 'a'.repeat(MAX_SOURCE_FILE_SIZE_BYTES + 1));
+    expect(context.readFile('large.ts')).toBeNull();
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ maxSourceFileSizeBytes: MAX_SOURCE_FILE_SIZE_BYTES * 2 }));
+    resolver.clearCaches();
+    expect(context.readFile('large.ts')?.length).toBe(MAX_SOURCE_FILE_SIZE_BYTES + 1);
   });
 
   it('accepts exactly the byte limit and rejects one byte more', () => {

@@ -65,6 +65,7 @@ import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
+import { getMaxSourceFileSizeBytes } from './file-limits';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -593,14 +594,9 @@ export class CodeGraph {
       // the final fold-up before the interval is restored in the finally.
       // Kill switch: CODEGRAPH_NO_WAL_DEFER=1. Non-WAL journal modes (some
       // network filesystems) have no WAL to defer — skip.
-      // Fast-init: on a COMPLETELY fresh DB, trade crash-durability for speed
-      // during the bulk build (journal in memory, no fsync). Safe because the
-      // DB is disposable until the index completes — index_state stays
-      // 'indexing' and a crashed init is re-run from scratch; existing DBs
-      // (re-index/sync) never take this path. Kill switch:
-      // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
       const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
-      const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
+      // Even a fresh index may have retained MCP readers: keep its WAL journal.
+      const fastInit = false;
       if (fastInit) {
         try {
           this.db.getDb().pragma('journal_mode = MEMORY');
@@ -1006,7 +1002,7 @@ export class CodeGraph {
         // timer-driven PASSIVE checkpoints ran, and a query-pool reader could
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
-        const fullReconcile = !options.paths || options.paths.length === 0;
+        const fullReconcile = !options.paths || options.paths.length === 0 || this.orchestrator.sourceSizeLimitChanged();
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
         const pythonFilesBefore = this.pythonFilePaths();
@@ -1021,7 +1017,7 @@ export class CodeGraph {
         // routes. Compared with the routes after runPostExtract below.
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
-        const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
+        const result = await this.orchestrator.sync(options.onProgress, fullReconcile ? undefined : options.paths, backpressure,
           (filePath, content) => {
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
@@ -1897,9 +1893,15 @@ export class CodeGraph {
   // Graph Statistics
   // ===========================================================================
 
-  /**
-   * Get statistics about the knowledge graph
-   */
+  /** Coverage exclusions are separate from whether the last indexing run completed. */
+  getSourceCoverage(): { sizeExcludedFileCount: number; maxSourceFileSizeBytes: number } {
+    return {
+      sizeExcludedFileCount: this.queries.getSizeExcludedFileCount(),
+      maxSourceFileSizeBytes: getMaxSourceFileSizeBytes(this.projectRoot),
+    };
+  }
+
+  /** Get statistics about the knowledge graph. */
   getStats(): GraphStats {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();

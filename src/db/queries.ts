@@ -5351,9 +5351,15 @@ export class QueryBuilder {
       .get() as { nodes: number; edges: number };
   }
 
-  /**
-   * Get graph statistics
-   */
+  /** Count exclusions without decoding every tracked file into JavaScript. */
+  getSizeExcludedFileCount(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM files
+      WHERE EXISTS (SELECT 1 FROM json_each(COALESCE(files.errors, '[]'))
+        WHERE json_extract(value, '$.code') = 'size_exceeded')`).get() as { count: number };
+    return row.count;
+  }
+
+  /** Get graph statistics. */
   getStats(): GraphStats {
     // Single query for all three aggregate counts
     const counts = this.db.prepare(`

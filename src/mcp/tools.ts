@@ -141,7 +141,7 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
  */
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
-import { indexedHashInput } from '../file-limits';
+import { indexedHashInput, getMaxSourceFileSizeBytes } from '../file-limits';
 import { resolve as resolvePath, relative as relativePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
@@ -2304,7 +2304,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`,
+            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files tracked), and extra calls are never rejected or rate-limited.`,
           };
         }
         return tool;
@@ -2766,7 +2766,7 @@ export class ToolHandler {
         if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
           // A file over the index's size limit is stored as its size stamp
           // (#1910), so it is compared as one, without reading it.
-          const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'));
+          const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'), getMaxSourceFileSizeBytes(root));
           // Must stay byte-identical to extraction's `hashContent` (sha256 over
           // the utf-8 string) — the identical-rewrite test in
           // mcp-stale-slice.test.ts pins the parity. Inlined (not imported)
@@ -2812,6 +2812,15 @@ export class ToolHandler {
         if (sameProject) cg = this.cg;
       } catch {
         /* getProjectRoot may throw on a closed instance — leave cg as is */
+      }
+    }
+
+    const coverage = cg.getSourceCoverage?.();
+    if (coverage && coverage.sizeExcludedFileCount > 0) {
+      const [head, ...tail] = result.content;
+      if (head?.type === 'text') {
+        const notice = `Coverage: ${coverage.sizeExcludedFileCount} source file${coverage.sizeExcludedFileCount === 1 ? '' : 's'} excluded by size (limit ${coverage.maxSourceFileSizeBytes} bytes; codegraph.json: maxSourceFileSizeBytes). Their symbols and call paths are absent.`;
+        result = { ...result, content: [{ type: 'text', text: `${notice}\n\n${head.text}` }, ...tail] };
       }
     }
 
@@ -6801,8 +6810,15 @@ export class ToolHandler {
         if (cursor <= c.end) spans.push({ range: { start: cursor, end: c.end }, plain: true });
         const first = spans[0];
         const last = spans[spans.length - 1];
-        if (first?.plain) first.range.start = Math.max(1, first.range.start - contextPadding);
-        if (last?.plain) last.range.end = Math.min(fileLines.length, last.range.end + contextPadding);
+        // Optional context must not price a small requested body out of its reservation.
+        if (first?.plain) {
+          const start = Math.max(1, first.range.start - contextPadding);
+          if (renderedSpanCost(start, first.range.end) <= allowance) first.range.start = start;
+        }
+        if (last?.plain) {
+          const end = Math.min(fileLines.length, last.range.end + contextPadding);
+          if (renderedSpanCost(last.range.start, end) <= allowance) last.range.end = end;
+        }
         // Spans that touch in the file are one block, not two parts with a gap
         // marker between adjacent lines.
         const merged: ExploreLineRange[] = [];
@@ -7684,7 +7700,7 @@ export class ToolHandler {
       try {
         const stats = cg.getStats();
         const callBudget = getExploreBudget(stats.fileCount);
-        budgetBlock = ['', `> **Exploration guidance — advisory only, NOT a quota: this project (~${stats.fileCount.toLocaleString()} files indexed) is usually covered in ≈${callBudget} focused explore calls, and extra calls are never rejected or rate-limited.** If the response above does not fully cover your question, run another codegraph_explore on the uncovered symbols — it is cheaper and more complete than Read. Only stop exploring when the response actually covers the flow you asked about.`];
+        budgetBlock = ['', `> **Exploration guidance — advisory only, NOT a quota: this project (~${stats.fileCount.toLocaleString()} files tracked) is usually covered in ≈${callBudget} focused explore calls, and extra calls are never rejected or rate-limited.** If the response above does not fully cover your question, run another codegraph_explore on the uncovered symbols — it is cheaper and more complete than Read. Only stop exploring when the response actually covers the flow you asked about.`];
       } catch {
         // Stats unavailable — skip budget note
       }
@@ -8286,6 +8302,7 @@ export class ToolHandler {
       } catch { /* closed instance — leave as is */ }
     }
     const stats = cg.getStats();
+    const coverage = cg.getSourceCoverage();
 
     // Warn when this index actually belongs to a different git working tree
     // (e.g. the server resolved up from a nested worktree to the main checkout).
@@ -8302,7 +8319,9 @@ export class ToolHandler {
       lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch).replace(/\n/g, '\n> ')}`, '');
     }
     lines.push(
-      `**Files indexed:** ${stats.fileCount}`,
+      `**Files tracked:** ${stats.fileCount}`,
+      `**Files excluded by size:** ${coverage.sizeExcludedFileCount}`,
+      `**Source size limit:** ${coverage.maxSourceFileSizeBytes} bytes (codegraph.json: maxSourceFileSizeBytes)`,
       `**Total nodes:** ${stats.nodeCount}`,
       `**Total edges:** ${stats.edgeCount}`,
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,

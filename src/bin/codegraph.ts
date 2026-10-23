@@ -1147,6 +1147,7 @@ program
           indexPath: getCodeGraphDir(projectPath),
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
+          coverage: cg.getSourceCoverage(),
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
@@ -1209,7 +1210,10 @@ program
 
       // Index stats
       console.log(chalk.bold('Index Statistics:'));
-      console.log(`  Files:     ${formatNumber(stats.fileCount)}`);
+      console.log(`  Files tracked: ${formatNumber(stats.fileCount)}`);
+      const coverage = cg.getSourceCoverage();
+      console.log(`  Files excluded by size: ${formatNumber(coverage.sizeExcludedFileCount)}`);
+      console.log(`  Source size limit: ${coverage.maxSourceFileSizeBytes} bytes (codegraph.json: maxSourceFileSizeBytes)`);
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
