@@ -46,6 +46,7 @@ import type { Node } from '../../types';
 import type { FrameworkExtractionResult, FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
 import { resolveImportPath } from '../import-resolver';
 import { stripCommentsForRegex } from '../strip-comments';
+import { escapeRegExp } from '../../utils';
 import { matchBracket, readFields, skipString, topLevelObjects } from './object-literal';
 import { dependsOn } from './package-deps';
 import {
@@ -516,22 +517,22 @@ export function constantText(expr: string, fromFile: string, context: Resolution
       }
       return null;
     };
-    const decl = new RegExp(String.raw`\b(?:const|let)\s+${root}\s*(?::[^=]+)?=\s*\{`).exec(safe);
-    const enumDecl = decl ? null : new RegExp(String.raw`\benum\s+${root}\s*\{`).exec(safe);
-    const classDecl = decl || enumDecl ? null : new RegExp(String.raw`\bclass\s+${root}\b[^{]*\{`).exec(safe);
+    const decl = new RegExp(String.raw`\b(?:const|let)\s+${escapeRegExp(root)}\s*(?::[^=]+)?=\s*\{`).exec(safe);
+    const enumDecl = decl ? null : new RegExp(String.raw`\benum\s+${escapeRegExp(root)}\s*\{`).exec(safe);
+    const classDecl = decl || enumDecl ? null : new RegExp(String.raw`\bclass\s+${escapeRegExp(root)}\b[^{]*\{`).exec(safe);
     if (decl) value = readChain(decl.index + decl[0].length - 1, chain);
     else if (enumDecl && chain.length === 1) {
       // `enum Paths { Board = 'board' }`
       const open = enumDecl.index + enumDecl[0].length - 1;
       const body = safe.slice(open, Math.max(open, matchBracket(safe, open)));
-      value = new RegExp(String.raw`\b${chain[0]}\s*=\s*(['"\`][^'"\`]*['"\`])`).exec(body)?.[1] ?? null;
+      value = new RegExp(String.raw`\b${escapeRegExp(chain[0]!)}\s*=\s*(['"\`][^'"\`]*['"\`])`).exec(body)?.[1] ?? null;
     } else if (classDecl) {
       // `class ProjectConst { static readonly IssueId = 'issueId' }`, and
       // `class RouterUtil { static Configuration = { Visualizer: 'visualizer' } }`.
       const open = classDecl.index + classDecl[0].length - 1;
       const close = matchBracket(safe, open);
       const body = close > open ? safe.slice(open, close) : '';
-      const field = new RegExp(String.raw`\bstatic\s+(?:readonly\s+)?${chain[0]}\s*(?::[^=;]+)?=\s*`).exec(body);
+      const field = new RegExp(String.raw`\bstatic\s+(?:readonly\s+)?${escapeRegExp(chain[0]!)}\s*(?::[^=;]+)?=\s*`).exec(body);
       if (field) {
         const at = open + field.index + field[0].length;
         if (safe[at] === '{') value = chain.length > 1 ? readChain(at, chain.slice(1)) : null;
@@ -550,12 +551,12 @@ export function constantText(expr: string, fromFile: string, context: Resolution
 function declarationSource(root: string, file: string, context: ResolutionContext, hops: number): string | null {
   const content = context.readFile(file);
   if (!content) return null;
-  if (new RegExp(String.raw`\b(?:const|let|class|enum)\s+${root}\b`).test(content)) return content;
+  if (new RegExp(String.raw`\b(?:const|let|class|enum)\s+${escapeRegExp(root)}\b`).test(content)) return content;
   if (hops >= 3) return null;
   const reexports = /\bexport\s+(\*|\{[^}]*\})\s*from\s+(['"])([^'"]+)\2/g;
   let m: RegExpExecArray | null;
   while ((m = reexports.exec(content)) !== null) {
-    if (m[1] !== '*' && !new RegExp(String.raw`\b${root}\b`).test(m[1]!)) continue;
+    if (m[1] !== '*' && !new RegExp(String.raw`\b${escapeRegExp(root)}\b`).test(m[1]!)) continue;
     const target = resolveImportPath(m[3]!, file, 'typescript', context);
     const found = target ? declarationSource(root, target, context, hops + 1) : null;
     if (found) return found;
@@ -577,7 +578,7 @@ function localAlias(expr: string, fromFile: string, context: ResolutionContext):
       if ((local ?? prop) === root && prop) return [`${m[2]!.replace(/\s+/g, '')}.${prop}`, ...rest].join('.');
     }
   }
-  const simple = new RegExp(String.raw`\b(?:const|let)\s+${root}\s*=\s*([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+)\s*;`).exec(content);
+  const simple = new RegExp(String.raw`\b(?:const|let)\s+${escapeRegExp(root)}\s*=\s*([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+)\s*;`).exec(content);
   return simple ? [simple[1]!.replace(/\s+/g, ''), ...rest].join('.') : null;
 }
 
@@ -868,7 +869,7 @@ export function namesSomewhere(href: HrefLiteral | null): HrefLiteral | null {
 /** A class property's initializer, read from its body: `routerLinkAbout = publicRoutes.about.routerLink;`. */
 export function propertyInitializer(owner: Node, name: string, content: string): string | null {
   const body = content.split('\n').slice(owner.startLine - 1, owner.endLine).join('\n');
-  const decl = new RegExp(String.raw`(?:^|[\s;{])(?:(?:public|private|protected|readonly|static|override)\s+)*${name}\s*(?::[^=;\n]+)?=\s*`).exec(body);
+  const decl = new RegExp(String.raw`(?:^|[\s;{])(?:(?:public|private|protected|readonly|static|override)\s+)*${escapeRegExp(name)}\s*(?::[^=;\n]+)?=\s*`).exec(body);
   if (!decl) return null;
   let i = decl.index + decl[0].length;
   const start = i;

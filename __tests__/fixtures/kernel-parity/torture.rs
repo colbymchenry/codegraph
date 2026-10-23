@@ -182,6 +182,22 @@ impl Render for dyn Base {
 
 impl Base for u32 {}
 
+// Associated items are qualified by the impl's type; one no single name
+// stands for keeps the impl's spelling, whitespace collapsed.
+impl Render for (u32,
+                 u32) {
+    type Out = u8;
+    const PAIR: usize = 2;
+}
+
+impl<'a> Render for &'a [u8] {
+    type Out = u16;
+}
+
+impl Render for u64 {
+    const WIDTH: usize = 8;
+}
+
 impl Later {
     fn touch(&self) {}
 }
@@ -289,6 +305,8 @@ routes![top_level_h];
 const INIT_CONST: usize = compute_len();
 static INIT_LAZY: Lazy<Cfg> = Lazy::new(|| build_cfg());
 static INIT_ALIAS: fn() = free_fn;
+// A table the walk above takes for its symbol, and the scan no longer for the file.
+static INIT_TABLE: &[fn()] = &[handler, handler2];
 
 pub union Reg {
     pub raw: u32,
@@ -296,3 +314,24 @@ pub union Reg {
 }
 
 impl Base for Reg {}
+
+// Turbofish calls name the function they wrap: `s.get::<u32>()` is `s.get`,
+// and a path's type arguments drop (`TfPool::<u8>::new` is `TfPool::new`),
+// nested ones and a `->` inside them included.
+fn turbofish_calls(s: &TfStore, items: &[u8]) {
+    let _a = s.get::<u32>();
+    let _b = tf_free::<Vec<u8>>();
+    let _c = TfPool::<u8>::new();
+    let _d = TfPool::<Vec<u8>>::with_capacity::<u8>(4);
+    let _e = TfPool::<u8>::new().len();
+    let _f = TfPool::create::<u8>().len();
+    let _g = tf_run::<fn() -> u8>(tf_free);
+    let _h = items.iter().collect::<Vec<_>>();
+}
+
+impl TfStore {
+    fn turbofish_self(&self) {
+        self.get::<u16>();
+        self.cache.load::<u8>();
+    }
+}

@@ -2,7 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult, sfcFileNode, sfcScriptLanguage } from './sfc-script';
 import { vueOptionsMembers } from './vue-options-api';
 import { vueTemplateCalls } from './vue-template-calls';
 
@@ -192,13 +192,13 @@ export class VueExtractor {
     content: string;
     startLine: number;
     isSetup: boolean;
-    isTypeScript: boolean;
+    language: Language;
   }> {
     const blocks: Array<{
       content: string;
       startLine: number;
       isSetup: boolean;
-      isTypeScript: boolean;
+      language: Language;
     }> = [];
 
     const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
@@ -208,8 +208,8 @@ export class VueExtractor {
       const attrs = match[1] || '';
       const content = match.groups?.content || match[2] || '';
 
-      // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
+      // TypeScript, TSX or JavaScript, from the lang attribute
+      const language = sfcScriptLanguage(attrs, 'vue');
 
       // Detect <script setup>
       const isSetup = /\bsetup\b/.test(attrs);
@@ -229,7 +229,7 @@ export class VueExtractor {
         content,
         startLine: contentStartLine,
         isSetup,
-        isTypeScript,
+        language,
       });
     }
 
@@ -240,10 +240,10 @@ export class VueExtractor {
    * Process a script block by delegating to TreeSitterExtractor
    */
   private processScriptBlock(
-    block: { content: string; startLine: number; isSetup: boolean; isTypeScript: boolean },
+    block: { content: string; startLine: number; isSetup: boolean; language: Language },
     componentNodeId: string
   ): void {
-    const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
+    const scriptLanguage = block.language;
 
     // Check if the script language parser is available
     if (!isLanguageSupported(scriptLanguage)) {

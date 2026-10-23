@@ -13,7 +13,7 @@
 #   scripts/build-bundle.sh <target> [node-version]
 #     target:        darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64
 #                  | win32-x64 | win32-arm64
-#     node-version:  e.g. v24.16.0 (default below; pin for reproducible builds)
+#     node-version:  e.g. v24.22.1 (default below; pin for reproducible builds)
 #
 # Output:
 #   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
@@ -21,7 +21,14 @@
 set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
-NODE_VERSION="${2:-v24.16.0}"
+# The release workflow passes no version, so this default is the Node every
+# release bundles. Keep it on 24.x (the CLI refuses Node 25+) and at 24.22.1 or
+# later. 24.22.1 is Node's October 2026 security release (issue #2780). Before
+# 24.20.0, Node 24 can abort on Windows just as the process exits, after its
+# work is done, with 0xC0000409 and "Assertion failed: !(handle->flags &
+# UV_HANDLE_CLOSING), file src\win\async.c" (nodejs/node#56645, fixed by
+# nodejs/node#61999; issue #2617).
+NODE_VERSION="${2:-v24.22.1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release"
@@ -33,24 +40,41 @@ OSFAM="${TARGET%-*}"   # darwin | linux | win32
 
 echo "[bundle] target=${TARGET} node=${NODE_VERSION}"
 
-# 1. Download + extract the official Node runtime for the target platform.
+# 1. Download + extract the official Node runtime for the target platform. The
+#    archive must match the SHA-256 that nodejs.org publishes for the release
+#    before anything is unpacked, so a bundle ships exactly that release's
+#    official build, never a truncated or substituted download (issue #2780).
 if [ "$OSFAM" = "win32" ]; then
   NODE_DIST="node-${NODE_VERSION}-win-${ARCH}"
-  NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.zip"
-  echo "[bundle] downloading ${NODE_URL}"
-  curl -fsSL "$NODE_URL" -o "$WORK/node.zip"
+  NODE_ARCHIVE="${NODE_DIST}.zip"
+else
+  NODE_DIST="node-${NODE_VERSION}-${TARGET}"
+  NODE_ARCHIVE="${NODE_DIST}.tar.gz"
+fi
+NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_ARCHIVE}"
+echo "[bundle] downloading ${NODE_URL}"
+curl -fsSL "$NODE_URL" -o "$WORK/$NODE_ARCHIVE"
+curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
+EXPECTED_SHA="$(awk -v name="$NODE_ARCHIVE" '$2 == name { print $1 }' "$WORK/SHASUMS256.txt")"
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(sha256sum < "$WORK/$NODE_ARCHIVE" | cut -d' ' -f1)"
+else
+  ACTUAL_SHA="$(shasum -a 256 < "$WORK/$NODE_ARCHIVE" | cut -d' ' -f1)"   # macOS
+fi
+if [ -z "$EXPECTED_SHA" ] || [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "[bundle] error: ${NODE_ARCHIVE} does not match the SHA-256 that nodejs.org lists for ${NODE_VERSION} (listed: ${EXPECTED_SHA:-nothing}, downloaded: ${ACTUAL_SHA})" >&2
+  exit 1
+fi
+echo "[bundle] verified ${NODE_ARCHIVE} against nodejs.org's SHASUMS256.txt (sha256 ${ACTUAL_SHA})"
+if [ "$OSFAM" = "win32" ]; then
   if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$WORK/node.zip" -d "$WORK"
+    unzip -q "$WORK/$NODE_ARCHIVE" -d "$WORK"
   else
-    tar -xf "$WORK/node.zip" -C "$WORK"   # bsdtar can read zip
+    tar -xf "$WORK/$NODE_ARCHIVE" -C "$WORK"   # bsdtar can read zip
   fi
   NODE_BIN="$WORK/${NODE_DIST}/node.exe"
 else
-  NODE_DIST="node-${NODE_VERSION}-${TARGET}"
-  NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.tar.gz"
-  echo "[bundle] downloading ${NODE_URL}"
-  curl -fsSL "$NODE_URL" -o "$WORK/node.tar.gz"
-  tar -xzf "$WORK/node.tar.gz" -C "$WORK"
+  tar -xzf "$WORK/$NODE_ARCHIVE" -C "$WORK"
   NODE_BIN="$WORK/${NODE_DIST}/bin/node"
 fi
 [ -f "$NODE_BIN" ] || { echo "[bundle] error: node binary not found ($NODE_BIN)" >&2; exit 1; }

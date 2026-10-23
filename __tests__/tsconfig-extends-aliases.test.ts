@@ -18,12 +18,14 @@
  *  - the nearest config wins: a child's own `paths` replaces (not merges with)
  *    the parent's, which is what `tsc` does
  *  - a cyclic `extends` terminates instead of blowing the stack
+ *  - a `baseUrl` with no `paths` still loads, and only a declared `baseUrl`
+ *    reads a bare specifier from its directory
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { loadProjectAliases, applyAliases } from '../src/resolution/path-aliases';
+import { loadProjectAliases, applyAliases, aliasAndBaseUrlCandidates } from '../src/resolution/path-aliases';
 
 function write(file: string, content: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -178,5 +180,65 @@ describe('tsconfig `extends` chains (#1534)', () => {
     write(path.join(root, 'tsconfig.json'), { extends: './tsconfig.base.json' });
 
     expect(loadProjectAliases(root)).toBeNull();
+  });
+});
+
+describe('a baseUrl with no paths', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tsbaseurl-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('loads a jsconfig that sets only baseUrl (CRA / Vite admin templates)', () => {
+    write(path.join(root, 'jsconfig.json'), { compilerOptions: { baseUrl: 'src' } });
+
+    const aliases = loadProjectAliases(root);
+    expect(aliases).not.toBeNull();
+    expect(aliases!.patterns).toEqual([]);
+    expect(aliases!.declaresBaseUrl).toBe(true);
+    expect(aliasAndBaseUrlCandidates('layout/MainLayout', aliases!, root)).toEqual(['src/layout/MainLayout']);
+  });
+
+  it('takes a baseUrl inherited through extends, relative to the file that set it', () => {
+    write(path.join(root, 'config/tsconfig.base.json'), { compilerOptions: { baseUrl: '../src' } });
+    write(path.join(root, 'tsconfig.json'), { extends: './config/tsconfig.base.json' });
+
+    const aliases = loadProjectAliases(root);
+    expect(aliases?.declaresBaseUrl).toBe(true);
+    expect(aliasAndBaseUrlCandidates('utils/format', aliases!, root)).toEqual(['src/utils/format']);
+  });
+
+  it('tries the most specific paths pattern before baseUrl', () => {
+    write(path.join(root, 'tsconfig.json'), {
+      compilerOptions: { baseUrl: '.', paths: { 'shared/*': ['libs/shared/src/*'] } },
+    });
+
+    const aliases = loadProjectAliases(root);
+    expect(aliasAndBaseUrlCandidates('shared/date', aliases!, root)).toEqual(['libs/shared/src/date', 'shared/date']);
+    expect(aliasAndBaseUrlCandidates('components/Button', aliases!, root)).toEqual(['components/Button']);
+  });
+
+  it('reads a catch-all "*" pattern without a baseUrl, but nothing else from the config directory', () => {
+    // mantis-free-react-admin-template's vite/jsconfig.json: `paths` alone,
+    // anchored at the config's own directory (TypeScript 4.1+).
+    write(path.join(root, 'jsconfig.json'), { compilerOptions: { paths: { '*': ['./src/*'] } } });
+
+    const aliases = loadProjectAliases(root);
+    expect(aliases?.declaresBaseUrl).toBe(false);
+    expect(aliasAndBaseUrlCandidates('pages/auth/Register', aliases!, root)).toEqual(['src/pages/auth/Register']);
+
+    write(path.join(root, 'jsconfig.json'), { compilerOptions: { paths: { '@/*': ['./src/*'] } } });
+    expect(aliasAndBaseUrlCandidates('pages/auth/Register', loadProjectAliases(root)!, root)).toEqual([]);
+  });
+
+  it('drops a candidate that leaves the project', () => {
+    write(path.join(root, 'jsconfig.json'), { compilerOptions: { baseUrl: 'src' } });
+
+    expect(aliasAndBaseUrlCandidates('../../outside/x', loadProjectAliases(root)!, root)).toEqual([]);
   });
 });

@@ -33,6 +33,7 @@ import type { Edge, Language } from '../types';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import { stripCommentsForRegex } from './strip-comments';
+import { escapeRegExp } from '../utils';
 import { isTestPath } from '../search/query-utils';
 import { parseHrefExpression, routesForFile, toHref, type HrefLiteral } from './frameworks/expo-router';
 import { matchBracket } from './frameworks/object-literal';
@@ -50,7 +51,7 @@ const LINK_TAGS = ['Link', 'NavLink', 'Navigate', 'Redirect', 'LinkContainer', '
 /** `<Tag … to=…>` for any of `tags`, the attribute anywhere in the tag. */
 function linkTagPattern(tags: readonly string[]): RegExp {
   // An attribute before `to` may hold an arrow (`onMouseEnter={() => …}`), whose `>` is not the tag's end.
-  return new RegExp(`<(${tags.map((t) => t.replace(/[$]/g, '\\$&')).join('|')})\\b((?:[^>]|=>)*?)\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`, 'g');
+  return new RegExp(`<(${tags.map(escapeRegExp).join('|')})\\b((?:[^>]|=>)*?)\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`, 'g');
 }
 
 const LINK_TAG = linkTagPattern(LINK_TAGS);
@@ -131,7 +132,7 @@ export async function reactRouterLinkEdges(ctx: ResolutionContext, onYield: Mayb
     if (!source || !/\bto\s*=/.test(source)) continue;
     const tags = linkTagsFor(file, wrappers, ctx);
     const pattern = tags.length === LINK_TAGS.length ? LINK_TAG : linkTagPattern(tags);
-    if (!new RegExp(`<(?:${tags.join('|')})\\b`).test(source)) continue;
+    if (!new RegExp(`<(?:${tags.map(escapeRegExp).join('|')})\\b`).test(source)) continue;
     const safe = stripCommentsForRegex(source, 'typescript');
     const nodes = ctx.getNodesInFile(file);
     const lineOf = makeLineAt(safe, 1);

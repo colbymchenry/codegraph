@@ -102,6 +102,13 @@ describe('describeSynthesizedHop', () => {
     [{ synthesizedBy: 'redux-thunk', via: 'fetchUser' }, 'redux thunk', ''],
     [{ synthesizedBy: 'gin-middleware-chain', via: 'Auth' }, 'gin middleware chain', ''],
     [{ synthesizedBy: 'event-bus', channel: 'event', event: 'user.created' }, 'bus event `user.created`', ''],
+    // A Go func field, and one whose function was copied in from another field.
+    [{ synthesizedBy: 'go-func-field', field: 'Lexer.state' }, 'func field `Lexer.state`', ''],
+    [
+      { synthesizedBy: 'go-func-field', field: 'Discovery.refreshf', via: 'Options.RefreshF' },
+      'func field `Discovery.refreshf` (set from `Options.RefreshF`)',
+      '',
+    ],
     // The detail only the call paths print.
     [{ synthesizedBy: 'queue-job', event: 'send-email', queue: 'emails' }, 'queue job `send-email`', ' on `emails`'],
     [{ synthesizedBy: 'event-bus', channel: 'socket', event: 'chat', tier: 'client→server' }, 'socket message `chat`', ' → server'],

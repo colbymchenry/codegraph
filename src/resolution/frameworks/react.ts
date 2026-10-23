@@ -11,7 +11,8 @@ import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
 import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
-import { makeLineAt } from '../synth-utils';
+import { escapeRegExp } from '../../utils';
+import { FN_KINDS, makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
 
@@ -84,16 +85,39 @@ export const reactResolver: FrameworkResolver = {
       isPascalCase(ref.referenceName) &&
       !isBuiltInType(ref.referenceName)
     ) {
-      // A name the file declares itself is that declaration, whatever refers
-      // to it — a route's `element`, a page's default export, a type: the
-      // module a `const RegisterPage = Loadable(lazy(() =>
-      // import('pages/auth/Register')))` loads, the function a value wraps, or
-      // else the declaration, which name matching binds — never a same-named
-      // component in another app of the repository.
-      const own = declaredComponent(ref.referenceName, ref.filePath, context);
-      if (own) {
-        return own.component ? { original: ref, targetNodeId: own.component.id, confidence: 0.9, resolvedBy: 'framework' } : null;
+      // A type annotation is name matching's, which scopes a type as
+      // TypeScript does — the file's own, an import's or a global one — and
+      // never a component elsewhere: component lookup handed the `Option`
+      // annotations of outline's InputSelect.tsx, which declares `type
+      // Option`, to the `Option` component of Export/ExportDialog.tsx, and
+      // mastodon's `<Item>` type parameters to the `Item` class of
+      // media_gallery.jsx. Only a type alias or interface the file declares
+      // beside a value or a component of its name is decided here, where both
+      // are the file's own: the annotation is the type, as bigbluebutton's
+      // `type ModalRegistration` is beside its render-prop component `const
+      // ModalRegistration = (…) =>`. (A class is a type and a value at once.)
+      const own = ownDeclarations(ref.referenceName, ref.filePath, context);
+      if (namesType(ref)) {
+        const type = own.find((n) => n.kind === 'type_alias' || n.kind === 'interface');
+        return type && own.some((n) => n.kind !== 'type_alias' && n.kind !== 'interface' && n.kind !== 'class')
+          ? { original: ref, targetNodeId: type.id, confidence: 0.8, resolvedBy: 'framework' } : null;
       }
+      // Anything else the file declares itself is that declaration, whatever
+      // refers to it — a route's `element`, a page's default export — never a
+      // same-named component in another app of the repository: the module a
+      // `const RegisterPage = Loadable(lazy(() =>
+      // import('pages/auth/Register')))` loads, the function a value wraps, a
+      // function, class or component of that name, or else the declaration,
+      // which name matching binds.
+      const value = declaredComponent(ref.referenceName, ref.filePath, context);
+      if (value) {
+        return value.component ? { original: ref, targetNodeId: value.component.id, confidence: 0.9, resolvedBy: 'framework' } : null;
+      }
+      const component = own.find((n) => COMPONENT_KINDS.has(n.kind));
+      if (component) {
+        return { original: ref, targetNodeId: component.id, confidence: 0.8, resolvedBy: 'framework' };
+      }
+      if (own.length > 0) return null;
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
@@ -245,6 +269,8 @@ export const reactResolver: FrameworkResolver = {
 const LAZY_ROUTE_PREFIX = 'lazy-import:';
 const ROUTE_PARTS_PREFIX = 'route-parts:';
 const LAYOUT_PREFIX = 'layout:';
+/** React Router's `<Outlet />`: what a route with no element of its own renders, the routes inside it. */
+const OUTLET = 'Outlet';
 
 /**
  * The export a lazy route's loader picks, named the way Vue Router and
@@ -291,7 +317,7 @@ function constantPathValue(expr: string, fromFile: string, context: ResolutionCo
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
-  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${escapeRegExp(name)}\\b`))));
   return open < 0 ? null : readObjectPath(text, open, keys);
 }
 
@@ -323,7 +349,7 @@ export function configHrefExpression(expr: string, fromFile: string, context: Re
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
-  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${escapeRegExp(name)}\\b`))));
   if (open < 0) return null;
   let value = readObjectValue(text, open, keys);
   if (value === null) return null;
@@ -586,7 +612,7 @@ function ownExport(source: string, name: string): string | null {
   if (name === 'default') {
     const declared = defaultExportedName(source);
     if (declared) return declared;
-  } else if (new RegExp(String.raw`\bexport\s+(?:async\s+)?(?:const|let|var|function|class)\s+${name.replace(/\$/g, '\\$')}(?![\w$])`).test(source)) {
+  } else if (new RegExp(String.raw`\bexport\s+(?:async\s+)?(?:const|let|var|function|class)\s+${escapeRegExp(name)}(?![\w$])`).test(source)) {
     return name;
   }
   return extractLocalExportAliases(source).find((a) => a.exportedName === name)?.localName ?? null;
@@ -859,6 +885,27 @@ function handedComponent(value: Node, context: ResolutionContext, nodes = contex
 }
 
 /**
+ * The name of the component a wrapper component's declaration hands its
+ * rendering to: what `styled(…)` is given (outline's `styled(ActionButton)`,
+ * whatever `.attrs(…)`, `.withConfig(…)`, type arguments or template follow),
+ * or what a `memo` or `forwardRef` call wraps (`memo(Button)`, `React.memo(Row,
+ * areEqual)`, `memo(forwardRef(Input))`; `wrappedName`). React renders it
+ * whenever it renders the wrapper, so a JSX tag's render flow goes on to it.
+ * Null for a wrapper of an element (`styled.div`, `styled('a')`) and for one
+ * around an inline render function, which has a body of its own.
+ */
+export function wrappedComponentName(component: Node, context: ResolutionContext): string | null {
+  const code = stripCommentsForRegex(declarationText(component, context), 'typescript');
+  const init = initializerAt(code, component.name.length);
+  if (init < 0) return null;
+  const expression = code.slice(init, statementEnd(code, init)).trim();
+  const styled = /^styled\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]/.exec(expression);
+  const name = styled ? styled[1]!
+    : /^(?:React\s*\.\s*)?(?:memo|forwardRef)\b/.test(expression) ? wrappedName(expression) : null;
+  return name && isPascalCase(name) && name !== component.name ? name : null;
+}
+
+/**
  * The component a route's `layout:` reference names, found the way the
  * route's own component is: through the route file's import of it, else
  * declared in reach — or a lazily loaded layout module's component, or the
@@ -914,6 +961,14 @@ interface RouteScope {
   lazy?: string;
   /** A `<Route>` element: a route even with nothing to render (a `<Route path>` that only groups others). */
   jsx?: boolean;
+  /**
+   * A route object that renders React Router's `<Outlet />` — `element:
+   * <Outlet />`, `Component: Outlet`, a loader handing back `{ Component:
+   * Outlet }` — as a route with no element does: a route at its address with
+   * nothing of its own, like a `<Route path>` that only groups others, and no
+   * layout around the routes inside it.
+   */
+  outlet?: boolean;
   /**
    * A layout at no address of its own: `{ element: <Shell/>, children }`, with
    * neither `path` nor `index`, or a `<Route element={<RequireAuth/>}>` (no
@@ -1026,8 +1081,10 @@ function scanRoutes(
     // then the innermost wrapper: `<RequireAuth><Outlet /></RequireAuth>` renders the guard.
     return own.find(content) ?? props.find(content) ?? [...own].reverse().find((t) => t !== 'Outlet') ?? own[0];
   };
+  // The component an `element` shows, `Outlet` included.
+  const elementTag = (value: string | undefined): string | undefined => componentName(value, true);
   // The page an `element` shows: `element={<Outlet />}` renders the route inside it and nothing of its own.
-  const elementPage = (value: string | undefined): string | undefined => componentName(value, true)?.replace(/^Outlet$/, '') || undefined;
+  const elementPage = (value: string | undefined): string | undefined => elementTag(value)?.replace(/^Outlet$/, '') || undefined;
   // The few characters before `at`, trailing whitespace skipped: enough for the
   // end-anchored checks below without copying the whole prefix per `/` or `<`.
   const tokenBefore = (at: number): string => {
@@ -1167,12 +1224,18 @@ function scanRoutes(
       const pathField = fields.get('path');
       const path = pathField && literal(pathField.value);
       const expr = pathField && path === undefined && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(pathField.value) ? pathField.value : undefined;
-      const component = componentName(fields.get('element')?.value, true)
-        ?? componentName(fields.get('Component')?.value, false);
-      const lazy = lazyRouteReference(fields.get('lazy')?.value, elementPage);
+      const shown = elementTag(fields.get('element')?.value) ?? componentName(fields.get('Component')?.value, false);
+      const loaded = lazyRouteReference(fields.get('lazy')?.value, elementTag);
+      // A route with no element renders an `<Outlet />`, so one written with
+      // it renders nothing of its own either: a route at its address, and no
+      // layout around the routes inside it. At its parent's address (`path:
+      // ''`) it only groups them, the parent's page staying the one there.
+      const outlet = (shown ?? loaded) === OUTLET && path !== '';
+      const component = shown === OUTLET ? undefined : shown;
+      const lazy = loaded === OUTLET ? undefined : loaded;
       const index = fields.get('index');
       if (pathField && (path !== undefined || expr)) {
-        scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, start: at, end: i, component, lazy });
+        scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, start: at, end: i, component, lazy, outlet });
       } else if (!pathField && index?.value === 'true') {
         // `{ index: true, element: <Home /> }` is the page at its parent's address.
         scopes.push({ part: { lit: '' }, at: index.at, start: at, end: i, component, lazy });
@@ -1223,7 +1286,9 @@ function scanRoutes(
       routeTags.push({ at, spreads, path: expression('path')?.trim() });
       const element = elementPage(expression('element'));
       const component = componentName(expression('component'), false) ?? element;
-      const lazy = lazyRouteReference(expression('lazy'), elementPage);
+      const loaded = lazyRouteReference(expression('lazy'), elementTag);
+      // A `<Route>` is a route with nothing of its own to render already.
+      const lazy = loaded === OUTLET ? undefined : loaded;
       const route: RouteScope = { part: { lit: path ?? '' }, at, start: at, end: source.length, component, lazy, jsx: true };
       if (path) scope = route;
       else if (pathText === undefined || path === '') {
@@ -1301,7 +1366,7 @@ function scanRoutes(
     const outer = around(s.start, s.end);
     return !outer.some((c) => c.opaque) && (outer.some((c) => Boolean(c.part.lit || c.part.expr)) || inRouter(s));
   };
-  const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || renders(s)) && addressed(s)));
+  const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || s.outlet || renders(s)) && addressed(s)));
   const layout = (c: RouteScope): boolean => renders(c) && !c.opaque;
   const routes: RouteDeclaration[] = [];
   for (const scope of pages) {
@@ -1481,14 +1546,17 @@ const FIRST_IMPORT = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/;
  * - A component of the route's own file it returns is named as written:
  *   `return { loader, Component: SettingsPage }`.
  *
- * Undefined when it renders nothing, handing over only a `loader`. A loader
- * this does not read, such as a helper's (`lazyPage(() => import('./x'))`)
- * or `.then(convert)`, loads the module its first import names, as before.
+ * `Outlet` when it hands back React Router's (`return { Component: Outlet,
+ * loader }`, which Medusa's `:id` routes write to load a breadcrumb): the
+ * routes inside it render in its place. Undefined when it renders nothing,
+ * handing over only a `loader`. A loader this does not read, such as a
+ * helper's (`lazyPage(() => import('./x'))`) or `.then(convert)`, loads the
+ * module its first import names, as before.
  */
-function lazyRouteReference(loader: string | undefined, elementPage: (jsx: string) => string | undefined): string | undefined {
+function lazyRouteReference(loader: string | undefined, elementTag: (jsx: string) => string | undefined): string | undefined {
   if (!loader) return undefined;
   const code = stripCommentsForRegex(loader, 'typescript').trim();
-  const rendered = code.startsWith('{') ? lazyPropertiesRender(code) : routeRender(loaderValue(code, new Map()), elementPage);
+  const rendered = code.startsWith('{') ? lazyPropertiesRender(code) : routeRender(loaderValue(code, new Map()), elementTag);
   if (rendered === null) return undefined;
   if (rendered !== undefined) return rendered;
   const spec = FIRST_IMPORT.exec(code)?.[1];
@@ -1497,9 +1565,10 @@ function lazyRouteReference(loader: string | undefined, elementPage: (jsx: strin
 
 /**
  * What route properties a loader resolves to render: the reference for its
- * page, null for none, undefined for properties this does not read.
+ * page, `Outlet` for React Router's, null for none, undefined for properties
+ * this does not read.
  */
-function routeRender(value: Loaded | null, elementPage: (jsx: string) => string | undefined): string | null | undefined {
+function routeRender(value: Loaded | null, elementTag: (jsx: string) => string | undefined): string | null | undefined {
   if (value?.kind === 'module') return LAZY_ROUTE_PREFIX + value.spec;
   if (value?.kind !== 'object') return undefined;
   const { props, spreads } = objectEntries(value.text);
@@ -1507,14 +1576,17 @@ function routeRender(value: Loaded | null, elementPage: (jsx: string) => string 
   const element = props.get('element');
   const shown = component ?? element;
   if (shown !== undefined) {
-    const named = component !== undefined ? pageReference(valueOf(component, value.scope)) : undefined;
+    const held = component !== undefined ? valueOf(component, value.scope) : null;
+    const named = pageReference(held);
     if (named) return named;
     // The one export the loader imported that it shows, past a guard of the
     // route file's own: `<AgeGate><FireworksPage /></AgeGate>`, `() =>
     // <PrivateRoute component={<Favorites />} />`, `withAuth(Page)`.
     const loaded = loadedExports(shown, value.scope);
     if (loaded.length === 1) return pageReference(loaded[0]!);
-    const tag = component === undefined && loaded.length === 0 ? elementPage(element!) : undefined;
+    const tag = component === undefined && loaded.length === 0 ? elementTag(element!) : undefined;
+    // `Component: Outlet`, `element: <Outlet />`: the routes inside render in its place.
+    if ((held?.kind === 'name' && held.name === OUTLET) || tag === OUTLET) return OUTLET;
     return tag ? pageReference(nameValue(tag, value.scope)) : undefined;
   }
   // `{ ...module }`: the module's exports are the route's properties.
@@ -1937,8 +2009,9 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     if (!source || !CONSUMER_HINT.test(source)) continue;
     const scan = scanRoutes(source, allowsJsx(file), { objects: ROUTER_CALL.test(source), uses: true });
     for (const use of scan.uses) {
-      const table = use.literal !== undefined ? { file, at: use.literal } : tableNamed(use.name!, file, context);
-      enqueue(table, pathValues(use.prefix, file, context), file, use.layouts);
+      const tables = use.literal !== undefined ? [{ file, at: use.literal }] : tableNamed(use.name!, file, context);
+      const prefix = pathValues(use.prefix, file, context);
+      for (const table of tables) enqueue(table, prefix, file, use.layouts);
     }
   }
   const made = new Set<string>();
@@ -1948,7 +2021,10 @@ function tableRoutes(context: ResolutionContext): FrameworkExtractionResult {
     const source = context.readFile(file);
     if (!source) continue;
     const scan = scanRoutes(source, allowsJsx(file), { table: { at, prefix: prefix.map((lit) => ({ lit })), layouts } });
-    for (const named of scan.names) enqueue(tableNamed(named, file, context), pathValues(named.prefix, file, context), file, named.layouts);
+    for (const named of scan.names) {
+      const prefix = pathValues(named.prefix, file, context);
+      for (const table of tableNamed(named, file, context)) enqueue(table, prefix, file, named.layouts);
+    }
     if (ROUTER_CALL.test(source)) continue;
     const lineAt = makeLineAt(source, 1);
     for (const route of scan.routes) {
@@ -1989,43 +2065,61 @@ function scriptLanguage(filePath: string): Language {
   return /\.tsx$/.test(filePath) ? 'tsx' : /\.[cm]?ts$/.test(filePath) ? 'typescript' : /\.jsx$/.test(filePath) ? 'jsx' : 'javascript';
 }
 
-/** The literal a table name stands for in `file`: declared there, or imported. */
-function tableNamed(named: TableName, file: string, context: ResolutionContext, depth = 0): { file: string; at: number } | null {
+/** A table literal: the file it is written in, and where it opens. */
+interface TableLiteral {
+  file: string;
+  at: number;
+}
+
+/**
+ * The literals a table name stands for in `file`: declared there, or
+ * imported. A value that holds a call's result — Medusa's `const routes =
+ * getRouteMap({ … })` — stands for the tables the function returns.
+ */
+function tableNamed(named: TableName, file: string, context: ResolutionContext, depth = 0): TableLiteral[] {
   const source = context.readFile(file);
-  if (!source) return null;
+  if (!source) return [];
   const safe = stripCommentsForRegex(source, 'typescript');
-  const local = declaredTable(safe, named.name, named.call);
-  if (local !== null) return { file, at: local };
+  const local = declaredTable(safe, named.name, named.call, visibleAt(named.at, safe, file, context));
+  if (local.length > 0) return tablesAt(local, file, context, depth);
   const language = scriptLanguage(file);
   const mapping = context.getImportMappings(file, language).find((m) => m.localName === named.name);
-  if (!mapping || mapping.isNamespace || depth > 3) return null;
+  if (!mapping || mapping.isNamespace || depth > 3) return [];
   const target = resolveImportPath(mapping.source, file, language, context);
-  if (!target) return null;
+  if (!target) return [];
   return exportedTable(target, mapping.isDefault ? 'default' : mapping.exportedName, named.call, context, depth + 1);
 }
 
-/** The literal `file` exports as `exported`: `export default [ … ]`, `export default AppRoutes`, `export const routes = [ … ]`, re-exports followed. */
-function exportedTable(file: string, exported: string, call: boolean, context: ResolutionContext, depth: number): { file: string; at: number } | null {
+/** The literals `sites` in `file` stand for: each literal written there, and the tables each function named returns. */
+function tablesAt(sites: TableSite[], file: string, context: ResolutionContext, depth: number): TableLiteral[] {
+  return sites.flatMap((site) =>
+    typeof site === 'number' ? [{ file, at: site }] : depth > 3 ? [] : tableNamed(site, file, context, depth + 1));
+}
+
+/** The literals `file` exports as `exported`: `export default [ … ]`, `export default AppRoutes`, `export const routes = [ … ]`, re-exports followed. */
+function exportedTable(file: string, exported: string, call: boolean, context: ResolutionContext, depth: number): TableLiteral[] {
   const source = context.readFile(file);
-  if (!source) return null;
+  if (!source) return [];
   const safe = stripCommentsForRegex(source, 'typescript');
   let local = exported;
   if (exported === 'default') {
     const m = /\bexport\s+default\s+/.exec(safe);
     if (m) {
       const after = m.index + m[0].length;
-      const inline = call ? returnedTable(safe, after) : safe[after] === '[' || safe[after] === '{' ? after : null;
-      if (inline !== null) return { file, at: inline };
+      // `export default [ … ]`, `export default buildRoutes()`, `export default function routes() { … }`.
+      const inline = call ? returnedTables(safe, after) : heldTable(safe, after);
+      if (inline.length > 0) return tablesAt(inline, file, context, depth);
       local = /^([A-Za-z_$][\w$]*)\s*(?:;|\n|$)/.exec(safe.slice(after))?.[1] ?? '';
     } else local = /\bexport\s*\{[^}]*?\b([A-Za-z_$][\w$]*)\s+as\s+default\b/.exec(safe)?.[1] ?? '';
   } else {
     // `export { appRoutes as routes }`
-    const alias = new RegExp(`\\bexport\\s*\\{[^}]*?\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${exported.replace(/\$/g, '\\$')}\\b`).exec(safe);
+    const alias = new RegExp(`\\bexport\\s*\\{[^}]*?\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${escapeRegExp(exported)}\\b`).exec(safe);
     if (alias) local = alias[1]!;
   }
-  const at = local ? declaredTable(safe, local, call) : null;
-  if (at !== null) return { file, at };
-  if (depth > 3) return null;
+  // What a module exports is declared at its top level.
+  const declared = local ? declaredTable(safe, local, call, visibleAt(undefined, safe, file, context)) : [];
+  if (declared.length > 0) return tablesAt(declared, file, context, depth);
+  if (depth > 3) return [];
   // `export { routes } from './routes'`, `export { default as routes } from './routes'`, `export * from './routes'`.
   const language = scriptLanguage(file);
   for (const re of context.getReExports?.(file, language) ?? []) {
@@ -2033,41 +2127,244 @@ function exportedTable(file: string, exported: string, call: boolean, context: R
     const target = resolveImportPath(re.source, file, language, context);
     if (!target) continue;
     const found = exportedTable(target, re.kind === 'named' ? re.originalName : exported, call, context, depth + 1);
-    if (found) return found;
+    if (found.length > 0) return found;
   }
-  return null;
+  return [];
 }
 
-/** Where `name`'s table literal opens, for `const name = [ … ]` (or a function returning one when `call`). */
-function declaredTable(safe: string, name: string, call: boolean): number | null {
-  const id = name.replace(/\$/g, '\\$');
-  const decl = new RegExp(`(?:^|[^\\w$.])(?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*`).exec(safe);
+/**
+ * Where `name`'s table literal opens, for `const name = [ … ]` (or the tables
+ * a function returns when `call`) — or, for `const name = getRouteMap({ …
+ * })`, the function whose returned table the value holds. Of several
+ * declarations of the name, the one `visible` picks.
+ */
+function declaredTable(
+  safe: string,
+  name: string,
+  call: boolean,
+  visible: (keywords: number[]) => number | undefined
+): TableSite[] {
+  const id = escapeRegExp(name);
+  const decls = [...safe.matchAll(new RegExp(`(?:^|[^\\w$.])((?:const|let|var)\\s+${id}\\s*(?::[^=;]*)?=\\s*)`, 'g'))];
+  const chosen = decls.length > 0 ? visible(decls.map((d) => d.index + d[0].length - d[1]!.length)) : undefined;
+  const decl = chosen === undefined ? undefined : decls[chosen];
   if (decl) {
     const after = decl.index + decl[0].length;
-    if (call) return returnedTable(safe, after);
-    return safe[after] === '[' || safe[after] === '{' ? after : null;
+    return call ? returnedTables(safe, after) : heldTable(safe, after);
   }
-  if (!call) return null;
+  if (!call) return [];
   const fn = new RegExp(`(?:^|[^\\w$.])function\\s+${id}\\s*\\(`).exec(safe);
-  return fn ? returnedTable(safe, fn.index + fn[0].indexOf('function')) : null;
+  return fn ? returnedTables(safe, fn.index + fn[0].indexOf('function')) : [];
 }
 
-/** The table a function at `at` returns: `(user) => [ … ]`, `(user) => ([ … ])`, `function routes(user) { return [ … ]; }`. */
-function returnedTable(safe: string, at: number): number | null {
-  const head = /^(?:async\s+)?(?:function\b[^(]*\([^)]*\)|\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^={]*)?(=>)?\s*/.exec(safe.slice(at));
-  if (!head) return null;
-  let i = at + head[0].length;
-  if (head[1]) {
-    while (safe[i] === '(') {
-      i++;
-      while (/\s/.test(safe[i] ?? '')) i++;
-    }
-    if (safe[i] === '[') return i;
+/** A table to read: where its literal opens in the file at hand, or a function whose returned tables to read. */
+type TableSite = number | TableName;
+
+/**
+ * The tables a value written at `at` gives: the literal there, or the
+ * function a call there names — `getRouteMap({ … })`, `await loadRoutes()` —
+ * whose returned table it is, and through `useMemo` what its callback
+ * returns: `useMemo(() => getRoutes(user), [user])`, `useMemo(getRoutes, [])`.
+ */
+function heldTable(safe: string, at: number): TableSite[] {
+  // Parentheses around the value change nothing: `return ([ … ])`.
+  while (safe[at] === '(') at = skipSpace(safe, at + 1);
+  if (safe[at] === '[' || safe[at] === '{') return [at];
+  const memo = /(?:React\s*\.\s*)?useMemo\s*(?:<[^()]*>)?\s*\(\s*/y;
+  memo.lastIndex = at;
+  if (memo.test(safe)) {
+    const handed = /([A-Za-z_$][\w$]*)\s*,/y;
+    handed.lastIndex = memo.lastIndex;
+    const fn = handed.exec(safe);
+    return fn ? [{ name: fn[1]!, call: true, at: memo.lastIndex }] : returnedTables(safe, memo.lastIndex);
+  }
+  const call = /(await\s+)?([A-Za-z_$][\w$]*)\s*\(/y;
+  call.lastIndex = at;
+  const m = call.exec(safe);
+  return m ? [{ name: m[2]!, call: true, at: at + (m[1]?.length ?? 0) }] : [];
+}
+
+/**
+ * Picks, of a name's declarations in `file` (where each keyword sits), the
+ * one in scope at `use`: in the innermost function around the use that
+ * declares the name, the last declaration before the use, else the first
+ * after it; else one at the module's top level. A declaration inside another
+ * function is that function's own. With no use, it picks one at the top
+ * level, which is what a module exports. The functions are the graph's — a
+ * component, a method, an arrow function held in a `const` — so the blocks
+ * inside one function are not told apart.
+ */
+function visibleAt(use: number | undefined, safe: string, file: string, context: ResolutionContext): (keywords: number[]) => number | undefined {
+  return (keywords) => {
+    const lineStarts = [0];
+    for (let i = safe.indexOf('\n'); i !== -1; i = safe.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+    const offset = (line: number, column: number): number => (lineStarts[line - 1] ?? safe.length) + column;
+    const fns = context.getNodesInFile(file)
+      .filter((n) => FN_KINDS.has(n.kind))
+      .map((n) => ({ start: offset(n.startLine, n.startColumn), end: offset(n.endLine, n.endColumn) }));
+    // The function a declaration's own value is (`const routes = (user) =>
+    // [ … ]`) starts after the keyword, so it is not around it.
+    const around = (at: number) => fns.filter((f) => f.start < at && f.end > at);
+    const scopes = new Set(use === undefined ? [] : around(use));
+    let best: number | undefined;
+    let depth = -1;
+    keywords.forEach((at, i) => {
+      const encl = around(at);
+      if (!encl.every((f) => scopes.has(f))) return;
+      if (encl.length > depth || (encl.length === depth && use !== undefined && at < use)) {
+        best = i;
+        depth = encl.length;
+      }
+    });
+    return best;
+  };
+}
+
+/**
+ * The tables the function written at `at` returns: its expression body's
+ * (`(user) => [ … ]`, `() => buildRoutes()`), or what each `return` of its
+ * own hands back, an early guard (`if (!user) return [];`) and every branch
+ * alike. A `return` in a function written inside it (`.map((p) => { return
+ * [ … ]; })`, a method's) is that function's.
+ */
+function returnedTables(safe: string, at: number): TableSite[] {
+  const body = functionBody(safe, at);
+  if (!body) return [];
+  if (!body.block) return heldTable(safe, body.start);
+  return ownReturns(safe, body.start, body.end).flatMap((value) => heldTable(safe, value));
+}
+
+/**
+ * Where the function written at `at` keeps its body: a block, from its `{` to
+ * its `}`, or an arrow's expression, at `start`. Null for no function.
+ */
+function functionBody(safe: string, at: number): { block: boolean; start: number; end: number } | null {
+  let i = skipSpace(safe, at);
+  const keyword = (word: string): boolean => {
+    const re = new RegExp(`${word}\\b`, 'y');
+    re.lastIndex = i;
+    if (!re.test(safe)) return false;
+    i = skipSpace(safe, re.lastIndex);
+    return true;
+  };
+  keyword('async');
+  const arrow = !keyword('function');
+  const name = /\*?\s*[A-Za-z_$][\w$]*/y;
+  if (!arrow) {
+    name.lastIndex = i;
+    if (name.test(safe)) i = skipSpace(safe, name.lastIndex);
+  }
+  if (safe[i] === '(') {
+    const close = matchBracket(safe, i);
+    if (close < 0) return null;
+    i = skipSpace(safe, close + 1);
+  } else {
+    // `user => [ … ]`
+    const param = /[A-Za-z_$][\w$]*/y;
+    param.lastIndex = i;
+    if (!arrow || !param.test(safe)) return null;
+    i = skipSpace(safe, param.lastIndex);
+  }
+  // A return type, up to the arrow or the body: `(): RouteObject[] => [ … ]`.
+  if (safe[i] === ':') {
+    const stop = safe.indexOf(arrow ? '=>' : '{', i);
+    if (stop < 0) return null;
+    i = stop;
+  }
+  if (arrow) {
+    if (!safe.startsWith('=>', i)) return null;
+    i = skipSpace(safe, i + 2);
+    if (safe[i] !== '{') return { block: false, start: i, end: i };
   }
   if (safe[i] !== '{') return null;
-  const close = matchBracket(safe, i);
-  const ret = /\breturn\s*(?:\(\s*)?\[/.exec(safe.slice(i, close < 0 ? safe.length : close));
-  return ret ? i + ret.index + ret[0].length - 1 : null;
+  const end = blockEnd(safe, i);
+  return end < 0 ? null : { block: true, start: i, end };
+}
+
+/** The statements that start a block of their own after a parenthesized head: never a method's. */
+const BLOCK_HEADS = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+
+/**
+ * Where each `return` of the block opening at `open` hands back its value:
+ * the block's own, past the functions written inside it — an arrow's block,
+ * a `function`, a method like `lazy() { … }`.
+ */
+function ownReturns(safe: string, open: number, close: number): number[] {
+  const values: number[] = [];
+  /** Past the body of a function whose parameters open at `paren`; -1 when there is none. */
+  const pastBody = (paren: number): number => {
+    const params = paren < 0 ? -1 : matchBracket(safe, paren);
+    if (params < 0) return -1;
+    let i = skipSpace(safe, params + 1);
+    if (safe[i] === ':') i = safe.indexOf('{', i);
+    return i >= 0 && safe[i] === '{' ? blockEnd(safe, i) : -1;
+  };
+  for (let i = open + 1; i < close; i++) {
+    const ch = safe[i]!;
+    if (opensString(safe, i)) {
+      const end = skipString(safe, i);
+      if (end < 0) break;
+      i = end;
+    } else if (ch === '=' && safe[i + 1] === '>') {
+      const body = skipSpace(safe, i + 2);
+      const end = safe[body] === '{' ? blockEnd(safe, body) : -1;
+      i = end < 0 ? i + 1 : end;
+    } else if (/[A-Za-z_$]/.test(ch) && !/[\w$.]/.test(safe[i - 1] ?? '')) {
+      const word = /[A-Za-z_$][\w$]*/y;
+      word.lastIndex = i;
+      word.test(safe);
+      const name = safe.slice(i, word.lastIndex);
+      const next = skipSpace(safe, word.lastIndex);
+      if (name === 'return') {
+        values.push(next);
+      } else if (name === 'function') {
+        const end = pastBody(safe.indexOf('(', next));
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      } else if (safe[next] === '(' && !BLOCK_HEADS.has(name)) {
+        const end = pastBody(next);
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      }
+      i = word.lastIndex - 1;
+    }
+  }
+  return values;
+}
+
+/**
+ * The index of the brace closing the block at `open`, or -1. A quote right
+ * after a word is an apostrophe in JSX text (`<p>Don't</p>`), not a string.
+ */
+function blockEnd(safe: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < safe.length; i++) {
+    if (opensString(safe, i)) {
+      const end = skipString(safe, i);
+      if (end < 0) return -1;
+      i = end;
+      continue;
+    }
+    const ch = safe[i]!;
+    if (ch === '{' || ch === '(' || ch === '[') depth++;
+    else if ((ch === '}' || ch === ')' || ch === ']') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** True for a quote that opens a string or template, not an apostrophe in JSX text. */
+function opensString(safe: string, i: number): boolean {
+  const ch = safe[i];
+  return ch === '`' || ((ch === '"' || ch === "'") && !/[\w$]/.test(safe[i - 1] ?? ''));
+}
+
+function skipSpace(safe: string, i: number): number {
+  while (/\s/.test(safe[i] ?? '')) i++;
+  return i;
 }
 
 /**
@@ -2091,6 +2388,28 @@ const BUILT_IN_TYPES = new Set([
 ]);
 
 const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
+
+/**
+ * What `filePath` declares at its top level under `name`: a type alias, an
+ * interface, a class, an enum, a function, a component or a value. A
+ * declaration nested in another (`EmojiMenu::renderMenuItem`) carries its
+ * owner in its qualified name; an import is no declaration.
+ */
+function ownDeclarations(name: string, filePath: string, context: ResolutionContext): Node[] {
+  return (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
+    .filter((n) => n.qualifiedName === name && n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file');
+}
+
+/**
+ * Whether a reference is written where TypeScript reads a type: what a class
+ * implements, or a type annotation's name — the extractor writes a
+ * `references` ref only for a name in a type, and a route's reference to what
+ * it renders comes from the router's own extraction.
+ */
+function namesType(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'implements' ||
+    (ref.referenceKind === 'references' && !ref.fromNodeId.startsWith('route:'));
+}
 
 /**
  * Resolve a component reference using name-based lookup

@@ -35,6 +35,7 @@ import { resolveProjectFile } from '../security';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import { createWhenReader } from './when';
 import { toNodeRef, type WireNodeRef } from './wire';
+import { escapeRegExp } from '../../utils';
 
 // =============================================================================
 // Wire shapes
@@ -586,7 +587,7 @@ function mentionsOf(cg: CodeGraph, projectRoot: string, value: Node): Edge[] {
     .slice(0, MAX_MENTION_FILES);
   if (importers.length === 0) return out;
   const files = cg.getNodesByIds(importers);
-  const word = new RegExp(`(?<![\\w$.])${value.name.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const word = new RegExp(`(?<![\\w$.])${escapeRegExp(value.name)}(?![\\w$])`);
   for (const file of files.values()) {
     if (file.kind !== 'file') continue;
     const found = findIndexedFile(cg, file.filePath.replace(/\\/g, '/'));

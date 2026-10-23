@@ -26,8 +26,10 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
+import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { goFuncFieldEdges } from './go-func-field-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
 import { nextLinkEdges } from './next-router-synthesizer';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
@@ -39,9 +41,12 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
-import { cppSpecializationArguments, crossesCodeBoundary, jsCodeBindsName } from './name-matcher';
-import { declaredComponent, exportedComponent, lazyValueModules } from './frameworks/react';
+import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
+import { goStdlibMethods } from './go-stdlib-methods';
+import { overrideFilter } from './override-parameters';
+import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
+import { isTestPath } from '../search/query-utils';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -61,6 +66,9 @@ const JSX_FAMILY = ['tsx', 'jsx', 'javascript'];
 // the next match, which `opensTag` reads as a type argument, not a tag.
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)(?=[\s/><])/g;
 const MAX_JSX_CHILDREN = 30;
+// A wrapper around a component — `styled(ActionButton)`, `memo(Button)`,
+// `forwardRef(Render)` — renders it without a tag (`wrappedComponentName`).
+const WRAPPER_CALL_RE = /\b(?:styled|memo|forwardRef)\s*\(\s*[A-Z]/;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
 // are already caught by JSX_TAG_RE via the SFC component node.
@@ -178,7 +186,7 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
     );
     if (chDispatchers.length === 0) continue;
-    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
+    const argRe = new RegExp(`${escapeRegExp(reg.node.name)}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
     for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -344,7 +352,9 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
       while ((m = ON_RE.exec(content))) {
         const handlerName = m[2] || m[3];
         if (!handlerName) continue;
-        const handler = ctx.getNodesByName(handlerName).find((n) => n.kind === 'function' || n.kind === 'method');
+        // A manual mock's function is a handler only test code registers (#2455).
+        const handler = ctx.getNodesByName(handlerName).find((n) =>
+          (n.kind === 'function' || n.kind === 'method') && !isManualMockHiddenFrom(n.filePath, file));
         if (!handler) continue;
         const map = handlersByEvent.get(m[1]!) ?? new Map<string, string>();
         map.set(handler.id, `${file}:${lineOf(m.index)}`); handlersByEvent.set(m[1]!, map);
@@ -799,7 +809,9 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
  * interface method. Bridge it like cpp-override: for each class that
  * `implements` an interface (or `extends` an abstract base), link each
  * base/interface method → the class's same-name method (the override) so
- * trace/callees reach the implementation. Over-approximation accepted
+ * trace/callees reach the implementation. Of an overloaded name, an overload
+ * links the methods with its parameters where the language makes an override
+ * repeat them (./override-parameters, #2663). Over-approximation accepted
  * (reachability-correct); capped per class, gated to JVM languages.
  */
 // Languages whose static `implements`/`extends` edges should bridge an
@@ -808,11 +820,19 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
 // kind that holds methods" — i.e. the shape this loop expects. Swift and
 // Scala fit shape-wise (Swift `protocol`/`class`, Scala `trait`/`class`)
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
-// or an `object` (Scala) so the loop also iterates those kinds.
+// or an `object` (Scala) so the loop also iterates those kinds. A `.tsx` or
+// `.jsx` class is a TypeScript or JavaScript class, and its base or interface
+// is often in a `.ts` file, or the other way round.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
+  'java', 'kotlin', 'csharp', 'typescript', 'tsx', 'javascript', 'jsx', 'swift', 'scala', 'go', 'rust',
   'arkts',
 ]);
+/**
+ * Languages whose static and instance methods override only their own kind:
+ * a JS/TS class's statics are inherited and overridden by the subclass's
+ * statics, its instance methods by instance methods (#2761).
+ */
+const STATIC_SPLIT_LANGS: ReadonlySet<string> = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 /**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
  * declared, never synthesized (go-implements writes those), into a struct, an
@@ -823,6 +843,40 @@ function isGoEmbedding(e: Edge, kindOf: (id: string) => NodeKind | null): boolea
   if (e.provenance === 'heuristic') return false;
   const to = kindOf(e.target);
   return to !== null && (kindOf(e.source) !== 'interface' || to === 'interface');
+}
+/** An exported Go identifier starts with an upper-case letter, in Unicode's sense. */
+const GO_EXPORTED_NAME = /^\p{Lu}/u;
+/**
+ * What a Go method matches an interface's method by: its name, and for an
+ * unexported name the package that declares it as well. Go makes the
+ * `refresh` declared in discovery/hetzner and the one declared in
+ * discovery/aws two different methods, so neither satisfies the other's
+ * interface. A package is a directory, the method's own file's, so a method
+ * that embedding promotes keeps the package of the type declaring it.
+ */
+function goMethodKey(m: Node): string {
+  if (GO_EXPORTED_NAME.test(m.name)) return m.name;
+  const file = m.filePath.replace(/\\/g, '/');
+  return `${file.slice(0, Math.max(file.lastIndexOf('/'), 0))}\0${m.name}`;
+}
+/**
+ * {@link goMethodKey} for a method of a standard-library type: its name, and
+ * for an unexported one (`testing.TB`'s `private`) the declaring package,
+ * spelled so it is no directory of the project's.
+ */
+function goStdlibMethodKey(importPath: string | null, name: string): string {
+  return GO_EXPORTED_NAME.test(name) ? name : `std:${importPath ?? ''}\0${name}`;
+}
+/** What a Go type has, or an interface asks for. */
+interface GoMethodNames {
+  /**
+   * Its methods by {@link goMethodKey}: its own, the project types' it
+   * embeds, and those the standard-library types it embeds bring
+   * (./go-stdlib-methods), `error`'s included.
+   */
+  readonly methods: Set<string>;
+  /** Embedded types from outside the index whose methods nothing names, by package and name. */
+  readonly opaque: ReadonlySet<string>;
 }
 /**
  * The top-level items of the Go bracketed list opening at `text[open]` — the
@@ -939,16 +993,37 @@ function goGrpcServerArity(signature: string | undefined): string | null {
  * has the methods promoted from the structs, interfaces and defined types it
  * embeds, at any depth: counting embedded interfaces alone would drop every
  * struct that satisfies one through promoted methods. Synthesized edges are
- * never followed (this pass writes them), and an embedding that resolved to
- * nothing (`io.Closer`) adds nothing.
+ * never followed (this pass writes them).
+ *
+ * A type embedded from outside the index leaves only the resolver's failed
+ * `extends` row. The methods of a standard-library type, and of `error`, are
+ * known (./go-stdlib-methods), with their counts: prometheus's `TBRun` is all
+ * of `testing.TB` plus `Run`, not any struct with a `Run`, and a struct
+ * embedding `sync.Mutex` is hugo's `Locker` but not etcd's gRPC `LockClient`,
+ * whose `Lock` takes a context and a request. Any other outside type's
+ * methods are unknown, so a struct embedding the same type has them, and
+ * otherwise only the one type with every method the interface does name is
+ * taken to implement it — kapacitor's `Diagnostic` (a third-party `Logger`
+ * plus `Log`) has no more claim on every struct with a `Log` than on none.
+ *
+ * Methods match by name, and an unexported name by its package too
+ * ({@link goMethodKey}). prometheus has a `refresher { refresh(…) }` in each of
+ * several discovery packages, and only a type with a `refresh` declared in that
+ * package satisfies it, its own or one embedding brings in: aws's
+ * EC2Discovery, with a `refresh` of package aws, is no hetzner refresher. etcd's
+ * gRPC servers sit outside the generated package and still satisfy its
+ * `KVServer`, whose `mustEmbedUnimplementedKVServer` the `UnsafeKVServer` or
+ * `UnimplementedKVServer` they embed declares there.
  *
  * Each wanted method also needs a declaration with its parameter and result
  * counts, read off the stored signatures: Go wants the signatures identical,
  * and the counts are what the text settles for certain — a cache's `Get(ctx,
- * key, opts ...OpOption)` is no `Get(id types.ID) Peer`. A signature that
- * doesn't read rules nothing out. A gRPC client interface also takes the
- * structs serving its service (see `wantedArities`), the bridge a client's
- * call crosses to reach its handler.
+ * key, opts ...OpOption)` is no `Get(id types.ID) Peer`. A standard-library
+ * method carries its counts in the table, so an `io.Writer`'s `Write` asks for
+ * one parameter and two results. A signature that doesn't read rules nothing
+ * out. A gRPC client interface also takes the structs serving its service
+ * (see `wantedArities`), the bridge a client's call crosses to reach its
+ * handler.
  *
  * Types are not compared, and a promoted name counts even where Go finds it
  * ambiguous or hidden by a field — over-approximation accepted, in line with
@@ -956,7 +1031,7 @@ function goGrpcServerArity(signature: string | undefined): string | null {
  * (`any`) are skipped so they don't match every type, and a struct that
  * embeds the interface keeps the edge its embedding already is.
  */
-async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -984,8 +1059,10 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   for (const i of goInterfaces) typeKind.set(i.id, 'interface');
   const kindOf = (id: string): NodeKind | null => typeKind.get(id) ?? null;
 
-  // Memoized: an embedded base is read once, however many types embed it. Each
-  // method's stored signature rides along for the arity check below.
+  // A type's own methods, each by its goMethodKey, so every method set below
+  // holds an unexported name with its package. Each method's stored signature
+  // rides along under the same key for the arity check below. Memoized: an
+  // embedded base is read once, however many types embed it.
   const ownMemo = new Map<string, Set<string>>();
   const ownSignatures = new Map<string, Map<string, (string | undefined)[]>>();
   const ownMethods = (id: string): Set<string> => {
@@ -996,10 +1073,11 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
       for (const e of queries.getOutgoingEdges(id, ['contains'])) {
         const n = queries.getNodeById(e.target);
         if (!n || n.kind !== 'method') continue;
-        names.add(n.name);
-        const list = signatures.get(n.name);
+        const key = goMethodKey(n);
+        names.add(key);
+        const list = signatures.get(key);
         if (list) list.push(n.signature);
-        else signatures.set(n.name, [n.signature]);
+        else signatures.set(key, [n.signature]);
       }
       ownMemo.set(id, names);
       ownSignatures.set(id, signatures);
@@ -1042,13 +1120,42 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     return [...reached];
   };
 
-  // Own methods plus every embedded type's.
-  const methodSet = (id: string): Set<string> => {
+  // The types each one embeds from outside the index, as the resolver's failed
+  // `extends` rows: the methods of a standard-library type or of `error`, by
+  // key with their arities, or else the embedded type itself, named by the
+  // package it is written through so that the same embedding elsewhere is
+  // recognized.
+  const outside = new Map<string, { stdlib: ReadonlyMap<string, string>[]; opaque: string[] }>();
+  for (const ref of queries.getUnresolvedReferencesFromNodes(typeIds, ['extends'])) {
+    if (ref.language !== 'go' || !ref.filePath) continue;
+    const name = ref.referenceName;
+    const { written, imported } = goRefQualification({ ...ref, filePath: ref.filePath, language: 'go' }, ctx);
+    const importPath = imported?.source ?? null;
+    const known = imported ? goStdlibMethods(importPath, name) : written ? undefined : goStdlibMethods(null, name);
+    let found = outside.get(ref.fromNodeId);
+    if (!found) outside.set(ref.fromNodeId, (found = { stdlib: [], opaque: [] }));
+    if (known) found.stdlib.push(new Map([...known].map(([m, arity]) => [goStdlibMethodKey(importPath, m), arity])));
+    else if (imported) found.opaque.push(`${imported.source}.${name}`);
+    else if (written) found.opaque.push(`${written}.${name}`);
+    else found.opaque.push(`${ref.filePath.replace(/\\/g, '/').replace(/\/?[^/]*$/, '')}#${name}`);
+  }
+  await onYield();
+
+  // Own methods plus every embedded type's, a standard-library one's too.
+  const NONE_OPAQUE: ReadonlySet<string> = new Set();
+  const methodNames = (id: string): GoMethodNames => {
     const types = embedClosure(id);
-    if (types.length === 1) return ownMethods(id);
-    const names = new Set<string>();
-    for (const t of types) for (const m of ownMethods(t)) names.add(m);
-    return names;
+    if (types.length === 1 && !outside.has(id)) return { methods: ownMethods(id), opaque: NONE_OPAQUE };
+    const methods = new Set<string>();
+    const opaque = new Set<string>();
+    for (const t of types) {
+      for (const m of ownMethods(t)) methods.add(m);
+      const out = outside.get(t);
+      if (!out) continue;
+      for (const known of out.stdlib) for (const key of known.keys()) methods.add(key);
+      for (const type of out.opaque) opaque.add(type);
+    }
+    return { methods, opaque };
   };
 
   const covers = (have: Set<string>, want: Set<string>): boolean => {
@@ -1058,11 +1165,18 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     }
     return true;
   };
+  const coversOpaque = (have: GoMethodNames, want: GoMethodNames): boolean => {
+    for (const type of want.opaque) {
+      if (!have.opaque.has(type)) return false;
+    }
+    return true;
+  };
 
-  // Each method name in a type's method set → the arities (`params/results`)
-  // its declarations there have, or null when one of their signatures doesn't
-  // read (then the name rules nothing out). Built only for the pairs whose
-  // names already match.
+  // Each method in a type's method set, by its goMethodKey, → the arities
+  // (`params/results`) its declarations there have, or null when one of their
+  // signatures doesn't read (then the name rules nothing out). A method a
+  // standard-library embedding brings has the table's. Built only for the
+  // pairs whose names already match.
   const arityMemo = new Map<string, Map<string, Set<string> | null>>();
   const methodArities = (id: string): Map<string, Set<string> | null> => {
     let arities = arityMemo.get(id);
@@ -1080,6 +1194,14 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
             arities.set(name, null);
             break;
           }
+          known.add(arity);
+        }
+      }
+      for (const methods of outside.get(t)?.stdlib ?? []) {
+        for (const [name, arity] of methods) {
+          let known = arities.get(name);
+          if (known === null) continue;
+          if (!known) arities.set(name, (known = new Set()));
           known.add(arity);
         }
       }
@@ -1106,6 +1228,8 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
         }
       }
     }
+    // What only a standard-library embedding asks for keeps the table's arity.
+    for (const [name, arities] of own) if (!wanted.has(name)) wanted.set(name, arities);
     return wanted;
   };
 
@@ -1130,21 +1254,22 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     return true;
   };
 
-  // A type without a method satisfies no interface this pass looks at.
+  // A type without a method, or an embedded type nothing describes, satisfies
+  // no interface this pass looks at.
   const candidates: Node[] = [];
-  const candidateMethods = new Map<string, Set<string>>();
+  const candidateMethods = new Map<string, GoMethodNames>();
   for (const s of goImplementers) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const have = methodSet(s.id);
-    if (have.size === 0) continue;
+    const have = methodNames(s.id);
+    if (have.methods.size + have.opaque.size === 0) continue;
     candidates.push(s);
     candidateMethods.set(s.id, have);
   }
 
   for (const iface of goInterfaces) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const want = methodSet(iface.id);
-    if (want.size === 0) continue; // empty interface (`any`) — would match everything
+    const want = methodNames(iface.id);
+    if (want.methods.size + want.opaque.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
     const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
@@ -1162,20 +1287,32 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
     };
     // A struct that needs promoted methods waits for the types declaring all
     // of them, every defined type among them: under the cap, those are what
-    // the interface-dispatch bridge links a call through the interface to.
+    // the interface-dispatch bridge links a call through the interface to. A
+    // namesake it declares of an unexported method from another package is
+    // not one of them: the method it needs is promoted. One that lacks only
+    // the embedded types nothing names the methods of counts when no other
+    // type has the rest.
     const throughEmbedding: Node[] = [];
     let wanted: Map<string, Set<string> | null> | undefined;
+    let covering = 0;
+    let sole: Node | undefined;
     for (const s of candidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       const have = candidateMethods.get(s.id)!;
-      if (!covers(have, want)) continue;
-      if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      if (!covers(have.methods, want.methods)) continue;
       if (!wanted) wanted = wantedArities(iface);
       if (!aritiesFit(s.id, wanted)) continue;
+      covering++;
+      if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
+      if (!coversOpaque(have, want)) {
+        if (covering === 1) sole = s;
+        continue;
+      }
       const own = ownMethods(s.id);
-      if (own !== have && !covers(own, want)) throughEmbedding.push(s);
+      if (want.opaque.size > 0 || (own !== have.methods && !covers(own, want.methods))) throughEmbedding.push(s);
       else link(s);
     }
+    if (sole && covering === 1 && want.methods.size > 0) throughEmbedding.push(sole);
     for (const s of throughEmbedding) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       link(s);
@@ -1326,27 +1463,29 @@ async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYiel
   return edges;
 }
 
-/** The methods a Go struct runs for a name it does not declare, and the line of the embedding they come through. */
+/** The methods a Go struct runs for a method it does not declare, and the line of the embedding they come through. */
 interface GoPromotion {
   methods: Node[];
   line: number;
 }
 
 /**
- * Which embedded type's method a Go struct runs for a name it does not
+ * Which embedded type's method a Go struct runs for a method it does not
  * declare, picked the way Go's selector picks it: breadth-first through the
- * struct's embeddings, the shallowest depth holding the name wins, and the
- * name selects nothing when it occurs more than once at that depth, one type
+ * struct's embeddings, the shallowest depth holding the method wins, and it
+ * selects nothing when it occurs more than once at that depth, one type
  * reached along two paths included. A type met at a shallower depth is not
  * walked again. An embedded interface brings its whole method set at its own
  * depth, and a method it provides is a dynamic call once more, so that is no
  * promotion either. Struct fields are not in the graph: a field that hides a
- * promoted method is not seen.
+ * promoted method is not seen. The method is asked for by its
+ * {@link goMethodKey}: a namesake of an unexported method declared in another
+ * package is another method, so it neither provides nor hides it.
  */
 function goPromotions(
   queries: QueryBuilder,
   methodsOf: (id: string) => Node[]
-): (structId: string, name: string) => GoPromotion | null {
+): (structId: string, key: string) => GoPromotion | null {
   const kinds = new Map<string, NodeKind | null>();
   const kindOf = (id: string): NodeKind | null => {
     let kind = kinds.get(id);
@@ -1382,7 +1521,7 @@ function goPromotions(
       const pending = [id];
       while (pending.length > 0) {
         const at = pending.pop()!;
-        for (const m of methodsOf(at)) names.add(m.name);
+        for (const m of methodsOf(at)) names.add(goMethodKey(m));
         for (const e of embeds(at)) {
           if (reached.has(e.target)) continue;
           reached.add(e.target);
@@ -1393,13 +1532,13 @@ function goPromotions(
     }
     return names;
   };
-  const provides = (id: string, name: string): boolean =>
-    kindOf(id) === 'interface' ? ifaceMethods(id).has(name) : methodsOf(id).some((m) => m.name === name);
+  const provides = (id: string, key: string): boolean =>
+    kindOf(id) === 'interface' ? ifaceMethods(id).has(key) : methodsOf(id).some((m) => goMethodKey(m) === key);
 
   const memo = new Map<string, GoPromotion | null>();
-  return (structId, name) => {
-    const key = `${structId}>${name}`;
-    const hit = memo.get(key);
+  return (structId, key) => {
+    const memoKey = `${structId}>${key}`;
+    const hit = memo.get(memoKey);
     if (hit !== undefined) return hit;
     let found: GoPromotion | null = null;
     // Each type at the current depth, with how many paths reach it and the
@@ -1421,24 +1560,24 @@ function goPromotions(
       let provider: string | undefined;
       for (const [id, at] of next) {
         met.add(id);
-        if (!provides(id, name)) continue;
+        if (!provides(id, key)) continue;
         paths += at.paths;
         provider = id;
       }
       if (provider !== undefined) {
         if (paths === 1 && kindOf(provider) !== 'interface') {
-          found = { methods: methodsOf(provider).filter((m) => m.name === name), line: next.get(provider)!.line };
+          found = { methods: methodsOf(provider).filter((m) => goMethodKey(m) === key), line: next.get(provider)!.line };
         }
         break;
       }
       level = next;
     }
-    memo.set(key, found);
+    memo.set(memoKey, found);
     return found;
   };
 }
 
-async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+async function interfaceOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1474,6 +1613,21 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     ];
     protocolMemo.set(base.id, methods);
     return methods;
+  };
+  // Of a class's same-named methods, the ones that can override one of a
+  // base's overloads (#2663): Java, Kotlin, C# and Scala make an override
+  // repeat the parameters of what it overrides. Asked only for a name that
+  // is overloaded on either side.
+  const overridesOf = overrideFilter(ctx);
+  const nameCounts = new Map<string, Map<string, number>>();
+  const declaredNamed = (base: Node, name: string): number => {
+    let counts = nameCounts.get(base.id);
+    if (!counts) {
+      counts = new Map();
+      for (const m of baseMethodsOf(base)) counts.set(m.name, (counts.get(m.name) ?? 0) + 1);
+      nameCounts.set(base.id, counts);
+    }
+    return counts.get(name) ?? 0;
   };
   // A Go struct also satisfies an interface with the methods its embedded
   // types promote into it (goImplementsEdges counts them), and a call through
@@ -1519,25 +1673,39 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
       const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
-      // link every base overload → every same-name impl overload (keying by name
-      // alone would drop all but one and miss the resolved overload).
-      const implByName = new Map<string, Node[]>();
+      // each base overload links the same-name impl methods that can override
+      // it — by parameters where the language makes an override repeat them
+      // (overrideFilter), else every one (keying by name alone would drop all
+      // but one and miss the resolved overload). A name declared once on each
+      // side pairs as it is. A Go
+      // interface's unexported method is matched in its own package only
+      // (goMethodKey): a namesake the type declares elsewhere is another
+      // method, and the one the interface asks for is promoted.
+      const keyOf = base.language === 'go' && base.kind === 'interface' ? goMethodKey : (m: Node): string => m.name;
+      const implsByKey = new Map<string, Node[]>();
       for (const m of implMethods) {
-        const arr = implByName.get(m.name);
-        if (arr) arr.push(m); else implByName.set(m.name, [m]);
+        const key = keyOf(m);
+        const arr = implsByKey.get(key);
+        if (arr) arr.push(m); else implsByKey.set(key, [m]);
       }
       let added = 0;
       const unmatched: Node[] = [];
       for (const bm of baseMethodsOf(base)) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-        const impls = implByName.get(bm.name);
+        const impls = implsByKey.get(keyOf(bm));
         if (!impls) {
           if (promotes) unmatched.push(bm);
           continue;
         }
-        for (const m of impls) {
+        const overloaded = impls.length > 1 || declaredNamed(base, bm.name) > 1;
+        for (const m of overloaded ? overridesOf(bm, impls) : impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
+          // A JS/TS static method overrides only a static one, and an
+          // instance method only an instance one (#2761): B's `s()` and the
+          // `static s()` of `class A extends B` are unrelated, and a call to
+          // one never runs the other.
+          if (STATIC_SPLIT_LANGS.has(m.language) && (bm.isStatic === true) !== (m.isStatic === true)) continue;
           const key = `${bm.id}>${m.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -1565,7 +1733,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     let budget = left;
     for (const bm of methods) {
       if (budget <= 0) break;
-      const promotion = goPromotion(cls.id, bm.name);
+      const promotion = goPromotion(cls.id, goMethodKey(bm));
       if (!promotion) continue;
       for (const m of promotion.methods) {
         if (budget <= 0) break;
@@ -1854,7 +2022,9 @@ function jsxChild(
 ): Node | undefined {
   const own = ownValueOf(name);
   if (own) return own.component ?? own.declaration;
-  const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  // A manual mock's component renders only in a test (#2455): production
+  // code's `<Chart />` never means `__mocks__/…`'s `Chart`.
+  const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind) && !isManualMockHiddenFrom(n.filePath, file));
   const local = candidates.find((n) => n.filePath === file);
   if (local) return local;
   if (importedFromPackage(ctx, name, file)) return undefined;
@@ -1890,6 +2060,32 @@ function jsxChild(
 }
 
 /**
+ * The component a wrapper component wraps, by the name its declaration hands
+ * the wrapper (`wrappedComponentName`), bound the way a tag of that name in the
+ * file is (`jsxChild`), but only where the file binds the name itself: a value
+ * or a component it declares, or an import of a project module the index
+ * holds. Anything else names no component of the project, and a namesake
+ * elsewhere is no guess worth an edge: bigbluebutton's `styled(Icon)`, imported through a
+ * Meteor `/imports/…` path no resolver follows, would render whichever of its
+ * dozens of `Icon`s came first, and SigNoz's `styled(Text)` of `const { Text }
+ * = Typography` a `Text` from another page's styles.
+ */
+function wrappedChild(
+  ctx: ResolutionContext,
+  name: string,
+  file: string,
+  importsOf: () => Map<string, string>,
+  ownValueOf: (name: string) => ReturnType<typeof declaredComponent>,
+  exportOf: (module: string, exported: string) => Node | null
+): Node | undefined {
+  const declared = ownValueOf(name) !== undefined ||
+    (ctx.getNodesInFileNamed?.(file, name) ?? ctx.getNodesInFile(file).filter((n) => n.name === name))
+      .some((n) => JSX_CHILD_KINDS.has(n.kind));
+  if (!declared && !projectImport(ctx, name, file)) return undefined;
+  return jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
+}
+
+/**
  * Whether the `<Name` at `at` opens a JSX tag. A type argument list follows
  * its type's name directly — `useState<User>()`, `Array<Item>`, the
  * `<Document>` of `<PaginatedList<Document>` — and a tag never does, short of
@@ -1918,6 +2114,16 @@ function writtenBare(src: string, name: string): boolean {
 }
 
 /**
+ * Whether the lines a file or top-level value owns (#2587) declare `name`
+ * (`const Card = vi.fn()` in a test callback). Only those lines are read, so
+ * a parameter or local of a function elsewhere in the file binds nothing here.
+ */
+function ownLinesBind(name: string, src: string): boolean {
+  const n = escapeRegExp(name);
+  return new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(src);
+}
+
+/**
  * What a tag renders when its parent binds the name itself: a component the
  * parent declares in its own lines (`const Row = ({ row }) => <tr />` in a
  * table's body), else nothing. Any other local is no node, and a same-named
@@ -1931,10 +2137,269 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
 }
 
 /**
+ * What a function's span holds: each tag's name and the line of its first tag
+ * (0 while only type argument or parameter lists name it, `opensTag`), the
+ * names it also writes outside a tag (`writtenBare`), its code, and whether
+ * that code destructures a name by a line (`destructuredBy`).
+ */
+type SpanTags = { tags: Map<string, number>; bare: Set<string>; src: string; destructured: Map<string, boolean> };
+
+/** The tags `src`, a function's lines from `startLine`, holds. */
+function spanTags(src: string, startLine: number): SpanTags {
+  const names: SpanTags = { tags: new Map<string, number>(), bare: new Set<string>(), src, destructured: new Map<string, boolean>() };
+  if (src.includes('</') || src.includes('/>')) {
+    let line = startLine;
+    let counted = 0;
+    JSX_TAG_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = JSX_TAG_RE.exec(src))) {
+      for (let nl = src.indexOf('\n', counted); nl !== -1 && nl < m.index; nl = src.indexOf('\n', nl + 1)) line++;
+      counted = m.index;
+      if (!names.tags.get(m[1]!)) names.tags.set(m[1]!, opensTag(src, m.index, m[1]!) ? line : 0);
+    }
+    for (const [name, first] of names.tags) if (first && writtenBare(src, name)) names.bare.add(name);
+  }
+  return names;
+}
+
+/**
+ * Whether `fn`'s code (`names`, its span) binds `name` by `line`: a `const`,
+ * a parameter (`jsCodeBindsName`) or a destructured name (`destructures`).
+ * Only a name it also writes outside a tag can be bound there.
+ */
+function scopeBinds(names: SpanTags, fn: Node, name: string, line: number, file: string, ctx: ResolutionContext): boolean {
+  return names.bare.has(name) &&
+    (jsCodeBindsName(name, fn, file, line, ctx) || destructuredBy(names, name, line - fn.startLine));
+}
+
+/** The functions among `parents` whose lines hold `fn`'s, innermost first. */
+function functionsAround(parents: Node[], fn: Node): Node[] {
+  const around: Node[] = [];
+  for (const n of parents) {
+    if (n.startLine <= fn.startLine && n.endLine >= fn.endLine &&
+        (n.startLine !== fn.startLine || n.endLine !== fn.endLine)) around.push(n);
+  }
+  return around.sort((a, b) => b.startLine - a.startLine || a.endLine - b.endLine);
+}
+
+/** Whether a span's code destructures `name` through its `index`th line (`destructures`), once per span, line and name. */
+function destructuredBy(names: SpanTags, name: string, index: number): boolean {
+  const key = `${index}\0${name}`;
+  let binds = names.destructured.get(key);
+  if (binds === undefined) names.destructured.set(key, (binds = destructures(names.src, name, lineEnd(names.src, index))));
+  return binds;
+}
+
+/** Where the `index`th line of `src`, counted from 0, ends. */
+function lineEnd(src: string, index: number): number {
+  let at = -1;
+  for (let i = 0; i <= index; i++) {
+    at = src.indexOf('\n', at + 1);
+    if (at === -1) return src.length;
+  }
+  return at;
+}
+
+const ID_CHAR = /[\w$]/;
+const SPACE = /\s/;
+/** How far a bracket walk reads: no pattern or parameter list runs longer. */
+const PATTERN_REACH = 10_000;
+const CONTROL_HEADS = new Set(['if', 'while', 'for', 'switch', 'with']);
+/** After a parameter list: a return type on its line, then `=>` or a body. */
+const PARAMETERS_END = /\s*(?::[^=;{}()\n]*)?(?:=>|\{)/y;
+/** After a declaration's pattern: its type, then a `require(…)` or `import(…)` value. */
+const IMPORTED_VALUE = /\s*(?::[^=;]*)?=\s*(?:await\s+)?(?:require|import)\s*\(/y;
+
+/**
+ * Whether `src`, before `end`, binds `name` in a destructuring pattern: a
+ * declaration's (excalidraw's example app: `const { Sidebar, Footer,
+ * WelcomeScreen } = excalidrawLib`; `const [Panel] = useState(…)`) or a
+ * parameter's (refine's `({ children, Header, Footer, Sider }) =>`, `({ icon:
+ * Icon }) =>`), nested patterns included. A key a pattern renames binds
+ * nothing (`{ footer: Footer }` binds `Footer`), nor does a default value
+ * (`{ Icon = DefaultIcon }`) or a type literal after the pattern (`}: {
+ * footer: Footer }`), and a declaration of `require(…)` or `import(…)` binds
+ * the module's own export, which links as an import does. `src` is code
+ * (`jsxCode`), so a bracket in a string is blank.
+ */
+function destructures(src: string, name: string, end: number): boolean {
+  for (let at = src.indexOf(name); at !== -1 && at < end; at = src.indexOf(name, at + name.length)) {
+    if (bindingElementAt(src, at, name.length)) return true;
+  }
+  return false;
+}
+
+/** Where a destructuring declaration's pattern opens: `const {`, `let [`. */
+const DESTRUCTURING_DECLARATION = /\b(?:const|let|var)\s*[{[]/g;
+
+/**
+ * The patterns `code` destructures at its top, as [opener, closer] pairs: a
+ * declaration's outside every brace, so in no function, class or block, and
+ * never a top-level callback's parameter. Braces alone are counted: JSX text
+ * may hold a stray `(` or `[`, never a `{` that opens no expression, and
+ * `code` (`jsxCode`) balances them.
+ */
+function topLevelPatterns(code: string): Array<[number, number]> {
+  const patterns: Array<[number, number]> = [];
+  let depth = 0;
+  let at = 0;
+  DESTRUCTURING_DECLARATION.lastIndex = 0;
+  for (let m = DESTRUCTURING_DECLARATION.exec(code); m; m = DESTRUCTURING_DECLARATION.exec(code)) {
+    for (; at < m.index; at++) {
+      if (code[at] === '{') depth++;
+      else if (code[at] === '}') depth--;
+    }
+    if (depth !== 0) continue;
+    const open = m.index + m[0].length - 1;
+    const close = matchingCloser(code, open);
+    if (close > open) patterns.push([open, close]);
+  }
+  return patterns;
+}
+
+/**
+ * Whether one of `patterns` in `code` binds `name` (`bindingElementAt`), so
+ * not in a declaration of `require(…)` or `import(…)`.
+ */
+function patternsBind(code: string, patterns: Array<[number, number]>, name: string): boolean {
+  for (const [open, close] of patterns) {
+    for (let at = code.indexOf(name, open); at !== -1 && at < close; at = code.indexOf(name, at + name.length)) {
+      if (bindingElementAt(code, at, name.length)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the name at `at` is an element of a pattern that binds it — `{
+ * Name }`, `{ ...Name }`, `{ key: Name }`, `[Name]` — followed by the next
+ * element, the pattern's end or a default.
+ */
+function bindingElementAt(code: string, at: number, length: number): boolean {
+  if (ID_CHAR.test(code[at - 1] ?? '') || ID_CHAR.test(code[at + length] ?? '')) return false;
+  const next = skipSpace(code, at + length, 1);
+  const after = code[next];
+  if (after !== ',' && after !== '}' && after !== ']' &&
+      (after !== '=' || code[next + 1] === '=' || code[next + 1] === '>')) return false;
+  let prev = skipSpace(code, at - 1, -1);
+  // A rest element; any other `.` reads a member.
+  if (code[prev] === '.') {
+    if (code[prev - 1] !== '.' || code[prev - 2] !== '.') return false;
+    prev = skipSpace(code, prev - 3, -1);
+  }
+  let opener = prev;
+  if (code[prev] === ',') {
+    opener = enclosingOpener(code, prev - 1);
+  } else if (code[prev] === ':') {
+    // A rename's target: its key opens an element of an object pattern.
+    if (!keyOpensElement(code, prev)) return false;
+    opener = enclosingOpener(code, prev - 1);
+    if (code[opener] !== '{') return false;
+  }
+  return (code[opener] === '{' || code[opener] === '[') && bindsPattern(code, opener, 0);
+}
+
+/**
+ * Whether the `{` or `[` at `opener` opens a pattern that binds its names: a
+ * declaration's, unless it declares an import, or a parameter's — itself or
+ * through the patterns it nests in.
+ */
+function bindsPattern(code: string, opener: number, depth: number): boolean {
+  if (depth > 8) return false;
+  const p = skipSpace(code, opener - 1, -1);
+  const c = code[p];
+  if (c === '(') return opensParameters(code, p);
+  if (c === '[') return bindsPattern(code, p, depth + 1);
+  if (c === ',') {
+    const q = enclosingOpener(code, p - 1);
+    if (code[q] === '(') return opensParameters(code, q);
+    return code[q] === '[' && bindsPattern(code, q, depth + 1);
+  }
+  if (c === ':') {
+    // `{ key: { … } }` nests a pattern; `props: {` and `}: {` annotate a type.
+    if (!keyOpensElement(code, p)) return false;
+    const q = enclosingOpener(code, p - 1);
+    return code[q] === '{' && bindsPattern(code, q, depth + 1);
+  }
+  if (!ID_CHAR.test(c ?? '')) return false;
+  const word = wordEndingAt(code, p);
+  if (word !== 'const' && word !== 'let' && word !== 'var') return false;
+  const close = matchingCloser(code, opener);
+  if (close < 0) return false;
+  IMPORTED_VALUE.lastIndex = close + 1;
+  return !IMPORTED_VALUE.test(code);
+}
+
+/**
+ * Whether the `(` at `paren` opens a parameter list: an arrow or a body
+ * follows it, and no control-flow keyword precedes it (`if ([a, B].includes(x)) {`).
+ */
+function opensParameters(code: string, paren: number): boolean {
+  const p = skipSpace(code, paren - 1, -1);
+  if (ID_CHAR.test(code[p] ?? '') && CONTROL_HEADS.has(wordEndingAt(code, p))) return false;
+  const close = matchingCloser(code, paren);
+  if (close < 0) return false;
+  PARAMETERS_END.lastIndex = close + 1;
+  return PARAMETERS_END.test(code);
+}
+
+/** Whether a property key ends at the `:` at `colon` and opens its element: `{ key:`, `, 'key':`, `, [key]:`. */
+function keyOpensElement(code: string, colon: number): boolean {
+  let k = skipSpace(code, colon - 1, -1);
+  const c = code[k];
+  if (c === ']') k = enclosingOpener(code, k - 1) - 1;
+  else if (c === '"' || c === "'") k = code.lastIndexOf(c, k - 1) - 1;
+  else if (ID_CHAR.test(c ?? '')) while (k >= 0 && ID_CHAR.test(code[k]!)) k--;
+  else return false;
+  const b = code[skipSpace(code, k, -1)];
+  return b === '{' || b === ',';
+}
+
+/** The `(`, `[` or `{` around `from`, past balanced brackets; -1 when none is near. */
+function enclosingOpener(code: string, from: number): number {
+  let depth = 0;
+  for (let i = from, stop = Math.max(0, from - PATTERN_REACH); i >= stop; i--) {
+    const c = code[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) return i;
+      depth--;
+    }
+  }
+  return -1;
+}
+
+/** The bracket that closes the one at `open`; -1 when none is near. */
+function matchingCloser(code: string, open: number): number {
+  let depth = 0;
+  for (let i = open, stop = Math.min(code.length, open + PATTERN_REACH); i < stop; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** The identifier that ends at `end`. */
+function wordEndingAt(code: string, end: number): string {
+  let start = end;
+  while (start > 0 && ID_CHAR.test(code[start - 1]!)) start--;
+  return code.slice(start, end + 1);
+}
+
+function skipSpace(code: string, at: number, step: 1 | -1): number {
+  while (at >= 0 && at < code.length && SPACE.test(code[at]!)) at += step;
+  return at;
+}
+
+/**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
- * JSX hop. Link parent → each capitalized JSX child it renders. File-oriented
+ * JSX hop. Link parent → each capitalized JSX child it renders. A parent is a
+ * method, function or component — or, for a tag outside all of those, the
+ * top-level value or the file that holds it (#2587), as for a plain call
+ * there. File-oriented
  * (read each JSX file once). Precision gates: the parent must write the name as
  * a tag in its code, not in a comment, a string or a template (react-router's
  * "You cannot render a <Router> inside another <Router>"; `jsxCode`), and
@@ -1942,18 +2407,26 @@ function declaredInside(ctx: ResolutionContext, name: string, parent: Node, chil
  * `<Entry extends BaseEntity>(…) =>`; outline's `<PaginatedList<Document>`
  * read its `Document` model class as a child), and the name must resolve to a
  * component/function/class node, or to a value the file declares itself (see
- * `jsxChild`). A name the parent binds itself by its first
- * tag — a parameter, or a `const` like outline's `const Content = variant ===
- * "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent` — is that
- * local, and renders only a component declared inside the parent
- * (`declaredInside`). A destructured name still links by name, as a
- * destructured function call does.
+ * `jsxChild`). A name the parent, or a function around it, binds by the
+ * parent's first tag — a parameter, or a `const` like outline's `const Content
+ * = variant === "dropdown" ? DropdownMenu.SubContent : ContextMenu.SubContent`
+ * — is that local, and renders only a component declared inside that function
+ * (`declaredInside`). So is a name it destructures (`destructures`): refine's
+ * `Layout({ children, Header, Footer, Sider })` rendered another example's
+ * `Footer`, and excalidraw's example app rendered the `Sidebar` of its own
+ * `ExampleSidebar.tsx` for the library's, out of `const { Sidebar, Footer } =
+ * excalidrawLib`. A name the file destructures at its top, like refine's
+ * `const { Title, Text } = Typography`, is a local of every function in it
+ * (`topLevelPatterns`). A destructured name keeps linking for a bare call —
+ * `const { t } = useI18n()` is that function more often than not — but a
+ * tag's is a component the props or a library hand in, which is no node here.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
+  const VALUE_PARENT_KINDS = new Set(['constant', 'variable']);
   // Once per module and export for the whole pass: what a tag imported from
   // the project renders. The lookup reads and comment-strips the module.
   const exports = new Map<string, Node | null>();
@@ -1972,66 +2445,179 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     if ((++scannedFiles & 15) === 0) await onYield();
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
-    if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
+    if (!content) continue;
+    const hasTags = content.includes('</') || content.includes('/>');
+    const wraps = WRAPPER_CALL_RE.test(content);
+    if (!hasTags && !wraps) continue; // JSX-file gate
     // File-level language gate, not merely a project-level one: mixed C/JS
     // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560). A
     // TypeScript `.ts` file holds no JSX either: a `<Name>` there is a type
     // assertion or text, like outline's OpenSearch XML template.
-    const parents = ctx.getNodesInFile(file).filter(
-      (n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language)
-    );
-    if (parents.length === 0) continue;
-    // Read once per file, and only when a name actually turns out ambiguous.
-    let imports: Map<string, string> | null = null;
-    const importsOf = () =>
-      (imports ??= importedFrom(ctx, file, parents[0]!.language));
+    const inFile = ctx.getNodesInFile(file);
     // Once per file and name: the value the file declares under it, if any.
     const ownValues = new Map<string, ReturnType<typeof declaredComponent>>();
     const ownValueOf = (name: string) => {
       if (!ownValues.has(name)) ownValues.set(name, declaredComponent(name, file, ctx));
       return ownValues.get(name);
     };
+    // A wrapper component renders the component it wraps, with no tag to read:
+    // outline's `const NudeButton = styled(ActionButton)…`, a `memo(Button)`.
+    // Without the link a render flow through it ends at the wrapper. The name
+    // binds as a tag of that name in this file would, where the file binds it
+    // (`wrappedChild`), so a package's `styled(Link)` renders nothing here. Any
+    // JS-family file: a styles `.ts` file declares wrappers too.
+    if (wraps) {
+      let wrapperImports: Map<string, string> | null = null;
+      for (const wrapper of inFile) {
+        if (wrapper.kind !== 'component' || !JS_FAMILY.includes(wrapper.language)) continue;
+        const name = wrappedComponentName(wrapper, ctx);
+        if (!name) continue;
+        const importsOf = () => (wrapperImports ??= importedFrom(ctx, file, wrapper.language));
+        const child = wrappedChild(ctx, name, file, importsOf, ownValueOf, exportOf);
+        if (!child || child.id === wrapper.id || crossesCodeBoundary(wrapper.language, child.language)) continue;
+        const key = `${wrapper.id}>${child.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: wrapper.id, target: child.id, kind: 'calls', line: wrapper.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'jsx-render', via: name, wrapped: true },
+        });
+      }
+    }
+    if (!hasTags) continue;
+    const fns = inFile.filter((n) => PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language));
+    // JSX outside every function renders from where a plain call there is
+    // attributed (#2587): a top-level `const ICONS = { a: <Icon /> }` from the
+    // const, `createRoot(el).render(<App />)` or a test's
+    // `it('…', () => render(<Card />))` from the file. Ownership is by line:
+    // a value owns the lines of its span no function or class holds and no
+    // other value shares; the file, the lines no node but itself, an import,
+    // an export or a framework's route holds. So no tag counts twice.
+    // The file's lines read as code, split once: a tag in a comment or a
+    // string is text (`jsxCode`).
+    let code: string | null | undefined;
+    const codeOf = () => (code === undefined ? (code = jsxCode(content)) : code);
+    let lines: string[] | null = null;
+    const holds = (n: Node) => PARENT_KINDS.has(n.kind) || n.kind === 'class';
+    let fileNode = inFile.find((n) => n.kind === 'file' && JSX_FAMILY.includes(n.language));
+    const owns = new Map<string, (line: number) => boolean>();
+    let values: Node[] = [];
+    if (fileNode) {
+      // Per line: 1 when a function or class holds it, 2 when any other node does.
+      const held = new Uint8Array((fileNode.endLine || 0) + 2);
+      const valuesOn = new Uint8Array(held.length);
+      for (const n of inFile) {
+        if (n.kind === 'file' || n.kind === 'import' || n.kind === 'export' || n.kind === 'route' ||
+            !n.startLine || !n.endLine) continue;
+        const mark = holds(n) ? 1 : 2;
+        for (let l = n.startLine; l <= n.endLine && l < held.length; l++) if (held[l] !== 1) held[l] = mark;
+      }
+      // A top-level value: its first line is in no function or class.
+      values = inFile.filter((n) => VALUE_PARENT_KINDS.has(n.kind) && JSX_FAMILY.includes(n.language) &&
+        held[n.startLine] !== 1);
+      // A line a value shares with another statement (`const root =
+      // createRoot(el); root.render(<App />)`) is no one's — not the value's,
+      // and not the file's, which owns only lines no node holds: ownership is
+      // by line, so its tags get no edge rather than a wrong one. Read as
+      // code, so a comment there is no statement.
+      const raw = (lines ??= (codeOf() ?? content).split('\n'));
+      for (const v of values) {
+        for (let l = v.startLine; l <= v.endLine && l < valuesOn.length; l++) if (valuesOn[l]! < 2) valuesOn[l]!++;
+        const before = (raw[v.startLine - 1] ?? '').slice(0, v.startColumn ?? 0);
+        const after = (raw[v.endLine - 1] ?? '').slice(v.endColumn ?? Infinity);
+        if (!/^\s*(?:(?:export|declare|default|const|let|var)\s+)*$/.test(before)) valuesOn[v.startLine] = 2;
+        if (!/^[\s;]*$/.test(after)) valuesOn[v.endLine] = 2;
+      }
+      for (const v of values) owns.set(v.id, (line) => held[line] !== 1 && valuesOn[line] === 1);
+      if (held.subarray(1, fileNode.endLine + 1).includes(0)) owns.set(fileNode.id, (line) => !held[line]);
+      else fileNode = undefined;
+    }
+    const parents = [...fns, ...values, ...(fileNode ? [fileNode] : [])];
+    if (parents.length === 0) continue;
+    // Read once per file, and only when a name actually turns out ambiguous.
+    let imports: Map<string, string> | null = null;
+    const importsOf = () =>
+      (imports ??= importedFrom(ctx, file, parents[0]!.language));
     // A function renders the tags its own lines hold, so functions that span
     // the same lines share them: every function of a minified bundle spans
     // its one line, and reading that line again per function took 9 to 25 s
     // over go-ethereum's graphiql.min.js (2,234 functions on 980 KB). The
     // file is split once, not once per function, and read as code once: a
     // tag in a comment or a string is text (`jsxCode`).
-    let lines: string[] | null = null;
-    // Each name a span holds, and the line of its first tag: 0 while only type
-    // argument or parameter lists name it (`opensTag`). `bare` holds the
-    // names it also writes outside a tag (`writtenBare`).
-    const tagsBySpan = new Map<string, { tags: Map<string, number>; bare: Set<string> }>();
-    for (const parent of parents) {
-      if (!parent.startLine || !parent.endLine) continue;
-      const span = `${parent.startLine}:${parent.endLine}`;
+    // Each name a span holds (`spanTags`), read when a function among the
+    // parents is, or a function around one. A parent that owns its lines
+    // (#2587) reads only those, the rest left blank, under its own key.
+    const tagsBySpan = new Map<string, SpanTags>();
+    const spanOf = (fn: Node): SpanTags => {
+      const own = owns.get(fn.id);
+      const span = own ? fn.id : `${fn.startLine}:${fn.endLine}`;
       let names = tagsBySpan.get(span);
       if (!names) {
-        names = { tags: new Map<string, number>(), bare: new Set<string>() };
-        lines ??= (jsxCode(content) ?? content).split('\n');
-        const src = lines.slice(parent.startLine - 1, parent.endLine).join('\n');
-        if (src.includes('</') || src.includes('/>')) {
-          let line = parent.startLine;
-          let counted = 0;
-          JSX_TAG_RE.lastIndex = 0;
-          let m: RegExpExecArray | null;
-          while ((m = JSX_TAG_RE.exec(src))) {
-            for (let nl = src.indexOf('\n', counted); nl !== -1 && nl < m.index; nl = src.indexOf('\n', nl + 1)) line++;
-            counted = m.index;
-            if (!names.tags.get(m[1]!)) names.tags.set(m[1]!, opensTag(src, m.index, m[1]!) ? line : 0);
-          }
-          for (const [name, first] of names.tags) if (first && writtenBare(src, name)) names.bare.add(name);
-        }
+        lines ??= (codeOf() ?? content).split('\n');
+        const spanLines = lines.slice(fn.startLine - 1, fn.endLine);
+        names = spanTags((own ? spanLines.map((text, i) => (own(fn.startLine + i) ? text : '')) : spanLines).join('\n'), fn.startLine);
         tagsBySpan.set(span, names);
       }
+      return names;
+    };
+    // Whether the file destructures a name at its top (`topLevelPatterns`),
+    // once per name. Read only off code: a file `jsxCode` can't read binds
+    // nothing here.
+    let topPatterns: Array<[number, number]> | null = null;
+    const topBinds = new Map<string, boolean>();
+    const destructuredAtTop = (name: string): boolean => {
+      let binds = topBinds.get(name);
+      if (binds === undefined) {
+        const src = codeOf();
+        topPatterns ??= src === null ? [] : topLevelPatterns(src);
+        binds = src !== null && topPatterns.length > 0 && patternsBind(src, topPatterns, name);
+        topBinds.set(name, binds);
+      }
+      return binds;
+    };
+    for (const parent of parents) {
+      if (!parent.startLine || !parent.endLine) continue;
+      const names = spanOf(parent);
+      // The functions around the parent, innermost first, once a tag needs them.
+      let around: Node[] | null = null;
       let added = 0;
       for (const [name, line] of names.tags) {
         if (added >= MAX_JSX_CHILDREN) break;
         if (!line) continue;
         let child = jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
-        // A name the parent binds itself by its first tag is that local.
-        if (child && names.bare.has(name) && jsCodeBindsName(name, parent, file, line, ctx)) {
-          child = declaredInside(ctx, name, parent, child);
+        if (child) {
+          const own = owns.get(parent.id);
+          if (own) {
+            // A tag the file or a top-level value holds (#2587): a name its own
+            // lines declare (`const Card = vi.fn()` in a test's callback), or one
+            // the file destructures at its top, is that local.
+            if ((names.bare.has(name) && ownLinesBind(name, names.src)) || destructuredAtTop(name)) {
+              child = declaredInside(ctx, name, parent, child);
+            }
+          } else {
+            // A name the parent, or a function around it, binds by the parent's
+            // first tag is that local: excalidraw's example app destructures
+            // `Sidebar` and `Footer` once and renders them in nested `render…`
+            // functions too. It renders a component that function declares, if
+            // any (`declaredInside`).
+            let binder = scopeBinds(names, parent, name, line, file, ctx) ? parent : undefined;
+            if (!binder) {
+              around ??= functionsAround(fns, parent);
+              for (const fn of around) {
+                if (scopeBinds(spanOf(fn), fn, name, line, file, ctx)) {
+                  binder = fn;
+                  break;
+                }
+              }
+            }
+            if (binder) child = declaredInside(ctx, name, binder, child);
+            // A name the file destructures at its top is every function's local:
+            // refine's pages take `const { Title, Text } = Typography` from antd
+            // and rendered two other examples' `Title` and `Text`. A function
+            // that declares the name inside itself still renders its own.
+            else if (destructuredAtTop(name)) child = declaredInside(ctx, name, around?.[around.length - 1] ?? parent, child);
+          }
         }
         if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
@@ -2122,7 +2708,7 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     // the package's: no other project symbol, nor a Nuxt auto-imported
     // component (`fallback`), is what it renders or calls.
     const resolve = (name: string, kinds: Set<string>, fallback?: Node): Node | undefined => {
-      const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind));
+      const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind) && !isManualMockHiddenFrom(n.filePath, file));
       const local = matches.find((n) => n.filePath === file);
       if (local || importedFromPackage(ctx, name, file)) return local;
       return matches[0] ?? fallback;
@@ -2283,7 +2869,7 @@ function constantEventName(expr: string, file: string, ctx: ResolutionContext, m
       const from = importedFile(owner);
       decls = from
         ? declaredIn(from)
-        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${owner}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
+        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${escapeRegExp(owner)}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
     }
     const values = new Set(decls.map(read).filter((v): v is string => v !== null));
     value = values.size === 1 ? [...values][0]! : null;
@@ -4491,9 +5077,13 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
-  if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
+  // Every Go file: besides the declarations the interface passes read, a call
+  // through a func field, or a function put in one, can sit in any of them.
+  if (/\.go$/.test(filePath)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
+  // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
+  if (WRAPPER_CALL_RE.test(content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
   if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
   const patterns = [THUNK_DECL_RE, CELERY_TASK_DECORATOR_RE, CELERY_DISPATCH_RE,
@@ -4546,7 +5136,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   {
     name: 'ifaceEdges',
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
-    run: (q, _c, y) => interfaceOverrideEdges(q, y),
+    run: (q, c, y) => interfaceOverrideEdges(q, c, y),
   },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
@@ -4588,6 +5178,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
   },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
+  // `d.refreshf(ctx)` onto the functions put in that func field (`RefreshF: d.refresh`).
+  // After the Go framework passes: a pair one of them bridges keeps its more specific edge.
+  { name: 'goFuncFieldEdges', gate: (has) => has('go'), run: (q, c, y) => goFuncFieldEdges(q, c, y, MAX_CALLBACKS_PER_CHANNEL) },
   // `router.push(await helper())` — the helper's return literals are the screens.
   { name: 'expoRouterReturnEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => expoRouterReturnEdges(c, y) },
   // `<Link href="/x">` / an internal `<a href>` — markup, not a call; the component navigates.
@@ -4609,7 +5202,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
  * order after these. A wrong hint costs wall time, never edges.
  */
 const SYNTH_PASS_COST_HINT: Readonly<Record<string, number>> = {
-  cFnPtrEdges: 100, registryEdges: 60, tierEdges: 55, jsxEdges: 25, rnEventEdgesList: 24,
+  cFnPtrEdges: 100, registryEdges: 60, tierEdges: 55, goFuncFieldEdges: 30, jsxEdges: 25, rnEventEdgesList: 24,
   ifaceEdges: 18, flutterEdges: 16, cppEdges: 15, emitterEdges: 12, fieldEdges: 11,
   mybatisEdges: 10, vuexEdges: 8, closureCollEdges: 6, piniaEdges: 5, renderEdges: 4,
 };
@@ -4620,6 +5213,16 @@ function synthPassCostHint(name: string): number {
 /** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
 const FIXED_SYNTH_STEPS = 4;
 export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
+
+/** The ids of every node a Jest or Vitest manual mock (`__mocks__/`) declares. */
+function manualMockNodeIds(ctx: ResolutionContext): Set<string> {
+  const ids = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!isManualMockPath(file)) continue;
+    for (const n of ctx.getNodesInFile(file)) ids.add(n.id);
+  }
+  return ids;
+}
 export async function synthesizeCallbackEdges(
   queries: QueryBuilder,
   ctx: ResolutionContext,
@@ -4718,7 +5321,7 @@ export async function synthesizeCallbackEdges(
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
-  const goImpl = has('go') ? await goImplementsEdges(queries, yieldToLoop) : NONE;
+  const goImpl = has('go') ? await goImplementsEdges(queries, ctx, yieldToLoop) : NONE;
   for (let i = 0; i < goImpl.length; i += 2000) {
     queries.insertEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();
@@ -4837,12 +5440,20 @@ export async function synthesizeCallbackEdges(
     }
   }
 
+  // A Jest or Vitest manual mock answers only for test code (#2455): whatever
+  // pass paired them, production code never links into a `__mocks__/` file.
+  const mockNodes = manualMockNodeIds(ctx);
+  const fromTestCode = (id: string): boolean => {
+    const source = ctx.getNodeById?.(id);
+    return !source || isTestPath(source.filePath);
+  };
   const merged: Edge[] = [];
   const seen = new Set<string>();
   for (const e of passEdges.flat()) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    if (mockNodes.size > 0 && mockNodes.has(e.target) && !fromTestCode(e.source)) continue;
     merged.push(e);
   }
   __mark('dedupe-merge');

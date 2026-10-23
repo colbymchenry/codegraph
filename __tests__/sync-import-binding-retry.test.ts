@@ -17,6 +17,15 @@
  * its own name: a binding its module never resolves is linked by that name
  * alone, to whichever declaration carries it (vben's `{ VbenFormSchema as
  * FormSchema }`), and that link must come back when the declaration does.
+ *
+ * A plain named import through a barrel (`import { useInvocation } from
+ * '@/test_investigation/context'`) waits the same way: `context/index.ts`
+ * declares none of the names it forwards. When the barrel or a file behind it
+ * is added, sync re-opens the barrel's importers (module-importers.ts); an
+ * edit that gives an existing barrel the name re-opened nothing, so the
+ * import and its uses stayed unlinked. Such a reference is parked under its
+ * module's key as well when its module is a file of the project that has the
+ * key, as the barrel does.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
@@ -125,9 +134,9 @@ function edgesOf(graph: CodeGraph): string[] {
     .sort();
 }
 
-/** The {@link LINKS} the graph has. */
-function linksOf(graph: CodeGraph): string[] {
-  const names = new Set(LINKS.map((link) => link.slice(0, link.indexOf(':'))));
+/** The links the graph has through the bindings `expected` names. */
+function linksOf(graph: CodeGraph, expected: string[] = LINKS): string[] {
+  const names = new Set(expected.map((link) => link.slice(0, link.indexOf(':'))));
   const ids = graph.getFiles().flatMap((file) => graph.getNodesInFile(file.path)).map((n) => n.id);
   const links: string[] = [];
   for (const edge of graph.getOutgoingEdgesFrom(ids)) {
@@ -219,14 +228,113 @@ describe('sync links references through an import binding to their module', () =
   }, 120_000);
 });
 
+/** Files that import a folder's barrel by the names it forwards. */
+const BARREL_IMPORTERS: Files = {
+  'package.json': JSON.stringify({ name: 'app', dependencies: { react: '^18', vue: '^3' } }),
+  'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', jsx: 'react-jsx', paths: { '@/*': ['src/*'] } } }),
+  // Hooks imported through a tsconfig alias from a folder's barrel (luci-go's milo).
+  'src/pages/invocation_page.tsx': "import { useInvocation, useProject } from '@/test_investigation/context';\n\nexport function InvocationPage() {\n  const invocation = useInvocation();\n  return <p>{invocation}{useProject()}</p>;\n}\n",
+  // Namesakes elsewhere, as milo has: without the barrel the hooks link to nothing.
+  'src/common/store/invocation_state.ts': 'export function useInvocation() {\n  return null;\n}\n',
+  'src/test_verdict/context/hooks.ts': 'export function useProject() {\n  return null;\n}\n',
+  // A component its barrel forwards under another name, rendered by a Vue template (vben).
+  'src/layouts/toolbar.vue': "<template><ThemeToggle /></template>\n<script setup lang=\"ts\">\nimport { ThemeToggle } from '../widgets/theme-toggle';\n</script>\n",
+};
+
+const BARRELS: Files = {
+  'src/test_investigation/context/index.ts': "export { useInvocation, useProject } from './context';\n",
+  'src/widgets/theme-toggle/index.ts': "export { default as ThemeToggle } from './theme-toggle.vue';\n",
+};
+
+/** The files behind the barrels, in the barrels' folders. */
+const BEHIND: Files = {
+  'src/test_investigation/context/context.ts': "export function useInvocation() {\n  return 'invocation';\n}\n\nexport function useProject() {\n  return 'project';\n}\n",
+  'src/widgets/theme-toggle/theme-toggle.vue': '<template><button>toggle</button></template>\n',
+};
+
+const BARREL_LINKS = [
+  'ThemeToggle: imports file src/layouts/toolbar.vue -> component src/widgets/theme-toggle/theme-toggle.vue::theme-toggle',
+  'ThemeToggle: references component src/layouts/toolbar.vue -> component src/widgets/theme-toggle/theme-toggle.vue::theme-toggle',
+  'useInvocation: calls function src/pages/invocation_page.tsx -> function src/test_investigation/context/context.ts::useInvocation',
+  'useInvocation: imports file src/pages/invocation_page.tsx -> function src/test_investigation/context/context.ts::useInvocation',
+  'useInvocation: imports file src/test_investigation/context/index.ts -> function src/test_investigation/context/context.ts::useInvocation',
+  'useProject: calls function src/pages/invocation_page.tsx -> function src/test_investigation/context/context.ts::useProject',
+  'useProject: imports file src/pages/invocation_page.tsx -> function src/test_investigation/context/context.ts::useProject',
+  'useProject: imports file src/test_investigation/context/index.ts -> function src/test_investigation/context/context.ts::useProject',
+];
+
+const ALL_BARREL_FILES: Files = { ...BARREL_IMPORTERS, ...BARRELS, ...BEHIND };
+
+describe('sync links a plain named import through a barrel', () => {
+  it('when the barrel is added after its importers', async () => {
+    const root = tempRoot();
+    write(root, { ...BARREL_IMPORTERS, ...BEHIND });
+    const graph = await index(root);
+    expect(linksOf(graph, BARREL_LINKS)).toEqual([]);
+
+    write(root, BARRELS);
+    const result = await graph.sync();
+    // The importers did not change: only what sync re-opens or retries links them.
+    expect(result.filesAdded).toBe(Object.keys(BARRELS).length);
+    expect(result.filesModified).toBe(0);
+    expect(linksOf(graph, BARREL_LINKS)).toEqual(BARREL_LINKS);
+    expect(edgesOf(graph)).toEqual(await fullIndexOf(ALL_BARREL_FILES));
+  }, 120_000);
+
+  it('when a file behind the barrel is added after its importers', async () => {
+    // The hooks' file declares them by name, which a sync always looked up
+    // (until it appears, they link by name to their namesakes). The
+    // component's file declares only `theme-toggle`: the barrel that forwards
+    // it is what leads to it.
+    const root = tempRoot();
+    write(root, { ...BARREL_IMPORTERS, ...BARRELS });
+    const graph = await index(root);
+    expect(linksOf(graph, BARREL_LINKS).filter((link) => link.startsWith('ThemeToggle:'))).toEqual([]);
+
+    write(root, BEHIND);
+    expect((await graph.sync()).filesAdded).toBe(Object.keys(BEHIND).length);
+    expect(linksOf(graph, BARREL_LINKS)).toEqual(BARREL_LINKS);
+    expect(edgesOf(graph)).toEqual(await fullIndexOf(ALL_BARREL_FILES));
+  }, 120_000);
+
+  it('when an edit gives the barrel the names it forwards', async () => {
+    // The barrel was there all along: no file appears, and the edit declares
+    // none of the names it now passes on. Only the barrel's module key finds
+    // the importers' failed references.
+    const root = tempRoot();
+    write(root, { ...BARREL_IMPORTERS, ...BEHIND });
+    write(root, Object.fromEntries(Object.keys(BARRELS).map((file) => [file, 'export {};\n'])));
+    const graph = await index(root);
+    expect(linksOf(graph, BARREL_LINKS)).toEqual([]);
+
+    write(root, BARRELS);
+    const result = await graph.sync();
+    expect(result.filesModified).toBe(Object.keys(BARRELS).length);
+    expect(result.filesAdded).toBe(0);
+    expect(linksOf(graph, BARREL_LINKS)).toEqual(BARREL_LINKS);
+    expect(edgesOf(graph)).toEqual(await fullIndexOf(ALL_BARREL_FILES));
+  }, 120_000);
+});
+
 describe('a failed reference through an import binding', () => {
   it('waits for its module, and every other reference keeps its own tail', async () => {
     const root = tempRoot();
     write(root, {
       ...IMPORTERS,
-      // A package's binding, an unaliased named import and a member of a
-      // namespace import wait for the name they use.
-      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, NS.make()];\n",
+      // A package's binding waits for the name it uses, and so does a plain
+      // named import while its module is missing (`./util`), when the file its
+      // module resolves to has another key (`@main`, an alias of
+      // `src/lib/main.ts`), or when its module gives the name and the
+      // reference failed anyway (`LIMIT`, a constant passed as a function).
+      // One whose module is a file of the project with the key and lacks the
+      // name (`./lib`, a barrel yet to pass it on) waits for that module, as
+      // the other bindings do, and so does a member of a namespace import
+      // (sync-import-member-retry.test.ts).
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'], '@main': ['src/lib/main.ts'] } } }),
+      'src/other.ts': "import express from 'express';\nimport { helper } from './util';\nimport { forwarded } from './lib';\nimport { mainThing } from '@main';\nimport { LIMIT } from './consts';\nimport * as NS from './ns';\nexport const app = express();\nexport const values = [helper, forwarded, mainThing, NS.make()];\nexport const mapped = [1, 2].map(LIMIT);\n",
+      'src/lib/index.ts': 'export {};\n',
+      'src/lib/main.ts': 'export const unrelated = 1;\n',
+      'src/consts.ts': 'export const LIMIT = 5;\n',
     });
     (await CodeGraph.init(root, { index: true })).close();
 
@@ -248,16 +356,23 @@ describe('a failed reference through an import binding', () => {
       expect(tailOf('src/layouts/LayoutMain.vue', 'Error404', 'imports')).toBe('module:404');
       expect(tailOf('src/App.svelte', 'Banner', 'references')).toBe('module:Hero');
       expect(tailOf('src/pages/index.astro', 'Shell', 'imports')).toBe('module:BaseLayout');
+      expect(tailOf('src/other.ts', 'forwarded', 'imports')).toBe('module:lib');
+      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('module:ns');
 
       expect(tailOf('src/other.ts', 'express', 'imports')).toBe('express');
       expect(tailOf('src/other.ts', 'helper', 'imports')).toBe('helper');
-      expect(tailOf('src/other.ts', 'NS.make', 'calls')).toBe('make');
+      expect(tailOf('src/other.ts', 'mainThing', 'imports')).toBe('mainThing');
+      expect(tailOf('src/other.ts', 'LIMIT', 'function_ref')).toBe('LIMIT');
 
-      // Each module's file is one of the keys its references wait under.
+      // Each module's file is one of the keys its references wait under, and
+      // so is a barrel's folder for every file in it.
       for (const [file, module] of [
         ['src/routes/tag/tag.controller.ts', './tag/tag.controller'],
         ['src/views/error/404.vue', '@/views/error/404.vue'],
         ['src/pages/Team/index.tsx', './pages/Team'],
+        ['src/test_investigation/context/index.ts', '@/test_investigation/context'],
+        ['src/test_investigation/context/context.ts', '@/test_investigation/context'],
+        ['src/widgets/theme-toggle/theme-toggle.vue', '../widgets/theme-toggle'],
       ]) {
         expect(moduleReferenceKeys(file)).toContain(moduleTail(module));
       }

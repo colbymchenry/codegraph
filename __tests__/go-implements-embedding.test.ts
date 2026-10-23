@@ -217,11 +217,18 @@ func (both) R() {}
 `,
   'empty/empty.go': `package empty
 
-import "io"
+import (
+	"io"
+
+	"go.uber.org/zap/zapcore"
+)
 
 type Any interface{}
 
-// Embeds only what the project does not declare: nothing to match.
+// Embeds only a type nothing here names the methods of: nothing to match.
+type Core interface{ zapcore.Core }
+
+// What io.Closer asks for: a Close.
 type Closer interface{ io.Closer }
 `,
   // More implementers than the cap: every unit through the base they all
@@ -294,8 +301,10 @@ describe('Go implicit satisfaction counts embedded methods on both sides', () =>
       'gin.RouterGroup -> gin.IRouter',
       'gin.RouterGroup -> gin.IRoutes',
       'gin.routeInfo -> gin.Chain',
+      'storage.BaseQuerier -> empty.Closer',
       'storage.BaseQuerier -> storage.ChunkQuerier',
       'storage.BaseQuerier -> storage.LabelQuerier',
+      'tsdb.blockQuerier -> empty.Closer',
       'tsdb.blockQuerier -> storage.ChunkQuerier',
       'tsdb.blockQuerier -> storage.LabelQuerier',
       'tsdb.blockQuerier -> storage.Querier',
@@ -337,7 +346,7 @@ describe('Go implicit satisfaction counts embedded methods on both sides', () =>
     const into = (name: string, file: string) =>
       cg.getIncomingEdgesTo([one(name, file).id], ['implements']).filter((e) => meta(e).synthesizedBy === 'go-implements');
     expect(into('Any', 'empty/empty.go')).toEqual([]);
-    expect(into('Closer', 'empty/empty.go')).toEqual([]);
+    expect(into('Core', 'empty/empty.go')).toEqual([]);
   });
 
   it('caps an interface at 40 implementers, keeping those that declare its methods', () => {

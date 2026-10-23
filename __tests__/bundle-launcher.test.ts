@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -120,5 +121,98 @@ describe('bundled launchers (#1278)', () => {
     for (const file of ['bin/codegraph', 'bin/codegraph.cmd', 'node.exe']) {
       expect(entries).toContain(`codegraph-${target}/${file}`);
     }
+  });
+});
+
+describe('bundled Node runtime (#2617)', () => {
+  it('ships a Node 24 release with the fix for the Windows abort at exit', () => {
+    // The release workflow passes only the target, so the recipe's default
+    // version is the Node every release bundles.
+    const workflow = fs.readFileSync(path.resolve('.github/workflows/release.yml'), 'utf8');
+    const calls = workflow.match(/build-bundle\.sh[^\r\n]*/g) ?? [];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.trim()).toBe('build-bundle.sh "$t"');
+
+    const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
+    expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
+    const [major, minor] = pin!.slice(1, 3).map(Number);
+    // The CLI refuses to run on Node 25 and later.
+    expect(major).toBe(24);
+    // Node 24 before 24.20.0 can abort on Windows as the process exits, after
+    // the command's work is done (0xC0000409, nodejs/node#56645).
+    expect(minor).toBeGreaterThanOrEqual(20);
+  });
+});
+
+describe('bundled Node security release (#2780)', () => {
+  const archive = 'node-v24.22.1-linux-x64.tar.gz';
+
+  // Step 1 of the release recipe, run against a stand-in for nodejs.org: `curl`
+  // copies the requested file out of `site/` and logs the URL it was asked for.
+  function download(sums: (sha: string) => string) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-node-download-'));
+    roots.push(root);
+    const site = path.join(root, 'site');
+    const work = path.join(root, 'work');
+    fs.mkdirSync(path.join(site, 'node-v24.22.1-linux-x64', 'bin'), { recursive: true });
+    fs.mkdirSync(work);
+    fs.writeFileSync(path.join(site, 'node-v24.22.1-linux-x64', 'bin', 'node'), '#!/bin/sh\n');
+    const arg = (n: number) => windows ? `$(cygpath -u "$${n}")` : `$${n}`;
+    // Packed the way nodejs.org packs a release: one top-level folder.
+    const pack = shell(`set -eu\ncd "${arg(1)}"\ntar -czf ${archive} node-v24.22.1-linux-x64`, [site]);
+    expect(pack.status, pack.stderr).toBe(0);
+    const sha = crypto.createHash('sha256').update(fs.readFileSync(path.join(site, archive))).digest('hex');
+    fs.writeFileSync(path.join(site, 'SHASUMS256.txt'), sums(sha));
+    const step = recipe.slice(recipe.indexOf('# 1. Download'), recipe.indexOf('# 2. Build'));
+    const result = shell(`set -euo pipefail
+WORK="${arg(1)}"
+SITE="${arg(2)}"
+TARGET=linux-x64 OSFAM=linux ARCH=x64 NODE_VERSION=v24.22.1
+curl() {
+  local url='' out=''
+  while [ $# -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac
+  done
+  printf '%s\\n' "$url" >> "$WORK/urls"
+  cp "$SITE/\${url##*/}" "$out"
+}
+${step}
+printf 'NODE_BIN=%s\\n' "$NODE_BIN"`, [work, site]);
+    const urls = fs.existsSync(path.join(work, 'urls'))
+      ? fs.readFileSync(path.join(work, 'urls'), 'utf8').trim().split('\n')
+      : [];
+    return { result, work, urls };
+  }
+
+  it('ships Node 24.22.1, the October 2026 security release, or a later 24.x', () => {
+    const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
+    expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
+    const [major, minor, patch] = pin!.slice(1, 4).map(Number);
+    expect(major).toBe(24);
+    // 24.22.1 fixes eight CVEs (four rated High) and ships OpenSSL 3.5.9.
+    expect(minor > 22 || (minor === 22 && patch >= 1), `v${major}.${minor}.${patch}`).toBe(true);
+  });
+
+  it('unpacks the Node download once it matches the SHA-256 nodejs.org publishes for it', () => {
+    const other = 'f'.repeat(64);
+    const { result, work, urls } = download((sha) =>
+      `${other}  node-v24.22.1-darwin-arm64.tar.gz\n${sha}  ${archive}\n${other}  node-v24.22.1-win-x64.zip\n`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(urls).toEqual([
+      `https://nodejs.org/dist/v24.22.1/${archive}`,
+      'https://nodejs.org/dist/v24.22.1/SHASUMS256.txt',
+    ]);
+    expect(fs.existsSync(path.join(work, 'node-v24.22.1-linux-x64', 'bin', 'node'))).toBe(true);
+    expect(result.stdout).toMatch(/^NODE_BIN=.*node-v24\.22\.1-linux-x64\/bin\/node\r?$/m);
+  });
+
+  it.each([
+    ['whose SHA-256 differs from the published one', () => `${'0'.repeat(64)}  ${archive}\n`],
+    ['that the published list leaves out', (sha: string) => `${sha}  node-v24.22.1-linux-arm64.tar.gz\n`],
+  ])('refuses a Node download %s, before unpacking it', (_, sums) => {
+    const { result, work } = download(sums);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${archive} does not match the SHA-256 that nodejs.org lists for v24.22.1`);
+    expect(fs.existsSync(path.join(work, 'node-v24.22.1-linux-x64'))).toBe(false);
   });
 });

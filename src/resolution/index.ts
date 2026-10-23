@@ -21,20 +21,28 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
+import {
+  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalNestedCall,
+  matchPascalParenlessRef, matchPascalSystemCall,
+} from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
+import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
+import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
+import { matchRubyConstantPathRef } from './ruby-constant-paths';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -43,12 +51,14 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
-import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
+import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { LRUCache } from './lru-cache';
+import { isTestPath } from '../search/query-utils';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
 import { parse as parseJsonc } from 'jsonc-parser';
@@ -86,6 +96,13 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+
+/**
+ * How many files that import a changed module by default a sync reads the
+ * edges of, when the module forwards its default from another file, to see
+ * whether they still land on it (changedDefaultExports).
+ */
+const DEFAULT_READER_SAMPLE_FILES = 8;
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -144,12 +161,24 @@ const GO_BUILT_INS = new Set([
   'string', 'bool', 'byte', 'rune', 'any',
 ]);
 
+/** What a Pascal typecast's name resolves to: `TFoo(x)` casts, it doesn't call (see createEdges). */
+const PASCAL_CAST_TARGET_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'type_alias']);
+
+/** The values a TypeScript type may share its name with in its file, which a call or `new` of the name means. */
+const TYPE_COMPANION_VALUE_KINDS: ReadonlySet<string> = new Set(['function', 'class', 'component', 'constant', 'variable']);
+
+/**
+ * The RTL's unit namespaces, as it spells them. Spelled otherwise, a
+ * receiver is most likely a variable that hides one (`data.GetObjectFrom`,
+ * `rest.EngineAdd`); only `system.` is the System unit's in any case.
+ */
 const PASCAL_UNIT_PREFIXES = [
   'System.', 'Winapi.', 'Vcl.', 'Fmx.', 'Data.', 'Datasnap.',
   'Soap.', 'Xml.', 'Web.', 'REST.', 'FireDAC.', 'IBX.',
   'IdHTTP', 'IdTCP', 'IdSSL',
 ];
 
+/** Lowercased: Pascal names ignore case. */
 const PASCAL_BUILT_INS = new Set([
   'System', 'SysUtils', 'Classes', 'Types', 'Variants', 'StrUtils',
   'Math', 'DateUtils', 'IOUtils', 'Generics.Collections', 'Generics.Defaults',
@@ -168,7 +197,7 @@ const PASCAL_BUILT_INS = new Set([
   'TList', 'TStringList', 'TStrings', 'TStream', 'TMemoryStream', 'TFileStream',
   'Exception', 'EAbort', 'EConvertError', 'EAccessViolation',
   'IInterface', 'IUnknown',
-]);
+].map((name) => name.toLowerCase()));
 
 const C_BUILT_INS = new Set([
   // Standard C library functions
@@ -280,6 +309,8 @@ export class ReferenceResolver {
   private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
   // getSupertypeNodes' memo, by node id, under the same generation tag.
   private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
+  // getSuperclassNodes' memo (`extends` edges alone), the same way.
+  private superclassNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -288,6 +319,7 @@ export class ReferenceResolver {
     // batches doesn't accrete dead entries.
     if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
     if (this.supertypeNodeMemo.size > 50_000) this.supertypeNodeMemo.clear();
+    if (this.superclassNodeMemo.size > 50_000) this.superclassNodeMemo.clear();
   }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
@@ -307,7 +339,7 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
-  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
+  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
   // Per project-relative directory ('' = the root): the module of the nearest
   // go.mod at or above it, up to the project root. Same lazy/immutable
@@ -351,6 +383,9 @@ export class ReferenceResolver {
    * Initialize the resolver (detect frameworks, etc.)
    */
   initialize(): void {
+    // A full index resolves by the package.json files on disk now, as the
+    // fingerprint it stamps says, even in a process that read them earlier.
+    this.workspacePackages = undefined;
     this.frameworks = detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
     this.clearCaches();
@@ -539,6 +574,13 @@ export class ReferenceResolver {
    * Clear internal caches
    */
   clearCaches(): void {
+    this.mocklessContext = null;
+    this.mocklessBase = null;
+    this.manualMocks = undefined;
+    this.classExpressionFreeViews = new WeakMap();
+    this.classExpressionFreeBases = new WeakMap();
+    this.classExpressionIndex = undefined;
+    this.classExpressionOnlyNameSet = null;
     this.nodeCache.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
@@ -552,6 +594,7 @@ export class ReferenceResolver {
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
     this.supertypeNodeMemo.clear();
+    this.superclassNodeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -571,12 +614,14 @@ export class ReferenceResolver {
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);
       clearVbnetReceiverMemos(this.context);
+      clearPascalScopeMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
       clearCFeatureVariantMemos(this.context);
+      clearAmbientModuleMemos(this.context);
     }
   }
 
@@ -687,11 +732,15 @@ export class ReferenceResolver {
       // `"lit/decorators": ["./node_modules/lit/decorators.js"]` lands in
       // `node_modules`, topcoder's `config` package on its `config/` folder.
       isOutOfRepoImport: (source, fromFile, language) => {
-        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false })) return false;
+        if (!isExternalImport(source, language, this.context, { aliasPrefixes: false, fromFile })) return false;
         const resolved = resolveImportPath(source, fromFile, language, this.context);
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
       },
+      resolveModuleFile: (source, fromFile, language) =>
+        resolveImportPath(source, fromFile, language, this.context),
+      isDeclaredPackage: (source, fromFile) => this.isDeclaredOutsidePackage(source, fromFile),
+      isIndexedFile: (filePath) => this.isIndexedFile(filePath),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -888,6 +937,12 @@ export class ReferenceResolver {
         return result;
       },
 
+      getNodeNamesOfKinds: (language, kinds) => this.queries.getNodeNamesOfKinds(language, kinds),
+
+      rememberNode: (node: Node) => {
+        if (!this.nodeByIdCache.has(node.id)) this.nodeByIdCache.set(node.id, node);
+      },
+
       getNodeById: (id: string) => {
         return this.nodeById(id);
       },
@@ -943,6 +998,18 @@ export class ReferenceResolver {
           if (target) nodes.push(target);
         }
         this.supertypeNodeMemo.set(id, { gen: this.supertypeGen, nodes });
+        return nodes;
+      },
+
+      getSuperclassNodes: (id: string) => {
+        const hit = this.superclassNodeMemo.get(id);
+        if (hit && hit.gen === this.supertypeGen) return hit.nodes;
+        const nodes: Node[] = [];
+        for (const edge of this.queries.getOutgoingEdges(id, ['extends'])) {
+          const target = this.nodeById(edge.target);
+          if (target) nodes.push(target);
+        }
+        this.superclassNodeMemo.set(id, { gen: this.supertypeGen, nodes });
         return nodes;
       },
 
@@ -1020,15 +1087,16 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        // Re-exports are a JS/TS-only construct, and what matters is the
-        // BARREL file's own language — not the consuming reference's. A
-        // `.svelte`/`.vue` consumer threads its own language down the
-        // re-export chase, which would make extractReExports() bail on a
-        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // What matters is the BARREL file's own language — not the consuming
+        // reference's. A `.svelte`/`.vue` consumer threads its own language
+        // down the re-export chase, which would make extractReExports() bail
+        // on a `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
-        // what kind of file imports through it.
+        // what kind of file imports through it. Python re-exports through its
+        // imports (a package `__init__.py`), so a `.py` barrel parses as Python.
         const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?|ets)$/i.test(filePath);
-        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
+        const barrelLanguage = isJsFamily ? 'typescript' : /\.py$/i.test(filePath) ? 'python' : language;
+        const reExports = extractReExports(content, barrelLanguage);
         this.reExportCache.set(filePath, reExports);
         return reExports;
       },
@@ -1131,33 +1199,37 @@ export class ReferenceResolver {
    */
   private hasAnyPossibleMatch(name: string): boolean {
     if (!this.knownNames) return true; // no pre-filter available
+    // In the view outside the class expressions, names only their classes
+    // and members carry name nothing (classExpressionFreeContextFor).
+    const only = this.classExpressionFreeBases.has(this.context) ? this.classExpressionOnlyNames() : null;
+    const known = (n: string): boolean => this.knownNames!.has(n) && !(only?.has(n) ?? false);
 
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (known(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-      if (this.knownNames.has(capitalized)) return true;
+      if (known(capitalized)) return true;
       // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
       // last one (`Bar`); the earlier check finds `example.foo.Bar` which
       // never matches a node name.
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -1166,7 +1238,7 @@ export class ReferenceResolver {
       const lastColon = name.lastIndexOf('::');
       if (lastColon > colonIdx) {
         const tail = name.substring(lastColon + 2);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
 
@@ -1180,9 +1252,9 @@ export class ReferenceResolver {
       if (sepIdx > 0) {
         const receiver = name.substring(0, sepIdx);
         const member = name.substring(sepIdx + 1);
-        if (this.knownNames.has(member) || this.knownNames.has(receiver)) return true;
+        if (known(member) || known(receiver)) return true;
         const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-        if (this.knownNames.has(capitalized)) return true;
+        if (known(capitalized)) return true;
       }
     }
 
@@ -1190,7 +1262,7 @@ export class ReferenceResolver {
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
       const fileName = name.substring(slashIdx + 1);
-      if (this.knownNames.has(fileName)) return true;
+      if (known(fileName)) return true;
     }
 
     return false;
@@ -1225,7 +1297,123 @@ export class ReferenceResolver {
    * Calls that land on an alias binding then forward once to the callable
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
+  /**
+   * The failed python attribute-chain refs that an edit to `touched` makes
+   * resolvable now — what a sync retries after a factory or a base class
+   * changed in another file (`pythonAttrRefResolves` answers each one).
+   *
+   * The candidates are the refs in the files that import a touched file
+   * within a few hops, counted once per (calling symbol, name). When there
+   * are more than `ceiling` of them — an edit to a module most of the project
+   * imports — only those the edit can plausibly reach are kept: an attribute
+   * a touched file assigns, a call receiver it defines, a class that
+   * subclasses one of its classes, or an attribute assigned from a call to
+   * something it defines. Null when even that is over the ceiling; those refs
+   * wait for a full index.
+   *
+   * Past the ceiling, then, these become resolvable only at the next full
+   * index: a factory two hops from the edit, a subclass two hops away, and an
+   * attribute typed by an annotation — a parameter `c: Client`, or a
+   * class-level `c: Client` in a class that only gains the base or import that
+   * resolves `Client` in the touched file.
+   */
+  pythonAttrRetryCandidates(touched: string[], ceiling: number = 2000): UnresolvedReference[] | null {
+    const touchedSet = new Set(touched);
+    const closure = this.queries.getPythonImporterClosure(touched).filter((f) => !touchedSet.has(f));
+    // One answer per (calling symbol, name): the same call written twice in
+    // one function resolves the same way, so it is asked — and counted — once.
+    const keyOf = (ref: { fromNodeId: string; referenceName: string }) => `${ref.fromNodeId}\0${ref.referenceName}`;
+    const resolvable = (refs: UnresolvedReference[]) => {
+      const answers = new Map<string, boolean>();
+      return refs.filter((ref) => {
+        if (!ref.filePath || !ref.language) return false;
+        const key = keyOf(ref);
+        let ok = answers.get(key);
+        if (ok === undefined) answers.set(key, (ok = pythonAttrRefResolves(ref as UnresolvedRef, this.context)));
+        return ok;
+      });
+    };
+    const candidates = this.queries.getFailedPythonAttrRefKeys(closure);
+    const load = (keys: typeof candidates) => this.queries.getUnresolvedReferencesByIds(keys.map((k) => k.id));
+    if (new Set(candidates.map(keyOf)).size <= ceiling) return resolvable(load(candidates));
+
+    const assigned = new Set<string>();
+    const defined = new Set<string>();
+    const subclassing = new Set<string>();
+    const calling = new Set<string>();
+    for (const file of touched) {
+      const source = this.context.readFile(file);
+      if (source) {
+        const text = stripCommentsForRegex(source, 'python');
+        for (const m of text.matchAll(/\b(?:self|cls)\.(\w+)\s*(?::[^=\n]*)?=(?!=)|^[ \t]+(\w+)\s*(?::[^=\n]*)?=(?!=)/gm)) {
+          assigned.add((m[1] ?? m[2])!);
+        }
+      }
+      for (const n of this.context.getNodesInFile(file)) {
+        if (n.kind === 'class' || n.kind === 'function' || n.kind === 'method') defined.add(n.name);
+      }
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['extends'], ['class'])) subclassing.add(f);
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['calls', 'instantiates'], ['function', 'method', 'class'])) {
+        calling.add(f);
+      }
+    }
+
+    const callees = new Map<string, Map<string, Set<string>>>(); // file → attr → callee names
+    const assignedCallees = (file: string, attr: string): Set<string> => {
+      let byAttr = callees.get(file);
+      if (!byAttr) {
+        byAttr = new Map();
+        const source = this.context.readFile(file);
+        const text = source ? stripCommentsForRegex(source, 'python') : '';
+        for (const m of text.matchAll(/\b(\w+)\s*(?::[^=\n]*)?=(?!=)\s*(?:await\s+)?(?:[\w.]*\.)?(\w+)\s*\(/g)) {
+          let set = byAttr.get(m[1]!);
+          if (!set) byAttr.set(m[1]!, (set = new Set()));
+          set.add(m[2]!);
+        }
+        callees.set(file, byAttr);
+      }
+      return byAttr.get(attr) ?? new Set();
+    };
+
+    const kept = candidates.filter((ref) => {
+      const name = ref.referenceName;
+      if (name.includes('().')) return defined.has(name.split('().')[0]!.split('.').pop()!);
+      const segs = name.split('.');
+      if (segs.length !== 3 || !segs.every((seg) => /^[A-Za-z_]\w*$/.test(seg))) return false;
+      const attr = segs[1]!;
+      if (assigned.has(attr)) return true;
+      if (subclassing.has(ref.filePath) && (segs[0] === 'self' || segs[0] === 'cls')) return true;
+      return calling.has(ref.filePath) && [...assignedCallees(ref.filePath, attr)].some((c) => defined.has(c));
+    });
+    return new Set(kept.map(keyOf)).size <= ceiling ? resolvable(load(kept)) : null;
+  }
+
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    // Production code is resolved as if the project's manual mocks were not
+    // indexed (see mocklessContextFor), and code outside the named class
+    // expressions as if their classes were not (classExpressionFreeContextFor);
+    // every strategy below reads the graph through this.context, so it
+    // answers for that view.
+    const outer = this.context;
+    const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
+    const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
+    const mockless = this.mocklessContextFor(ref, base) ?? base;
+    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+  }
+
+  /** resolveOneIn with every strategy reading the graph through `context`. */
+  private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
+    const outer = this.context;
+    if (context === outer) return this.resolveOneIn(ref);
+    this.context = context;
+    try {
+      return this.resolveOneIn(ref);
+    } finally {
+      this.context = outer;
+    }
+  }
+
+  private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
@@ -1245,28 +1433,52 @@ export class ReferenceResolver {
       this.context,
     );
     const scoped = this.gateRustScope(candidate, ref);
-    const resolved = this.gateSuperSelfCall(
+    // A Go name its package defines once per build target is the definition
+    // the reference's file builds with (see preferGoBuildTwin).
+    const resolved = preferGoBuildTwin(this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
-    );
+    ), ref, this.context);
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
         resolved.targetNodeId === ref.fromNodeId) return null;
+    if (resolved && isPythonFromImportModule(ref, this.context)) {
+      const module = this.nodeById(resolved.targetNodeId);
+      if (module && module.kind !== 'file' && module.kind !== 'module') return null;
+    }
+    // A name the calling JS/TS function binds itself (a parameter, a local) in
+    // scope at the reference is that binding even when the file imports the
+    // name, which the import resolver answers before the matcher's own check.
+    if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A declaration of a declaration file's `declare module 'x'` is reached
+    // through an import of `x`, never by its bare name from a file that
+    // reaches no `x` (see reachesAmbientModule).
+    if (resolved && resolved.resolvedBy !== 'import') {
+      const specifier = ambientModuleDeclarations(this.context).get(resolved.targetNodeId);
+      const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
+      if (declaringFile !== undefined && declaringFile !== ref.filePath &&
+          !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
+    // A Pascal call to data runs only a routine the data holds, in scope, and
+    // one to a routine nested in another comes only from inside that one (see
+    // gatePascalCall).
+    const call = ref.language === 'pascal' ? gatePascalCall(resolved, ref, this.context) : resolved;
+    if (!call) return null;
 
-    const target = this.nodeById(resolved.targetNodeId);
-    if (!target) return resolved;
+    const target = this.nodeById(call.targetNodeId);
+    if (!target) return call;
 
     const dot = ref.referenceName.lastIndexOf('.');
     const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
     const forwarded = resolveAliasBinding(target, memberName, this.context);
-    if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
+    if (!forwarded || forwarded.id === call.targetNodeId) return call;
 
     return this.gateLanguage({
-      ...resolved,
+      ...call,
       targetNodeId: forwarded.id,
-      confidence: Math.min(resolved.confidence, 0.85),
+      confidence: Math.min(call.confidence, 0.85),
     }, ref);
   }
 
@@ -1280,6 +1492,19 @@ export class ReferenceResolver {
     // ./cpp-supertypes).
     if (isCppSupertypeRef(ref)) return matchCppSupertype(ref, this.context);
 
+    // A Pascal name written without parentheses (#2514) links only to a
+    // routine its scope reaches, or through a receiver to a method of the
+    // receiver's declared type; data of that name links nothing.
+    if (isPascalParenlessRef(ref)) return matchPascalParenlessRef(ref, this.context);
+    // So does a Pascal call to a name the compiler or the System unit gives
+    // meaning to (`SizeOf`, `TypeInfo`, `length(S)`, `Pointer(P)`), whatever
+    // its case: only a declaration in the call's scope shadows it.
+    if (isPascalSystemCall(ref, this.context)) return matchPascalSystemCall(ref, this.context);
+    // A bare Pascal call to a routine nested where it is made (`Inner(1)` in
+    // the routine that declares `procedure Inner(N: Integer);`) is that one,
+    // and one made in a nested routine is what its scope declares first.
+    const nested = matchPascalNestedCall(ref, this.context);
+    if (nested) return nested;
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
@@ -1295,15 +1520,35 @@ export class ReferenceResolver {
     // to nothing the project declares.
     const asserted = matchGoAssertedCall(ref, this.context);
     if (asserted !== undefined) return asserted;
+    // So is one on an indexed element (`schemas[ix].ValidateBytes(data)`,
+    // deepcopy's `(*in)[i].DeepCopyInto(…)`): to a method of the element type.
+    const indexed = matchGoIndexedCall(ref, this.context);
+    if (indexed !== undefined) return indexed;
+    // And one on any other receiver the extractor keeps no name for: a
+    // fluent chain's later link, a call's result, a composite literal
+    // (`model.WithContext(0).Where(1)`, `GitOracle{}.Worktree()`, #2543).
+    const chained = matchGoChainedCall(ref, this.context);
+    if (chained !== undefined) return chained;
 
     // A section or snippet a Shopify theme's file names is that theme's own,
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
     const themeFile = matchShopifyThemeFile(ref, this.context);
     if (themeFile !== undefined) return themeFile;
 
-    // Skip built-in/external references
+    // A TS/JS `super.run(…)` runs the method of the class's parent or a
+    // nearer ancestor, or one outside the project: never a method found by
+    // its name alone (see ./js-super-calls).
+    const superCall = matchJsSuperCall(ref, this.context);
+    if (superCall !== undefined) return superCall;
+
+    // Skip built-in/external references — except a python call of a
+    // builtin-named method through a local or a parameter its def types as a
+    // project class (`reg = Registry(); reg.get(k)`, #2583): that reading,
+    // by evidence only, is the one way back, and nothing guesses past it.
     if (this.isBuiltInOrExternal(ref)) {
-      return null;
+      return this.isPythonBuiltinNamedMethodCall(ref)
+        ? this.gateLanguage(matchPythonTypedLocalCall(ref, this.context), ref)
+        : null;
     }
 
     // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
@@ -1329,6 +1574,15 @@ export class ReferenceResolver {
     // strategy ran, and PHP gives each one exactly one meaning; resolve it first.
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
+
+    // A Ruby constant written with its namespace (`Billing::ChargeCard`,
+    // `::Foo`) and a call on one (`Billing::ChargeCard.call`) are what Ruby's
+    // constant lookup finds from where they are written, or nothing the
+    // project declares (see ./ruby-constant-paths). The pre-filter below
+    // drops a `::`-rooted name, and the strategies past it would take a
+    // namesake by its last name.
+    const rubyPath = matchRubyConstantPathRef(ref, this.context);
+    if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
@@ -1379,6 +1633,12 @@ export class ReferenceResolver {
     if (isVbPathCall(ref)) {
       return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)), ref);
     }
+
+    // The last name of a TypeScript type written qualified (`React.ReactNode`,
+    // `TChat.ChatMessage`) is a member of what its qualifier names, which no
+    // framework, import or name strategy may guess past by the name alone.
+    const tsQualified = resolveTsQualifiedTypeRef(ref, this.context);
+    if (tsQualified !== undefined) return this.gateLanguage(tsQualified, ref);
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
     // import-based resolution first (an imported callback resolves through its
@@ -1463,6 +1723,14 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+    // A reference a framework answers alone ends with the frameworks' answer
+    // (see FrameworkResolver.ownsReference): Nuxt's `navigateTo(x)` with a
+    // destination no route serves is no namesake's call.
+    if (this.frameworksFor(ref.language).some((f) => f.ownsReference?.(ref, this.context))) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => (curr.confidence > best.confidence ? curr : best))
+        : null;
+    }
     // A retained untyped chain supplies effect/call-site evidence only. In
     // particular, importing its root does not make the root its call target.
     // A path through module namespaces is not untyped: `z.coerce.number()`
@@ -1612,6 +1880,27 @@ export class ReferenceResolver {
             kind = 'implements';
           }
         }
+      }
+
+      // A Go call whose callee is a type is a conversion — `Category(s)`,
+      // `(*Pair)(p)`, `model.Kind(3)` — which uses the type, and calls or
+      // instantiates nothing (#2581).
+      if (kind === 'calls' && ref.original.language === 'go') {
+        const targetNode = this.nodeById(ref.targetNodeId);
+        if (targetNode && GO_TYPE_KINDS.has(targetNode.kind)) kind = 'references';
+      }
+
+      // A Pascal call written with a bare name that resolves to a type is a
+      // typecast: `TButton(Sender).Caption`, `PInt64Rec(P)^.Lo`, `F :=
+      // TFoo(Obj)`. Delphi builds an object only through a constructor
+      // (`TFoo.Create`), so the code refers to the type and creates nothing.
+      if (
+        kind === 'calls' &&
+        ref.original.language === 'pascal' &&
+        !ref.original.referenceName.includes('.') &&
+        PASCAL_CAST_TARGET_KINDS.has(this.nodeById(ref.targetNodeId)?.kind ?? '')
+      ) {
+        kind = 'references';
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a
@@ -2645,6 +2934,69 @@ export class ReferenceResolver {
   }
 
   /**
+   * Digest of the package roots Python import resolution rests on (see
+   * `pythonRootFingerprint`). Build configs are read from disk rather than
+   * the file cache, so a sync after an edit sees the edit. Empty for a
+   * project with no Python.
+   */
+  getPythonRootFingerprint(): string {
+    return pythonRootFingerprint(this.diskContext());
+  }
+
+  /**
+   * The workspace packages and path dependencies as package.json files
+   * declare them now, read again from disk, and their fingerprint (see
+   * `workspaceFingerprint`). The resolver keeps the map for its lifetime, so
+   * a sync calls this to see a manifest edit; when the map moved, the
+   * resolver takes the new one and drops every memo resolved through the old
+   * one, and the caller re-opens what was linked by it.
+   */
+  refreshWorkspacePackages(): string {
+    const fresh = loadWorkspacePackages(this.projectRoot);
+    const fingerprint = workspaceFingerprint(fresh);
+    if (this.workspacePackages === undefined || workspaceFingerprint(this.workspacePackages) !== fingerprint) {
+      this.workspacePackages = fresh;
+      this.clearCaches();
+    }
+    return fingerprint;
+  }
+
+  /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
+  getWorkspaceFingerprint(): string {
+    return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */
+  workspacePackageDirOf(file: string): string | null {
+    const ws = this.context.getWorkspacePackages?.();
+    return ws ? workspacePackageDirOf(ws, file) : null;
+  }
+
+  /** What a sync must re-open after these Python files were added or removed (see `pythonReopenScope`). */
+  getPythonReopenScope(changedFiles: string[]): ReturnType<typeof pythonReopenScope> {
+    return pythonReopenScope(this.diskContext(), changedFiles);
+  }
+
+  /** Importers of Python packages whose `__init__.py` was edited, with the names they bind (see `pythonPackageImporters`). */
+  getPythonPackageImporters(initFiles: string[]): Map<string, Map<string, string | null>> {
+    return pythonPackageImporters(this.context, initFiles);
+  }
+
+  /** The resolution context, reading build configs from disk rather than the file cache. */
+  private diskContext(): ResolutionContext {
+    return {
+      ...this.context,
+      readFile: (filePath: string) => {
+        try {
+          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+        } catch {
+          return null;
+        }
+      },
+    };
+  }
+
+  /**
    * Get detected frameworks
    */
   getDetectedFrameworks(): string[] {
@@ -2654,6 +3006,17 @@ export class ReferenceResolver {
   /** The project file a module specifier written in `fromFile` names, as its import resolves it; null when none. */
   resolveModuleFile(specifier: string, fromFile: string, language: Language): string | null {
     return resolveImportPath(specifier, fromFile, language, this.context);
+  }
+
+  /**
+   * What `ref` resolves to against the graph as it is now, writing nothing:
+   * its target and how it was found, or null. A sync compares it with the
+   * edge the reference made before, to re-open only an edge an edit moved.
+   */
+  resolveNow(ref: UnresolvedReference): { targetNodeId: string; resolvedBy: string } | null {
+    if (!ref.filePath || !ref.language) return null;
+    const resolved = this.resolveOne({ ...ref, filePath: ref.filePath, language: ref.language });
+    return resolved ? { targetNodeId: resolved.targetNodeId, resolvedBy: resolved.resolvedBy } : null;
   }
 
   /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
@@ -2742,6 +3105,123 @@ export class ReferenceResolver {
   }
 
   /**
+   * The edited modules among `modifiedFilePaths` whose default export moved:
+   * an edit made `export default A` into `export default B`, or took the
+   * default away, while `A` stayed declared. A sync moves the edges other
+   * files made into a changed file onto the node that replaces each target, so
+   * `new Y()` after `import Y from './x'` kept `A` where a full index links
+   * `B`. An `export default` statement is no node, so neither the definition
+   * delta nor a failed-reference retry sees it change.
+   *
+   * The default a module had is read off the edges into it, with no file read:
+   * a default or namespace import of it is an `imports` edge into its file
+   * node named for the binding, and a whole-name reference through that
+   * binding (`Y`, not `Y.run`) that resolved through the import names exactly
+   * its default (a namespace binding's `NS` names the file). Only edges bound
+   * before this sync resolved anything count (up to `resolvedUpToEdgeId`), and
+   * only from files it left alone. A module that forwards its default from
+   * another file (`export { default } from './impl'`) has those edges there,
+   * so a few of its importers' are read instead. An edit that leaves the
+   * default alone, nearly every one, finds them all still on it. Each module
+   * comes with the declarations its default was (`was`), as those edges say.
+   */
+  changedDefaultExports(
+    modifiedFilePaths: readonly string[],
+    changedFilePaths: readonly string[],
+    resolvedUpToEdgeId: number,
+  ): Array<{ path: string; language: Language; was: string[] }> {
+    const fresh = new Set(changedFilePaths);
+    const moved: Array<{ path: string; language: Language; was: string[] }> = [];
+    for (const filePath of modifiedFilePaths) {
+      if (!isJsFamilyFile(filePath)) continue;
+      const bindings = new Map<string, Set<string>>();
+      for (const i of this.queries.getImportsInto(`file:${filePath}`, filePath)) {
+        if (i.refName === null || fresh.has(i.filePath) || !isModuleBindingName(i.refName)) continue;
+        const names = bindings.get(i.filePath) ?? new Set<string>();
+        names.add(i.refName);
+        bindings.set(i.filePath, names);
+      }
+      if (bindings.size === 0) continue;
+      const language = this.queries.getFileByPath(filePath)?.language;
+      if (!language) continue;
+      const readsDefault = (e: Edge & { edgeId: number; sourceFilePath: string }): boolean => {
+        const name = e.metadata?.refName;
+        return typeof name === 'string' && e.metadata?.resolvedBy === 'import' && e.edgeId <= resolvedUpToEdgeId &&
+          !e.target.startsWith('file:') && bindings.get(e.sourceFilePath)?.has(name) === true;
+      };
+      let readers: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> =
+        this.queries.getCrossFileIncomingEdgesWithTarget(filePath).filter(readsDefault);
+      if (readers.length === 0) {
+        const now = moduleDefaultExport(filePath, language, this.context);
+        if (!now || now.filePath === filePath) continue;
+        readers = [...bindings].slice(0, DEFAULT_READER_SAMPLE_FILES)
+          .flatMap(([file, names]) => this.queries.getResolutionEdgesThrough(file, [...names]))
+          .filter(readsDefault);
+      }
+      const was = new Set<string>();
+      for (const e of readers) {
+        const now = moduleDefaultExport(filePath, e.sourceLanguage, this.context);
+        // A call that lands on an alias binding goes on to the callable it names (resolveOne).
+        if (now && (e.target === now.id || (e.kind === 'calls' && resolveAliasBinding(now, null, this.context)?.id === e.target))) continue;
+        was.add(e.target);
+      }
+      if (was.size > 0) moved.push({ path: filePath, language, was: [...was] });
+    }
+    return moved;
+  }
+
+  /**
+   * Whether a failed import could name one of `files`, the files a sync just
+   * added: the test the import retry puts a crowded key's imports to
+   * (`QueryBuilder.getRetryableFailedImports`). `utils` is the path stem of a
+   * project's own `./utils` and of every `jotai/utils` and `@scope/pkg/utils`
+   * import alike, and `assert` the name of every binding of `import * as
+   * assert from 'assert'`, so past the retry's ceiling a key holds the few
+   * imports an added `utils.ts` or `assert.ts` is for among hundreds that no
+   * file of the project is.
+   *
+   * A JavaScript or TypeScript import reaches a file by the module it is
+   * written as (a path, a tsconfig alias or a workspace package, an `index`
+   * file and the emitted `.js` of a `.ts` included), by a framework's alias
+   * (SvelteKit's `$lib/…`) or by the file's own name (`…/utils.js`). One that
+   * none of those lead to an added file — a package, an import binding, a
+   * workspace package's subpath only its `exports` map resolves — names none
+   * of them. Of an import written in another language this knows nothing, so
+   * a crowded key skips it, as it always has.
+   */
+  couldNameAnyOf(files: readonly string[]): (reference: UnresolvedReference) => boolean {
+    const added = new Set(files);
+    const names = new Set(files.map((file) => file.slice(file.lastIndexOf('/') + 1)));
+    return (reference) => {
+      const language = reference.language || this.getLanguageFromNodeId(reference.fromNodeId);
+      if (!ESM_IMPORT_LANGUAGES.has(language)) return false;
+      const ref: UnresolvedRef = {
+        fromNodeId: reference.fromNodeId,
+        referenceName: reference.referenceName,
+        referenceKind: reference.referenceKind,
+        line: reference.line,
+        column: reference.column,
+        filePath: reference.filePath || this.getFilePathFromNodeId(reference.fromNodeId),
+        language,
+        rowId: reference.rowId,
+      };
+      const name = ref.referenceName;
+      if (names.has(name.slice(name.lastIndexOf('/') + 1))) return true;
+      // Where the specifier leads first: a package's leads nowhere, and only
+      // then is it worth asking whether the resolver reads the reference as a
+      // module, which for a bare name means reading the file's imports.
+      const target = resolveImportPath(name, ref.filePath, language, this.context);
+      if (target !== null && added.has(target) && jsModuleFile(ref, this.context) === target) return true;
+      // A framework's alias is a path (`$lib/x`, `~/x`); a bare name, which
+      // every binding is, is no alias, and asking reads the file.
+      return name.includes('/') && this.frameworksFor(language).some((framework) => {
+        const result = framework.resolve(ref, this.context);
+        return result !== null && added.has(this.nodeById(result.targetNodeId)?.filePath ?? '');
+      });
+    };
+  }
+
+  /**
    * True when `receiver` is a local name bound by an import that resolves to a
    * file IN THIS PROJECT — the only case where letting a python
    * built-in-method name through the filter is safe (#1681).
@@ -2775,6 +3255,14 @@ export class ReferenceResolver {
       }
     }
     return false;
+  }
+
+  /** A python call `x.get(…)` of a method named like a builtin collection, string or file method. */
+  private isPythonBuiltinNamedMethodCall(ref: UnresolvedRef): boolean {
+    if (ref.language !== 'python' || ref.referenceKind !== 'calls') return false;
+    const dot = ref.referenceName.indexOf('.');
+    return dot > 0 && PYTHON_BUILT_IN_METHODS.has(ref.referenceName.slice(dot + 1)) &&
+      !PYTHON_BUILT_IN_TYPES.has(ref.referenceName.slice(0, dot));
   }
 
   /**
@@ -2888,12 +3376,14 @@ export class ReferenceResolver {
       }
     }
 
-    // Pascal/Delphi built-ins and standard library units
+    // Pascal/Delphi built-ins, whatever their case: Pascal names ignore it
+    // (`length(S)`, `system.TypeInfo(T)`). And standard library units.
     if (ref.language === 'pascal') {
-      if (PASCAL_UNIT_PREFIXES.some((p) => name.startsWith(p))) {
+      const lower = name.toLowerCase();
+      if (PASCAL_UNIT_PREFIXES.some((p) => name.startsWith(p)) || lower.startsWith('system.')) {
         return true;
       }
-      if (PASCAL_BUILT_INS.has(name)) {
+      if (PASCAL_BUILT_INS.has(lower)) {
         return true;
       }
     }
@@ -3008,6 +3498,12 @@ export class ReferenceResolver {
    * edge. Directory comparison is case-insensitive (CFML path resolution is);
    * the class segment itself is matched exactly, which real code satisfies —
    * dotted paths are written to match the on-disk file name.
+   *
+   * A test suite is no candidate for production code (#2209's rule), and on a
+   * tie it yields to the one component outside the test suites (#2650): a
+   * TestBox spec mirroring the component's path (`tests/specs/unit/core/
+   * basecore.cfc` beside `core/basecore.cfc`) corroborates the same segments,
+   * and a mapping root like `contenscms` (onto `contens/`) matches neither.
    */
   private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
     const cfmlCandidates = (name: string): Node[] =>
@@ -3051,10 +3547,13 @@ export class ReferenceResolver {
     const className = segments[segments.length - 1]!;
     const dirSegments = segments.slice(0, -1);
 
-    let best: Node | null = null;
+    // Production code never names a component in a test suite; a test can
+    // name one, by the path to it.
+    const fromTest = isTestPath(ref.filePath);
     let bestScore = 0;
-    let tie = false;
+    let tied: Node[] = [];
     for (const cand of cfmlCandidates(className)) {
+      if (!fromTest && isTestSuitePath(cand.filePath)) continue;
       const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
       // Count matching directory segments right-to-left: for
       // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
@@ -3069,15 +3568,17 @@ export class ReferenceResolver {
         score++;
       }
       if (score > bestScore) {
-        best = cand;
         bestScore = score;
-        tie = false;
+        tied = [cand];
       } else if (score === bestScore && score > 0) {
-        tie = true;
+        tied.push(cand);
       }
     }
-    if (!best || bestScore === 0 || tie) return null;
-    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    // A test's tie between a component and a suite mirroring its path: the
+    // path names the component, as it does from production code.
+    if (tied.length > 1) tied = tied.filter((c) => !isTestSuitePath(c.filePath));
+    if (bestScore === 0 || tied.length !== 1) return null;
+    return { original: ref, targetNodeId: tied[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
   }
 
   /**
@@ -3297,6 +3798,13 @@ export class ReferenceResolver {
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
 
+    // A Go name called or passed bare that the function around it binds
+    // itself — a parameter, a `:=`, a `var` — is that binding, never a
+    // declaration of the package: client-go's `init := func(…)` then
+    // `init(t)` calls no `func init()`.
+    if (ref.language === 'go' && (ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref') &&
+        isGoBareName(ref, this.context) && isGoLocallyBound(ref, this.context)) return null;
+
     // A `#define` is a value, never a callee (#1838): a macro defined only in
     // an unrelated file is not what `NAME(x)` here expands to either.
     if (ref.referenceKind === 'calls') {
@@ -3308,6 +3816,21 @@ export class ReferenceResolver {
       // through its package; as a struct here it read as an instantiation.
       if (target && ref.language === 'go' && GO_TYPE_KINDS.has(target.kind) &&
           !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
+    }
+
+    // A TypeScript interface or type alias is no value: nothing calls one or
+    // makes an instance of it. A strategy that found one by name meant the
+    // value its file declares beside it (`interface Ok` and `function Ok` in a
+    // result module); with none there, the name is a value from elsewhere
+    // that the project only types (`new Response()`, `new Worker()`), and
+    // links nothing.
+    if ((ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && ESM_IMPORT_LANGUAGES.has(ref.language)) {
+      const target = this.nodeById(result.targetNodeId);
+      if (target && (target.kind === 'interface' || target.kind === 'type_alias')) {
+        const value = this.sameNamedValueOfType(target);
+        if (!value) return null;
+        result = { ...result, targetNodeId: value.id };
+      }
     }
 
     // An `imports` reference names something importable — never a member that
@@ -3322,11 +3845,13 @@ export class ReferenceResolver {
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
-    // A Go alias names its type as an embedding does (below): written through
-    // a package that is none of the file's imports as indexed, the type found
-    // by its bare name is another package's namesake, or the alias itself.
+    // A Go type declaration — an alias, a defined type, a struct's fields —
+    // names its types as an embedding does (below): written through a package
+    // that is none of the file's imports as indexed, the type found by its
+    // bare name is another package's namesake, or the declaration itself
+    // (`op clientv3.Op` beside the file's own `Op`).
     if (ref.language === 'go' && ref.referenceKind === 'references' &&
-        this.nodeById(ref.fromNodeId)?.kind === 'type_alias' && isGoUnknownQualified(ref, this.context)) return null;
+        GO_TYPE_KINDS.has(this.nodeById(ref.fromNodeId)?.kind ?? '') && isGoUnknownQualified(ref, this.context)) return null;
 
     // A Go type position — a parameter or result type, a composite literal's
     // type — names a type of the package Go reads it from (route handlers are
@@ -3349,6 +3874,9 @@ export class ReferenceResolver {
     // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its
     // bare name is some other package's namesake.
     if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
+    // One embedded bare that only a package the file dot-imports declares is
+    // that package's, not a namesake as near the file.
+    if (ref.language === 'go') return goDotImportedSupertype(result, ref, this.context);
     return result;
   }
 
@@ -3365,6 +3893,9 @@ export class ReferenceResolver {
    */
   private gateSuperSelfCall(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result || ref.referenceKind !== 'calls' || result.targetNodeId !== ref.fromNodeId) return result;
+    // A TS/JS call is read where it starts, so a `this.run()` that shares its
+    // line with a `super.run()` keeps its edge (#2497).
+    if (isJsSuperCallLanguage(ref.language)) return isJsSuperCallSite(ref, this.context) ? null : result;
     const name = ref.referenceName.slice(Math.max(ref.referenceName.lastIndexOf('.'), ref.referenceName.lastIndexOf(':')) + 1);
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) return result;
     const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
@@ -3379,12 +3910,247 @@ export class ReferenceResolver {
   /**
    * A bare Rust name reaches only what is in scope — every strategy's result,
    * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
-   * isRustNameInScope).
+   * isRustNameInScope). A call through a path whose type is from outside the
+   * project reaches only the project's impls for that type (or of that trait,
+   * isRustPathCallReachable). And a call, however written, reaches a project
+   * impl on a std type only as Rust would pick it (isRustForeignImplCallable).
    */
   private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
-    if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
+    if (!result || ref.language !== 'rust') return result;
+    const bare = /^[A-Za-z_]\w*$/.test(ref.referenceName);
+    if (!bare && ref.referenceKind !== 'calls') return result;
     const target = this.nodeById(result.targetNodeId);
-    return target && !isRustNameInScope(target, ref, this.context) ? null : result;
+    if (!target) return result;
+    if (bare && !isRustNameInScope(target, ref, this.context)) return null;
+    if (ref.referenceKind !== 'calls') return result;
+    if (!bare && !isRustPathCallReachable(target, ref, this.context)) return null;
+    return isRustForeignImplCallable(target, ref, this.context) ? result : null;
+  }
+
+  /**
+   * The context production code is resolved in when the project has Jest or
+   * Vitest manual mocks (`__mocks__/`): the graph without them. A mock
+   * re-declares its module's names by design and stands in for the module
+   * only while a test runs, so production code means what it would mean were
+   * the mocks not there (#2455): `formatLabel(name)`, whose import of a
+   * workspace package was not followed, is the package's `formatLabel`, never
+   * the nearer mock's. Adding or deleting a mock then changes nothing for
+   * production code, as a fresh index would have it. Test code, a mock
+   * included, keeps the whole graph: a mock is what Jest hands it. Null when
+   * the whole graph applies.
+   */
+  private mocklessContextFor(ref: UnresolvedRef, base: ResolutionContext): ResolutionContext | null {
+    if (isTestPath(ref.filePath)) return null;
+    const mocks = this.manualMockNames();
+    if (!mocks) return null;
+    if (this.mocklessContext && this.mocklessBase === base) return this.mocklessContext;
+    const isMock = (n: Node): boolean => isManualMockPath(n.filePath);
+    const real = (nodes: Node[]): Node[] => (nodes.some(isMock) ? nodes.filter((n) => !isMock(n)) : nodes);
+    // Only a name some mock declares can lose a node: other lookups pass
+    // straight through, and the filtered answers are kept.
+    const byName = new Map<string, Node[]>();
+    const byLowerName = new Map<string, Node[]>();
+    const byKind = new Map<Node['kind'], Node[]>();
+    const getMethodMatches = base.getMethodMatches;
+    const iterateNodesByKind = base.iterateNodesByKind;
+    this.mocklessBase = base;
+    this.mocklessContext = {
+      ...base,
+      getNodesByName: (name) => {
+        if (!mocks.names.has(name)) return base.getNodesByName(name);
+        let nodes = byName.get(name);
+        if (!nodes) byName.set(name, (nodes = real(base.getNodesByName(name))));
+        return nodes;
+      },
+      getNodesByLowerName: (lowerName) => {
+        if (!mocks.lowerNames.has(lowerName)) return base.getNodesByLowerName(lowerName);
+        let nodes = byLowerName.get(lowerName);
+        if (!nodes) byLowerName.set(lowerName, (nodes = real(base.getNodesByLowerName(lowerName))));
+        return nodes;
+      },
+      getNodesByQualifiedName: (qualifiedName) => real(base.getNodesByQualifiedName(qualifiedName)),
+      getNodesByKind: (kind) => {
+        let nodes = byKind.get(kind);
+        if (!nodes) byKind.set(kind, (nodes = real(base.getNodesByKind(kind))));
+        return nodes;
+      },
+      getMethodMatches: getMethodMatches
+        ? (typeName, methodName, language) => {
+          const nodes = getMethodMatches(typeName, methodName, language);
+          return mocks.names.has(methodName) ? real(nodes) : nodes;
+        }
+        : undefined,
+      iterateNodesByKind: iterateNodesByKind
+        ? function* (kind) {
+          for (const n of iterateNodesByKind(kind)) if (!isMock(n)) yield n;
+        }
+        : undefined,
+    };
+    return this.mocklessContext;
+  }
+
+  /** Built on first use from `mocklessBase`; clearCaches drops it, and the memos keyed by it go with it. */
+  private mocklessContext: ResolutionContext | null = null;
+  private mocklessBase: ResolutionContext | null = null;
+  /** The names the project's manual mocks declare, null when it has none; read once per cache window. */
+  private manualMocks: { names: Set<string>; lowerNames: Set<string> } | null | undefined;
+
+  private manualMockNames(): { names: Set<string>; lowerNames: Set<string> } | null {
+    if (this.manualMocks !== undefined) return this.manualMocks;
+    const files = [...(this.knownFiles ?? this.queries.getAllFilePaths())].filter(isManualMockPath);
+    const names = new Set<string>();
+    const lowerNames = new Set<string>();
+    if (files.length > 0) {
+      for (const n of this.queries.getNodesByFiles(files)) {
+        names.add(n.name);
+        lowerNames.add(n.name.toLowerCase());
+      }
+    }
+    this.manualMocks = names.size > 0 ? { names, lowerNames } : null;
+    return this.manualMocks;
+  }
+
+  /**
+   * The context a TS/JS reference is resolved in outside the named class
+   * expressions (#2499): one without the classes they declare or their
+   * members. An expression's name is bound inside it alone, and its class's
+   * value travels in ways resolution doesn't follow. So outside, a reference
+   * means what it would were those classes not indexed, with the confidence
+   * it had: `const Panel = class Panel {…}` keeps `new Panel()` on the
+   * constant, an interface beside a same-named class expression keeps its
+   * typed calls, and an `HTMLElement` type stays clear of lit's
+   * `HTMLElementShim = class HTMLElement {…}`. A class a CommonJS module
+   * exports isn't among them (classExpressions). Null inside a class
+   * expression, where the whole graph applies.
+   */
+  private classExpressionFreeContextFor(ref: UnresolvedRef, base: ResolutionContext): ResolutionContext | null {
+    if (!CLASS_EXPRESSION_REF_LANGUAGES.has(ref.language)) return null;
+    const expressions = this.classExpressions();
+    if (!expressions) return null;
+    const dot = ref.referenceName.indexOf('.');
+    const named = expressions.byName.get(dot > 0 ? ref.referenceName.slice(0, dot) : ref.referenceName);
+    // Written in a class expression, a reference sees its class and the
+    // classes around it, as JavaScript scopes them, unless it names another
+    // one, which is bound only inside that one.
+    const inside = expressions.byFile.get(ref.filePath)?.some((n) => writtenIn(n, ref)) ?? false;
+    if (inside && !(named && !named.some((n) => writtenIn(n, ref)))) return null;
+    let view = this.classExpressionFreeViews.get(base);
+    if (!view) {
+      view = this.classExpressionFreeView(base);
+      this.classExpressionFreeViews.set(base, view);
+      this.classExpressionFreeBases.set(view, base);
+    }
+    return view;
+  }
+
+  /**
+   * `base` without the classes class expressions declare and their members.
+   * The lookups an import reads a module's exports by (getNodesInFileNamed,
+   * getExportedNodesInFile) are left whole.
+   */
+  private classExpressionFreeView(base: ResolutionContext): ResolutionContext {
+    const { hiddenIds } = this.classExpressions()!;
+    const hidden = (n: Node): boolean => hiddenIds.has(n.id);
+    const keep = (nodes: Node[]): Node[] => (nodes.some(hidden) ? nodes.filter((n) => !hidden(n)) : nodes);
+    const byKind = new Map<Node['kind'], Node[]>();
+    const getMethodMatches = base.getMethodMatches;
+    const iterateNodesByKind = base.iterateNodesByKind;
+    const { files } = this.classExpressions()!;
+    return {
+      ...base,
+      getNodesByName: (name) => keep(base.getNodesByName(name)),
+      getNodesByLowerName: (lowerName) => keep(base.getNodesByLowerName(lowerName)),
+      getNodesByQualifiedName: (qualifiedName) => keep(base.getNodesByQualifiedName(qualifiedName)),
+      getNodesInFile: (filePath) => (files.has(filePath) ? keep(base.getNodesInFile(filePath)) : base.getNodesInFile(filePath)),
+      getNodesByKind: (kind) => {
+        let nodes = byKind.get(kind);
+        if (!nodes) byKind.set(kind, (nodes = keep(base.getNodesByKind(kind))));
+        return nodes;
+      },
+      getMethodMatches: getMethodMatches
+        ? (typeName, methodName, language) => keep(getMethodMatches(typeName, methodName, language))
+        : undefined,
+      iterateNodesByKind: iterateNodesByKind
+        ? function* (kind) {
+          for (const n of iterateNodesByKind(kind)) if (!hidden(n)) yield n;
+        }
+        : undefined,
+    };
+  }
+
+  /** classExpressionFreeContextFor's views, by the context each hides from and what it hides, and each view's context; clearCaches drops both. */
+  private classExpressionFreeViews = new WeakMap<ResolutionContext, ResolutionContext>();
+  private classExpressionFreeBases = new WeakMap<ResolutionContext, ResolutionContext>();
+  /**
+   * The names that only class expressions' classes and members carry, which
+   * name nothing where classExpressionFreeView hides those: lit's DOM shims
+   * (`class HTMLElement`, `class Event`) would otherwise send every
+   * `HTMLElement` and `new Event()` across the project through the whole
+   * resolution only to find nothing, where before the name pre-filter
+   * dropped them. Read once per cache window.
+   */
+  private classExpressionOnlyNames(): Set<string> {
+    if (this.classExpressionOnlyNameSet) return this.classExpressionOnlyNameSet;
+    const only = new Set<string>();
+    const expressions = this.classExpressions();
+    if (expressions) {
+      const names = new Set<string>();
+      for (const id of expressions.hiddenIds) {
+        const n = this.nodeById(id);
+        if (n) names.add(n.name);
+      }
+      for (const name of names) {
+        if (!this.queries.getNodesByName(name).some((n) => !expressions.hiddenIds.has(n.id))) only.add(name);
+      }
+    }
+    this.classExpressionOnlyNameSet = only;
+    return only;
+  }
+
+  /** classExpressionOnlyNames' answer; clearCaches drops it. */
+  private classExpressionOnlyNameSet: Set<string> | null = null;
+
+  /**
+   * The classes named class expressions declare: by name, the files holding
+   * them, the ids of them and their members, and the one a member belongs
+   * to. Null when there are none. Read once per cache window. A class a
+   * CommonJS module exports is left out: the module binds it, so it is read
+   * as a declaration is.
+   */
+  private classExpressionIndex: ClassExpressionIndex | null | undefined;
+
+  private classExpressions(): ClassExpressionIndex | null {
+    if (this.classExpressionIndex !== undefined) return this.classExpressionIndex;
+    const byName = new Map<string, Node[]>();
+    const byFile = new Map<string, Node[]>();
+    const byKey = new Map<string, Node>();
+    const files = new Set<string>();
+    const hiddenIds = new Set<string>();
+    const linesOf = (file: string): readonly string[] =>
+      this.context.getFileLines?.(file) ?? this.context.readFile(file)?.split(/\r?\n/) ?? [];
+    for (const n of this.queries.getNodesByKind('class')) {
+      if (!isJsClassExpression(n) || isCommonJsExportedClass(n, linesOf(n.filePath))) continue;
+      const named = byName.get(n.name);
+      if (named) named.push(n); else byName.set(n.name, [n]);
+      const inFile = byFile.get(n.filePath);
+      if (inFile) inFile.push(n); else byFile.set(n.filePath, [n]);
+      byKey.set(`${n.filePath}\0${n.qualifiedName}`, n);
+      files.add(n.filePath);
+      hiddenIds.add(n.id);
+    }
+    // A member is its class's when it is declared in its file under its
+    // qualified name (`Widget::run` of `Widget`).
+    const ownerOf = (member: Node): Node | undefined => {
+      const cut = member.qualifiedName.lastIndexOf('::');
+      return cut > 0 ? byKey.get(`${member.filePath}\0${member.qualifiedName.slice(0, cut)}`) : undefined;
+    };
+    if (files.size > 0) {
+      for (const n of this.queries.getNodesByFiles([...files])) {
+        if ((n.kind === 'method' || n.kind === 'property' || n.kind === 'field') && ownerOf(n)) hiddenIds.add(n.id);
+      }
+    }
+    this.classExpressionIndex = byName.size > 0 ? { byName, byFile, files, hiddenIds, ownerOf } : null;
+    return this.classExpressionIndex;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */
@@ -3458,6 +4224,19 @@ export class ReferenceResolver {
   }
 
   /** The one supertype-kind node a TypeScript value shares its name and file with. */
+  /**
+   * The value a file declares beside a type of the same name — `export
+   * function Ok()` beside `export interface Ok`, a class merged with an
+   * interface — which a call or `new` written with the name reaches. The
+   * first by position; null when the file declares none.
+   */
+  private sameNamedValueOfType(type: Node): Node | null {
+    return this.context
+      .getNodesInFile(type.filePath)
+      .filter((n) => n.name === type.name && TYPE_COMPANION_VALUE_KINDS.has(n.kind))
+      .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null;
+  }
+
   private sameNamedTypeOfValue(value: Node): Node | null {
     if (value.kind !== 'constant' && value.kind !== 'variable') return null;
     if (value.language !== 'typescript' && value.language !== 'tsx') return null;

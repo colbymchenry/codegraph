@@ -32,12 +32,15 @@ import {
   type DaemonLockInfo,
 } from './daemon-paths';
 import {
+  getWriterPidPath,
   readWriterLock,
   releaseWriterLock,
   swapWriterLock,
   tryAcquireWriterLock,
+  writerLockHeldMessage,
   type WriterLockInfo,
 } from './writer-lock';
+import { classifyLockHolder, describeProcess } from './process-identity';
 import { isOlderRelease } from './version';
 import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
@@ -217,11 +220,38 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
     info = decodeLockInfo(lockContents);
   } catch { /* missing/corrupt */ }
   if (info && isProcessAlive(info.pid)) {
-    // A live legacy holder has no socket path to probe. That is inconclusive,
-    // not proof of PID reuse, so preserve its lock rather than risk two writers.
-    if (!canProbeDaemonIdentity(info) || await probeDaemonIdentity(info)) return false;
+    if (canProbeDaemonIdentity(info)) {
+      if (await probeDaemonIdentity(info)) return false;
+    } else if (!await holderIsForeign(info.pid)) {
+      // A live legacy holder has no socket path to probe. That is inconclusive,
+      // not proof of PID reuse, so preserve its lock rather than risk two
+      // writers, unless the OS shows the process isn't a CodeGraph server.
+      return false;
+    }
   }
   return cleanupDaemonArtifacts(root, lockContents);
+}
+
+/**
+ * Whether the OS shows that the live process `pid` can't be a CodeGraph daemon
+ * (#2770): its command line is not a CodeGraph MCP server's. A lock naming it
+ * is stale, as one naming a dead process is. A process the OS won't describe
+ * is never counted, and neither is this one.
+ */
+async function holderIsForeign(pid: number): Promise<boolean> {
+  if (pid === process.pid) return false;
+  return classifyLockHolder(await describeProcess(pid)) === 'other';
+}
+
+/**
+ * Clear the lock of a live holder that {@link holderIsForeign} rules out as a
+ * daemon, the way a dead holder's is cleared, never signalling it. Resolves
+ * null when the holder may be a daemon.
+ */
+async function clearForeignHolder(root: string, pid: number, lockContents: string | null): Promise<StopResult | null> {
+  if (!await holderIsForeign(pid)) return null;
+  const removed = cleanupDaemonArtifacts(root, lockContents);
+  return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -297,16 +327,78 @@ export async function stopDaemonAt(
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
   // Never signal a process merely because it reused a stale daemon PID. The
-  // daemon's immediate hello is the process-identity proof (#1553).
+  // daemon's immediate hello is the process-identity proof (#1553). A holder
+  // the OS shows is no CodeGraph server is no daemon either: its lock is
+  // stale, and is cleared without signalling it (#2770).
   if (!identity || !canProbeDaemonIdentity(identity)) {
-    return { root, pid, outcome: 'unverified' };
+    return await clearForeignHolder(root, pid, lockContents) ?? { root, pid, outcome: 'unverified' };
   }
   if (!await probeDaemonIdentity(identity)) {
-    if (options.preserveUnverified) return { root, pid, outcome: 'unverified' };
+    if (options.preserveUnverified) {
+      return await clearForeignHolder(root, pid, lockContents) ?? { root, pid, outcome: 'unverified' };
+    }
     const removed = cleanupDaemonArtifacts(root, lockContents);
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
   return stopVerifiedDaemon(root, identity, lockContents, options.shutdownGraceMs);
+}
+
+/** The OS command that stops process `pid`, for advice text. */
+function stopCommand(pid: number, force = false): string {
+  if (process.platform === 'win32') return `taskkill /PID ${pid} /F`;
+  return force ? `kill -9 ${pid}` : `kill ${pid}`;
+}
+
+/**
+ * What `codegraph index` reports when {@link stopDaemonAt} left the project's
+ * daemon lock in place (outcome `unverified` or `still-running`): the process
+ * that holds it, what that process is, and a command that clears it (#2770).
+ */
+export async function daemonStopFailureMessage(root: string, result: StopResult): Promise<string> {
+  const retry = 'then retry `codegraph index`';
+  if (result.outcome === 'still-running' && result.pid !== null) {
+    return `The CodeGraph daemon serving this project (process ${result.pid}) did not exit when asked to stop. ` +
+      `Stop it with \`${stopCommand(result.pid, true)}\`, ${retry}.`;
+  }
+  const lockPath = getDaemonPidPath(root);
+  let holder: number | null = null;
+  try {
+    const current = decodeLockInfo(fs.readFileSync(lockPath, 'utf8'));
+    if (current && isProcessAlive(current.pid)) holder = current.pid;
+  } catch { /* no lock now */ }
+  if (holder !== null && result.pid !== null && holder !== result.pid) {
+    return `A new CodeGraph daemon (process ${holder}) started for this project while \`codegraph index\` was stopping the old one; ` +
+      'retry `codegraph index`.';
+  }
+  const kind = holder === null ? null : classifyLockHolder(await describeProcess(holder));
+  if (holder !== null && kind === 'codegraph-server') {
+    return `Process ${holder} runs a CodeGraph server (\`codegraph serve --mcp\`) and holds this project's daemon lock, ` +
+      'but did not answer as its daemon, so it was left running. It is probably an older or stuck CodeGraph daemon: ' +
+      `stop it with \`${stopCommand(holder)}\`, ${retry}.`;
+  }
+  if (holder !== null && kind === 'unknown') {
+    return `Process ${holder} holds this project's daemon lock (${lockPath}) but did not answer as a CodeGraph daemon, ` +
+      'and CodeGraph could not tell what it is, so it was left running. ' +
+      `If it is a CodeGraph server, stop it with \`${stopCommand(holder)}\`; if it is not, delete ${lockPath}. ` +
+      'Then retry `codegraph index`.';
+  }
+  // The daemon lock names no daemon: no live process, or one that is not
+  // CodeGraph. Such a lock is only cleared while holding the project's writer
+  // lock, so that is what kept it.
+  const writer = readWriterLock(root);
+  const writerPath = getWriterPidPath(root);
+  if (writer && writer.pid > 0 && writer.pid !== process.pid && isProcessAlive(writer.pid)) {
+    if (writer.pid === holder) {
+      return `The project's writer lock (${writerPath}) names process ${holder}, which is not a CodeGraph process, ` +
+        `so it is stale: delete ${writerPath}, ${retry}.`;
+    }
+    return writerLockHeldMessage(writer, writerPath);
+  }
+  if (holder !== null) {
+    return `Process ${holder} is not a CodeGraph process, so this project's daemon lock is stale, but it could not be removed: ` +
+      `delete ${lockPath}, ${retry}.`;
+  }
+  return 'The project\'s CodeGraph daemon changed while `codegraph index` was stopping it; retry `codegraph index`.';
 }
 
 /**

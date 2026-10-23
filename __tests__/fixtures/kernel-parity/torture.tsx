@@ -23,6 +23,7 @@ var oldVar = 'x';
 @scoped.Registry<Config>('name')
 export abstract class BaseService extends EventTarget implements Disposable, Serializable {
   static instances = 0;
+  static handlers = { refresh: helperFn, table: CONFIG_TABLE };
   private readonly cache: Map<string, Config> = new Map();
   public fonts: FontConfig;
   count = 0;
@@ -128,6 +129,46 @@ export const Styled = styled.button`
 `;
 const memoCache = memo(computeThing); // lowercase — stays a constant
 
+// Wrappers with no render function: the initializer is walked under the
+// component — interpolations, `.attrs()` / `.withConfig()` / options
+// arguments, a style function, a comparator — but not the wrapper's own chain,
+// and the wrapped component is no fn-ref (a typed tag's type is not walked).
+const BASE_MIXIN = css`color: red;`;
+export const StyledBase = styled(Button)`
+  color: ${(p) => themeColor(p, 'accent')};
+  ${BASE_MIXIN}
+  ${breakpoint('tablet')`padding: 0;`}
+`;
+export const AttrsWrapped = styled(ImportedComponent).attrs((props: ButtonProps) => ({ title: labelFor(props) }))<ButtonProps>`
+  width: ${(props) => sizeOf(props)}px;
+`;
+export const Configured = styled(MemoRow)
+  .withConfig({ shouldForwardProp: (prop) => !isInternalProp(prop) })
+  .attrs<RowProps>((props) => ({ align: alignOf(props) }))<RowProps>``;
+export const TypedTag = styled.section<ButtonProps | RowProps>`margin: ${spacing(2)};`;
+export const MuiStyled = styled(ImportedComponent, { shouldForwardProp: helperFn })(({ theme }) => ({
+  padding: theme.spacing(1),
+  color: pickColor(theme, CONFIG_TABLE),
+}));
+export const MemoCompared = memo(ImportedComponent, helperFn);
+export const MemoForward = memo(forwardRef(RenderInput));
+export const RefForwarded = React.forwardRef(RenderInput);
+
+// Callees that name nothing, and the wrappers that keep one.
+export async function calleeShapes(handlers: Record<string, () => void>, fn: () => void, load: () => Promise<() => void>) {
+  (() => { helperFn(); })();
+  create<ButtonProps>()(helperFn);
+  handlers['open']();
+  (0, fn)();
+  fn!();
+  (fn as () => void)();
+  (await load())();
+  await helperFn<ButtonProps>();
+  void helperFn<ButtonProps>();
+  if (!NS.helper.deep<boolean>(1)) return;
+  return typeof create<ButtonProps>() === 'function' && !!create<RowProps>();
+}
+
 export function App() {
   const nodes: GraphNode[] = [];
   return (
@@ -149,6 +190,7 @@ export const actionsMap = {
   update(input: UpdateInput) {
     return persistExisting(input);
   },
+  fallback: helperFn,
 };
 
 // Zustand-style store through middleware wrappers.
@@ -238,3 +280,18 @@ export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a:
   const [a, b] = [() => 1, () => 2];
   return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
 }
+
+// --- parameter defaults are the function's code (#2588) ----------------------
+export function defaultsOf(note = formatLabel('x'), { a = parseLabel('a'), b: { c = new FieldDelegator({}, []) } = {} as any }: any = {}, [first = formatLabel('f')]: string[] = [], { [parseLabel('k')]: keyed }: any = {}) { return [note, a, c, first, keyed]; }
+export const defaultArrow = (cb = (e: unknown) => formatLabel(String(e)), typed: ReturnType<typeof parseLabel> = parseLabel('t')) => cb(typed);
+export class DefaultsHolder {
+  constructor(private readonly delegate = new FieldDelegator({ send: (m: string) => m }, [])) {}
+  pick(item = formatLabel('i')) { return item; }
+  onPick = (item = parseLabel('p')) => item;
+  wrappedPick = withBatchedUpdates((item = formatLabel('w')) => item);
+}
+export const DefaultsApi = { load(note = formatLabel('l')) { return note; }, save: (note = parseLabel('s')) => note };
+export const DefaultsRef = forwardRef(function DefaultsRef({ size = parseLabel('z') }: any, ref: any) { return <b ref={ref}>{size}</b>; });
+export const DefaultsBox = styled.div.attrs((p = formatLabel('b')) => ({ p }))`color: red;`;
+export function overloadedDefault(x: string): string;
+export function overloadedDefault(x: string = formatLabel('o')): string { return x; }

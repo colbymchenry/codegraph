@@ -43,6 +43,82 @@ export function pushDartTypeRefs(
   for (const child of node.namedChildren) pushDartTypeRefs(child, fromNodeId, push);
 }
 
+/**
+ * The name a typedef declares. The grammar gives `type_alias` no fields, and
+ * the first type name is not always it: the legacy form writes its return
+ * type first (`typedef Report LegacyMaker(int n);`). The name is the last type
+ * name before the `=`, the type parameters or the parameter list.
+ */
+export function dartTypeAliasName(node: SyntaxNode): SyntaxNode | undefined {
+  let name: SyntaxNode | undefined;
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (!child || child.type === '=' || child.type === 'type_parameters' || child.type === 'formal_parameter_list') break;
+    if (child.type === 'type_identifier') name = child;
+  }
+  return name;
+}
+
+/** `scope` and the type parameters `node` declares, when it declares any (`Mapper<T>`, `T Function<T>(T a)`). */
+function dartTypeParameterScope(node: SyntaxNode, scope: ReadonlySet<string>): ReadonlySet<string> {
+  const parameters = node.namedChildren.find((c: SyntaxNode) => c.type === 'type_parameters');
+  if (!parameters) return scope;
+  const inner = new Set(scope);
+  for (const parameter of parameters.namedChildren) {
+    const name = parameter.type === 'type_parameter'
+      ? parameter.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier')
+      : undefined;
+    if (name) inner.add(name.text);
+  }
+  return inner;
+}
+
+/** pushDartTypeRefs for a typedef's aliased type: a type parameter in `scope` is no type of its own. */
+function pushDartAliasedTypeRefs(
+  node: SyntaxNode,
+  fromNodeId: string,
+  scope: ReadonlySet<string>,
+  push: (ref: UnresolvedReference) => void,
+): void {
+  if (node.type === 'type_identifier') {
+    // `p.T` is the type an import names, whatever is declared as `T` here.
+    const parameter = scope.has(node.text) && node.previousSibling?.type !== '.';
+    if (!parameter && isDartTypeName(node)) {
+      push({
+        fromNodeId,
+        referenceName: node.text,
+        referenceKind: 'references',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+    return;
+  }
+  const inner = dartTypeParameterScope(node, scope);
+  for (const child of node.namedChildren) pushDartAliasedTypeRefs(child, fromNodeId, inner, push);
+}
+
+/**
+ * A `references` ref from the typedef `node` for every type its aliased type
+ * names (#2327): a function type's return and parameter types, generic
+ * arguments, record fields, a type parameter's bound, and the legacy form's
+ * return and parameter types. A type parameter, the typedef's own or a
+ * generic function type's (`T Function<T>(T a)`), means that parameter and no
+ * type of the project's. The typedef's annotations are not its type.
+ */
+export function pushDartTypeAliasRefs(
+  node: SyntaxNode,
+  fromNodeId: string,
+  push: (ref: UnresolvedReference) => void,
+): void {
+  const name = dartTypeAliasName(node);
+  const scope = dartTypeParameterScope(node, new Set());
+  for (const child of node.namedChildren) {
+    if (child.type === 'annotation' || (name && child.equals(name))) continue;
+    pushDartAliasedTypeRefs(child, fromNodeId, scope, push);
+  }
+}
+
 /** The bodies a Dart field `declaration` can sit in: a class's or mixin's, an extension's, an enum's. */
 const DART_MEMBER_BODIES: ReadonlySet<string> = new Set(['class_body', 'extension_body', 'enum_body']);
 
@@ -646,6 +722,9 @@ export const dartExtractor: LanguageExtractor = {
     return false;
   },
   resolveName: (node) => {
+    // A typedef has no `name` field, and a legacy one writes its return type
+    // before its name (`typedef Report LegacyMaker(int n);`).
+    if (node.type === 'type_alias') return dartTypeAliasName(node)?.text;
     // `class A = B with C;` — a mixin application — names its class inside
     // the `mixin_application_class`, not in a `name` field.
     if (node.type === 'class_definition') {

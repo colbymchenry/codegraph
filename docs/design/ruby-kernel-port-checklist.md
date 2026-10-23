@@ -253,14 +253,18 @@ Hooks PRESENT (port each exactly):
   (see extractImport below).
 
 Hooks ABSENT (the walker must NOT do these): `preParse`, `resolveName`,
-`recoverMangledName`, `isMisparsedFunction`, `isConst`, `isStatic`,
+`recoverMangledName`, `isMisparsedFunction`, `isConst`,
 `isExported`, `isAsync`, `getSignature`, `getReturnType`, `getReceiverType`,
 `resolveBody`, `classifyClassNode`, `classifyMethodNode`,
 `extractPropertyName`, `interfaceKind`, `extraClassNodeTypes`,
 `packageTypes`/`extractPackage`, `extractModifiers`, `synthesizeMembers`,
 `skipBodilessClass`, `methodsAreTopLevel`. Consequences: every ruby
-function/method node has signature/isAsync/isStatic/returnType/isExported
-**undefined** (file node isExported:false); **no isConst means every
+function/method node has signature/isAsync/returnType/isExported
+**undefined** (file node isExported:false). `isStatic` IS a hook
+(isRubyClassMethod / `is_class_method`): every function/method node carries
+it — true for a `singleton_method` (`def self.x`, `def Foo.x`) and for a
+`method` whose parent, past one `body_statement`, is a `singleton_class`
+(`class << self`), false for every other def (a nested def included). **no isConst means every
 `assignment` extracts kind `'variable'`, never `'constant'` — including
 `MAX = 3`** (value-ref targeting still works: kind variable is a target);
 `attr_accessor`/`attr_reader`/`attr_writer` synthesize NOTHING (no
@@ -279,9 +283,9 @@ non-decorator sibling — always a no-op).
 | every node | visitNode hook first (943) | mixin calls + modules handled there (above); handled → scanFnRefSubtree + STOP |
 | every node | maybeCaptureFnRefs (990) | fires for `argument_list` / `pair` (the RUBY_SPEC dispatch keys) in visitNode context too — this is how class-body hook-DSL symbols are captured |
 | `method` | functionTypes:994 | inside class-like (class/module/…, isInsideClassLikeNode:1486 — **`module` counts**, 1498) AND in methodTypes → extractMethod:1737; else extractFunction:1517. skipChildren |
-| `singleton_method` (`def self.x` / `def Foo.x` / `def obj.x`) | NOT functionTypes → methodTypes:1027 | no classifyMethodNode → extractMethod. At top level: not class-like, no methodsAreTopLevel, no receiver hook → gate 1747 sends it to extractFunction → a top-level `def self.x` is a plain **function** node named x. `object` field ignored everywhere — `def self.x` vs `def x` are indistinguishable in the graph (isStatic undefined) |
+| `singleton_method` (`def self.x` / `def Foo.x` / `def obj.x`) | NOT functionTypes → methodTypes:1027 | no classifyMethodNode → extractMethod. At top level: not class-like, no methodsAreTopLevel, no receiver hook → gate 1747 sends it to extractFunction → a top-level `def self.x` is a plain **function** node named x. `object` field ignored everywhere; `def self.x` and `def x` share a qualified name, and only isStatic (true for the singleton_method) tells them apart |
 | `class` | classTypes:1005 | no classifyClassNode → extractClass:1679 (kind 'class') |
-| `singleton_class` (`class << self`) | NO branch | recursed → its `body` body_statement's defs extract as methods of the OUTER class, indistinguishable from instance methods (probed) |
+| `singleton_class` (`class << self`) | NO branch | recursed → its `body` body_statement's defs extract as methods of the OUTER class, under the same qualified names as instance methods, with isStatic true (probed) |
 | `assignment` (top level / class / module) | variableTypes:1098 | gate: `!isInsideClassLikeNode() \|\| isClassScopeConstantAssignment` (1508: type==='assignment' AND (`left` field ?? namedChild(0)).type === `'constant'`). File scope: identifier AND constant LHS both extract. Class/module scope: ONLY constant-LHS. Then extractVariable:2538 + scanFnRefSubtree (1110) + skipChildren — **the RHS is never walked: top-level/class-level `X = Foo.new` emits NO instantiates/calls** |
 | `operator_assignment` (`+=`, `\|\|=`) | no branch | not `assignment` → nothing extracted at any scope; recursed (children emit nothing either at non-body scope) |
 | `call` (top level / class / module body) | **importTypes:1209 — NEVER callTypes** | extractImport:3170 (below). require/require_relative → import node + refs; **every other call → NOTHING** (hook null → 3350 `if (this.extractor.extractImport) return;`). skipChildren stays false → children ARE visited: nested calls also land here (nothing), argument_lists get fn-ref capture. This kills `attr_accessor`, `has_many`, `define_method` (+ its do_block body!), `get '/x' do…end` route blocks, bare DSL calls — **all invisible to extraction at non-body scope** except fn-ref candidates + the rails regex extractor |
@@ -330,7 +334,7 @@ extractFilePackage:1397 (no packageTypes → no namespace node);
   `value=` — keep the suffix in the name). `<anonymous>` path (1549) can't
   trigger (grammar requires a name). No misparse hook. Node extras: docstring
   (getPrecedingDocstring), signature undefined, visibility (sibling scan!),
-  isExported/isAsync/isStatic/returnType undefined. extractTypeAnnotations →
+  isExported/isAsync/returnType undefined, isStatic from the hook (above). extractTypeAnnotations →
   no-op (ruby ∉ TYPE_ANNOTATION_LANGUAGES:5752). extractDecoratorsFor →
   no-op. Push, walk `body` field (`body_statement`) via visitFunctionBody,
   pop. **`parameters` (method_parameters) are NEVER walked — a call in a
@@ -429,13 +433,17 @@ field_expression machinery, which ruby therefore NEVER runs. Steps:
    normalized to `()`**, unlike java/php chain encodings); literal receivers
    are NOT filtered (`"literal".upcase` → `"literal".upcase`, `5.times` →
    `5.times` — unresolvable noise, PRESERVE).
-6. Receiver node TYPE exactly `constant` (and not skipped) → ADDITIONAL
-   `references` ref {name: receiverName, line/col: **the RECEIVER's**
-   position} — `Klass.static_call` emits calls `Klass.static_call` +
-   references `Klass`; fires for VALUE constants too (`RETRY_MAX.times {…}`
-   → calls `RETRY_MAX.times` + references `RETRY_MAX` — pinned). A
-   `scope_resolution` receiver (`Foo::Bar.baz`) gets NO references ref
-   (type ≠ constant). PRESERVE.
+6. Receiver a CONSTANT PATH (and not skipped) → ADDITIONAL `references`
+   ref {name: receiverName, line/col: **the RECEIVER's** position} —
+   `Klass.static_call` emits calls `Klass.static_call` + references `Klass`;
+   fires for VALUE constants too (`RETRY_MAX.times {…}` → calls
+   `RETRY_MAX.times` + references `RETRY_MAX` — pinned). A constant path is
+   a `constant`, or a `scope_resolution` whose `name` is a `constant` and
+   whose `scope` is absent or itself a constant path (#2503): `Foo::Bar.baz`
+   → references `Foo::Bar`, `::Foo.baz` → references `::Foo` (the leading
+   `::` kept — the resolver reads it as "from the top level"). A path
+   through a value (`obj::Thing.go`, `self.class::LIMIT.times`) gets NONE.
+   Both engines: `is_constant_path` / `isRubyConstantPath`.
 7. return — inner receiver calls are ALSO visited afterwards (the body
    walker recurses children at 5277 — extractCall does not consume its
    subtree), so `chained.first_call.second_call` emits BOTH

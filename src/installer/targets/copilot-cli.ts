@@ -42,6 +42,7 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  removeFileUnlessLinked,
   writeJsonFile,
 } from './shared';
 
@@ -158,7 +159,9 @@ class CopilotCliTarget implements AgentTarget {
       // Nothing left but the `{}` we'd write back — delete the file so
       // uninstall fully reverses a from-scratch install. A leftover
       // empty file would keep detect() reporting the CLI as installed.
-      fs.unlinkSync(file);
+      // A symbolic link is the user's, so it is kept with `{}` written
+      // through it (#2721).
+      removeFileUnlessLinked(file, '{}\n');
     } else {
       writeJsonFile(file, config);
     }

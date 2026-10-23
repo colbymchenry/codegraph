@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { CODEGRAPH_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
 import {
   detectInstallMethod,
   deriveInstallDir,
@@ -83,8 +85,8 @@ describe('detectInstallMethod', () => {
   it('detects a local (project) npm install as local', () => {
     const cwd = '/home/u/project';
     const filename = `${cwd}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
-    const m = detectInstallMethod({ filename, platform: 'linux', cwd, exists: () => false });
-    expect(m).toEqual({ kind: 'npm', scope: 'local' });
+    const m = detectInstallMethod({ filename, platform: 'linux', cwd, exists: bundleExists(new Set([`${cwd}/package.json`])) });
+    expect(m).toEqual({ kind: 'npm', scope: 'local', root: cwd });
   });
 
   it('detects an npx run from the _npx cache', () => {
@@ -115,9 +117,9 @@ describe('detectInstallMethod', () => {
     const cwd = '/home/u/project';
     const root = `${cwd}/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-darwin-arm64`;
     const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node`, `${root}/bin/codegraph`]);
+    const present = new Set([`${root}/node`, `${root}/bin/codegraph`, `${cwd}/node_modules/.bin/codegraph`]);
     const m = detectInstallMethod({ filename, platform: 'darwin', cwd, exists: bundleExists(present) });
-    expect(m).toEqual({ kind: 'npm', scope: 'local' });
+    expect(m).toEqual({ kind: 'npm', scope: 'local', root: cwd });
   });
 
   it('still detects an npx run when the cached platform package has the bundle layout', () => {
@@ -149,6 +151,99 @@ describe('detectInstallMethod', () => {
       exists: () => false,
     });
     expect(m.kind).toBe('unknown');
+  });
+
+  // #2477: the scope came from "is the running file under cwd", so a global
+  // prefix inside the home folder (Windows %APPDATA%\npm, nvm, ~/.npm-global)
+  // was taken for a local install whenever upgrade ran from home — npm then
+  // ran without -g and the global copy stayed old. It is now read from npm's
+  // layout: a global launcher beside the tree, or a project around it.
+  describe('npm scope comes from npm\'s layout, never from cwd (#2477)', () => {
+    const slash = (p: string | undefined) => p?.replace(/\\/g, '/');
+    const winHome = 'C:/Users/X';
+    const winPrefix = `${winHome}/AppData/Roaming/npm`;
+    const winThin = `${winPrefix}/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-win32-x64/lib/dist/bin/codegraph.js`;
+
+    it.each([winHome, 'C:/Users', 'C:/', 'C:/Users/X/projects/app'])('a Windows global install under %%APPDATA%%\\npm is global with cwd %s', (cwd) => {
+      const present = new Set([`${winPrefix}/codegraph.cmd`, `${winHome}/package.json`]);
+      for (const filename of [winThin, `${winPrefix}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`]) {
+        expect(detectInstallMethod({ filename, platform: 'win32', cwd, exists: bundleExists(present) })).toEqual({ kind: 'npm', scope: 'global' });
+      }
+    });
+
+    it.each(['/home/u', '/', '/home'])('a POSIX global install under nvm in the home folder is global with cwd %s', (cwd) => {
+      const prefix = '/home/u/.nvm/versions/node/v22.11.0';
+      const filename = `${prefix}/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
+      const present = new Set([`${prefix}/bin/codegraph`, '/home/u/package.json']);
+      expect(detectInstallMethod({ filename, platform: 'linux', cwd, exists: bundleExists(present) })).toEqual({ kind: 'npm', scope: 'global' });
+    });
+
+    it('a global install under a custom prefix is global from home (~/.npm-global, D:\\tools\\npm)', () => {
+      const posix = '/home/u/.npm-global';
+      expect(detectInstallMethod({
+        filename: `${posix}/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+        platform: 'darwin', cwd: '/home/u', exists: bundleExists(new Set([`${posix}/bin/codegraph`])),
+      })).toEqual({ kind: 'npm', scope: 'global' });
+      expect(detectInstallMethod({
+        filename: 'D:/tools/npm/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js',
+        platform: 'win32', cwd: 'D:/', exists: bundleExists(new Set(['D:/tools/npm/codegraph.cmd'])),
+      })).toEqual({ kind: 'npm', scope: 'global' });
+    });
+
+    it('a local install whose project root is the home folder stays local and belongs to the home folder, from any cwd', () => {
+      const filename = `${winHome}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
+      const present = new Set([`${winHome}/package.json`, `${winHome}/node_modules/.bin/codegraph.cmd`, `${winHome}/projects/app/package.json`]);
+      // ~/projects/app is a project of its own: npm run there would install into it.
+      for (const cwd of [winHome, 'C:/', `${winHome}/projects/app`]) {
+        const m = detectInstallMethod({ filename, platform: 'win32', cwd, exists: bundleExists(present) }) as Extract<InstallMethod, { kind: 'npm' }>;
+        expect([m.scope, slash(m.root)]).toEqual(['local', winHome]);
+      }
+    });
+
+    it('a local install in a project belongs to that project, from any cwd', () => {
+      const project = '/home/u/projects/app';
+      const filename = `${project}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
+      const present = new Set([`${project}/package.json`, `${project}/node_modules/.bin/codegraph`]);
+      for (const cwd of [project, `${project}/src`, `${project}/packages/web`, '/home/u', '/', '/home/u/projects/application']) {
+        expect(detectInstallMethod({ filename, platform: 'linux', cwd, exists: bundleExists(present) })).toEqual({ kind: 'npm', scope: 'local', root: project });
+      }
+    });
+
+    it('npx and bundled installs under the home folder are unaffected by a home cwd', () => {
+      expect(detectInstallMethod({
+        filename: `${winHome}/AppData/Local/npm-cache/_npx/1a2b3c/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+        platform: 'win32', cwd: winHome, exists: () => false,
+      })).toEqual({ kind: 'npx' });
+      const winBundle = `${winHome}/AppData/Local/codegraph/current`;
+      const win = detectInstallMethod({
+        filename: `${winBundle}/lib/dist/bin/codegraph.js`, platform: 'win32', cwd: winHome,
+        exists: bundleExists(new Set([`${winBundle}/node.exe`, `${winBundle}/bin/codegraph.cmd`])),
+      });
+      expect(win.kind).toBe('bundle');
+      const unixBundle = '/home/u/.codegraph/versions/v1.6.2';
+      expect(detectInstallMethod({
+        filename: `${unixBundle}/lib/dist/bin/codegraph.js`, platform: 'linux', cwd: '/home/u',
+        exists: bundleExists(new Set([`${unixBundle}/node`, `${unixBundle}/bin/codegraph`, '/home/u/.codegraph'])),
+      })).toEqual({ kind: 'bundle', os: 'unix', bundleRoot: unixBundle, installDir: '/home/u/.codegraph' });
+    });
+
+    it('a pnpm, yarn or bun install is named as such, so npm never runs in its folder', () => {
+      const pnpm = '/home/u/.local/share/pnpm/global/5';
+      expect(detectInstallMethod({
+        filename: `${pnpm}/node_modules/.pnpm/@colbymchenry+codegraph@1.6.2/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+        platform: 'linux', cwd: '/home/u', exists: bundleExists(new Set([`${pnpm}/package.json`])),
+      })).toEqual({ kind: 'package-manager', manager: 'pnpm', global: true });
+      const yarn = '/home/u/.config/yarn/global';
+      expect(detectInstallMethod({
+        filename: `${yarn}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+        platform: 'linux', cwd: '/home/u', exists: bundleExists(new Set([`${yarn}/package.json`, `${yarn}/yarn.lock`])),
+      })).toEqual({ kind: 'package-manager', manager: 'yarn', global: true });
+      const project = '/home/u/app';
+      expect(detectInstallMethod({
+        filename: `${project}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+        platform: 'linux', cwd: project, exists: bundleExists(new Set([`${project}/package.json`, `${project}/bun.lock`])),
+      })).toEqual({ kind: 'package-manager', manager: 'bun', global: false });
+    });
   });
 });
 
@@ -336,7 +431,7 @@ describe('windows bundle swap script (#2185)', () => {
 // ---------------------------------------------------------------------------
 
 interface Calls {
-  runs: Array<{ cmd: string; args: string[]; env?: NodeJS.ProcessEnv }>;
+  runs: Array<{ cmd: string; args: string[]; env?: NodeJS.ProcessEnv; cwd?: string }>;
   captures: Array<{ cmd: string; args: string[] }>;
   logs: string[];
   errors: string[];
@@ -353,8 +448,8 @@ function makeDeps(
     currentVersion: overrides.currentVersion,
     method: overrides.method,
     resolveLatest: overrides.resolveLatest ?? (async () => 'v0.9.9'),
-    run: (cmd, args, env) => {
-      calls.runs.push({ cmd, args, env });
+    run: (cmd, args, env, cwd) => {
+      calls.runs.push({ cmd, args, env, cwd });
       return runExit;
     },
     // Default probe: spawn fails → 'inconclusive'. Tests that exercise the
@@ -554,6 +649,87 @@ describe('runUpgrade', () => {
     expect(code).toBe(0);
     expect(calls.runs).toHaveLength(0);
     expect(calls.logs.join('\n')).toMatch(/git pull/);
+  });
+});
+
+describe('runUpgrade picks npm\'s scope and folder from the install, not from cwd (#2477)', () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-2477-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const npmRun = (calls: Calls) => calls.runs.find((r) => r.args.join(' ').includes('install'));
+
+  it('a Windows global install run from the home folder upgrades with -g (the report)', async () => {
+    const home = 'C:/Users/X';
+    const prefix = `${home}/AppData/Roaming/npm`;
+    const method = detectInstallMethod({
+      filename: `${prefix}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`,
+      platform: 'win32',
+      cwd: home,
+      exists: (p) => p.replace(/\\/g, '/') === `${prefix}/codegraph.cmd`,
+    });
+    const { deps, calls } = makeDeps({ method, currentVersion: '0.9.8', platform: 'win32' });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    const run = npmRun(calls)!;
+    expect(run.args).toEqual(['/d', '/s', '/c', `npm install -g ${NPM_PACKAGE}@latest`]);
+    expect(run.cwd).toBeUndefined();
+  });
+
+  it('a local install is upgraded in its own project, and the version npm left there is checked', async () => {
+    const project = path.join(tmp, 'app');
+    const manifest = path.join(project, 'node_modules', '@colbymchenry', 'codegraph', 'package.json');
+    fs.mkdirSync(path.dirname(manifest), { recursive: true });
+    fs.writeFileSync(path.join(project, 'package.json'), '{}\n');
+
+    const method: InstallMethod = { kind: 'npm', scope: 'local', root: project };
+    // npm left the project on the old version: say so, don't just claim success.
+    fs.writeFileSync(manifest, JSON.stringify({ version: '0.9.8' }));
+    const stale = makeDeps({ method, currentVersion: '0.9.8' });
+    expect(await runUpgrade({}, stale.deps)).toBe(0);
+    expect(npmRun(stale.calls)!).toMatchObject({ cmd: 'npm', args: ['install', `${NPM_PACKAGE}@latest`], cwd: project });
+    expect(stale.calls.logs.join('\n')).toContain(`Running: npm install ${NPM_PACKAGE}@latest (in ${project})`);
+    expect(stale.calls.logs.join('\n')).toContain(`npm finished, but ${project} still has CodeGraph v0.9.8.`);
+
+    fs.writeFileSync(manifest, JSON.stringify({ version: '0.9.9' }));
+    const done = makeDeps({ method, currentVersion: '0.9.8' });
+    await runUpgrade({}, done.deps);
+    expect(done.calls.logs.join('\n')).toContain(`✓ ${project} now has CodeGraph v0.9.9.`);
+  });
+
+  it('a local install in a home folder that is a project is upgraded there, even when run from another project inside it', async () => {
+    const home = path.join(tmp, 'home');
+    const other = path.join(home, 'projects', 'app');
+    fs.mkdirSync(path.join(home, 'node_modules', '.bin'), { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(home, 'package.json'), '{}\n');
+    fs.writeFileSync(path.join(home, 'node_modules', '.bin', 'codegraph'), '');
+    fs.writeFileSync(path.join(other, 'package.json'), '{}\n');
+    const method = detectInstallMethod({
+      filename: path.join(home, 'node_modules', '@colbymchenry', 'codegraph', 'dist', 'bin', 'codegraph.js'),
+      platform: process.platform,
+      cwd: other,
+    });
+    const { deps, calls } = makeDeps({ method, currentVersion: '0.9.8' });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(npmRun(calls)!.cwd).toBe(home);
+  });
+
+  it('a pnpm, yarn or bun install is not touched with npm: the user gets the command for their manager', async () => {
+    for (const [manager, global, command] of [
+      ['pnpm', true, `pnpm add -g ${NPM_PACKAGE}@latest`],
+      ['yarn', true, `yarn global add ${NPM_PACKAGE}@latest`],
+      ['bun', false, `bun add ${NPM_PACKAGE}@latest`],
+    ] as const) {
+      const { deps, calls } = makeDeps({ method: { kind: 'package-manager', manager, global }, currentVersion: '0.9.8' });
+      expect(await runUpgrade({}, deps)).toBe(1);
+      expect(calls.runs).toHaveLength(0);
+      expect(calls.logs.join('\n')).toContain(`installed with ${manager}, so npm can't upgrade it`);
+      expect(calls.logs.join('\n')).toContain(command);
+    }
   });
 });
 
@@ -822,6 +998,159 @@ describe('post-upgrade refresh of installed agent surfaces', () => {
     expect(calls.runs.filter((r) => r.cmd === 'codegraph')).toHaveLength(0);
     expect(calls.logs.join('\n')).toMatch(/run `codegraph install --refresh` once the PATH is fixed/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The refresh an upgrade runs keeps the user's instructions files (#2506)
+// ---------------------------------------------------------------------------
+
+describe('post-upgrade refresh keeps the user\'s instructions files (#2506)', () => {
+  const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-2506-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('an npm upgrade refreshes the block in the global opencode AGENTS.md and keeps every line around it', async () => {
+    // opencode configured globally, as a previous `codegraph install` left it.
+    const dir = path.join(home, '.config', 'opencode');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'opencode.jsonc'), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: { servers: { codegraph: { type: 'local', command: ['codegraph', 'serve', '--mcp'], disabled: false, codemode: false } } },
+    }, null, 2) + '\n');
+    // The user's maintained guidance, opening with what is left of an older
+    // block whose end marker was deleted, and an old block at the end.
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    const notes = '<!-- CODEGRAPH_START -->\n## CodeGraph\n\n# Toolset\n\n- ripgrep, fd\n\n## Commit policy\n\n- conventional commits\n\n';
+    const oldBlock = '<!-- CODEGRAPH_START -->\n## CodeGraph\n\nPrefer `codegraph_search` over grep.\n<!-- CODEGRAPH_END -->\n';
+    fs.writeFileSync(agentsMd, notes + oldBlock);
+
+    const work = path.join(home, 'work');
+    fs.mkdirSync(work);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      APPDATA: path.join(home, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_TELEMETRY: '0',
+      CODEGRAPH_NO_UPDATE_CHECK: '1',
+      DO_NOT_TRACK: '1',
+    };
+    for (const key of ['CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'CLAUDE_CONFIG_DIR', 'CODEGRAPH_NO_INSTALL_REFRESH']) delete env[key];
+
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    // `npm install -g` succeeds without running; the refresh it is followed
+    // by runs the real CLI against the private home.
+    deps.run = (cmd, args, runEnv) => {
+      calls.runs.push({ cmd, args, env: runEnv });
+      if (cmd !== 'codegraph') return 0;
+      const r = spawnSync(process.execPath, [BIN, ...args], { cwd: work, env, encoding: 'utf-8', timeout: 60_000 });
+      return r.status ?? -1;
+    };
+
+    expect(await runUpgrade({}, deps)).toBe(0);
+    const refresh = calls.runs[calls.runs.length - 1];
+    expect(refresh?.cmd).toBe('codegraph');
+    expect(refresh?.args).toEqual(['install', '--refresh']);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+  }, 90_000);
+});
+
+// ---------------------------------------------------------------------------
+// A symbolic link the refresh can't write through (#2721)
+// ---------------------------------------------------------------------------
+
+/** File symlinks need Developer Mode or admin rights on Windows. */
+function canCreateFileSymlink(): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-symlink-probe-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'target'), '');
+    fs.symlinkSync(path.join(dir, 'target'), path.join(dir, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+const FILE_SYMLINKS = canCreateFileSymlink();
+
+describe.skipIf(!FILE_SYMLINKS)(`post-upgrade refresh with a link it can't write through (#2721)${FILE_SYMLINKS ? '' : ' — skipped: creating a file symlink needs Developer Mode or admin rights on Windows'}`, () => {
+  const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-2721-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('warns, keeps the link, and still refreshes every other agent', async () => {
+    // Codex and Gemini configured globally. Codex's AGENTS.md is a link into a
+    // dotfiles folder that isn't there; Gemini's block is out of date.
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), '[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp"]\n');
+    const agentsMd = path.join(home, '.codex', 'AGENTS.md');
+    const missing = path.join(home, 'dotfiles', 'AGENTS.md');
+    fs.symlinkSync(missing, agentsMd, 'file');
+    fs.mkdirSync(path.join(home, '.gemini'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.gemini', 'settings.json'), JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2) + '\n');
+    const geminiMd = path.join(home, '.gemini', 'GEMINI.md');
+    fs.writeFileSync(geminiMd, '<!-- CODEGRAPH_START -->\n## CodeGraph\n\nPrefer `codegraph_search` over grep.\n<!-- CODEGRAPH_END -->\n');
+
+    const work = path.join(home, 'work');
+    fs.mkdirSync(work);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      APPDATA: path.join(home, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_TELEMETRY: '0',
+      CODEGRAPH_NO_UPDATE_CHECK: '1',
+      DO_NOT_TRACK: '1',
+      NO_COLOR: '1',
+    };
+    for (const key of ['CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'CLAUDE_CONFIG_DIR', 'CODEGRAPH_NO_INSTALL_REFRESH']) delete env[key];
+
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    let refreshOutput = '';
+    deps.run = (cmd, args, runEnv) => {
+      calls.runs.push({ cmd, args, env: runEnv });
+      if (cmd !== 'codegraph') return 0;
+      const r = spawnSync(process.execPath, [BIN, ...args], { cwd: work, env, encoding: 'utf-8', timeout: 60_000 });
+      refreshOutput = `${r.stdout}\n${r.stderr}`;
+      return r.status ?? -1;
+    };
+
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(calls.logs.join('\n')).toMatch(/Could not refresh the installed agent surfaces/);
+    expect(refreshOutput).toMatch(/Codex CLI: could not refresh — .*AGENTS\.md is a symbolic link to .*its folder does not exist/);
+    expect(fs.lstatSync(agentsMd).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.dirname(missing))).toBe(false);
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toBe(CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+  }, 90_000);
 });
 
 // ---------------------------------------------------------------------------

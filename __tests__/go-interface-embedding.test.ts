@@ -18,9 +18,10 @@
  * resolution reads the package back from the source. `storage.LabelQuerier`
  * reaches that package's interface; `io.Closer` and `sync.Mutex` stay
  * unresolved rather than landing on a project type that shares the name.
- * Go's predeclared types are never recorded: `int64` is a constraint's term,
- * and `error`, `any` and `comparable` exist in no graph. Runs against the
- * native kernel (when built) and the wasm extractor, which must agree.
+ * Go's predeclared types are not recorded: `int64` is a constraint's term,
+ * and `any` and `comparable` have no methods. `error` has one, so embedding it
+ * is recorded, and stays unresolved like `io.Closer`. Runs against the native
+ * kernel (when built) and the wasm extractor, which must agree.
  *
  * Resolution keeps an embedded type in its package. A bare name is its own
  * package's type, not another package's struct of that name, which the Go
@@ -204,6 +205,7 @@ describe('Go embedded types are supertypes', () => {
         'Querier extends Closer',
         'Querier extends LabelQuerier',
         'Querier extends Queryable',
+        'Timeout extends error',
       ]);
       expectRefsOnTheirNames(result, source);
       // The interfaces' own methods are still its members, the embeddings are not.
@@ -228,6 +230,7 @@ describe('Go embedded types are supertypes', () => {
         'Store extends List',
         'Store extends Mutex',
         'Store extends Reader',
+        'Store extends error',
       ]);
       expectRefsOnTheirNames(result, source);
     });

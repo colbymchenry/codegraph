@@ -25,6 +25,27 @@
 import type { Edge, ExtractionError, ExtractionResult, Language, Node, UnresolvedReference } from '../types';
 import * as path from 'path';
 
+const TS_LANG_ATTR = /lang\s*=\s*["'](ts|typescript)["']/;
+const TSX_LANG_ATTR = /lang\s*=\s*["']tsx["']/;
+
+/**
+ * The grammar a `<script>` block is read with, from its opening tag's
+ * attributes — by the Vue and Svelte extractors, and by the viewer's syntax
+ * regions, so a component's code is highlighted with the grammar its symbols
+ * came from.
+ *
+ * `ts` / `typescript` is TypeScript. A Vue block can also be `tsx` (#2570):
+ * TypeScript with JSX, which only the TSX grammar reads — the TypeScript
+ * grammar has no JSX, and the JavaScript one stops at the first type, so a
+ * `defineProps<{…}>()` or an `interface` was lost. Svelte has no TSX scripts.
+ * Anything else is JavaScript, whose grammar reads JSX (`lang="jsx"`) already.
+ */
+export function sfcScriptLanguage(attrs: string, host: Language): Language {
+  if (TS_LANG_ATTR.test(attrs)) return 'typescript';
+  if (host === 'vue' && TSX_LANG_ATTR.test(attrs)) return 'tsx';
+  return 'javascript';
+}
+
 /** The SFC's own file node — the whole file, as the tree-sitter extractor makes one. */
 export function sfcFileNode(filePath: string, source: string, language: Language): Node {
   return {
