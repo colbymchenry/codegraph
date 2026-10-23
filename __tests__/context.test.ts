@@ -225,6 +225,30 @@ export function validateEmail(email: string): boolean {
 
       expect(result.nodes.size).toBeLessThanOrEqual(5);
     });
+
+    it('adds a widely implemented interface\'s subtypes within the hierarchy budget', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-context-hierarchy-'));
+      fs.writeFileSync(path.join(dir, 'lifecycle.ts'), 'export interface IDisposable {\n  release(): void;\n}\n');
+      for (let i = 0; i < 15; i++) {
+        fs.writeFileSync(
+          path.join(dir, `impl${i}.ts`),
+          `import { IDisposable } from './lifecycle';\nexport class Impl${i} implements IDisposable {\n  release(): void {}\n}\n`
+        );
+      }
+      const graph = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+      try {
+        await graph.indexAll();
+        // No traversal, so every implementor here comes from the hierarchy
+        // step, which takes at most a quarter of the budget: 3 of 12.
+        const result = await graph.findRelevantContext('IDisposable', { maxNodes: 12, traversalDepth: 0 });
+        const implementors = [...result.nodes.values()].filter((n) => /^Impl\d+$/.test(n.name));
+        expect(implementors.length).toBeGreaterThan(0);
+        expect(implementors.length).toBeLessThanOrEqual(3);
+      } finally {
+        graph.destroy();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('buildContext()', () => {

@@ -435,16 +435,19 @@ export class GraphTraverser {
 
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
-    const visited = new Set<string>();
 
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
+    // Each direction keeps its own visited set: the ancestor walk marks the
+    // focal node first, and a shared set made the descendant walk return at
+    // its guard before reading one incoming edge, so no type ever had
+    // subtypes (#2833).
     // Get ancestors (what this extends/implements)
-    this.getTypeAncestors(nodeId, nodes, edges, visited);
+    this.getTypeAncestors(nodeId, nodes, edges, new Set<string>());
 
     // Get descendants (what extends/implements this)
-    this.getTypeDescendants(nodeId, nodes, edges, visited);
+    this.getTypeDescendants(nodeId, nodes, edges, new Set<string>());
 
     return {
       nodes,

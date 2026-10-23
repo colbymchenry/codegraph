@@ -242,6 +242,24 @@ export { main };
       expect(hierarchy.nodes.has(derivedClass.id)).toBe(true);
     });
 
+    it('returns the subtypes and implementors of a type, not only its ancestors', () => {
+      const base = cg.getNodesByKind('class').find((n) => n.name === 'BaseClass')!;
+      const printable = cg.getNodesByKind('interface').find((n) => n.name === 'Printable')!;
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass')!;
+
+      const fromBase = cg.getTypeHierarchy(base.id);
+      expect(fromBase.nodes.has(derived.id)).toBe(true);
+      expect(fromBase.edges.some((e) => e.source === derived.id && e.target === base.id && e.kind === 'extends')).toBe(true);
+
+      const fromInterface = cg.getTypeHierarchy(printable.id);
+      expect(fromInterface.nodes.has(derived.id)).toBe(true);
+      expect(fromInterface.edges.some((e) => e.source === derived.id && e.target === printable.id && e.kind === 'implements')).toBe(true);
+
+      // The ancestors still come back from the subtype's side.
+      const fromDerived = cg.getTypeHierarchy(derived.id);
+      expect(fromDerived.nodes.has(base.id) && fromDerived.nodes.has(printable.id)).toBe(true);
+    });
+
     it('should return empty subgraph for non-existent node', () => {
       const hierarchy = cg.getTypeHierarchy('non-existent-id');
 

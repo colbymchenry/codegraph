@@ -1143,13 +1143,16 @@ export class ContextBuilder {
       if (hierarchyNodesAdded >= maxHierarchyNodes) break;
       if (typeHierarchyKinds.has(result.node.kind)) {
         const hierarchy = this.traverser.getTypeHierarchy(result.node.id);
+        // The budget holds per node: a widely implemented interface brings
+        // its whole descendant tree (IDisposable: hundreds of types).
         for (const [id, node] of hierarchy.nodes) {
-          if (!nodes.has(id)) {
+          if (!nodes.has(id) && hierarchyNodesAdded < maxHierarchyNodes) {
             nodes.set(id, node);
             hierarchyNodesAdded++;
           }
         }
         for (const edge of hierarchy.edges) {
+          if (!nodes.has(edge.source) || !nodes.has(edge.target)) continue;
           const exists = edges.some(
             (e) => e.source === edge.source && e.target === edge.target && e.kind === edge.kind
           );
