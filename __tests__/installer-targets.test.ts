@@ -2652,6 +2652,89 @@ describe('Installer — a config folder that is a link keeps working (#2721)', (
   });
 });
 
+// ---------------------------------------------------------------------------
+// A rewritten config file keeps its mode (found while fixing #2721)
+//
+// Every write is a temp file renamed over the old one, and a new file gets
+// the default mode: a 0600 `~/.claude.json` or `~/.codex/config.toml` holding
+// tokens came out 0644, readable by every account on the machine. Windows has
+// no POSIX modes, so these run elsewhere; installer-file-mode.test.ts runs the
+// same flows on every machine with the mode reported through a mock.
+// ---------------------------------------------------------------------------
+describe('Installer — install, refresh and uninstall keep each config file\'s mode', () => {
+  const POSIX = process.platform !== 'win32';
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('mode-home');
+    tmpCwd = mkTmpDir('mode-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const modeOf = (p: string) => (fs.statSync(p).mode & 0o7777).toString(8);
+  /** A small file of the user's own, in the format of `file`, for an agent to add its entry to. */
+  const userContent = (file: string): string => {
+    if (/\.jsonc?$/.test(file)) return '{\n  "userSetting": true\n}\n';
+    if (file.endsWith('.toml')) return 'model = "o3"\n';
+    if (/\.ya?ml$/.test(file)) return 'model: default\n';
+    return '# my notes\n';
+  };
+
+  for (const target of ALL_TARGETS) {
+    for (const location of (['global', 'local'] as const).filter((l) => target.supportsLocation(l))) {
+      it.runIf(POSIX)(`${target.id} (${location}): files that were 0600 are still 0600 after install and uninstall`, () => {
+        const files = target.describePaths(location);
+        for (const f of files) {
+          fs.mkdirSync(path.dirname(f), { recursive: true });
+          fs.writeFileSync(f, userContent(f));
+          fs.chmodSync(f, 0o600);
+        }
+
+        const installed = target.install(location, { autoAllow: true });
+        expect(installed.files.some((f) => f.action === 'updated')).toBe(true);
+        for (const f of files.filter((x) => fs.existsSync(x))) expect(modeOf(f), f).toBe('600');
+
+        target.uninstall(location);
+        for (const f of files.filter((x) => fs.existsSync(x))) expect(modeOf(f), f).toBe('600');
+      });
+    }
+  }
+
+  it.runIf(POSIX)('a refresh rewriting a stale entry keeps a 0600 ~/.claude.json and ~/.codex/config.toml 0600', () => {
+    const claude = getTarget('claude')!;
+    const codex = getTarget('codex')!;
+    claude.install('global', { autoAllow: true });
+    codex.install('global', { autoAllow: true });
+    const claudeJson = path.join(tmpHome, '.claude.json');
+    const codexToml = path.join(tmpHome, '.codex', 'config.toml');
+    // Entries as an older version left them, in files the user keeps private.
+    const json = JSON.parse(fs.readFileSync(claudeJson, 'utf-8'));
+    json.mcpServers.codegraph.args = ['serve'];
+    fs.writeFileSync(claudeJson, JSON.stringify(json, null, 2) + '\n');
+    fs.writeFileSync(codexToml, fs.readFileSync(codexToml, 'utf-8').replace(/^args = .*$/m, 'args = ["serve"]'));
+    fs.chmodSync(claudeJson, 0o600);
+    fs.chmodSync(codexToml, 0o600);
+
+    const reports = refreshTargets([claude, codex], 'global');
+
+    expect(reports.flatMap((r) => r.changedPaths)).toEqual(expect.arrayContaining([claudeJson, codexToml]));
+    expect(modeOf(claudeJson)).toBe('600');
+    expect(modeOf(codexToml)).toBe('600');
+  });
+});
+
 describe('Installer — detection never writes (#1870)', () => {
   let tmpHome: string;
   let tmpCwd: string;
