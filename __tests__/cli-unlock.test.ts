@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFile, execFileSync } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
@@ -101,14 +101,22 @@ describe('codegraph unlock — daemon artifact recovery (#1553)', () => {
   });
 
   it('preserves a live legacy lock whose daemon identity cannot be probed', () => {
-    const pidPath = getDaemonPidPath(tempDir);
-    fs.writeFileSync(pidPath, `${process.pid}\n`);
+    // The holder's command line reads like a CodeGraph MCP server's, so it may
+    // be the daemon. One that is plainly another program leaves a stale lock,
+    // which unlock clears (#2770).
+    const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codegraph.js', 'serve', '--mcp'], { stdio: 'ignore' });
+    try {
+      const pidPath = getDaemonPidPath(tempDir);
+      fs.writeFileSync(pidPath, `${holder.pid}\n`);
 
-    const output = runCodegraph(['unlock', tempDir], tempDir);
+      const output = runCodegraph(['unlock', tempDir], tempDir);
 
-    expect(output).toContain('No stale lock files found');
-    expect(fs.readFileSync(pidPath, 'utf8')).toBe(`${process.pid}\n`);
-    expect(() => process.kill(process.pid, 0)).not.toThrow();
+      expect(output).toContain('No stale lock files found');
+      expect(fs.readFileSync(pidPath, 'utf8')).toBe(`${holder.pid}\n`);
+      expect(() => process.kill(holder.pid!, 0)).not.toThrow();
+    } finally {
+      holder.kill('SIGKILL');
+    }
   });
 
   it('removes a legacy lock whose PID is dead', () => {

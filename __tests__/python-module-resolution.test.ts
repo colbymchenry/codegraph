@@ -338,7 +338,8 @@ def fetch():
     cg = await CodeGraph.init(tempDir, { index: true });
 
     expect(targets('analysis.py', 'analysis.py', 'imports')).toEqual([]);
-    expect(targets('report.py', 'report.py', 'imports')).toEqual(['summary@analysis.py']);
+    // The from-import's module is analysis.py itself; the name is its `summary`.
+    expect(targets('report.py', 'report.py', 'imports').sort()).toEqual(['analysis.py@analysis.py', 'summary@analysis.py']);
     expect(cg.findCircularDependencies()).toEqual([]);
   });
 
@@ -651,7 +652,8 @@ def main():
         'main.py': 'from pkg import f\n\n\ndef main():\n    f()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
-      expect(targets('main.py', 'main.py', 'imports')).toEqual(['f@pkg/__init__.py']);
+      // The package itself is the from-import's module; `f` is its attribute.
+      expect(targets('main.py', 'main.py', 'imports').sort()).toEqual(['__init__.py@pkg/__init__.py', 'f@pkg/__init__.py']);
     });
 
     it('binds it through a relative import too', async () => {
@@ -675,7 +677,7 @@ def main():
         'main.py': 'from pkg import thing\n\n\ndef main():\n    thing()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
-      expect(targets('main.py', 'main.py', 'imports')).toEqual(['thing@pkg/impl.py']);
+      expect(targets('main.py', 'main.py', 'imports').sort()).toEqual(['__init__.py@pkg/__init__.py', 'thing@pkg/impl.py']);
     });
 
     it('still binds the submodule when the package does not bind the name', async () => {
@@ -685,7 +687,7 @@ def main():
         'main.py': 'from pkg import f\n\n\ndef main():\n    f.g()\n',
       });
       cg = await CodeGraph.init(tempDir, { index: true });
-      expect(targets('main.py', 'main.py', 'imports')).toEqual(['f.py@pkg/f.py']);
+      expect(targets('main.py', 'main.py', 'imports').sort()).toEqual(['__init__.py@pkg/__init__.py', 'f.py@pkg/f.py']);
       expect(targets('main', 'main.py', 'calls')).toEqual(['g@pkg/f.py']);
     });
   });

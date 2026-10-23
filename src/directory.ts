@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
+import { loadNodeSqlite } from './db/node-sqlite';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -214,10 +215,11 @@ function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
  * second connection opened and closed here leaves the first one's locks alone.
  */
 function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { DatabaseSync } = require('node:sqlite');
   let db: any = null;
   try {
+    // A runtime without node:sqlite can't inspect the file: `unknown`, so the
+    // command goes on to open it and reports why that is impossible.
+    const { DatabaseSync } = loadNodeSqlite();
     db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
     return row !== undefined ? 'schema' : 'no-schema';
@@ -1122,4 +1124,42 @@ export function isTaskNotification(prompt: string): boolean {
  */
 export function isAgentMessage(prompt: string): boolean {
   return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
+}
+
+/**
+ * A message another local Claude Code session sends to this one arrives as a
+ * `<cross-session-message from="…">…</cross-session-message>` prompt, which
+ * UserPromptSubmit hooks also receive (#2635). Same rule as
+ * {@link isTaskNotification}: only a prompt that is entirely that envelope is
+ * skipped.
+ */
+export function isCrossSessionMessage(prompt: string): boolean {
+  return /^\s*<cross-session-message(?:\s[^>]*)?>[\s\S]*<\/cross-session-message>\s*$/.test(prompt);
+}
+
+const SYSTEM_REMINDER_CLOSE = '</system-reminder>';
+/** One complete reminder block. The attribute run stops at `<`, so a tag left
+ *  open in pasted text can't make the scan quadratic. */
+const SYSTEM_REMINDER_BLOCK = /<system-reminder(?:\s[^<>]*)?>[\s\S]*?<\/system-reminder>/g;
+
+/**
+ * The prompt the user typed, without the `<system-reminder>…</system-reminder>`
+ * blocks Claude Code's desktop app puts in front of it, such as which other
+ * local sessions are linked. UserPromptSubmit hooks receive them as
+ * part of the prompt (#2635), but they are the host's status, not the user's
+ * words: gated and explored on, they made every turn, a bare "yes" included,
+ * inject context about the reminder, and they hid a task notification, a
+ * subagent hand-back or a cross-session message behind them from
+ * {@link isTaskNotification}, {@link isAgentMessage} and
+ * {@link isCrossSessionMessage}. Every complete block is removed and the rest
+ * trimmed; a `<system-reminder>` the user only mentions, with no closing tag,
+ * stays.
+ */
+export function stripSystemReminders(prompt: string): string {
+  // Only the text up to the last closing tag can hold a complete block, and
+  // bounding the scan there keeps an unclosed tag from rescanning the tail.
+  const end = prompt.lastIndexOf(SYSTEM_REMINDER_CLOSE);
+  if (end < 0) return prompt.trim();
+  const head = prompt.slice(0, end + SYSTEM_REMINDER_CLOSE.length);
+  return (head.replace(SYSTEM_REMINDER_BLOCK, '\n') + prompt.slice(head.length)).trim();
 }

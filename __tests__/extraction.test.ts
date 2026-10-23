@@ -5325,6 +5325,64 @@ import 'package:flutter/material.dart';
       expect(vars).toContain('heading');
     });
 
+    /* `{% capture name %}…{% endcapture %}` declares a variable as `assign`
+       does; only assigns were read (#2498). */
+    it.each([
+      ['{% capture captured %}Hello{% endcapture %}', 'captured', 1, 0],
+      ['{%- capture trimmed -%}Hi{%- endcapture -%}', 'trimmed', 1, 0],
+      ['{% capture tight-%}Hi{% endcapture %}', 'tight', 1, 0],
+      ["<p>{% capture 'single' %}Hi{% endcapture %}</p>", 'single', 1, 3],
+      ['{% capture "double" %}Hi{% endcapture %}', 'double', 1, 0],
+      ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
+      ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
+      ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+    ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
+      const result = extractFromSource('sections/card.liquid', code);
+      const variables = result.nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.qualifiedName, n.startLine, n.startColumn]))
+        .toEqual([[name, `sections/card.liquid::${name}`, line, column]]);
+      const file = result.nodes.find((n) => n.kind === 'file')!;
+      expect(result.edges).toContainEqual({ source: file.id, target: variables[0]!.id, kind: 'contains' });
+    });
+
+    it('reads no capture from comments, raw regions, prose or a tag without a name', () => {
+      const code = [
+        '{% comment %}{% capture ghost %}x{% endcapture %}{% endcomment %}',
+        '{%- raw -%}{% capture ghost %}x{% endcapture %}{%- endraw -%}',
+        '{% # capture ghost %}',
+        '{% liquid', '  # capture ghost', '  comment', '  capture ghost', '  endcomment', '%}',
+        '{% capture %}x{% endcapture %}',
+        '<p>We capture ghost moments.</p>',
+        '{% assign text = "{% capture ghost %}" %}',
+      ].join('\n');
+      const result = extractFromSource('sections/card.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
+    });
+
+    it('never cuts a capture name short', () => {
+      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
+      // either; such a name gets no node rather than a wrong one.
+      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+      expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
+    });
+
+    it('keeps an assign and captures of the same name on one line apart', () => {
+      const code = '{% assign title = 1 %}{% capture title %}one{% endcapture %}{% capture title %}two{% endcapture %}';
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startColumn]))
+        .toEqual([['title', 0], ['title', code.indexOf('{% capture')], ['title', code.lastIndexOf('{% capture')]]);
+      expect(new Set(variables.map((n) => n.id)).size).toBe(3);
+      // The assign keeps the id it had before captures were read.
+      expect(variables[0]!.id).toBe(generateNodeId('sections/card.liquid', 'variable', 'title', 1));
+    });
+
+    it('still reads the tags inside a capture', () => {
+      const code = "{% capture card_html %}{% render 'card' %}{% assign inner = 1 %}{% endcapture %}";
+      const result = extractFromSource('sections/product.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name).sort()).toEqual(['card_html', 'inner']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['snippets/card.liquid']);
+    });
+
     it('should extract section inside a {% liquid %} block', () => {
       const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
       const result = extractFromSource('layout/theme.liquid', code);
@@ -5415,6 +5473,40 @@ import 'package:flutter/material.dart';
         .toEqual(['live', 'live', 'after', 'after']);
       expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line]))
         .toEqual([['snippets/live.liquid', 18], ['snippets/after.liquid', 20]]);
+    });
+
+    /* A layout renders a section group, the JSON file `sections/<group>.json`,
+       with the plural tag; only the singular one was read (#2494). */
+    it.each([
+      "{% sections 'header-group' %}",
+      '{%- sections "header-group" -%}',
+      "{% liquid\n  sections 'header-group'\n%}",
+    ])('reads a section group from %j', (code) => {
+      const result = extractFromSource('layout/theme.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.name)).toEqual(['header-group']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['sections/header-group.json']);
+    });
+
+    it('keeps a section and a section group of the same name apart', () => {
+      const result = extractFromSource('layout/theme.liquid', "{% section 'header' %}{% sections 'header' %}");
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]))
+        .toEqual([['sections/header.liquid', 1, 0], ['sections/header.json', 1, 22]]);
+      expect(result.nodes.filter((n) => n.kind === 'component').map((n) => n.qualifiedName))
+        .toEqual(['layout/theme.liquid::section:header', 'layout/theme.liquid::sections:header']);
+      expect(new Set(result.nodes.map((n) => n.id)).size).toBe(result.nodes.length);
+    });
+
+    it.each(['comment', 'raw'])('indexes no schema written inside %s', (tag) => {
+      // An example schema in a comment is not the section's, and a lone
+      // opening tag in one must not swallow the real schema after it (#2494).
+      const code = [
+        `{% ${tag} %}`, '{% schema %}', '{"name": "Ghost"}', '{% endschema %}', `{% end${tag} %}`,
+        `{%- ${tag} -%}{% schema %}{%- end${tag} -%}`,
+        '{% schema %}', '{"name": "Live"}', '{% endschema %}',
+      ].join('\n');
+      const result = extractFromSource('sections/header.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => [n.name, n.startLine]))
+        .toEqual([['Live', 7]]);
     });
 
     it('should extract multiple imports', () => {
@@ -7503,6 +7595,24 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
   });
 
+  it('indexes capture declarations as variables that search finds, in or out of a Shopify theme', async () => {
+    // A captured variable could not be found, while an assigned one could (#2498).
+    fs.mkdirSync(path.join(tempDir, '_includes'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, '_includes/card.liquid'), [
+      "{% assign existing = 'ok' %}",
+      '{% capture captured %}Hello{% endcapture %}',
+      '{% liquid', '  capture bare_capture', "    echo 'x'", '  endcapture', '%}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    for (const [name, line] of [['existing', 1], ['captured', 2], ['bare_capture', 4]] as const) {
+      const hit = cg.searchNodes(name, { kinds: ['variable'] }).find((r) => r.node.name === name);
+      expect(hit?.node, name).toMatchObject({ filePath: '_includes/card.liquid', language: 'liquid', startLine: line });
+      expect(cg.getIncomingEdges(hit!.node.id)).toContainEqual(expect.objectContaining({ kind: 'contains' }));
+    }
+  });
+
   it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
     // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
     // a `{% section %}` Liquid tag — so a section used only from a JSON template
@@ -7749,6 +7859,97 @@ describe('Liquid Shopify JSON template section resolution', () => {
     writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
     await cg.sync();
     expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  // The notice Shopify's theme editor writes at the top of every JSON template
+  // and section group it saves.
+  const editorNotice = [
+    '/*',
+    ' * ------------------------------------------------------------',
+    ' * IMPORTANT: The contents of this file are auto-generated.',
+    ' * ------------------------------------------------------------',
+    ' */',
+  ];
+  const referencesFrom = (file: string): Array<[string | undefined, number | undefined, number | undefined]> => {
+    const fileNode = cg.getNodesInFile(file).find((n) => n.kind === 'file')!;
+    return cg.getOutgoingEdges(fileNode.id)
+      .filter((e) => e.kind === 'references')
+      .map((e): [string | undefined, number | undefined, number | undefined] => [cg.getNode(e.target)?.filePath, e.line, e.column])
+      .sort((a, b) => a[1]! - b[1]!);
+  };
+
+  it.each(['\n', '\r\n'])('links the sections an editor-saved template and section group list, where each `type` is (%j)', async (newline) => {
+    // JSON.parse rejects the editor's comment, so such a file linked none of
+    // its sections, and a file without one linked them at line 1 (#2494).
+    writeFiles({
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [
+        ...editorNotice, '{', '  "type": "header",', '  "name": "Header",', '  "sections": {',
+        '    "bar": { "type": "announcement-bar" },', '    "header": {', '      "type": "header"', '    }',
+        '  },', '  "order": ["bar", "header"]', '}',
+      ].join(newline),
+      'sections/announcement-bar.liquid': `<div></div>\n`,
+      'sections/header.liquid': `<header></header>\n`,
+      'sections/main-product.liquid': `<div>{{ product.title }}</div>\n`,
+      'templates/product.json': [
+        ...editorNotice, '{', '  "sections": {', '    "main": {', '      "type": "main-product",',
+        '      "settings": { "note": "https://example.com/*not-a-comment*/ // nor this" }', '    },',
+        '    "again": { "type": "main-product" }', '  },', '  "order": ["main", "again"]', '}',
+      ].join(newline),
+      'templates/index.json': `{\n  "sections": {\n    "main": { "type": "header" }\n  },\n  "order": ["main"]\n}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(referencesFrom('templates/product.json')).toEqual([['sections/main-product.liquid', 9, 14]]);
+    expect(referencesFrom('sections/header-group.json')).toEqual([
+      ['sections/announcement-bar.liquid', 10, 21],
+      ['sections/header.liquid', 12, 14],
+    ]);
+    expect(referencesFrom('templates/index.json')).toEqual([['sections/header.liquid', 3, 22]]);
+    expect(referencesFrom('layout/theme.liquid')).toEqual([['sections/header-group.json', 1, 0]]);
+  });
+
+  it('reads a JSON template with trailing commas, which Shopify accepts in theme JSON', () => {
+    const text = '// a note\n{"sections": {"main": {"type": "main-product",}, "hero": {"type": "hero"},}, "order": ["main", "hero",],}';
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences.map((r) => r.referenceName))
+      .toEqual(['sections/main-product.liquid', 'sections/hero.liquid']);
+  });
+
+  it.each([
+    ['a missing brace', '{"sections": {"main": {"type": "main-product"}}'],
+    ['an unclosed comment', '/* saved by the editor {"sections": {"main": {"type": "main-product"}}}'],
+    ['a missing comma', '{"sections": {"main": {"type": "main-product"} "hero": {"type": "hero"}}}'],
+  ])('links nothing from a JSON template with %s', (_case, text) => {
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences).toEqual([]);
+  });
+
+  it("links a layout's section groups inside its own theme, and on to the sections they list", async () => {
+    // `{% sections 'header-group' %}` renders the theme's
+    // sections/header-group.json, whose sections render snippets (#2494).
+    writeFiles({
+      ...severalThemes,
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n'),
+      // This theme has no header group of its own, and the root theme's is not its.
+      'examples/tailwind/layout/theme.liquid': `{% liquid\n  sections 'header-group'\n%}{{ content_for_layout }}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header-group.json']);
+    expect(linksOf('sections/header-group.json')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual([]);
+
+    // Once the theme has a header group of its own, sync links the layout to it.
+    writeFiles({ 'examples/tailwind/sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n') });
+    await cg.sync();
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header-group.json']);
+    expect(linksOf('examples/tailwind/sections/header-group.json')).toEqual(['examples/tailwind/sections/header.liquid']);
   }, 60_000);
 
   it('finds the theme a file is in from the theme folder it sits in', () => {

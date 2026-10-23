@@ -11,7 +11,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
-import { resolveWorkspaceImport } from './workspace-packages';
+import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
@@ -30,6 +30,7 @@ import {
   tsImportedTypeFile,
   reExportSource,
   pythonFunctionModuleAlias,
+  isPythonFromImportModule,
   isRustAssociatedItem,
   tsGlobalScope,
 } from './name-matcher';
@@ -389,7 +390,7 @@ function resolveImportPathUncached(
   // alias map first (custom prefixes like `@components/*` would
   // otherwise be misclassified as npm). What still looks like a package
   // may name a file through the importing app's own config.
-  if (isExternalImport(importPath, language, context)) {
+  if (isExternalImport(importPath, language, context, { fromFile })) {
     return resolveFromOwnConfig(importPath, fromFile, language, context);
   }
 
@@ -1105,12 +1106,16 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * asked `resolveImportPath` whether an alias maps the specifier to a file.
  * Matching a prefix proves nothing by itself: a catch-all `"*"` pattern
  * (`"*": ["./typings/*"]`) has an empty prefix and matches every package.
+ *
+ * `fromFile`, the importing file, lets a package another package depends on
+ * by path (`"acme-shared": "file:../common"`) count as the project's for the
+ * files under the manifest that declares it (#2456).
  */
 export function isExternalImport(
   importPath: string,
   language: Language,
   context?: ResolutionContext,
-  options: { aliasPrefixes?: boolean } = {}
+  options: { aliasPrefixes?: boolean; fromFile?: string } = {}
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
@@ -1122,7 +1127,7 @@ export function isExternalImport(
   // workspace map first so they aren't misclassified as external (#629). The
   // map is null for single-package repos, so this is a no-op there.
   const workspaces = context?.getWorkspacePackages?.();
-  if (workspaces && resolveWorkspaceImport(importPath, workspaces)) {
+  if (workspaces && resolveWorkspaceImport(importPath, workspaces, options.fromFile)) {
     return false;
   }
 
@@ -1244,7 +1249,8 @@ const EMITTED_TO_SOURCE_EXTENSIONS: ReadonlyArray<readonly [RegExp, readonly str
 function findSourceForEmittedSpecifier(
   relativePath: string,
   language: Language,
-  context: ResolutionContext
+  context: ResolutionContext,
+  exists: (file: string) => boolean = (file) => context.fileExists(file)
 ): string | null {
   if (!EMITTED_SPECIFIER_LANGUAGES.has(language)) return null;
   for (const [emitted, sources] of EMITTED_TO_SOURCE_EXTENSIONS) {
@@ -1252,7 +1258,7 @@ function findSourceForEmittedSpecifier(
     const stem = relativePath.replace(emitted, '');
     for (const ext of sources) {
       const candidate = stem + ext;
-      if (context.fileExists(candidate)) return candidate;
+      if (exists(candidate)) return candidate;
     }
     return null;
   }
@@ -1297,16 +1303,23 @@ function resolveAliasedImport(
     }
   }
 
-  // 1.5 Workspace packages (`@scope/ui/widgets` → `packages/ui/widgets`).
-  //     Resolves a monorepo member import to the member's directory; the
-  //     extension/index permutations below then find its barrel (#629).
+  // 1.5 Workspace packages and path dependencies: the entry the package's
+  //     manifest declares for the import (#2502), else the member's
+  //     directory (`@scope/ui/widgets` → `packages/ui/widgets`), where the
+  //     extension/index permutations find its barrel (#629). A path into the
+  //     package's build output the index lacks (`@acme/utils/lib/path`) is
+  //     read as the source it is built from (`src/path.ts`), as a declared
+  //     entry is, before a file only a local build left on disk.
   const workspaces = context.getWorkspacePackages?.();
-  if (workspaces) {
-    const base = resolveWorkspaceImport(importPath, workspaces);
-    if (base) {
-      const hit = tryWithExt(base);
-      if (hit) return hit;
-    }
+  const targets = workspaces ? workspaceImportTargets(importPath, workspaces, fromFile) : null;
+  if (targets) {
+    const declared = declaredWorkspaceEntry(targets, language, context);
+    if (declared) return declared;
+    const direct = tryWithExt(targets.directory);
+    if (direct && (context.isIndexedFile?.(direct) ?? true)) return direct;
+    const built = builtSourceOf(targets.directory, targets.packageDir, language, context);
+    if (built) return built;
+    if (direct) return direct;
   }
 
   // 2. Hard-coded fallback list. Kept for projects that use these
@@ -1362,6 +1375,80 @@ function indexedSpelling(filePath: string, language: Language): string {
   return ESM_IMPORT_LANGUAGES.has(language) && /\/\/|(?:^|\/)\.\.?(?:\/|$)/.test(filePath)
     ? path.posix.normalize(filePath)
     : filePath;
+}
+
+/**
+ * The file a package's declared entry for an import lands on (#2502): the
+ * first declared target, in order (`exports` by condition, then the root's
+ * `main`-style fields), that the index holds, or that is build output the
+ * index lacks (`dist/index.js`), read as the source it is built from
+ * (`src/index.ts`). So `import`'s `./build/index.js` leads to `src/index.ts`
+ * before a custom condition's `./src/browser.ts` does. Null when none holds
+ * — the caller then tries the package's directory, as it did before entries
+ * were read.
+ */
+function declaredWorkspaceEntry(targets: WorkspaceImportTargets, language: Language, context: ResolutionContext): string | null {
+  for (const target of targets.declared) {
+    const hit = indexedTarget(target, language, context) ?? builtSourceOf(target, targets.packageDir, language, context);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** `target`, build output the index lacks, as the indexed source it is built from (see builtSourcesOf); null when there is none. */
+function builtSourceOf(target: string, packageDir: string, language: Language, context: ResolutionContext): string | null {
+  for (const source of builtSourcesOf(target, packageDir)) {
+    const hit = indexedTarget(source, language, context);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * `target` as a file the index holds: as written, with the language's
+ * extensions or index files, or as the source of an emitted `.js`. Only the
+ * index counts: build output a developer has built locally is on disk, but
+ * nothing links to it.
+ */
+function indexedTarget(target: string, language: Language, context: ResolutionContext): string | null {
+  const indexed = (file: string): boolean => context.isIndexedFile?.(file) ?? context.fileExists(file);
+  const asIs = indexedSpelling(target, language);
+  if (indexed(asIs)) return asIs;
+  for (const ext of EXTENSION_RESOLUTION[language] || []) {
+    const candidate = indexedSpelling(target + ext, language);
+    if (indexed(candidate)) return candidate;
+  }
+  return findSourceForEmittedSpecifier(asIs, language, context, indexed);
+}
+
+/** A package's build folder: `dist/`, `build/`, `lib/`, `out/`, `es/`, `esm/`, `cjs/`. */
+const BUILD_ROOT = /^(?:dist|build|lib|out|output|es|esm|cjs|umd)\//;
+/** The format subfolder a bundler adds below it (`dist/esm/`, `dist/types/`), or the source folder tsc mirrors (`dist/src/`). */
+const BUILD_FORMAT = /^(?:esm|cjs|es|mjs|module|modules|commonjs|types|typings|umd|node|browser|src)\//;
+/** An emitted file's extension, declaration files included. */
+const EMITTED_EXTENSION = /(?:\.d)?\.(?:[cm]?[jt]s|[jt]sx)$/;
+
+/**
+ * The source files a package's build output may be built from,
+ * extension-less, most literal first: the build folder mirrored under
+ * `src/` (vite's `dist/node/index.js` → `src/node/index`), then without a
+ * format subfolder (`dist/esm/index.mjs`, `dist/types/index.d.ts` →
+ * `src/index`). The caller links one only if the index holds it, so a
+ * mapping that is not clear links nothing. Empty for a target outside a
+ * build folder.
+ */
+function builtSourcesOf(target: string, packageDir: string): string[] {
+  const prefix = packageDir === '' ? '' : packageDir + '/';
+  if (!target.startsWith(prefix)) return [];
+  const inPackage = target.slice(prefix.length);
+  const root = BUILD_ROOT.exec(inPackage);
+  if (!root) return [];
+  const mirrored = inPackage.slice(root[0].length);
+  const format = BUILD_FORMAT.exec(mirrored);
+  const stems = [mirrored, ...(format ? [mirrored.slice(format[0].length)] : [])]
+    .map((rest) => rest.replace(EMITTED_EXTENSION, ''))
+    .filter((stem) => stem !== '' && !stem.startsWith('src/'));
+  return [...new Set(stems)].map((stem) => `${prefix}src/${stem}`);
 }
 
 /**
@@ -3575,11 +3662,14 @@ function resolvePythonAbsoluteModule(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
-  // (`from app.api.routes import authentication`) is ambiguous on its own — three
-  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
-  // which uses the import's source (`app.api.routes`) to build the full path.
-  if (!ref.referenceName.includes('.')) return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path, and so does
+  // the module a from-import names, dotted or not: `from loader import X` is
+  // the top-level `loader`, found from the package roots as `import loader`
+  // finds it. A bare leaf it imports (`from app.api.routes import
+  // authentication`) is ambiguous on its own — three `authentication.py` files
+  // may exist — so leave it to resolveModuleImportToFile, which uses the
+  // import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.') && !isPythonFromImportModule(ref, context)) return null;
   const hit = pythonModuleFileNode(ref.referenceName, ref.filePath, context);
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
@@ -4242,7 +4332,7 @@ export function isBoundToOutOfRepoImport(
     if (imp.localName !== name) continue;
     // A package the repository declares itself (`declare module 'x'`) has
     // its declarations in the repository.
-    return isExternalImport(imp.source, ref.language, context) &&
+    return isExternalImport(imp.source, ref.language, context, { fromFile: ref.filePath }) &&
       resolveImportPath(imp.source, ref.filePath, ref.language, context) === null &&
       !ambientModuleDeclares(imp.source, imp.exportedName, imp.isDefault, ref, context);
   }
@@ -4315,7 +4405,7 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   const binding = mappings.find((m) => m.localName === name) ??
     (receiver && ref.referenceKind === 'calls' ? localTypeBinding(receiver, ref, context, mappings) : undefined);
   if (!binding) return undefined;
-  if (isExternalImport(binding.source, ref.language, context) &&
+  if (isExternalImport(binding.source, ref.language, context, { fromFile: ref.filePath }) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
       !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix)) &&
       // A module the app's `baseUrl` or catch-all `paths` reads (`layout/MainLayout`).

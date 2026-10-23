@@ -8,6 +8,8 @@ import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
+import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
+import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -105,6 +107,20 @@ export class NotIndexedError extends Error {}
  * {@link NotIndexedError} it answers SUCCESS-shaped — never `isError`, which
  * would teach the agent to abandon codegraph for projects that work fine.
  */
+/**
+ * A project whose index exists but could not be opened: SQLite's own failure,
+ * with the path and what to check, or a runtime without node:sqlite. A real
+ * malfunction, so it stays `isError` with the retry-once note, but it says
+ * what failed instead of calling it an internal error.
+ */
+function databaseOpenFailureText(err: DatabaseOpenError | NodeSqliteUnavailableError): string {
+  return (
+    `${err.message}\n` +
+    'Retry the call once; if it persists, continue without codegraph for this task and pass ' +
+    'the message above on to the user.'
+  );
+}
+
 function wslSharedIndexGuidance(err: WslSharedIndexError): string {
   return (
     `${err.message}\n\n` +
@@ -2021,9 +2037,10 @@ export class ToolHandler {
   private knownSubprojects: string[] = [];
   private knownSubprojectsBase: string | null = null;
   // Why the default project failed to open, when that is worth telling the
-  // agent instead of "no project loaded" — today only the Windows/WSL
-  // shared-index error (#995). Engine-maintained; cleared by a successful open.
-  private defaultOpenFailure: WslSharedIndexError | null = null;
+  // agent instead of "no project loaded": the Windows/WSL shared-index error
+  // (#995), or an index that exists but could not be opened (SQLite's own
+  // failure, or no node:sqlite). Engine-maintained; cleared by a successful open.
+  private defaultOpenFailure: WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null = null;
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -2083,7 +2100,7 @@ export class ToolHandler {
    * call that needs it answers with that fix rather than "no project loaded".
    * `null` clears it.
    */
-  setDefaultOpenFailure(err: WslSharedIndexError | null): void {
+  setDefaultOpenFailure(err: WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null): void {
     this.defaultOpenFailure = err;
   }
 
@@ -3021,6 +3038,10 @@ export class ToolHandler {
       if (err instanceof PathRefusalError) {
         return this.errorResult(err.message);
       }
+      // An index that exists but could not be opened: a malfunction, said as what it is.
+      if (isDatabaseOpenFailure(err)) {
+        return this.errorResult(databaseOpenFailureText(err));
+      }
       return this.errorResult(
         `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
         'This is an internal codegraph error — retry the call once; if it persists, ' +
@@ -3108,6 +3129,9 @@ export class ToolHandler {
       }
       if (err instanceof PathRefusalError) {
         return this.errorResult(err.message);
+      }
+      if (isDatabaseOpenFailure(err)) {
+        return this.errorResult(databaseOpenFailureText(err));
       }
       return this.errorResult(
         `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +

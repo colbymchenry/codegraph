@@ -26,23 +26,6 @@ export interface ImportInfo {
 }
 
 /**
- * Information about a single variable within a declaration.
- * Returned by a language's extractVariables hook.
- */
-export interface VariableInfo {
-  /** Variable name */
-  name: string;
-  /** Node kind: 'variable' or 'constant' */
-  kind: NodeKind;
-  /** Optional signature string */
-  signature?: string;
-  /** If set, this declarator is actually a function and should be extracted as such */
-  delegateToFunction?: SyntaxNode;
-  /** The AST node to use for positioning (may differ from the declaration node) */
-  positionNode?: SyntaxNode;
-}
-
-/**
  * Context object passed to language hooks that need to call back into the core extractor.
  * Provides a controlled API surface — hooks can create nodes, visit children, and add
  * references without accessing the full TreeSitterExtractor internals.
@@ -137,7 +120,14 @@ export interface LanguageExtractor {
   importTypes: string[];
   /** Node types that represent function calls */
   callTypes: string[];
-  /** Node types that represent variable declarations (const, let, var, etc.) */
+  /**
+   * Node types that represent variable declarations (const, let, var, etc.).
+   * By default the core names each declared variable from the node's direct
+   * `identifier` or `variable_declarator` children (`extractVariable` in
+   * tree-sitter.ts). A grammar that nests the names deeper, like Swift's
+   * `pattern` or Lua's `variable_list`, gets its own branch there; there is no
+   * per-language hook for it.
+   */
   variableTypes: string[];
   /** Node types that represent class fields (extracted as 'field' kind inside class bodies) */
   fieldTypes?: string[];
@@ -330,12 +320,6 @@ export interface LanguageExtractor {
    * Return null if the node isn't a recognized import form.
    */
   extractImport?: (node: SyntaxNode, source: string) => ImportInfo | null;
-
-  /**
-   * Extract variable declarations from a variable declaration node.
-   * Returns info about each declared variable, allowing the core to create nodes.
-   */
-  extractVariables?: (node: SyntaxNode, source: string) => VariableInfo[];
 
   /**
    * Extract receiver/owner type name from a method declaration.

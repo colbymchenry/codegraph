@@ -30,7 +30,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
-import { QueryBuilder } from './db/queries';
+import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
@@ -68,6 +68,7 @@ import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
+import { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
 import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
@@ -150,6 +151,8 @@ export interface IndexOptions {
  */
 /** project_metadata key for the Python package-root digest (see sync). */
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
+/** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
+const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
 
 export class CodeGraph {
   private db: DatabaseConnection;
@@ -215,24 +218,47 @@ export class CodeGraph {
     // on the pattern array's identity, which the cache keeps stable.
     let cachedPatterns: string[] | undefined;
     let cachedMatcher: ReturnType<typeof ignore> | undefined;
-    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+    // The compiled matcher for the patterns `codegraph.json` holds right now,
+    // or null when there are none.
+    const currentMatcher = (): ReturnType<typeof ignore> | null => {
+      const patterns = loadDeprioritizePatterns(this.projectRoot);
+      if (patterns.length === 0) return null;
+      if (patterns !== cachedPatterns) {
+        cachedPatterns = patterns;
+        cachedMatcher = ignore().add(patterns);
+      }
+      return cachedMatcher!;
+    };
+    const matches = (matcher: ReturnType<typeof ignore> | null, filePath: string): boolean => {
+      if (!matcher) return false;
+      const rel = path.isAbsolute(filePath)
+        ? path.relative(this.projectRoot, filePath)
+        : filePath;
+      if (!rel || rel.startsWith('..')) return false;
+      return matcher.ignores(rel.split(path.sep).join('/'));
+    };
+    const deprioritized: DeprioritizedPathMatcher = (filePath: string): boolean => {
       try {
-        const patterns = loadDeprioritizePatterns(this.projectRoot);
-        if (patterns.length === 0) return false;
-        if (patterns !== cachedPatterns) {
-          cachedPatterns = patterns;
-          cachedMatcher = ignore().add(patterns);
-        }
-        const rel = path.isAbsolute(filePath)
-          ? path.relative(this.projectRoot, filePath)
-          : filePath;
-        if (!rel || rel.startsWith('..')) return false;
-        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+        return matches(currentMatcher(), filePath);
       } catch {
         // Ranking must never take the search down with it.
         return false;
       }
-    });
+    };
+    // One `stat` for a whole loop of candidates instead of one per candidate
+    // (#2620): a search reads the config once, then asks the frozen matcher.
+    deprioritized.snapshot = () => {
+      let matcher: ReturnType<typeof ignore> | null = null;
+      try { matcher = currentMatcher(); } catch { matcher = null; }
+      return (filePath: string): boolean => {
+        try {
+          return matches(matcher, filePath);
+        } catch {
+          return false;
+        }
+      };
+    };
+    this.queries.setDeprioritizedPathMatcher(deprioritized);
 
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
@@ -772,6 +798,7 @@ export class CodeGraph {
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
+        if (result.success) this.stampWorkspaceFingerprint();
 
         if (result.success && result.filesIndexed > 0) {
           try {
@@ -879,6 +906,13 @@ export class CodeGraph {
   private stampPythonRootFingerprint(fingerprint = this.resolver.getPythonRootFingerprint()): void {
     try {
       this.queries.setMetadata(PYTHON_ROOTS_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the workspace-package digest a later sync compares against (see sync). */
+  private stampWorkspaceFingerprint(fingerprint = this.resolver.getWorkspaceFingerprint()): void {
+    try {
+      this.queries.setMetadata(WORKSPACE_METADATA_KEY, fingerprint);
     } catch { /* metadata is advisory */ }
   }
 
@@ -1047,6 +1081,35 @@ export class CodeGraph {
           }
         }
 
+        // Workspace packages and path dependencies (#2456, #2502). A
+        // package.json edit — a member's name, its `main` or `exports`, a
+        // `file:` dependency — moves what an import of the package resolves to
+        // in files it never touched, and no indexed file changes with it. A
+        // full reconcile (`codegraph sync`, a git hook, the watcher's catch-up)
+        // reads the manifests again; when what they declare moved, every
+        // JavaScript-family reference is re-opened, as a moved Python root set
+        // re-opens Python's below, and the orphan sweep resolves them by the
+        // new map exactly as a fresh index would. Package.json edits that leave
+        // the map alone (a version bump, a new registry dependency) cost one
+        // read. The watcher's scoped syncs follow source files only and skip
+        // the read: a monorepo's manifests take a walk of the tree to find.
+        // An index stamped by an older engine has no digest: record one.
+        if (fullReconcile) {
+          const tWorkspace = Date.now();
+          const before = this.queries.getMetadata(WORKSPACE_METADATA_KEY);
+          const now = this.resolver.refreshWorkspacePackages();
+          if (before !== null && before !== now) {
+            let reopened = 0;
+            for (const language of ESM_IMPORT_LANGUAGES) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(`[phase-timing] sync-workspace-packages: ${Date.now() - tWorkspace}ms (${reopened} refs re-opened)`);
+            }
+          }
+          if (before !== now) this.stampWorkspaceFingerprint(now);
+        }
+
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
         // The last edge before the failed-ref retry below: the rebind's
@@ -1170,7 +1233,9 @@ export class CodeGraph {
             // `index.ts` re-exporting what it imports: what the files importing
             // it bound by name in its absence, or failed, goes back to pending
             // for the sweep below, which binds it through the module as a fresh
-            // index does. (The removal half runs before removed files are deleted.)
+            // index does. So does what an import of a workspace package bound
+            // through another of its files while the entry its manifest names
+            // was missing. (The removal half runs before removed files are deleted.)
             const importReader = createImportReader(this.projectRoot);
             const added = (result.addedFilePaths ?? []).flatMap((filePath) => {
               const file = this.queries.getFileByPath(filePath);
@@ -1180,7 +1245,8 @@ export class CodeGraph {
               const tAdded = Date.now();
               const reopened = reopenReferencesThroughAddedFiles(
                 this.queries, importReader, added, edgesBeforeResolution,
-                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language)
+                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language),
+                (file) => this.resolver.workspacePackageDirOf(file)
               );
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
             }
