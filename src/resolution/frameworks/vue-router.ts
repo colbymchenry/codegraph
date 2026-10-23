@@ -535,7 +535,10 @@ export const vueRouterResolver: FrameworkResolver = {
     if (!href) return null;
     // Every arm of a conditional destination is somewhere this call goes; the
     // first is this reference's resolution and the rest ride as `alsoTargets`.
-    const targets = destinationsForHref(href, routes);
+    // An arm that is no path of the app — an absolute URL, which Nuxt's
+    // `navigateTo(url, { external: true })` leaves the app for — opens none of
+    // its routes, as `<NuxtLink to>` is read (vue-router-synthesizer).
+    const targets = destinationsForHref(href, routes).filter((t) => t.href.path.startsWith('/'));
     const target = targets[0];
     if (!target) return null;
     return {

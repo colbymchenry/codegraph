@@ -1713,6 +1713,14 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+    // A reference a framework answers alone ends with the frameworks' answer
+    // (see FrameworkResolver.ownsReference): Nuxt's `navigateTo(x)` with a
+    // destination no route serves is no namesake's call.
+    if (this.frameworksFor(ref.language).some((f) => f.ownsReference?.(ref, this.context))) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => (curr.confidence > best.confidence ? curr : best))
+        : null;
+    }
     // A retained untyped chain supplies effect/call-site evidence only. In
     // particular, importing its root does not make the root its call target.
     // A path through module namespaces is not untyped: `z.coerce.number()`

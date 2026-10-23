@@ -374,6 +374,17 @@ export interface FrameworkResolver {
    */
   claimsReference?(name: string): boolean;
   /**
+   * A reference this framework answers alone. When no framework's `resolve()`
+   * links it, it stays unresolved: no import or name strategy guesses past it,
+   * as they would for a project function that only shares its name. Nuxt's
+   * auto-imported `navigateTo('/x')` names a page, which Vue Router reads;
+   * one whose destination is computed, or a path no page serves, calls no
+   * function of the project — elk declares a `navigateTo` of its own inside a
+   * plugin. Unresolved, a sync can still revisit it when a route appears.
+   * Asked only about references written in the languages `resolve()` sees.
+   */
+  ownsReference?(ref: UnresolvedRef, context: ResolutionContext): boolean;
+  /**
    * Extract framework-specific nodes and references from a file.
    *
    * Returns route nodes, middleware nodes, etc., plus unresolved references
