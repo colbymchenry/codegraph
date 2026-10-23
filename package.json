@@ -11,9 +11,13 @@
   "bin": {
     "codegraph": "./dist/bin/codegraph.js"
   },
+  "omp": {
+    "extensions": ["./omp/index.ts"]
+  },
   "files": [
     "dist",
     "scripts",
+    "omp",
     "README.md"
   ],
   "workspaces": [
