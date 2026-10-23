@@ -10,6 +10,7 @@ import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
 import { escapeRegExp } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { isJsSuperCallSite } from './js-super-calls';
 import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
@@ -12254,8 +12255,11 @@ export function matchByExactName(
   }
 
   // A member of the caller's own class (or what it inherits / is nested in)
-  // is what the name means there, however far away it is declared.
-  const member = matchEnclosingScopeMember(ref, candidates, context);
+  // is what the name means there, however far away it is declared. Not for a
+  // call written on `super`: the one in a class expression's method gets here
+  // (js-super-calls declines to place it), and its `super` is that
+  // expression's parent, never the enclosing class's (#2497).
+  const member = isJsSuperCallSite(ref, context) ? null : matchEnclosingScopeMember(ref, candidates, context);
   // The scope names the member, not the overload: when the class (or, in C++,
   // the caller's namespace) declares the name more than once, the one the
   // arguments fit, else the nearest, is chosen below — among those overloads
