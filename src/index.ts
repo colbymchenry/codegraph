@@ -887,8 +887,11 @@ export class CodeGraph {
         // The files' nodes are new to the resolver: a resolution after this
         // reloads its caches, the set of node names included, as indexAll and
         // sync do before they resolve, instead of reading the graph as it was
-        // before (#2829).
-        return this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
+        // before (#2829). Awaited, so the write lock is held until the files
+        // are stored, as indexAll and sync hold it: returned unawaited, the
+        // promise left the `try` at once and the `finally` let the lock go as
+        // soon as indexing started, so another process could write meanwhile.
+        return await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
       } finally {
         this.fileLock.release();
       }
