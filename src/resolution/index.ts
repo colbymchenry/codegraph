@@ -774,6 +774,10 @@ export class ReferenceResolver {
         return result;
       },
 
+      // The set warmCaches loads (`SELECT DISTINCT name FROM nodes`, the exact
+      // match getNodesByName makes); unloaded, no name is absent.
+      isAbsentName: (name: string) => this.knownNames !== null && !this.knownNames.has(name),
+
       getMethodMatches: (typeName: string, methodName: string, language: Language) => {
         const key = `${language} ${typeName}::${methodName}`;
         const cached = this.methodMatchCache.get(key);

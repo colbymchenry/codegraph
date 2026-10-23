@@ -19728,6 +19728,22 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  // A JS/TS call of a member no node in the index is named — `list.push()`,
+  // `fs.writeFileSync()`, a test library's matcher — is one only the
+  // object-literal reader below can link (#2829). It follows a member to the
+  // binding the literal gives it: `const api = { alias: renamed }` makes
+  // `api.alias()` a call of `renamed` (#1932). Every other strategy looks the
+  // member up by its own name and finds nothing, so reading the calling file
+  // for the receiver's type is wasted work. When the reader answers, the
+  // whole path below runs and decides, as before.
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && context.isAbsentName?.(methodName!)) {
+    const literal = nmTimedT('mc-absent', ref, () => dotMatch && !objectOrClass!.includes('.')
+      ? resolveObjectPathMember(objectOrClass!, methodName!, ref, context, null)
+      : null);
+    if (!literal) return null;
+  }
+
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   // A python attribute receiver (`self.conn`, `cfg.client`) is not one: the

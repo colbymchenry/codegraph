@@ -101,6 +101,15 @@ export interface ResolutionContext {
   getNodesInFileNamed?(filePath: string, name: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
+  /**
+   * Whether no node in the index has exactly this name, answered from the
+   * resolver's set of every node name rather than a query (#2829). False
+   * whenever that set isn't loaded (before `warmCaches`, after
+   * `clearCaches`), so a caller only ever acts on a certain absence. A view
+   * that hides nodes keeps its base's answer, which stays certain: hiding
+   * nodes adds no name. Optional: a context without it never answers.
+   */
+  isAbsentName?(name: string): boolean;
   /** Get all nodes by qualified name */
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
