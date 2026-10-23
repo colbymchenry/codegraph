@@ -2722,8 +2722,9 @@ export function resolvePhpQualifiedClassRef(
   if (separator === 0) {
     fqn = name.slice(1);
   } else {
-    const head = name.slice(0, separator);
-    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === head);
+    // PHP matches a namespace alias without regard to case.
+    const head = name.slice(0, separator).toLowerCase();
+    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName.toLowerCase() === head);
     if (imp) {
       fqn = imp.source.replace(/^\\/, '') + name.slice(separator);
     } else {

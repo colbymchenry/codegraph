@@ -194,4 +194,11 @@ class Personal extends L\\Base
 `);
     expect(await edgesFrom('app/Personal.php')).toEqual([]);
   });
+
+  it('matches the namespace alias without regard to its case', async () => {
+    write('app/Blocks/Personal/Fields/FirstName.php', firstName('App\\Blocks\\Personal\\Fields'));
+    write('app/Blocks/Personal/Personal.php',
+      consumer('use App\\Blocks\\Personal\\Fields as Field;', 'new field\\FirstName()'));
+    expect(await instantiated()).toEqual(['App\\Blocks\\Personal\\Fields::FirstName']);
+  });
 });
