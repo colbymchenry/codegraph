@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Nim is now indexed (`.nim`, `.nims`, `.nimble`): procs, funcs, methods, iterators, templates and macros with their signatures, `object` and `ref object` types with their fields and their `of` inheritance, enums with their members, concepts, and import and call edges. A `method` is linked to the type of its first parameter, so the overrides of a base type are told apart.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
