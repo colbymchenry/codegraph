@@ -794,3 +794,18 @@ export function inSameDartLibrary(fromFile: string, declFile: string, context: R
   const scope = scopeOf(fromFile, context, memoFor(context));
   return scope !== null && scope.own.has(declFile);
 }
+
+/**
+ * Whether a private `_name` declared in `declFile` can be named in `fromFile`:
+ * both are files of one library, the library file and its parts. Dart keeps a
+ * `_name` to its library, not to its file, so a library split into `part`s
+ * calls its own private helpers across them. Unlike inSameDartLibrary this
+ * needs no pubspec.yaml above the files: a part names its library by a path
+ * or a library name. False when the library of `fromFile` is unknown.
+ */
+export function dartPrivateVisible(fromFile: string, declFile: string, context: ResolutionContext): boolean {
+  if (fromFile === declFile) return true;
+  const memo = memoFor(context);
+  const library = libraryOf(fromFile, context, memo);
+  return library !== null && membersOf(library, context, memo).has(declFile);
+}

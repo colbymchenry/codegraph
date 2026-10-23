@@ -12,7 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
+import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
@@ -2150,9 +2150,10 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
 /**
  * Languages in which `visibility: 'private'` on a definition means no other
  * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
- * same holds for Java, C#, Swift, Scala, Dart and PHP members.
+ * same holds for Java, C#, Swift, Scala and PHP members. (A Dart `_name` is
+ * its library's, which can span several files: see isVisibleAcrossFiles.)
  */
-const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php']);
 
 /** Per-context memo: node id → "this C/C++ function is declared `static`". */
 const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -3404,9 +3405,12 @@ function isGoNameVisible(candidate: Node, ref: UnresolvedRef, context: Resolutio
  * - **Objective-C**: a struct, union, enum, typedef or global a `.m` / `.mm`
  *   source file defines is local to that file, as in C; other files reach a
  *   global through its header's `extern` declaration. A class is not.
- * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
+ * - **Kotlin, Java, C#, Swift, Scala, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
+ * - **Dart**: a `_name` is private to its library — the library file and the
+ *   files its `part` directives name — so another file of the library names
+ *   it, and a file of another library never does (#2466).
  * - **Go**: an unexported (lowercase) identifier is package-local, and a
  *   package is a directory. Judged by the name's case: the extractor's
  *   `isExported` is unset for every Go method.
@@ -3495,6 +3499,13 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     if (candidate.kind === 'method' && RUST_TYPED_REFS.get(context)?.has(ref) && rustTraitOf(candidate, context)?.visibility !== 'private') return true;
     const owner = rustModuleDir(candidate.filePath);
     return ref.filePath.startsWith(owner + '/');
+  }
+  // A Dart `_name` is its library's, which spans the library file and its
+  // parts: riverpod_generator's `class Counter extends _$Counter` names the
+  // class it wrote into `main.g.dart`, and protobuf.dart's GeneratedMessage
+  // calls `_fieldSet._clear()` on the FieldSet another part declares.
+  if (lang === 'dart') {
+    return candidate.visibility !== 'private' || (ref.language === 'dart' && dartPrivateVisible(ref.filePath, candidate.filePath, context));
   }
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
   // An R test file runs in an environment of its own (testthat): its top-level
@@ -4362,6 +4373,21 @@ function isDartTopLevelVisible(candidate: Node, ref: UnresolvedRef, context: Res
   return prefix === null
     ? dartLibrarySees(ref.filePath, candidate.filePath, candidate.name, context)
     : dartPrefixSees(ref.filePath, prefix, candidate.filePath, candidate.name, context);
+}
+
+/**
+ * Whether `n` is a Dart `_name` that another library declares, which nothing
+ * written in the reference's library can mean (#2466). It leaves the
+ * candidates before one is picked, so the library's own declaration wins
+ * where another library's namesake would have ranked first and then been
+ * declined: the Dart SDK's wasm `_ImmutableLinkedHashMapMixin` calls the
+ * `_createIndex` of the `_MapCreateIndexMixin` it is `on`, not the one the
+ * VM's mixin of the same name declares. isVisibleAcrossFiles applies the
+ * same rule to the pipeline's pick.
+ */
+function isDartPrivateOfAnotherLibrary(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return n.language === 'dart' && n.visibility === 'private' && n.filePath !== ref.filePath &&
+    !dartPrivateVisible(ref.filePath, n.filePath, context);
 }
 
 /**
@@ -11844,6 +11870,7 @@ export function matchByExactName(
     !(ref.language === 'dart' && isDartConstructor(n, context)) &&
     !(dartBare && isDartTypeValue(n) && !isDartMethodInScope(n, ref, context)) &&
     !((dartBare || dartTypeRef) && !isDartTopLevelVisible(n, ref, context, dartPrefix)) &&
+    !(ref.language === 'dart' && isDartPrivateOfAnotherLibrary(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
