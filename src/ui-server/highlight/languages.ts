@@ -11,9 +11,9 @@
  * The three single-file-component formats are the exception worth naming. A
  * `.svelte`, `.vue` or `.astro` file has no grammar of its own here — the
  * extractors pull the `<script>` block out and hand it to TypeScript or
- * JavaScript — and the classifier does exactly the same thing, so a component's
- * code is read by the grammar its symbols came from while the surrounding
- * markup stays plain.
+ * JavaScript (TSX for a Vue `lang="tsx"` block) — and the classifier does
+ * exactly the same thing, so a component's code is read by the grammar its
+ * symbols came from while the surrounding markup stays plain.
  */
 
 import type { Language } from '../../types';

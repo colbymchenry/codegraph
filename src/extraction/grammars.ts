@@ -463,13 +463,18 @@ function resolveWasmPath(lang: GrammarLanguage): string {
  * SFC languages (svelte/vue/astro) have no grammar of their own — their
  * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
  * those grammars must be loaded even when no plain .ts/.js file is in the index
- * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * set (e.g. a pure-.astro content site). A Vue `<script lang="tsx">` is read
+ * with the TSX grammar (#2570), which nothing else loads in a project without
+ * a .tsx or .js file. CFML (.cfc/.cfm) likewise delegates
  * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
  * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
  */
 function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
     languages = [...languages, 'typescript', 'javascript'];
+  }
+  if (languages.includes('vue')) {
+    languages = [...languages, 'tsx'];
   }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];

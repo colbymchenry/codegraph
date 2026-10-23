@@ -2,7 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult, sfcFileNode, sfcScriptLanguage } from './sfc-script';
 
 /** Svelte 5 rune names — compiler builtins, not real functions */
 const SVELTE_RUNES = new Set([
@@ -133,7 +133,7 @@ export class SvelteExtractor {
       const content = match.groups?.content || match[2] || '';
 
       // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
+      const isTypeScript = sfcScriptLanguage(attrs, 'svelte') === 'typescript';
 
       // Detect module script: Svelte 4's `context="module"`, Svelte 5's `module`
       const isModule = /context\s*=\s*["']module["']|(?:^|\s)module(?=[\s=]|$)/.test(attrs);
