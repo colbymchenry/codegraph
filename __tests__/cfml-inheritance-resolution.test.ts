@@ -163,4 +163,20 @@ describe('CFML component-path inheritance resolution (#1152)', () => {
     const edges = await load();
     expect(edges.filter((e) => e.src === 'Caller' || e.src === 'go')).toHaveLength(0);
   });
+
+  it('resolves a one-folder path to a component at the project root (a framework\'s own repo, #2652)', async () => {
+    // Wheels' own source: `wheels` is the mapping onto the root, so
+    // `wheels.Model` is Model.cfc there, with no folder to corroborate.
+    write('Model.cfc', `component {}\n`);
+    write('models/User.cfc', `component extends="wheels.Model" {}\n`);
+    // A longer path names folders the root component isn't in.
+    write('Util.cfc', `component {}\n`);
+    write('models/Helper.cfc', `component extends="coldbox.system.Util" {}\n`);
+    // An app's own Controller sits in folders the path doesn't name.
+    write('app/controllers/Controller.cfc', `component {}\n`);
+    write('app/controllers/Main.cfc', `component extends="wheels.Controller" {}\n`);
+    const edges = await load();
+    expect(has(edges, 'User', 'Model', 'Model.cfc')).toBe(true);
+    expect(edges.filter((e) => e.src === 'Helper' || e.src === 'Main')).toHaveLength(0);
+  });
 });

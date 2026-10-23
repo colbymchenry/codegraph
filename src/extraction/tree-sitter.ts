@@ -27,7 +27,7 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
-import { isCfIncludeCall } from './languages/cfscript';
+import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -5174,6 +5174,24 @@ export class TreeSitterExtractor {
       return;
     }
 
+    // CFML `createObject("component", "a.b.Batch")` makes an instance of the
+    // component, as `new a.b.Batch()` does (#2652): an instantiation of it,
+    // under the path as written, which the resolver reads as `extends`'
+    // component paths. Not a call: createObject is the engine's own function.
+    if (this.language === 'cfscript') {
+      const created = cfmlCreatedComponent(node, this.source);
+      if (created) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: created,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+        return;
+      }
+    }
+
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
     // array_access_expression (field `array`, not `function`) — even Roslyn
@@ -5956,6 +5974,7 @@ export class TreeSitterExtractor {
               return;
             }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
+            let constructed: string | null = null;
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
@@ -6079,6 +6098,14 @@ export class TreeSitterExtractor {
               // (`!Settings.Defaults.isOn()`). Mirrored in the kernel's
               // extract_call (swift.rs).
               calleeName = `${swiftUnwrappedText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (this.language === 'cfscript' && receiver && (constructed = cfmlConstructedComponent(receiver, this.source))) {
+              // CFML call on the component the receiver constructs —
+              // `createObject("component", "a.b.Batch").init()`, `new
+              // a.b.Batch().init()` (#2652). Encode `<component>().<method>`:
+              // the resolver finds the component as `new`/`extends` do and the
+              // method on it, or nothing. The bare `init` this used to emit
+              // matched whichever component's `init` came first.
+              calleeName = `${constructed}().${methodName}`;
             } else if (
               this.language === 'cfscript' &&
               receiver &&

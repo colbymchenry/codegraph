@@ -97,6 +97,9 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
 
+/** A CFML call on a construction, `a.b.Batch().init` (#2652); CFML names may hold `$` (`$init`). */
+const CFML_CONSTRUCTED_CALL = /^([A-Za-z_$][\w$.-]*)\(\)\.([A-Za-z_$][\w$]*)$/;
+
 /**
  * How many files that import a changed module by default a sync reads the
  * edges of, when the module forwards its default from another file, to see
@@ -1566,6 +1569,15 @@ export class ReferenceResolver {
       (ref.referenceName.includes('.') || ref.referenceName.includes('/'))
     ) {
       return this.resolveCfmlComponentPath(ref);
+    }
+    // The component a CFML `createObject("component", "a.b.Batch")` makes,
+    // named by its component path as `extends` names one (#2652), and a call
+    // chained onto a construction — `createObject(…).init()`, `new
+    // a.b.Batch().init()`, encoded `a.b.Batch().init` — which is a method of
+    // that component or of nothing: no name match may guess past it.
+    if (ref.language === 'cfml' || ref.language === 'cfscript') {
+      if (ref.referenceKind === 'instantiates' && ref.referenceName.includes('.')) return this.resolveCfmlComponentPath(ref);
+      if (ref.referenceKind === 'calls' && CFML_CONSTRUCTED_CALL.test(ref.referenceName)) return this.resolveCfmlConstructedCall(ref);
     }
 
     // A CFML include names a template by its path from the including file's
@@ -3519,6 +3531,12 @@ export class ReferenceResolver {
    * TestBox spec mirroring the component's path (`tests/specs/unit/core/
    * basecore.cfc` beside `core/basecore.cfc`) corroborates the same segments,
    * and a mapping root like `contenscms` (onto `contens/`) matches neither.
+   *
+   * The one exception to corroboration is a path with a single folder segment
+   * and a component at the project root (#2652): `wheels.JobWorker` in Wheels'
+   * own source, where `wheels` is the mapping onto the root, has no folder of
+   * the file's to corroborate. It ranks below any candidate a folder
+   * corroborates, and the file must be named like the component.
    */
   private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
     const cfmlCandidates = (name: string): Node[] =>
@@ -3582,6 +3600,12 @@ export class ReferenceResolver {
       ) {
         score++;
       }
+      if (
+        score === 0 && dirs.length === 0 && dirSegments.length === 1 &&
+        cand.filePath.replace(/\.cfc$/i, '').toLowerCase() === className.toLowerCase()
+      ) {
+        score = 0.5; // a root component, named by the mapping onto the root
+      }
       if (score > bestScore) {
         bestScore = score;
         tied = [cand];
@@ -3593,7 +3617,57 @@ export class ReferenceResolver {
     // path names the component, as it does from production code.
     if (tied.length > 1) tied = tied.filter((c) => !isTestSuitePath(c.filePath));
     if (bestScore === 0 || tied.length !== 1) return null;
-    return { original: ref, targetNodeId: tied[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    return { original: ref, targetNodeId: tied[0]!.id, confidence: bestScore >= 1 ? 0.9 : 0.8, resolvedBy: 'qualified-name' };
+  }
+
+  /**
+   * A CFML call chained onto a construction (#2652): `createObject("component",
+   * "a.b.Batch").init()` or `new a.b.Batch().init()`, encoded
+   * `a.b.Batch().init`. The component is the one its path names, by
+   * resolveCfmlComponentPath's rules, or for a bare name the one beside the
+   * calling file (where CFML looks first), else the only one of that name. The
+   * method is the component's own or one it inherits — inheritance is wired
+   * before calls are resolved. Null when either is missing: the bare `init`
+   * such a call used to emit matched whichever component's `init` came first.
+   */
+  private resolveCfmlConstructedCall(ref: UnresolvedRef): ResolvedRef | null {
+    const match = CFML_CONSTRUCTED_CALL.exec(ref.referenceName);
+    if (!match) return null;
+    const component = match[1]!;
+    const cls = component.includes('.')
+      ? this.nodeById(this.resolveCfmlComponentPath({ ...ref, referenceName: component, referenceKind: 'instantiates' })?.targetNodeId ?? '')
+      : this.cfmlComponentByName(component, ref.filePath);
+    const method = cls ? this.cfmlMethodOf(cls, match[2]!.toLowerCase(), new Set()) : undefined;
+    return method ? { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+  }
+
+  /** The CFML component a bare name reaches from `fromFile`: the one in its directory, else the only one so named. */
+  private cfmlComponentByName(name: string, fromFile: string): Node | undefined {
+    const components = this.context
+      .getNodesByLowerName(name.toLowerCase())
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && (n.language === 'cfml' || n.language === 'cfscript'));
+    const dirOf = (p: string): string => p.slice(0, p.lastIndexOf('/') + 1);
+    const beside = components.filter((n) => dirOf(n.filePath) === dirOf(fromFile));
+    if (beside.length === 1) return beside[0];
+    return components.length === 1 ? components[0] : undefined;
+  }
+
+  /** A CFML component's method by its lowercased name (CFML names ignore case): its own, else one a supertype has. */
+  private cfmlMethodOf(cls: Node, lowerName: string, seen: Set<string>): Node | undefined {
+    if (seen.has(cls.id) || seen.size >= 8) return undefined;
+    seen.add(cls.id);
+    const own = this.context.getNodesInFile(cls.filePath).find((n) =>
+      n.kind === 'method' &&
+      n.name.toLowerCase() === lowerName &&
+      n.qualifiedName.toLowerCase() === `${cls.name}::${n.name}`.toLowerCase() &&
+      n.startLine >= cls.startLine && n.endLine <= cls.endLine
+    );
+    if (own) return own;
+    for (const supertype of this.context.getSupertypeNodes?.(cls.id) ?? []) {
+      const inherited = this.cfmlMethodOf(supertype, lowerName, seen);
+      if (inherited) return inherited;
+    }
+    return undefined;
   }
 
   /**

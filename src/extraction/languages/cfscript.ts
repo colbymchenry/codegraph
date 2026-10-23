@@ -19,8 +19,9 @@ function cfmlVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' | 
 
 /**
  * A string literal's text when it is written out in full, or null when a
- * `#…#` expression builds it at runtime (`"#dir#/x.cfm"`): such a path names
- * no file the index can link.
+ * `#…#` expression builds it at runtime (`"#dir#/x.cfm"`, `"#dir#.Batch"`):
+ * such a path names no file, and such a name no component, the index can
+ * link.
  */
 function literalString(node: SyntaxNode | null | undefined, source: string): string | null {
   if (node?.type !== 'string' || node.namedChildren.some((c: SyntaxNode) => c.type !== 'string_fragment')) return null;
@@ -53,6 +54,56 @@ function cfIncludeCallTemplate(node: SyntaxNode, source: string): string | null 
     if (named) return named;
   }
   return literalString(args.namedChildren[0], source);
+}
+
+/** A component name or dotted component path (`Batch`, `contenscms.core.queue.Batch`). */
+const COMPONENT_PATH = /^[A-Za-z_][\w$-]*(?:\.[A-Za-z_][\w$-]*)*$/;
+
+/**
+ * The component `createObject("component", "a.b.Batch")` makes — or the
+ * one-argument `createObject("a.b.Batch")` (Lucee, ACF), or with named
+ * arguments, `createObject(type="component", component="a.b.Batch")` — as
+ * written (#2652). Null for any other call, for another type of object
+ * (`createObject("java", …)`), and for a name built at runtime.
+ */
+export function cfmlCreatedComponent(call: SyntaxNode, source: string): string | null {
+  if (call.type !== 'call_expression') return null;
+  const fn = getChildByField(call, 'function');
+  if (fn?.type !== 'identifier' || getNodeText(fn, source).toLowerCase() !== 'createobject') return null;
+  const args = getChildByField(call, 'arguments')?.namedChildren ?? [];
+  let type: string | null | undefined;
+  let name: string | null | undefined;
+  if (args.length > 0 && args.every((a: SyntaxNode) => a.type === 'assignment_expression')) {
+    for (const arg of args) {
+      const key = getNodeText(getChildByField(arg, 'left') ?? arg, source).toLowerCase();
+      if (key === 'type') type = literalString(getChildByField(arg, 'right'), source);
+      else if (key === 'component') name = literalString(getChildByField(arg, 'right'), source);
+    }
+  } else if (args.length === 1) {
+    name = literalString(args[0], source);
+  } else if (args.length >= 2) {
+    type = literalString(args[0], source);
+    name = literalString(args[1], source);
+  }
+  if (type !== undefined && type?.toLowerCase() !== 'component') return null;
+  return name && COMPONENT_PATH.test(name) ? name : null;
+}
+
+/**
+ * The component an expression constructs, when the expression is a
+ * construction a call is chained onto: `new a.b.Batch()` or a component
+ * `createObject(…)`, parenthesized or not (#2652).
+ */
+export function cfmlConstructedComponent(node: SyntaxNode, source: string): string | null {
+  let expr: SyntaxNode | null = node;
+  while (expr?.type === 'parenthesized_expression') expr = expr.namedChild(0);
+  if (!expr) return null;
+  if (expr.type === 'new_expression') {
+    const ctor = getChildByField(expr, 'constructor');
+    const name = ctor ? getNodeText(ctor, source).replace(/\s+/g, '') : '';
+    return COMPONENT_PATH.test(name) ? name : null;
+  }
+  return cfmlCreatedComponent(expr, source);
 }
 
 export const cfscriptExtractor: LanguageExtractor = {
