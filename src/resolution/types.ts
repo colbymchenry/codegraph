@@ -101,6 +101,15 @@ export interface ResolutionContext {
   getNodesInFileNamed?(filePath: string, name: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
+  /**
+   * Whether any node in the index carries exactly this name, answered from one
+   * in-memory name set instead of a query.
+   *
+   * `false` means the name is certainly absent. Views that hide nodes may
+   * answer `true` more often, never `false`; absent or `true` means "cannot
+   * tell", and the caller must not skip. Optional for external/test contexts.
+   */
+  hasKnownName?(name: string): boolean;
   /** Get all nodes by qualified name */
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */

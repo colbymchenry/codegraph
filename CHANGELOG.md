@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Indexing JavaScript and TypeScript projects is quicker when the code calls a lot of things the project doesn't contain, like a test's `expect(value).toBe(…)`, an array's `list.push(…)` or Node's `fs.writeFileSync(…)`. CodeGraph now decides from the symbol names already in its index that such a call names nothing in the project, instead of first reading the calling file to work out what the thing it is called on might be. On this repository that is about 12,000 calls per index, and a single-threaded resolution pass finishes about four percent sooner; every resolved target is the same as before.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

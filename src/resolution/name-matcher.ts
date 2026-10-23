@@ -12783,6 +12783,23 @@ function resolveObjectPathMember(
 }
 
 /**
+ * Whether the object-literal member reader would answer this call.
+ *
+ * Only a resolved target prevents the fast path. `null` and `undefined` both
+ * mean this reader cannot resolve the call.
+ */
+function literalMemberAnswers(
+  receiver: string,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if (receiver.includes('.') || !OBJECT_LITERAL_LANGUAGES.has(ref.language)) return false;
+  const answer = resolveObjectPathMember(receiver, member, ref, context, null);
+  return answer !== null && answer !== undefined;
+}
+
+/**
  * `a.b.m()` through a namespace an object literal was hung on (`App.utils =
  * {…}` then `App.utils.fmt()`, #2300). Identifier-rooted chains carry no type
  * (#1566), so nothing else may resolve them: this answers only when a holder
@@ -19601,6 +19618,22 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  // Without an indexed method name, name-based resolution cannot succeed.
+  // Object-literal members may alias differently named symbols, so preserve
+  // that resolution path. Leave this/super handling unchanged.
+  if (
+    ref.referenceKind === 'calls' &&
+    JS_FAMILY.has(ref.language) &&
+    objectOrClass !== 'this' &&
+    objectOrClass !== 'super' &&
+    !objectOrClass!.startsWith('this.') &&
+    context.hasKnownName?.(methodName!) === false &&
+    !(dotMatch !== null && literalMemberAnswers(objectOrClass!, methodName!, ref, context))
+  ) {
+    return null;
+  }
+
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   // A python attribute receiver (`self.conn`, `cfg.client`) is not one: the

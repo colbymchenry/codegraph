@@ -770,6 +770,10 @@ export class ReferenceResolver {
         return result;
       },
 
+      // Answered from the warmed name set, not a query. An unwarmed resolver
+      // answers true, so the matcher runs as before.
+      hasKnownName: (name: string) => this.hasKnownName(name),
+
       getMethodMatches: (typeName: string, methodName: string, language: Language) => {
         const key = `${language} ${typeName}::${methodName}`;
         const cached = this.methodMatchCache.get(key);
@@ -1189,6 +1193,17 @@ export class ReferenceResolver {
     const lower = name.toLowerCase();
     if (this.knownLowerNames.has(lower)) return true;
     return lower.split(/::|->|\./).some((part) => part.length > 0 && this.knownLowerNames!.has(part));
+  }
+
+  /**
+   * Whether any node carries exactly this name, from the warmed name set.
+   *
+   * false only when the name is certainly absent. Before `warmCaches` and
+   * after `clearCaches` the set is null, and this answers true — a caller
+   * must never skip a lookup on a guess.
+   */
+  private hasKnownName(name: string): boolean {
+    return this.knownNames === null || this.knownNames.has(name);
   }
 
   /**
