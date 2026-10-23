@@ -12,7 +12,7 @@
  * CodeGraph server keeps its lock, and the message names that process and a
  * command that stops it.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -31,6 +31,23 @@ const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const windows = process.platform === 'win32';
 const holders: number[] = [];
 let root: string;
+
+/**
+ * Each OS lookup gets a minute here, in this process and in the CLIs it runs,
+ * not the 5 s CodeGraph gives one: on a loaded machine PowerShell can take
+ * longer than that to start, and a Windows lookup that runs out falls back to
+ * tasklist, which has no command line to show. The tests that look a process
+ * up allow for it.
+ */
+const LOOKUP_ENV = 'CODEGRAPH_PROCESS_LOOKUP_TIMEOUT_MS';
+const savedLookupTimeout = process.env[LOOKUP_ENV];
+beforeAll(() => {
+  process.env[LOOKUP_ENV] = '60000';
+});
+afterAll(() => {
+  if (savedLookupTimeout === undefined) delete process.env[LOOKUP_ENV];
+  else process.env[LOOKUP_ENV] = savedLookupTimeout;
+});
 
 /**
  * Start a long-lived process to be named by the lock: `native` is no
@@ -57,7 +74,7 @@ function runCli(args: string[]) {
   return spawnSync(process.execPath, [BIN, ...args], {
     cwd: root,
     encoding: 'utf8',
-    timeout: 60_000,
+    timeout: 240_000,
     env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_PROMPT_HOOK: '1' },
   });
 }
@@ -132,9 +149,22 @@ describe('what a lock holder is (#2770)', () => {
     expect(classifyLockHolder(nativeInfo)).toBe('other');
     expect(classifyLockHolder(await describeProcess(server))).toBe('codegraph-server');
     process.kill(native, 'SIGKILL');
-    const end = Date.now() + 10_000;
+    const end = Date.now() + 30_000;
     while (isProcessAlive(native) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
     expect(classifyLockHolder(await describeProcess(native))).toBe('unknown');
+  }, 240_000);
+
+  // Windows starts no process within a millisecond, so both of its queries run out.
+  it.runIf(windows)('a lookup that runs out of time says nothing, so the holder stays unknown', async () => {
+    const native = startHolder('native');
+    process.env[LOOKUP_ENV] = '1';
+    try {
+      const info = await describeProcess(native);
+      expect(info).toEqual({ name: null, commandLine: null });
+      expect(classifyLockHolder(info)).toBe('unknown');
+    } finally {
+      process.env[LOOKUP_ENV] = '60000';
+    }
   }, 30_000);
 });
 
@@ -157,7 +187,7 @@ describe('codegraph index and unlock with a daemon lock naming a live process (#
     const cg = CodeGraph.openSync(root);
     try { expect(cg.searchNodes('replacementSymbol').length).toBeGreaterThan(0); }
     finally { cg.close(); }
-  }, 60_000);
+  }, 300_000);
 
   it('unlock clears an old-format lock naming a process that is not CodeGraph, leaving the process alone', () => {
     const holder = startHolder('native');
@@ -169,7 +199,7 @@ describe('codegraph index and unlock with a daemon lock naming a live process (#
     expect(unlock.stdout).toContain('Removed stale lock artifacts');
     expect(fs.existsSync(lockPath)).toBe(false);
     expect(isProcessAlive(holder)).toBe(true);
-  }, 60_000);
+  }, 300_000);
 
   it.each([
     ['an old-format lock', writeLegacyLock],
@@ -190,11 +220,11 @@ describe('codegraph index and unlock with a daemon lock naming a live process (#
 
     // The advice: stop that process, then retry `codegraph index`.
     process.kill(holder, 'SIGKILL');
-    const end = Date.now() + 10_000;
+    const end = Date.now() + 30_000;
     while (isProcessAlive(holder) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
     const retry = runCli(['index', '--quiet', root]);
     expect(retry.status, retry.stderr).toBe(0);
-  }, 90_000);
+  }, 600_000);
 
   it('names the stale writer lock when the same process that is not CodeGraph holds it too', () => {
     const holder = startHolder('native');
@@ -212,7 +242,7 @@ describe('codegraph index and unlock with a daemon lock naming a live process (#
     const retry = runCli(['index', '--quiet', root]);
     expect(retry.status, retry.stderr).toBe(0);
     expect(isProcessAlive(holder)).toBe(true);
-  }, 90_000);
+  }, 600_000);
 
   it('the writer-lock message names `codegraph daemon`, a command the CLI accepts', () => {
     expect(tryAcquireWriterLock(root, 'daemon').kind).toBe('acquired');

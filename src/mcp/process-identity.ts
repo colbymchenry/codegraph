@@ -35,11 +35,22 @@ export type LockHolderKind = 'codegraph-server' | 'other' | 'unknown';
 
 const LOOKUP_TIMEOUT_MS = 5_000;
 
+/**
+ * How long one OS query may run: 5 s, unless `CODEGRAPH_PROCESS_LOOKUP_TIMEOUT_MS`
+ * says otherwise. Tests set it: on a loaded machine PowerShell can take longer
+ * than 5 s to start, and a Windows lookup that runs out falls back to tasklist,
+ * which has no command line to show.
+ */
+function lookupTimeoutMs(): number {
+  const fromEnv = Number(process.env.CODEGRAPH_PROCESS_LOOKUP_TIMEOUT_MS);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : LOOKUP_TIMEOUT_MS;
+}
+
 /** Runs a short OS query and resolves its stdout, or null when it fails or times out. */
 function query(file: string, args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
     try {
-      execFile(file, args, { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS, windowsHide: true, maxBuffer: 1 << 20 },
+      execFile(file, args, { encoding: 'utf8', timeout: lookupTimeoutMs(), windowsHide: true, maxBuffer: 1 << 20 },
         (error, stdout) => resolve(error ? null : stdout));
     } catch {
       resolve(null);
