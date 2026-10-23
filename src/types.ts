@@ -48,6 +48,13 @@ export const NODE_KINDS = [
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
+ * The docstring both engines give a Java record's implicit component accessor
+ * (languages/java.ts, codegraph-kernel/src/java.rs). The resolver reaches one
+ * only through what types its receiver, never by a name-only guess.
+ */
+export const IMPLICIT_RECORD_ACCESSOR_DOC = 'Implicit record component accessor';
+
+/**
  * Types of edges (relationships) between nodes.
  *
  * Runtime-iterable like NODE_KINDS. The ARRAY ORDER is part of the native

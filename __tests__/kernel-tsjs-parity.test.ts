@@ -409,6 +409,11 @@ export const Box = () => <div data-size={THEME_TOKENS.size} />;
     assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
   });
 
+  it('torture fixture (java records): components, compact ctors, nested/local/generic records', () => {
+    const file = path.join(FIXTURE_DIR, 'TortureRecord.java');
+    assertParity('fixtures/TortureRecord.java', fs.readFileSync(file, 'utf8'), 'java');
+  });
+
   it('torture fixture (python): decorators, self fn-refs, imports, shadowing', () => {
     const file = path.join(FIXTURE_DIR, 'torture.py');
     assertParity('fixtures/torture.py', fs.readFileSync(file, 'utf8'), 'python');
@@ -503,6 +508,7 @@ func wire(s *Store) {
     ['torture.tsx', 'tsx'],
     ['torture.js', 'javascript'],
     ['Torture.java', 'java'],
+    ['TortureRecord.java', 'java'],
     ['torture.py', 'python'],
     ['torture.go', 'go'],
   ] as const)('torture fixture CRLF parity: %s', (name, lang) => {

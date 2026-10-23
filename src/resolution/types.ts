@@ -55,6 +55,8 @@ export interface ResolvedRef {
   edgeKind?: EdgeKind;
   /** Extra metadata the strategy wants persisted on the edge (`href`, …). */
   metadata?: Record<string, unknown>;
+  /** Picked by a name-only strategy (the receiver's word, not its type). Not persisted. */
+  byName?: boolean;
   /**
    * The OTHER targets, when one reference names several.
    *

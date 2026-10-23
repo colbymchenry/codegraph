@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Language, Node } from '../types';
+import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
 import { escapeRegExp } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
@@ -2154,6 +2154,21 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
  * its library's, which can span several files: see isVisibleAcrossFiles.)
  */
 const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php']);
+
+/**
+ * Whether a resolution lands on a Java record's implicit accessor from outside
+ * the record. One is reached through what types its receiver (a typed
+ * receiver, `Record::x`, `Record.x`) or from inside the record; a name-only
+ * guess bound `result.content()` on a library type to any record with a
+ * `content` component. Applied by ReferenceResolver to name-only results.
+ */
+export function isGuessedRecordAccessor(resolved: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const target = context.getNodeById?.(resolved.targetNodeId);
+  if (!target || target.kind !== 'method' || target.docstring !== IMPLICIT_RECORD_ACCESSOR_DOC) return false;
+  const record = target.qualifiedName.slice(0, target.qualifiedName.lastIndexOf('::'));
+  return ref.filePath !== target.filePath || !context.getNodesInFile(target.filePath).some((n) =>
+    n.kind === 'class' && n.qualifiedName === record && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line);
+}
 
 /** Per-context memo: node id → "this C/C++ function is declared `static`". */
 const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -18454,6 +18469,8 @@ const MEMBER_TYPE_NON_TYPES: ReadonlySet<string> = new Set([
   'var', 'val', 'goto', 'nameof', 'typeof', 'sizeof', 'default', 'when', 'where', 'get', 'set', 'init',
   'class', 'interface', 'enum', 'struct', 'record', 'object', 'namespace', 'package', 'import', 'extends',
   'implements', 'fun', 'static', 'final', 'abstract', 'sealed', 'override', 'virtual', 'delegate', 'event',
+  // Java's `sealed interface Shape permits Circle, Square` and `void run() throws Failure {`.
+  'permits', 'throws',
 ]);
 
 /**
@@ -20434,6 +20451,7 @@ export function matchMethodCall(
             targetNodeId: methodNode.id,
             confidence: 0.8,
             resolvedBy: 'instance-method',
+            byName: true,
           };
         }
       }
@@ -20556,6 +20574,7 @@ export function matchMethodCall(
         targetNodeId: targetMethods[0]!.id,
         confidence: 0.7,
         resolvedBy: 'instance-method',
+        byName: true,
       };
     }
 
@@ -20640,6 +20659,7 @@ export function matchMethodCall(
           targetNodeId: bestMatch.id,
           confidence: 0.65,
           resolvedBy: 'instance-method',
+          byName: true,
         };
       }
     }
