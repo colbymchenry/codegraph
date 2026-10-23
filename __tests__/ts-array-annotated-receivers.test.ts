@@ -291,6 +291,24 @@ describe("a call on a TypeScript local annotated as one of a type's properties",
     expect(calls.filter((c) => c.startsWith('onDone.'))).toEqual(['onDone.fire -> Emitter::fire']);
   }, 60_000);
 
+  it("reads a property typed by a type parameter of the indexed type as no type, whatever class shares the parameter's name", async () => {
+    // `Item` is each type's own parameter here, not the project class `Item`:
+    // a generic type alias, and a class whose parameter list holds braces.
+    // `Stack` has a `flush` too, so the call's name alone picks neither.
+    const calls = await callsOf({
+      ...CLASSES,
+      'src/stack.ts': 'export class Stack {\n  findLast() { return 1; }\n  flush() { return 2; }\n}\n',
+      'src/state.ts':
+        'export type State<Item = unknown> = { current: Item };\n' +
+        'export class Shaped<Item extends { id: string } = any> { current!: Item; }\n',
+      'src/use.ts':
+        "import { State, Shaped } from './state';\n" +
+        "export function viaAlias(x: State['current']) { return x.flush(); }\n" +
+        "export function viaShaped(x: Shaped['current']) { return x.flush(); }\n",
+    });
+    expect(calls.filter((c) => c.startsWith('x.'))).toEqual([]);
+  }, 60_000);
+
   it("is not matched to a method by the call's name when the property's type isn't written in the project", async () => {
     // vscode's `invocation: Parameters<typeof rawFinalizeToolInvocation>[0]`:
     // left untyped, the receiver's name alone would pick `Logger.info`.

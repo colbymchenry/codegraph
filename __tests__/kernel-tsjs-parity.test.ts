@@ -294,6 +294,10 @@ async function exprReceivers(x, y) {
   f().list.map(g);
   (() => 1).call(null);
   this.a.b.run();
+  this.listeners[type].push(h);
+  this[k].stop();
+  this['svc'].start();
+  ${typed ? 'this.items![0].save(); (this.items[1] as X).save();' : ''}
   super.stop();
   new Runner().go();
   window.Api.start();
@@ -304,7 +308,9 @@ async function exprReceivers(x, y) {
       .map((r) => r.referenceName)).toEqual([
         'list().map', 'list', 'x.run',
         ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
-        'f', 'run', 'stop', 'go', 'start',
+        'f', 'run', 'this.listeners[].push', 'this.svc.start',
+        ...(typed ? ['this.items[].save', 'this.items[].save'] : []),
+        'stop', 'go', 'start',
       ]);
   });
 

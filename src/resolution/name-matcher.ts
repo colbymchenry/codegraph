@@ -19716,6 +19716,11 @@ export function matchMethodCall(
   if (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx') {
     const privateField = ref.referenceName.match(/^this\.(#[\w$]+)\.(\w+)$/);
     if (privateField) return matchTsThisFieldCall(privateField[1]!, privateField[2]!, ref, context);
+    // An element of a field — `this.listeners[type].push()`, emitted as
+    // `this.listeners[].push`: the element type the field's declaration
+    // writes, or nothing.
+    const elementOf = ref.referenceName.match(/^this\.(#?[\w$]+)\[\]\.([\w$]+)$/);
+    if (elementOf) return matchTsThisFieldCall(elementOf[1]!, elementOf[2]!, ref, context, true);
   }
 
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
@@ -24952,7 +24957,13 @@ const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDec
  * names (`Mailer` of `mailer: Mailer<T>`), whether that is a value's
  * (`typeof X`), and whether the field holds an array of it (`items: Item[]`).
  */
-type TsFieldDecl = { valueType: boolean; type: string; array?: boolean };
+type TsFieldDecl = {
+  valueType: boolean;
+  type: string;
+  array?: boolean;
+  /** What one of the field's elements holds: `Item` of `Item[]`, `Array<Item>` or `Record<string, Item>`. */
+  element?: string;
+};
 /**
  * The call an initializer hands `new X(…)` to: `this.<method>(…)`, or
  * `this.<holder>.<method>(…)` — vscode's `this._register(new Emitter())` and
@@ -25031,7 +25042,12 @@ function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string
   // An injector's type argument is the type it returns: `inject<Params>(DIALOG_DATA)`.
   const type = pattern.wrapped ? m[4] : pattern.injected ? m[2] ?? m[3] : m[1];
   if (!type) return null;
-  const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
+  const rest = line.slice(m.index! + m[0].length);
+  const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(rest) };
+  if (!pattern.valueType && !pattern.wrapped && !pattern.injected) {
+    const element = tsFieldElementType(type, rest);
+    if (element) decl.element = element;
+  }
   if (pattern.wrapped) {
     decl.via = { holder: m[1], method: m[2]! };
     if (m[3]) decl.injector = 'createInstance';
@@ -25042,6 +25058,59 @@ function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string
   // type argument list (`inject<Foo>(`) holds none.
   if (pattern.wrapped || pattern.injected) decl.open = m.index! + m[0].indexOf('(');
   return decl;
+}
+
+/**
+ * Whether what follows a field's type joins it with another type: `| Other[]`,
+ * `& Extra`. `| null` and `| undefined` do not.
+ */
+function tsJoinsAnotherType(tail: string): boolean {
+  return /^\s*[|&]/.test(tail.replace(/^(?:\s*\|\s*(?:null|undefined)\b)+/, ''));
+}
+
+/** Container types whose element type is one of their type arguments, and which. */
+const TS_ELEMENT_CONTAINERS: ReadonlyMap<string, { args: number; at: number }> = new Map([
+  ['Array', { args: 1, at: 0 }],
+  ['ReadonlyArray', { args: 1, at: 0 }],
+  ['Record', { args: 2, at: 1 }],
+]);
+
+/**
+ * The type an element of a field holds, from the field's written type (`type`)
+ * and what follows it on the line (`rest`): `Item` of `Item[]`, `Array<Item>`
+ * and `Record<string, Item>`. Undefined for any other type, an array of
+ * arrays, an element that is not a plain type name (a union, a generic), or
+ * a field typed as a union with another type (`Item[] | Other[]`); `| null`
+ * and `| undefined` leave the element as it is.
+ */
+function tsFieldElementType(type: string, rest: string): string | undefined {
+  const plain = (t: string | undefined): string | undefined => (t && /^[A-Za-z_$][\w.$]*$/.test(t) ? t : undefined);
+  const array = /^\s*\[\s*\]/.exec(rest);
+  if (array) {
+    const tail = rest.slice(array[0].length);
+    return /^\s*\[/.test(tail) || tsJoinsAnotherType(tail) ? undefined : type;
+  }
+  const container = TS_ELEMENT_CONTAINERS.get(type);
+  if (!container) return undefined;
+  const open = /^\s*</.exec(rest);
+  if (!open) return undefined;
+  let depth = 0;
+  let from = open[0].length;
+  const args: string[] = [];
+  for (let i = from; i < rest.length; i++) {
+    const c = rest[i]!;
+    if (c === '<' || c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === '>' || c === ')' || c === ']' || c === '}') && depth > 0) depth--;
+    else if (c === ',' && depth === 0) {
+      args.push(rest.slice(from, i).trim());
+      from = i + 1;
+    } else if (c === '>' && depth === 0) {
+      args.push(rest.slice(from, i).trim());
+      if (/^\s*\[/.test(rest.slice(i + 1)) || tsJoinsAnotherType(rest.slice(i + 1))) return undefined;
+      return args.length === container.args ? plain(args[container.at]) : undefined;
+    }
+  }
+  return undefined;
 }
 
 /** The first declaration of `field` on one line, as `line.match` of its patterns in order would find it. */
@@ -25196,6 +25265,12 @@ function tsFieldDeclaration(
  * before.
  */
 function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
+  // A type that goes on below with `| Other[]` holds no one element type.
+  if (onLine?.element) {
+    let below = '';
+    for (let r = row + 1; r < lines.length && /^\s*[|&]/.test(lines[r]!); r++) below += ' ' + lines[r];
+    if (tsJoinsAnotherType(below)) onLine = { ...onLine, element: undefined };
+  }
   if (!onLine?.via && !onLine?.injector) return onLine;
   if (!tsCallEndsStatement(lines, row, onLine.open!)) return null;
   if (onLine.via && !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
@@ -25529,14 +25604,26 @@ function tsIndexedPropertyType(
   return undefined;
 }
 
-/** Is `name` one of the type parameters the head of the TS class or interface `cls` declares (`class Emitter<T>`)? */
+/** Lines of a class header the type-parameter reader looks through: decorators, then `class C<…>` over several lines. */
+const TS_CLASS_HEAD_LINES = 24;
+
+/**
+ * Is `name` one of the type parameters the head of the TS class, interface
+ * or type alias `cls` declares (`class Emitter<T>`, `type State<T> = …`)? The
+ * list is read from the `class` / `interface` / `type` keyword to its own
+ * `>`, over several lines and through constraints and defaults that hold
+ * braces (`<T extends { id: string }>`). A list whose `>` is not found reads
+ * as declaring `name`: a caller drops the type rather than take a parameter
+ * for a project class.
+ */
 function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
-  const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ').split('{')[0]!;
-  const open = new RegExp(`\\b${escapeRegExp(cls.name)}\\s*<`).exec(head);
+  const head = lines.slice(cls.startLine - 1, cls.startLine - 1 + TS_CLASS_HEAD_LINES).join('\n');
+  const open = new RegExp(`\\b(?:class|interface|type)\\s+${escapeRegExp(cls.name)}\\s*<`).exec(head);
   if (!open) return false;
   // The parameters between the `<` after the name and its own `>`, split
   // at their top level: `T`, `K extends keyof T = never`.
+  const named = (param: string): boolean => param.trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name;
   let depth = 0;
   let from = open.index + open[0].length;
   for (let i = from; i < head.length; i++) {
@@ -25544,14 +25631,14 @@ function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContex
     if (c === '<' || c === '(' || c === '[' || c === '{') depth++;
     else if (c === ')' || c === ']' || c === '}') depth--;
     else if (c === '>' && head[i - 1] !== '=') {
-      if (depth === 0) return head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name;
+      if (depth === 0) return named(head.slice(from, i));
       depth--;
     } else if (c === ',' && depth === 0) {
-      if (head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name) return true;
+      if (named(head.slice(from, i))) return true;
       from = i + 1;
     }
   }
-  return false;
+  return true;
 }
 
 /**
@@ -25571,6 +25658,7 @@ function matchTsThisFieldCall(
   methodName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  element = false,
 ): ResolvedRef | null {
   if (!field || field.includes('.')) return null;
   const written = context.getNodeById?.(ref.fromNodeId);
@@ -25598,7 +25686,19 @@ function matchTsThisFieldCall(
     }
     return null;
   });
-  if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
+  // `this.<field>[k].<method>()` calls the element's type: what the field's
+  // declaration writes for it, or nothing.
+  // A type parameter of the declaring class names no type (`class
+  // Store<Item> { items: Item[] }`), whatever project class shares its name.
+  const held = (decl: TsFieldRead, cls: Node): TsFieldRead | null =>
+    !element ? decl
+      : !decl.valueType && decl.element && !tsClassTypeParameter(cls, decl.element, context)
+        ? { valueType: false, type: decl.element }
+        : null;
+  if (found) {
+    const decl = held(found.decl, found.cls);
+    return decl ? tsFieldCall(decl, found.cls, methodName, ref, context) : null;
+  }
   // Else a same-named class elsewhere may declare it, read for a calling
   // class whose own declaration isn't (a wrapper the reader can't vouch
   // for), but only with a type the call's file imports or declares: another
@@ -25606,7 +25706,8 @@ function matchTsThisFieldCall(
   const namesake = nmTimedT('mc-thisfield-namesakes', ref, () => {
     for (const cls of owners) {
       if (cls.filePath === ref.filePath) continue;
-      const decl = tsFieldDeclaration(cls, field, context);
+      const read = tsFieldDeclaration(cls, field, context);
+      const decl = read && held(read, cls);
       if (decl && tsTypeVisibleIn(decl.type, ref, context)) return decl;
     }
     return null;
