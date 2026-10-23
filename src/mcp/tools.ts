@@ -58,6 +58,7 @@ import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-bound
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
+import { groupFilesByPackage } from '../graph/package-owners';
 import {
   findAllSymbols,
   resolveNamedSymbolFlow,
@@ -1875,8 +1876,8 @@ export const tools: ToolDefinition[] = [
         },
         format: {
           type: 'string',
-          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language)',
-          enum: ['tree', 'flat', 'grouped'],
+          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language), "package" (by the owning manifest\'s name, for monorepos)',
+          enum: ['tree', 'flat', 'grouped', 'package'],
           default: 'tree',
         },
         includeMetadata: {
@@ -8416,7 +8417,7 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
-    const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';
+    const format = (args.format as 'tree' | 'flat' | 'grouped' | 'package') || 'tree';
     const includeMetadata = args.includeMetadata !== false;
     const maxDepth = args.maxDepth != null ? clamp(args.maxDepth as number, 1, 20) : undefined;
 
@@ -8461,6 +8462,9 @@ export class ToolHandler {
         break;
       case 'grouped':
         output = this.formatFilesGrouped(files, includeMetadata);
+        break;
+      case 'package':
+        output = this.formatFilesByPackage(cg.getProjectRoot(), files, includeMetadata);
         break;
       case 'tree':
       default:
@@ -8526,6 +8530,37 @@ export class ToolHandler {
         } else {
           lines.push(`- ${file.path}`);
         }
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Format files grouped by owning package (#1871). The unowned bucket is a
+   * section of its own, not a silent skip: a file whose package the index cannot
+   * name is exactly what a sharding caller needs to see.
+   */
+  private formatFilesByPackage(
+    projectRoot: string,
+    files: { path: string; language: string; nodeCount: number }[],
+    includeMetadata: boolean
+  ): string {
+    const groups = groupFilesByPackage(projectRoot, files);
+    const owners = groups.filter((group) => group.owner).length;
+    const lines: string[] = [`**Files by Package (${files.length} files, ${owners} packages)**`, ''];
+
+    for (const { owner, files: groupFiles } of groups) {
+      const where = owner ? (owner.dir ? `${owner.name} (${owner.dir})` : owner.name) : 'no owning package';
+      const count = `${groupFiles.length} file${groupFiles.length === 1 ? '' : 's'}`;
+      lines.push(`**${where} — ${count}**`);
+      for (const file of groupFiles) {
+        lines.push(
+          includeMetadata
+            ? `- ${file.path} (${file.language}, ${file.nodeCount} symbols)`
+            : `- ${file.path}`
+        );
       }
       lines.push('');
     }

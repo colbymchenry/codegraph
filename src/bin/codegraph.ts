@@ -73,6 +73,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
+import { groupFilesByPackage } from '../graph/package-owners';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -1742,7 +1743,7 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('--filter <dir>', 'Filter to files under this directory')
   .option('--pattern <glob>', 'Filter files matching this glob pattern')
-  .option('--format <format>', 'Output format (tree, flat, grouped)', 'tree')
+  .option('--format <format>', 'Output format (tree, flat, grouped, package)', 'tree')
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
   .option('-j, --json', 'Output as JSON')
@@ -1850,6 +1851,28 @@ program
             console.log();
           }
           break;
+
+        case 'package': {
+          // Grouped by the nearest manifest that names a package (#1871): a
+          // monorepo shards by workspace member without any extra config.
+          const groups = groupFilesByPackage(projectPath, files);
+          const owners = groups.filter((group) => group.owner).length;
+          console.log(chalk.bold(`\nFiles by Package (${files.length} files, ${owners} packages):\n`));
+          for (const { owner, files: groupFiles } of groups) {
+            const where = owner ? (owner.dir ? `${owner.name} (${owner.dir})` : owner.name) : 'no owning package';
+            const count = `${groupFiles.length} file${groupFiles.length === 1 ? '' : 's'}`;
+            console.log(chalk.cyan(`${where} — ${count}:`));
+            for (const file of groupFiles) {
+              if (includeMetadata) {
+                console.log(`  ${file.path} ${chalk.dim(`(${file.language}, ${file.nodeCount} symbols)`)}`);
+              } else {
+                console.log(`  ${file.path}`);
+              }
+            }
+            console.log();
+          }
+          break;
+        }
 
         case 'tree':
         default:

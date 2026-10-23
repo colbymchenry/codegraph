@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph files --format package`, and `codegraph_files` with `format: "package"`, now group a project's files by the package that owns them. The owner is the nearest `package.json` or `composer.json` that names one, so a monorepo splits into its workspace members with no configuration, and files no manifest claims get a section of their own instead of being folded into the root package. (#1871)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
