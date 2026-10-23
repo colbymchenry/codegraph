@@ -699,8 +699,32 @@ export class CfmlExtractor {
       }
       this.unresolvedReferences.push(ref);
     }
-    for (const error of result.errors) {
-      if (error.line) error.line += startLine;
+    this.addBlockErrors(result.errors, scriptTag, 'cfscript', startLine);
+  }
+
+  /**
+   * Record a delegated block's errors as the file's (#2654). The block's own
+   * extraction warns "parse produced no symbols … contributes nothing to the
+   * graph" when its code has a syntax error and declares nothing — which a
+   * `<cfquery>` body never does, so any SQL its grammar can't read earned it.
+   * That is about the block, not the file, whose symbols come from the tag
+   * walk: it is recorded as a block of the file that failed to parse, by its
+   * tag and line, under its own code, so `init` and `status` don't report the
+   * file as one that contributes nothing. Other errors pass through.
+   */
+  private addBlockErrors(errors: ExtractionError[], tag: SyntaxNode, tagName: 'cfscript' | 'cfquery', lineOffset: number): void {
+    for (const error of errors) {
+      if (error.severity === 'warning' && error.code === 'parse_error') {
+        const line = tag.startPosition.row + 1;
+        this.errors.push({
+          message: `${this.filePath}: <${tagName}> at line ${line} has a syntax error — the rest of the file is indexed, but calls inside that block may be missing from the graph`,
+          line,
+          severity: 'warning',
+          code: 'partial_parse',
+        });
+        continue;
+      }
+      if (error.line) error.line += lineOffset;
       this.errors.push(error);
     }
   }
@@ -733,10 +757,7 @@ export class CfmlExtractor {
       if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId) && parentId) ref.fromNodeId = parentId;
       this.unresolvedReferences.push(ref);
     }
-    for (const error of result.errors) {
-      if (error.line) error.line += startLine;
-      this.errors.push(error);
-    }
+    this.addBlockErrors(result.errors, queryTag, 'cfquery', startLine);
   }
 
   /** Read a `cf_attribute`'s value by name from a tag node's direct `cf_attribute`/`cf_tag_attributes` children. */
