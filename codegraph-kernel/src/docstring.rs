@@ -202,7 +202,7 @@ fn preceding_docstring_with(
             break;
         }
     }
-    comments.reverse(); // collected nearest-first; TS unshifts to keep source order
+    comments.reverse(); // collected nearest-first; return source order
 
     let mut first = 0;
     if skip_trailing {

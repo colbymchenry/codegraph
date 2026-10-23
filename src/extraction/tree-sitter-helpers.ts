@@ -130,6 +130,8 @@ function cleanCommentMarkers(comment: string): string {
     .trim();
 }
 
+const DOCSTRING_COMMENT_TYPES = new Set(['comment', 'line_comment', 'block_comment', 'documentation_comment']);
+
 /**
  * Number of ARGUMENTS in an `args` node — its named children minus comments.
  *
@@ -189,20 +191,26 @@ export function getPrecedingDocstring(
   const comments: SyntaxNode[] = [];
 
   while (sibling) {
-    if (
-      sibling.type === 'comment' ||
-      sibling.type === 'line_comment' ||
-      sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
-    ) {
-      comments.unshift(sibling);
-      sibling = sibling.previousNamedSibling;
-    } else if (stepOver.includes(sibling.type)) {
-      sibling = sibling.previousNamedSibling;
-    } else {
+    if (DOCSTRING_COMMENT_TYPES.has(sibling.type)) {
+      comments.push(sibling);
+      if (comments.length === 32 && anchor.parent) {
+        // Repeated previous-sibling lookups rescan long runs of extra nodes.
+        const siblings = anchor.parent.namedChildren;
+        const index = siblings.findIndex(child => child.equals(anchor));
+        comments.length = 0;
+        for (let i = index - 1; i >= 0; i--) {
+          const child = siblings[i]!;
+          if (DOCSTRING_COMMENT_TYPES.has(child.type)) comments.push(child);
+          else if (!stepOver.includes(child.type)) break;
+        }
+        break;
+      }
+    } else if (!stepOver.includes(sibling.type)) {
       break;
     }
+    sibling = sibling.previousNamedSibling;
   }
+  comments.reverse();
 
   let first = 0;
   if (skipTrailing) {

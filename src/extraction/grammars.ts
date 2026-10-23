@@ -392,7 +392,8 @@ export async function initGrammars(): Promise<void> {
  * tree-sitter-cli 0.25.10 `build --wasm` — the same tables crates.io compiles
  * (parser.c sha-matched against the crates.io tarball).
  * The kernel-grammar-parity test asserts this alignment; bump the crate and
- * the vendored wasm together.
+ * the vendored wasm together. Python shares the patched native scanner;
+ * see docs/grammars/tree-sitter-python.md for its reproducible WASM build.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
