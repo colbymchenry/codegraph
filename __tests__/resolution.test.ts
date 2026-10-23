@@ -2453,6 +2453,37 @@ func main() {
   });
 
   describe('Local-variable receiver-type inference (#1108)', () => {
+    it.each(['ts', 'tsx', 'js', 'jsx'])('keeps compound receiver evidence without guessing targets — %s (#1794)', async (ext) => {
+      fs.writeFileSync(path.join(tempDir, `holder.${ext}`), 'export const holder = { values: new Map() };');
+      const receivers = [
+        'holder?.values', 'holder[readKey()]', 'holder[0]', 'holder["odd.key"]',
+        'holder /* receiver */.values', 'höldér.values', 'imported.values', 'data.holder.values',
+      ];
+      fs.writeFileSync(path.join(tempDir, `calls.${ext}`), `
+import { holder as imported } from './holder';
+import * as data from './holder';
+export class Collision { get(key) { return key; } }
+export function readKey() { return 'values'; }
+${receivers.map((receiver, i) => `export function nested${i}(holder, höldér) { return ${receiver}.get(readKey()); }`).join('\n')}
+`);
+      // A dotted chain stays in the index, unresolved, as the call's evidence
+      // (#1790 dropped these calls outright).
+      const kept: Record<number, string> = { 0: 'holder.values.get', 6: 'imported.values.get', 7: 'data.holder.values.get' };
+      cg = await CodeGraph.init(tempDir, { index: true });
+      for (let i = 0; i < receivers.length; i++) {
+        const caller = cg.getNodesByName(`nested${i}`).find(n => n.kind === 'function')!;
+        const callees = cg.getCallees(caller.id).filter(({ edge }) => edge.kind === 'calls');
+        // Argument and computed-key calls survive, but neither an imported
+        // root object nor Collision.get is evidence of the called member.
+        expect(callees.length, receivers[i]).toBeGreaterThan(0);
+        expect(callees.every(({ node }) => node.name === 'readKey'), receivers[i]).toBe(true);
+        if (kept[i]) {
+          const refs = cg.getUnresolvedReferencesFrom(caller.id).filter((r) => r.referenceKind === 'calls');
+          expect(refs.map((r) => r.referenceName), receivers[i]).toEqual([kept[i]]);
+        }
+      }
+    });
+
     it.each(['ts', 'tsx', 'js', 'jsx'])('keeps built-in Map calls off project methods — %s (#1566)', async (ext) => {
       const typed = ext === 'ts' || ext === 'tsx';
       fs.writeFileSync(path.join(tempDir, `cache.${ext}`), `
