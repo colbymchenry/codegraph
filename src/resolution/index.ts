@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -3498,6 +3498,12 @@ export class ReferenceResolver {
    * edge. Directory comparison is case-insensitive (CFML path resolution is);
    * the class segment itself is matched exactly, which real code satisfies —
    * dotted paths are written to match the on-disk file name.
+   *
+   * A test suite is no candidate for production code (#2209's rule), and on a
+   * tie it yields to the one component outside the test suites (#2650): a
+   * TestBox spec mirroring the component's path (`tests/specs/unit/core/
+   * basecore.cfc` beside `core/basecore.cfc`) corroborates the same segments,
+   * and a mapping root like `contenscms` (onto `contens/`) matches neither.
    */
   private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
     const cfmlCandidates = (name: string): Node[] =>
@@ -3541,10 +3547,13 @@ export class ReferenceResolver {
     const className = segments[segments.length - 1]!;
     const dirSegments = segments.slice(0, -1);
 
-    let best: Node | null = null;
+    // Production code never names a component in a test suite; a test can
+    // name one, by the path to it.
+    const fromTest = isTestPath(ref.filePath);
     let bestScore = 0;
-    let tie = false;
+    let tied: Node[] = [];
     for (const cand of cfmlCandidates(className)) {
+      if (!fromTest && isTestSuitePath(cand.filePath)) continue;
       const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
       // Count matching directory segments right-to-left: for
       // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
@@ -3559,15 +3568,17 @@ export class ReferenceResolver {
         score++;
       }
       if (score > bestScore) {
-        best = cand;
         bestScore = score;
-        tie = false;
+        tied = [cand];
       } else if (score === bestScore && score > 0) {
-        tie = true;
+        tied.push(cand);
       }
     }
-    if (!best || bestScore === 0 || tie) return null;
-    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    // A test's tie between a component and a suite mirroring its path: the
+    // path names the component, as it does from production code.
+    if (tied.length > 1) tied = tied.filter((c) => !isTestSuitePath(c.filePath));
+    if (bestScore === 0 || tied.length !== 1) return null;
+    return { original: ref, targetNodeId: tied[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
   }
 
   /**

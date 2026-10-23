@@ -1724,7 +1724,7 @@ const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum
  * its own code may use. A `foo_unittest/` directory is a suite, as a
  * `foo_unittest.cc` file is: glog builds each one as a test program of its own.
  */
-function isTestSuitePath(filePath: string): boolean {
+export function isTestSuitePath(filePath: string): boolean {
   if (!isTestPath(filePath)) return false;
   const lower = filePath.toLowerCase();
   const name = lower.slice(lower.lastIndexOf('/') + 1);
