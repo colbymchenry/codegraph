@@ -820,16 +820,17 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
 // kind that holds methods" — i.e. the shape this loop expects. Swift and
 // Scala fit shape-wise (Swift `protocol`/`class`, Scala `trait`/`class`)
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
-// or an `object` (Scala) so the loop also iterates those kinds.
+// or an `object` (Scala) so the loop also iterates those kinds. A `.tsx` or
+// `.jsx` class is a TypeScript or JavaScript class, and its base or interface
+// is often in a `.ts` file, or the other way round.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
+  'java', 'kotlin', 'csharp', 'typescript', 'tsx', 'javascript', 'jsx', 'swift', 'scala', 'go', 'rust',
   'arkts',
 ]);
 /**
  * Languages whose static and instance methods override only their own kind:
  * a JS/TS class's statics are inherited and overridden by the subclass's
- * statics, its instance methods by instance methods (#2761). tsx and jsx
- * follow the same rule, though this pass doesn't walk their classes today.
+ * statics, its instance methods by instance methods (#2761).
  */
 const STATIC_SPLIT_LANGS: ReadonlySet<string> = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 /**
