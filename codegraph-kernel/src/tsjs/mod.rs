@@ -82,7 +82,16 @@ fn is_function_type(kind: &str) -> bool {
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
-    kind == "class_declaration" || (v.is_ts() && kind == "abstract_class_declaration")
+    kind == "class_declaration" || kind == "class" || (v.is_ts() && kind == "abstract_class_declaration")
+}
+
+/// Whether `node` is a class to extract: a class declaration, or a class
+/// expression (`class`) with a name, `register(class Widget extends Base
+/// {…})` (#2499); an anonymous one is passed over. Mirrors
+/// TreeSitterExtractor.isClassTypeNode.
+fn is_class_node(v: Variant, node: Node) -> bool {
+    let kind = node.kind();
+    is_class_type(v, kind) && (kind != "class" || node.child_by_field_name("name").is_some())
 }
 
 fn is_variable_type(kind: &str) -> bool {
@@ -692,7 +701,7 @@ impl<'t> Walker<'t> {
             // `declare function`, a function in a `declare module` body or a `.d.ts`.
             self.extract_function(node, None);
             skip_children = true;
-        } else if is_class_type(self.variant, kind) {
+        } else if is_class_node(self.variant, node) {
             self.extract_class(node);
             skip_children = true;
         } else if is_method_type(self.variant, kind)
@@ -839,7 +848,7 @@ impl<'t> Walker<'t> {
             }
         }
 
-        if is_class_type(self.variant, kind) {
+        if is_class_node(self.variant, node) {
             self.extract_class(node);
             return;
         }

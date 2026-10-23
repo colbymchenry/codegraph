@@ -368,10 +368,15 @@ impl<'t> Walker<'t> {
     pub(super) fn extract_class(&mut self, node: Node<'t>) {
         let resolved_body = body_of(node); // skipBodilessClass unset for TS/JS
         let name = self.extract_name(node);
+        // A class expression's name is bound inside the expression alone:
+        // never exported by it, and its head is its signature, which a
+        // declaration lacks (#2499). Mirrors TreeSitterExtractor.extractClass.
+        let expression = node.kind() == "class";
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             visibility: self.visibility_of(node),
-            is_exported: Some(self.is_exported(node)),
+            is_exported: Some(!expression && self.is_exported(node)),
+            signature: if expression { resolved_body.map(|body| class_expression_head(self.src, node, body)) } else { None },
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else {
@@ -2012,6 +2017,15 @@ impl<'t> Walker<'t> {
             }
         }
     }
+}
+
+/// A class expression's head, `class Widget extends Base`: its text up to the
+/// body, trailing spaces and line breaks dropped. Mirrors classExpressionHead
+/// (tree-sitter.ts).
+fn class_expression_head(src: &str, node: Node<'_>, body: Node<'_>) -> String {
+    src[node.start_byte()..body.start_byte()]
+        .trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'))
+        .to_string()
 }
 
 /// `.replace(/\s+/g, ' ')` for the tuple-contract signature.

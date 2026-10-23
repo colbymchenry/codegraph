@@ -40,6 +40,7 @@ import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
+import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -575,6 +576,10 @@ export class ReferenceResolver {
     this.mocklessContext = null;
     this.mocklessBase = null;
     this.manualMocks = undefined;
+    this.classExpressionFreeViews = new WeakMap();
+    this.classExpressionFreeBases = new WeakMap();
+    this.classExpressionIndex = undefined;
+    this.classExpressionOnlyNameSet = null;
     this.nodeCache.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
@@ -1193,33 +1198,37 @@ export class ReferenceResolver {
    */
   private hasAnyPossibleMatch(name: string): boolean {
     if (!this.knownNames) return true; // no pre-filter available
+    // In the view outside the class expressions, names only their classes
+    // and members carry name nothing (classExpressionFreeContextFor).
+    const only = this.classExpressionFreeBases.has(this.context) ? this.classExpressionOnlyNames() : null;
+    const known = (n: string): boolean => this.knownNames!.has(n) && !(only?.has(n) ?? false);
 
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (known(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-      if (this.knownNames.has(capitalized)) return true;
+      if (known(capitalized)) return true;
       // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
       // last one (`Bar`); the earlier check finds `example.foo.Bar` which
       // never matches a node name.
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -1228,7 +1237,7 @@ export class ReferenceResolver {
       const lastColon = name.lastIndexOf('::');
       if (lastColon > colonIdx) {
         const tail = name.substring(lastColon + 2);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
 
@@ -1242,9 +1251,9 @@ export class ReferenceResolver {
       if (sepIdx > 0) {
         const receiver = name.substring(0, sepIdx);
         const member = name.substring(sepIdx + 1);
-        if (this.knownNames.has(member) || this.knownNames.has(receiver)) return true;
+        if (known(member) || known(receiver)) return true;
         const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-        if (this.knownNames.has(capitalized)) return true;
+        if (known(capitalized)) return true;
       }
     }
 
@@ -1252,7 +1261,7 @@ export class ReferenceResolver {
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
       const fileName = name.substring(slashIdx + 1);
-      if (this.knownNames.has(fileName)) return true;
+      if (known(fileName)) return true;
     }
 
     return false;
@@ -1380,11 +1389,20 @@ export class ReferenceResolver {
 
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
     // Production code is resolved as if the project's manual mocks were not
-    // indexed (see mocklessContextFor); every strategy below reads the graph
-    // through this.context, so it answers for that view.
+    // indexed (see mocklessContextFor), and code outside the named class
+    // expressions as if their classes were not (classExpressionFreeContextFor);
+    // every strategy below reads the graph through this.context, so it
+    // answers for that view.
     const outer = this.context;
-    const base = outer === this.mocklessContext && this.mocklessBase ? this.mocklessBase : outer;
-    const context = this.mocklessContextFor(ref, base) ?? base;
+    const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
+    const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
+    const mockless = this.mocklessContextFor(ref, base) ?? base;
+    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+  }
+
+  /** resolveOneIn with every strategy reading the graph through `context`. */
+  private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
+    const outer = this.context;
     if (context === outer) return this.resolveOneIn(ref);
     this.context = context;
     try {
@@ -3957,6 +3975,149 @@ export class ReferenceResolver {
     }
     this.manualMocks = names.size > 0 ? { names, lowerNames } : null;
     return this.manualMocks;
+  }
+
+  /**
+   * The context a TS/JS reference is resolved in outside the named class
+   * expressions (#2499): one without the classes they declare or their
+   * members. An expression's name is bound inside it alone, and its class's
+   * value travels in ways resolution doesn't follow. So outside, a reference
+   * means what it would were those classes not indexed, with the confidence
+   * it had: `const Panel = class Panel {…}` keeps `new Panel()` on the
+   * constant, an interface beside a same-named class expression keeps its
+   * typed calls, and an `HTMLElement` type stays clear of lit's
+   * `HTMLElementShim = class HTMLElement {…}`. A class a CommonJS module
+   * exports isn't among them (classExpressions). Null inside a class
+   * expression, where the whole graph applies.
+   */
+  private classExpressionFreeContextFor(ref: UnresolvedRef, base: ResolutionContext): ResolutionContext | null {
+    if (!CLASS_EXPRESSION_REF_LANGUAGES.has(ref.language)) return null;
+    const expressions = this.classExpressions();
+    if (!expressions) return null;
+    const dot = ref.referenceName.indexOf('.');
+    const named = expressions.byName.get(dot > 0 ? ref.referenceName.slice(0, dot) : ref.referenceName);
+    // Written in a class expression, a reference sees its class and the
+    // classes around it, as JavaScript scopes them, unless it names another
+    // one, which is bound only inside that one.
+    const inside = expressions.byFile.get(ref.filePath)?.some((n) => writtenIn(n, ref)) ?? false;
+    if (inside && !(named && !named.some((n) => writtenIn(n, ref)))) return null;
+    let view = this.classExpressionFreeViews.get(base);
+    if (!view) {
+      view = this.classExpressionFreeView(base);
+      this.classExpressionFreeViews.set(base, view);
+      this.classExpressionFreeBases.set(view, base);
+    }
+    return view;
+  }
+
+  /**
+   * `base` without the classes class expressions declare and their members.
+   * The lookups an import reads a module's exports by (getNodesInFileNamed,
+   * getExportedNodesInFile) are left whole.
+   */
+  private classExpressionFreeView(base: ResolutionContext): ResolutionContext {
+    const { hiddenIds } = this.classExpressions()!;
+    const hidden = (n: Node): boolean => hiddenIds.has(n.id);
+    const keep = (nodes: Node[]): Node[] => (nodes.some(hidden) ? nodes.filter((n) => !hidden(n)) : nodes);
+    const byKind = new Map<Node['kind'], Node[]>();
+    const getMethodMatches = base.getMethodMatches;
+    const iterateNodesByKind = base.iterateNodesByKind;
+    const { files } = this.classExpressions()!;
+    return {
+      ...base,
+      getNodesByName: (name) => keep(base.getNodesByName(name)),
+      getNodesByLowerName: (lowerName) => keep(base.getNodesByLowerName(lowerName)),
+      getNodesByQualifiedName: (qualifiedName) => keep(base.getNodesByQualifiedName(qualifiedName)),
+      getNodesInFile: (filePath) => (files.has(filePath) ? keep(base.getNodesInFile(filePath)) : base.getNodesInFile(filePath)),
+      getNodesByKind: (kind) => {
+        let nodes = byKind.get(kind);
+        if (!nodes) byKind.set(kind, (nodes = keep(base.getNodesByKind(kind))));
+        return nodes;
+      },
+      getMethodMatches: getMethodMatches
+        ? (typeName, methodName, language) => keep(getMethodMatches(typeName, methodName, language))
+        : undefined,
+      iterateNodesByKind: iterateNodesByKind
+        ? function* (kind) {
+          for (const n of iterateNodesByKind(kind)) if (!hidden(n)) yield n;
+        }
+        : undefined,
+    };
+  }
+
+  /** classExpressionFreeContextFor's views, by the context each hides from and what it hides, and each view's context; clearCaches drops both. */
+  private classExpressionFreeViews = new WeakMap<ResolutionContext, ResolutionContext>();
+  private classExpressionFreeBases = new WeakMap<ResolutionContext, ResolutionContext>();
+  /**
+   * The names that only class expressions' classes and members carry, which
+   * name nothing where classExpressionFreeView hides those: lit's DOM shims
+   * (`class HTMLElement`, `class Event`) would otherwise send every
+   * `HTMLElement` and `new Event()` across the project through the whole
+   * resolution only to find nothing, where before the name pre-filter
+   * dropped them. Read once per cache window.
+   */
+  private classExpressionOnlyNames(): Set<string> {
+    if (this.classExpressionOnlyNameSet) return this.classExpressionOnlyNameSet;
+    const only = new Set<string>();
+    const expressions = this.classExpressions();
+    if (expressions) {
+      const names = new Set<string>();
+      for (const id of expressions.hiddenIds) {
+        const n = this.nodeById(id);
+        if (n) names.add(n.name);
+      }
+      for (const name of names) {
+        if (!this.queries.getNodesByName(name).some((n) => !expressions.hiddenIds.has(n.id))) only.add(name);
+      }
+    }
+    this.classExpressionOnlyNameSet = only;
+    return only;
+  }
+
+  /** classExpressionOnlyNames' answer; clearCaches drops it. */
+  private classExpressionOnlyNameSet: Set<string> | null = null;
+
+  /**
+   * The classes named class expressions declare: by name, the files holding
+   * them, the ids of them and their members, and the one a member belongs
+   * to. Null when there are none. Read once per cache window. A class a
+   * CommonJS module exports is left out: the module binds it, so it is read
+   * as a declaration is.
+   */
+  private classExpressionIndex: ClassExpressionIndex | null | undefined;
+
+  private classExpressions(): ClassExpressionIndex | null {
+    if (this.classExpressionIndex !== undefined) return this.classExpressionIndex;
+    const byName = new Map<string, Node[]>();
+    const byFile = new Map<string, Node[]>();
+    const byKey = new Map<string, Node>();
+    const files = new Set<string>();
+    const hiddenIds = new Set<string>();
+    const linesOf = (file: string): readonly string[] =>
+      this.context.getFileLines?.(file) ?? this.context.readFile(file)?.split(/\r?\n/) ?? [];
+    for (const n of this.queries.getNodesByKind('class')) {
+      if (!isJsClassExpression(n) || isCommonJsExportedClass(n, linesOf(n.filePath))) continue;
+      const named = byName.get(n.name);
+      if (named) named.push(n); else byName.set(n.name, [n]);
+      const inFile = byFile.get(n.filePath);
+      if (inFile) inFile.push(n); else byFile.set(n.filePath, [n]);
+      byKey.set(`${n.filePath}\0${n.qualifiedName}`, n);
+      files.add(n.filePath);
+      hiddenIds.add(n.id);
+    }
+    // A member is its class's when it is declared in its file under its
+    // qualified name (`Widget::run` of `Widget`).
+    const ownerOf = (member: Node): Node | undefined => {
+      const cut = member.qualifiedName.lastIndexOf('::');
+      return cut > 0 ? byKey.get(`${member.filePath}\0${member.qualifiedName.slice(0, cut)}`) : undefined;
+    };
+    if (files.size > 0) {
+      for (const n of this.queries.getNodesByFiles([...files])) {
+        if ((n.kind === 'method' || n.kind === 'property' || n.kind === 'field') && ownerOf(n)) hiddenIds.add(n.id);
+      }
+    }
+    this.classExpressionIndex = byName.size > 0 ? { byName, byFile, files, hiddenIds, ownerOf } : null;
+    return this.classExpressionIndex;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */

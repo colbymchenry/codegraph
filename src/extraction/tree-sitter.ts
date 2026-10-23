@@ -430,6 +430,14 @@ const LITERAL_RECEIVER_TYPES = new Set([
  */
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
+/** Languages whose `class` node is a class expression (#2499). */
+const CLASS_EXPRESSION_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/** A class expression's head, `class Widget extends Base`: its text up to the body. Mirrored in the kernel (tsjs extract_class). */
+function classExpressionHead(source: string, node: SyntaxNode, body: SyntaxNode): string {
+  return source.substring(node.startIndex, body.startIndex).replace(/[ \t\r\n]+$/, '');
+}
+
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
@@ -1543,7 +1551,7 @@ export class TreeSitterExtractor {
       skipChildren = true;
     }
     // Check for class declarations
-    else if (this.extractor.classTypes.includes(nodeType)) {
+    else if (this.isClassTypeNode(node, nodeType)) {
       // Some languages reuse class_declaration for structs/enums (e.g. Swift)
       const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
       if (classification === 'struct') {
@@ -2540,6 +2548,16 @@ export class TreeSitterExtractor {
   /**
    * Extract a class
    */
+  /**
+   * Whether `node` is a class to extract: one of the language's class types,
+   * except a TS/JS class expression without a name (`register(class extends
+   * Base {…})`), which is passed over as before (#2499).
+   */
+  private isClassTypeNode(node: SyntaxNode, nodeType: string): boolean {
+    if (!this.extractor!.classTypes.includes(nodeType)) return false;
+    return nodeType !== 'class' || !CLASS_EXPRESSION_LANGUAGES.has(this.language) || !!getChildByField(node, 'name');
+  }
+
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
@@ -2555,13 +2573,19 @@ export class TreeSitterExtractor {
     const name = extractName(node, this.source, this.extractor);
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
-    const isExported = this.extractor.isExported?.(node, this.source);
+    // A class expression's name is bound inside the expression alone, so the
+    // class is never what a module exports by it, and it carries its head
+    // (`class Widget extends Base`) as its signature: a class declaration
+    // has none, which is how resolution tells the two apart (#2499).
+    const expression = node.type === 'class' && CLASS_EXPRESSION_LANGUAGES.has(this.language);
+    const isExported = expression ? false : this.extractor.isExported?.(node, this.source);
     const scoped = this.writtenScopeQualifiedName(node, name);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
+      ...(expression && resolvedBody ? { signature: classExpressionHead(this.source, node, resolvedBody) } : {}),
       ...this.cppBodyEnd(resolvedBody),
       ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
@@ -7420,7 +7444,7 @@ export class TreeSitterExtractor {
 
       // Extract structural nodes found inside function bodies.
       // Each extract method visits its own children, so we return after extracting.
-      if (this.extractor!.classTypes.includes(nodeType)) {
+      if (this.isClassTypeNode(node, nodeType)) {
         const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
         if (classification === 'struct') this.extractStruct(node);
         else if (classification === 'enum') this.extractEnum(node);

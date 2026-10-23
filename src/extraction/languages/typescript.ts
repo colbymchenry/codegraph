@@ -150,7 +150,10 @@ export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   isAmbientFunction: isAmbientFunctionSignature,
-  classTypes: ['class_declaration', 'abstract_class_declaration'],
+  // `class` is a class expression, `register(class Widget extends Base {…})`:
+  // a named one is a class with its members and supertypes (#2499), and an
+  // anonymous one is passed over (TreeSitterExtractor.isClassTypeNode).
+  classTypes: ['class_declaration', 'abstract_class_declaration', 'class'],
   // `method_signature` is the interface/type-literal form of a method; without it
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need

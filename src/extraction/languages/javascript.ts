@@ -4,7 +4,8 @@ import { classifyTsClassMember, hasStaticModifier } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
-  classTypes: ['class_declaration'],
+  // A named class expression too, as in TypeScript (#2499).
+  classTypes: ['class_declaration', 'class'],
   methodTypes: ['method_definition', 'field_definition'],
   // JS `field_definition` ≙ TS `public_field_definition`: plain fields are
   // properties, function-valued fields are methods (#808).
