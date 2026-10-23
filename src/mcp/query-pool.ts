@@ -13,6 +13,8 @@
  *   - lazy growth: one warm worker on construct, grows to `size` on demand, so a
  *     single-agent session pays for one connection and a 10-subagent burst grows
  *     to the core budget.
+ *   - idle shrink: excess workers release their connections and heaps after a
+ *     minute idle; one warm worker remains for the next call.
  *   - crash recovery: a dead worker is respawned and its in-flight call retried
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
@@ -50,6 +52,8 @@ const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
 
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
+
+const IDLE_WORKER_TIMEOUT_MS = 60_000;
 
 /**
  * Total worker deaths before the pool declares itself unhealthy and the caller
@@ -157,6 +161,8 @@ export class QueryPool {
   private queue: Job[] = [];
   private inflight = new Map<PoolWorker, Job>();
   private workers = new Set<PoolWorker>();
+  private idleTimers = new Map<PoolWorker, NodeJS.Timeout>();
+  private retirements = new Set<Promise<void>>();
   // Workers spawned but not yet 'ready'. Growth must count these so a single
   // first call (with the eager worker still starting) doesn't spawn the WHOLE
   // pool at once — N simultaneous cold worker starts (each a full module load +
@@ -250,17 +256,37 @@ export class QueryPool {
         return;
       }
       this.everReady = true;
-      this.idle.push(w);
+      this.park(w);
       this.drain();
       return;
     }
     if (m.type === 'result') {
       const job = this.inflight.get(w);
       this.inflight.delete(w);
-      this.idle.push(w);
+      this.park(w);
       if (job) this.settle(job, m.result ?? busyGuidance(0));
       this.drain();
     }
+  }
+
+  private park(w: PoolWorker): void {
+    this.idle.push(w);
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(w);
+      if (this.idle.length <= 1) return;
+      this.idle = this.idle.filter(x => x !== w);
+      this.workers.delete(w); // Intentional termination must not trigger crash recovery.
+      const retirement = this.terminateStarted(w);
+      this.retirements.add(retirement);
+      void retirement.then(() => this.retirements.delete(retirement));
+    }, IDLE_WORKER_TIMEOUT_MS);
+    timer.unref?.();
+    this.idleTimers.set(w, timer);
+  }
+
+  private clearIdleTimer(w: PoolWorker): void {
+    clearTimeout(this.idleTimers.get(w));
+    this.idleTimers.delete(w);
   }
 
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
@@ -270,6 +296,7 @@ export class QueryPool {
     if (!this.workers.has(w)) return; // already handled (error+exit both fire)
     this.workers.delete(w);
     this.pendingWorkers.delete(w);
+    this.clearIdleTimer(w);
     this.idle = this.idle.filter((x) => x !== w);
     this.totalCrashes++;
     const job = this.inflight.get(w);
@@ -305,6 +332,7 @@ export class QueryPool {
       while (this.queue.length && (job = this.queue.shift()) && job.settled) job = undefined;
       if (!job || job.settled) break;
       const w = this.idle.pop()!;
+      this.clearIdleTimer(w);
       this.inflight.set(w, job);
       w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args });
     }
@@ -369,6 +397,8 @@ export class QueryPool {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    for (const timer of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
     const ws = [...this.workers];
     this.workers.clear();
     this.pendingWorkers.clear();
@@ -378,6 +408,6 @@ export class QueryPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => this.terminateStarted(w)));
+    await Promise.all([...this.retirements, ...ws.map((w) => this.terminateStarted(w))]);
   }
 }
