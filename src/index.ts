@@ -70,7 +70,6 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
-import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -596,19 +595,9 @@ export class CodeGraph {
       // network filesystems) have no WAL to defer — skip.
       const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
       // Even a fresh index may have retained MCP readers: keep its WAL journal.
-      const fastInit = false;
-      if (fastInit) {
-        try {
-          this.db.getDb().pragma('journal_mode = MEMORY');
-          this.db.getDb().pragma('synchronous = OFF');
-        } catch { /* keep WAL */ }
-      }
-      const deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
-      // Set when the fastInit+pool path below defers autocheckpointing, so the
-      // finally knows to restore the interval on that path too.
-      let restoreAutocheckpoint = false;
       if (deferWal) {
         priorAutocheckpoint = this.db.getWalAutocheckpoint();
         this.db.setWalAutocheckpoint(0);
@@ -651,7 +640,7 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit: false } : null
           );
         } finally {
           if (freshDb) {
@@ -691,37 +680,6 @@ export class CodeGraph {
         if (result.success && result.filesIndexed > 0) {
           // Get count without loading all refs into memory
           const unresolvedCount = this.queries.getUnresolvedReferencesCount();
-
-          // Fast-init leaves the DB in memory-journal (rollback) mode, where
-          // the parallel resolver pool's read connections would contend with
-          // the main writer's exclusive commits. When the pool will actually
-          // run (enough pending refs), restore WAL BEFORE resolution so
-          // readers never block the writer; otherwise stay in the fast mode
-          // until the finally — sequential resolution has no readers.
-          if (fastInit && unresolvedCount >= minRefsForPool()) {
-            try {
-              this.db.getDb().pragma('synchronous = NORMAL');
-              this.db.getDb().pragma('journal_mode = WAL');
-              // Defer auto-checkpointing for the resolution phase, same
-              // rationale as the deferWal path above: at the default 1000-page
-              // interval, the persist loop's edge inserts + ref deletes make
-              // SQLite re-write hot B-tree pages into the main DB file inline
-              // on the writer over and over (#1231's pathology — measured as
-              // ~58% of the resolution phase on a 255k-ref repo). The valve
-              // bounds WAL growth off-thread; runMaintenance does the final
-              // fold and the finally restores the interval.
-              priorAutocheckpoint = this.db.getWalAutocheckpoint();
-              this.db.setWalAutocheckpoint(0);
-              restoreAutocheckpoint = true;
-              walValve = new WalCheckpointValve(
-                this.db,
-                undefined,
-                undefined,
-                options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
-              );
-              walValve.start();
-            } catch { /* keep current mode; resolution still works sequentially */ }
-          }
 
           options.onProgress?.({
             phase: 'resolving',
@@ -851,16 +809,8 @@ export class CodeGraph {
         // (SQLite replays the WAL on the next open) and the follow-up write
         // that folds it is the known cost of a failed run.
         if (walValve) { walValve.stop(); await walValve.drain(); }
-        if (deferWal || restoreAutocheckpoint) {
+        if (deferWal) {
           try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
-        }
-        if (fastInit) {
-          // Back to the durable defaults; journal_mode=WAL folds the MEMORY
-          // journal state into a normal WAL-mode database file.
-          try {
-            this.db.getDb().pragma('synchronous = NORMAL');
-            this.db.getDb().pragma('journal_mode = WAL');
-          } catch { /* connection may be closing */ }
         }
         this.fileLock.release();
       }
