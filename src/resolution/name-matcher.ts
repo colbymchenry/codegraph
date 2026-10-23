@@ -7805,7 +7805,7 @@ function isRubyMethodInScope(method: Node, ref: UnresolvedRef, context: Resoluti
 }
 
 /** A Ruby class's qualified name, those of its superclasses, and of every module mixed into any of them. */
-function rubyAncestry(qn: string, context: ResolutionContext): Set<string> {
+export function rubyAncestry(qn: string, context: ResolutionContext): Set<string> {
   let memo = RUBY_ANCESTRY.get(context);
   if (!memo) RUBY_ANCESTRY.set(context, (memo = new Map()));
   const hit = memo.get(qn);

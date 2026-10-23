@@ -41,6 +41,7 @@ import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-mo
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
+import { matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -1573,6 +1574,15 @@ export class ReferenceResolver {
     // strategy ran, and PHP gives each one exactly one meaning; resolve it first.
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
+
+    // A Ruby constant written with its namespace (`Billing::ChargeCard`,
+    // `::Foo`) and a call on one (`Billing::ChargeCard.call`) are what Ruby's
+    // constant lookup finds from where they are written, or nothing the
+    // project declares (see ./ruby-constant-paths). The pre-filter below
+    // drops a `::`-rooted name, and the strategies past it would take a
+    // namesake by its last name.
+    const rubyPath = matchRubyConstantPathRef(ref, this.context);
+    if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is

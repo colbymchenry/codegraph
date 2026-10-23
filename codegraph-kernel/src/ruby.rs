@@ -820,10 +820,12 @@ impl<'t> Walker<'t> {
         };
         self.push_ref(caller, &callee, calls_kind, line, col);
 
-        // Capitalized constant receiver (`Klass.static_call`, `RETRY_MAX.times`)
-        // → an ADDITIONAL references ref at the RECEIVER's position.
-        // (scope_resolution receivers get none — type ≠ constant.)
-        if !skip && receiver.kind() == "constant" {
+        // Capitalized constant receiver (`Klass.static_call`, `RETRY_MAX.times`),
+        // or one written with its namespace (`Billing::ChargeCard.call`,
+        // `::Foo.call` — #2503) → an ADDITIONAL references ref at the
+        // RECEIVER's position, under the receiver as written. A path through
+        // a value (`obj::Thing`, `self.class::LIMIT`) names no constant.
+        if !skip && is_constant_path(receiver) {
             self.push_ref_at(
                 caller,
                 &receiver_name.to_string(),
@@ -1118,6 +1120,19 @@ impl<'t> Walker<'t> {
                 }
             }
         }
+    }
+}
+
+/// A constant, or a `scope_resolution` path of constants (`A::B::C`, a
+/// top-level `::A` / `::A::B`): what Ruby reads as a constant (isRubyConstantPath).
+fn is_constant_path(node: Node) -> bool {
+    match node.kind() {
+        "constant" => true,
+        "scope_resolution" => {
+            node.child_by_field_name("name").map_or(false, |n| n.kind() == "constant")
+                && node.child_by_field_name("scope").map_or(true, is_constant_path)
+        }
+        _ => false,
     }
 }
 

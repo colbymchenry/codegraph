@@ -429,13 +429,17 @@ field_expression machinery, which ruby therefore NEVER runs. Steps:
    normalized to `()`**, unlike java/php chain encodings); literal receivers
    are NOT filtered (`"literal".upcase` → `"literal".upcase`, `5.times` →
    `5.times` — unresolvable noise, PRESERVE).
-6. Receiver node TYPE exactly `constant` (and not skipped) → ADDITIONAL
-   `references` ref {name: receiverName, line/col: **the RECEIVER's**
-   position} — `Klass.static_call` emits calls `Klass.static_call` +
-   references `Klass`; fires for VALUE constants too (`RETRY_MAX.times {…}`
-   → calls `RETRY_MAX.times` + references `RETRY_MAX` — pinned). A
-   `scope_resolution` receiver (`Foo::Bar.baz`) gets NO references ref
-   (type ≠ constant). PRESERVE.
+6. Receiver a CONSTANT PATH (and not skipped) → ADDITIONAL `references`
+   ref {name: receiverName, line/col: **the RECEIVER's** position} —
+   `Klass.static_call` emits calls `Klass.static_call` + references `Klass`;
+   fires for VALUE constants too (`RETRY_MAX.times {…}` → calls
+   `RETRY_MAX.times` + references `RETRY_MAX` — pinned). A constant path is
+   a `constant`, or a `scope_resolution` whose `name` is a `constant` and
+   whose `scope` is absent or itself a constant path (#2503): `Foo::Bar.baz`
+   → references `Foo::Bar`, `::Foo.baz` → references `::Foo` (the leading
+   `::` kept — the resolver reads it as "from the top level"). A path
+   through a value (`obj::Thing.go`, `self.class::LIMIT.times`) gets NONE.
+   Both engines: `is_constant_path` / `isRubyConstantPath`.
 7. return — inner receiver calls are ALSO visited afterwards (the body
    walker recurses children at 5277 — extractCall does not consume its
    subtree), so `chained.first_call.second_call` emits BOTH

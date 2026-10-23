@@ -107,6 +107,47 @@ describe.skipIf(!kernelBuilt)('kernel Ruby extraction parity', () => {
     assertParity('fixtures/torture.rb (crlf)', crlf, 30);
   });
 
+  // A receiver written with its namespace (`Billing::ChargeCard.call`, `::Foo.call`)
+  // is a constant read, as a bare `ChargeCard.call`'s is (#2503): both backends
+  // emit the same `references` ref for it, under the receiver as written, at
+  // the receiver. A path through a value (`obj::Thing`, `self.class::LIMIT`)
+  // names no constant the index can know, and `.new` stays an instantiation.
+  it('namespaced constant receivers', () => {
+    const src = [
+      'class Callers',
+      '  def a',
+      '    Billing::ChargeCard.call(amount: 1)',
+      '    ::Billing::ChargeCard.call',
+      '    ::Foo.call',
+      '    Users::Create&.call',
+      '    A::B::C.run!',
+      '    Config::DEFAULTS.fetch(:x)',
+      '    Foo::Bar::baz',
+      '    obj::Thing.go',
+      '    self.class::LIMIT.times { }',
+      '    Billing::ChargeCard.new(amount: 3)',
+      '  end',
+      'end',
+      '',
+    ].join('\n');
+    assertParity('src/callers.rb', src);
+    process.env.CODEGRAPH_KERNEL = '0';
+    const refs = extractFromSource('src/callers.rb', src, 'ruby').unresolvedReferences
+      .filter((r) => r.referenceKind === 'references' || r.referenceKind === 'instantiates')
+      .map((r) => `${r.referenceKind} ${r.referenceName} ${r.line}:${r.column}`);
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(refs.sort()).toEqual([
+      'instantiates ChargeCard 12:4',
+      'references ::Billing::ChargeCard 4:4',
+      'references ::Foo 5:4',
+      'references A::B::C 7:4',
+      'references Billing::ChargeCard 3:4',
+      'references Config::DEFAULTS 8:4',
+      'references Foo::Bar 9:4',
+      'references Users::Create 6:4',
+    ]);
+  });
+
   it('mixin implements refs carry filePath through the v2 ref-flag wire path', () => {
     const src = 'class Widget\n  include Comparable\nend\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';

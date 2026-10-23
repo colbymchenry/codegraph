@@ -305,6 +305,18 @@ function swiftPropertyInfo(
   return { nameNode: firstSimpleIdentifier(pattern), isLet, isComputed };
 }
 
+/**
+ * A Ruby constant, or a `scope_resolution` path of constants (`A::B::C`, a
+ * top-level `::A` / `::A::B`): what Ruby reads as a constant. A path through
+ * a value (`obj::Thing`, `self.class::LIMIT`) is not one.
+ */
+function isRubyConstantPath(node: SyntaxNode): boolean {
+  if (node.type === 'constant') return true;
+  if (node.type !== 'scope_resolution') return false;
+  const scope = getChildByField(node, 'scope');
+  return getChildByField(node, 'name')?.type === 'constant' && (!scope || isRubyConstantPath(scope));
+}
+
 /** True when `node` is (transitively) inside a C function body — i.e. a local,
  * not a file/namespace-scope declaration. Walks the parent chain to the root. */
 function hasFunctionAncestor(node: SyntaxNode): boolean {
@@ -5444,7 +5456,10 @@ export class TreeSitterExtractor {
       // — is itself a dependency on that constant; emit a `references` ref so a
       // class used only via its class methods still records a dependent (the edge
       // the old receiver-only callee happened to provide, now made explicit).
-      if (!skip && receiverNode.type === 'constant') {
+      // So is one written with its namespace, `Billing::ChargeCard.call` or
+      // `::Foo.call` (#2503), under the receiver as written; a path through a
+      // value (`obj::Thing`, `self.class::LIMIT`) names no constant.
+      if (!skip && isRubyConstantPath(receiverNode)) {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: receiverName,
