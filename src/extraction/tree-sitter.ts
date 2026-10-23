@@ -7701,9 +7701,7 @@ export class TreeSitterExtractor {
     }
 
     // Look for extends/implements clauses
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (!child) continue;
+    for (const child of node.namedChildren) {
 
       // Dart: `class A = B with M implements I;` keeps its supertypes in a
       // `mixin_application` — the same shapes as a class body's clauses.

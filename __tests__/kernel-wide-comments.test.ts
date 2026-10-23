@@ -75,15 +75,16 @@ for (const backend of ['native', 'wasm'] as const) {
       const source = shape === 'function'
         ? 'def included():\n' + indented + '    """body docs"""\n    return helper()\n'
         : shape === 'class'
-          ? 'class Container:\n    """class docs"""\n' + indented + '    def included(self):\n        return helper()\n'
+          ? 'class Container(Base):\n    """class docs"""\n' + indented + '    def included(self):\n        return helper()\n'
           : shape === 'class prefix'
-            ? 'class Container:\n' + indented + '    def included(self):\n        return helper()\n'
+            ? 'class Container(Base):\n' + indented + '    def included(self):\n        return helper()\n'
             : 'VALUE = 42\n' + comments + 'def included():\n    return VALUE\n';
       const result = extract(source);
       const fn = result.nodes.find(n => n.name === 'included')!;
       expect(result.errors).toEqual([]);
       expect(fn).toBeDefined();
       if (shape === 'function') expect(fn.docstring).toBe('body docs');
+      if (shape.startsWith('class')) expect(result.unresolvedReferences.some(r => r.referenceName === 'Base' && r.referenceKind === 'extends')).toBe(true);
       if (shape === 'class') expect(fn.docstring).toBe('padding\n'.repeat(70_000).trimEnd());
       if (shape === 'value references') {
         const value = result.nodes.find(n => n.name === 'VALUE')!;
