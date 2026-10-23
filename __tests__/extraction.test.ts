@@ -13742,6 +13742,60 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('Go: a method carries the exportedness of its name, like a function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-method-exported-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'log.go'),
+        'package log\n\ntype writer struct{}\n\nfunc (w *writer) Close() error { return nil }\n\nfunc (w *writer) flush() {}\n\nfunc Open() *writer { return &writer{} }\n\nfunc helper() {}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const flag = (name: string) =>
+          cg.getNodesByKind('method').concat(cg.getNodesByKind('function')).find((n) => n.name === name)!.isExported;
+        expect(flag('Close')).toBe(true);
+        expect(flag('flush')).toBe(false);
+        expect(flag('Open')).toBe(true);
+        expect(flag('helper')).toBe(false);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('Go: a call through a package stays on its function, not an exported method of that name', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-package-member-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+      fs.mkdirSync(path.join(dir, 'applog'));
+      // The method comes first, so a lookup by name meets it before the function.
+      fs.writeFileSync(
+        path.join(dir, 'applog', 'log.go'),
+        'package applog\n\ntype Logger struct{}\n\nfunc (l *Logger) Infof(format string) {}\n\nfunc Infof(format string) {}\n'
+      );
+      fs.mkdirSync(path.join(dir, 'svc'));
+      fs.writeFileSync(
+        path.join(dir, 'svc', 'use.go'),
+        'package svc\n\nimport "example.com/app/applog"\n\nfunc Use(l *applog.Logger) {\n\tapplog.Infof("x")\n\tl.Infof("y")\n}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const use = cg.getNodesByKind('function').find((n) => n.name === 'Use')!;
+        const calls = cg.getOutgoingEdgesFrom([use.id], ['calls']).map((e) => {
+          const target = cg.getNode(e.target)!;
+          return `${e.line} ${target.kind} ${target.qualifiedName}`;
+        }).sort();
+        expect(calls).toEqual(['6 function Infof', '7 method Logger::Infof']);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [

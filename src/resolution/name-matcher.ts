@@ -3370,7 +3370,7 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
  * Whether Go lets `ref`'s file name the Go declaration `candidate`: an
  * exported name from anywhere, an unexported one only inside its own package,
  * which is a directory. By the name's first letter, not the extractor's flag:
- * the flag is unset for every Go method, exported or not.
+ * an index built before Go methods carried the flag has it unset on every one.
  *
  * A package's external tests (`package a_test` beside `package a`) share its
  * directory but are a package of their own: a name one of them declares at
@@ -3412,8 +3412,8 @@ function isGoNameVisible(candidate: Node, ref: UnresolvedRef, context: Resolutio
  *   files its `part` directives name — so another file of the library names
  *   it, and a file of another library never does (#2466).
  * - **Go**: an unexported (lowercase) identifier is package-local, and a
- *   package is a directory. Judged by the name's case: the extractor's
- *   `isExported` is unset for every Go method.
+ *   package is a directory. Judged by the name's case, which an older index's
+ *   Go methods don't carry in `isExported`.
  * - **Rust**: a non-`pub` item is visible to its module and that module's
  *   descendants, never to a sibling module or another crate — `.count()` on
  *   an iterator resolved onto a `fn count` in a different crate. A method in

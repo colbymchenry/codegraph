@@ -3935,7 +3935,9 @@ function findGoPackageMember(
   if (pkgDir == null) return null;
   for (const node of context.getNodesByName(memberName)) {
     if (node.language !== 'go') continue;
-    if (!node.isExported) continue;
+    // A method is no member of its package: `pkg.Infof` is the package's
+    // function, never a method `(*Logger).Infof` declared beside it.
+    if (!node.isExported || node.kind === 'method') continue;
     if (path.posix.dirname(node.filePath.replace(/\\/g, '/')) === pkgDir) {
       return {
         original: ref,
