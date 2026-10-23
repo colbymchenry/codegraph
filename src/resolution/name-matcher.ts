@@ -26050,6 +26050,9 @@ export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionCont
   const shape = ref.referenceName.match(NEW_RECEIVER_SHAPE);
   const method = shape?.[2];
   if (!cls || !method) return null;
+  // Java's and C#'s no-argument `new Foo().bar()` reach here from the
+  // conformance pass; their own rules pick among same-named classes.
+  if (ref.language === 'java' || ref.language === 'csharp') return matchJavaCsharpNewReceiverCall(cls, shape![1]!, method, ref, context);
   // Several classes may share the name: the one the call's file imports
   // under the written name is the class constructed (tsImportedTypeFile).
   const onClass = resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method', tsImportedTypeFile(shape![1]!, ref, context));
@@ -26065,6 +26068,36 @@ export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionCont
   return onProto.length === 1
     ? { original: ref, targetNodeId: onProto[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
     : null;
+}
+
+/**
+ * A Java or C# `new Foo().bar()`. With one project class of the name, its
+ * method or an inherited one, as for any typed call. With several, the class
+ * the language picks, or none: Java's written package (`new a.b.Foo()`), the
+ * file's single-type import, else the caller's own package; C#'s one type the
+ * file's namespaces and usings can see (isCsharpTypeVisible). Then only that
+ * class's own method: an inherited one is looked up by name, across every
+ * class of the name.
+ */
+function matchJavaCsharpNewReceiverCall(cls: string, written: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const twins = context.getNodesByName(cls).filter((n) =>
+    (n.kind === 'class' || n.kind === 'struct') && sameLanguageFamily(n.language, ref.language));
+  if (twins.length <= 1) return resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+  const dirOf = (file: string) => file.slice(0, file.lastIndexOf('/'));
+  let chosen: Node | undefined;
+  if (ref.language === 'csharp') {
+    const visible = twins.filter((n) => isCsharpTypeVisible(n, ref, context));
+    if (visible.length === 1) chosen = visible[0];
+  } else {
+    const fqn = written.includes('.') ? written : importedFqnOf(cls, ref, context);
+    const byPath = (n: Node) => n.filePath.replace(/\.java$/, '').endsWith('/' + fqn!.replace(/\./g, '/'));
+    const ownPackage = twins.filter((n) => dirOf(n.filePath) === dirOf(ref.filePath));
+    chosen = fqn ? twins.find(byPath) : ownPackage.length === 1 ? ownPackage[0] : undefined;
+  }
+  if (!chosen) return null;
+  const own = context.getNodesInFile(chosen.filePath).find((n) =>
+    n.kind === 'method' && n.name === method && n.qualifiedName === `${chosen!.qualifiedName}::${method}`);
+  return own ? { original: ref, targetNodeId: own.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
 }
 
 /** Resolve the implementation inside the identified store, not a namesake or
