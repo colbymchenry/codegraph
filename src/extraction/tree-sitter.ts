@@ -27,6 +27,7 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import { isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -5166,6 +5167,13 @@ export class TreeSitterExtractor {
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
 
+    // CFML `cfinclude(template="x.cfm")` includes a template, as `include
+    // "x.cfm";` does (#2651): an import of the file, never a call.
+    if (this.language === 'cfscript' && isCfIncludeCall(node, this.source)) {
+      this.extractImport(node);
+      return;
+    }
+
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
     // array_access_expression (field `array`, not `function`) — even Roslyn
@@ -7248,6 +7256,10 @@ export class TreeSitterExtractor {
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
+
+      // A CFML `include "x.cfm";` in a function body includes the template
+      // there, as it does at component scope (#2651).
+      if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);

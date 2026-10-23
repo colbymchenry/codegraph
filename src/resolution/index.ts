@@ -1568,6 +1568,21 @@ export class ReferenceResolver {
       return this.resolveCfmlComponentPath(ref);
     }
 
+    // A CFML include names a template by its path from the including file's
+    // directory, or from the web root (#2651): `<cfinclude template="../shared/
+    // helpers.cfm">` is that file, not whichever `helpers.cfm` file-name
+    // matching would settle on. A path that names no file here (one through a
+    // server mapping, `/contenscms/…`) is matched by its file name, as before,
+    // but only to a file: the symbol strategies below took a path no file
+    // matched for another template's import statement of the same path. Nor
+    // is it the including file, which a file-name match can land on (Wheels'
+    // `views/wheels/wheels.cfm` including `../../wheels/public/wheels.cfm`).
+    if ((ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'imports' && isCfmlTemplatePath(ref.referenceName)) {
+      const included = this.resolveCfmlIncludePath(ref) ?? matchByFilePath(ref, this.context);
+      if (included && this.nodeById(included.targetNodeId)?.filePath === ref.filePath) return null;
+      return this.gateLanguage(included, ref);
+    }
+
     // A PHP class written with a namespace in it — `new Alias\X()` through a
     // `use Ns as Alias;` namespace alias, `extends Sub\Base`, `\Ns\X::make()`
     // (#2256). The pre-filter below would drop most of these before any import
@@ -3582,6 +3597,41 @@ export class ReferenceResolver {
   }
 
   /**
+   * The file a CFML include names (#2651) — `include "x.cfm";`,
+   * `<cfinclude template="x.cfm">`, `cfinclude(template="x.cfm")`. A template
+   * path is relative to the directory of the file that includes it
+   * (`formlistshared.cfm`, `../shared/helpers.cfm`), or to the web root when
+   * it starts with `/`: the project root, when the project is the web root —
+   * an assumption, so such a match is less sure. Null when no indexed file is
+   * there. CFML code written on a case-blind file system often spells a path
+   * in another case, so a single file that matches ignoring case counts too.
+   */
+  private resolveCfmlIncludePath(ref: UnresolvedRef): ResolvedRef | null {
+    const written = ref.referenceName.trim().replace(/\\/g, '/');
+    const fromRoot = written.startsWith('/');
+    const parts = fromRoot ? [] : ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+    for (const seg of written.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (parts.length === 0) return null; // above the project root
+        parts.pop();
+      } else {
+        parts.push(seg);
+      }
+    }
+    const fileName = parts[parts.length - 1];
+    if (!fileName) return null;
+    const wanted = parts.join('/');
+    const files = this.context.getNodesByLowerName(fileName.toLowerCase()).filter((n) => n.kind === 'file');
+    const exact = files.find((n) => n.filePath === wanted);
+    if (exact) return { original: ref, targetNodeId: exact.id, confidence: fromRoot ? 0.85 : 0.95, resolvedBy: 'file-path' };
+    const folded = files.filter((n) => n.filePath.toLowerCase() === wanted.toLowerCase());
+    return folded.length === 1
+      ? { original: ref, targetNodeId: folded[0]!.id, confidence: fromRoot ? 0.8 : 0.9, resolvedBy: 'file-path' }
+      : null;
+  }
+
+  /**
    * Resolve a `this.<member>` function-as-value reference (#756/#808) to the
    * ENCLOSING CLASS's own member — never a same-named symbol elsewhere. The
    * registration idiom (`btn.on('click', this.handleClick)`) names a member
@@ -4265,6 +4315,15 @@ export class ReferenceResolver {
     if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
+}
+
+/**
+ * Whether a CFML `imports` name is the path of a template an include names
+ * (`formlistshared.cfm`, `../shared/helpers.cfm`, `/app/x.cfm`), not a
+ * cfscript `import com.foo.Bar;` or `import "java:…";` (#2651).
+ */
+function isCfmlTemplatePath(name: string): boolean {
+  return !name.includes(':') && (name.includes('/') || name.includes('\\') || /\.(?:cfml?|cfc|cfs)$/i.test(name.trim()));
 }
 
 /** The project-relative directory holding `p` ('' for the project root). */
