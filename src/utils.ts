@@ -123,7 +123,8 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
- *   escapes the root
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,
@@ -143,23 +144,43 @@ export function validatePathWithinRoot(
   //    The indexing read path (allowSymlinkEscape) skips only this rejection so
   //    it stays consistent with the directory walk, which already followed the
   //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
   try {
-    const realRoot = fs.realpathSync(normalizedRoot);
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    return null;
+  }
+
+  try {
     const realResolved = fs.realpathSync(resolved);
     if (options?.allowSymlinkEscape) {
       return realResolved;
     }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
-    // ENOENT: the path doesn't exist yet (a file about to be written, or an
-    // index entry for a since-deleted file) — no symlink to follow, and the
-    // lexical check already passed, so allow the lexical path. Any other
-    // resolution failure (ELOOP, EACCES, …) is treated as unsafe → reject.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return resolved;
-    }
-    return null;
+    // A missing leaf may still sit below an EXISTING symlink. Resolve the
+    // nearest existing ancestor before allowing a write path: otherwise
+    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+    // passes the lexical check and mkdir follows the symlink out of the root.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
   }
+
+  let ancestor = path.dirname(resolved);
+  while (isWithinDir(ancestor, normalizedRoot)) {
+    try {
+      const realAncestor = fs.realpathSync(ancestor);
+      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
+        return resolved;
+      }
+      return null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      ancestor = parent;
+    }
+  }
+  return null;
 }
 
 /**

@@ -244,6 +244,44 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
   });
 
+  it('rejects a missing leaf below an out-of-root directory symlink', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt')).toBeNull();
+  });
+
+  // A directory link that needs no privilege on Windows (a junction), so the
+  // cases below run there without Developer Mode; a symlink elsewhere. Each
+  // test removes its own link, so nothing recursive ever walks through one.
+  const dirLink = (linkPath: string, target: string): void =>
+    fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+
+  it.runIf(process.platform === 'win32')('rejects a missing leaf below an out-of-root directory junction', () => {
+    const junction = path.join(root, 'escapejunction');
+    dirLink(junction, path.join(outside, 'pkg'));
+    try {
+      expect(validatePathWithinRoot(root, 'escapejunction/not-created-yet/file.txt')).toBeNull();
+    } finally {
+      fs.unlinkSync(junction);
+    }
+  });
+
+  it('still allows a missing leaf below a directory link that stays WITHIN the root', () => {
+    fs.mkdirSync(path.join(root, 'src', 'realdir'));
+    const inLink = path.join(root, 'src', 'linkdir');
+    dirLink(inLink, path.join(root, 'src', 'realdir'));
+    try {
+      expect(validatePathWithinRoot(root, 'src/linkdir/new/file.ts')).toBe(
+        path.join(root, 'src', 'linkdir', 'new', 'file.ts')
+      );
+    } finally {
+      fs.unlinkSync(inLink);
+    }
+  });
+
+  it('rejects every path under a root that does not exist', () => {
+    expect(validatePathWithinRoot(path.join(root, 'gone'), 'src/in.ts')).toBeNull();
+  });
+
   it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
     if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
@@ -261,6 +299,18 @@ describe('Symlink escape prevention (#527)', () => {
   it('allowSymlinkEscape follows a path through an in-repo out-of-root DIR symlink (indexing read)', () => {
     if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape still allows a missing leaf through an out-of-root DIR link (indexing read)', () => {
+    const escapeLink = path.join(root, 'escapedir');
+    dirLink(escapeLink, path.join(outside, 'pkg'));
+    try {
+      expect(
+        validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt', { allowSymlinkEscape: true })
+      ).not.toBeNull();
+    } finally {
+      fs.unlinkSync(escapeLink);
+    }
   });
 
   it('allowSymlinkEscape STILL rejects a lexical ../ traversal (guard not waived)', () => {
