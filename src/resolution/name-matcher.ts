@@ -9285,6 +9285,72 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
   return local === undefined || rustFirstArgIs(local, ref, context);
 }
 
+/**
+ * Whether a Rust call through a type's path can mean `target` (#2614). A
+ * type the path names from std or a dependency — through the file's `use`
+ * (`J::from(i)` under `use serde_json::Value as J`, `Value::default()` under
+ * `use serde_json::Value`) or as written (`serde_json::Value::default()`) —
+ * is that crate's own: the project holds a function of it only as its own
+ * impl of a trait for it (`impl Blank for serde_json::Value`, `impl From<Fail>
+ * for PathBuf`), and a call through a trait's path (`W::flush(s)` under `use
+ * std::io::Write as W`) reaches the project's impls of that trait. A
+ * same-named function of a project type is another type's: the reporter's
+ * `J::from(i)` went to a local `impl From<io::Error> for Fail`, a guess by
+ * the name alone, and `Value::default()` to a project `Value` of its own.
+ */
+export function isRustPathCallReachable(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (target.language !== 'rust') return true;
+  const segments = ref.referenceName.split('::');
+  if (segments.length < 2 || !segments.every((s) => /^[A-Za-z_]\w*$/.test(s))) return true;
+  const type = segments[segments.length - 2]!;
+  if (!/^[A-Z]/.test(type) || type === 'Self') return true;
+  const outside = rustOutsidePathType(type, segments.slice(0, -2), ref, context);
+  if (outside === null) return true;
+  const impl = target.kind === 'method' ? rustTraitImplHeader(target, context) : null;
+  if (!impl) return false;
+  if (impl.trait === outside) return true;
+  if (impl.self !== outside) return false;
+  // The type the impl is for, as its own file names it: the outside one, not a project namesake.
+  const head = rustPathHead(impl.selfText.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, ''));
+  const lookup = rustTypeLookup(head?.name ?? impl.self, head?.segments ?? [], target.filePath, context, rustNodeOffset(target, context));
+  return lookup.outside || !lookup.nodes.some((n) => RUST_OWNER_KINDS.has(n.kind));
+}
+
+/**
+ * The name of the type a Rust path `path::type` names from std or a
+ * dependency, where the file's `use`s or the path itself say it is from
+ * there — `J` under `use serde_json::Value as J` is `Value` — or null: one of
+ * the project's, or one nothing written says is from outside it.
+ */
+function rustOutsidePathType(type: string, path: string[], ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const scopes = rustScopesOf(ref.filePath, context);
+  const at = scopes ? (scopes.lineStarts[ref.line - 1] ?? 0) + Math.max(0, ref.column) : undefined;
+  let root: string | undefined;
+  let real = type;
+  if (path.length === 0) {
+    const bound = rustUsePath(type, ref.filePath, at, context);
+    if (!bound || bound.length < 2) return null;
+    root = bound[0];
+    real = bound[bound.length - 1]!;
+  } else {
+    root = rustUsePath(path[0]!, ref.filePath, at, context)?.[0] ?? path[0];
+  }
+  return root !== undefined && isRustOutsideCrate(root, ref, context) ? real : null;
+}
+
+/** Whether a Rust path's first segment names std, or a crate the manifests depend on that the project doesn't hold. */
+function isRustOutsideCrate(root: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (RUST_STD_ROOTS.has(root)) return true;
+  if (root === 'crate' || root === 'self' || root === 'super' || rustProjectCrates(context).has(root)) return false;
+  if (!rustDependencyCrates(context).has(root)) return false;
+  // A path dependency the project holds, a workspace member or not, is the project's.
+  const graph = rustCrateGraph(context);
+  const own = rustCrateDirOf(ref.filePath, graph);
+  if (own !== null && graph.crates.get(own)?.keys.has(root)) return false;
+  for (const crate of graph.crates.values()) if (crate.name === root) return false;
+  return true;
+}
+
 /** Whether `type` is a Rust enum that declares `variant` (#2328). */
 function declaresRustVariant(type: Node, variant: string, context: ResolutionContext): boolean {
   if (type.kind !== 'enum') return false;
@@ -10385,6 +10451,8 @@ function rustFieldValue(
   else written = rustValueType(recv, at, scopes, ref, context, depth + 1);
   if (!written) return null;
   const read = rustReadType(written, ref, context);
+  // `self.pair.0` on a field declared `(Config, u8)`: the tuple's field at that place.
+  if (read.kind === 'outside' && read.name === '(' && /^\d+$/.test(field)) return rustTupleField(written, Number(field));
   if (read.kind !== 'named') return null;
   const lookup = rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at);
   const structs = lookup.outside ? [] : lookup.nodes.filter((n) => n.kind === 'struct' || n.kind === 'union');
@@ -24330,6 +24398,225 @@ function matchRustAsMutChainCall(ref: UnresolvedRef, context: ResolutionContext)
   return rustLentCall(projected && decl.pinned ? `Pin<&mut ${decl.type}>` : decl.type, name, ref, context, tried);
 }
 
+/**
+ * A Rust call on a field chain or a struct literal, which the extractor
+ * records by its bare name — `vis.map.get("a")`, `self.inner.cfg.port()`,
+ * `self.0.len()`, `Xyz { x: 1.0 }.to_val()` (#2614) — is a call on the type
+ * that receiver is written with: the last field's as its struct declares it,
+ * the literal's own (rustValueType, rustTypedMethodCall). By the name alone,
+ * the reporter's `vis.map.get("a")` on a `HashMap<String, i32>` field went to
+ * the project's one `get`, `Ext::get`, an associated function at that, and
+ * `Xyz { … }.to_val()` to `Stat::to_val`, the same trait's other impl.
+ * Undefined, for the name strategies to decide as before, where the receiver
+ * is anything else (a call's value, an index, a macro) or its type can't be
+ * read.
+ */
+function matchRustWrittenReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const scopes = rustScopesOf(ref.filePath, context);
+  const lineStart = scopes?.lineStarts[ref.line - 1];
+  if (!scopes || lineStart === undefined || ref.column < 0) return undefined;
+  const start = lineStart + ref.column;
+  if (start >= (scopes.lineStarts[ref.line] ?? scopes.code.length)) return undefined;
+  const receiver = rustWrittenCallReceiver(scopes, start, ref.referenceName);
+  if (receiver === null) return undefined;
+  const written = rustValueType(receiver, start, scopes, ref, context, 0);
+  if (!written) return undefined;
+  const read = rustReadType(written, ref, context);
+  // A type no declaration the index holds names — one a macro declares, like
+  // tokio's `type AtomicUnsignedShort = …` inside `cfg_has_atomic_u64! { … }` —
+  // says nothing of what the call reaches, unless a wrapper around it has the
+  // method itself (`Arc::clone`): the name strategies decide, as before.
+  if (read.kind === 'named' && !read.wrappers.some((w) => RUST_WRAPPER_OWN_METHODS.get(w)?.has(ref.referenceName))) {
+    const lookup = rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at);
+    if (lookup.undeclared && rustMethodsNamed(lookup.name, ref.referenceName, context).length === 0) return undefined;
+  }
+  let result = rustTypedMethodCall(read, ref.referenceName, ref, context);
+  if (result === 'unread') return undefined;
+  if (result === null && read.kind === 'named') result = rustDerivedTraitMethod(read, ref.referenceName, ref, context);
+  if (result) {
+    let typed = RUST_TYPED_REFS.get(context);
+    if (!typed) RUST_TYPED_REFS.set(context, (typed = new WeakSet()));
+    typed.add(ref);
+  }
+  return result;
+}
+
+/**
+ * The method a Rust project trait that a type derives provides, for a call
+ * on a value of the type: `#[derive(TypedPath)] struct UsersShow { … }`
+ * reaches axum-extra's `TypedPath::with_query_params` through the impl the
+ * derive writes, which the index doesn't hold. Null unless exactly one
+ * derived trait in scope at the call declares the method with a body.
+ */
+function rustDerivedTraitMethod(read: Extract<RustTypeRead, { kind: 'named' }>, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const lookup = rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at);
+  const types = lookup.outside ? [] : lookup.nodes.filter((n) => RUST_OWNER_KINDS.has(n.kind));
+  if (types.length !== 1) return null;
+  const found: Node[] = [];
+  for (const name of rustDerivedNames(types[0]!, context)) {
+    const traits = context.getNodesByName(name).filter((n) => n.kind === 'trait' && n.language === 'rust' && n.name === name);
+    for (const m of rustTraitMethods(traits, method, context)) {
+      const trait = rustTraitOf(m, context);
+      if (trait && rustHasBody(m, context) && isRustTraitInScope(trait.name, ref, m, context)) found.push(m);
+    }
+  }
+  const owners = new Set(found.map((m) => rustTraitOf(m, context)?.id));
+  return owners.size === 1 ? { original: ref, targetNodeId: found[0]!.id, confidence: 0.85, resolvedBy: 'instance-method' } : null;
+}
+
+/** The names a Rust type's `#[derive(…)]` attributes write, each by its path's last segment. */
+function rustDerivedNames(decl: Node, context: ResolutionContext): string[] {
+  const scopes = rustScopesOf(decl.filePath, context);
+  if (!scopes) return [];
+  const start = rustNodeOffset(decl, context);
+  const keyword = new RegExp(`\\b(?:struct|enum|union)\\s+${escapeRegExp(decl.name)}\\b`).exec(scopes.code.slice(start, start + 2000));
+  if (!keyword) return [];
+  const at = start + keyword.index;
+  // The attributes right before the keyword: `#[derive(TypedPath, Deserialize)] #[typed_path("…")] pub struct …`.
+  const attrs = /((?:#\s*\[(?:[^[\]]|\[[^[\]]*\])*\]\s*)+)(?:pub(?:\s*\([^()]*\))?\s+)?$/.exec(scopes.code.slice(Math.max(0, at - 2000), at))?.[1] ?? '';
+  const names: string[] = [];
+  for (const m of attrs.matchAll(/\bderive\s*\(([^()]*)\)/g)) {
+    for (const part of m[1]!.split(',')) {
+      const name = part.trim().split('::').pop()?.trim();
+      if (name && /^[A-Za-z_]\w*$/.test(name)) names.push(name);
+    }
+  }
+  return names;
+}
+
+/** Past the whitespace at `i` in a Rust file's blanked text. */
+function rustSpaceEnd(code: string, i: number): number {
+  while (i < code.length && /\s/.test(code[i]!)) i++;
+  return i;
+}
+
+/** Past the arguments of a call at `p` — `(…)`, after a turbofish `::<…>` — or -1 where no call's arguments start there. */
+function rustCallArgsEnd(scopes: RustScopes, p: number): number {
+  const { code, close } = scopes;
+  let q = rustSpaceEnd(code, p);
+  if (code.startsWith('::', q)) {
+    q = rustSpaceEnd(code, q + 2);
+    if (code[q] !== '<') return -1;
+    const end = rustAngleEnd(code.slice(q, q + 512), 0);
+    if (end < 0) return -1;
+    q = rustSpaceEnd(code, q + end + 1);
+  }
+  if (code[q] !== '(') return -1;
+  const end = close.get(q);
+  return end === undefined ? -1 : end + 1;
+}
+
+/**
+ * A field chain or a struct literal at `from` in a Rust file's blanked text,
+ * up to `limit`: where it ends, how many fields it reads (`.inner`, `.0`),
+ * and whether it starts with a value that writes its type — a struct literal
+ * (`Xyz { … }`, `Shape::Circle { … }`, `Self { … }`) or one of these in
+ * parentheses, `(&Config { … })`. Null for anything else: a path's value, a
+ * call, a macro, a `match`.
+ */
+function rustFieldChainAt(scopes: RustScopes, from: number, limit: number): { end: number; hops: number; typed: boolean } | null {
+  const { code, close } = scopes;
+  let p = from;
+  let typed = false;
+  if (code[p] === '(') {
+    const end = close.get(p);
+    if (end === undefined || end >= limit) return null;
+    let q = rustSpaceEnd(code, p + 1);
+    if (code[q] === '&') {
+      q = rustSpaceEnd(code, q + 1);
+      if (/^mut\b/.test(code.slice(q, q + 4))) q = rustSpaceEnd(code, q + 3);
+    }
+    const inner = rustFieldChainAt(scopes, q, end);
+    if (!inner || rustSpaceEnd(code, inner.end) !== end || (inner.hops === 0 && !inner.typed)) return null;
+    p = end + 1;
+    typed = true;
+  } else {
+    const path = /^(?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*/.exec(code.slice(p, Math.min(limit, p + 512)))?.[0];
+    if (!path) return null;
+    const segments = path.split('::').map((s) => s.trim());
+    const last = segments[segments.length - 1]!;
+    let q = rustSpaceEnd(code, p + path.length);
+    // `Wrapper::<u8> { … }`: the literal's type arguments.
+    if (code.startsWith('::', q)) {
+      const lt = rustSpaceEnd(code, q + 2);
+      const end = code[lt] === '<' ? rustAngleEnd(code.slice(lt, lt + 512), 0) : -1;
+      if (end < 0) return null;
+      q = rustSpaceEnd(code, lt + end + 1);
+    }
+    if (/^[A-Z]/.test(last) && code[q] === '{') {
+      const end = close.get(q);
+      if (end === undefined || end >= limit) return null;
+      p = end + 1;
+      typed = true;
+    } else if (segments.length === 1 && /^[a-z_]/.test(last)) {
+      // A local, a parameter or `self`; a keyword (`match x { … }`) reads no field after it.
+      p += path.length;
+    } else {
+      return null;
+    }
+  }
+  let hops = 0;
+  for (;;) {
+    let q = rustSpaceEnd(code, p);
+    if (q >= limit || code[q] !== '.' || code[q + 1] === '.') break;
+    q = rustSpaceEnd(code, q + 1);
+    const id = /^(?:[A-Za-z_]\w*|\d+)/.exec(code.slice(q, Math.min(limit, q + 128)))?.[0];
+    // `.await` and a method call end the chain.
+    if (!id || id === 'await' || rustCallArgsEnd(scopes, q + id.length) >= 0) break;
+    p = q + id.length;
+    hops++;
+  }
+  return { end: p, hops, typed };
+}
+
+/**
+ * The receiver of the Rust call `name(…)` whose expression starts at `start`
+ * (where the extractor records a call it names bare), when it is a field
+ * chain — `vis.map`, `self.inner.cfg`, `self.0` — or a struct literal, alone
+ * or in parentheses (rustFieldChainAt), as the file's blanked text writes it.
+ * Null for any other receiver, and when a later link of the chain calls
+ * `name` again (`m.inner.get(k).get(j)`): that call is recorded at the same
+ * place, and can't be told from this one.
+ */
+function rustWrittenCallReceiver(scopes: RustScopes, start: number, name: string): string | null {
+  const { code, close } = scopes;
+  if (/\w/.test(code[start - 1] ?? '')) return null;
+  const chain = rustFieldChainAt(scopes, start, code.length);
+  // `x.name(…)` and `self.name(…)` are recorded with their receiver.
+  if (!chain || (chain.hops === 0 && !chain.typed)) return null;
+  const dot = rustSpaceEnd(code, chain.end);
+  if (code[dot] !== '.' || code[dot + 1] === '.') return null;
+  const at = rustSpaceEnd(code, dot + 1);
+  if (!code.startsWith(name, at) || /\w/.test(code[at + name.length] ?? '')) return null;
+  let p = rustCallArgsEnd(scopes, at + name.length);
+  if (p < 0) return null;
+  // The links after the call: `?`, `[…]`, `.field`, `.method(…)`.
+  for (;;) {
+    p = rustSpaceEnd(code, p);
+    const c = code[p];
+    if (c === '?') {
+      p++;
+      continue;
+    }
+    if (c === '[') {
+      const end = close.get(p);
+      if (end === undefined) return null;
+      p = end + 1;
+      continue;
+    }
+    if (c !== '.' || code[p + 1] === '.') break;
+    p = rustSpaceEnd(code, p + 1);
+    const id = /^(?:[A-Za-z_]\w*|\d+)/.exec(code.slice(p, p + 128))?.[0];
+    if (!id) break;
+    p += id.length;
+    const args = rustCallArgsEnd(scopes, p);
+    if (args < 0) continue;
+    if (id === name) return null;
+    p = args;
+  }
+  return code.slice(start, dot).trim();
+}
+
 /** Std pointers whose `as_ref` / `as_mut` lend what they hold: `Box<T>`, `NonNull<T>` → `&mut T`. */
 const RUST_LENDING_POINTERS: ReadonlySet<string> = new Set(['Box', 'NonNull', 'Rc', 'Arc', 'Cow']);
 
@@ -26731,9 +27018,14 @@ function matchReferenceInner(
   // extractor records by its bare name — `self.delay.as_mut().reset(…)` — is
   // a call on the type the receiver is declared with, or on nothing of the
   // project's (matchRustAsMutChainCall).
+  // So is one on a field chain or a struct literal — `vis.map.get("a")`,
+  // `Xyz { x: 1.0 }.to_val()` — a call on the type that receiver is written
+  // with (matchRustWrittenReceiverCall).
   if (ref.language === 'rust' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const lent = nmTimedT('rustAsMut', ref, () => matchRustAsMutChainCall(ref, context));
     if (lent !== undefined) return lent;
+    const written = nmTimedT('rustWritten', ref, () => matchRustWrittenReceiverCall(ref, context));
+    if (written !== undefined) return written;
   }
 
   // A Kotlin call on what an unqualified call returns, which the extractor
