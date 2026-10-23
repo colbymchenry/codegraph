@@ -816,15 +816,19 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
-  // The source as the file has it, kept when this instance's preParse changed
-  // it, for an extractor whose signatures read it (`signatureAsWritten`).
+  // The source as the file has it, kept when preParse changed it (by this
+  // instance, or at the kernel route point for a deferred file), for an
+  // extractor whose signatures read it (`signatureAsWritten`) or whose
+  // re-exports keep their statements as written (`reExportAsWritten`).
   private sourceAsWritten: string | null = null;
+  // Memoized reExportAsWritten verdict (per-extractor = per-file).
+  private reExportsAsWritten: boolean | null = null;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
   ) {
     this.filePath = filePath;
     this.source = source;
@@ -832,11 +836,25 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    if (options?.sourceAsWritten !== undefined && options.sourceAsWritten !== source) {
+      this.sourceAsWritten = options.sourceAsWritten;
+    }
   }
 
   /** The text `getSignature` reads: the source as written when the extractor asks for it. */
   private get signatureSource(): string {
-    return this.sourceAsWritten ?? this.source;
+    return this.extractor?.signatureAsWritten && this.sourceAsWritten !== null ? this.sourceAsWritten : this.source;
+  }
+
+  /**
+   * The text an import node reads its statement from: for a re-export, the
+   * source as written when the extractor asks (`reExportAsWritten`), so
+   * `export type * from './x'` keeps its `type` (#2474).
+   */
+  private importSource(node: SyntaxNode): string {
+    if (node.type !== 'export_statement' || this.sourceAsWritten === null) return this.source;
+    this.reExportsAsWritten ??= this.extractor?.reExportAsWritten?.(this.sourceAsWritten) === true;
+    return this.reExportsAsWritten ? this.sourceAsWritten : this.source;
   }
 
   /**
@@ -889,7 +907,7 @@ export class TreeSitterExtractor {
       // kernel route point already applied it (sourceIsPreParsed).
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
         const preParsed = this.extractor.preParse(this.source, this.filePath);
-        if (preParsed !== this.source && this.extractor.signatureAsWritten) this.sourceAsWritten = this.source;
+        if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
       this.tree = parser.parse(this.source) ?? null;
@@ -986,6 +1004,7 @@ export class TreeSitterExtractor {
       }
       // Release source string to reduce GC pressure
       this.source = '';
+      this.sourceAsWritten = null;
     }
 
     return {
@@ -4625,11 +4644,12 @@ export class TreeSitterExtractor {
   private extractImport(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    const importText = getNodeText(node, this.source).trim();
+    const statementSource = this.importSource(node);
+    const importText = getNodeText(node, statementSource).trim();
 
     // Try language-specific hook first
     if (this.extractor.extractImport) {
-      const info = this.extractor.extractImport(node, this.source);
+      const info = this.extractor.extractImport(node, statementSource);
       if (info) {
         this.createNode('import', info.moduleName, node, {
           signature: info.signature,
@@ -9551,7 +9571,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null }
+        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source } : undefined
       );
       result = extractor.extract();
     }

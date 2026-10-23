@@ -87,6 +87,13 @@ export interface LanguageExtractor {
    * or `const [MVCFromBody] Person` (#2545). Offsets are the same in both.
    */
   signatureAsWritten?: boolean;
+  /**
+   * Whether a re-export's import node (`export … from`) keeps its statement as
+   * the file writes it, not as `preParse` left it, given the source as
+   * written: TypeScript asks for a file whose `export type *` it blanks
+   * (#2474). The kernel route reads the same answer (kernel/index.ts).
+   */
+  reExportAsWritten?: (source: string) => boolean;
 
   // --- Node type mappings ---
 

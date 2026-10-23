@@ -87,12 +87,22 @@ const EXPORT_TYPE_STAR = /(^|[;{}]|\*\/)([ \t]*export\s+)type(?=\s*\*\s*(?:from|
  * kernel handed every such file to the wasm parser (#2474). Only a statement
  * start is blanked, so a mention in a comment or a doc keeps its text. The
  * import resolver reads the statement as written, `type` included, from the
- * file itself (`extractReExports`). Applied before both engines parse (the
+ * file itself (`extractReExports`), and so does the import node the statement
+ * makes ({@link blanksExportTypeStar}). Applied before both engines parse (the
  * kernel's preParse hoist), so they agree.
  */
 export function blankExportTypeStar(source: string): string {
   if (!EXPORT_TYPE_STAR_HINT.test(source)) return source;
   return source.replace(EXPORT_TYPE_STAR, '$1$2    ');
+}
+
+/**
+ * Whether {@link blankExportTypeStar} blanks anything in `source`. Such a
+ * file's re-exports keep their statements as written in the graph, `type`
+ * included (`reExportAsWritten`).
+ */
+export function blanksExportTypeStar(source: string): boolean {
+  return EXPORT_TYPE_STAR_HINT.test(source) && blankExportTypeStar(source) !== source;
 }
 
 /**
@@ -174,6 +184,7 @@ export function isAmbientFunctionSignature(node: SyntaxNode, filePath: string): 
 
 export const typescriptExtractor: LanguageExtractor = {
   preParse: (source, filePath) => blankExportTypeStar(blankFlowSyntax(source, filePath)),
+  reExportAsWritten: blanksExportTypeStar,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   isAmbientFunction: isAmbientFunctionSignature,
   // `class` is a class expression, `register(class Widget extends Base {…})`:

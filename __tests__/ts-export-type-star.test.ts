@@ -22,8 +22,8 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { extractFromSource } from '../src/extraction';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
-import { tryKernelExtract, resetKernelForTests } from '../src/extraction/kernel';
-import { blankExportTypeStar } from '../src/extraction/languages/typescript';
+import { tryKernelExtract, tryKernelExtractRaw, resetKernelForTests } from '../src/extraction/kernel';
+import { blankExportTypeStar, blanksExportTypeStar } from '../src/extraction/languages/typescript';
 import type { ExtractionResult, Language } from '../src/types';
 
 const KERNEL_PATH = path.join(
@@ -44,6 +44,9 @@ const BARREL = [
   'export type * as Shapes from "./shapes.js";',
   '',
 ].join('\n');
+
+/** Each statement of the barrel, as its import node keeps it. */
+const BARREL_STATEMENTS = BARREL.split('\n').filter(Boolean);
 
 describe('blankExportTypeStar', () => {
   it('blanks the `type` of a type-only star re-export, keeping every offset', () => {
@@ -150,9 +153,36 @@ describe('a type-only star re-export parses in both engines', () => {
           'FooClient@1',
           'FooClientOptions@1',
         ]);
+        // Each import node keeps its statement as written, `type` included.
+        expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.signature)).toEqual(BARREL_STATEMENTS);
       });
     }
   }
+
+  it.runIf(kernelAvailable)('keeps a re-export as written in a file the kernel hands to the wasm parser', () => {
+    // `export const = ;` is an error, so the kernel defers the whole file.
+    const source = 'export type * from "./types.js";\nexport const = ;\n';
+    delete process.env.CODEGRAPH_KERNEL;
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    expect(tryKernelExtract('src/broken.ts', source, 'typescript')).toBeNull();
+    const result = extractFromSource('src/broken.ts', source, 'typescript');
+    expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.signature)).toEqual([
+      'export type * from "./types.js";',
+    ]);
+  });
+
+  it.runIf(kernelAvailable)('leaves the undecoded kernel path to files with nothing to keep as written', () => {
+    delete process.env.CODEGRAPH_KERNEL;
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    // Its import nodes' text is restored on the decoded path, which the parse worker falls back to.
+    expect(tryKernelExtractRaw('src/index.ts', BARREL, 'typescript')).toBeNull();
+    const plain = 'export { FooClient } from "./client.js";\nexport * from "./types.js";\n';
+    expect(tryKernelExtractRaw('src/plain.ts', plain, 'typescript')).not.toBeNull();
+    expect(blanksExportTypeStar(BARREL)).toBe(true);
+    expect(blanksExportTypeStar(plain)).toBe(false);
+    // A mention only in a comment blanks nothing.
+    expect(blanksExportTypeStar('// prefer export type * from "./types"\nexport * from "./types";\n')).toBe(false);
+  });
 
   it.each(backends)('in a declaration file\'s declare module body: %s', (backend) => {
     const source = 'declare module "sdk" {\n  export type * from "./types";\n  export function connect(): void;\n}\n';
@@ -220,6 +250,11 @@ describe('indexing a barrel with `export type *` (#2474)', () => {
     const barrel = cg.getFile('packages/sdk/src/index.ts');
     expect(barrel).not.toBeNull();
     expect(barrel!.errors ?? []).toEqual([]);
+  });
+
+  it('stores each re-export as written', () => {
+    const imports = cg.getNodesInFile('packages/sdk/src/index.ts').filter((n) => n.kind === 'import');
+    expect(imports.sort((a, b) => a.startLine - b.startLine).map((n) => n.signature)).toEqual(BARREL_STATEMENTS);
   });
 
   it('links each name imported through the barrel to the file that declares it', () => {
