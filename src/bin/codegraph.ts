@@ -550,9 +550,11 @@ async function offerIndexIgnoredRepos(
   opts: { interactive: boolean },
 ): Promise<IndexResult | undefined> {
   let repos: string[];
+  let patterns: string[];
   try {
-    const { findUnindexedIgnoredRepos } = await import('../extraction');
+    const { findUnindexedIgnoredRepos, includeIgnoredPatternFor } = await import('../extraction');
     repos = findUnindexedIgnoredRepos(projectPath);
+    patterns = repos.map(includeIgnoredPatternFor);
   } catch {
     return; // detection is advisory — never let it break the command
   }
@@ -563,7 +565,7 @@ async function offerIndexIgnoredRepos(
   const SHOWN = 6;
   const names = repos.slice(0, SHOWN).map((r) => r.replace(/\/$/, ''));
   const extra = repos.length > SHOWN ? ` (+${formatNumber(repos.length - SHOWN)} more)` : '';
-  const snippet = `{ "includeIgnored": [${repos.map((p) => JSON.stringify(p)).join(', ')}] }`;
+  const snippet = `{ "includeIgnored": [${patterns.map((p) => JSON.stringify(p)).join(', ')}] }`;
 
   clack.log.warn(
     `Your .gitignore excludes ${isOne ? 'a nested git repository' : `${formatNumber(repos.length)} nested git repositories`} here, ` +
@@ -594,7 +596,7 @@ async function offerIndexIgnoredRepos(
   let added: number;
   try {
     const { addIncludeIgnoredPatterns } = await import('../project-config');
-    added = addIncludeIgnoredPatterns(projectPath, repos);
+    added = addIncludeIgnoredPatterns(projectPath, patterns);
   } catch (err) {
     clack.log.error(`Could not update ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`);
     manualHint();

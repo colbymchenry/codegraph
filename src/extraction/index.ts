@@ -517,9 +517,12 @@ function readGitExcludeExtraPatterns(rootDir: string): string {
 
 /**
  * Directories `git ls-files -o -i --exclude-standard --directory` reports as
- * ignored-untracked. Seeded into {@link ScopeIgnore} so nested `.gitignore`
- * effects (and any exclude-standard rule the flat matcher might miss) prune the
- * watcher the same way the indexer skips them (#1728).
+ * ignored-untracked, relative to `rootDir` (git prints paths relative to its
+ * cwd, also when `rootDir` is a subfolder of the repo) and trailing-slashed.
+ * Seeded into {@link ScopeIgnore} so nested `.gitignore` effects (and any
+ * exclude-standard rule the flat matcher might miss) prune the watcher the
+ * same way the indexer skips them (#1728). Each one is a path, not a pattern:
+ * see {@link ScopeIgnore}.
  */
 function listGitIgnoredDirectories(rootDir: string): string[] {
   try {
@@ -535,8 +538,11 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
       },
     );
     const dirs: string[] = [];
-    for (const entry of out.split('\0')) {
-      if (!entry) continue;
+    for (const raw of out.split('\0')) {
+      // `./` is git's "this whole directory" for a root that is itself ignored
+      // (#936); the root's own files stay in scope.
+      if (isWholeCwdEntry(raw)) continue;
+      const entry = normalizePath(raw);
       dirs.push(entry.endsWith('/') ? entry : `${entry}/`);
     }
     return dirs;
@@ -958,9 +964,27 @@ export class ScopeIgnore {
      */
     private include: Ignore | null = null,
     private includeRoots: string[] = [],
+    /**
+     * The directories `git ls-files --exclude-standard` reports as ignored
+     * (see listGitIgnoredDirectories): root-relative, trailing-slashed paths.
+     * Each names one directory and is matched as a literal path prefix, never
+     * as a gitignore pattern. As a pattern, `src/` matched every `src/` below
+     * the root too, hiding a whole Maven monorepo's sources (#2849), and a
+     * folder named `[draft]` or `a[b` read as a glob (or did not compile).
+     */
+    private gitIgnoredDirs: ReadonlySet<string> = new Set(),
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
+  }
+
+  /** True when `rel` is one of {@link gitIgnoredDirs} or lies inside one. */
+  private inGitIgnoredDir(rel: string): boolean {
+    if (this.gitIgnoredDirs.size === 0) return false;
+    for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
+      if (this.gitIgnoredDirs.has(rel.slice(0, slash + 1))) return true;
+    }
+    return false;
   }
 
   ignores(rel: string): boolean {
@@ -994,7 +1018,7 @@ export class ScopeIgnore {
     if (rel.endsWith('/') && this.embedded.some(({ root }) => root.startsWith(rel))) {
       return false;
     }
-    return this.rootMatcher.ignores(rel);
+    return this.rootMatcher.ignores(rel) || this.inGitIgnoredDir(rel);
   }
 }
 
@@ -1006,19 +1030,17 @@ export class ScopeIgnore {
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
-  // Root matcher already has defaults + root `.gitignore` + info/exclude +
-  // core.excludesFile. Seed ignored-untracked directories from git so nested
-  // `.gitignore` effects prune the watcher identically to the indexer (#1728).
-  const rootMatcher = buildDefaultIgnore(rootDir);
-  for (const dir of listGitIgnoredDirectories(rootDir)) {
-    rootMatcher.add(dir);
-  }
+  // The root matcher has defaults + root `.gitignore` + info/exclude +
+  // core.excludesFile. The ignored-untracked directories git reports join
+  // them, so nested `.gitignore` effects prune the watcher identically to the
+  // indexer (#1728) — as literal paths, not patterns (#2849).
   return new ScopeIgnore(
-    rootMatcher,
+    buildDefaultIgnore(rootDir),
     roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
     loadExcludeMatcher(rootDir),
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
+    new Set(listGitIgnoredDirectories(rootDir)),
   );
 }
 
@@ -1165,6 +1187,18 @@ export function findUnindexedIgnoredRepos(rootDir: string): string[] {
     }
   }
   return repos;
+}
+
+/**
+ * The `codegraph.json` `includeIgnored` pattern that opts in exactly the repo
+ * at `repoDir`, a root-relative, trailing-slashed path from
+ * {@link findUnindexedIgnoredRepos}. Patterns are gitignore syntax, so the
+ * path is anchored to the root (a bare `child/` also matches every `child/`
+ * below it) and its `*` and `[` are escaped (#2849). The `ignore` matcher has
+ * no working escape for `?`, so a `?` stays a one-character wildcard.
+ */
+export function includeIgnoredPatternFor(repoDir: string): string {
+  return '/' + repoDir.replace(/[*[]/g, '\\$&');
 }
 
 /**
