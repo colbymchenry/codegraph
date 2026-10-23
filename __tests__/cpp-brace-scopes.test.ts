@@ -350,7 +350,7 @@ describe('scanCppBraceScopes', () => {
   });
 });
 
-describe.skipIf(!kernelAvailable)('C++ brace scopes: native kernel parity (error-extract hatch)', () => {
+describe.skipIf(!kernelAvailable || process.env.CODEGRAPH_KERNEL === '0')('C++ brace scopes: native kernel parity (error-extract hatch)', () => {
   beforeAll(async () => {
     await initGrammars();
     await loadGrammarsForLanguages(['cpp']);
