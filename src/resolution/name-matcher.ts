@@ -1937,7 +1937,7 @@ const JVM_PACKAGES = new WeakMap<ResolutionContext, Set<string>>();
  * `import static org.junit.Assert.assertEquals;`. A nested class of a project
  * type (`import com.acme.Outer.Inner;`) is under a project package, so it is not.
  */
-function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+export function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === name);
   if (!binding) return false;
   // A member the file declares itself is in scope before any import —
@@ -27201,7 +27201,7 @@ type Arity = { min: number; max: number } | null;
 /** Per context: node id → its same-owner overloads with their arities (null: none). */
 const OVERLOAD_SETS = new WeakMap<ResolutionContext, Map<string, { name: string; own: Arity; siblings: Array<{ id: string; arity: Arity }> } | null>>();
 
-function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef {
+export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef {
   if (ref.referenceKind !== 'calls' || !OVERLOADING_LANGUAGES.has(ref.language)) return result;
   // C++ overload sets (templates, SFINAE tags, a `data()` on any container) are
   // only trusted for a method's call to itself.

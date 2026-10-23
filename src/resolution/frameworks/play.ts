@@ -18,10 +18,14 @@
 import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
 import { isPlayRoutesFile } from '../../extraction/grammars';
+import { isJavaOutsideImport, retargetSelfOverload } from '../name-matcher';
 
 const ROUTE_LINE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+(.+)$/;
 const METHOD_KINDS = new Set(['method', 'function']);
-const CLASS_KINDS = new Set(['class']);
+/** A route's controller: a class, or a Scala `object` (a companion shares its class's qualified name). */
+const CONTROLLER_KINDS = new Set(['class', 'module']);
+/** What a call in code names: those, or a Java interface or enum, which hold static members of their own. */
+const OWNER_KINDS = new Set([...CONTROLLER_KINDS, 'interface', 'enum']);
 
 export const playResolver: FrameworkResolver = {
   name: 'play',
@@ -49,15 +53,42 @@ export const playResolver: FrameworkResolver = {
     const m = ref.referenceName.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
     if (!m) return null;
     const [, className, methodName] = m;
-    const classNodes = context.getNodesByName(className!).filter((n) => CLASS_KINDS.has(n.kind));
-    for (const cls of classNodes) {
-      const method = context
-        .getNodesInFile(cls.filePath)
-        .find((n) => METHOD_KINDS.has(n.kind) && n.name === methodName);
-      if (method) {
-        return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'framework' };
+    const route = isPlayRoutesFile(ref.filePath);
+    // `import org.apache.logging.log4j.core.config.Configurator` makes a Java
+    // file's `Configurator` that library's, never a project type of the name.
+    if (!route && ref.language === 'java' && isJavaOutsideImport(className!, ref, context)) return null;
+    // A call's own language comes first: Play's `RequestAuthority` is both a
+    // Scala case class and a Java record, and each language's callers mean
+    // their own; the other language's types follow, since Play's Java API
+    // calls its Scala classes. A route file has no language of its own.
+    const kinds = route ? CONTROLLER_KINDS : OWNER_KINDS;
+    const owners = context.getNodesByName(className!).filter((n) => kinds.has(n.kind));
+    const groups = route
+      ? [owners]
+      : [owners.filter((n) => n.language === ref.language), owners.filter((n) => n.language !== ref.language)];
+    for (const group of groups) {
+      // Only a member of THAT type counts: a file can hold many classes (Java
+      // nested classes, a Scala class + its companion + siblings), and the
+      // first same-named method in the file is usually another class's. A
+      // Scala object, a companion included, holds its own members.
+      const members = new Map<string, Node>();
+      for (const cls of group) {
+        const memberQn = `${cls.qualifiedName}::${methodName}`;
+        for (const n of context.getNodesInFile(cls.filePath)) {
+          if (METHOD_KINDS.has(n.kind) && n.name === methodName && n.qualifiedName === memberQn) members.set(n.id, n);
+        }
       }
+      if (members.size === 0) continue;
+      const found = [...members.values()];
+      // Same-named types in several packages (Scala names carry no package):
+      // the one in the caller's own file comes first.
+      const pick = (!route && found.find((n) => n.filePath === ref.filePath)) || found[0]!;
+      const result: ResolvedRef = { original: ref, targetNodeId: pick.id, confidence: 0.9, resolvedBy: 'framework' };
+      // Overloads: the one the call's arguments fit, as the generic resolver picks it.
+      return route ? result : retargetSelfOverload(result, ref, context);
     }
+    // An inherited member isn't looked up here: the generic resolver finds it
+    // through the class's declared supertypes.
     return null;
   },
 
