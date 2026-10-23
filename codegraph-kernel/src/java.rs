@@ -1034,7 +1034,7 @@ impl<'t> Walker<'t> {
                         None => child.named_child(0).into_iter().collect(),
                     };
                     for target in targets {
-                        let name = self.text(target).to_string();
+                        let name = self.supertype_name(target);
                         self.push_ref_at(class_row, &name, extends_kind, target);
                     }
                 }
@@ -1047,13 +1047,27 @@ impl<'t> Walker<'t> {
                         None => (0..child.named_child_count()).filter_map(|j| child.named_child(j)).collect(),
                     };
                     for iface in targets {
-                        let name = self.text(iface).to_string();
+                        let name = self.supertype_name(iface);
                         self.push_ref_at(class_row, &name, implements_kind, iface);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// supertypeName — a parameterized supertype (`generic_type`) by the name
+    /// before its type arguments: `Store` for `implements Store<String>`.
+    fn supertype_name(&self, node: Node<'t>) -> String {
+        if node.kind() == "generic_type" {
+            let named = (0..node.named_child_count())
+                .filter_map(|j| node.named_child(j))
+                .find(|c| c.kind() != "type_arguments");
+            if let Some(named) = named {
+                return self.text(named).to_string();
+            }
+        }
+        self.text(node).to_string()
     }
 
     /// extractDecoratorsFor — Java annotations live inside `modifiers`.

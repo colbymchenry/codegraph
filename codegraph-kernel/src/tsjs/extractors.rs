@@ -1984,14 +1984,14 @@ impl<'t> Walker<'t> {
                 // TS `extends_clause` (the other spellings are other grammars').
                 "extends_clause" | "superclass" | "base_clause" | "extends_interfaces" => {
                     if let Some(target) = child.named_child(0) {
-                        let name = self.text(target).to_string();
+                        let name = self.supertype_name(target);
                         self.push_ref(class_row, &name, extends_kind, target);
                     }
                 }
                 "implements_clause" | "class_interface_clause" | "super_interfaces" | "interfaces" => {
                     for j in 0..child.named_child_count() {
                         if let Some(iface) = child.named_child(j) {
-                            let name = self.text(iface).to_string();
+                            let name = self.supertype_name(iface);
                             self.push_ref(class_row, &name, implements_kind, iface);
                         }
                     }
@@ -2025,6 +2025,20 @@ impl<'t> Walker<'t> {
                 _ => {}
             }
         }
+    }
+
+    /// supertypeName — a parameterized supertype (`generic_type`) by the name
+    /// before its type arguments: `Store` for `implements Store<string>`.
+    fn supertype_name(&self, node: Node<'t>) -> String {
+        if node.kind() == "generic_type" {
+            let named = (0..node.named_child_count())
+                .filter_map(|j| node.named_child(j))
+                .find(|c| c.kind() != "type_arguments");
+            if let Some(named) = named {
+                return self.text(named).to_string();
+            }
+        }
+        self.text(node).to_string()
     }
 
     // --- type annotations (#381 — TS family only) ----------------------------------------------
