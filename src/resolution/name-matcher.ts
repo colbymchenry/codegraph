@@ -17856,6 +17856,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_BASES_MEMO.delete(context);
   PY_FILE_CLASSES.delete(context);
   PY_ATTR_CALL_MEMO.delete(context);
+  PY_FILE_DEFS.delete(context);
+  PY_SCOPE_BINDINGS.delete(context);
+  PY_LOCAL_CLASS_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -23405,6 +23408,255 @@ function pythonAttrCallOn(
   }
   for (const f of hit.read) read.add(f);
   return hit.answer ? { ...hit.answer, original: ref } : hit.answer;
+}
+
+/**
+ * A call of a builtin-named method — `get`, `update`, `items`, `close` —
+ * through a local or a parameter (#2583): `reg = SystemPackRegistry();
+ * reg.get(k)`, `registry = load_registry()` with `def load_registry() ->
+ * SystemPackRegistry`, `def f(reg: SystemPackRegistry)`. The builtin filter
+ * drops such a call by its method's name before any strategy reads the
+ * receiver, and this is its one way back, by evidence only: the def that binds
+ * the name where the call reads it (the calling one, or one it is nested in)
+ * gives it one project class everywhere it binds it (pythonLocalClass), and
+ * the method is that class's own or a declared base's. A module-level name,
+ * and one its def leaves unknown or contested, stay dropped. The edge records
+ * the other files its answer was read from (`typeFrom`), as an attribute
+ * call's does, so a sync that edits the factory or a base re-opens it.
+ */
+export function matchPythonTypedLocalCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (ref.language !== 'python' || ref.referenceKind !== 'calls') return null;
+  const m = /^([A-Za-z_]\w*)\.(\w+)$/.exec(ref.referenceName);
+  if (!m || m[1] === 'self' || m[1] === 'cls') return null;
+  const receiver = m[1]!;
+  const scope = pythonBindingScope(receiver, ref, context);
+  if (!scope) return null;
+  const read = new Set<string>();
+  const cls = pythonLocalClass(scope, receiver, ref, context, read);
+  if (!cls || cls === 'runtime') return null;
+  const hit = pythonMethodOnClass(cls, m[2]!, ref, context, read);
+  if (!hit) return null;
+  read.delete(ref.filePath);
+  return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
+/** Per context: a python file's functions and methods, the latest-starting first, for the defs around a call. */
+const PY_FILE_DEFS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+function pythonFileDefs(filePath: string, context: ResolutionContext): Node[] {
+  const memo = pyMemo(PY_FILE_DEFS, context);
+  let hit = memo.get(filePath);
+  if (!hit) {
+    hit = context.getNodesInFile(filePath)
+      .filter((n) => n.kind === 'function' || n.kind === 'method')
+      .sort((a, b) => b.startLine - a.startLine);
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(filePath, hit);
+  }
+  return hit;
+}
+
+/**
+ * Per context: a def and a name → what the def's parameter of that name is
+ * annotated with (pythonParamAnnotation), and every binding of the name in the
+ * def's own body.
+ */
+const PY_SCOPE_BINDINGS = new WeakMap<ResolutionContext, Map<string, { param: string | null | undefined; bindings: PythonBinding[] }>>();
+
+function pythonScopeBindings(scope: Node, name: string, context: ResolutionContext): { param: string | null | undefined; bindings: PythonBinding[] } {
+  const memo = pyMemo(PY_SCOPE_BINDINGS, context);
+  const key = `${scope.id}\0${name}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const lines = pythonMemberLines(scope.filePath, context);
+    const statements = pythonStatementStarts(scope.filePath, context);
+    // pythonLineBindings binds nothing on a statement that names the name
+    // only as a receiver or a container (`reg.get(…)`, `reg[k]`), its
+    // continuation lines included: its own word test rules those out first.
+    // An import binds the head of a dotted name (`import os.path`), and a star
+    // import, which binds any name, can't be written in a def. So the lines
+    // that can't bind skip its per-line work.
+    const n = escapeRegExp(name);
+    const word = new RegExp(`(?<![\\w.])${n}\\b(?!\\s*[.\\[])`);
+    const mention = new RegExp(`(?<![\\w.])${n}\\b`);
+    const names = (i: number): boolean => {
+      const test = /^\s*(?:from|import)\b/.test(lines[i]!) ? mention : word;
+      if (test.test(lines[i]!)) return true;
+      if (!statements[i]) return false;
+      for (let j = i + 1; j < lines.length && !statements[j]; j++) if (test.test(lines[j]!)) return true;
+      return false;
+    };
+    const bindings: PythonBinding[] = [];
+    for (const i of pythonOwnLines(scope, scope.filePath, context)) {
+      if (names(i)) bindings.push(...pythonLineBindings(lines, i, statements, name));
+    }
+    hit = { param: pythonParamAnnotation(scope.signature ?? '', name), bindings };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  return hit;
+}
+
+/**
+ * The def whose local `name` is the one `ref` reads: the innermost def around
+ * the reference that binds the name, by a parameter or anywhere in its own
+ * body. Null when no def around it does (a module global), or when one
+ * declares it `global`.
+ */
+function pythonBindingScope(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  for (const scope of pythonFileDefs(ref.filePath, context)) {
+    if (scope.startLine > ref.line || scope.endLine < ref.line) continue;
+    const { param, bindings } = pythonScopeBindings(scope, name, context);
+    if (param !== undefined) return scope;
+    if (bindings.some((b) => b.kind === 'global')) return null;
+    if (bindings.length > 0) return scope;
+  }
+  return null;
+}
+
+/**
+ * What the parameter `name` of a def with this signature (`(a, b: T = d)`)
+ * says of its type: the annotation as written, null for a parameter without
+ * one and for `*name` / `**name` (a tuple, a dict), undefined when the def has
+ * no parameter of that name.
+ */
+function pythonParamAnnotation(signature: string, name: string): string | null | undefined {
+  const open = signature.indexOf('(');
+  if (open < 0 || !signature.includes(name)) return undefined;
+  // Parameters split at the commas directly inside the parentheses; strings
+  // are blanked (same length) so a quoted comma or bracket doesn't count.
+  const blank = pythonBlankStrings(signature);
+  const params: Array<[number, number]> = [];
+  let depth = 0;
+  let from = open + 1;
+  for (let i = open; i < blank.length; i++) {
+    const c = blank[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) { params.push([from, i]); break; }
+    } else if (c === ',' && depth === 1) {
+      params.push([from, i]);
+      from = i + 1;
+    }
+  }
+  for (const [start, end] of params) {
+    const head = /^\s*(\*{0,2})([A-Za-z_]\w*)\s*(:?)/.exec(signature.slice(start, end));
+    if (!head || head[2] !== name) continue;
+    if (head[1] || !head[3]) return null;
+    // The annotation runs up to the default's `=`, outside brackets.
+    const at = start + head[0].length;
+    let d = 0;
+    let to = end;
+    for (let i = at; i < end; i++) {
+      const c = blank[i]!;
+      if (c === '(' || c === '[' || c === '{') d++;
+      else if (c === ')' || c === ']' || c === '}') d--;
+      else if (c === '=' && d === 0) { to = i; break; }
+    }
+    return signature.slice(at, to).trim() || null;
+  }
+  return undefined;
+}
+
+/** Per context: a def and a name → the class pythonLocalClass reads, and the files read for it. */
+const PY_LOCAL_CLASS_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: PythonTypeAnswer; read: string[] }>>();
+
+/**
+ * The project class the local or parameter `name` of `scope` holds, the same
+ * for every binding of it there. A parameter holds what its annotation names
+ * (`"T"`, `Optional[T]` and `T | None` too); an assignment, what its own
+ * annotation names, or else what its whole value makes — a class's
+ * constructor, or a factory, typed by its `-> T` or by what it returns
+ * (pythonValueEvidence, pythonFactoryType) — or what an annotated parameter it
+ * copies holds; `name = None` says nothing either way. Each class is the one
+ * the file's imports name (pythonClassNamed), so one from outside the project,
+ * as `from queue import Queue` gives, is none of the project's ('runtime').
+ *
+ * Anything else that binds the name leaves its type unknown (null): a
+ * parameter without an annotation, a `for` / `with` / `except` / comprehension
+ * target, a tuple or augmented assignment, a walrus, an import, `del`, a
+ * nested `def` or `class` of the name, a `nonlocal` write from a def nested in
+ * the scope. So does a value that names no class — `{}` is a dict, and
+ * `json.load(p)`, `Foo().data()` or a union are unknown — and a callee the
+ * scope or a def around it rebinds (`Store = load(); reg = Store()`).
+ */
+function pythonLocalClass(
+  scope: Node,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer {
+  const memo = pyMemo(PY_LOCAL_CLASS_MEMO, context);
+  const key = `${scope.id}\0${name}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    hit = { answer: pythonLocalClassUncached(scope, name, ref, context, own), read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer;
+}
+
+function pythonLocalClassUncached(
+  scope: Node,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer {
+  const filePath = scope.filePath;
+  const { param, bindings } = pythonScopeBindings(scope, name, context);
+  const evidence: PythonEvidence[] = [];
+  if (param !== undefined) {
+    const ev = param === null ? null : pythonAnnotationEvidence(param);
+    if (!ev) return null;
+    evidence.push(ev);
+  }
+  for (const b of bindings) {
+    if (b.kind !== 'assign') return null;
+    let ev: PythonAttrEvidence;
+    if (b.type) {
+      // `reg: Base = make()` trusts the annotation; `reg: A = B()` contradicts it.
+      const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
+      if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) return null;
+      ev = pythonAnnotationEvidence(b.type);
+    } else if (b.value === 'None') {
+      continue;
+    } else if (/^[A-Za-z_]\w*$/.test(b.value)) {
+      // `reg = registry`: what the parameter's annotation names, unless the def rebinds it.
+      const copied = pythonScopeBindings(scope, b.value, context);
+      if (!copied.param || copied.bindings.length > 0) return null;
+      ev = pythonAnnotationEvidence(copied.param);
+    } else {
+      const at: UnresolvedRef = { ...ref, line: b.line + 1 };
+      if (pythonValueCallees(b.value).some((c) => pythonBindsLocally(c.split('.')[0]!, at, context, false))) return null;
+      ev = pythonValueEvidence(b.value, null);
+    }
+    if (!ev) return null;
+    evidence.push(ev);
+  }
+  // Nothing here can be a project class: a builtin, or no evidence.
+  if (!evidence.some((ev) => ev !== 'runtime')) return evidence.length > 0 ? 'runtime' : null;
+
+  // A def or class of the name nested in the scope binds it there, a def
+  // nested in it can rebind the scope's own through `nonlocal`, and `with … as
+  // (a, name)` binds it in a way pythonLineBindings doesn't read.
+  if (pythonFileDefs(filePath, context).some((n) => n.id !== scope.id && n.name === name &&
+      n.startLine > scope.startLine && n.endLine <= scope.endLine) ||
+      pythonFileClasses(filePath, context).some((n) => n.name === name &&
+      n.startLine > scope.startLine && n.endLine <= scope.endLine)) return null;
+  const lines = pythonMemberLines(filePath, context);
+  const n = escapeRegExp(name);
+  const nonlocal = new RegExp(`^\\s*nonlocal\\b.*(?<![\\w.])${n}\\b`);
+  const asTuple = new RegExp(`\\bas\\s*\\([^)]*(?<![\\w.])${n}\\b`);
+  for (let i = scope.startLine - 1; i < Math.min(scope.endLine, lines.length); i++) {
+    const line = lines[i]!;
+    if (line.includes(name) && (nonlocal.test(line) || asTuple.test(line))) return null;
+  }
+  return pythonAgree(evidence.map((ev) => pythonEvidenceClass(ev, filePath, context, read, 0, null)));
 }
 
 /**

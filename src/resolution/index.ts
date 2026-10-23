@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, isManualMockPath } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -1522,9 +1522,14 @@ export class ReferenceResolver {
     const superCall = matchJsSuperCall(ref, this.context);
     if (superCall !== undefined) return superCall;
 
-    // Skip built-in/external references
+    // Skip built-in/external references — except a python call of a
+    // builtin-named method through a local or a parameter its def types as a
+    // project class (`reg = Registry(); reg.get(k)`, #2583): that reading,
+    // by evidence only, is the one way back, and nothing guesses past it.
     if (this.isBuiltInOrExternal(ref)) {
-      return null;
+      return this.isPythonBuiltinNamedMethodCall(ref)
+        ? this.gateLanguage(matchPythonTypedLocalCall(ref, this.context), ref)
+        : null;
     }
 
     // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
@@ -3214,6 +3219,14 @@ export class ReferenceResolver {
       }
     }
     return false;
+  }
+
+  /** A python call `x.get(…)` of a method named like a builtin collection, string or file method. */
+  private isPythonBuiltinNamedMethodCall(ref: UnresolvedRef): boolean {
+    if (ref.language !== 'python' || ref.referenceKind !== 'calls') return false;
+    const dot = ref.referenceName.indexOf('.');
+    return dot > 0 && PYTHON_BUILT_IN_METHODS.has(ref.referenceName.slice(dot + 1)) &&
+      !PYTHON_BUILT_IN_TYPES.has(ref.referenceName.slice(0, dot));
   }
 
   /**
