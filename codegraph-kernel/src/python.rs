@@ -25,8 +25,8 @@ const MAX_VALUE_REF_NODES: usize = 20_000;
 // Keep body-docstring selection and cleaning in sync with languages/python.ts.
 fn body_docstring(node: Node, src: &str) -> Option<String> {
     let body = if node.kind() == "module" { node } else { node.child_by_field_name("body")? };
-    let first = (0..body.named_child_count())
-        .filter_map(|i| body.named_child(i))
+    let mut cursor = body.walk();
+    let first = body.named_children(&mut cursor)
         .find(|c| c.kind() != "comment")?;
     if first.kind() != "expression_statement" {
         return None;
@@ -443,10 +443,9 @@ impl<'t> Walker<'t> {
         }
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                self.visit_node(child);
             }
         }
     }
@@ -478,10 +477,9 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.visit_for_calls_and_structure(child);
         }
     }
 
@@ -541,8 +539,8 @@ impl<'t> Walker<'t> {
 
         // Inheritance: `class Flask(Scaffold, Mixin):` — argument_list children.
         let extends_kind = edge_kind_index("extends").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             if child.kind() == "argument_list" {
                 for j in 0..child.named_child_count() {
                     let Some(arg) = child.named_child(j) else { continue };
@@ -557,10 +555,9 @@ impl<'t> Walker<'t> {
 
         self.stack.push(Scope { row, kind: "class", name });
         let body = node.child_by_field_name("body").unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            self.visit_node(child);
         }
         self.stack.pop();
     }
@@ -801,35 +798,17 @@ impl<'t> Walker<'t> {
     /// (python's `call` kind isn't `call_expression`, and `attribute` isn't in
     /// the target-kind list — mirrored exactly).
     fn extract_decorators_for(&mut self, decl: Node<'t>, decorated_row: u32) {
-        for i in 0..decl.named_child_count() {
-            if let Some(child) = decl.named_child(i) {
-                self.consider_decorator(child, decorated_row);
-            }
+        let mut cursor = decl.walk();
+        for child in decl.named_children(&mut cursor) {
+            self.consider_decorator(child, decorated_row);
         }
-        let Some(parent) = decl.parent() else { return };
-        let decl_start = decl.start_byte();
-        let mut decl_idx: isize = -1;
-        for i in 0..parent.named_child_count() {
-            if let Some(sib) = parent.named_child(i) {
-                if sib.start_byte() == decl_start {
-                    decl_idx = i as isize;
-                    break;
-                }
+        let mut sibling = decl.prev_named_sibling();
+        while let Some(sib) = sibling {
+            if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
+                break;
             }
-        }
-        if decl_idx > 0 {
-            let mut j = decl_idx - 1;
-            while j >= 0 {
-                let Some(sib) = parent.named_child(j as usize) else {
-                    j -= 1;
-                    continue;
-                };
-                if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
-                    break;
-                }
-                self.consider_decorator(sib, decorated_row);
-                j -= 1;
-            }
+            self.consider_decorator(sib, decorated_row);
+            sibling = sib.prev_named_sibling();
         }
     }
 
@@ -983,10 +962,9 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1, walked);
-            }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.scan_fn_ref_subtree(child, depth + 1, walked);
         }
     }
 
@@ -1069,11 +1047,8 @@ impl<'t> Walker<'t> {
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
-            }
+            let mut cursor = n.walk();
+            dstack.extend(n.named_children(&mut cursor));
         }
         let shadowed: Vec<String> = decl_counts
             .iter()
@@ -1121,11 +1096,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
-                }
+                let mut cursor = n.walk();
+                stack.extend(n.named_children(&mut cursor));
             }
         }
     }

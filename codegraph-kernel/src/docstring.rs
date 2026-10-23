@@ -184,6 +184,17 @@ fn preceding_docstring_with(
     while let Some(s) = sibling {
         if is_comment(s.kind()) {
             comments.push(s);
+            if comments.len() == 32 {
+                // Long runs need one forward walk; repeated sibling lookups rescan extras.
+                let parent = anchor.parent()?;
+                let mut cursor = parent.walk();
+                let siblings: Vec<_> = parent.named_children(&mut cursor)
+                    .take_while(|n| n.start_byte() < anchor.start_byte()).collect();
+                comments = siblings.into_iter().rev()
+                    .take_while(|n| is_comment(n.kind()) || step_over.contains(&n.kind()))
+                    .filter(|n| is_comment(n.kind())).collect();
+                break;
+            }
             sibling = s.prev_named_sibling();
         } else if step_over.contains(&s.kind()) {
             sibling = s.prev_named_sibling();
@@ -191,7 +202,7 @@ fn preceding_docstring_with(
             break;
         }
     }
-    comments.reverse(); // collected nearest-first; TS unshifts to keep source order
+    comments.reverse(); // collected nearest-first; return source order
 
     let mut first = 0;
     if skip_trailing {

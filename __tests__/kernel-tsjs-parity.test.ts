@@ -409,6 +409,23 @@ export const Box = () => <div data-size={THEME_TOKENS.size} />;
     assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
   });
 
+  it.each([0, 1, 5, 33].flatMap(count => ['    ', '\t'].flatMap(indent =>
+    ['\n', '\r\n'].flatMap(ending => [0, 1, 2].map(commentMode =>
+      ({ count, indent, ending, commentMode }))))))(
+    'Python comment indentation parity $count/$indent/$ending/$commentMode',
+    ({ count, indent, ending, commentMode }) => {
+      const comments = (depth: number) => Array.from({ length: count }, (_, i) =>
+        indent.repeat(commentMode === 1 || (commentMode === 2 && i % 2 === 0) ? 0 : depth)
+        + '# padding\n').join('');
+      const source = 'VALUE = 42\n' + comments(0) + 'def included():\n' + comments(1)
+        + indent + '"""function docs"""\n' + indent + 'if VALUE:\n' + comments(2)
+        + indent.repeat(2) + 'return helper()\n' + comments(1)
+        + indent + 'return VALUE\nclass Container:\n' + comments(1)
+        + indent + 'def method(self):\n' + indent.repeat(2) + 'return included()\n'
+        + comments(0) + 'def helper(): return VALUE\n';
+      assertParity('comments.py', source.replace(/\n/g, ending), 'python');
+    });
+
   it('torture fixture (python): decorators, self fn-refs, imports, shadowing', () => {
     const file = path.join(FIXTURE_DIR, 'torture.py');
     assertParity('fixtures/torture.py', fs.readFileSync(file, 'utf8'), 'python');
