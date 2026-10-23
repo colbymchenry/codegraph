@@ -24489,9 +24489,14 @@ function matchRustAsMutChainCall(ref: UnresolvedRef, context: ResolutionContext)
  * the reporter's `vis.map.get("a")` on a `HashMap<String, i32>` field went to
  * the project's one `get`, `Ext::get`, an associated function at that, and
  * `Xyz { … }.to_val()` to `Stat::to_val`, the same trait's other impl.
- * Undefined, for the name strategies to decide as before, where the receiver
- * is anything else (a call's value, an index, a macro) or its type can't be
- * read.
+ * A call the extractor keeps with its receiver's chain of fields and method
+ * calls — `self.services.store.put`, `self.store().put` (#2836) — comes here
+ * by its method's name with that chain (rustChainedCallByName), and its
+ * receiver is the chain where the call writes it: a method call's value is
+ * what the method's signature returns, and a later link calling the same
+ * name is a call of its own. Undefined, for the name strategies to decide as
+ * before, where the receiver is anything else (an index, a macro, a call on
+ * a path) or its type can't be read.
  */
 function matchRustWrittenReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   const scopes = rustScopesOf(ref.filePath, context);
@@ -24499,7 +24504,10 @@ function matchRustWrittenReceiverCall(ref: UnresolvedRef, context: ResolutionCon
   if (!scopes || lineStart === undefined || ref.column < 0) return undefined;
   const start = lineStart + ref.column;
   if (start >= (scopes.lineStarts[ref.line] ?? scopes.code.length)) return undefined;
-  const receiver = rustWrittenCallReceiver(scopes, start, ref.referenceName);
+  const chain = RUST_CHAINED_CALLS.get(ref);
+  const receiver = chain
+    ? rustChainedReceiver(scopes, start, chain, ref.referenceName)
+    : rustWrittenCallReceiver(scopes, start, ref.referenceName);
   if (receiver === null) return undefined;
   const written = rustValueType(receiver, start, scopes, ref, context, 0);
   if (!written) return undefined;
@@ -24697,6 +24705,65 @@ function rustWrittenCallReceiver(scopes: RustScopes, start: number, name: string
     p = args;
   }
   return code.slice(start, dot).trim();
+}
+
+/**
+ * A Rust call the extractor keeps with the chain of fields and method calls
+ * its receiver is — `self.services.store.put`, `self.store().put`,
+ * `vis.map.get`, `self.0.len` (#2836): the chain's root, its links (a call
+ * written `name()`) and the method. The one-field `self.<field>.<method>`
+ * has a reading of its own (matchMethodCall), and isn't one.
+ */
+const RUST_CHAINED_CALL = /^(self|[A-Za-z_]\w*)((?:\.(?:[A-Za-z_]\w*(?:\(\))?|\d+))+)\.([A-Za-z_]\w*)$/;
+
+/** The receiver chain, root first, of a Rust call resolution reads by its method's name (rustChainedCallByName). */
+const RUST_CHAINED_CALLS = new WeakMap<UnresolvedRef, readonly string[]>();
+
+/**
+ * What a Rust call kept with its receiver chain is resolved as: the call by
+ * its method's name, as the extractor recorded it before it kept the chain
+ * (#2836), so the frameworks, the strategies and the scope gates read it as
+ * they did; the chain goes with it, and the receiver's type is read through
+ * all of it (matchRustWrittenReceiverCall). Null for any other reference.
+ */
+export function rustChainedCallByName(ref: UnresolvedRef): UnresolvedRef | null {
+  if (ref.language !== 'rust' || ref.referenceKind !== 'calls') return null;
+  const m = RUST_CHAINED_CALL.exec(ref.referenceName);
+  if (!m) return null;
+  const links = m[2]!.slice(1).split('.');
+  if (m[1] === 'self' && links.length === 1 && /^[A-Za-z_]\w*$/.test(links[0]!)) return null;
+  const byName: UnresolvedRef = { ...ref, referenceName: m[3]! };
+  RUST_CHAINED_CALLS.set(byName, [m[1]!, ...links]);
+  return byName;
+}
+
+/**
+ * The receiver of the Rust call `name(…)` whose expression starts at `start`,
+ * where its reference keeps the receiver's chain (`chain`, root first — `self`,
+ * `store()`): that chain as the file's blanked text writes it, a call's
+ * arguments and turbofish included, over lines too. Null where the text
+ * doesn't read as the chain and then the call.
+ */
+function rustChainedReceiver(scopes: RustScopes, start: number, chain: readonly string[], name: string): string | null {
+  const { code } = scopes;
+  const word = (at: number, id: string): boolean => code.startsWith(id, at) && !/\w/.test(code[at + id.length] ?? '');
+  if (/\w/.test(code[start - 1] ?? '') || !word(start, chain[0]!)) return null;
+  let p = start + chain[0]!.length;
+  let end = -1;
+  // Each link — `.services`, `.store` and its `(…)` — and then the call itself.
+  for (const link of [...chain.slice(1), `${name}()`]) {
+    end = p;
+    const call = link.endsWith('()');
+    const id = call ? link.slice(0, -2) : link;
+    const dot = rustSpaceEnd(code, p);
+    if (code[dot] !== '.' || code[dot + 1] === '.') return null;
+    const at = rustSpaceEnd(code, dot + 1);
+    if (!word(at, id)) return null;
+    const args = rustCallArgsEnd(scopes, at + id.length);
+    if (call !== args >= 0) return null;
+    p = call ? args : at + id.length;
+  }
+  return code.slice(start, end);
 }
 
 /** Std pointers whose `as_ref` / `as_mut` lend what they hold: `Box<T>`, `NonNull<T>` → `&mut T`. */

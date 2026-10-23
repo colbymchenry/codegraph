@@ -153,6 +153,42 @@ fn uses() {
     ]);
   });
 
+  it('a call keeps its receiver chain of fields and method calls (#2836)', () => {
+    const links = Array.from({ length: 17 }, (_, i) => `l${i}()`).join('.');
+    const source = `
+pub struct Svc { services: Services, store: Box<dyn Store>, pair: (u8, Config) }
+impl Svc {
+    fn chains(&self, vis: &Vis) {
+        self.services.store.put("a"); let _ = self.services.store.put("ü");
+        self
+            .services // rustfmt
+            .store
+            .put("c");
+        self.store().put("m"); self.store.put("d"); self.put("e"); vis.put(1);
+        vis.map.get("k").get(0); self.0.len(); self.pair.1.port();
+        vis.get::<u8>(1).put::<u16>(2); vis.a.b().c.d();
+        Foo::new().a().b(); (vis).a.b(); self.a?.b(); self.a.b().await.c(); vis[0].a.b();
+        r#vis.a.b(); vis.${links}.m();
+    }
+}
+`;
+    assertParity('chains.rs', source);
+    assertParity('chains.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: the chains are kept, the other receivers keep their old names.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const names = new Set(extractFromSource('chains.rs', source, 'rust').unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName));
+    delete process.env.CODEGRAPH_KERNEL;
+    for (const name of [
+      'self.services.store.put', 'self.store().put', 'self.store.put', 'self.put', 'vis.put', 'vis.map.get',
+      'vis.map.get().get', 'self.0.len', 'self.pair.1.port', 'vis.get', 'vis.get().put', 'vis.a.b().c.d',
+      'Foo::new().a', 'b', 'c', 'm',
+    ]) {
+      expect(names, name).toContain(name);
+    }
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

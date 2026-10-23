@@ -534,6 +534,45 @@ function stripRustTurbofish(text: string): string {
   return out;
 }
 
+/** The most links a Rust receiver chain is kept with (rustReceiverChain). */
+const RUST_RECEIVER_CHAIN_MAX_LINKS = 16;
+
+/**
+ * The receiver chain a Rust method call is written on, when it is fields and
+ * method calls on `self` or on a name: `self.services.store`, `self.store()`,
+ * `vis.map`, `self.0`, `x.get::<u8>(1)` — each field by its name or index,
+ * each call as `name()`, its arguments and turbofish dropped. Null for any
+ * other receiver (a path's call, a literal, parentheses, `?`, `.await`, an
+ * index, a macro), and past RUST_RECEIVER_CHAIN_MAX_LINKS links, which keep
+ * the bare method name. Mirrored in the kernel's receiver_chain
+ * (rustlang.rs): both emit the same bytes.
+ */
+function rustReceiverChain(node: SyntaxNode, source: string): string | null {
+  const links: string[] = [];
+  let cur: SyntaxNode | null = node;
+  while (cur && links.length <= RUST_RECEIVER_CHAIN_MAX_LINKS) {
+    if (cur.type === 'self' || cur.type === 'identifier') {
+      const root = getNodeText(cur, source);
+      if (links.length === 0 || !/^[A-Za-z_]\w*$/.test(root)) return null;
+      return [root, ...links.reverse()].join('.');
+    }
+    let fieldOf: SyntaxNode | null = cur;
+    let call = false;
+    if (cur.type === 'call_expression') {
+      fieldOf = getChildByField(cur, 'function');
+      if (fieldOf?.type === 'generic_function') fieldOf = getChildByField(fieldOf, 'function');
+      call = true;
+    }
+    if (fieldOf?.type !== 'field_expression') return null;
+    const field = getChildByField(fieldOf, 'field');
+    const name = field ? getNodeText(field, source) : '';
+    if (call ? !/^[A-Za-z_]\w*$/.test(name) : !/^(?:[A-Za-z_]\w*|\d+)$/.test(name)) return null;
+    links.push(call ? `${name}()` : name);
+    cur = getChildByField(fieldOf, 'value');
+  }
+  return null;
+}
+
 /**
  * A Swift receiver's text from its innermost wrapped operand on: the wrappers
  * sit on the chain's left edge, so `!Settings.Defaults` reads
@@ -5995,6 +6034,7 @@ export class TreeSitterExtractor {
             }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
             let constructed: string | null = null;
+            let rustChain: string | null = null;
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
@@ -6028,11 +6068,20 @@ export class TreeSitterExtractor {
               // or unknown. Previously this collapsed to the bare method name,
               // which exact-matched whichever same-named method was nearest —
               // often the calling method itself, a self-edge not in the source.
-              // Deeper chains (`self.a.b.m()`), `self.f().m()` and parenthesized
-              // receivers keep the bare name. Mirrored in the kernel's
-              // extract_call (rustlang.rs).
+              // Mirrored in the kernel's extract_call (rustlang.rs).
               const fieldName = getNodeText(getChildByField(receiver, 'field')!, this.source);
               calleeName = `self.${fieldName}.${methodName}`;
+            } else if (this.language === 'rust' && receiver && (rustChain = rustReceiverChain(receiver, this.source)) !== null) {
+              // Rust call on a longer chain of fields and method calls —
+              // `self.services.store.put()`, `self.store().put()`,
+              // `vis.map.get()`, split over lines by rustfmt or not (#2836).
+              // Keep the chain, calls written `name()`: the bare method name
+              // this used to emit said nothing of which value the call is
+              // made on. The resolver reads the receiver where the call is
+              // written. Parenthesized receivers, `?`, `.await` and a path's
+              // call (`Foo::new().a().b()`) keep the bare name. Mirrored in
+              // the kernel's extract_call (rustlang.rs).
+              calleeName = `${rustChain}.${methodName}`;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||

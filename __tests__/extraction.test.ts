@@ -1670,7 +1670,7 @@ impl From<u32> for Own {
     ).toBe(true);
   });
 
-  it('keeps the owner shape for `self.<method>()` and `self.<field>.<method>()`, and collapses every other receiver (#1585, #1861)', () => {
+  it('keeps the owner shape for `self.<method>()` and `self.<field>.<method>()`, a longer receiver chain whole, and collapses a parenthesized receiver (#1585, #1861, #2836)', () => {
     const code = `
 pub struct Outer { pub inner: Inner, pub deep: Deep }
 impl Outer {
@@ -1689,22 +1689,23 @@ impl Outer {
     const calls = result.unresolvedReferences
       .filter((r) => r.referenceKind === 'calls')
       .map((r) => r.referenceName);
-    // Two shapes keep an owner the resolver can act on: the single-hop field
-    // receiver, whose type it reads off the owner struct (#1585), and the bare
-    // `self` receiver, whose type is the calling method's own owner (#1861).
-    // `self.make().run()` contributes `self.make` — the inner call — and its
-    // OUTER call collapses, because a method's return type is not read here.
+    // The single-hop field receiver keeps its owner, whose type the resolver
+    // reads off the owner struct (#1585), and so does the bare `self`
+    // receiver, whose type is the calling method's own owner (#1861). A
+    // longer chain of fields and method calls is kept whole, a call written
+    // `name()` (#2836): `self.make().run()` contributes `self.make`, the inner
+    // call, and `self.make().run`.
     expect(calls.filter((c) => c.startsWith('self.')).sort()).toEqual([
+      'self.deep.inner.run',
       'self.inner.run',
       'self.make',
+      'self.make().run',
       'self.run',
     ]);
     // A local receiver keeps its name as before…
     expect(calls).toContain('local.run');
-    // …and the deeper chain, the call receiver and the parenthesized receiver
-    // still collapse to the method name. `self.run()` no longer does, so this
-    // is three rather than four.
-    expect(calls.filter((c) => c === 'run')).toHaveLength(3);
+    // …and the parenthesized receiver still collapses to the method name.
+    expect(calls.filter((c) => c === 'run')).toHaveLength(1);
     const outerRun = result.nodes.find((n) => n.qualifiedName === 'Outer::run');
     expect(outerRun).toBeDefined();
     const fieldRef = result.unresolvedReferences.find((r) => r.referenceName === 'self.inner.run');

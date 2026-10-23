@@ -24,10 +24,13 @@
 //! - Chained-call re-encode is scoped_identifier-gated (`Foo::new().bar()` →
 //!   `Foo::new().bar`); a call through a field of the enclosing type keeps
 //!   the owner-field shape (`self.inner.run()` → `self.inner.run`, #1585);
-//!   instance chains, parens, `.await`, deeper/non-self field chains, and
-//!   bare `self` receivers all collapse to the bare method name (`self` is
-//!   node kind `self`, not `identifier`, so it dodges SKIP_RECEIVERS by
-//!   falling through). Turbofish callees keep the raw `helper::<T>` text.
+//!   a longer chain of fields and method calls on `self` or a name keeps
+//!   that chain, calls as `name()` (`self.services.store.put()` →
+//!   `self.services.store.put`, `self.store().put()` → `self.store().put`,
+//!   #2836); other instance chains, parens, `?`, `.await`, and longer
+//!   path-rooted chains collapse to the bare method name. A bare `self`
+//!   receiver keeps `self.` (#1861). Turbofish callees drop their type
+//!   arguments (`helper::<T>` → `helper`).
 //! - `use` emits an import node named by the ROOT module (`crate`/`self`/…),
 //!   one root `imports` ref, then one FULL-path `imports` ref per binding;
 //!   `use x::*` (use_wildcard) emits nothing at all.
@@ -927,10 +930,13 @@ impl<'t> Walker<'t> {
                                 }
                             }
                             "call_expression" => {
-                                // Chained-call re-encode: ONLY an associated-
+                                // Chained-call re-encode: an associated-
                                 // function chain (`Foo::new().bar()`, inner
-                                // callee a scoped_identifier). Instance chains
-                                // keep the bare method name.
+                                // callee a scoped_identifier). A chain of
+                                // fields and method calls on `self` or a name
+                                // (`self.store().put()`, #2836) keeps that
+                                // chain; any other instance chain the bare
+                                // method name.
                                 let inner_fn = r.child_by_field_name("function").map(unwrap_generic_function);
                                 let reencode =
                                     inner_fn.map(|f| f.kind() == "scoped_identifier").unwrap_or(false);
@@ -943,6 +949,8 @@ impl<'t> Walker<'t> {
                                         .collect();
                                     let inner = strip_turbofish(&inner);
                                     callee_name = format!("{inner}().{method_name}");
+                                } else if let Some(chain) = receiver_chain(r, self.src) {
+                                    callee_name = format!("{chain}.{method_name}");
                                 } else {
                                     callee_name = method_name.to_string();
                                 }
@@ -952,9 +960,11 @@ impl<'t> Walker<'t> {
                                 // field of the enclosing type (#1585): keep the
                                 // `self.` prefix so the resolver can type the
                                 // field from the owner struct's declaration
-                                // (or leave it unresolved). Any other
-                                // field_expression receiver — a deeper chain,
-                                // a non-self base — keeps the bare name.
+                                // (or leave it unresolved). A longer chain of
+                                // fields and method calls on `self` or a name
+                                // (`self.services.store.put()`, `vis.map.get()`,
+                                // #2836) keeps that chain; any other
+                                // field_expression receiver the bare name.
                                 let base = r.child_by_field_name("value");
                                 let field = r.child_by_field_name("field");
                                 match (base, field) {
@@ -964,7 +974,12 @@ impl<'t> Walker<'t> {
                                         let field_name = self.text(f);
                                         callee_name = format!("self.{field_name}.{method_name}");
                                     }
-                                    _ => callee_name = method_name.to_string(),
+                                    _ => {
+                                        callee_name = match receiver_chain(r, self.src) {
+                                            Some(chain) => format!("{chain}.{method_name}"),
+                                            None => method_name.to_string(),
+                                        }
+                                    }
                                 }
                             }
                             // `self.method()` — keep the `self.` prefix so the
@@ -1626,6 +1641,64 @@ fn unwrap_generic_function(func: Node<'_>) -> Node<'_> {
     } else {
         func
     }
+}
+
+/// The most links a receiver chain is kept with (receiver_chain).
+const RECEIVER_CHAIN_MAX_LINKS: usize = 16;
+
+fn is_rust_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The receiver chain a method call is written on, when it is fields and
+/// method calls on `self` or on a name: `self.services.store`,
+/// `self.store()`, `vis.map`, `self.0`, `x.get::<u8>(1)` — each field by its
+/// name or index, each call as `name()`, its arguments and turbofish
+/// dropped. None for any other receiver (a path's call, a literal,
+/// parentheses, `?`, `.await`, an index, a macro), and past
+/// RECEIVER_CHAIN_MAX_LINKS links. Mirrors rustReceiverChain in
+/// TreeSitterExtractor (#2836): both emit the same bytes.
+fn receiver_chain(node: Node<'_>, src: &str) -> Option<String> {
+    let mut links: Vec<String> = Vec::new();
+    let mut cur = node;
+    while links.len() <= RECEIVER_CHAIN_MAX_LINKS {
+        if cur.kind() == "self" || cur.kind() == "identifier" {
+            let root = &src[cur.byte_range()];
+            if links.is_empty() || !is_rust_ident(root) {
+                return None;
+            }
+            links.reverse();
+            let mut out = root.to_string();
+            for link in &links {
+                out.push('.');
+                out.push_str(link);
+            }
+            return Some(out);
+        }
+        let call = cur.kind() == "call_expression";
+        let field_of = if call {
+            unwrap_generic_function(cur.child_by_field_name("function")?)
+        } else {
+            cur
+        };
+        if field_of.kind() != "field_expression" {
+            return None;
+        }
+        let name = field_of.child_by_field_name("field").map(|f| &src[f.byte_range()]).unwrap_or("");
+        let ok = if call {
+            is_rust_ident(name)
+        } else {
+            is_rust_ident(name) || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()))
+        };
+        if !ok {
+            return None;
+        }
+        links.push(if call { format!("{name}()") } else { name.to_string() });
+        cur = field_of.child_by_field_name("value")?;
+    }
+    None
 }
 
 /// A callee path without its turbofish type arguments: `Vec::<u8>::new` →
