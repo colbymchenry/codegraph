@@ -7830,6 +7830,33 @@ function isRubyMethodInScope(method: Node, ref: UnresolvedRef, context: Resoluti
   return rubyAncestry(here.qualifiedName, context).has(method.qualifiedName.slice(0, cut));
 }
 
+/**
+ * Of a Ruby class's two methods of one name, `def build` and `def self.build`
+ * (both `Widget::build`), the one a bare call means: a bare call is a call on
+ * `self`, so in an instance method it is the instance method, and in a class
+ * method (`def self.x`, `class << self`) the class method. Widget's `run`
+ * calling `build` reaches `def build`, and its `def self.go` calling `build`
+ * reaches `def self.build`. Only such pairs are split: inside a block that
+ * runs on another object (`Module.new do … end`, a test's `it do … end`) the
+ * caller's kind says nothing of `self`, and any other candidate stays as it
+ * was. A call written anywhere but in a method splits nothing.
+ */
+function rubyMethodsOfCallerKind(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (candidates.length < 2) return candidates;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || caller.kind !== 'method' || caller.language !== 'ruby') return candidates;
+  const wantClass = caller.isStatic === true;
+  const isRubyMethod = (n: Node): boolean => n.kind === 'method' && n.language === 'ruby';
+  // Per qualified name, which kinds the candidates declare: 1 class, 2 instance.
+  const kinds = new Map<string, number>();
+  for (const n of candidates) {
+    if (isRubyMethod(n)) kinds.set(n.qualifiedName, (kinds.get(n.qualifiedName) ?? 0) | (n.isStatic === true ? 1 : 2));
+  }
+  const twinOfOtherKind = (n: Node): boolean =>
+    isRubyMethod(n) && kinds.get(n.qualifiedName) === 3 && (n.isStatic === true) !== wantClass;
+  return candidates.some(twinOfOtherKind) ? candidates.filter((n) => !twinOfOtherKind(n)) : candidates;
+}
+
 /** A Ruby class's qualified name, those of its superclasses, and of every module mixed into any of them. */
 export function rubyAncestry(qn: string, context: ResolutionContext): Set<string> {
   let memo = RUBY_ANCESTRY.get(context);
@@ -11950,7 +11977,8 @@ export function matchByExactName(
   const ranked = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
-    : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
+    : kotlinBare ? lexicalKotlinMembers(filtered, ref, context)
+    : rubyBare ? rubyMethodsOfCallerKind(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
   // (Above the ceiling below nothing is picked, so no translation unit is read.)
   const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? withinCppTranslationUnit(ranked, ref, context, true) : ranked;
 
@@ -13125,7 +13153,11 @@ export function resolveMethodOnType(
   // intentionally in ANOTHER file (#314) — is unaffected: those blocks return
   // early whenever an import pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
-  const ordered = preferCallSiteFile(withinCppTranslationUnit(cppVisibleFirst(matches, ref, context), ref, context), ref.filePath);
+  // A Ruby receiver is typed only by `x = Widget.new`, so it is an instance:
+  // `x.build` reaches `def build`, not `def self.build`, wherever each is.
+  const ordered = rubyMethodsOfKindFirst(
+    preferCallSiteFile(withinCppTranslationUnit(cppVisibleFirst(matches, ref, context), ref, context), ref.filePath),
+    ref.language === 'ruby' ? 'instance' : undefined);
   return {
     original: ref,
     targetNodeId: ordered[0]!.id,
@@ -18609,18 +18641,18 @@ function tsClassHead(lines: readonly string[], cls: Node): string {
 }
 
 /** A method named `name` on a supertype of the given classes, nearest first. */
-function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
   if (classes.length === 0) return null;
   let memo = INHERITED_METHODS.get(context);
   if (!memo) INHERITED_METHODS.set(context, (memo = new Map()));
-  const key = `${classes.map((c) => c.id).join(',')}|${name}`;
+  const key = `${classes.map((c) => c.id).join(',')}|${name}|${kind ?? ''}`;
   if (memo.has(key)) return memo.get(key)!;
-  const found = findInheritedClassMethod(classes, name, context);
+  const found = findInheritedClassMethod(classes, name, context, kind);
   memo.set(key, found);
   return found;
 }
 
-function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
   const seen = new Set<string>(classes.map((c) => c.id));
   let frontier = classes;
   for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
@@ -18630,8 +18662,8 @@ function findInheritedClassMethod(classes: Node[], name: string, context: Resolu
         for (const decl of context.getNodesByName(sup)) {
           if (decl.language !== cls.language || !isMethodOwnerKind(decl) || seen.has(decl.id)) continue;
           seen.add(decl.id);
-          const method = context.getNodesInFile(decl.filePath).find((n) => n.kind === 'method' && n.name === name &&
-            n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name);
+          const method = rubyMethodsOfKindFirst(context.getNodesInFile(decl.filePath).filter((n) => n.kind === 'method' && n.name === name &&
+            n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name), kind)[0];
           if (method) return method;
           next.push(decl);
         }
@@ -20242,7 +20274,9 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const methodNode = classStrategyMethod(classNode, methodName!, context);
+      // A Ruby call on a class is a call of its class method: `Widget.build`
+      // reaches `def self.build`, not `def build`, whichever comes first.
+      const methodNode = classStrategyMethod(classNode, methodName!, context, ref.language === 'ruby' ? 'class' : undefined);
 
       if (methodNode) {
         return {
@@ -20255,7 +20289,8 @@ export function matchMethodCall(
     }
     // A class method the named class inherits — Horse's `THorse.Get(…)` is
     // THorseCore's, three `class(…)` heads up — before any guess by name.
-    const inherited = inheritedClassMethod(classCandidates.filter((c) => c.language === ref.language), methodName!, context);
+    const inherited = inheritedClassMethod(classCandidates.filter((c) => c.language === ref.language), methodName!, context,
+      ref.language === 'ruby' ? 'class' : undefined);
     if (inherited) return { original: ref, targetNodeId: inherited.id, confidence: 0.8, resolvedBy: 'qualified-name' };
     return null;
   });
@@ -20344,6 +20379,10 @@ export function matchMethodCall(
         if (!isLexicallyReachable(classNode, ref, context)) continue;
         if (productionCaller && isTestPath(classNode.filePath)) continue;
 
+        // A Ruby receiver named after a class may hold the class as well as an
+        // instance of it (rubocop's `cop.cop_name` runs over its registry's
+        // cop classes, so it is `def self.cop_name`), so neither of a class's
+        // two methods of the name is preferred: the first declared is taken.
         const methodNode = classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode) {
@@ -25688,9 +25727,12 @@ function tsFieldCall(
  * the caller's loop, so a nested `Outer::Logger` can take a top-level
  * `Logger.log()` (declared first, or the only one with the method). Choosing
  * among them needs each language's scope rules.
+ *
+ * `kind` picks between a Ruby class's two methods of the name, `def self.m`
+ * and `def m`, which share one qualified name (rubyMethodsOfKindFirst).
  */
-function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
-  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string, kind?: RubyMethodKind): Node | undefined {
+  const methods = rubyMethodsOfKindFirst(nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName), kind);
   const exact = `${classNode.qualifiedName}::${methodName}`;
   const byName = `${classNode.name}::${methodName}`;
   return (
@@ -25706,9 +25748,30 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string)
  * `Form` reaches `BaseForm::is_valid`, which the substring test this replaced
  * only found because `BaseForm` contains `Form`.
  */
-function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext): Node | undefined {
-  return findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName) ??
-    inheritedClassMethod([classNode], methodName, context) ?? undefined;
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext, kind?: RubyMethodKind): Node | undefined {
+  return findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName, kind) ??
+    inheritedClassMethod([classNode], methodName, context, kind) ?? undefined;
+}
+
+/**
+ * Which of a Ruby class's two methods of one name a call reaches: a call on
+ * the class (`Widget.build`) its class method, `def self.build` or one in
+ * `class << self`; a call on an instance (`widget.build`) its instance
+ * method, `def build`. Both share one qualified name, `Widget::build`, and
+ * only `isStatic` tells them apart.
+ */
+export type RubyMethodKind = 'class' | 'instance';
+
+/**
+ * `methods` with the ones of `kind` first, in their own order: a pick of the
+ * first then takes one of the kind wherever there is one, and still the
+ * first otherwise. Methods of other languages are never static-split.
+ */
+export function rubyMethodsOfKindFirst<T extends Node>(methods: T[], kind: RubyMethodKind | undefined): T[] {
+  if (!kind || methods.length < 2) return methods;
+  const fits = (m: T): boolean => m.language === 'ruby' && (m.isStatic === true) === (kind === 'class');
+  const first = methods.filter(fits);
+  return first.length === 0 || first.length === methods.length ? methods : [...first, ...methods.filter((m) => !fits(m))];
 }
 
 /**

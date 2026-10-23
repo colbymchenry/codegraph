@@ -20,7 +20,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { isTestPath } from '../search/query-utils';
-import { rubyAncestry } from './name-matcher';
+import { rubyAncestry, rubyMethodsOfKindFirst } from './name-matcher';
 
 /** `A::B`, `::A`, `::A::B`: a constant path. Group 1 is a leading `::`. */
 const CONSTANT_PATH = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)$/;
@@ -98,14 +98,16 @@ function lexicalScope(ref: UnresolvedRef, context: ResolutionContext): string {
 /**
  * The method `name` of the class or module `owner`: its own, else the first
  * of its superclasses and mixed-in modules that declares one (rubyAncestry).
- * Production code never reaches one a test declares.
+ * Of a class's `def self.m` and `def m`, which share one qualified name, the
+ * call on the class reaches the class method. Production code never reaches
+ * one a test declares.
  */
 function methodOf(owner: string, name: string, ref: UnresolvedRef, context: ResolutionContext): { node: Node; own: boolean } | null {
   const production = !isTestPath(ref.filePath);
   for (const qn of rubyAncestry(owner, context)) {
     const methods = context.getNodesByQualifiedName(`${qn}::${name}`).filter((n) =>
       n.kind === 'method' && n.language === 'ruby' && !(production && isTestPath(n.filePath)));
-    if (methods.length > 0) return { node: ordered(methods, ref)[0]!, own: qn === owner };
+    if (methods.length > 0) return { node: rubyMethodsOfKindFirst(ordered(methods, ref), 'class')[0]!, own: qn === owner };
   }
   return null;
 }

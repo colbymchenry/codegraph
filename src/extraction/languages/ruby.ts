@@ -2,6 +2,20 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * A class method: `def self.x` or `def Widget.x` (a singleton_method), or a
+ * `def` inside `class << self`. It shares its qualified name with an instance
+ * method of the same name (`Widget::build` for both), so only this tells the
+ * two apart.
+ */
+function isRubyClassMethod(node: SyntaxNode): boolean {
+  if (node.type === 'singleton_method') return true;
+  if (node.type !== 'method') return false;
+  let parent = node.parent;
+  if (parent?.type === 'body_statement') parent = parent.parent;
+  return parent?.type === 'singleton_class';
+}
+
 export const rubyExtractor: LanguageExtractor = {
   functionTypes: ['method'],
   classTypes: ['class'],
@@ -103,6 +117,7 @@ export const rubyExtractor: LanguageExtractor = {
 
     return name;
   },
+  isStatic: isRubyClassMethod,
   getVisibility: (node) => {
     // Ruby visibility is based on preceding visibility modifiers
     let sibling = node.previousNamedSibling;
