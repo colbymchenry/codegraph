@@ -350,6 +350,98 @@ describe('QueryPool', () => {
 
 });
 
+describe('QueryPool idle retirement', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('releases excess idle workers and repeatedly regrows without spending the crash budget', async () => {
+    const workers: FakeWorker[] = [];
+    const pool = new QueryPool({ root: '/x', size: 3, createWorker: () => {
+      const w = new FakeWorker(() => ({ result: ok('served') }));
+      w.terminate = async () => { w.alive = false; w.emitExit(); return 1; };
+      workers.push(w);
+      return w;
+    } });
+    try {
+      for (let wave = 0; wave < 7; wave++) {
+        const calls = Array.from({ length: 3 }, () => pool.run('codegraph_explore', {}));
+        await vi.advanceTimersByTimeAsync(10);
+        expect(await Promise.all(calls)).toEqual(Array.from({ length: 3 }, () => ok('served')));
+        expect(pool.liveWorkers).toBe(3);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(pool.liveWorkers).toBe(1);
+        expect(workers.filter(w => w.alive)).toHaveLength(1);
+        expect(pool.healthy).toBe(true);
+        expect(pool.ready).toBe(true);
+      }
+      const call = pool.run('codegraph_explore', {});
+      await vi.advanceTimersByTimeAsync(10);
+      expect(await call).toEqual(ok('served'));
+    } finally { await pool.destroy(); }
+    expect(workers.every(w => !w.alive)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('never retires active or starting workers', async () => {
+    const workers: FakeWorker[] = [];
+    let release!: (result: ToolResult) => void;
+    const gate = new Promise<ToolResult>(resolve => { release = resolve; });
+    const pool = new QueryPool({ root: '/x', size: 3, softTimeoutMs: 120_000, createWorker: () => {
+      const w = new FakeWorker(() => ({ wait: gate }), null);
+      workers.push(w);
+      return w;
+    } });
+    try {
+      workers[0].emitMessage({ type: 'ready', ok: true });
+      const calls = Array.from({ length: 3 }, () => pool.run('codegraph_explore', {}));
+      workers[1].emitMessage({ type: 'ready', ok: true });
+      await vi.advanceTimersByTimeAsync(60_010);
+      expect(pool.liveWorkers).toBe(3);
+      expect(workers.every(w => w.alive)).toBe(true);
+      workers[2].emitMessage({ type: 'ready', ok: true });
+      release(ok('finished'));
+      expect(await Promise.all(calls)).toEqual(Array.from({ length: 3 }, () => ok('finished')));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(pool.liveWorkers).toBe(1);
+    } finally { await pool.destroy(); }
+  });
+
+  it('destroy waits for idle retirements already in progress', async () => {
+    const finishes: Array<() => void> = [];
+    const pool = new QueryPool({ root: '/x', size: 3, createWorker: () => {
+      const w = new FakeWorker(() => ({ result: ok('served') }));
+      w.terminate = () => new Promise<number>(resolve => finishes.push(() => {
+        w.alive = false;
+        w.emitExit();
+        resolve(1);
+      }));
+      return w;
+    } });
+    try {
+      const calls = Array.from({ length: 3 }, () => pool.run('codegraph_explore', {}));
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.all(calls);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(finishes).toHaveLength(2);
+      let destroyed = false;
+      const down = pool.destroy().then(() => { destroyed = true; });
+      expect(finishes).toHaveLength(3);
+      finishes[2](); // The remaining warm worker exits before the retirees.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(destroyed).toBe(false);
+      finishes[0]();
+      finishes[1]();
+      await down;
+      expect(destroyed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      const down = pool.destroy();
+      finishes.forEach(finish => finish());
+      await down;
+    }
+  });
+});
+
 // Use the built engine so its pool loads the real compiled worker sibling.
 const BuiltEngine: typeof MCPEngine = require('../dist/mcp/engine').MCPEngine;
 
