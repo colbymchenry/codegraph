@@ -17491,6 +17491,219 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
+/** How many lines past its first a Kotlin call is read for its arguments. */
+const KOTLIN_CALL_LINES = 8;
+
+/** An unqualified Kotlin call's head, up to its `(`: `repository(`, `this.repository(`, `make<Foo>(`. */
+const KOTLIN_UNQUALIFIED_CALL = /^(?:this\s*\.\s*)?([a-z_]\w*)\s*(?:<[^<>()]*>)?\s*\(/;
+
+/** The index of the `)` closing the `(` at `open` in Kotlin source, string literals skipped; -1 when it doesn't close. */
+function kotlinClosingParen(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === '\\') i++;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * A Kotlin call written on what an unqualified call returns —
+ * `repository().pending(1)`, `this.repository().pending(1)`,
+ * `nullable()?.pending(1)` — which the extractor records by the outer
+ * method's bare name at the inner call's column (a capitalized inner is a
+ * constructor, kept as `Foo().pending`). The inner function's name, or null
+ * for any other shape: anything but `!!` between the inner call and the
+ * method makes another one (`repository().other().pending()`).
+ */
+function kotlinCallResultCallee(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.language !== 'kotlin' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const first = lines?.[ref.line - 1];
+  if (!lines || first === undefined) return null;
+  const text = [first.slice(Math.max(0, ref.column)), ...lines.slice(ref.line, ref.line + KOTLIN_CALL_LINES)].join('\n');
+  const head = KOTLIN_UNQUALIFIED_CALL.exec(text);
+  if (!head) return null;
+  const close = kotlinClosingParen(text, head[0].length - 1);
+  if (close < 0) return null;
+  const outer = new RegExp(`^\\s*(?:!!\\s*)?\\??\\.\\s*${escapeRegExp(ref.referenceName)}\\s*[({<]`);
+  return outer.test(text.slice(close + 1)) ? head[1]! : null;
+}
+
+/**
+ * The type an unqualified Kotlin call to `name` returns, as the function it
+ * calls declares it (#2805): a method of the calling class, else of a type
+ * around the call or one those inherit (kotlinHierarchyAt, read from their
+ * declarations), else a top-level function the calling file can name.
+ * Undefined when no such function is found, or those found don't declare one
+ * type: `fun repository() = RealRepo()` declares none.
+ */
+function kotlinCallResultType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const fns = context.getNodesByName(name).filter((n) => n.language === 'kotlin' && (n.kind === 'method' || n.kind === 'function'));
+  if (fns.length === 0) return undefined;
+  const ownerOf = (qualifiedName: string): string => qualifiedName.slice(0, Math.max(0, qualifiedName.lastIndexOf('::')));
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  // Inside an extension function on a type from outside the project (`fun
+  // URI.toHttpUrlOrNull() = toString()…`), that type's own members are the
+  // first a bare call reaches, and they aren't known here.
+  if (caller?.kind === 'method') {
+    const owner = ownerOf(caller.qualifiedName);
+    const member = context.getNodesByQualifiedName(owner).some((n) => MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module');
+    if (!member && !isKotlinProjectType(owner.split(/::|\./).pop() ?? '', context)) return undefined;
+  }
+  let pool = caller ? fns.filter((n) => n.kind === 'method' && ownerOf(n.qualifiedName) === ownerOf(caller.qualifiedName)) : [];
+  if (pool.length === 0) {
+    const hierarchy = kotlinHierarchyAt(ref, context);
+    pool = fns.filter((n) => {
+      if (n.kind !== 'method') return false;
+      const owner = ownerOf(n.qualifiedName).split(/::|\./);
+      const type = owner.pop();
+      // A companion object's members are called bare inside its class.
+      return hierarchy.has(type === 'Companion' ? owner.pop() ?? '' : type ?? '');
+    });
+  }
+  if (pool.length === 0) {
+    pool = fns.filter((n) => {
+      if (n.kind !== 'function') return false;
+      const pkg = kotlinFileScope(n.filePath, context).pkg;
+      return n.qualifiedName === (pkg ? `${pkg}::${n.name}` : n.name) && isKotlinTopLevelVisible(n, ref, context);
+    });
+  }
+  const types = new Set(pool.map((n) => kotlinScopedReturnType(n, context) ?? ''));
+  return pool.length > 0 && types.size === 1 && !types.has('') ? [...types][0] : undefined;
+}
+
+/**
+ * The type a Kotlin function declares it returns (kotlinDeclaredReturnType),
+ * a name written alone taken as the nested type of the class it is declared
+ * in, or of a class around that, that has the name: `fun newBuilder():
+ * Builder` in `Request` returns `Request.Builder`, not `Headers.Builder`.
+ */
+function kotlinScopedReturnType(fn: Node, context: ResolutionContext): string | undefined {
+  const written = kotlinDeclaredReturnType(fn);
+  if (!written || written.includes('.')) return written;
+  const isType = (qualifiedName: string): boolean =>
+    context.getNodesByQualifiedName(qualifiedName).some((n) => MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module');
+  const scopes = fn.qualifiedName.split('::').slice(0, -1);
+  for (let i = scopes.length; i > 0; i--) {
+    const scope = scopes.slice(0, i).join('::');
+    if (isType(scope) && isType(`${scope}::${written}`)) return `${scopes[i - 1]!}.${written}`;
+  }
+  return written;
+}
+
+/**
+ * The type a Kotlin function's signature declares it returns, as its type
+ * names from the outermost type on, without nullability, type arguments or a
+ * package: `(source: Buffer): Hpack.Reader` → `Hpack.Reader`, `(): RealRepo?`
+ * → `RealRepo`, `(): List<Foo>` → `List`. Undefined for none, or a function type.
+ */
+function kotlinDeclaredReturnType(fn: Node): string | undefined {
+  const sig = fn.signature?.trim();
+  if (!sig?.startsWith('(')) return undefined;
+  const close = kotlinClosingParen(sig, 0);
+  const written = close < 0 ? undefined : /^\s*:\s*([\s\S]+)$/.exec(sig.slice(close + 1))?.[1];
+  const path = written?.trim().replace(/\?+$/, '').replace(/<[\s\S]*>$/, '').trim().split('.').map((p) => p.trim());
+  if (!path || !path.every((p) => /^[A-Za-z_]\w*$/.test(p))) return undefined;
+  const types = path.slice(path.findIndex((p) => /^[A-Z]/.test(p)));
+  return types.length > 0 && types.every((p) => /^[A-Z]/.test(p)) ? types.join('.') : undefined;
+}
+
+/** Whether a Kotlin or Java type of the project — a class, interface, enum or object — has the name `name`. */
+function isKotlinProjectType(name: string, context: ResolutionContext): boolean {
+  return kotlinProjectTypes(name, context).length > 0;
+}
+
+/** The project's Kotlin and Java types — classes, interfaces, enums, objects — named `name`. */
+function kotlinProjectTypes(name: string, context: ResolutionContext): Node[] {
+  return context.getNodesByName(name).filter((n) =>
+    (n.language === 'kotlin' || n.language === 'java') && (MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module'));
+}
+
+/**
+ * A Kotlin call on what an unqualified call returns (kotlinCallResultCallee):
+ * the method of the type that function declares (#2805), as a
+ * `Foo.factory().bar()` chain takes it (matchDottedCallChain), or nothing —
+ * never a namesake found by the method's name alone. A nested type the
+ * function names through its outer one, `Request.Builder`, is that one, not
+ * another type's `Builder`. Undefined when the shape or the declared type
+ * can't be read, for the strategies after it.
+ */
+function matchKotlinCallResultCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const callee = kotlinCallResultCallee(ref, context);
+  if (!callee) return undefined;
+  const written = kotlinCallResultType(callee, ref, context);
+  const path = written?.split('.') ?? [];
+  const type = path[path.length - 1];
+  // A type from outside the project is no help: its methods, and which of the
+  // project's extensions its supertypes take, aren't known here.
+  if (!type || !isKotlinProjectType(type, context)) return undefined;
+  const name = ref.referenceName;
+  const found = resolveMethodOnType(type, name, ref, context, 0.85, 'instance-method', importedFqnOf(type, ref, context));
+  // Whole names: `MockResponse::Builder::body` is no `Response::Builder::body`.
+  const member = `${path.join('::')}::${name}`;
+  const isPathMember = (n: Node): boolean => n.qualifiedName === member || n.qualifiedName.endsWith(`::${member}`);
+  if (found) {
+    const target = context.getNodeById?.(found.targetNodeId);
+    // An extension function, kept under its receiver type's bare name, is
+    // the one the calling file can name: Exposed declares `Expression<T>.year()`
+    // in three modules, and a test of one calls its own.
+    if (target && target.kind === 'method' && !target.qualifiedName.slice(0, target.qualifiedName.lastIndexOf('::')).includes('::')) {
+      const visible = context.getNodesByName(name).filter((n) =>
+        n.kind === 'method' && n.qualifiedName === target.qualifiedName && isKotlinTopLevelVisible(n, ref, context));
+      if (visible.some((n) => n.id === target.id)) return found;
+      return visible.length === 1 ? { ...found, targetNodeId: visible[0]!.id } : undefined;
+    }
+    if (path.length === 1 || (target && isPathMember(target))) return found;
+    // Another type's `Builder`: the method of the one the path names, or the strategies after this one.
+    const own = context.getNodesByName(name).filter((n) => n.kind === 'method' && isPathMember(n));
+    return own.length === 1 ? { original: ref, targetNodeId: own[0]!.id, confidence: 0.85, resolvedBy: 'instance-method' } : undefined;
+  }
+  // An extension the index doesn't keep under the type may be it: one on a
+  // nullable receiver (`fun MediaType?.charsetOrUtf8()`) is a top-level
+  // function, one on a nested type (`fun Dns.Call.toEventsQueue()`) is kept
+  // under its outer type's bare name (`Dns::toEventsQueue`), where a member's
+  // owner carries its package.
+  const extension = context.getNodesByName(name).some((n) => n.language === 'kotlin' &&
+    (n.kind === 'function' || (n.kind === 'method' && !n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::')).includes('::'))));
+  return extension ? undefined : null;
+}
+
+/**
+ * The type a Kotlin local holds when its nearest declaration in the calling
+ * function sets it from an unqualified call alone — `val repo =
+ * repository()`, `var repo = this.repository()!!` — as that function declares
+ * (kotlinCallResultType, #2805). Undefined for any other declaration, or none.
+ */
+function kotlinLocalCallResultType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return undefined;
+  const r = escapeRegExp(receiver);
+  const declares = new RegExp(`\\b(?:val|var)\\s+${r}\\b`);
+  const initializer = new RegExp(`^(?:val|var)\\s+${r}\\s*=\\s*(?:this\\s*\\.\\s*)?([a-z_]\\w*)\\s*(?:<[^<>()]*>)?\\s*\\(`);
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const line = lines[i]!;
+    const at = declares.exec(i === ref.line - 1 ? line.slice(0, Math.max(0, ref.column)) : line);
+    if (!at) continue;
+    const text = [line.slice(at.index), ...lines.slice(i + 1, i + 1 + KOTLIN_CALL_LINES)].join('\n');
+    const call = initializer.exec(text);
+    if (!call) return undefined;
+    const close = kotlinClosingParen(text, call[0].length - 1);
+    if (close < 0 || !/^[ \t]*(?:!![ \t]*)?(?:;|\/\/|\r?\n|$)/.test(text.slice(close + 1))) return undefined;
+    // Only a type of the project's (see matchKotlinCallResultCall), and a
+    // nested one only when no other type shares its name: the type is looked
+    // up by its last name from here on.
+    const path = kotlinCallResultType(call[1]!, ref, context)?.split('.') ?? [];
+    const types = path.length > 0 ? kotlinProjectTypes(path[path.length - 1]!, context) : [];
+    return types.length === 1 || (types.length > 1 && path.length === 1) ? path[path.length - 1] : undefined;
+  }
+  return undefined;
+}
+
 /** Per-context memo: `<file>\0<type name as written>` → tsImportedTypeFile's answer. */
 const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
@@ -19517,6 +19730,12 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // A Kotlin local set from an unqualified call holds what that function
+    // declares it returns: `val repo = repository()` (#2805), where the
+    // receiver's name led to the interface `Repo`.
+    if (!inferredType && ref.language === 'kotlin' && dotMatch && /^[a-z_]\w*$/.test(objectOrClass!)) {
+      inferredType = nmTimedT('mc-kotlincall', ref, () => kotlinLocalCallResultType(objectOrClass!, ref, context)) ?? null;
+    }
     // `subprocess.run(…)` after `import subprocess`: a function of a module
     // from outside the project, not a same-named project method (#2599).
     if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
@@ -26515,6 +26734,16 @@ function matchReferenceInner(
   if (ref.language === 'rust' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const lent = nmTimedT('rustAsMut', ref, () => matchRustAsMutChainCall(ref, context));
     if (lent !== undefined) return lent;
+  }
+
+  // A Kotlin call on what an unqualified call returns, which the extractor
+  // records by its bare name — `repository().pending(1)` — is a call on the
+  // type that function declares, or on nothing (#2805): the strategies below
+  // took any `pending`, a test double's in another package. What the type
+  // inherits counts, as inheritance is resolved before any call.
+  if (ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const onResult = nmTimedT('kotlinCallResult', ref, () => matchKotlinCallResultCall(ref, context));
+    if (onResult !== undefined) return onResult;
   }
 
   // Try strategies in order of confidence
