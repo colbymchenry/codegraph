@@ -138,7 +138,7 @@ describe('expression receivers', () => {
       .map((r) => r.referenceName);
     expect(refs).toEqual([
       'list().map', 'list', 'x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget',
-      'f', 'run', 'this.listeners[].push', 'this.svc.start', 'go', 'start',
+      'f', 'run', 'this.listeners[].push', 'this.svc.start', 'new Runner().go', 'start',
     ]);
   });
 });

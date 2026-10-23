@@ -300,6 +300,11 @@ async function exprReceivers(x, y) {
   ${typed ? 'this.items![0].save(); (this.items[1] as X).save();' : ''}
   super.stop();
   new Runner().go();
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
+  new Runner().a.run();
+  new this.constructor().copy(x);
+  new this().init();
   window.Api.start();
 }
 `, language);
@@ -310,7 +315,7 @@ async function exprReceivers(x, y) {
         ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
         'f', 'run', 'this.listeners[].push', 'this.svc.start',
         ...(typed ? ['this.items[].save', 'this.items[].save'] : []),
-        'stop', 'go', 'start',
+        'stop', 'new Runner().go', 'new ns.Widget().draw', 'pick', 'copy', 'init', 'start',
       ]);
   });
 
