@@ -7,6 +7,7 @@ import { oversizeStamp, hashContent } from '../src/extraction';
 import { hasDriftedOnDisk, readFileShape } from '../src/ui-server/api/source';
 import { ToolHandler } from '../src/mcp/tools';
 import { validateAnswerFiles } from '../src/mcp/answer-freshness';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../src/file-limits';
 
 /**
  * A file over the size limit is stored as skipped without ever being read
@@ -22,20 +23,20 @@ describe('oversize files are stat-gated, never read (#1910)', () => {
   it('indexes the neighbours, records the oversize file as skipped with a size-stamp hash, and does not decode it', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oversize-'));
     fs.writeFileSync(path.join(dir, 'app.ts'), 'export function alpha() { return beta(); }\nexport function beta() { return 1; }\n');
-    // 1 MB + 1: over the limit; invalid UTF-8 (0xFF) so any decode would be visible as replacement chars.
-    fs.writeFileSync(path.join(dir, 'blob.ts'), big(1024 * 1024 + 1, 0xff));
+    // Over the limit; invalid UTF-8 makes any decode visible as replacement chars.
+    fs.writeFileSync(path.join(dir, 'blob.ts'), big(MAX_SOURCE_FILE_SIZE_BYTES + 1, 0xff));
     const cg = await CodeGraph.init(dir, { index: true });
     try {
       expect(cg.getNodesByKind('function').map(n => n.name).sort()).toEqual(['alpha', 'beta']);
       const rec = cg.getFiles().find(f => f.path === 'blob.ts');
       expect(rec).toBeDefined();
-      expect(rec!.contentHash).toBe(hashContent(oversizeStamp(1024 * 1024 + 1)));
+      expect(rec!.contentHash).toBe(hashContent(oversizeStamp(MAX_SOURCE_FILE_SIZE_BYTES + 1)));
       // Nothing from the blob reached the graph.
       expect(cg.getNodesInFile('blob.ts').filter(n => n.kind !== 'file')).toEqual([]);
       // Change detection agrees with what was stored: nothing pending.
       expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
       // A same-size rewrite is not a change (nothing about it is indexed)...
-      fs.writeFileSync(path.join(dir, 'blob.ts'), big(1024 * 1024 + 1, 0xfe));
+      fs.writeFileSync(path.join(dir, 'blob.ts'), big(MAX_SOURCE_FILE_SIZE_BYTES + 1, 0xfe));
       expect(cg.getChangedFiles().modified).toEqual([]);
       // ...crossing the limit is: the file becomes ordinary source.
       fs.writeFileSync(path.join(dir, 'blob.ts'), 'export const gamma = 3;\n');
@@ -43,10 +44,10 @@ describe('oversize files are stat-gated, never read (#1910)', () => {
       await cg.sync();
       expect(cg.getNodesInFile('blob.ts').some(n => n.name === 'gamma')).toBe(true);
       // ...and growing back over it is a change too, stored as the stamp again.
-      fs.writeFileSync(path.join(dir, 'blob.ts'), big(2 * 1024 * 1024, 0xff));
+      fs.writeFileSync(path.join(dir, 'blob.ts'), big(MAX_SOURCE_FILE_SIZE_BYTES + 2, 0xff));
       expect(cg.getChangedFiles().modified).toEqual(['blob.ts']);
       await cg.sync();
-      expect(cg.getFiles().find(f => f.path === 'blob.ts')!.contentHash).toBe(hashContent(oversizeStamp(2 * 1024 * 1024)));
+      expect(cg.getFiles().find(f => f.path === 'blob.ts')!.contentHash).toBe(hashContent(oversizeStamp(MAX_SOURCE_FILE_SIZE_BYTES + 2)));
       expect(cg.getNodesInFile('blob.ts').some(n => n.name === 'gamma')).toBe(false);
     } finally {
       cg.close();

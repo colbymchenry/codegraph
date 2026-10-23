@@ -48,7 +48,7 @@ import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
+import { getMaxSourceFileSizeBytes } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
@@ -682,7 +682,7 @@ export class ReferenceResolver {
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
       const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+      if (!stats.isFile() || stats.size > getMaxSourceFileSizeBytes(this.projectRoot)) {
         this.fileCache.set(filePath, null);
         return null;
       }
@@ -706,7 +706,7 @@ export class ReferenceResolver {
     const fullPath = path.join(this.projectRoot, filePath);
     try {
       const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) return false;
+      if (!stats.isFile() || stats.size > getMaxSourceFileSizeBytes(this.projectRoot)) return false;
       return fs.readFileSync(fullPath).includes(needle);
     } catch {
       return false;

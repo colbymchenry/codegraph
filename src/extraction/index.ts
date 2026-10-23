@@ -36,7 +36,7 @@ import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { getMaxSourceFileSizeBytes, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -184,8 +184,8 @@ export function hashContent(content: string): string {
  * and runs only for a file that is new or changed — never once per `.ts` file
  * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string | null {
-  const { stats, bytes } = readBoundedSourceSync(fullPath);
+function readSourceOrStamp(fullPath: string, maxBytes: number): string | null {
+  const { stats, bytes } = readBoundedSourceSync(fullPath, maxBytes);
   if (bytes === null) return oversizeStamp(stats.size);
   return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
 }
@@ -1991,6 +1991,10 @@ export class ExtractionOrchestrator {
    */
   private scopedMatcher: { key: string; matcher: ScopeIgnore } | null = null;
 
+  private get maxSourceFileSizeBytes(): number {
+    return getMaxSourceFileSizeBytes(this.rootDir);
+  }
+
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
@@ -2067,7 +2071,7 @@ export class ExtractionOrchestrator {
         try {
           // Framework detectors scan source by name; a file over the size
           // limit was never indexed and must not be decoded here either (#1910).
-          return readBoundedSourceSync(full).bytes?.toString('utf8') ?? null;
+          return readBoundedSourceSync(full, this.maxSourceFileSizeBytes).bytes?.toString('utf8') ?? null;
         } catch {
           return null;
         }
@@ -2566,7 +2570,7 @@ export class ExtractionOrchestrator {
             // Stat first: a file over the size limit is stored as skipped
             // without ever being read or decoded (#1910), so ten oversize
             // fixtures in one I/O batch no longer cost their size in RSS.
-            const { stats, bytes } = await readBoundedSource(fullPath);
+            const { stats, bytes } = await readBoundedSource(fullPath, this.maxSourceFileSizeBytes);
             if (bytes === null) {
               return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
             }
@@ -2609,18 +2613,18 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
+        // Honour the project source-size bound. Without this check, vendored generated
         // headers, minified bundles, and other multi-MB files get indexed,
         // wasting WASM heap and the worker recycle budget on inputs with no
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        if (stats.size > this.maxSourceFileSizeBytes) {
           await storeResult(filePath, content, stats, {
             nodes: [],
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+              message: `File exceeds max size (${stats.size} > ${this.maxSourceFileSizeBytes})`,
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -2724,7 +2728,7 @@ export class ExtractionOrchestrator {
           const fullPath = validatePathWithinRoot(this.rootDir, filePath);
           if (!fullPath) continue;
           // Bounded like the first read: the file may have grown since (#1910).
-          const bytes = (await readBoundedSource(fullPath)).bytes;
+          const bytes = (await readBoundedSource(fullPath, this.maxSourceFileSizeBytes)).bytes;
           if (bytes === null) continue;
           content = bytes.toString('utf8');
         } catch {
@@ -2778,7 +2782,7 @@ export class ExtractionOrchestrator {
           try {
             const fullPath = validatePathWithinRoot(this.rootDir, filePath);
             if (!fullPath) continue;
-            const bytes = (await readBoundedSource(fullPath)).bytes;
+            const bytes = (await readBoundedSource(fullPath, this.maxSourceFileSizeBytes)).bytes;
             if (bytes === null) continue;
             fullContent = bytes.toString('utf8');
           } catch {
@@ -2913,7 +2917,7 @@ export class ExtractionOrchestrator {
     let stats: fs.Stats;
     try {
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
-      const read = await readBoundedSource(fullPath);
+      const read = await readBoundedSource(fullPath, this.maxSourceFileSizeBytes);
       stats = read.stats;
       // An MPEG transport stream named `.ts` is not TypeScript (#1910).
       if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
@@ -2965,14 +2969,14 @@ export class ExtractionOrchestrator {
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir), this.rootDir);
 
     // Check file size
-    if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+    if (stats.size > this.maxSourceFileSizeBytes) {
       const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+            message: `File exceeds max size (${stats.size} > ${this.maxSourceFileSizeBytes})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -3024,14 +3028,12 @@ export class ExtractionOrchestrator {
    */
   private healZeroNodeRows(): void {
     for (const f of this.queries.getAllFiles()) {
-      // A zero-node row WITH recorded errors is a deliberate skip marker
-      // (#1557: oversized / repeatedly-unparseable files are persisted with
-      // their reason so syncs stop retrying them) — leave those alone. The
-      // #1541 wipe rows are the error-FREE zero-node rows.
+      // Retry old size skips when the source now fits; preserve other parse errors.
       if (
         f.nodeCount === 0 &&
         !isFileLevelOnlyLanguage(f.language) &&
-        (f.errors === undefined || f.errors.length === 0)
+        (f.errors === undefined || f.errors.length === 0 ||
+          (f.size <= this.maxSourceFileSizeBytes && f.errors.every(error => error.code === 'size_exceeded')))
       ) {
         this.queries.deleteFile(f.path);
       }
@@ -3698,7 +3700,8 @@ export class ExtractionOrchestrator {
       if (tracked && !neverParsed) {
         try {
           const stat = fs.statSync(fullPath);
-          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt) &&
+              (stat.size > this.maxSourceFileSizeBytes) === !!tracked.errors?.some(e => e.code === 'size_exceeded')) {
             continue;
           }
         } catch (error) {
@@ -3712,7 +3715,7 @@ export class ExtractionOrchestrator {
       // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, this.maxSourceFileSizeBytes);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -3810,6 +3813,11 @@ export class ExtractionOrchestrator {
     };
   }
 
+  sourceSizeLimitChanged(): boolean {
+    // Reconcile legacy indexes once: their previous effective limit is unknown.
+    return this.queries.getMetadata('max_source_file_size_bytes') !== String(this.maxSourceFileSizeBytes);
+  }
+
   private indexedDirtyPaths(stamp: string | null): string[] | null {
     try {
       const state = JSON.parse(this.queries.getMetadata('indexed_dirty_paths') ?? 'null');
@@ -3821,7 +3829,7 @@ export class ExtractionOrchestrator {
   }
 
   /** Capture before file reads. In-flight/failed full writes must not claim freshness. */
-  beginGitIndexState(full: boolean): { head: string; stamp: string; dirty: string[] | null } {
+  beginGitIndexState(full: boolean): { head: string; stamp: string; dirty: string[] | null; maxSourceFileSizeBytes: number } {
     const head = getGitHeadSha(this.rootDir) ?? '';
     const stamp = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? '';
     const prior = this.indexedDirtyPaths(stamp);
@@ -3837,10 +3845,13 @@ export class ExtractionOrchestrator {
       // first write, so a crash cannot forget an indexed uncommitted edit.
       this.queries.setMetadata('indexed_dirty_paths', JSON.stringify({ commit: stamp, paths: dirty }));
     }
-    return { head, stamp, dirty };
+    return { head, stamp, dirty, maxSourceFileSizeBytes: this.maxSourceFileSizeBytes };
   }
 
-  finishGitIndexState(snapshot: { head: string; stamp: string; dirty: string[] | null }, full: boolean, retries: string[] = []): void {
+  finishGitIndexState(snapshot: { head: string; stamp: string; dirty: string[] | null; maxSourceFileSizeBytes: number }, full: boolean, retries: string[] = []): void {
+    if (full && snapshot.maxSourceFileSizeBytes === this.maxSourceFileSizeBytes) {
+      this.queries.setMetadata('max_source_file_size_bytes', String(snapshot.maxSourceFileSizeBytes));
+    }
     const after = getGitChangedFiles(this.rootDir);
     if (!snapshot.dirty || !after) return;
     const commit = full ? snapshot.head : snapshot.stamp;
@@ -3863,7 +3874,8 @@ export class ExtractionOrchestrator {
     let sinceCommit: string | null = null;
     try { sinceCommit = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? null; } catch { /* advisory */ }
     const dirtyPaths = this.indexedDirtyPaths(sinceCommit);
-    const gitChanges = dirtyPaths !== null && canTrustGitFastPath(this.rootDir, sinceCommit)
+    const sizeLimitUnchanged = !this.sourceSizeLimitChanged();
+    const gitChanges = sizeLimitUnchanged && dirtyPaths !== null && canTrustGitFastPath(this.rootDir, sinceCommit)
       ? getGitChangedFiles(this.rootDir, sinceCommit)
       : null;
 
@@ -3887,7 +3899,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string | null;
-        try { content = readSourceOrStamp(fullPath); }
+        try { content = readSourceOrStamp(fullPath, this.maxSourceFileSizeBytes); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -3931,7 +3943,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, this.maxSourceFileSizeBytes);
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;

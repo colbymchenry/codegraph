@@ -32,6 +32,8 @@ import { logWarn } from './errors';
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
+  /** Maximum source bytes to parse/read; absent means the built-in default. */
+  maxSourceFileSizeBytes?: number;
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -86,6 +88,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  maxSourceFileSizeBytes?: number;
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -162,12 +165,19 @@ function parseConfig(file: string): ParsedConfig {
 
   if (!parsed || typeof parsed !== 'object') return EMPTY_CONFIG;
 
+  const rawLimit = (parsed as ProjectConfig).maxSourceFileSizeBytes;
+  const maxSourceFileSizeBytes = typeof rawLimit === 'number' && Number.isSafeInteger(rawLimit) && rawLimit > 0
+    ? rawLimit : undefined;
+  if (rawLimit !== undefined && maxSourceFileSizeBytes === undefined) {
+    logWarn(`Ignoring "maxSourceFileSizeBytes" in ${PROJECT_CONFIG_FILENAME}: must be a positive safe integer`, { file });
+  }
   const extensions = extractExtensions(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   if (
+    maxSourceFileSizeBytes === undefined &&
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
@@ -176,7 +186,7 @@ function parseConfig(file: string): ParsedConfig {
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, maxSourceFileSizeBytes };
 }
 
 /**
@@ -446,4 +456,9 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;
+}
+
+/** Shared by CLI, watchers and readers; a per-process override would split the index. */
+export function loadMaxSourceFileSizeBytes(rootDir: string): number | undefined {
+  return loadParsedConfig(rootDir).maxSourceFileSizeBytes;
 }
