@@ -37,10 +37,15 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
     : new Promise((resolve) => child.once('exit', () => resolve()));
 }
 
+/**
+ * A live process standing in for a daemon. Its command line reads like a
+ * CodeGraph MCP server's: one that is plainly another program would make its
+ * lock stale (#2770).
+ */
 function startDetachedProcess(): number {
   const source = [
     "const { spawn } = require('child_process');",
-    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codegraph.js', 'serve', '--mcp'], { detached: true, stdio: 'ignore' });",
     'child.unref();',
     'console.log(child.pid);',
   ].join(' ');
@@ -100,6 +105,32 @@ describe('daemon-registry', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('clears, without signalling it, the lock of a live process that is not a CodeGraph server (#2770)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-foreign-holder-'));
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const pid = holder.pid!;
+    try {
+      fs.writeFileSync(
+        getDaemonPidPath(root),
+        encodeLockInfo({ pid, version: 'test', socketPath: path.join(root, '.codegraph', 'missing.sock'), startedAt: Date.now() }),
+      );
+      expect((await stopDaemonAt(root, { preserveUnverified: true })).outcome).toBe('not-running');
+      expect(fs.existsSync(getDaemonPidPath(root))).toBe(false);
+      expect(isProcessAlive(pid)).toBe(true);
+
+      // An old-format lock has no socket to ask; the command line still tells.
+      fs.writeFileSync(getDaemonPidPath(root), `${pid}\n`);
+      expect(await clearStaleDaemonArtifacts(root)).toBe(true);
+      expect(fs.existsSync(getDaemonPidPath(root))).toBe(false);
+      expect(isProcessAlive(pid)).toBe(true);
+    } finally {
+      holder.kill('SIGKILL');
+      await waitForExit(holder);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it.each([false, true])('confirms daemon termination (refused: %s)', async (refused) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-daemon-identity-'));

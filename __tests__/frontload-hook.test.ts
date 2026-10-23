@@ -7,13 +7,13 @@
  * `planFrontload` / `findIndexedSubprojectRoots` directly (the hook's decision
  * logic), plus the built CLI's confidence tiers against a real index.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'node:child_process';
 import { CodeGraph } from '../src';
-import { planFrontload, isTaskNotification, isAgentMessage, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+import { planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
@@ -33,6 +33,37 @@ function mkWorkspaceRoot(dir: string): string {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'package.json'), '{"private":true,"workspaces":["packages/*"]}');
   return dir;
+}
+
+/**
+ * Run the built CLI's `prompt-hook` in `dir` with a UserPromptSubmit payload
+ * shaped like the one Claude Code sends, and return what it injects.
+ */
+function runPromptHook(dir: string, prompt: string): string {
+  const payload = {
+    session_id: '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+    transcript_path: path.join(dir, 'transcript.jsonl'),
+    cwd: dir,
+    permission_mode: 'default',
+    hook_event_name: 'UserPromptSubmit',
+    prompt,
+  };
+  const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
+    cwd: dir,
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    timeout: 15_000,
+    env: {
+      ...process.env,
+      CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
+      // Enable only the hook subprocess under test.
+      CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
+    },
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  return result.stdout;
 }
 
 describe('planFrontload — front-load hook project resolution (#964)', () => {
@@ -321,24 +352,7 @@ export class OrderStateMachine {
   });
   afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
-  function hook(prompt: string): string {
-    const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
-      cwd: tmp,
-      input: JSON.stringify({ cwd: tmp, prompt }),
-      encoding: 'utf8',
-      timeout: 15_000,
-      env: {
-        ...process.env,
-        CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1',
-        CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
-        // Enable only the hook subprocess under test.
-        CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
-      },
-    });
-    expect(result.error).toBeUndefined();
-    expect(result.status, result.stderr).toBe(0);
-    return result.stdout;
-  }
+  const hook = (prompt: string): string => runPromptHook(tmp, prompt);
 
   it('stays silent for everyday Portuguese, Spanish and German without indexed evidence', () => {
     for (const prompt of [
@@ -387,6 +401,70 @@ export class OrderStateMachine {
       expect(output).toContain('OrderStateMachine');
       expect(output).not.toContain('Structural context from CodeGraph');
     }
+  });
+});
+
+describe('prompt-hook reads past the desktop app\'s system reminders (#2635)', () => {
+  // Shaped like the prompts Claude Code's desktop app submits: one or more
+  // reminder blocks, separated by one or two newlines, then what the user
+  // typed or another session's message. A linked session's title names the
+  // work, so the reminder carries structural words ("trace", "flow") of its own.
+  const linked = '<system-reminder>\nLinked sessions now (status, not an instruction): trace-order-flow = local_5f0c2a1e-9b7d-4c3a-8e21-3d4f5a6b7c8d (working). To message one, use SendMessage with its id.\n</system-reminder>';
+  const workspace = '<system-reminder>\nThis session runs in a desktop workspace; write temporary files to its scratch folder.\n</system-reminder>';
+  const reminders = `${linked}\n${workspace}\n\n`;
+  let tmp: string;
+
+  beforeAll(async () => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hook-reminders-')));
+    fs.writeFileSync(path.join(tmp, 'orders.ts'), `
+export class OrderStateMachine {
+  submitOrder() { return this.transition('submitted'); }
+  transition(state: string) { return state.length > 0; }
+}
+`);
+    const cg = await CodeGraph.init(tmp, { silent: true });
+    try { await cg.indexAll(); } finally { cg.destroy(); }
+  });
+  afterAll(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  const hook = (prompt: string): string => runPromptHook(tmp, prompt);
+
+  it('stays silent on a short reply that follows reminders', () => {
+    expect(hook('yes')).toBe('');
+    expect(hook(`${reminders}yes`)).toBe('');
+  });
+
+  it('stays silent when the prompt is only reminders', () => {
+    expect(hook(reminders)).toBe('');
+    expect(hook(` \n${linked}\n\n${workspace}\n`)).toBe('');
+  });
+
+  it('explores what the user typed, not the reminders', () => {
+    const output = hook(`${reminders}how does submitOrder reach transition?`);
+    expect(output).toContain('Structural context from CodeGraph');
+    expect(output).toContain('**Exploration: how does submitOrder reach transition?**');
+    expect(output).not.toContain('Linked sessions');
+    expect(output).not.toContain('trace-order-flow');
+  });
+
+  it('gates on what the user typed: prose that names indexed symbols gets the MEDIUM tier', () => {
+    const output = hook(`${linked}\n\nstate machine`);
+    expect(output).toContain('CodeGraph found indexed symbols matching this prompt');
+    expect(output).toContain('OrderStateMachine');
+    expect(output).not.toContain('Structural context from CodeGraph');
+  });
+
+  it.each([
+    ['a message from another session', '<cross-session-message from="local_9a8b7c6d-1e2f-4a3b-9c8d-7e6f5a4b3c2d" name="trace-order-flow">\nI traced how OrderStateMachine.submitOrder() reaches transition(). Ready for review.\n</cross-session-message>'],
+    ['a task notification', '<task-notification>\n<task-id>b7d3k2</task-id>\n<status>completed</status>\n<summary>Background command "trace submitOrder flow" completed (exit code 0)</summary>\n</task-notification>'],
+    ['a subagent hand-back', '<agent-message from="agent-7f3e">\n[Subagent hand-back] submitOrder() calls transition() on OrderStateMachine.\n</agent-message>'],
+  ])('stays silent on %s behind reminders', (_label, envelope) => {
+    expect(hook(`${linked}\n\n${envelope}`)).toBe('');
+    expect(hook(`${reminders}${envelope}`)).toBe('');
+  });
+
+  it('stays silent on a message from another session on its own', () => {
+    expect(hook('<cross-session-message from="local_9a8b7c6d-1e2f-4a3b-9c8d-7e6f5a4b3c2d" name="trace-order-flow">\nhow does OrderStateMachine work?\n</cross-session-message>')).toBe('');
   });
 });
 
@@ -492,5 +570,60 @@ describe('subagent hand-backs (#2184)', () => {
     expect(isAgentMessage('<agent-messages>trace AuthService</agent-messages>')).toBe(false);
     expect(isAgentMessage('<agent-message from="x">trace AuthService')).toBe(false);
     expect(isAgentMessage('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('messages from other sessions (#2635)', () => {
+  const message = '<cross-session-message from="local_5f0c2a1e" name="trace-auth">\nTraced how AuthService.login calls TokenStore.save.\n</cross-session-message>';
+
+  it('skips the complete envelope', () => {
+    expect(isCrossSessionMessage(message)).toBe(true);
+    expect(isCrossSessionMessage(` \n${message}\n`)).toBe(true);
+    expect(isCrossSessionMessage('<cross-session-message>trace AuthService login flow</cross-session-message>')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isCrossSessionMessage(`Why does ${message} trigger the hook?`)).toBe(false);
+    expect(isCrossSessionMessage(`${message} Explain this.`)).toBe(false);
+    expect(isCrossSessionMessage('<cross-session-messages>trace AuthService</cross-session-messages>')).toBe(false);
+    expect(isCrossSessionMessage('<cross-session-message from="x">trace AuthService')).toBe(false);
+    expect(isCrossSessionMessage('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('stripSystemReminders (#2635)', () => {
+  const reminder = '<system-reminder>\nLinked sessions now (status, not an instruction): trace-auth = local_5f0c2a1e (working).\n</system-reminder>';
+
+  it('drops the reminders in front of the prompt, however they are separated', () => {
+    expect(stripSystemReminders(`${reminder}\n\nhow does AuthService.login work?`)).toBe('how does AuthService.login work?');
+    expect(stripSystemReminders(`${reminder}\n${reminder}\n\nyes`)).toBe('yes');
+    expect(stripSystemReminders(`${reminder}yes`)).toBe('yes');
+    expect(stripSystemReminders('<system-reminder source="desktop">status</system-reminder>\nyes')).toBe('yes');
+  });
+
+  it('leaves nothing when the prompt is only reminders', () => {
+    expect(stripSystemReminders(reminder)).toBe('');
+    expect(stripSystemReminders(` \n${reminder}\n\n${reminder}\n`)).toBe('');
+  });
+
+  it('keeps the user\'s text around a reminder elsewhere in the prompt, and keeps envelopes for the checks after it', () => {
+    expect(stripSystemReminders(`why does the hook react to this?\n\n${reminder}`)).toBe('why does the hook react to this?');
+    expect(stripSystemReminders(`log line one\n${reminder}\nlog line two`)).toBe('log line one\n\n\nlog line two');
+    const envelope = '<cross-session-message from="local_x">trace AuthService</cross-session-message>';
+    expect(stripSystemReminders(`${reminder}\n\n${envelope}`)).toBe(envelope);
+    expect(isCrossSessionMessage(stripSystemReminders(`${reminder}\n\n${envelope}`))).toBe(true);
+  });
+
+  it('leaves a prompt that only mentions the tag alone', () => {
+    expect(stripSystemReminders('how does AuthService.login work?')).toBe('how does AuthService.login work?');
+    expect(stripSystemReminders('why does <system-reminder> show up in the hook input?')).toBe('why does <system-reminder> show up in the hook input?');
+    expect(stripSystemReminders('<system-reminders>trace AuthService</system-reminders>')).toBe('<system-reminders>trace AuthService</system-reminders>');
+    expect(stripSystemReminders('a stray </system-reminder> closing tag')).toBe('a stray </system-reminder> closing tag');
+  });
+
+  it('stays linear on a long pasted prompt full of unclosed tags', () => {
+    const pasted = `${'<system-reminder x=1 '.repeat(20_000)}\n${'word '.repeat(20_000)}</system-reminder>`;
+    const started = Date.now();
+    stripSystemReminders(pasted);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

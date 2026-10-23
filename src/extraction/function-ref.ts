@@ -355,9 +355,13 @@ const PASCAL_SPEC: FnRefSpec = {
   idTypes: new Set(['identifier']),
   dispatch: new Map<string, CaptureRule>([
     ['exprArgs', { mode: 'args' }],
-    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := Handler
+    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := @Handler
   ]),
   unwrap: new Map<string, string | null>([['exprUnary', 'operand']]), // @Handler
+  // A bare name (`OnClick := Handler`, `Register(Handler)`) is a paren-less
+  // name the extractor records itself, linked by scope (#2514); only the
+  // explicit `@Handler` is a function value here.
+  addressOfOnly: true,
 };
 
 /**

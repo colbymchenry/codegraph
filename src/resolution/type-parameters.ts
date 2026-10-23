@@ -149,10 +149,23 @@ function scalaMemberInScope(result: ResolvedRef, ref: UnresolvedRef, context: Re
   return /^[A-Za-z_]\w*$/.test(owner.name) && /^[A-Za-z_]\w*$/.test(target.name) ? imports.test(text) : true;
 }
 
-function enclosingDeclarations(ref: UnresolvedRef, context: ResolutionContext): Node[] {
+function enclosingDeclarations(at: { filePath: string; line: number }, context: ResolutionContext): Node[] {
   return context
-    .getNodesInFile(ref.filePath)
-    .filter((n) => DECLARATION_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line);
+    .getNodesInFile(at.filePath)
+    .filter((n) => DECLARATION_KINDS.has(n.kind) && n.startLine <= at.line && n.endLine >= at.line);
+}
+
+/**
+ * The type parameters in scope at a declaration: its own and those of the
+ * declarations around it — a method's (`<T> T map(Class<T> type)`), its
+ * class's (`interface Repository<T>`), an enclosing class's.
+ */
+export function typeParametersInScope(node: Node, context: ResolutionContext): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const declaration of enclosingDeclarations({ filePath: node.filePath, line: node.startLine }, context)) {
+    for (const name of declaredTypeParameters(declaration, context).keys()) names.add(name);
+  }
+  return names;
 }
 
 /** The type parameters a declaration declares, each with the default a C++ head gives it (`typename Parser = TcParser`). */

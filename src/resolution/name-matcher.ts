@@ -11632,15 +11632,7 @@ function enclosingOpenParen(source: string, at: number): number {
  * arrow.
  */
 function bindsAtSites(source: string, name: string, sites: LocalBindingSites): boolean {
-  let patterns = LOCAL_BINDING_PATTERNS.get(name);
-  if (!patterns) {
-    patterns = localBindingPatterns(name, 'y');
-    if (LOCAL_BINDING_PATTERNS.size >= LOCAL_BINDING_PATTERNS_CAP) {
-      LOCAL_BINDING_PATTERNS.delete(LOCAL_BINDING_PATTERNS.keys().next().value!);
-    }
-    LOCAL_BINDING_PATTERNS.set(name, patterns);
-  }
-  const { decl, fn, param } = patterns;
+  const { decl, fn, param } = stickyBindingPatterns(name);
   let from = 0;
   for (const at of sites.varDecls) {
     if (at < from) continue;
@@ -17499,6 +17491,219 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
+/** How many lines past its first a Kotlin call is read for its arguments. */
+const KOTLIN_CALL_LINES = 8;
+
+/** An unqualified Kotlin call's head, up to its `(`: `repository(`, `this.repository(`, `make<Foo>(`. */
+const KOTLIN_UNQUALIFIED_CALL = /^(?:this\s*\.\s*)?([a-z_]\w*)\s*(?:<[^<>()]*>)?\s*\(/;
+
+/** The index of the `)` closing the `(` at `open` in Kotlin source, string literals skipped; -1 when it doesn't close. */
+function kotlinClosingParen(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === '\\') i++;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * A Kotlin call written on what an unqualified call returns —
+ * `repository().pending(1)`, `this.repository().pending(1)`,
+ * `nullable()?.pending(1)` — which the extractor records by the outer
+ * method's bare name at the inner call's column (a capitalized inner is a
+ * constructor, kept as `Foo().pending`). The inner function's name, or null
+ * for any other shape: anything but `!!` between the inner call and the
+ * method makes another one (`repository().other().pending()`).
+ */
+function kotlinCallResultCallee(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.language !== 'kotlin' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const first = lines?.[ref.line - 1];
+  if (!lines || first === undefined) return null;
+  const text = [first.slice(Math.max(0, ref.column)), ...lines.slice(ref.line, ref.line + KOTLIN_CALL_LINES)].join('\n');
+  const head = KOTLIN_UNQUALIFIED_CALL.exec(text);
+  if (!head) return null;
+  const close = kotlinClosingParen(text, head[0].length - 1);
+  if (close < 0) return null;
+  const outer = new RegExp(`^\\s*(?:!!\\s*)?\\??\\.\\s*${escapeRegExp(ref.referenceName)}\\s*[({<]`);
+  return outer.test(text.slice(close + 1)) ? head[1]! : null;
+}
+
+/**
+ * The type an unqualified Kotlin call to `name` returns, as the function it
+ * calls declares it (#2805): a method of the calling class, else of a type
+ * around the call or one those inherit (kotlinHierarchyAt, read from their
+ * declarations), else a top-level function the calling file can name.
+ * Undefined when no such function is found, or those found don't declare one
+ * type: `fun repository() = RealRepo()` declares none.
+ */
+function kotlinCallResultType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const fns = context.getNodesByName(name).filter((n) => n.language === 'kotlin' && (n.kind === 'method' || n.kind === 'function'));
+  if (fns.length === 0) return undefined;
+  const ownerOf = (qualifiedName: string): string => qualifiedName.slice(0, Math.max(0, qualifiedName.lastIndexOf('::')));
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  // Inside an extension function on a type from outside the project (`fun
+  // URI.toHttpUrlOrNull() = toString()…`), that type's own members are the
+  // first a bare call reaches, and they aren't known here.
+  if (caller?.kind === 'method') {
+    const owner = ownerOf(caller.qualifiedName);
+    const member = context.getNodesByQualifiedName(owner).some((n) => MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module');
+    if (!member && !isKotlinProjectType(owner.split(/::|\./).pop() ?? '', context)) return undefined;
+  }
+  let pool = caller ? fns.filter((n) => n.kind === 'method' && ownerOf(n.qualifiedName) === ownerOf(caller.qualifiedName)) : [];
+  if (pool.length === 0) {
+    const hierarchy = kotlinHierarchyAt(ref, context);
+    pool = fns.filter((n) => {
+      if (n.kind !== 'method') return false;
+      const owner = ownerOf(n.qualifiedName).split(/::|\./);
+      const type = owner.pop();
+      // A companion object's members are called bare inside its class.
+      return hierarchy.has(type === 'Companion' ? owner.pop() ?? '' : type ?? '');
+    });
+  }
+  if (pool.length === 0) {
+    pool = fns.filter((n) => {
+      if (n.kind !== 'function') return false;
+      const pkg = kotlinFileScope(n.filePath, context).pkg;
+      return n.qualifiedName === (pkg ? `${pkg}::${n.name}` : n.name) && isKotlinTopLevelVisible(n, ref, context);
+    });
+  }
+  const types = new Set(pool.map((n) => kotlinScopedReturnType(n, context) ?? ''));
+  return pool.length > 0 && types.size === 1 && !types.has('') ? [...types][0] : undefined;
+}
+
+/**
+ * The type a Kotlin function declares it returns (kotlinDeclaredReturnType),
+ * a name written alone taken as the nested type of the class it is declared
+ * in, or of a class around that, that has the name: `fun newBuilder():
+ * Builder` in `Request` returns `Request.Builder`, not `Headers.Builder`.
+ */
+function kotlinScopedReturnType(fn: Node, context: ResolutionContext): string | undefined {
+  const written = kotlinDeclaredReturnType(fn);
+  if (!written || written.includes('.')) return written;
+  const isType = (qualifiedName: string): boolean =>
+    context.getNodesByQualifiedName(qualifiedName).some((n) => MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module');
+  const scopes = fn.qualifiedName.split('::').slice(0, -1);
+  for (let i = scopes.length; i > 0; i--) {
+    const scope = scopes.slice(0, i).join('::');
+    if (isType(scope) && isType(`${scope}::${written}`)) return `${scopes[i - 1]!}.${written}`;
+  }
+  return written;
+}
+
+/**
+ * The type a Kotlin function's signature declares it returns, as its type
+ * names from the outermost type on, without nullability, type arguments or a
+ * package: `(source: Buffer): Hpack.Reader` → `Hpack.Reader`, `(): RealRepo?`
+ * → `RealRepo`, `(): List<Foo>` → `List`. Undefined for none, or a function type.
+ */
+function kotlinDeclaredReturnType(fn: Node): string | undefined {
+  const sig = fn.signature?.trim();
+  if (!sig?.startsWith('(')) return undefined;
+  const close = kotlinClosingParen(sig, 0);
+  const written = close < 0 ? undefined : /^\s*:\s*([\s\S]+)$/.exec(sig.slice(close + 1))?.[1];
+  const path = written?.trim().replace(/\?+$/, '').replace(/<[\s\S]*>$/, '').trim().split('.').map((p) => p.trim());
+  if (!path || !path.every((p) => /^[A-Za-z_]\w*$/.test(p))) return undefined;
+  const types = path.slice(path.findIndex((p) => /^[A-Z]/.test(p)));
+  return types.length > 0 && types.every((p) => /^[A-Z]/.test(p)) ? types.join('.') : undefined;
+}
+
+/** Whether a Kotlin or Java type of the project — a class, interface, enum or object — has the name `name`. */
+function isKotlinProjectType(name: string, context: ResolutionContext): boolean {
+  return kotlinProjectTypes(name, context).length > 0;
+}
+
+/** The project's Kotlin and Java types — classes, interfaces, enums, objects — named `name`. */
+function kotlinProjectTypes(name: string, context: ResolutionContext): Node[] {
+  return context.getNodesByName(name).filter((n) =>
+    (n.language === 'kotlin' || n.language === 'java') && (MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'module'));
+}
+
+/**
+ * A Kotlin call on what an unqualified call returns (kotlinCallResultCallee):
+ * the method of the type that function declares (#2805), as a
+ * `Foo.factory().bar()` chain takes it (matchDottedCallChain), or nothing —
+ * never a namesake found by the method's name alone. A nested type the
+ * function names through its outer one, `Request.Builder`, is that one, not
+ * another type's `Builder`. Undefined when the shape or the declared type
+ * can't be read, for the strategies after it.
+ */
+function matchKotlinCallResultCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const callee = kotlinCallResultCallee(ref, context);
+  if (!callee) return undefined;
+  const written = kotlinCallResultType(callee, ref, context);
+  const path = written?.split('.') ?? [];
+  const type = path[path.length - 1];
+  // A type from outside the project is no help: its methods, and which of the
+  // project's extensions its supertypes take, aren't known here.
+  if (!type || !isKotlinProjectType(type, context)) return undefined;
+  const name = ref.referenceName;
+  const found = resolveMethodOnType(type, name, ref, context, 0.85, 'instance-method', importedFqnOf(type, ref, context));
+  // Whole names: `MockResponse::Builder::body` is no `Response::Builder::body`.
+  const member = `${path.join('::')}::${name}`;
+  const isPathMember = (n: Node): boolean => n.qualifiedName === member || n.qualifiedName.endsWith(`::${member}`);
+  if (found) {
+    const target = context.getNodeById?.(found.targetNodeId);
+    // An extension function, kept under its receiver type's bare name, is
+    // the one the calling file can name: Exposed declares `Expression<T>.year()`
+    // in three modules, and a test of one calls its own.
+    if (target && target.kind === 'method' && !target.qualifiedName.slice(0, target.qualifiedName.lastIndexOf('::')).includes('::')) {
+      const visible = context.getNodesByName(name).filter((n) =>
+        n.kind === 'method' && n.qualifiedName === target.qualifiedName && isKotlinTopLevelVisible(n, ref, context));
+      if (visible.some((n) => n.id === target.id)) return found;
+      return visible.length === 1 ? { ...found, targetNodeId: visible[0]!.id } : undefined;
+    }
+    if (path.length === 1 || (target && isPathMember(target))) return found;
+    // Another type's `Builder`: the method of the one the path names, or the strategies after this one.
+    const own = context.getNodesByName(name).filter((n) => n.kind === 'method' && isPathMember(n));
+    return own.length === 1 ? { original: ref, targetNodeId: own[0]!.id, confidence: 0.85, resolvedBy: 'instance-method' } : undefined;
+  }
+  // An extension the index doesn't keep under the type may be it: one on a
+  // nullable receiver (`fun MediaType?.charsetOrUtf8()`) is a top-level
+  // function, one on a nested type (`fun Dns.Call.toEventsQueue()`) is kept
+  // under its outer type's bare name (`Dns::toEventsQueue`), where a member's
+  // owner carries its package.
+  const extension = context.getNodesByName(name).some((n) => n.language === 'kotlin' &&
+    (n.kind === 'function' || (n.kind === 'method' && !n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::')).includes('::'))));
+  return extension ? undefined : null;
+}
+
+/**
+ * The type a Kotlin local holds when its nearest declaration in the calling
+ * function sets it from an unqualified call alone — `val repo =
+ * repository()`, `var repo = this.repository()!!` — as that function declares
+ * (kotlinCallResultType, #2805). Undefined for any other declaration, or none.
+ */
+function kotlinLocalCallResultType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return undefined;
+  const r = escapeRegExp(receiver);
+  const declares = new RegExp(`\\b(?:val|var)\\s+${r}\\b`);
+  const initializer = new RegExp(`^(?:val|var)\\s+${r}\\s*=\\s*(?:this\\s*\\.\\s*)?([a-z_]\\w*)\\s*(?:<[^<>()]*>)?\\s*\\(`);
+  const start = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  for (let i = Math.min(lines.length, ref.line) - 1; i >= start; i--) {
+    const line = lines[i]!;
+    const at = declares.exec(i === ref.line - 1 ? line.slice(0, Math.max(0, ref.column)) : line);
+    if (!at) continue;
+    const text = [line.slice(at.index), ...lines.slice(i + 1, i + 1 + KOTLIN_CALL_LINES)].join('\n');
+    const call = initializer.exec(text);
+    if (!call) return undefined;
+    const close = kotlinClosingParen(text, call[0].length - 1);
+    if (close < 0 || !/^[ \t]*(?:!![ \t]*)?(?:;|\/\/|\r?\n|$)/.test(text.slice(close + 1))) return undefined;
+    // Only a type of the project's (see matchKotlinCallResultCall), and a
+    // nested one only when no other type shares its name: the type is looked
+    // up by its last name from here on.
+    const path = kotlinCallResultType(call[1]!, ref, context)?.split('.') ?? [];
+    const types = path.length > 0 ? kotlinProjectTypes(path[path.length - 1]!, context) : [];
+    return types.length === 1 || (types.length > 1 && path.length === 1) ? path[path.length - 1] : undefined;
+  }
+  return undefined;
+}
+
 /** Per-context memo: `<file>\0<type name as written>` → tsImportedTypeFile's answer. */
 const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
@@ -17848,6 +18053,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_FN_LOCAL_MEMO.delete(context);
   JS_CODE_BINDS.delete(context);
   JS_FN_CODE.delete(context);
+  JS_SCOPE_FILES.delete(context);
+  JS_MODULE_VALUES.delete(context);
+  REACT_LIFECYCLE_MEMO.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
   TS_PASS_THROUGH_WRAPPERS.delete(context);
@@ -17861,6 +18069,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_BASES_MEMO.delete(context);
   PY_FILE_CLASSES.delete(context);
   PY_ATTR_CALL_MEMO.delete(context);
+  PY_FILE_DEFS.delete(context);
+  PY_SCOPE_BINDINGS.delete(context);
+  PY_LOCAL_CLASS_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -17874,6 +18085,13 @@ function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
   PATTERN_MEMO.set(key, patterns);
   return patterns;
 }
+
+/**
+ * The type a TS annotation writes, captured: `Logger`, `Repository<User>` (as
+ * `Repository`), and with brackets after it whole — `Item[]`, `Element["ids"]`
+ * — for matchMethodCall to read (arrayElementType, tsIndexedPropertyType).
+ */
+const TS_ANNOTATED_TYPE = '([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)';
 
 export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
   return memoPatterns(`${language}|${r}`, () => buildLocalReceiverTypePatterns(language, r));
@@ -17908,7 +18126,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // can tell an array of it (`items: Item[]`, `items: Item<K>[]`), whose
         // own methods aren't an element's (arrayElementType), from one of its
         // properties (`groupIds: Element["groupIds"]`), which isn't it.
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)`), // lg: Logger  (annotation or typed param)
+        new RegExp(`\\b${r}\\b\\s*:\\s*${TS_ANNOTATED_TYPE}`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -18233,7 +18451,7 @@ function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): 
 const DECLARED_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
 const INHERITED_METHODS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
 
-function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+export function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
   let memo = DECLARED_SUPERS.get(context);
   if (!memo) DECLARED_SUPERS.set(context, (memo = new Map()));
   const hit = memo.get(cls.id);
@@ -18257,7 +18475,7 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
   const names = (text: string | undefined): string[] =>
     text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
   switch (cls.language) {
-    case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
+    case 'pascal': return names(/=\s*class\s*(?:sealed|abstract)?\s*\(([^)]*)\)/i.exec(head)?.[1]);
     // A base built by a class's factory — Django's `class Manager(
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.
@@ -18840,6 +19058,373 @@ function resolveAwaitedCallType(
 }
 
 /**
+ * A JS/TS file's code read for the bindings its names have (jsBindingAt):
+ * comments, strings, template literals and regex literals blanked; where each
+ * line starts; its braces as a tree of scopes, the first the file's own; and
+ * where a `const`/`let`/`var`, a `function`/`class` or an arrow can start.
+ * Per name, the bindings jsBindingSites finds.
+ */
+interface JsScopeFile {
+  code: string;
+  lineStarts: number[];
+  scopes: { start: number; end: number; parent: number }[];
+  varDecls: number[];
+  fnDecls: number[];
+  arrows: number[];
+  bindings: Map<string, JsBindingSite[]>;
+}
+
+/**
+ * A binding of a name: where it holds (`from`, its block's `{` or its body's
+ * start, through `to`) and where it is written (`at`). A `const`/`let`/`var`
+ * of the name alone is a declaration, a parameter list's name a parameter,
+ * a `function` or `class` declaration a function. Any other binding — a
+ * destructuring, a `for` head, a lone or destructured arrow parameter — says
+ * nothing of the value. `reading` keeps what the binding says
+ * (jsBindingReading).
+ */
+interface JsBindingSite {
+  from: number;
+  to: number;
+  at: number;
+  kind: 'declaration' | 'parameter' | 'function' | 'other';
+  reading?: JsBindingReading | null;
+}
+
+/**
+ * What a binding says its value is: an instance of the type it is written
+ * with, or of the class its whole value makes with `new` (`raw` as written,
+ * on `line`).
+ */
+type JsBindingReading = { type: string; raw: string; line: number };
+
+/** Per context, the files jsScopeFile read last, most recent last. */
+const JS_SCOPE_FILES = new WeakMap<ResolutionContext, Map<string, JsScopeFile | null>>();
+const JS_SCOPE_FILES_KEEP = 16;
+
+function jsScopeFile(filePath: string, context: ResolutionContext): JsScopeFile | null {
+  let files = JS_SCOPE_FILES.get(context);
+  if (!files) JS_SCOPE_FILES.set(context, (files = new Map()));
+  let file = files.get(filePath);
+  if (file !== undefined) {
+    files.delete(filePath);
+  } else {
+    file = null;
+    const source = context.readFile(filePath);
+    // A bundle's names are nothing a person declares a receiver with.
+    if (source !== null && source.length <= 1_000_000 && !isMinifiedContent(filePath, source)) {
+      const regexes: number[] = [];
+      const chars = blankStringContents(stripCommentsForRegex(source, 'javascript'), regexes).split('');
+      for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
+      const code = chars.join('');
+      const lineStarts = [0];
+      const scopes = [{ start: -1, end: code.length, parent: -1 }];
+      const open = [0];
+      for (let i = 0; i < code.length; i++) {
+        const c = code[i];
+        if (c === '\n') lineStarts.push(i + 1);
+        else if (c === '{') {
+          scopes.push({ start: i, end: code.length, parent: open[open.length - 1]! });
+          open.push(scopes.length - 1);
+        } else if (c === '}' && open.length > 1) scopes[open.pop()!]!.end = i;
+      }
+      const offsets = (re: RegExp): number[] => Array.from(code.matchAll(re), (m) => m.index!);
+      const arrows: number[] = [];
+      for (let a = code.indexOf('=>'); a !== -1; a = code.indexOf('=>', a + 2)) arrows.push(a);
+      file = { code, lineStarts, scopes, varDecls: offsets(VAR_DECL_SITE), fnDecls: offsets(FN_DECL_SITE), arrows, bindings: new Map() };
+    }
+    if (files.size >= JS_SCOPE_FILES_KEEP) files.delete(files.keys().next().value!);
+  }
+  files.set(filePath, file);
+  return file;
+}
+
+/** The innermost scope of `file` that holds `offset`. */
+function jsScopeAt(file: JsScopeFile, offset: number): number {
+  const { scopes } = file;
+  let lo = 0, hi = scopes.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (scopes[mid]!.start < offset) lo = mid; else hi = mid;
+  }
+  while (lo > 0 && scopes[lo]!.end < offset) lo = scopes[lo]!.parent;
+  return lo;
+}
+
+/** localBindingPatterns, sticky, by name. */
+function stickyBindingPatterns(name: string): LocalBindingPatterns {
+  let patterns = LOCAL_BINDING_PATTERNS.get(name);
+  if (!patterns) {
+    patterns = localBindingPatterns(name, 'y');
+    if (LOCAL_BINDING_PATTERNS.size >= LOCAL_BINDING_PATTERNS_CAP) {
+      LOCAL_BINDING_PATTERNS.delete(LOCAL_BINDING_PATTERNS.keys().next().value!);
+    }
+    LOCAL_BINDING_PATTERNS.set(name, patterns);
+  }
+  return patterns;
+}
+
+/** Every binding of `name` in the file, read once per file and name. */
+function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
+  const known = file.bindings.get(name);
+  if (known) return known;
+  const sites: JsBindingSite[] = [];
+  const { code } = file;
+  const { decl, fn, param } = stickyBindingPatterns(name);
+  const blockOf = (at: number) => {
+    const scope = file.scopes[jsScopeAt(file, at)]!;
+    return { from: scope.start, to: scope.end };
+  };
+  let resume = 0;
+  for (const at of file.varDecls) {
+    if (at < resume) continue;
+    decl.lastIndex = at;
+    const m = decl.exec(code);
+    if (!m) continue;
+    resume = at + m[0].length;
+    if (/\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at))) {
+      // A `for` head's binding holds in the head and the statement after it.
+      sites.push({ from: code.lastIndexOf('(', at), to: jsForStatementEnd(code, at), at, kind: 'other' });
+      continue;
+    }
+    // `const x = require('./x')` binds an import, which the file's imports answer for.
+    const plain = !/^(?:const|let|var)\s+[{[]/.test(m[0]) && !IMPORT_BINDING_VALUE.test(m[1] ?? '');
+    sites.push({ ...blockOf(at), at, kind: plain ? 'declaration' : 'other' });
+  }
+  for (const at of file.fnDecls) {
+    fn.lastIndex = at;
+    if (fn.test(code)) sites.push({ ...blockOf(at), at, kind: 'function' });
+  }
+  const n = escapeRegExp(name);
+  const paramName = new RegExp(`(?:^\\(|,)\\s*${PARAM_MODIFIERS}(?:\\.\\.\\.)?(${n})(?![\\w$])`);
+  let tried = -1;
+  for (let at = code.indexOf(name); at !== -1; at = code.indexOf(name, at + 1)) {
+    // A whole name, and no member's (`el.root`), though a rest parameter's (`...root`) is one.
+    if ((at > 0 && /[\w$]/.test(code[at - 1]!)) || /[\w$]/.test(code[at + name.length] ?? '') ||
+        (code[at - 1] === '.' && code.slice(Math.max(0, at - 3), at) !== '...')) continue;
+    const open = enclosingOpenParen(code, at);
+    // A control-flow head, `if (root) {`, binds nothing.
+    if (open >= 0 && /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(Math.max(0, open - 12), open))) continue;
+    if (open < 0) {
+      // A destructured parameter: `({ root }) => …`, `function f([root]) {`.
+      const body = destructuredParameterBody(code, at);
+      if (body) sites.push({ ...body, at, kind: 'other' });
+      continue;
+    }
+    if (open === tried) continue;
+    tried = open;
+    param.lastIndex = open;
+    const m = param.exec(code);
+    if (!m) continue;
+    const end = open + m[0].length;
+    const own = paramName.exec(m[0]);
+    sites.push({
+      ...(code[end - 1] === '{' ? { from: end - 1, to: jsBlockEnd(code, end) } : { from: end, to: jsBodyEnd(code, end) }),
+      at: own ? open + own.index + own[0].length - name.length : at,
+      kind: 'parameter',
+    });
+  }
+  // `name =>`: the name ends where the whitespace before the arrow starts.
+  for (const arrow of file.arrows) {
+    let end = arrow;
+    while (end > 0 && WHITESPACE.test(code[end - 1]!)) end--;
+    const start = end - name.length;
+    if (start >= 0 && code.startsWith(name, start) && (start === 0 || !ARROW_HEAD_CHAR.test(code[start - 1]!))) {
+      sites.push({ from: arrow + 2, to: jsBodyEnd(code, arrow + 2), at: start, kind: 'other' });
+    }
+  }
+  file.bindings.set(name, sites);
+  return sites;
+}
+
+/** Where a `for` statement whose head holds `at` ends: past the statement after its head. */
+function jsForStatementEnd(code: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth < 0) return c === ')' ? jsBodyEnd(code, i + 1) : i;
+  }
+  return code.length;
+}
+
+/**
+ * The body of the function whose parameter list destructures the name at
+ * `at` (`({ a, b: [root] }) => …`), or null when the name is in no
+ * parameter list: read back out of the braces and brackets around it to the
+ * `(` that opens the list, which a `=>` or a body's `{` follows (past a
+ * return type) and no `if`, `while`, `for`, `switch` or `with` heads.
+ */
+function destructuredParameterBody(code: string, at: number): { from: number; to: number } | null {
+  let depth = 0;
+  let nested = false;
+  let open = -1;
+  for (let i = at - 1; i >= 0 && at - i <= 2000; i--) {
+    const c = code[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) {
+        depth--;
+      } else if (c === '(') {
+        open = i;
+        break;
+      } else {
+        nested = true;
+      }
+    } else if (c === ';' && depth === 0) {
+      return null;
+    }
+  }
+  if (!nested || open < 0 || /\b(?:if|while|for|switch|with)\s*$/.test(code.slice(Math.max(0, open - 12), open))) return null;
+  let close = open + 1;
+  for (let d = 1; close < code.length && d > 0; close++) {
+    if (code[close] === '(') d++;
+    else if (code[close] === ')') d--;
+  }
+  const head = /^\s*(?::(?:[^=;{}()\n]|\{(?:[^{}]|\{[^{}]*\})*\})*)?(=>|\{)/.exec(code.slice(close, close + 2000));
+  if (!head) return null;
+  const end = close + head[0].length;
+  return head[1] === '{' ? { from: end - 1, to: jsBlockEnd(code, end) } : { from: end, to: jsBodyEnd(code, end) };
+}
+
+/**
+ * The binding of `name` in scope at `offset` of a JS/TS file: the one whose
+ * scope holds it innermost, and of two in one scope the declaration nearest
+ * before it. Null when no binding of the name holds there.
+ */
+function jsBindingAt(name: string, file: JsScopeFile, offset: number): JsBindingSite | null {
+  let best: JsBindingSite | null = null;
+  for (const site of jsBindingSites(name, file)) {
+    if (site.from > offset || site.to < offset) continue;
+    if (!best || site.from > best.from ||
+        (site.from === best.from && (site.at <= offset ? best.at > offset || site.at > best.at : best.at > offset && site.at < best.at))) {
+      best = site;
+    }
+  }
+  return best;
+}
+
+/**
+ * What a binding of `name` says its value is (JsBindingReading), or null when
+ * it says nothing: a declaration or a parameter written with a type, or a
+ * declaration whose whole value is a `new` of a class.
+ */
+function jsBindingReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  if (site.reading === undefined) {
+    site.reading = site.kind === 'parameter' ? jsParameterReading(name, site, file)
+      : site.kind === 'declaration' ? jsDeclarationReading(name, site, file)
+      : null;
+  }
+  return site.reading;
+}
+
+/** The 1-based line of an offset in `file`. */
+function jsLineOf(file: JsScopeFile, offset: number): number {
+  let lo = 0, hi = file.lineStarts.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (file.lineStarts[mid]! <= offset) lo = mid; else hi = mid;
+  }
+  return lo + 1;
+}
+
+/** The type a parameter is written with (`root: Root`, `svc?: Store`). */
+function jsParameterReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  const typed = new RegExp(`${escapeRegExp(name)}(?![\\w$])\\s*\\??\\s*:\\s*${TS_ANNOTATED_TYPE}`, 'y');
+  typed.lastIndex = site.at;
+  const raw = typed.exec(file.code)?.[1];
+  const type = raw ? normalizeInferredTypeName(raw) : null;
+  return raw && type ? { type, raw, line: jsLineOf(file, site.at) } : null;
+}
+
+/**
+ * What a `const`/`let`/`var` says its value is: the type it is written with,
+ * or the class its whole value makes with `new` — not a `new` of a
+ * parameter or variable (`new Backend(root)`), which names no class.
+ */
+function jsDeclarationReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
+  const { code } = file;
+  const head = new RegExp(`(?:const|let|var)\\s+${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
+  head.lastIndex = site.at;
+  const m = head.exec(code);
+  if (!m) return null;
+  const valueAt = site.at + m[0].length;
+  const rest = code.slice(valueAt, valueAt + 400);
+  // An object literal is its own members' (resolveObjectPathMember), whatever
+  // type it is written with: vite's `const server: ViteDevServer = { … }` is
+  // the `close` it declares, not the interface's.
+  if (/^[^=;]*=(?![=>])\s*\{/.test(rest)) return null;
+  const line = jsLineOf(file, site.at);
+  if (m[1]) {
+    const type = normalizeInferredTypeName(m[1]);
+    return type ? { type, raw: m[1], line } : null;
+  }
+  const made = /^\s*=\s*new\s+([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*(?:<[^;(){}]*>\s*)?\(/.exec(rest);
+  if (!made) return null;
+  const className = made[1]!.replace(/\s+/g, '');
+  const bound = jsBindingAt(className.split('.')[0]!, file, valueAt);
+  if (bound && bound.kind !== 'function') return null;
+  // The `new` is the whole value: no member, index, call or operator follows it.
+  let close = valueAt + made[0].length;
+  let depth = 1;
+  for (const limit = close + 5000; close < code.length && close < limit && depth > 0; close++) {
+    if (code[close] === '(') depth++;
+    else if (code[close] === ')') depth--;
+  }
+  if (depth > 0 || !/^[ \t]*(?:[;,)}]|\r?\n(?![ \t]*(?:[.(\[?:]|\?\?|\|\||&&|as\b))|$)/.test(code.slice(close, close + 200))) return null;
+  const type = normalizeInferredTypeName(className);
+  return type ? { type, raw: className, line } : null;
+}
+
+/**
+ * Per context and file: how many functions and methods hold each line, and
+ * the names the file's module scope gives a variable or constant node.
+ */
+const JS_MODULE_VALUES = new WeakMap<ResolutionContext, Map<string, { depth: Int32Array; names: Set<string> }>>();
+
+/**
+ * Whether the binding a call's receiver has may lie outside the function
+ * making the call, where the calling function's own declarations, which the
+ * receiver reader has read already, can't say what it is: in a function
+ * around that one, or at module scope, which declares the name. Code outside
+ * any function was read from the file's start.
+ */
+function jsMayBindOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  let files = JS_MODULE_VALUES.get(context);
+  if (!files) JS_MODULE_VALUES.set(context, (files = new Map()));
+  let scope = files.get(ref.filePath);
+  if (!scope) {
+    const nodes = context.getNodesInFile(ref.filePath);
+    const functions = nodes.filter((n) => n.kind === 'function' || n.kind === 'method');
+    const depth = new Int32Array(functions.reduce((last, n) => Math.max(last, n.endLine), 0) + 2);
+    for (const n of functions) {
+      depth[n.startLine]!++;
+      depth[n.endLine + 1]!--;
+    }
+    for (let line = 1; line < depth.length; line++) depth[line]! += depth[line - 1]!;
+    const names = new Set(nodes.filter((n) => (n.kind === 'variable' || n.kind === 'constant') && n.qualifiedName === n.name).map((n) => n.name));
+    if (files.size >= 64) files.delete(files.keys().next().value!);
+    files.set(ref.filePath, (scope = { depth, names }));
+  }
+  const around = scope.depth[ref.line] ?? 0;
+  return around > 1 || (around === 1 && scope.names.has(name));
+}
+
+/**
+ * A JS/TS receiver the calling function doesn't type, read by its binding in
+ * scope at the call (#2589): a module's `let root: Root | null`, a `let
+ * popupRoot: Root` in the function around the one calling, or an outer
+ * function's typed parameter. Null when the binding says nothing of its value.
+ */
+function jsReceiverBindingReading(receiver: string, ref: UnresolvedRef, context: ResolutionContext): JsBindingReading | null {
+  if (!jsMayBindOutside(receiver, ref, context)) return null;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const site = jsBindingAt(receiver, file, (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column);
+  return site ? jsBindingReading(receiver, site, file) : null;
+}
+
+/**
  * Patterns that recover a PHP class property's declared type for a
  * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
  * property-shaped declarations qualify —
@@ -19145,6 +19730,12 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // A Kotlin local set from an unqualified call holds what that function
+    // declares it returns: `val repo = repository()` (#2805), where the
+    // receiver's name led to the interface `Repo`.
+    if (!inferredType && ref.language === 'kotlin' && dotMatch && /^[a-z_]\w*$/.test(objectOrClass!)) {
+      inferredType = nmTimedT('mc-kotlincall', ref, () => kotlinLocalCallResultType(objectOrClass!, ref, context)) ?? null;
+    }
     // `subprocess.run(…)` after `import subprocess`: a function of a module
     // from outside the project, not a same-named project method (#2599).
     if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
@@ -19191,6 +19782,22 @@ export function matchMethodCall(
     if (awaited) {
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
+    }
+    // A TS/JS receiver the calling function doesn't type is read by its
+    // binding in scope at the call (#2589): a module's `let root: Root |
+    // null`, a `let popupRoot: Root` in the function around the one calling,
+    // or an outer function's typed parameter types it, as the calling
+    // function's own declaration would.
+    if (!inferredType && !awaited && dotMatch && /^[A-Za-z_$][\w$]*$/.test(objectOrClass!) &&
+        (ref.language === 'typescript' || ref.language === 'tsx' || ref.language === 'javascript' || ref.language === 'jsx') &&
+        objectOrClass !== 'this' && objectOrClass !== 'super' && !isImportBinding(objectOrClass!, ref, context) &&
+        isLocallyBoundJsName(objectOrClass!, ref.filePath, context)) {
+      const reading = nmTimedT('mc-jsbinding', ref, () => jsReceiverBindingReading(objectOrClass!, ref, context));
+      if (reading) {
+        inferredType = reading.type;
+        decl.raw = reading.raw;
+        decl.line = reading.line;
+      }
     }
     // A TS annotation with brackets after the type. An array of it (`items:
     // Item[]`): a method arrays have is the array's, which no project class
@@ -19731,6 +20338,14 @@ export function matchMethodCall(
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // A React class component's `render()` and lifecycle methods are React's
+    // to call (#2589): react-dom's `root.render(<App />)` is no error
+    // boundary's `render`, whatever holds the root.
+    if (JS_FAMILY.has(ref.language) && objectOrClass !== 'this' && objectOrClass !== 'super') {
+      const kept = targetMethods.filter((m) => !isReactLifecycleMethod(m, context));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
     // only by the name of its last link, in the scoring below — Django's
@@ -19869,6 +20484,36 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
   return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** The methods React calls on a class component itself. */
+const REACT_LIFECYCLE_METHODS: ReadonlySet<string> = new Set([
+  'render', 'componentDidMount', 'componentDidUpdate', 'componentWillUnmount', 'shouldComponentUpdate',
+  'getSnapshotBeforeUpdate', 'componentDidCatch', 'componentWillMount', 'componentWillReceiveProps',
+  'componentWillUpdate', 'UNSAFE_componentWillMount', 'UNSAFE_componentWillReceiveProps', 'UNSAFE_componentWillUpdate',
+]);
+const REACT_LIFECYCLE_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A lifecycle method (`render`, `componentDidMount`, …) of a class that
+ * extends React's `Component` or `PureComponent` (or Preact's), read from the
+ * class's head.
+ */
+function isReactLifecycleMethod(n: Node, context: ResolutionContext): boolean {
+  if (n.kind !== 'method' || !REACT_LIFECYCLE_METHODS.has(n.name)) return false;
+  let memo = REACT_LIFECYCLE_MEMO.get(context);
+  if (!memo) REACT_LIFECYCLE_MEMO.set(context, (memo = new Map()));
+  let hit = memo.get(n.id);
+  if (hit === undefined) {
+    const ownerName = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split('::').pop();
+    const owner = ownerName ? context.getNodesInFile(n.filePath).find((c) =>
+      c.kind === 'class' && c.name === ownerName && c.startLine <= n.startLine && c.endLine >= n.endLine) : undefined;
+    const lines = owner ? context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [] : [];
+    const head = owner ? lines.slice(owner.startLine - 1, Math.min(owner.startLine + 3, n.startLine)).join(' ').split('{')[0]! : '';
+    hit = /\bextends\s+(?:React\s*\.\s*)?(?:Pure)?Component\b/.test(head);
+    memo.set(n.id, hit);
+  }
+  return hit;
 }
 
 /** A method a Vue Options API component declares for itself (`index::handleLogin` in `index.vue`). */
@@ -22985,6 +23630,255 @@ function pythonAttrCallOn(
 }
 
 /**
+ * A call of a builtin-named method — `get`, `update`, `items`, `close` —
+ * through a local or a parameter (#2583): `reg = SystemPackRegistry();
+ * reg.get(k)`, `registry = load_registry()` with `def load_registry() ->
+ * SystemPackRegistry`, `def f(reg: SystemPackRegistry)`. The builtin filter
+ * drops such a call by its method's name before any strategy reads the
+ * receiver, and this is its one way back, by evidence only: the def that binds
+ * the name where the call reads it (the calling one, or one it is nested in)
+ * gives it one project class everywhere it binds it (pythonLocalClass), and
+ * the method is that class's own or a declared base's. A module-level name,
+ * and one its def leaves unknown or contested, stay dropped. The edge records
+ * the other files its answer was read from (`typeFrom`), as an attribute
+ * call's does, so a sync that edits the factory or a base re-opens it.
+ */
+export function matchPythonTypedLocalCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (ref.language !== 'python' || ref.referenceKind !== 'calls') return null;
+  const m = /^([A-Za-z_]\w*)\.(\w+)$/.exec(ref.referenceName);
+  if (!m || m[1] === 'self' || m[1] === 'cls') return null;
+  const receiver = m[1]!;
+  const scope = pythonBindingScope(receiver, ref, context);
+  if (!scope) return null;
+  const read = new Set<string>();
+  const cls = pythonLocalClass(scope, receiver, ref, context, read);
+  if (!cls || cls === 'runtime') return null;
+  const hit = pythonMethodOnClass(cls, m[2]!, ref, context, read);
+  if (!hit) return null;
+  read.delete(ref.filePath);
+  return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
+/** Per context: a python file's functions and methods, the latest-starting first, for the defs around a call. */
+const PY_FILE_DEFS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
+
+function pythonFileDefs(filePath: string, context: ResolutionContext): Node[] {
+  const memo = pyMemo(PY_FILE_DEFS, context);
+  let hit = memo.get(filePath);
+  if (!hit) {
+    hit = context.getNodesInFile(filePath)
+      .filter((n) => n.kind === 'function' || n.kind === 'method')
+      .sort((a, b) => b.startLine - a.startLine);
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(filePath, hit);
+  }
+  return hit;
+}
+
+/**
+ * Per context: a def and a name → what the def's parameter of that name is
+ * annotated with (pythonParamAnnotation), and every binding of the name in the
+ * def's own body.
+ */
+const PY_SCOPE_BINDINGS = new WeakMap<ResolutionContext, Map<string, { param: string | null | undefined; bindings: PythonBinding[] }>>();
+
+function pythonScopeBindings(scope: Node, name: string, context: ResolutionContext): { param: string | null | undefined; bindings: PythonBinding[] } {
+  const memo = pyMemo(PY_SCOPE_BINDINGS, context);
+  const key = `${scope.id}\0${name}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const lines = pythonMemberLines(scope.filePath, context);
+    const statements = pythonStatementStarts(scope.filePath, context);
+    // pythonLineBindings binds nothing on a statement that names the name
+    // only as a receiver or a container (`reg.get(…)`, `reg[k]`), its
+    // continuation lines included: its own word test rules those out first.
+    // An import binds the head of a dotted name (`import os.path`), and a star
+    // import, which binds any name, can't be written in a def. So the lines
+    // that can't bind skip its per-line work.
+    const n = escapeRegExp(name);
+    const word = new RegExp(`(?<![\\w.])${n}\\b(?!\\s*[.\\[])`);
+    const mention = new RegExp(`(?<![\\w.])${n}\\b`);
+    const names = (i: number): boolean => {
+      const test = /^\s*(?:from|import)\b/.test(lines[i]!) ? mention : word;
+      if (test.test(lines[i]!)) return true;
+      if (!statements[i]) return false;
+      for (let j = i + 1; j < lines.length && !statements[j]; j++) if (test.test(lines[j]!)) return true;
+      return false;
+    };
+    const bindings: PythonBinding[] = [];
+    for (const i of pythonOwnLines(scope, scope.filePath, context)) {
+      if (names(i)) bindings.push(...pythonLineBindings(lines, i, statements, name));
+    }
+    hit = { param: pythonParamAnnotation(scope.signature ?? '', name), bindings };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  return hit;
+}
+
+/**
+ * The def whose local `name` is the one `ref` reads: the innermost def around
+ * the reference that binds the name, by a parameter or anywhere in its own
+ * body. Null when no def around it does (a module global), or when one
+ * declares it `global`.
+ */
+function pythonBindingScope(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  for (const scope of pythonFileDefs(ref.filePath, context)) {
+    if (scope.startLine > ref.line || scope.endLine < ref.line) continue;
+    const { param, bindings } = pythonScopeBindings(scope, name, context);
+    if (param !== undefined) return scope;
+    if (bindings.some((b) => b.kind === 'global')) return null;
+    if (bindings.length > 0) return scope;
+  }
+  return null;
+}
+
+/**
+ * What the parameter `name` of a def with this signature (`(a, b: T = d)`)
+ * says of its type: the annotation as written, null for a parameter without
+ * one and for `*name` / `**name` (a tuple, a dict), undefined when the def has
+ * no parameter of that name.
+ */
+function pythonParamAnnotation(signature: string, name: string): string | null | undefined {
+  const open = signature.indexOf('(');
+  if (open < 0 || !signature.includes(name)) return undefined;
+  // Parameters split at the commas directly inside the parentheses; strings
+  // are blanked (same length) so a quoted comma or bracket doesn't count.
+  const blank = pythonBlankStrings(signature);
+  const params: Array<[number, number]> = [];
+  let depth = 0;
+  let from = open + 1;
+  for (let i = open; i < blank.length; i++) {
+    const c = blank[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) { params.push([from, i]); break; }
+    } else if (c === ',' && depth === 1) {
+      params.push([from, i]);
+      from = i + 1;
+    }
+  }
+  for (const [start, end] of params) {
+    const head = /^\s*(\*{0,2})([A-Za-z_]\w*)\s*(:?)/.exec(signature.slice(start, end));
+    if (!head || head[2] !== name) continue;
+    if (head[1] || !head[3]) return null;
+    // The annotation runs up to the default's `=`, outside brackets.
+    const at = start + head[0].length;
+    let d = 0;
+    let to = end;
+    for (let i = at; i < end; i++) {
+      const c = blank[i]!;
+      if (c === '(' || c === '[' || c === '{') d++;
+      else if (c === ')' || c === ']' || c === '}') d--;
+      else if (c === '=' && d === 0) { to = i; break; }
+    }
+    return signature.slice(at, to).trim() || null;
+  }
+  return undefined;
+}
+
+/** Per context: a def and a name → the class pythonLocalClass reads, and the files read for it. */
+const PY_LOCAL_CLASS_MEMO = new WeakMap<ResolutionContext, Map<string, { answer: PythonTypeAnswer; read: string[] }>>();
+
+/**
+ * The project class the local or parameter `name` of `scope` holds, the same
+ * for every binding of it there. A parameter holds what its annotation names
+ * (`"T"`, `Optional[T]` and `T | None` too); an assignment, what its own
+ * annotation names, or else what its whole value makes — a class's
+ * constructor, or a factory, typed by its `-> T` or by what it returns
+ * (pythonValueEvidence, pythonFactoryType) — or what an annotated parameter it
+ * copies holds; `name = None` says nothing either way. Each class is the one
+ * the file's imports name (pythonClassNamed), so one from outside the project,
+ * as `from queue import Queue` gives, is none of the project's ('runtime').
+ *
+ * Anything else that binds the name leaves its type unknown (null): a
+ * parameter without an annotation, a `for` / `with` / `except` / comprehension
+ * target, a tuple or augmented assignment, a walrus, an import, `del`, a
+ * nested `def` or `class` of the name, a `nonlocal` write from a def nested in
+ * the scope. So does a value that names no class — `{}` is a dict, and
+ * `json.load(p)`, `Foo().data()` or a union are unknown — and a callee the
+ * scope or a def around it rebinds (`Store = load(); reg = Store()`).
+ */
+function pythonLocalClass(
+  scope: Node,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer {
+  const memo = pyMemo(PY_LOCAL_CLASS_MEMO, context);
+  const key = `${scope.id}\0${name}`;
+  let hit = memo.get(key);
+  if (!hit) {
+    const own = new Set<string>();
+    hit = { answer: pythonLocalClassUncached(scope, name, ref, context, own), read: [...own] };
+    if (memo.size >= PY_MEMO_CAP) memo.clear();
+    memo.set(key, hit);
+  }
+  for (const f of hit.read) read.add(f);
+  return hit.answer;
+}
+
+function pythonLocalClassUncached(
+  scope: Node,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer {
+  const filePath = scope.filePath;
+  const { param, bindings } = pythonScopeBindings(scope, name, context);
+  const evidence: PythonEvidence[] = [];
+  if (param !== undefined) {
+    const ev = param === null ? null : pythonAnnotationEvidence(param);
+    if (!ev) return null;
+    evidence.push(ev);
+  }
+  for (const b of bindings) {
+    if (b.kind !== 'assign') return null;
+    let ev: PythonAttrEvidence;
+    if (b.type) {
+      // `reg: Base = make()` trusts the annotation; `reg: A = B()` contradicts it.
+      const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
+      if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) return null;
+      ev = pythonAnnotationEvidence(b.type);
+    } else if (b.value === 'None') {
+      continue;
+    } else if (/^[A-Za-z_]\w*$/.test(b.value)) {
+      // `reg = registry`: what the parameter's annotation names, unless the def rebinds it.
+      const copied = pythonScopeBindings(scope, b.value, context);
+      if (!copied.param || copied.bindings.length > 0) return null;
+      ev = pythonAnnotationEvidence(copied.param);
+    } else {
+      const at: UnresolvedRef = { ...ref, line: b.line + 1 };
+      if (pythonValueCallees(b.value).some((c) => pythonBindsLocally(c.split('.')[0]!, at, context, false))) return null;
+      ev = pythonValueEvidence(b.value, null);
+    }
+    if (!ev) return null;
+    evidence.push(ev);
+  }
+  // Nothing here can be a project class: a builtin, or no evidence.
+  if (!evidence.some((ev) => ev !== 'runtime')) return evidence.length > 0 ? 'runtime' : null;
+
+  // A def or class of the name nested in the scope binds it there, a def
+  // nested in it can rebind the scope's own through `nonlocal`, and `with … as
+  // (a, name)` binds it in a way pythonLineBindings doesn't read.
+  if (pythonFileDefs(filePath, context).some((n) => n.id !== scope.id && n.name === name &&
+      n.startLine > scope.startLine && n.endLine <= scope.endLine) ||
+      pythonFileClasses(filePath, context).some((n) => n.name === name &&
+      n.startLine > scope.startLine && n.endLine <= scope.endLine)) return null;
+  const lines = pythonMemberLines(filePath, context);
+  const n = escapeRegExp(name);
+  const nonlocal = new RegExp(`^\\s*nonlocal\\b.*(?<![\\w.])${n}\\b`);
+  const asTuple = new RegExp(`\\bas\\s*\\([^)]*(?<![\\w.])${n}\\b`);
+  for (let i = scope.startLine - 1; i < Math.min(scope.endLine, lines.length); i++) {
+    const line = lines[i]!;
+    if (line.includes(name) && (nonlocal.test(line) || asTuple.test(line))) return null;
+  }
+  return pythonAgree(evidence.map((ev) => pythonEvidenceClass(ev, filePath, context, read, 0, null)));
+}
+
+/**
  * Python chained factory call — `Client.from_env().send()`,
  * `make_client().send()`, `Client().send()` — the python instance of the #750
  * chained-factory family. The receiver's class is what the factory produces
@@ -25840,6 +26734,16 @@ function matchReferenceInner(
   if (ref.language === 'rust' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const lent = nmTimedT('rustAsMut', ref, () => matchRustAsMutChainCall(ref, context));
     if (lent !== undefined) return lent;
+  }
+
+  // A Kotlin call on what an unqualified call returns, which the extractor
+  // records by its bare name — `repository().pending(1)` — is a call on the
+  // type that function declares, or on nothing (#2805): the strategies below
+  // took any `pending`, a test double's in another package. What the type
+  // inherits counts, as inheritance is resolved before any call.
+  if (ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
+    const onResult = nmTimedT('kotlinCallResult', ref, () => matchKotlinCallResultCall(ref, context));
+    if (onResult !== undefined) return onResult;
   }
 
   // Try strategies in order of confidence

@@ -43,6 +43,7 @@ import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
 import { goStdlibMethods } from './go-stdlib-methods';
+import { overrideFilter } from './override-parameters';
 import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 import { isTestPath } from '../search/query-utils';
@@ -808,7 +809,9 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
  * interface method. Bridge it like cpp-override: for each class that
  * `implements` an interface (or `extends` an abstract base), link each
  * base/interface method → the class's same-name method (the override) so
- * trace/callees reach the implementation. Over-approximation accepted
+ * trace/callees reach the implementation. Of an overloaded name, an overload
+ * links the methods with its parameters where the language makes an override
+ * repeat them (./override-parameters, #2663). Over-approximation accepted
  * (reachability-correct); capped per class, gated to JVM languages.
  */
 // Languages whose static `implements`/`extends` edges should bridge an
@@ -822,6 +825,13 @@ const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
   'arkts',
 ]);
+/**
+ * Languages whose static and instance methods override only their own kind:
+ * a JS/TS class's statics are inherited and overridden by the subclass's
+ * statics, its instance methods by instance methods (#2761). tsx and jsx
+ * follow the same rule, though this pass doesn't walk their classes today.
+ */
+const STATIC_SPLIT_LANGS: ReadonlySet<string> = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 /**
  * Whether a supertype edge out of a Go type is one of its embeddings (#2397):
  * declared, never synthesized (go-implements writes those), into a struct, an
@@ -1566,7 +1576,7 @@ function goPromotions(
   };
 }
 
-async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+async function interfaceOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1602,6 +1612,21 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
     ];
     protocolMemo.set(base.id, methods);
     return methods;
+  };
+  // Of a class's same-named methods, the ones that can override one of a
+  // base's overloads (#2663): Java, Kotlin, C# and Scala make an override
+  // repeat the parameters of what it overrides. Asked only for a name that
+  // is overloaded on either side.
+  const overridesOf = overrideFilter(ctx);
+  const nameCounts = new Map<string, Map<string, number>>();
+  const declaredNamed = (base: Node, name: string): number => {
+    let counts = nameCounts.get(base.id);
+    if (!counts) {
+      counts = new Map();
+      for (const m of baseMethodsOf(base)) counts.set(m.name, (counts.get(m.name) ?? 0) + 1);
+      nameCounts.set(base.id, counts);
+    }
+    return counts.get(name) ?? 0;
   };
   // A Go struct also satisfies an interface with the methods its embedded
   // types promote into it (goImplementsEdges counts them), and a call through
@@ -1647,8 +1672,11 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
       const promotes = goStruct && sup.provenance === 'heuristic' && base.kind === 'interface';
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
       // `list(params)` are distinct nodes and a call may resolve to either, so
-      // link every base overload → every same-name impl overload (keying by name
-      // alone would drop all but one and miss the resolved overload). A Go
+      // each base overload links the same-name impl methods that can override
+      // it — by parameters where the language makes an override repeat them
+      // (overrideFilter), else every one (keying by name alone would drop all
+      // but one and miss the resolved overload). A name declared once on each
+      // side pairs as it is. A Go
       // interface's unexported method is matched in its own package only
       // (goMethodKey): a namesake the type declares elsewhere is another
       // method, and the one the interface asks for is promoted.
@@ -1668,9 +1696,15 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
           if (promotes) unmatched.push(bm);
           continue;
         }
-        for (const m of impls) {
+        const overloaded = impls.length > 1 || declaredNamed(base, bm.name) > 1;
+        for (const m of overloaded ? overridesOf(bm, impls) : impls) {
           if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
           if (bm.id === m.id) continue;
+          // A JS/TS static method overrides only a static one, and an
+          // instance method only an instance one (#2761): B's `s()` and the
+          // `static s()` of `class A extends B` are unrelated, and a call to
+          // one never runs the other.
+          if (STATIC_SPLIT_LANGS.has(m.language) && (bm.isStatic === true) !== (m.isStatic === true)) continue;
           const key = `${bm.id}>${m.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -5101,7 +5135,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   {
     name: 'ifaceEdges',
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
-    run: (q, _c, y) => interfaceOverrideEdges(q, y),
+    run: (q, c, y) => interfaceOverrideEdges(q, c, y),
   },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },

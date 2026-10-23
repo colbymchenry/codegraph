@@ -4,6 +4,18 @@ import { hasFlowPragma } from '../grammars';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 /**
+ * Whether a class member is written `static`: its own `static` keyword, never
+ * a member named `static()`. Shared by the TypeScript and JavaScript
+ * extractors, which parse class bodies alike.
+ */
+export function hasStaticModifier(node: SyntaxNode): boolean {
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.child(i)?.type === 'static') return true;
+  }
+  return false;
+}
+
+/**
  * A TS/JS class field (`public_field_definition` / `field_definition`) is a
  * METHOD only when its value is callable — an arrow function, a function
  * expression, or a HOF call wrapping one (`onScroll = throttle(() => {…})`),
@@ -138,7 +150,10 @@ export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   isAmbientFunction: isAmbientFunctionSignature,
-  classTypes: ['class_declaration', 'abstract_class_declaration'],
+  // `class` is a class expression, `register(class Widget extends Base {…})`:
+  // a named one is a class with its members and supertypes (#2499), and an
+  // anonymous one is passed over (TreeSitterExtractor.isClassTypeNode).
+  classTypes: ['class_declaration', 'abstract_class_declaration', 'class'],
   // `method_signature` is the interface/type-literal form of a method; without it
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need
@@ -230,13 +245,7 @@ export const typescriptExtractor: LanguageExtractor = {
     }
     return false;
   },
-  isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (child?.type === 'static') return true;
-    }
-    return false;
-  },
+  isStatic: hasStaticModifier,
   isConst: (node) => {
     // For lexical_declaration, check if it's 'const' or 'let'
     // For variable_declaration, it's always 'var'
