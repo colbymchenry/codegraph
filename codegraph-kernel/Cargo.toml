@@ -23,7 +23,6 @@ regex = "1"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-java = "0.23"
-tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 # Pinned exact: the vendored wasm (src/extraction/wasm/) was built from these
 # tags' checked-in parser.c, sha-matched against these registry tarballs

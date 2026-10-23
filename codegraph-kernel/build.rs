@@ -1,6 +1,17 @@
 fn main() {
     napi_build::setup();
 
+    // Python v0.23.6 (bffb65a), same generated parser as the wasm; scanner avoids
+    // rescanning indented comment runs that cannot produce an INDENT or DEDENT.
+    let mut python = cc::Build::new();
+    python.include("grammars/python");
+    python.file("grammars/python/parser.c");
+    python.file("grammars/python/scanner.c");
+    python.flag_if_supported("-Wno-unused-parameter");
+    python.flag_if_supported("-utf-8");
+    python.compile("tree-sitter-python");
+    println!("cargo:rerun-if-changed=grammars/python");
+
     // Kotlin grammar — vendored C, compiled here instead of a crate dep: the
     // crates.io tree-sitter-kotlin 0.3.8 pins `tree-sitter >= 0.21, < 0.23`
     // (the kernel links 0.25) and tree-sitter-kotlin-ng is a DIFFERENT

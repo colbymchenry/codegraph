@@ -13,6 +13,9 @@
 
 use tree_sitter::Language;
 
+// Python v0.23.6 with the behavior-preserving comment lookahead optimization.
+extern "C" { fn tree_sitter_python() -> *const (); }
+
 // Vendored kotlin grammar (build.rs-compiled C — no usable crate exists;
 // see grammars/kotlin and the kotlin checklist §Grammar prep).
 extern "C" {
@@ -53,7 +56,7 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "javascript" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
-        "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "python" => Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_python) }.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         // `.metal`/`.cu`/`.cuh` map to language 'cpp' at detectLanguage, so the
         // dialects ride this grammar too (their blanking pre-passes stay
