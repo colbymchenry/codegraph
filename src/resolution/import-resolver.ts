@@ -30,6 +30,7 @@ import {
   tsImportedTypeFile,
   reExportSource,
   pythonFunctionModuleAlias,
+  isPythonFromImportModule,
   isRustAssociatedItem,
   tsGlobalScope,
 } from './name-matcher';
@@ -3661,11 +3662,14 @@ function resolvePythonAbsoluteModule(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
-  // (`from app.api.routes import authentication`) is ambiguous on its own — three
-  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
-  // which uses the import's source (`app.api.routes`) to build the full path.
-  if (!ref.referenceName.includes('.')) return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path, and so does
+  // the module a from-import names, dotted or not: `from loader import X` is
+  // the top-level `loader`, found from the package roots as `import loader`
+  // finds it. A bare leaf it imports (`from app.api.routes import
+  // authentication`) is ambiguous on its own — three `authentication.py` files
+  // may exist — so leave it to resolveModuleImportToFile, which uses the
+  // import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.') && !isPythonFromImportModule(ref, context)) return null;
   const hit = pythonModuleFileNode(ref.referenceName, ref.filePath, context);
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
