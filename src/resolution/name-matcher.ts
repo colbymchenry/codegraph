@@ -20571,6 +20571,7 @@ export function matchMethodCall(
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, targetMethods[0]!, context)) return null;
+      if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -20883,6 +20884,25 @@ function importBindsOther(candidate: Node, ref: UnresolvedRef, context: Resoluti
   if (!node || node.kind === 'function' || node.kind === 'method' || node.filePath === candidate.filePath) return false;
   const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/)) ?? [];
   return !/\bimport\s*\(/.test(lines.slice(node.startLine - 1, Math.min(node.endLine, node.startLine + 15)).join('\n'));
+}
+
+/** Receivers that name the current object (or its own class/base) — a call
+ * through one of these may genuinely recurse into the enclosing method. */
+const SELF_RECEIVERS = new Set(['this', 'self', 'Self', 'super', 'cls']);
+
+/**
+ * Strategy 3's single-candidate branch matches by method NAME alone, so a
+ * delegating wrapper whose method is the only one of that name —
+ * `wrapped.unbind(v)` inside `unbind(v)` — name-matches the method it is
+ * written in and the resolver emitted a self-loop. (The word-overlap branch
+ * already refuses the caller itself.) A receiver that is an explicit, other
+ * object is by construction not the enclosing method's own instance, so that
+ * candidate is the one guess we know is wrong: no edge beats a wrong edge.
+ * Real recursion (`this.foo()`, `self.foo()`, bare `foo()`) is kept; Go's
+ * named method receiver (`r.foo()`) is typed and never gets here.
+ */
+function isForeignReceiverSelfLoop(candidate: Node, receiver: string, ref: UnresolvedRef): boolean {
+  return candidate.id === ref.fromNodeId && !SELF_RECEIVERS.has(receiver);
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
