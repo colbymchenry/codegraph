@@ -406,7 +406,8 @@ export const Box = () => <div data-size={THEME_TOKENS.size} />;
 
   it('torture fixture (java): Lombok, anonymous classes, method refs, chains', () => {
     const file = path.join(FIXTURE_DIR, 'Torture.java');
-    assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
+    const result = assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');
+    expect(result.nodes.find(n => n.name === 'DEFAULT_PRIORITY')).toMatchObject({ kind: 'constant', isStatic: true });
   });
 
   it('torture fixture (java records): components, compact ctors, nested/local/generic records', () => {
