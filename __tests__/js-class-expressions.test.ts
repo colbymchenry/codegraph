@@ -175,7 +175,7 @@ describe.each(['js', 'ts'])('a class expression\'s name reaches it from inside a
 
     expect(edgesFrom(graph, `src/widgets.${ext}`)).toEqual([
       'calls Panel::PanelImpl::go -> Base::run [instance-method 0.9]',
-      'calls Widget::extra -> Widget::run [exact-match 0.4]',
+      'calls Widget::extra -> Widget::run [exact-match 0.9]',
       'calls Widget::run -> Base::run [instance-method 0.9]',
       `calls src/widgets.${ext} -> register [import 0.9]`,
       'extends Panel::PanelImpl -> Base [import 0.9]',
