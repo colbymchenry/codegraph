@@ -14047,9 +14047,10 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
-  // Only calls and captured method values have a callable receiver. Inheritance
-  // references such as `class Foo extends IBar.Stub` must not reach this helper.
-  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref') return null;
+  // Frameworks can name an inherited handler with a qualified reference.
+  // Inheritance refs still name a type, not a callable receiver.
+  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref' &&
+      ref.referenceKind !== 'references') return null;
 
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
@@ -21534,11 +21535,9 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // A dotted/scoped name is not necessarily an invocation: Java inheritance
-  // refs such as `IBar.Stub` have the same surface shape. Let type-reference
-  // strategies handle non-call refs rather than falling through to the
-  // same-named-method heuristics below.
-  if (ref.referenceKind !== 'calls') return null;
+  // A dotted/scoped name can be a framework's handler reference, while
+  // inheritance refs must stay with type lookup.
+  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'references') return null;
 
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
