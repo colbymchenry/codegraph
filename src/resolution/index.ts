@@ -43,6 +43,9 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
+import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -1141,6 +1144,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -1560,6 +1564,10 @@ export class ReferenceResolver {
     // its name alone (see ./js-super-calls).
     const superCall = matchJsSuperCall(ref, this.context);
     if (superCall !== undefined) return superCall;
+
+    if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, this.context, matchReference);
+    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
+    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
 
     // Skip built-in/external references — except a python call of a
     // builtin-named method through a local or a parameter its def types as a
@@ -2000,6 +2008,8 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
+          ...(ref.original.language === 'verilog' && ref.original.candidates?.length
+            ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -2305,6 +2315,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2425,6 +2436,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
