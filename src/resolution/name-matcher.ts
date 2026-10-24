@@ -18283,7 +18283,7 @@ function kotlinDeclaredTypeIn(
     const argType = inferLocalReceiverType(arg[1], ref, context);
     return argType && /^[A-Z]/.test(argType) ? argType : null;
   }
-  return kotlinCallResultType(segments.length > 0 ? segments.join('::') : undefined, last, ref, context);
+  return kotlinChainedCallResultType(segments.length > 0 ? segments.join('::') : undefined, last, ref, context);
 }
 
 /** Kotlin stdlib functions whose result is always a library type. */
@@ -18307,7 +18307,7 @@ const KOTLIN_ARGUMENT_PASSTHROUGH = new Set(['requireNotNull', 'checkNotNull']);
  * `HardwareLock::Lease`). KOTLIN_EXTERNAL_TYPE for a call on a type the
  * project does not declare (`Executors.newSingleThreadScheduledExecutor()`).
  */
-function kotlinCallResultType(
+function kotlinChainedCallResultType(
   owner: string | undefined,
   fn: string,
   ref: UnresolvedRef,
