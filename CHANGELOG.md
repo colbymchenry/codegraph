@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- When a project keeps copies of the same code in several modules, a call now links to the copy in the caller's own module, even in deeply nested trees where it could previously land on another module's copy.
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In JavaScript and TypeScript, a call or `new` in a parameter's default value, like `function renderWithNote(note = buildNote())`, a destructured `{ size = defaultSize() }` or `constructor(private svc = new Service())`, now counts as the function's own call. Before, it was dropped, so `buildNote` was missing that caller and impact on it came back incomplete. Re-index JavaScript and TypeScript projects after upgrading. Thanks @inth3shadows for the report and the pull request. (#2588)
 - In React, a component rendered at module scope, in a top-level constant or inside a test's `it(…)` callback, like `createRoot(el).render(<App />)` or `render(<Card />)`, now counts as rendered there, so an app's entry reaches its root component and a component's tests show among its callers. (#2587)
