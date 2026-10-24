@@ -900,6 +900,12 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
 
+## Contributing
+
+Contributions are welcome! See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, testing conventions, and PR guidelines.
+
+Want to add a new language? Use the `/add-lang` skill (`.claude/skills/add-lang/SKILL.md`) — it walks through sourcing a tree-sitter grammar, probing the AST, choosing an extractor pattern, and the worked examples in the existing extractors.
+
 ## License
 
 MIT
