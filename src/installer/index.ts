@@ -161,16 +161,19 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4: auto-allow permissions (only meaningful for Claude;
-  // skipped silently by other targets).
+  // Step 4: auto-allow permissions (only meaningful for Claude and
+  // Qwen Code; skipped silently by other targets).
   let autoAllow: boolean;
   if (opts.autoAllow !== undefined) {
     autoAllow = opts.autoAllow;
   } else if (useDefaults) {
     autoAllow = true;
-  } else if (targets.some((t) => t.id === 'claude')) {
+  } else if (targets.some((t) => t.id === 'claude' || t.id === 'qwen')) {
+    const forClaude = targets.some((t) => t.id === 'claude');
+    const forQwen = targets.some((t) => t.id === 'qwen');
+    const scope = forClaude && forQwen ? 'Claude Code and Qwen Code' : forClaude ? 'Claude Code' : 'Qwen Code';
     const ans = await clack.confirm({
-      message: 'Auto-allow CodeGraph commands? (Skips permission prompts in Claude Code)',
+      message: `Auto-allow CodeGraph commands? (Skips permission prompts in ${scope})`,
       initialValue: true,
     });
     if (clack.isCancel(ans)) {
@@ -480,8 +483,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.qwen' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro, ./.qwen' },
       ],
       initialValue: 'global' as const,
     });

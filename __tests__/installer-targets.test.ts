@@ -516,6 +516,159 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
+  it('qwen: install writes settings.json (mcpServers.codegraph) and the QWEN.md block (#704)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(result.files.some((f) => f.path === qwenMd)).toBe(true);
+    expect(fs.existsSync(qwenMd)).toBe(true);
+    expect(fs.readFileSync(qwenMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    // autoAllow uses Qwen's server-scoped rule, not Claude's wildcard form.
+    expect(cfg.permissions.allow).toEqual(['mcp__codegraph']);
+  });
+
+  it('qwen: autoAllow=false writes the MCP entry but no permissions', () => {
+    const qwen = getTarget('qwen')!;
+    qwen.install('global', { autoAllow: false });
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.permissions).toBeUndefined();
+  });
+
+  it('qwen: install preserves pre-existing settings (model/security/mcpServers siblings survive)', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      model: { name: 'qwen3-max' },
+      security: { auth: { selectedType: 'openai' } },
+      mcpServers: { idea: { type: 'stdio', command: 'java' } },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.model?.name).toBe('qwen3-max');
+    expect(after.security?.auth?.selectedType).toBe('openai');
+    expect(after.mcpServers.idea).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+    expect(after.permissions.allow).toEqual(['mcp__codegraph']);
+  });
+
+  it('qwen: preserves JSONC comments through install + idempotent re-run', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    const original = [
+      '{',
+      '  // my qwen setup',
+      '  "general": { "language": "zh" }, // keep Chinese replies',
+      '  /* providers below */',
+      '  "model": { "name": "qwen3-max" }',
+      '}',
+      '',
+    ].join('\n');
+    fs.writeFileSync(settings, original);
+
+    qwen.install('global', { autoAllow: true });
+    const afterInstall = fs.readFileSync(settings, 'utf-8');
+    expect(afterInstall).toContain('// my qwen setup');
+    expect(afterInstall).toContain('// keep Chinese replies');
+    expect(afterInstall).toContain('/* providers below */');
+    expect(afterInstall).toContain('"codegraph"');
+    expect(afterInstall).toContain('"qwen3-max"');
+
+    const second = qwen.install('global', { autoAllow: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+    expect(fs.readFileSync(settings, 'utf-8')).toBe(afterInstall);
+  });
+
+  it('qwen: install replaces a legacy QWEN.md codegraph block, preserving user content', () => {
+    const qwen = getTarget('qwen')!;
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    fs.mkdirSync(path.dirname(qwenMd), { recursive: true });
+    fs.writeFileSync(qwenMd, `# My Qwen notes\n\nAlways respond in Chinese.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = qwen.install('global', { autoAllow: false });
+
+    const body = fs.readFileSync(qwenMd, 'utf-8');
+    expect(body).toContain('# My Qwen notes');
+    expect(body).toContain('Always respond in Chinese.');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+    expect(result.files.find((f) => f.path.endsWith('QWEN.md'))?.action).toBe('updated');
+  });
+
+  it('qwen: local install writes ./.qwen/settings.json and the project-root ./QWEN.md block (#704)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.qwen/settings.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/QWEN.md') && !p.includes('/.qwen/'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'QWEN.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), '.qwen', 'settings.json'))).toBe(true);
+  });
+
+  it('qwen: uninstall removes only codegraph — sibling servers, permissions and settings survive', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      model: { name: 'qwen3-max' },
+      mcpServers: { idea: { type: 'stdio', command: 'java' } },
+      permissions: { allow: ['mcp__codegraph', 'mcp__idea', 'Read'] },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.mcpServers?.codegraph).toBeUndefined();
+    expect(after.mcpServers.idea).toBeDefined();
+    expect(after.permissions.allow).toEqual(['mcp__idea', 'Read']);
+    expect(after.model?.name).toBe('qwen3-max');
+    expect(qwen.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('qwen: uninstall drops emptied mcpServers/permissions wrappers', () => {
+    const qwen = getTarget('qwen')!;
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.mcpServers).toBeUndefined();
+    expect(after.permissions).toBeUndefined();
+  });
+
+  it('qwen: uninstall strips a leftover QWEN.md codegraph block, keeping user content', () => {
+    const qwen = getTarget('qwen')!;
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    fs.mkdirSync(path.dirname(qwenMd), { recursive: true });
+    fs.writeFileSync(qwenMd, `# My Qwen notes\n\nAlways respond in Chinese.\n\n${LEGACY_BLOCK}\n`);
+
+    qwen.uninstall('global');
+
+    const body = fs.readFileSync(qwenMd, 'utf-8');
+    expect(body).toContain('# My Qwen notes');
+    expect(body).toContain('Always respond in Chinese.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('qwen: uninstall when never installed reports not-found, no throw', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.uninstall('global');
+    for (const f of result.files) {
+      expect(['not-found', 'kept']).toContain(f.action);
+    }
+  });
+
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
