@@ -178,6 +178,12 @@ interface MacroDef {
   expansion: string;
 }
 
+/** Regex captures are sliced strings in V8. A cached tiny macro capture would
+ * otherwise pin its whole multi-megabyte source header; force an owned copy. */
+function ownString(value: string): string {
+  return Buffer.from(value, 'utf8').toString('utf8');
+}
+
 /**
  * Collect function-like macros from (comment-stripped) source, joining
  * `\`-continuations first. Only object/positional table macros matter here, so
@@ -191,9 +197,9 @@ function parseFunctionMacros(stripped: string): Map<string, MacroDef> {
   const RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)\(([^)]*)\)\s+(.+)$/gm;
   let m: RegExpExecArray | null;
   while ((m = RE.exec(joined))) {
-    const params = m[2]!.split(',').map((p) => p.trim()).filter(Boolean);
+    const params = m[2]!.split(',').map((p) => p.trim()).filter(Boolean).map(ownString);
     if (params.some((p) => p === '...' || p.endsWith('...'))) continue; // variadic — skip
-    out.set(m[1]!, { params, expansion: m[3]!.trim() });
+    out.set(ownString(m[1]!), { params, expansion: ownString(m[3]!.trim()) });
   }
   return out;
 }
@@ -207,20 +213,39 @@ function parseObjectMacros(stripped: string): Map<string, string> {
   const out = new Map<string, string>();
   if (!stripped.includes('#define') && !stripped.includes('# define')) return out;
   const joined = stripped.replace(/\\\r?\n/g, ' ');
-  const RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+(\S[^\n]*)$/gm;
+  const RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+((?:(?:struct|union)[ \t]+)?[A-Za-z_]\w*)[ \t\r]*$/gm;
   let m: RegExpExecArray | null;
-  while ((m = RE.exec(joined))) out.set(m[1]!, m[2]!.trim());
+  while ((m = RE.exec(joined))) out.set(ownString(m[1]!), ownString(m[2]!));
   return out;
 }
 
 /** All macro names a file `#define`s (value-ful or not) — the "defined" set for #ifdef. */
-function parseDefinedNames(stripped: string): Set<string> {
+function parseDefinedNames(stripped: string, relevant: Set<string>): Set<string> {
   const out = new Set<string>();
-  if (!stripped.includes('#define') && !stripped.includes('# define')) return out;
+  if (relevant.size === 0 || (!stripped.includes('#define') && !stripped.includes('# define'))) return out;
   const RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)/gm;
   let m: RegExpExecArray | null;
-  while ((m = RE.exec(stripped))) out.add(m[1]!);
+  while ((m = RE.exec(stripped))) {
+    if (relevant.has(m[1]!)) out.add(ownString(m[1]!));
+  }
   return out;
+}
+
+/** Names the conditional evaluator can observe. Keeping only these in each
+ * file's defined-set drops millions of numeric register macros that can never
+ * affect an `#ifdef`/`defined(NAME)` branch in any registration unit. */
+function collectConditionalNames(source: string, out: Set<string>): void {
+  if (!source.includes('#if') && !source.includes('# if') && !source.includes('#elif')) return;
+  const ifdef = /^[ \t]*#[ \t]*(?:ifdef|ifndef)[ \t]+(\w+)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = ifdef.exec(source))) out.add(ownString(m[1]!));
+  const line = /^[ \t]*#[ \t]*(?:if|elif)\b([^\n]*)$/gm;
+  while ((m = line.exec(source))) {
+    const expr = m[1]!;
+    const defined = /\bdefined\s*(?:\(\s*)?(\w+)/g;
+    let d: RegExpExecArray | null;
+    while ((d = defined.exec(expr))) out.add(ownString(d[1]!));
+  }
 }
 
 /**
@@ -370,7 +395,7 @@ const INCLUDABLE_EXT = /\.(def|inc|h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc|tbl)$/i;
  *  are excluded: `resolveTypeName` would rewrite to a dead-end token that can
  *  never name a struct, so skipping them is exact, and it drops the register
  *  flood. */
-const OBJ_ALIAS_RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+(?:(?:struct|union)[ \t]+)*[A-Za-z_]\w*[ \t\r]*$/gm;
+const OBJ_ALIAS_RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+((?:(?:struct|union)[ \t]+)?[A-Za-z_]\w*)[ \t\r]*$/gm;
 
 /** `(?:struct )?TYPE name[opt] = {` initializers, where TYPE is a struct that
  *  has ≥1 fn-pointer field. Handles both single (`= {…}`) and array
@@ -469,19 +494,26 @@ export async function cFnPointerDispatchEdges(
   // The extraction sweep reads sequentially; the linking stages re-request
   // only surviving files (plus include units), so access is near-sequential
   // and a small LRU hits; a miss just re-reads + re-strips.
-  // Cache sizing is memory-budget-aware AND all-or-nothing (§7a.3 cFnPtr
-  // round): a partial LRU is WORSE than useless for cyclic sweeps (a first
-  // attempt sized ~61k against 63.8k files thrashed to a ~0% cross-sweep hit
-  // rate). Hold every stripped file (~24KB each measured on the Linux tree)
-  // only when 40% of the live memory budget covers it; otherwise keep the
-  // within-stage-locality 128. When the big cache declines (the kernel), the
-  // survival filters keep the linking stages' re-strips to a fraction of a
-  // sweep. Slack over files.length: non-indexed includes (.def/.inc, generated
-  // headers) join the working set mid-pass. Pass-scoped transient, freed on
-  // return.
+  // Bound by ACTUAL retained string bytes, not an average bytes-per-file guess:
+  // large generated files made the old entry-count estimate understate the
+  // cache by multiples and drove the main-thread resolution pass into OOM.
+  // UTF-16 length*2 is conservative for V8's one-byte strings and correctly
+  // bounds the worst case. The shared 128MB ceiling is also capped at 5% of
+  // currently-available memory, leaving room for the DB, fact tables and edges.
+  // The survival filters keep cache misses in later stages to a fraction of a
+  // full sweep, so bounded re-reads are preferable to an unbounded peak.
   const fullCacheCap = Math.ceil(files.length * 1.05) + 512;
-  const cacheCap = memoryBudgetBytes() * 0.5 >= fullCacheCap * 24_576 ? fullCacheCap : 128;
-  const rawCache = new LRUCache<string, string | null>(Math.min(cacheCap, 4096));
+  const totalTextBudget = Math.max(
+    16 * 1024 * 1024,
+    Math.min(128 * 1024 * 1024, Math.floor(memoryBudgetBytes() * 0.05))
+  );
+  const rawBudget = Math.floor(totalTextBudget / 3);
+  const srcBudget = totalTextBudget - rawBudget;
+  const stringWeight = (value: string | null): number => value === null ? 1 : Math.max(64, value.length * 2);
+  const rawCache = new LRUCache<string, string | null>(Math.min(fullCacheCap, 4096), {
+    maxWeight: rawBudget,
+    weightOf: stringWeight,
+  });
   const raw = (file: string): string | null => {
     if (rawCache.has(file)) return rawCache.get(file)!;
     const t0 = prof ? Date.now() : 0;
@@ -490,7 +522,10 @@ export async function cFnPointerDispatchEdges(
     rawCache.set(file, r);
     return r;
   };
-  const srcCache = new LRUCache<string, string>(cacheCap);
+  const srcCache = new LRUCache<string, string>(fullCacheCap, {
+    maxWeight: srcBudget,
+    weightOf: stringWeight,
+  });
   const src = (file: string): string | null => {
     // A cached '' (empty or unreadable file) returns '' where the miss path
     // returns null for unreadable — every caller falsy-checks, so the two are
@@ -548,6 +583,8 @@ export async function cFnPointerDispatchEdges(
   const inlineTags = new Set<string>();
   /** Object-macro names with an alias-shaped value anywhere (see OBJ_ALIAS_RE). */
   const aliasNames = new Set<string>();
+  /** Macro names that can affect a supported preprocessor conditional anywhere. */
+  const conditionalNames = new Set<string>();
 
   // Parse a struct body (the text between its `{` and `}`) into ordered fields,
   // structure only — see RawFieldDecl for why classification is deferred.
@@ -698,6 +735,7 @@ export async function cFnPointerDispatchEdges(
       await tick();
       const rawText = raw(file);
       if (!rawText) continue; // unreadable or empty — the JS sweep skips these too
+      collectConditionalNames(rawText, conditionalNames);
       const tN = prof ? Date.now() : 0;
       const fileNodes = ctx.getNodesInFile(file);
       if (prof) { prof.nodesMs += Date.now() - tN; prof.nodesN++; }
@@ -719,6 +757,7 @@ export async function cFnPointerDispatchEdges(
     await tick();
     const s = src(file);
     if (!s) continue;
+    collectConditionalNames(s, conditionalNames);
 
     // Typedefs (cross-file).
     if (s.includes('typedef')) {
@@ -991,22 +1030,50 @@ export async function cFnPointerDispatchEdges(
   // parsed tables is ruled out by the kernel's 6.1M `#define`s, and the
   // registration stage below only builds an env for files that survive its
   // filter or carry local includes, so most files never need one.
-  const fnMacroCache = new LRUCache<string, Map<string, MacroDef>>(256);
+  const macroCacheBudget = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, totalTextBudget / 2));
+  const fnMacroWeight = (macros: Map<string, MacroDef>): number => {
+    let chars = 0;
+    for (const [name, def] of macros) {
+      chars += name.length + def.expansion.length;
+      for (const param of def.params) chars += param.length;
+    }
+    return Math.max(64, chars * 2);
+  };
+  const objMacroWeight = (macros: Map<string, string>): number => {
+    let chars = 0;
+    for (const [name, value] of macros) chars += name.length + value.length;
+    return Math.max(64, chars * 2);
+  };
+  const definedWeight = (names: Set<string>): number => {
+    let chars = 0;
+    for (const name of names) chars += name.length;
+    return Math.max(64, chars * 2);
+  };
+  const fnMacroCache = new LRUCache<string, Map<string, MacroDef>>(256, {
+    maxWeight: Math.floor(macroCacheBudget * 0.4),
+    weightOf: fnMacroWeight,
+  });
   const fileFnMacros = (file: string): Map<string, MacroDef> => {
     let m = fnMacroCache.get(file);
     if (!m) { m = parseFunctionMacros(src(file) ?? ''); fnMacroCache.set(file, m); }
     return m;
   };
-  const objMacroCache = new LRUCache<string, Map<string, string>>(256);
+  const objMacroCache = new LRUCache<string, Map<string, string>>(256, {
+    maxWeight: Math.floor(macroCacheBudget * 0.2),
+    weightOf: objMacroWeight,
+  });
   const fileObjMacros = (file: string): Map<string, string> => {
     let m = objMacroCache.get(file);
     if (!m) { m = parseObjectMacros(src(file) ?? ''); objMacroCache.set(file, m); }
     return m;
   };
-  const definedCache = new LRUCache<string, Set<string>>(256);
+  const definedCache = new LRUCache<string, Set<string>>(256, {
+    maxWeight: Math.floor(macroCacheBudget * 0.4),
+    weightOf: definedWeight,
+  });
   const fileDefinedNames = (file: string): Set<string> => {
     let d = definedCache.get(file);
-    if (!d) { d = parseDefinedNames(src(file) ?? ''); definedCache.set(file, d); }
+    if (!d) { d = parseDefinedNames(src(file) ?? '', conditionalNames); definedCache.set(file, d); }
     return d;
   };
 
@@ -1204,6 +1271,25 @@ export async function cFnPointerDispatchEdges(
       processUnit({ text, file: target, env: incEnv, objEnv: incObjEnv });
     }
   }
+  // Registration-only facts and memo tables are substantial on C-heavy repos;
+  // release them before propagation/dispatch allocate their own working sets.
+  for (const facts of factsByFile.values()) {
+    facts.initTokens = null;
+    facts.arrayElems = null;
+    facts.inlineTypes = null;
+    facts.includes = NO_INCLUDES;
+  }
+  inlineTags.clear();
+  aliasNames.clear();
+  includeCache.clear();
+  fnMacroCache.clear();
+  objMacroCache.clear();
+  definedCache.clear();
+  seenInclude.clear();
+  interned.clear();
+  fnPtrTypedefs.clear();
+  fnTypeTypedefs.clear();
+  conditionalNames.clear();
   if (prof) { prof.C = Date.now() - tPass; tPass = Date.now(); }
 
   // ---- receiver-type resolution within a function's source ----
@@ -1321,6 +1407,8 @@ export async function cFnPointerDispatchEdges(
     }
     if (!changed) break;
   }
+  propagations.length = 0;
+  for (const facts of factsByFile.values()) facts.dPairs = null;
   if (prof) { prof.D = Date.now() - tPass; tPass = Date.now(); }
   if (reg.size === 0 && arrayReg.size === 0) return [];
 

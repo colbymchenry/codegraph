@@ -23,6 +23,7 @@
 
 import { parentPort, workerData } from 'worker_threads';
 import type { ToolResult } from './tools';
+import { collectBeforeExit } from '../worker-teardown';
 
 interface WorkerInit {
   root: string | null;
@@ -33,6 +34,11 @@ interface CallMessage {
   id: number;
   toolName: string;
   args: Record<string, unknown>;
+}
+
+/** The pool retiring this idle worker: close everything and exit. */
+interface CloseMessage {
+  type: 'close';
 }
 
 // Mirror the engine's lazy-require of the heavy CodeGraph + tools chain. This
@@ -50,10 +56,11 @@ if (parentPort) {
   // opened lazily on first cross-project (projectPath) call by the ToolHandler's
   // own per-handler cache. openSync does not start a watcher — workers are pure
   // readers; the single watcher/writer stays on the daemon's main thread.
+  let cg: import('../index').default | null = null;
   let handler: InstanceType<typeof import('./tools').ToolHandler> | null = null;
   let initError: string | null = null;
   try {
-    const cg = root ? loadCodeGraph().openSync(root) : null;
+    cg = root ? loadCodeGraph().openSync(root) : null;
     handler = new (loadToolHandler())(cg);
   } catch (err) {
     initError = err instanceof Error ? err.message : String(err);
@@ -63,7 +70,18 @@ if (parentPort) {
   // against its crash budget (→ fall back to in-process) without hanging.
   port.postMessage({ type: 'ready', ok: initError === null, error: initError });
 
-  port.on('message', (msg: CallMessage) => {
+  port.on('message', (msg: CallMessage | CloseMessage) => {
+    if (msg?.type === 'close') {
+      try {
+        void handler?.closeAll(); // projects opened through projectPath
+      } catch { /* already closed */ }
+      try {
+        cg?.close();
+      } catch { /* already closed */ }
+      // No GC marking in flight when the thread ends (worker-teardown.ts).
+      collectBeforeExit();
+      process.exit(0);
+    }
     if (!msg || msg.type !== 'call') return;
     void serve(msg);
   });
