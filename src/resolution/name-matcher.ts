@@ -12049,8 +12049,19 @@ export function matchByExactName(
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
+    // Every candidate is a copy of one symbol and this is the caller's own
+    // copy: the name itself is not ambiguous, only which copy — so rank it
+    // above a proximity guess, but below a unique name or the file's own
+    // definition (0.9). The candidates are those findBestMatch weighed: a
+    // namesake in another language never wins while one in the reference's
+    // own language exists. The caller's own copy being the caller itself is
+    // no evidence, as for a same-file match (isDecisiveSameFileMatch).
+    const weighed = candidates.some((c) => c.language === ref.language)
+      ? candidates.filter((c) => c.language === ref.language)
+      : candidates;
     const confidence = isDecisiveSameFileMatch(bestMatch, ref, candidates, context)
       ? 0.9
+      : bestMatch.id !== ref.fromNodeId && closestCopy(ref, weighed) === bestMatch ? 0.8
       : proximity >= 30 ? 0.7 : 0.4;
     return {
       original: ref,
@@ -26798,6 +26809,7 @@ function findBestMatch(
 
   let bestScore = -1;
   let bestNode: Node | null = null;
+  let tied: Node[] = [];
 
   // Split the ref's path once (it's the same across every candidate) instead of
   // re-splitting it inside computePathProximity per candidate (#915 hot spot).
@@ -26888,10 +26900,63 @@ function findBestMatch(
     if (score > bestScore) {
       bestScore = score;
       bestNode = candidate;
+      tied = [candidate];
+    } else if (score === bestScore) {
+      tied.push(candidate);
     }
   }
 
-  return bestNode;
+  // Proximity is capped, so on deep trees two copies of the same symbol in
+  // sibling modules can tie; the caller's own copy, if uniquely closest, wins.
+  return (tied.length > 1 && closestCopy(ref, tied)) || bestNode;
+}
+
+/**
+ * Number of leading directory segments two file paths share (uncapped).
+ */
+function sharedDirDepth(filePath1: string, filePath2: string): number {
+  const a = filePath1.split('/');
+  const b = filePath2.split('/');
+  a.pop();
+  b.pop();
+  let shared = 0;
+  while (shared < a.length && shared < b.length && a[shared] === b[shared]) shared++;
+  return shared;
+}
+
+/**
+ * When every candidate is a copy of the same symbol — same qualified name, kind
+ * and file basename, as when a module is duplicated under another source root
+ * (`rc2/flymod/src/…` vs `rcpro2/flymod/src/…`) — return the copy whose file
+ * shares the longest directory prefix with the reference, i.e. the one in the
+ * caller's own module. Returns null when the candidates are not all copies or
+ * no copy is uniquely closest, so callers keep their existing choice.
+ */
+function closestCopy(ref: UnresolvedRef, candidates: Node[]): Node | null {
+  if (candidates.length < 2) return null;
+  const first = candidates[0]!;
+  const base = path.posix.basename(first.filePath);
+  let best: Node | null = null;
+  let bestDepth = -1;
+  let unique = false;
+  for (const c of candidates) {
+    if (
+      c.qualifiedName !== first.qualifiedName ||
+      c.kind !== first.kind ||
+      path.posix.basename(c.filePath) !== base
+    ) {
+      return null;
+    }
+    const depth = sharedDirDepth(ref.filePath, c.filePath);
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      best = c;
+      unique = true;
+    } else if (depth === bestDepth) {
+      unique = false;
+    }
+  }
+  return unique ? best : null;
 }
 
 /**
