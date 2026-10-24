@@ -394,6 +394,43 @@ export class OrderStateMachine {
     expect(hook(`<agent-message from="agent-7f3e">\n[Subagent hand-back] ${report}\n</agent-message>`)).toBe('');
   });
 
+  it('ignores every system reminder when gating a short reply (#2635)', () => {
+    expect(hook(`<system-reminder>how does OrderStateMachine work?</system-reminder>
+yes
+<system-reminder source="desktop">submitOrder() calls into the state machine.</system-reminder>`)).toBe('');
+  });
+
+  it('stays silent when only system reminders remain (#2635)', () => {
+    expect(hook(' \n<system-reminder>how does OrderStateMachine work?</system-reminder>\n')).toBe('');
+  });
+
+  it.each([
+    '<task-notification>how does OrderStateMachine work?</task-notification>',
+    '<agent-message from="agent-7f3e">how does OrderStateMachine work?</agent-message>',
+    '<cross-session-message from="local_x">how does OrderStateMachine work?</cross-session-message>',
+  ])('skips a system envelope after a reminder: %s (#2635)', (envelope) => {
+    expect(hook(`<system-reminder>Linked sessions now: submitOrder()</system-reminder>\n\n${envelope}`)).toBe('');
+  });
+
+  it('stays silent on a bare cross-session message (#2635)', () => {
+    expect(hook('<cross-session-message from="local_x">how does OrderStateMachine work?</cross-session-message>')).toBe('');
+  });
+
+  it('uses only the real prompt for explore (#2635)', () => {
+    const output = hook('<system-reminder>UnrelatedSession calls MissingService()</system-reminder>\n\nhow does OrderStateMachine work?');
+    expect(output).toContain('Structural context from CodeGraph');
+    expect(output).toContain('**Exploration: how does OrderStateMachine work?**');
+    expect(output).not.toContain('UnrelatedSession');
+    expect(output).not.toContain('MissingService');
+  });
+
+  it('keeps MEDIUM for real prose when a reminder contains a structural keyword (#2635)', () => {
+    const output = hook('<system-reminder>how does OrderStateMachine work?</system-reminder>\n\nstate machine');
+    expect(output).toContain('CodeGraph found indexed symbols matching this prompt');
+    expect(output).toContain('OrderStateMachine');
+    expect(output).not.toContain('Structural context from CodeGraph');
+  });
+
   it('uses MEDIUM for indexed prose segments without a strong keyword or verified token', () => {
     for (const prompt of ['como state machine?', 'wie state machine?']) {
       const output = hook(prompt);
@@ -587,6 +624,8 @@ describe('messages from other sessions (#2635)', () => {
     expect(isCrossSessionMessage('<cross-session-messages>trace AuthService</cross-session-messages>')).toBe(false);
     expect(isCrossSessionMessage('<cross-session-message from="x">trace AuthService')).toBe(false);
     expect(isCrossSessionMessage('trace AuthService login')).toBe(false);
+    expect(isCrossSessionMessage('<cross-session-message>trace AuthService</agent-message>')).toBe(false);
+    expect(isAgentMessage('<agent-message>trace AuthService</cross-session-message>')).toBe(false);
   });
 });
 
