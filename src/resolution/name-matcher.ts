@@ -11832,6 +11832,8 @@ export function matchByExactName(
   const inheritanceRef = isInheritanceRef(ref);
   // Read once, and only for a candidate in another file: it scans the file.
   let bareTypeName: boolean | undefined;
+  // Every candidate uses the same binding key. Keep this check lazy.
+  let locallyBoundJsName: boolean | undefined;
   const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
   const sameName = context.getNodesByName(ref.referenceName);
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
@@ -11972,7 +11974,7 @@ export function matchByExactName(
       !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context)) &&
     // A name the file binds itself (a parameter, a const) shadows every other
     // file's symbol of that name, so a bare call has no cross-file candidate.
-    !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
+    !(bareJs && n.filePath !== ref.filePath && (locallyBoundJsName ??= isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
   );
   const ranked = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
