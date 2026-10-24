@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- OCaml is now supported: `.ml` and `.mli` files are indexed with their functions, types, variants, records, exceptions, modules, module types, functors, classes and `open`/`include` imports. Each file is its own module, so `Util.double` links across files, and calls link to the implementation rather than the interface. In a dune project, a call through a wrapped library's name (`My_lib.Entry.run`) links to the module's function.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

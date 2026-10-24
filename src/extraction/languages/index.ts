@@ -32,6 +32,7 @@ import { cfqueryExtractor } from './cfquery';
 import { cobolExtractor } from './cobol';
 import { vbnetExtractor } from './vbnet';
 import { erlangExtractor } from './erlang';
+import { ocamlExtractor } from './ocaml';
 import { solidityExtractor } from './solidity';
 import { terraformExtractor } from './terraform';
 import { arktsExtractor } from './arkts';
@@ -65,6 +66,8 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   cobol: cobolExtractor,
   vbnet: vbnetExtractor,
   erlang: erlangExtractor,
+  ocaml: ocamlExtractor,
+  ocaml_interface: ocamlExtractor,
   solidity: solidityExtractor,
   terraform: terraformExtractor,
   arkts: arktsExtractor,
