@@ -16,6 +16,7 @@
   import KindGlyph from '../KindGlyph.svelte';
   import { fileHref } from '../../lib/navigation';
   import type { EntryRow, EntrySection } from '../../lib/entry-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     section: EntrySection;
@@ -67,15 +68,15 @@
               {/if}
               {#if row.flowFrom}
                 {@const label =
-                  armed === null ? 'Flow ›' : armed === row.id ? 'Cancel' : '→ here'}
+                  armed === null ? t('entry.flowChip') : armed === row.id ? t('entry.cancel') : t('entry.hintChip')}
                 <button
                   type="button"
                   class="chip"
                   title={armed === null
-                    ? `Start a flow from ${row.flowFrom}`
+                    ? t('entry.startFlowFrom', { name: row.flowFrom })
                     : armed === row.id
-                      ? 'Stop drawing a flow from here'
-                      : `Draw the path that ends at ${row.flowFrom}`}
+                      ? t('entry.stopDrawingFlow')
+                      : t('entry.drawPathEndsAt', { name: row.flowFrom })}
                   data-entry-flow={row.id}
                   onclick={() => onflow(row)}>{label}</button
                 >
@@ -90,8 +91,11 @@
 
   {#if section.shown < section.total}
     <p class="note dim">
-      Showing {section.shown} of {section.floor ? 'at least ' : ''}{section.total} — the rest are in
-      the index, not on this list.
+      {t('entry.truncated', {
+        shown: section.shown,
+        prefix: section.floor ? t('entry.atLeast') : '',
+        total: section.total,
+      })}
     </p>
   {/if}
 </section>

@@ -53,6 +53,7 @@
   import { liveRefresh } from '../lib/live.svelte';
   import { fileHref, navigate, symbolHref } from '../lib/navigation';
   import { arrivedFrom, walkTo } from '../lib/walk';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     id: string;
@@ -286,9 +287,9 @@
   let emptyCalleeReason = $derived.by(() => {
     if (!payload) return '';
     if (!wantsBody) {
-      return `A ${payload.node.kind.replace(/_/g, ' ')} makes no calls itself — its members do. Open one from the outline.`;
+      return t('sym.emptyCalleeMember', { kind: payload.node.kind.replace(/_/g, ' ') });
     }
-    return 'This symbol makes no resolved calls — a leaf.';
+    return t('sym.emptyCalleeLeaf');
   });
 
   /* ------------------------------------------------------------ movement -- */
@@ -536,18 +537,18 @@
 {#if failure}
   <div class="scroll">
     <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'No such symbol' : 'Could not load this symbol'}</h2>
+      <h2>{failure.code === 'not-found' ? t('sym.noSuch') : t('sym.couldNotLoad')}</h2>
       <p>{failure.message}</p>
       {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
     </div>
   </div>
 {:else if loading || !payload || !callers || !callees}
   <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
+    <div class="emptystate"><p class="dim">{t('sym.loading')}</p></div>
   </div>
 {:else}
   <div class="focus">
-    <aside class="rail-left" bind:this={leftRailEl} aria-label="Called by">
+    <aside class="rail-left" bind:this={leftRailEl} aria-label={t('sym.calledByAria')}>
       <CallersRail
         model={callers}
         originId={originLeft}
@@ -567,13 +568,11 @@
             <div class="banner">
               <DriftBanner file={payload.node.file}>
                 {#if driftTooLong}
-                  indexed line ranges may be shifted, and the file is too long to stand in for
-                  this symbol's body here —
-                  <a href={fileHref(payload.node.file, { source: true })}>open its current source</a>.
-                  The next sync picks it up.
+                  {t('sym.driftLongBefore')}
+                  <a href={fileHref(payload.node.file, { source: true })}>{t('sym.driftLongOpen')}</a>
+                  {t('sym.driftLongAfter')}
                 {:else}
-                  indexed line ranges may be shifted; showing the file's current source. The next
-                  sync picks it up.
+                  {t('sym.driftShort')}
                 {/if}
               </DriftBanner>
             </div>
@@ -598,7 +597,7 @@
           {:else if !wantsBody}
             <!-- The outline below IS the body for a container this size. -->
           {:else if source}
-            <div class="note">{source.reason ?? 'Source is not available for this symbol.'}</div>
+            <div class="note">{source.reason ?? t('sym.sourceUnavailable')}</div>
           {/if}
 
           {#if outline.length > 0}
@@ -620,7 +619,7 @@
           {/if}
         </section>
 
-        <aside class="rail-right" bind:this={railEl} aria-label="Calls">
+        <aside class="rail-right" bind:this={railEl} aria-label={t('sym.callsAria')}>
           <CalleeRail
             model={callees}
             {tops}

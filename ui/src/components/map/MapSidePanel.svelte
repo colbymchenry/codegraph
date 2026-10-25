@@ -14,6 +14,7 @@
   import ExportButtons from '../ExportButtons.svelte';
   import { fileHref } from '../../lib/navigation';
   import { plural } from '../../lib/symbol-model';
+  import { t, tPair } from '../../lib/locale.svelte';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
 
@@ -62,7 +63,7 @@
   const DEPTHS = [1, 2, 3, 4] as const;
 
   function depthLabel(depth: number): string {
-    return depth === 1 ? 'top-level folders' : `${depth} folders deep`;
+    return depth === 1 ? t('map.topLevelFolders') : t('map.foldersDeep', { n: depth });
   }
 
   /** An em dash the mono face has; the select is narrow enough to notice a tofu. */
@@ -96,11 +97,9 @@
 </script>
 
 <aside class="mapside">
-  <h2>Architecture map</h2>
+  <h2>{t('map.title')}</h2>
   <p>
-    Derived from the graph, not drawn by hand: each module sits one layer above the modules it
-    depends on, so reading top to bottom follows the dependency direction. Line weight is how many
-    calls, imports and type references cross the link.
+    {t('map.intro')}
   </p>
 
   <!-- The map is the thing people paste into a README, so the way out sits
@@ -108,13 +107,13 @@
   <ExportButtons build={buildSvg} filename={exportName} />
 
   <label class="field">
-    <span>Showing</span>
+    <span>{t('map.showingLabel')}</span>
     <select
       value={payload.root}
       onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
     >
       {#each payload.roots as option (option.root)}
-        <option value={option.root}>{option.label} · {option.files} files</option>
+        <option value={option.root}>{t('map.rootOption', { label: option.label, files: option.files })}</option>
       {/each}
     </select>
   </label>
@@ -123,7 +122,7 @@
        draws as one box at the shallowest setting, which is why the default is
        chosen from the repository rather than fixed at 1. -->
   <label class="field">
-    <span>Grouping</span>
+    <span>{t('map.groupingLabel')}</span>
     <select
       value={chosenDepth === null ? 'auto' : String(chosenDepth)}
       onchange={(event) => {
@@ -131,7 +130,7 @@
         onSelectDepth(value === 'auto' ? null : Number(value));
       }}
     >
-      <option value="auto">automatic {DASH} {depthLabel(payload.depth)}</option>
+      <option value="auto">{t('map.automatic', { dash: DASH, depth: depthLabel(payload.depth) })}</option>
       {#each DEPTHS as option (option)}
         <option value={String(option)}>{depthLabel(option)}</option>
       {/each}
@@ -144,36 +143,36 @@
       checked={includeTests}
       onchange={(event) => onToggleTests((event.currentTarget as HTMLInputElement).checked)}
     />
-    Include test modules
+    {t('map.includeTests')}
   </label>
 
   <div class="notes">
     {#if thinCount > 0}
       <p class="dim">
-        {plural(thinCount, 'link')} carrying fewer than {layout.minWeight} references
-        {thinCount === 1 ? 'is' : 'are'} hidden until you select a module {thinCount === 1
-          ? 'it'
-          : 'they'} touch.
+        {t('map.thinNote', {
+          n: plural(thinCount, tPair('sym.linkWord')[0]),
+          minWeight: layout.minWeight,
+          isAre: thinCount === 1 ? t('map.is') : t('map.are'),
+          itThey: thinCount === 1 ? t('map.it') : t('map.they'),
+        })}
       </p>
     {/if}
     {#if layout.basis.kind === 'declared'}
       <p class="dim">
-        The layering uses the {layout.basis.declaredLinks} of {layout.basis.totalLinks} links with an
-        import, a qualified name, an inheritance clause or a typed receiver behind them. Bare
-        name matches still count toward line weight, but they do not decide what sits above what.
+        {t('map.declaredBasis', { declared: layout.basis.declaredLinks, total: layout.basis.totalLinks })}
       </p>
     {:else}
       <p class="dim">
-        Too few links here carry an import or a declared type, so the layering uses raw reference
-        counts. A name shared by two unrelated modules can move a box.
+        {t('map.rawBasis')}
       </p>
     {/if}
     {#if payload.excluded.uncertainEdges > 0}
       <p class="dim">
-        {plural(payload.excluded.uncertainEdges, 'cross-module reference')} below confidence {payload
-          .excluded.confidenceBelow}
-        {payload.excluded.uncertainEdges === 1 ? 'is' : 'are'} excluded from every count on this
-        screen — they are name-only guesses.
+        {t('map.uncertainNote', {
+          n: plural(payload.excluded.uncertainEdges, tPair('sym.crossModuleReferenceWord')[0]),
+          confidence: payload.excluded.confidenceBelow,
+          isAre: payload.excluded.uncertainEdges === 1 ? t('map.is') : t('map.are'),
+        })}
       </p>
     {/if}
   </div>
@@ -181,20 +180,19 @@
   {#if layout.mutual.length > 0}
     <details>
       <summary>
-        Mutual dependencies
+        {t('map.mutual')}
         <span class="dim">
-          · {plural(layout.mutual.length, 'pair')} — the lighter direction, dashed when
-          selected
+          {t('map.mutualCount', { n: plural(layout.mutual.length, tPair('sym.pairWord')[0]) })}
         </span>
       </summary>
       {#each layout.mutual.slice(0, 8) as pair (pair.back.source + pair.back.target)}
         <div class="cyc">
           <b>{pair.back.source}</b> ⇄ {pair.back.target}
-          <span class="dim">({pair.back.count} back-references)</span>
+          <span class="dim">{t('map.backReferences', { n: pair.back.count })}</span>
         </div>
       {/each}
       {#if layout.mutual.length > 8}
-        <div class="cyc dim">+{layout.mutual.length - 8} more</div>
+        <div class="cyc dim">{t('map.more', { n: layout.mutual.length - 8 })}</div>
       {/if}
     </details>
   {/if}
@@ -202,9 +200,9 @@
   {#if layout.moduleCycles.length > 0}
     <details>
       <summary>
-        Dependency cycles
+        {t('map.cycles')}
         <span class="dim">
-          · {plural(layout.moduleCycles.length, 'loop')} of three or more modules
+          {t('map.cyclesCount', { n: plural(layout.moduleCycles.length, tPair('sym.loopWord')[0]) })}
         </span>
       </summary>
       {#each layout.moduleCycles.slice(0, 6) as cycle, i (i)}
@@ -216,25 +214,25 @@
   {#if payload.cycles.total > 0}
     <details>
       <summary>
-        Circular imports between files
+        {t('map.circularImports')}
         <span class="dim">
-          · {plural(payload.cycles.total, 'group')}
+          {t('map.groupsCount', { n: plural(payload.cycles.total, tPair('sym.groupWord')[0]) })}
         </span>
       </summary>
       {#each payload.cycles.items.slice(0, 6) as cycle, i (i)}
         <div class="cyc">
-          <span class="dim">{cycle.size} files ·</span>
+          <span class="dim">{t('map.cycleFiles', { n: cycle.size })}</span>
           {cycle.modules.join(', ')}
         </div>
         {#each cycle.files as file (file)}
           <a class="filerow" href={fileHref(file)}>{file}</a>
         {/each}
         {#if cycle.size > cycle.files.length}
-          <div class="cyc dim">+{cycle.size - cycle.files.length} more files in this group</div>
+          <div class="cyc dim">{t('map.moreFilesInGroup', { n: cycle.size - cycle.files.length })}</div>
         {/if}
       {/each}
       {#if payload.cycles.truncated}
-        <div class="cyc dim">+{payload.cycles.total - payload.cycles.shown} more groups</div>
+        <div class="cyc dim">{t('map.moreGroups', { n: payload.cycles.total - payload.cycles.shown })}</div>
       {/if}
     </details>
   {/if}
@@ -243,58 +241,53 @@
     <div class="edgeinfo">
       <div class="head">
         <b class="mono">{selectedModule.id}</b>
-        <button class="clear" onclick={() => onSelect(null)}>clear</button>
+        <button class="clear" onclick={() => onSelect(null)}>{t('scr.clear')}</button>
       </div>
       <p>
-        {plural(selectedModule.symbols, 'symbol')} in {plural(selectedModule.files, 'file')}
+        {t('map.selectedCounts', { symbols: plural(selectedModule.symbols, tPair('file.symbolWord')[0]), files: plural(selectedModule.files, tPair('sym.fileWord')[0]) })}
         {#if selectedModule.languages.length > 0}
           · {selectedModule.languages.map((l) => `${l.language} ${l.files}`).join(', ')}
         {/if}
         {#if selectedModule.generated > 0}
           · {selectedModule.generated === selectedModule.files
-            ? 'all tool-generated'
-            : `${selectedModule.generated} tool-generated`}
+            ? t('map.allToolGenerated')
+            : t('map.toolGeneratedCount', { n: selectedModule.generated })}
         {/if}
       </p>
 
       {#if (selectedModule.dependents?.files ?? 0) > 0}
         <p class="reach">
-          <b>{plural(selectedModule.dependents.files, 'file')}</b> outside it, across
-          {plural(selectedModule.dependents.modules, 'module')}, reference straight into it — the
-          floor on what a change here has to be checked against, and the bar along the bottom of
-          the box.
+          <b>{plural(selectedModule.dependents.files, tPair('sym.fileWord')[0])}</b> {t('map.reach', { modules: plural(selectedModule.dependents.modules, tPair('sym.moduleWord')[0]) })}
         </p>
       {/if}
 
       {#if selectedNode?.island}
         <p class="island">
-          Nothing in the index depends on this module — no import, call or reference crosses into
-          it. It may be an entry point, or reached in a way the graph cannot see.
+          {t('map.islandBody')}
         </p>
       {/if}
 
-      {@render linkList('depends on', dependencies, 'target')}
-      {@render linkList('depended on by', dependents, 'source')}
+      {@render linkList(t('map.dependsOn'), dependencies, 'target')}
+      {@render linkList(t('map.dependedOnBy'), dependents, 'source')}
 
-      <div class="pair label">files</div>
+      <div class="pair label">{t('map.filesLabel')}</div>
       {#if files.length > 0}
         {#each files as file (file)}
           <a
             class="filerow"
             class:gen={generatedFiles.has(file)}
             href={fileHref(file)}
-            title={generatedFiles.has(file) ? `${file} — tool-generated` : file}>{file}</a
+            title={generatedFiles.has(file) ? t('map.fileGeneratedTitle', { file }) : file}>{file}</a
           >
         {/each}
       {:else}
-        <div class="pair dim">no files in the index for this module</div>
+        <div class="pair dim">{t('map.noFiles')}</div>
       {/if}
     </div>
   {:else}
     <div class="edgeinfo">
       <p class="dim">
-        Hover a link to see what crosses it — the counts by kind and the symbol pairs behind the
-        weight. Click a module to isolate its links and list its files.
+        {t('map.hint')}
       </p>
     </div>
   {/if}
@@ -310,7 +303,7 @@
       </div>
     {/each}
   {:else}
-    <div class="pair dim">nothing</div>
+    <div class="pair dim">{t('map.nothing')}</div>
   {/if}
 {/snippet}
 

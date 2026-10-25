@@ -22,6 +22,7 @@
   import { Handle, Position } from '@xyflow/svelte';
   import { endCapText, type FlowEndCapLayout } from '../../lib/flow-model';
   import { basename } from '../../lib/symbol-model';
+  import { locale, t } from '../../lib/locale.svelte';
 
   interface Props {
     data: {
@@ -33,7 +34,9 @@
 
   let { data }: Props = $props();
   let cap = $derived(data.cap);
-  let text = $derived(endCapText(cap.boundary));
+  // `locale.current` is read here so the end-cap's sentences re-render when the
+  // viewer's language switches (`endCapText` itself is not reactive).
+  let text = $derived((locale.current, endCapText(cap.boundary)));
 </script>
 
 <div
@@ -43,13 +46,13 @@
 >
   <Handle type="target" position={Position.Left} id="in" isConnectable={false} />
 
-  <p class="lead"><b>Where the graph stops.</b> {text.intro}</p>
+  <p class="lead"><b>{t('flow.endCapWhereStops')}</b> {text.intro}</p>
 
   {#each text.sites as site, i (i)}
     <div class="site">
       <p class="form">{site.headline}</p>
       {#if site.key !== null}
-        <p class="key">key <span class="mono">{site.key}</span></p>
+        <p class="key">{t('flow.keyLabel')} <span class="mono">{site.key}</span></p>
       {/if}
       {#each site.notes as note (note)}
         <p class="soft">{note}</p>

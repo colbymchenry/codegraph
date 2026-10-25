@@ -12,6 +12,7 @@
   import KindGlyph from '../KindGlyph.svelte';
   import { fileHref } from '../../lib/navigation';
   import { kindPhrase, plural } from '../../lib/symbol-model';
+  import { t, tPair } from '../../lib/locale.svelte';
   import type {
     WireNodeDetail,
     WireNodeRef,
@@ -58,7 +59,7 @@
   let typeChips = $derived(payload.typesUsed.slice(0, TYPE_CHIP_LIMIT));
 
   function relationWord(relation: WireRelation): string {
-    return relation.edgeKinds.includes('implements') ? 'implements' : 'extends';
+    return relation.edgeKinds.includes('implements') ? t('sym.implements') : t('sym.extends');
   }
 
   /**
@@ -67,21 +68,24 @@
    * directly, so the badge must not widen that to three hops.
    */
   let testBadge = $derived.by(() => {
+    const hops = tests.hopsSearched;
     if (tests.reached) {
       return {
         warn: false,
-        text: `Reached by tests · ${plural(tests.fileCount, 'file')} within ${tests.hopsSearched} hop${tests.hopsSearched === 1 ? '' : 's'}`,
+        text: t('sym.testReached', {
+          files: plural(tests.fileCount, tPair('sym.fileWord')[0]),
+          hops,
+          s: hops === 1 ? '' : 's',
+        }),
         title: tests.files.join(', '),
       };
     }
     return {
       warn: true,
       text: tests.exhaustive
-        ? `No test reaches this within ${tests.hopsSearched} caller hops`
-        : 'No test calls this directly',
-      title: tests.exhaustive
-        ? 'No test file reaches this symbol within the caller hops searched.'
-        : 'The caller search ran out of budget — only direct callers were checked.',
+        ? t('sym.testNotExhaustive', { hops, s: hops === 1 ? '' : 's' })
+        : t('sym.testNoDirect'),
+      title: tests.exhaustive ? t('sym.testNotExhaustiveTitle') : t('sym.testBudgetTitle'),
     };
   });
 </script>
@@ -92,7 +96,7 @@
   <span class="kindword">{kindPhrase(node)}</span>
   <span class="loc mono">
     <a href={fileHref(node.file, { line: node.line })}>{node.file}</a>:{node.line}–{node.endLine}
-    · {plural(node.lines, 'line')}
+    · {plural(node.lines, tPair('sym.lineWord')[0])}
   </span>
 </div>
 
@@ -105,10 +109,13 @@
 {/if}
 
 <div class="badges">
-  {#if node.exported}<span class="badge">exported</span>{/if}
+  {#if node.exported}<span class="badge">{t('sym.exportedBadge')}</span>{/if}
   {#if payload.counts.hub}
-    <span class="badge hub" title="Changing this reaches a lot of the repo">
-      hub · {plural(payload.counts.callers, 'caller')}
+    <span class="badge hub" title={t('sym.hubTitle')}>
+      {t('sym.hub', {
+        n: payload.counts.callers,
+        caller: tPair('sym.hubCaller')[payload.counts.callers === 1 ? 0 : 1],
+      })}
     </span>
   {/if}
   <span class="badge" class:warn={testBadge.warn} title={testBadge.title}>
@@ -138,7 +145,7 @@
     {/if}
     {#if subtypes.length > 0}
       <span>
-        {subtypes[0]?.edgeKinds.includes('implements') ? 'implemented by' : 'extended by'}
+        {subtypes[0]?.edgeKinds.includes('implements') ? t('sym.implementedBy') : t('sym.extendedBy')}
         {#each subtypes as relation (relation.node.id)}
           <button type="button" class="chip" onclick={() => onopen(relation.node)}>
             {relation.node.name}
@@ -148,7 +155,7 @@
     {/if}
     {#if typeChips.length > 0}
       <span>
-        uses types
+        {t('sym.usesTypes')}
         {#each typeChips as relation (relation.node.id)}
           <button type="button" class="chip" onclick={() => onopen(relation.node)}>
             {relation.node.name}

@@ -30,6 +30,7 @@
 
 import type { WireMapLink, WireMapModule, WireScreen, WireScreenLink, WireScreensPayload } from './wire';
 import { clauseWords, clauses } from './conditions';
+import { t } from './locale';
 import {
   buildMapLayout,
   linkId,
@@ -272,7 +273,7 @@ export function edgeLabel(links: ReadonlyArray<{ when: string; sites?: ReadonlyA
     return text.length > EDGE_LABEL_MAX ? `${text.slice(0, EDGE_LABEL_MAX - 1)}…` : text;
   }
   const conditional = ways.filter((w) => w).length;
-  return conditional > 0 ? `${ways.length} ways · ${conditional} conditional` : `${ways.length} ways`;
+  return conditional > 0 ? t('screens.edgeLabelWays', { n: ways.length, m: conditional }) : t('screens.edgeLabelWaysOnly', { n: ways.length });
 }
 
 /* ---------------------------------------------------------------- build -- */
@@ -298,7 +299,7 @@ export function buildScreensModel(payload: WireScreensPayload): ScreensModel {
     const info: ScreenNodeInfo = {
       id: origin.id,
       label: origin.node.kind === 'component' ? `<${origin.node.name}>` : `${origin.node.name}()`,
-      sub: origin.sharedBy ? `on ${origin.sharedBy} screens` : origin.node.file,
+      sub: origin.sharedBy ? t('screens.onScreens', { n: origin.sharedBy }) : origin.node.file,
       screen: null,
       origin: true,
       entry: false,

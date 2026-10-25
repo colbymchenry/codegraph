@@ -12,6 +12,7 @@
    */
   import { Handle, Position, type NodeProps } from '@xyflow/svelte';
   import { moduleMetaLabel, type MapNodeLayout } from '../../lib/map-model';
+  import { locale, t } from '../../lib/locale.svelte';
 
   let { data }: NodeProps = $props();
 
@@ -25,6 +26,9 @@
   );
   const layout = $derived(node.layout);
   const module = $derived(layout.module);
+  // `locale.current` is read here so the count line re-renders when the
+  // viewer's language switches (`moduleMetaLabel` itself is not reactive).
+  const countLabel = $derived((locale.current, moduleMetaLabel(module, layout.island)));
 
   function portStyle(index: number, total: number): string {
     return `left:${((index + 1) / (total + 1)) * 100}%`;
@@ -50,21 +54,13 @@
   style={`width:${layout.width}px;height:${layout.height}px`}
   onclick={() => node.onSelect(layout.id)}
   aria-pressed={node.selected}
-  title={`${module.id} — ${module.symbols} symbols in ${module.files} file${
-    module.files === 1 ? '' : 's'
-  }${
-    (module.dependents?.files ?? 0) > 0
-      ? `. ${module.dependents.files} file${module.dependents.files === 1 ? '' : 's'} outside it, across ${module.dependents.modules} module${module.dependents.modules === 1 ? '' : 's'}, reference into it.`
-      : ''
-  }${layout.island ? '. Nothing in the index depends on it.' : ''}${
-    layout.generated ? '. Every file in it is tool-generated.' : ''
-  }`}
+  title={`${t('map.nodeTitle', { name: module.id, symbols: module.symbols, files: module.files, s: module.files === 1 ? '' : 's' })}${(module.dependents?.files ?? 0) > 0 ? t('map.nodeDependents', { files: module.dependents.files, s: module.dependents.files === 1 ? '' : 's', modules: module.dependents.modules, ms: module.dependents.modules === 1 ? '' : 's' }) : ''}${layout.island ? t('map.nodeIsland') : ''}${layout.generated ? t('map.nodeGenerated') : ''}`}
 >
   <!-- The label elides a folder chain nothing forks in; the title keeps the full path. -->
   <span class="name">{module.label || module.id}</span>
   <!-- The same string nodeWidth() sized the box for; they must not drift. -->
   <span class="count" class:island={layout.island}
-    >{moduleMetaLabel(module, layout.island)}</span
+    >{countLabel}</span
   >
   <!-- How much leans on this box, as a share of the heaviest one drawn. Inside
        the border rather than on it, so it reads as a level in the box and not

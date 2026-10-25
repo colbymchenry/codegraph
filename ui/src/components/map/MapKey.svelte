@@ -20,71 +20,66 @@
     open: boolean;
     onToggle: (open: boolean) => void;
   }
+  import { t } from '../../lib/locale.svelte';
+
   let { minWeight, thinCount, declaredBasis, open, onToggle }: Props = $props();
 </script>
 
 <div class="legend" class:open>
   <button class="legend-h" onclick={() => onToggle(!open)} aria-expanded={open}>
-    Key <span class="dim">{open ? '▾' : '▸'}</span>
+    {t('scr.key')} <span class="dim">{open ? '▾' : '▸'}</span>
   </button>
   {#if open}
     <div class="legend-body">
       <div class="lrow">
         <span class="k-box mono">src/api</span>
-        <span>A module — one directory, with the symbols and files in it</span>
+        <span>{t('map.keyModule')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-weight mono">src/db</span>
         <span>
-          The bar along the bottom is how much leans on it — files elsewhere that reference
-          straight into it, against the most depended-on box here. The count is on the box
+          {t('map.keyWeight')}
         </span>
       </div>
       <div class="lrow">
         <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line" /></svg>
         <span>
-          Depends on — the box above calls, imports, extends or names a type from the box below.
-          Thicker is more references{declaredBasis
-            ? ''
-            : '; here the layering had too few imports to trust, so it used raw counts'}
+          {t('map.keyDependsOnBefore')}{declaredBasis ? '' : t('map.keyDependsOnRaw')}
         </span>
       </div>
       <div class="lrow">
         <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-back" /></svg>
         <span>
-          Points back up — the lighter half of a mutual dependency, or a link with no import or
-          declared type behind it. Drawn only while a module it touches is selected
+          {t('map.keyBack')}
         </span>
       </div>
       <div class="lrow">
         <span class="k-label">top / bottom</span>
         <span>
-          A module sits one layer above everything it depends on, so entry points end up at the top
-          and the foundations — which depend on nothing below — at the bottom
+          {t('map.keyLayer')}
         </span>
       </div>
       <div class="lrow">
         <span class="k-box k-sel mono">src/api</span>
-        <span>Selected: click a module to bring out its links and list its files; everything more than one hop away fades</span>
+        <span>{t('map.keySelected')}</span>
       </div>
       <div class="lrow">
         <span class="k-label">nothing depends on this</span>
-        <span>No link in the index arrives here — a script, a workflow, an unreferenced corner</span>
+        <span>{t('map.keyNothingDepends')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-test mono">__tests__</span>
-        <span>More than half its files are tests; off unless you turn tests on</span>
+        <span>{t('map.keyTest')}</span>
       </div>
       <div class="lrow">
         <span class="k-box k-gen mono">gen</span>
-        <span>Every file in it is tool-generated — nobody wrote it and nobody edits it</span>
+        <span>{t('map.keyGen')}</span>
       </div>
       {#if thinCount > 0}
         <div class="lrow">
-          <span class="k-label">{thinCount} hidden</span>
+          <span class="k-label">{t('map.keyHiddenCount', { n: thinCount })}</span>
           <span>
-            Links carrying fewer than {minWeight} references wait until you select a module they
-            touch, so a weak coincidence never draws as a dependency
+            {t('map.keyThin', { minWeight })}
           </span>
         </div>
       {/if}

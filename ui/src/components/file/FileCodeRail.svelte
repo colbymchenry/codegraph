@@ -19,6 +19,7 @@
   import { hot } from '../../lib/focus.svelte';
   import type { FileCallRow } from '../../lib/filecode-model';
   import type { WireNodeRef } from '../../lib/api';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     /** Already windowed to the viewport by the view. */
@@ -35,7 +36,7 @@
 
   function title(row: FileCallRow): string {
     const node = row.call.relation.node;
-    const where = row.lines.length > 0 ? ` · called from line ${row.lines.join(', ')}` : '';
+    const where = row.lines.length > 0 ? ` · ${t('fc.calledFromLine', { lines: row.lines.join(', ') })}` : '';
     return `${node.qualifiedName} — ${node.file}:${node.line}${where}`;
   }
 </script>
@@ -74,11 +75,11 @@
         {node.name}{#if row.lines.length > 1}<span class="dim"> ×{row.lines.length}</span>{/if}
       </div>
       <div class="meta">
-        <span>{node.file === focalFile ? 'same file' : node.file}</span>
+        <span>{node.file === focalFile ? t('sym.sameFile') : node.file}</span>
         {#if row.words.length > 0}<span>{row.words.join(', ')}</span>{/if}
         {#if row.via}<span
             class="tag"
-            title="A synthesized edge — dynamic dispatch the parser cannot see">via {row.via}</span
+            title={t('sym.synthEdgeTitle')}>{t('sym.via', { via: row.via })}</span
           >{/if}
       </div>
     </div>

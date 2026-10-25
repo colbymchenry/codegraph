@@ -10,6 +10,7 @@
    */
   import PaletteRows from './PaletteRows.svelte';
   import { palette } from '../lib/palette.svelte';
+  import { t } from '../lib/locale.svelte';
   import type { PaletteItem } from '../lib/search-model';
 
   interface Props {
@@ -29,7 +30,7 @@
   });
 </script>
 
-<div class="panel" bind:this={panel} id="palette-panel" role="listbox" aria-label="Search results">
+<div class="panel" bind:this={panel} id="palette-panel" role="listbox" aria-label={t('palette.resultsAria')}>
   {#if view.hint}
     <p class="hint">{view.hint}</p>
   {/if}
@@ -45,7 +46,7 @@
   {#if palette.failure}
     <p class="note">{palette.failure}</p>
   {:else if palette.pending && view.items.length === 0}
-    <p class="note">Searching…</p>
+    <p class="note">{t('palette.searching')}</p>
   {:else if view.empty}
     <p class="note">{view.empty}</p>
   {/if}

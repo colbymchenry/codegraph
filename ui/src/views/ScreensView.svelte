@@ -37,6 +37,7 @@
     viaText,
     type ScreensModel,
   } from '../lib/screens-model';
+  import { t } from '../lib/locale.svelte';
 
   let payload = $state<WireScreensPayload | null>(null);
   let error = $state<string | null>(null);
@@ -265,7 +266,7 @@
   /** The words a panel row puts on its line: the arrow, and the whole condition. */
   function fullText(link: WireScreenLink): string {
     const arriving = selected !== null && link.to === selected && link.from !== selected;
-    return `${arriving ? '←' : '→'} ${whenWords(link.when) || 'always'}`;
+    return `${arriving ? '←' : '→'} ${whenWords(link.when) || t('scr.whenAlways')}`;
   }
 
   function rowHot(link: WireScreenLink): boolean {
@@ -292,20 +293,15 @@
   <div class="stage" bind:this={stage} role="presentation" onmousemove={onStageMove} onmouseleave={() => (hovered = null)}>
     {#if error !== null}
       <div class="state">
-        <h2>The screens could not be read</h2>
+        <h2>{t('scr.couldNotRead')}</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Reading screens and transitions…</p></div>
+      <div class="state"><p class="dim">{t('scr.reading')}</p></div>
     {:else if payload !== null && !payload.routed}
       <div class="state">
-        <h2>No screen navigation in this graph</h2>
-        <p>
-          This view draws the routes a UI framework binds to components and the navigation calls
-          that reach them. The index has {payload.screens.length === 0 ? 'no routes' : 'routes'} but no
-          navigation between them — it is not an app with screens, or its router is one CodeGraph
-          does not read yet.
-        </p>
+        <h2>{t('scr.noNavTitle')}</h2>
+        <p>{t('scr.noNavBody', { routes: payload.screens.length === 0 ? t('scr.noRoutes') : t('scr.hasRoutes') })}</p>
       </div>
     {:else if model !== null}
       <SvelteFlow
@@ -337,44 +333,41 @@
            descriptions. Collapsible, remembered per browser. -->
       <div class="legend" class:open={legendOpen}>
         <button class="legend-h" onclick={() => (legendOpen = !legendOpen)} aria-expanded={legendOpen}>
-          Key <span class="dim">{legendOpen ? '▾' : '▸'}</span>
+          {t('scr.key')} <span class="dim">{legendOpen ? '▾' : '▸'}</span>
         </button>
         {#if legendOpen}
           <div class="legend-body">
             <div class="lrow">
               <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line" /></svg>
-              <span>Transition — the destination is written at the call</span>
+              <span>{t('scr.keyTransition')}</span>
             </div>
             <div class="lrow">
               <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-synth" /></svg>
-              <span>Destination inferred from a helper's return value</span>
+              <span>{t('scr.keySynth')}</span>
             </div>
             <div class="lrow">
               <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-back" /></svg>
-              <span>Goes back up the picture (returning) — leaves the top of its box, arrives at the bottom of the other</span>
+              <span>{t('scr.keyBack')}</span>
             </div>
             <div class="lrow">
               <span class="k-label mono">→ …x</span>
-              <span>
-                The last condition checked before the transition, beside the screen at the other end of
-                the selected screen's line; ← when it arrives there. None = always
-              </span>
+              <span>{t('scr.keyCondition')}</span>
             </div>
             <div class="lrow">
               <span class="k-box mono">/path</span>
-              <span>A screen — its path and the component that renders it</span>
+              <span>{t('scr.keyScreen')}</span>
             </div>
             <div class="lrow">
               <span class="k-box k-entry mono"><span class="mark">●</span>/</span>
-              <span>The entry screen; each row down is one more transition away</span>
+              <span>{t('scr.keyEntry')}</span>
             </div>
             <div class="lrow">
               <span class="k-box k-origin mono">fn()</span>
-              <span>Not a screen: shared chrome, or a trigger no screen reaches — a row above what it opens</span>
+              <span>{t('scr.keyOrigin')}</span>
             </div>
             <div class="lrow">
               <span class="k-box k-unreached mono">/path</span>
-              <span>Nothing reaches it from the entry (bottom band)</span>
+              <span>{t('scr.keyUnreached')}</span>
             </div>
           </div>
         {/if}
@@ -385,12 +378,12 @@
           <div class="mono"><b>{nameOf(hoveredInfo.from)}</b> → {nameOf(hoveredInfo.to)}</div>
           {#each hoveredInfo.links.slice(0, 5) as link (link.id)}
             <div class="tiprow">
-              {#if link.sites.length > 1}<span class="dim">{link.sites.length} ways</span>{/if}
+              {#if link.sites.length > 1}<span class="dim">{t('scr.ways', { n: link.sites.length })}</span>{/if}
               <span class="when">{@render words(conditionTokens(link.when))}</span>
-              {#if link.via.length > 0}<span class="mono dim">via {viaText(link)}</span>{/if}
+              {#if link.via.length > 0}<span class="mono dim">{t('scr.via', { via: viaText(link) })}</span>{/if}
             </div>
           {/each}
-          {#if hoveredInfo.links.length > 5}<div class="dim">+{hoveredInfo.links.length - 5} more</div>{/if}
+          {#if hoveredInfo.links.length > 5}<div class="dim">{t('scr.more', { n: hoveredInfo.links.length - 5 })}</div>{/if}
         </div>
       {/if}
     {/if}
@@ -408,26 +401,29 @@
                 {selectedInfo.screen.component.name}
               </a>
             {:else if selectedInfo.origin}
-              <span class="sub dim">navigates from outside any screen</span>
+              <span class="sub dim">{t('scr.outsideScreen')}</span>
             {/if}
             {#if selectedInfo.screen}
               <a class="sub dim" href={fileHref(selectedInfo.screen.file)}>{selectedInfo.screen.file}</a>
             {/if}
-            <a class="sub act" href={stepsHref({ anchor: selectedInfo.id })}>What happens here →</a>
+            <a class="sub act" href={stepsHref({ anchor: selectedInfo.id })}>{t('scr.whatHappens')}</a>
           </div>
-          <button class="clear" onclick={() => (selected = null)}>clear</button>
+          <button class="clear" onclick={() => (selected = null)}>{t('scr.clear')}</button>
         </div>
         {#if pills !== null && pills.hidden > 0}
           <p class="dim note">
-            {pills.hidden} condition{pills.hidden === 1 ? '' : 's'} not drawn on the picture for want of
-            room — hover a row below to see {pills.hidden === 1 ? 'it' : 'each'} on its line.
+            {t('scr.hiddenConditions', {
+              n: pills.hidden,
+              s: pills.hidden === 1 ? '' : 's',
+              each: pills.hidden === 1 ? t('scr.hiddenIt') : t('scr.hiddenEach'),
+            })}
           </p>
         {/if}
 
-        <h4>Opens from <span class="dim">{lists.opensFrom.length}</span></h4>
+        <h4>{t('scr.opensFrom')} <span class="dim">{lists.opensFrom.length}</span></h4>
         {#if lists.opensFrom.length === 0}
           <p class="dim">
-            {selectedInfo.entry ? 'The entry screen — the app starts here.' : 'Nothing in the graph navigates here.'}
+            {selectedInfo.entry ? t('scr.entryScreen') : t('scr.nothingNavigates')}
           </p>
         {/if}
         {#each lists.opensFrom as link (link.id)}
@@ -443,8 +439,8 @@
           >
             <button class="peer mono" onclick={() => (selected = link.from)}>{sentence(link, 'from')}</button>
             {#if sc.common.length > 0}<div class="when">{@render words(commonTokens(sc.common))}</div>{/if}
-            {#if link.via.length > 0}<div class="via">via {viaText(link)}</div>{/if}
-            {#if sc.rows.length > 1}<div class="ways dim">{sc.rows.length} ways</div>{/if}
+            {#if link.via.length > 0}<div class="via">{t('scr.via', { via: viaText(link) })}</div>{/if}
+            {#if sc.rows.length > 1}<div class="ways dim">{t('scr.ways', { n: sc.rows.length })}</div>{/if}
             {#each sc.rows as row (row.site.file + row.site.line)}
               <div class="scenario" class:many={sc.rows.length > 1}>
                 {#if sc.rows.length > 1}<div class="when">{@render words(restTokens(row.rest, sc.common.length > 0))}</div>{/if}
@@ -456,8 +452,8 @@
           </div>
         {/each}
 
-        <h4>Goes to <span class="dim">{lists.goesTo.length}</span></h4>
-        {#if lists.goesTo.length === 0}<p class="dim">No navigation leaves this screen.</p>{/if}
+        <h4>{t('scr.goesTo')} <span class="dim">{lists.goesTo.length}</span></h4>
+        {#if lists.goesTo.length === 0}<p class="dim">{t('scr.noLeaves')}</p>{/if}
         {#each lists.goesTo as link (link.id)}
             {@const sc = scenarios(link.sites)}
           <div
@@ -471,8 +467,8 @@
           >
             <button class="peer mono" onclick={() => (selected = link.to)}>{sentence(link, 'to')}</button>
             {#if sc.common.length > 0}<div class="when">{@render words(commonTokens(sc.common))}</div>{/if}
-            {#if link.via.length > 0}<div class="via">via {viaText(link)}</div>{/if}
-            {#if sc.rows.length > 1}<div class="ways dim">{sc.rows.length} ways</div>{/if}
+            {#if link.via.length > 0}<div class="via">{t('scr.via', { via: viaText(link) })}</div>{/if}
+            {#if sc.rows.length > 1}<div class="ways dim">{t('scr.ways', { n: sc.rows.length })}</div>{/if}
             {#each sc.rows as row (row.site.file + row.site.line)}
               <div class="scenario" class:many={sc.rows.length > 1}>
                 {#if sc.rows.length > 1}<div class="when">{@render words(restTokens(row.rest, sc.common.length > 0))}</div>{/if}
@@ -486,35 +482,29 @@
           </div>
         {/each}
       {:else}
-        <div class="head"><div class="big">Screens</div></div>
-        <p>
-          <b>{payload.screens.length}</b> screens · <b>{payload.links.length}</b> transitions{#if payload.origins.length > 0}
-            · <b>{payload.origins.length}</b> triggered outside a screen{/if}.
-        </p>
+        <div class="head"><div class="big">{t('scr.screens')}</div></div>
+        <p>{t('scr.counts', {
+          screens: payload.screens.length,
+          transitions: payload.links.length,
+          outside: payload.origins.length > 0 ? t('scr.countsOutside', { n: payload.origins.length }) : '',
+        })}</p>
         <p class="dim">
-          <span class="mark">●</span> The entry screen is at the top; each row down is one more
-          transition away from it. Click a screen and each of its transitions is labelled at the far
-          end of its line — beside the screen it leads to or comes from — with the last condition
-          checked before it happens; hover the line, or its row here, for the whole chain and the
-          calls it travels through.
+          <span class="mark">●</span> {t('scr.explain1')}
         </p>
-        <p class="dim">
-          Solid: the destination is written at the call. Dashed grey: it comes back from a
-          helper's return value (inferred). Dashed accent: a transition back up the picture
-          (returning), drawn around the boxes rather than through them. Dashed box: a trigger that
-          is not a screen — shared chrome, or code no screen's render chain reaches.
-        </p>
+        <p class="dim">{t('scr.explain2')}</p>
         {#if model.unreached > 0}
           <p class="dim">
-            <b>{model.unreached}</b> screen{model.unreached === 1 ? '' : 's'} in the band at the bottom: no
-            transition in the graph reaches {model.unreached === 1 ? 'it' : 'them'} from the entry — opened
-            by something the graph cannot see (a layout's initial route, a deep link), or unused.
+            {t('scr.unreached', {
+              n: model.unreached,
+              s: model.unreached === 1 ? '' : 's',
+              them: model.unreached === 1 ? t('scr.unreachedIt') : t('scr.unreachedThem'),
+            })}
           </p>
         {/if}
         {#if payload.dropped > 0}
-          <p class="dim">{payload.dropped} navigation{payload.dropped === 1 ? '' : 's'} could not be attributed: the walk back to a screen hit a hub.</p>
+          <p class="dim">{t('scr.dropped', { n: payload.dropped, s: payload.dropped === 1 ? '' : 's' })}</p>
         {/if}
-        <h4>Most connected</h4>
+        <h4>{t('scr.mostConnected')}</h4>
         {#each [...payload.screens].sort((a, b) => b.incoming + b.outgoing - (a.incoming + a.outgoing)).slice(0, 8) as screen (screen.id)}
           <button class="peer mono" onclick={() => (selected = screen.id)}
             >{screen.path} <span class="dim">←{screen.incoming} →{screen.outgoing}</span></button

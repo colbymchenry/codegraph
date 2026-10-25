@@ -52,6 +52,7 @@
     type StepsModel,
   } from '../lib/steps-model';
   import { buildOrderModel } from '../lib/program-model';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     anchor: string | null;
@@ -469,7 +470,7 @@
   /** The words a panel row puts on its line: the arrow, and the whole condition. */
   function fullText(link: WireStepLink): string {
     const arriving = selected !== null && link.to === selected && link.from !== selected;
-    return `${arriving ? '←' : '→'} ${whenWords(link.when) || 'always'}`;
+    return `${arriving ? '←' : '→'} ${whenWords(link.when) || t('scr.whenAlways')}`;
   }
 
   function rowHot(link: WireStepLink): boolean {
@@ -514,33 +515,31 @@
   <div class="stage" bind:this={stage} role="presentation" onmousemove={onStageMove} onmouseleave={() => (hovered = null)}>
     {#if !supported}
       <div class="state">
-        <h2>This viewer cannot draw steps</h2>
-        <p>The host it runs in has not wired the steps question. The Screens and Flow views still work.</p>
+        <h2>{t('step.cannotDraw')}</h2>
+        <p>{t('step.notWired')}</p>
       </div>
     {:else if !asked}
       <div class="state chooser">
-        <h2>What happens from where?</h2>
+        <h2>{t('step.whatFromWhere')}</h2>
         {#if chooser === 'routes'}
           <p>
-            Pick an endpoint and this view draws everything it sets in motion — its handler and what runs
-            before it, the calls into the database, a queue, another service, and every response it can
-            send — one box per step, an arrow for every way one leads to the next, and on each arrow the
-            condition under which it happens. Or search a symbol and choose <i>What happens from here</i>.
+            {t('step.pickEndpointBefore')}
+            <i>{t('step.whatHere')}</i>.
           </p>
         {:else}
           <p>
-            Pick a screen and this view draws everything it sets in motion — its handlers, the calls that
-            cross into native code, the events that come back, the state it writes, the requests that leave
-            the app — one box per step, an arrow for every way one leads to the next, and on each arrow the
-            condition under which it happens. Or search a symbol and choose <i>What happens from here</i>.
+            {t('step.pickScreenBefore')}
+            <i>{t('step.whatHere')}</i>.
           </p>
         {/if}
         {#if chooser === null}
-          <p class="dim">Reading {screens === null ? 'screens' : 'endpoints'}…</p>
+          <p class="dim">{screens === null ? t('step.readingScreens') : t('step.readingEndpoints')}</p>
         {:else if chooser === 'none'}
           <p class="dim">
-            No screens or endpoints in this graph. Open a symbol from the search box and follow <i>What happens from here</i>,
-            or link here directly with <span class="mono">#/steps?symbol=&lt;name&gt;</span>.
+            {t('step.noEndpointsBefore')}
+            <i>{t('step.whatHere')}</i>
+            {t('step.noEndpointsAfter')}
+            <span class="mono">#/steps?symbol=&lt;name&gt;</span>.
           </p>
         {:else if chooser === 'screens' && screens !== null}
           <div class="chooser-list">
@@ -565,19 +564,16 @@
       </div>
     {:else if error !== null}
       <div class="state">
-        <h2>The steps could not be read</h2>
+        <h2>{t('step.buildError')}</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Walking from the anchor…</p></div>
+      <div class="state"><p class="dim">{t('step.walking')}</p></div>
     {:else if model !== null && payload !== null && readAs === 'order' && !orderReadable}
       <div class="state">
-        <h2>This has no body to read in order</h2>
-        <p>
-          Nothing the picture holds is written inside this symbol — a screen renders handlers that fire on
-          events, and they have no order between them. Read it as what it sets in motion instead.
-        </p>
-        <p><a class="pick" href={rewrite({ view: 'tree' })}>What it sets in motion →</a></p>
+        <h2>{t('step.noOrderTitle')}</h2>
+        <p>{t('step.noOrderBody')}</p>
+        <p><a class="pick" href={rewrite({ view: 'tree' })}>{t('step.whatItSets')}</a></p>
       </div>
     {:else if model !== null && payload !== null}
       <SvelteFlow
@@ -610,16 +606,16 @@
           <div class="mono"><b>{nameOf(hoveredInfo.from)}</b> → {nameOf(hoveredInfo.to)}</div>
           {#each hoveredInfo.links.slice(0, 5) as link (link.id)}
             <div class="tiprow">
-              {#if link.trigger}<span class="fires"><b class="kw">FIRES FROM</b> {triggerWords(link.trigger)} <span class="dim">in {link.trigger.in}</span></span>{/if}
-              {#if link.via.length > 0}<span class="via">via {stepViaText(link)}</span>{/if}
-              {#if link.within}<span class="dim">inside {link.within}(…)</span>{/if}
-              {#if link.sites.length > 1}<span class="dim">{link.sites.length} ways</span>{/if}
+              {#if link.trigger}<span class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(link.trigger)} <span class="dim">{t('step.in')} {link.trigger.in}</span></span>{/if}
+              {#if link.via.length > 0}<span class="via">{t('step.via', { via: stepViaText(link) })}</span>{/if}
+              {#if link.within}<span class="dim">{t('step.inside', { name: link.within })}</span>{/if}
+              {#if link.sites.length > 1}<span class="dim">{t('step.ways', { n: link.sites.length })}</span>{/if}
               <span class="when">{@render words(conditionTokens(link.when))}</span>
               {#if link.label}<span class="dim">{link.label}</span>{/if}
               {#if link.sites[0]}<span class="mono">{#if link.sites[0].status}<b class="status">{link.sites[0].status}</b> · {/if}{siteWords(link.sites[0])}</span>{/if}
             </div>
           {/each}
-          {#if hoveredInfo.links.length > 5}<div class="dim">+{hoveredInfo.links.length - 5} more</div>{/if}
+          {#if hoveredInfo.links.length > 5}<div class="dim">{t('step.more', { n: hoveredInfo.links.length - 5 })}</div>{/if}
         </div>
       {/if}
     {/if}
@@ -642,9 +638,9 @@
         <div class="head">
           <div>
             <div class="mono big">{selectedInfo.label}</div>
-            <div class="sub dim">{kindWord(selectedInfo.step.kind, payload.project, selectedInfo.step)}{#if selectedInfo.step.anchor} · where the picture starts{/if}</div>
+            <div class="sub dim">{kindWord(selectedInfo.step.kind, payload.project, selectedInfo.step)}{#if selectedInfo.step.anchor} {t('step.whereStarts')}{/if}</div>
             {#if selectedInfo.step.trigger}
-              <div class="fires"><b class="kw">FIRES FROM</b> {triggerWords(selectedInfo.step.trigger)} <span class="dim">in {selectedInfo.step.trigger.in}</span></div>
+              <div class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(selectedInfo.step.trigger)} <span class="dim">{t('step.in')} {selectedInfo.step.trigger.in}</span></div>
             {/if}
             {#if selectedInfo.step.screen?.component}
               <a class="sub" href={symbolHref(selectedInfo.step.screen.component.id)}>
@@ -660,52 +656,55 @@
             {#if selectedInfo.step.effect}
               <a class="sub" href={symbolHref(selectedInfo.step.effect.by.id, { line: selectedInfo.step.effect.line })}>
                 <KindGlyph kind={selectedInfo.step.effect.by.kind} />
-                {selectedInfo.step.effect.by.name} · line {selectedInfo.step.effect.line}
+                {selectedInfo.step.effect.by.name} · {t('step.line')} {selectedInfo.step.effect.line}
               </a>
             {/if}
             {#if selectedInfo.step.node}
               <a class="sub dim" href={fileHref(selectedInfo.step.node.file)}>{selectedInfo.step.node.file}</a>
             {/if}
             {#if selectedInfo.step.node && !selectedInfo.step.anchor}
-              <a class="sub act" href={stepsHref({ anchor: selectedInfo.step.node.id })}>Start here →</a>
+              <a class="sub act" href={stepsHref({ anchor: selectedInfo.step.node.id })}>{t('step.startHere')}</a>
             {/if}
           </div>
-          <button class="clear" onclick={() => (selected = null)}>clear</button>
+          <button class="clear" onclick={() => (selected = null)}>{t('step.clear')}</button>
         </div>
         {#if selectedInfo.step.cut === 'screen'}
-          <p class="dim note">Another {kindWord('screen', payload.project, selectedInfo.step)} — a chapter of its own. Start here (or double-click its box) to see what happens on it, or continue through {kindWords('screen', payload.project)[1]} from the summary.</p>
+          <p class="dim note">{t('step.cutScreen', { kind: kindWord('screen', payload.project, selectedInfo.step), kids: kindWords('screen', payload.project)[1] })}</p>
         {:else if selectedInfo.step.cut === 'component'}
-          <p class="dim note">The event lands in a component of another screen — a picture of its own. Start here (or double-click its box) to see it, or continue through screens from the summary.</p>
+          <p class="dim note">{t('step.cutComponent')}</p>
         {:else if selectedInfo.step.cut !== null}
           <p class="dim note">
-            The walk was cut at this step ({selectedInfo.step.cut === 'depth'
-              ? 'the picture’s depth'
+            {t('step.cutGeneric', { reason: selectedInfo.step.cut === 'depth'
+              ? t('step.cutDepth')
               : selectedInfo.step.cut === 'fan-out'
-                ? 'more calls than the walk follows from one node'
+                ? t('step.cutFanout')
                 : selectedInfo.step.cut === 'folded'
-                  ? 'as much plumbing as it folds from one step'
-                  : 'the picture’s size'}). Start here to see on.
+                  ? t('step.cutFolded')
+                  : t('step.cutSize') })}
           </p>
         {/if}
         {#if selectedInfo.step.effect && selectedInfo.step.effect.apis.length > 1}
           <p class="dim note mono">{selectedInfo.step.effect.apis.join(' · ')}</p>
         {/if}
         {#if selectedInfo.step.effect?.category === 'response'}
-          <p class="dim note">{selectedInfo.step.effect.statuses?.length ? 'One way the endpoint answers — each row below is a site that sends it, with the condition it answers under; its other outcomes are the boxes beside it.' : 'Replies whose status the code does not spell out — each row below is one, with the condition it answers under.'}</p>
+          <p class="dim note">{selectedInfo.step.effect.statuses?.length ? t('step.responseStated') : t('step.responseUnstated')}</p>
         {/if}
         {#if selectedInfo.step.events && selectedInfo.step.events.length > 1}
           <p class="dim note mono">⇠ {selectedInfo.step.events.join(' · ')}</p>
         {/if}
         {#if pills !== null && pills.hidden > 0}
           <p class="dim note">
-            {pills.hidden} condition{pills.hidden === 1 ? '' : 's'} not drawn on the picture for want of
-            room — hover a row below to see {pills.hidden === 1 ? 'it' : 'each'} on its line.
+            {t('step.hiddenConditions', {
+              n: pills.hidden,
+              s: pills.hidden === 1 ? '' : 's',
+              each: pills.hidden === 1 ? t('scr.hiddenIt') : t('scr.hiddenEach'),
+            })}
           </p>
         {/if}
 
-        <h4>Arrives from <span class="dim">{lists.arrivesFrom.length}</span></h4>
+        <h4>{t('step.arrivesFrom')} <span class="dim">{lists.arrivesFrom.length}</span></h4>
         {#if lists.arrivesFrom.length === 0}
-          <p class="dim">{selectedInfo.step.anchor ? 'The anchor — the picture starts here.' : 'Nothing in the picture leads here.'}</p>
+          <p class="dim">{selectedInfo.step.anchor ? t('step.anchorStarts') : t('step.nothingLeads')}</p>
         {/if}
         {#each lists.arrivesFrom as link (link.id)}
             {@const sc = scenarios(link.sites)}
@@ -720,17 +719,17 @@
             onfocusout={() => onRowHover(null)}
           >
             <button class="peer mono" onclick={() => (selected = link.from)}>{nameOf(link.from)}</button>
-            {#if link.trigger}<div class="fires"><b class="kw">FIRES FROM</b> {triggerWords(link.trigger)} <span class="dim">in {link.trigger.in}</span></div>{/if}
-            {#if link.via.length > 0}<div class="via">via {stepViaText(link)}</div>{/if}
-            {#if link.within}<div class="via dim">inside {link.within}(…)</div>{/if}
+            {#if link.trigger}<div class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(link.trigger)} <span class="dim">{t('step.in')} {link.trigger.in}</span></div>{/if}
+            {#if link.via.length > 0}<div class="via">{t('step.via', { via: stepViaText(link) })}</div>{/if}
+            {#if link.within}<div class="via dim">{t('step.inside', { name: link.within })}</div>{/if}
             {#if sc.common.length > 0}<div class="when">{@render words(commonTokens(sc.common))}</div>{/if}
             {#if link.label}<div class="via dim">{link.label}</div>{/if}
-            {#if sc.rows.length > 1}<div class="ways dim">{sc.rows.length} ways</div>{/if}
+            {#if sc.rows.length > 1}<div class="ways dim">{t('step.ways', { n: sc.rows.length })}</div>{/if}
             {#each sc.rows as row (row.site.file + row.site.line)}
               {@const href = siteHref(link, row.site, fallback)}
               <div class="scenario" class:many={sc.rows.length > 1}>
                 {#if row.site.trigger && triggerWords(row.site.trigger) !== (link.trigger ? triggerWords(link.trigger) : '')}
-                  <div class="fires"><b class="kw">FIRES FROM</b> {triggerWords(row.site.trigger)}</div>
+                  <div class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(row.site.trigger)}</div>
                 {/if}
                 {#if sc.rows.length > 1}<div class="when">{@render words(restTokens(row.rest, sc.common.length > 0))}</div>{/if}
                 {#if href}
@@ -740,18 +739,18 @@
                 {/if}
               </div>
             {/each}
-            {#if stripHref(link)}<a class="site act" href={stripHref(link)}>Open as a flow →</a>{/if}
+            {#if stripHref(link)}<a class="site act" href={stripHref(link)}>{t('step.openFlow')}</a>{/if}
           </div>
         {/each}
 
-        <h4>Leads to <span class="dim">{lists.leadsTo.length}</span></h4>
+        <h4>{t('step.leadsTo')} <span class="dim">{lists.leadsTo.length}</span></h4>
         {#if lists.leadsTo.length === 0}
           <p class="dim">
             {selectedInfo.step.kind === 'effect'
-              ? 'Outside the index: the graph cannot follow it further.'
+              ? t('step.outsideIndex')
               : selectedInfo.step.cut === 'screen' || selectedInfo.step.cut === 'component'
-                ? 'Not entered — a boundary. Start here for its own picture, or continue through from the summary.'
-                : 'Nothing the walk follows leaves this step.'}
+                ? t('step.notEntered')
+                : t('step.nothingFollows')}
           </p>
         {/if}
         {#each lists.leadsTo as link (link.id)}
@@ -767,17 +766,17 @@
             onfocusout={() => onRowHover(null)}
           >
             <button class="peer mono" onclick={() => (selected = link.to)}>{nameOf(link.to)}</button>
-            {#if link.trigger}<div class="fires"><b class="kw">FIRES FROM</b> {triggerWords(link.trigger)} <span class="dim">in {link.trigger.in}</span></div>{/if}
-            {#if link.via.length > 0}<div class="via">via {stepViaText(link)}</div>{/if}
-            {#if link.within}<div class="via dim">inside {link.within}(…)</div>{/if}
+            {#if link.trigger}<div class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(link.trigger)} <span class="dim">{t('step.in')} {link.trigger.in}</span></div>{/if}
+            {#if link.via.length > 0}<div class="via">{t('step.via', { via: stepViaText(link) })}</div>{/if}
+            {#if link.within}<div class="via dim">{t('step.inside', { name: link.within })}</div>{/if}
             {#if sc.common.length > 0}<div class="when">{@render words(commonTokens(sc.common))}</div>{/if}
             {#if link.label}<div class="via dim">{link.label}</div>{/if}
-            {#if sc.rows.length > 1}<div class="ways dim">{sc.rows.length} ways</div>{/if}
+            {#if sc.rows.length > 1}<div class="ways dim">{t('step.ways', { n: sc.rows.length })}</div>{/if}
             {#each sc.rows as row (row.site.file + row.site.line)}
               {@const href = siteHref(link, row.site, fallback)}
               <div class="scenario" class:many={sc.rows.length > 1}>
                 {#if row.site.trigger && triggerWords(row.site.trigger) !== (link.trigger ? triggerWords(link.trigger) : '')}
-                  <div class="fires"><b class="kw">FIRES FROM</b> {triggerWords(row.site.trigger)}</div>
+                  <div class="fires"><b class="kw">{t('step.firesFrom')}</b> {triggerWords(row.site.trigger)}</div>
                 {/if}
                 {#if sc.rows.length > 1}<div class="when">{@render words(restTokens(row.rest, sc.common.length > 0))}</div>{/if}
                 {#if href}
@@ -787,13 +786,13 @@
                 {/if}
               </div>
             {/each}
-            {#if stripHref(link)}<a class="site act" href={stripHref(link)}>Open as a flow →</a>{/if}
+            {#if stripHref(link)}<a class="site act" href={stripHref(link)}>{t('step.openFlow')}</a>{/if}
           </div>
         {/each}
       {:else}
         <div class="head">
           <div>
-            <div class="big">What happens from <span class="mono">{payload.anchor.name}</span></div>
+            <div class="big">{t('step.whatHappensFrom', { name: payload.anchor.name })}</div>
             <a class="sub" href={symbolHref(payload.anchor.id)}>
               <KindGlyph kind={payload.anchor.kind} />
               {payload.anchor.qualifiedName}
@@ -803,20 +802,20 @@
         </div>
         {#if payload.ambiguous.length > 0}
           <p class="dim note">
-            {payload.ambiguous.length} other symbol{payload.ambiguous.length === 1 ? '' : 's'} share this name:
+            {t('step.ambiguousShare', { n: payload.ambiguous.length, s: payload.ambiguous.length === 1 ? '' : 's' })}
             {#each payload.ambiguous as other, i (other.id)}
               {#if i > 0},{/if}
-              <a href={stepsHref({ anchor: other.id })}>{other.kind} in {basename(other.file)}</a>
+              <a href={stepsHref({ anchor: other.id })}>{other.kind} {t('step.in')} {basename(other.file)}</a>
             {/each}
           </p>
         {/if}
         <p class="reading">
-          Read as:
-          <a class="tab" class:on={readAs === 'order'} href={rewrite({ view: 'order' })}>in order</a>
-          <a class="tab" class:on={readAs === 'tree'} href={rewrite({ view: 'tree' })}>what it sets in motion</a>
+          {t('step.readAs')}
+          <a class="tab" class:on={readAs === 'order'} href={rewrite({ view: 'order' })}>{t('step.inOrder')}</a>
+          <a class="tab" class:on={readAs === 'tree'} href={rewrite({ view: 'tree' })}>{t('step.whatSetInMotion')}</a>
         </p>
         <p>
-          <b>{payload.steps.length}</b> steps · <b>{payload.links.length}</b> links · depth
+          {t('step.stepsLinks', { n: payload.steps.length, m: payload.links.length })}
           <select
             class="depth"
             value={String(payload.depth)}
@@ -831,9 +830,9 @@
         <p>
           <label class="opt">
             <input type="checkbox" checked={payload.through} onchange={(e) => navigate(rewrite({ through: (e.currentTarget as HTMLInputElement).checked }))} />
-            Continue through {kindWords('screen', payload.project)[1]}
+            {t('step.continueThrough', { kids: kindWords('screen', payload.project)[1] })}
           </label>
-          <span class="dim">— otherwise another {kindWord('screen', payload.project)} is drawn as a boundary, and is a click from being the next anchor.</span>
+          <span class="dim">{t('step.otherwiseBoundary', { kind: kindWord('screen', payload.project) })}</span>
         </p>
         <p class="counts">
           {#each ['screen', 'trigger', 'bridge', 'event', 'store', 'effect'] as const as kind (kind)}
@@ -846,39 +845,28 @@
         {#if payload.steps.length === 1 && payload.truncated.steps === 0 && payload.truncated.hubs === 0}
           <!-- A lone anchor is an answer, not an empty canvas: say what the walk looked for. -->
           <p>
-            Nothing this sets in motion is a step the picture draws — no reply, database, queue, network or
-            other {kindWord('screen', payload.project)} within {payload.depth} calls. Calls between plain functions
-            fold into the lines between steps, so a helper that only computes is drawn alone.
-            {#if payload.anchor}<a href={symbolHref(payload.anchor.id)}>Its callers and callees →</a>{/if}
+            {t('step.loneAnchor', { depth: payload.depth, kind: kindWord('screen', payload.project) })}
+            {#if payload.anchor}<a href={symbolHref(payload.anchor.id)}>{t('step.callersCallees')}</a>{/if}
           </p>
         {/if}
         {#if readAs === 'order'}
           <p class="dim">
-            <span class="mark">●</span> The anchor is at the top, and each row down is what happens next: a line
-            means <b>and then</b>. Where the code forks both ways, a small box asks the condition once and each
-            line out of it answers — <span class="mono">yes</span>, <span class="mono">no</span>, a case; a lone
-            guard rides its line as <span class="mono">WHEN</span>. A call written inside another call's arguments
-            happens first — the token is signed before the reply that carries it — and an arm that answers,
-            returns or throws simply has nothing leaving it. Click a step for its sites and the whole condition; a
-            step is the next anchor.
+            <span class="mark">●</span> {t('step.orderExplain')}
           </p>
         {:else}
           <p class="dim">
-            <span class="mark">●</span> The anchor is at the top; each row down is one more step away from
-            it. Click a step and each of its links is labelled at the far end of its line with the last
-            condition checked before it happens; hover the line, or its row here, for the whole chain and the
-            plumbing it travels through. A step is the next anchor, and any link opens as a Flow strip.
+            <span class="mark">●</span> {t('step.treeExplain')}
           </p>
         {/if}
         {#if payload.truncated.steps > 0 || payload.truncated.hubs > 0 || payload.truncated.chrome > 0}
           <p class="dim">
-            Not drawn:
-            {#if payload.truncated.steps > 0}<b>{payload.truncated.steps}</b> step{payload.truncated.steps === 1 ? '' : 's'} past the picture’s size limit;{/if}
-            {#if payload.truncated.hubs > 0}<b>{payload.truncated.hubs}</b> walk{payload.truncated.hubs === 1 ? '' : 's'} that reached a hub;{/if}
-            {#if payload.truncated.chrome > 0}<b>{payload.truncated.chrome}</b> into shared chrome.{/if}
+            {t('step.notDrawn')}
+            {#if payload.truncated.steps > 0} <b>{payload.truncated.steps}</b> {t('step.notDrawnSteps', { s: payload.truncated.steps === 1 ? '' : 's' })}{/if}
+            {#if payload.truncated.hubs > 0} <b>{payload.truncated.hubs}</b> {t('step.notDrawnHubs', { s: payload.truncated.hubs === 1 ? '' : 's' })}{/if}
+            {#if payload.truncated.chrome > 0} <b>{payload.truncated.chrome}</b> {t('step.notDrawnChrome')}{/if}
           </p>
         {/if}
-        <h4>Most connected</h4>
+        <h4>{t('step.mostConnected')}</h4>
         {#each [...payload.steps].sort((a, b) => (model.layout.nodes.find((n) => n.id === b.id)?.ports.top.length ?? 0) + (model.layout.nodes.find((n) => n.id === b.id)?.ports.bottom.length ?? 0) - ((model.layout.nodes.find((n) => n.id === a.id)?.ports.top.length ?? 0) + (model.layout.nodes.find((n) => n.id === a.id)?.ports.bottom.length ?? 0))).slice(0, 8) as step (step.id)}
           <button class="peer mono" onclick={() => (selected = step.id)}>{model.nodes.get(step.id)?.label ?? step.label} <span class="dim sans">{kindWord(step.kind, payload.project, step)}</span></button>
         {/each}

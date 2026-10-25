@@ -22,11 +22,16 @@
   import { buildEntryPanel, flowPair, type EntryRow } from '../lib/entry-model';
   import { flowHref, navigate } from '../lib/navigation';
   import { openEntryTarget } from '../lib/walk';
+  import { locale, t } from '../lib/locale.svelte';
 
   interface Props {
     project?: string | null;
   }
   let { project = null }: Props = $props();
+
+  const projectSuffix = $derived(
+    project ? (locale.current === 'zh-CN' ? `（${project}）` : ` in ${project}`) : ''
+  );
 
   $effect(() => {
     void palette.ensureEntries();
@@ -85,16 +90,16 @@
 
 <div class="scroll">
   <div class="head">
-    <h2>Entry points</h2>
+    <h2>{t('entry.title')}</h2>
     <p>
-      Where a flow starts{project ? ` in ${project}` : ''} — every list below is read out of the
-      graph, not guessed from a filename. Open a row to read the code, or use
-      <span class="chiplike">Flow ›</span> to draw the path from it to a second symbol.
+      {t('entry.introBefore', { project: projectSuffix })}
+      <span class="chiplike">{t('entry.flowChip')}</span>
+      {t('entry.introAfter')}
     </p>
   </div>
 
   {#if armed}
-    <div class="arming" role="group" aria-label="Draw a flow">
+    <div class="arming" role="group" aria-label={t('entry.drawAria')}>
       <span class="from">{armed.name}</span>
       <span class="arrow" aria-hidden="true">→</span>
       <input
@@ -104,8 +109,8 @@
         type="text"
         autocomplete="off"
         spellcheck="false"
-        placeholder="a symbol it reaches"
-        aria-label={`The symbol ${armed.name} should reach`}
+        placeholder={t('entry.inputPlaceholder')}
+        aria-label={t('entry.inputAria', { name: armed.name })}
         onkeypress={(event) => {
           if (event.key === 'Enter' && armed) draw(armed.name, reaches);
         }}
@@ -114,10 +119,10 @@
         type="button"
         class="go"
         disabled={flowPair(armed.name, reaches) === null}
-        onclick={() => armed && draw(armed.name, reaches)}>Draw the flow</button
+        onclick={() => armed && draw(armed.name, reaches)}>{t('entry.drawButton')}</button
       >
-      <button type="button" class="cancel" onclick={() => (armed = null)}>Cancel</button>
-      <span class="hint">or pick the other end with <span class="chiplike">→ here</span></span>
+      <button type="button" class="cancel" onclick={() => (armed = null)}>{t('entry.cancel')}</button>
+      <span class="hint">{t('entry.hint')} <span class="chiplike">{t('entry.hintChip')}</span></span>
     </div>
   {/if}
 
@@ -129,9 +134,9 @@
   </div>
 
   {#if palette.entriesFailure}
-    <p class="state">Could not read the entry points — {palette.entriesFailure}</p>
+    <p class="state">{t('entry.readError', { failure: palette.entriesFailure })}</p>
   {:else if !palette.entriesSettled}
-    <p class="state">Reading the graph…</p>
+    <p class="state">{t('entry.reading')}</p>
   {:else if panel.empty}
     <p class="state">{panel.empty}</p>
   {:else}

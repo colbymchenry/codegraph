@@ -18,6 +18,7 @@
   import { trails } from '../lib/trails.svelte';
   import { trail } from '../lib/trail.svelte';
   import { decodeTrail } from '../lib/trail-codec';
+  import { t } from '../lib/locale.svelte';
   import {
     isOpenable,
     trailDecay,
@@ -34,7 +35,7 @@
     /** Render nothing at all when there are no saved trails (the empty screen). */
     hideWhenEmpty?: boolean;
   }
-  let { title = 'Saved trails', hideWhenEmpty = true }: Props = $props();
+  let { title = t('trails.title'), hideWhenEmpty = true }: Props = $props();
 
   $effect(() => {
     void trails.ensure();
@@ -103,11 +104,11 @@
     {#if trails.failure}
       <p class="msg err">{trails.failure}</p>
     {:else if !trails.settled}
-      <p class="msg">Reading saved trails…</p>
+      <p class="msg">{t('trails.reading')}</p>
     {:else if list.length === 0}
       <p class="msg">
-        No saved trails yet. Walk a path through the code, then press
-        <strong>Save trail</strong> on the trail bar to keep it.
+        {t('trails.emptyBefore')}
+        <strong>{t('trails.save')}</strong>{t('trails.emptyAfter')}
         {#if trails.readOnlyReason}
           <br />{trails.readOnlyReason}
         {/if}
@@ -134,7 +135,7 @@
             </button>
 
             <div class="acts">
-              <button type="button" class="act" onclick={() => download(saved)}>Export</button>
+              <button type="button" class="act" onclick={() => download(saved)}>{t('trails.export')}</button>
               {#if trails.canSave}
                 <button
                   type="button"
@@ -144,7 +145,7 @@
                   onclick={() => remove(saved)}
                   onblur={() => (confirming = confirming === saved.id ? null : confirming)}
                 >
-                  {confirming === saved.id ? 'Delete?' : 'Delete'}
+                  {confirming === saved.id ? t('trails.deleteConfirm') : t('trails.delete')}
                 </button>
               {/if}
             </div>
@@ -160,7 +161,7 @@
         {/each}
       </div>
       {#if trails.payload?.bounded}
-        <p class="msg">Only the first trails in the directory are listed.</p>
+        <p class="msg">{t('trails.onlyFirst')}</p>
       {/if}
     {/if}
   </section>

@@ -15,6 +15,7 @@
   import { Handle, Position, type NodeProps } from '@xyflow/svelte';
   import type { MapNodeLayout } from '../../lib/map-model';
   import type { ScreenNodeInfo } from '../../lib/screens-model';
+  import { t } from '../../lib/locale.svelte';
 
   let { data }: NodeProps = $props();
 
@@ -65,10 +66,8 @@
   }}
   aria-pressed={node.selected}
   title={(info.origin
-    ? `${info.label} — navigates, but no screen reaches it within the walk. In ${info.sub}.`
-    : `${info.label} — rendered by ${info.sub}${info.entry ? '. The entry screen.' : ''}${
-        info.unreached ? '. No transition in the graph reaches it from the entry.' : ''
-      }`) + (node.onOpen ? ' Double-click for what happens here.' : '')}
+    ? t('scr.nodeOrigin', { name: info.label, sub: info.sub })
+    : `${t('scr.nodeRendered', { name: info.label, sub: info.sub })}${info.entry ? t('scr.nodeEntry') : ''}${info.unreached ? t('scr.nodeUnreached') : ''}`) + (node.onOpen ? t('scr.nodeDoubleClick') : '')}
 >
   <span class="name">{#if info.entry}<span class="mark" aria-hidden="true">●</span>{/if}{info.label}</span>
   <span class="sub">{info.sub}</span>

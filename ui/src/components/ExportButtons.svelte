@@ -14,6 +14,7 @@
 <script lang="ts">
   import { copyPngToClipboard, downloadSvg, svgToPng, PNG_SCALE } from '../lib/export-image';
   import { toast } from '../lib/toast.svelte';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     /** Builds the SVG at a given device-pixel scale. */
@@ -36,11 +37,11 @@
       );
       toast.show(
         where === 'copied'
-          ? 'Image copied · paste it into a comment'
-          : 'Clipboard unavailable · image saved instead'
+          ? t('export.imageCopied')
+          : t('export.clipboardUnavailable')
       );
     } catch (error) {
-      toast.show(error instanceof Error ? error.message : 'The image could not be made.');
+      toast.show(error instanceof Error ? error.message : t('export.imageError'));
     } finally {
       busy = false;
     }
@@ -49,18 +50,18 @@
   function saveSvg(): void {
     try {
       downloadSvg(build(1), `${filename}.svg`);
-      toast.show('SVG saved');
+      toast.show(t('export.svgSaved'));
     } catch (error) {
-      toast.show(error instanceof Error ? error.message : 'The file could not be saved.');
+      toast.show(error instanceof Error ? error.message : t('export.fileError'));
     }
   }
 </script>
 
 <div class="exp">
   <button type="button" onclick={copyImage} disabled={disabled || busy}>
-    {busy ? 'Rendering…' : 'Copy image'}
+    {busy ? t('export.rendering') : t('export.copyImage')}
   </button>
-  <button type="button" onclick={saveSvg} {disabled}>Download SVG</button>
+  <button type="button" onclick={saveSvg} {disabled}>{t('export.downloadSvg')}</button>
 </div>
 
 <style>

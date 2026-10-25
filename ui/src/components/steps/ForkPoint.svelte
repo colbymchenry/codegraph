@@ -12,6 +12,7 @@
   import type { StepForkInfo } from '../../lib/steps-model';
   import { joinTokens, whenTokens } from '../../lib/conditions';
   import { EDGE_LABEL_MAX } from '../../lib/screens-model';
+  import { t } from '../../lib/locale.svelte';
 
   let { data }: NodeProps = $props();
   const node = $derived(data as unknown as { layout: MapNodeLayout; fork: StepForkInfo; dimmed: boolean });
@@ -41,8 +42,8 @@
   class:dimmed={node.dimmed}
   style={`width:${layout.width}px;height:${layout.height}px`}
   title={node.fork.on
-    ? `${node.fork.on} — the code forks here; each line out is one arm.`
-    : 'The code forks here; each line out is one arm.'}
+    ? `${node.fork.on} — ${t('step.fork')}`
+    : t('step.fork')}
 >
   <span class="q"
     >{#if plain}{node.fork.label}{:else}{#each tokens as t, i (i)}{#if i > 0}{' '}{/if}{#if t.kw}<b class="kw"

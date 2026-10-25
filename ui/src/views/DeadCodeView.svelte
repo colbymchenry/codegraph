@@ -25,7 +25,6 @@
   import { deadHref, fileHref, navigate, symbolHref } from '../lib/navigation';
   import { live } from '../lib/live.svelte';
   import {
-    DEAD_CODE_CAVEAT,
     deadCodeHeadline,
     deadCodeRowMeta,
     deadCodeScale,
@@ -33,6 +32,7 @@
     exclusionPhrases,
     groupMeta,
   } from '../lib/deadcode-model';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     /** Include symbols something outside the index could import. */
@@ -60,7 +60,7 @@
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
-        failure = error instanceof ApiFailure ? error.message : 'The list could not be read.';
+        failure = error instanceof ApiFailure ? error.message : t('dead.listReadError');
         loading = false;
       });
     return () => controller.abort();
@@ -77,40 +77,31 @@
 
 <div class="scroll">
   <div class="head">
-    <h2>Dead code</h2>
-    <p>
-      Symbols no import, call or reference in this index reaches, largest first. Everything below
-      is what the graph can see; the notes under the list are what it cannot.
-    </p>
+    <h2>{t('dead.title')}</h2>
+    <p>{t('dead.intro')}</p>
   </div>
 
   <div class="bar">
-    <p class="caveat">{DEAD_CODE_CAVEAT}</p>
+    <p class="caveat">{t('dead.caveat')}</p>
     <a
       class="toggle"
       class:on={exported}
       href={deadHref({ exported: !exported })}
-      title={exported
-        ? 'Back to symbols nothing outside this repository could import either'
-        : 'Also list symbols something outside this repository could import — the index cannot check those'}
+      title={exported ? t('dead.toggleOnTitle') : t('dead.toggleOffTitle')}
       onclick={(event) => {
         event.preventDefault();
         navigate(deadHref({ exported: !exported }));
-      }}>{exported ? 'Including exported' : 'Internal only'}</a
+      }}>{exported ? t('dead.includingExported') : t('dead.internalOnly')}</a
     >
   </div>
 
   {#if failure}
-    <p class="state">Could not read the list — {failure}</p>
+    <p class="state">{t('dead.readError', { failure })}</p>
   {:else if loading && payload === null}
-    <p class="state">Reading the graph…</p>
+    <p class="state">{t('dead.reading')}</p>
   {:else if payload}
     {#if exported}
-      <p class="warn">
-        Exported symbols are on this list. Nothing in this repository references them, but anything
-        outside it can — a published package, another service, a script. Read each one before you
-        believe it.
-      </p>
+      <p class="warn">{t('dead.warn')}</p>
     {/if}
 
     {#if payload.groups.length === 0}
@@ -139,7 +130,7 @@
                     <a class="ln" href={fileHref(group.file, { source: true, line: row.line })}
                       >{row.file}:{row.line}</a
                     >
-                    {#if row.exported}<span class="chip">exported</span>{/if}
+                    {#if row.exported}<span class="chip">{t('dead.chipExported')}</span>{/if}
                   </div>
                   <div class="meta">{deadCodeRowMeta(row)}</div>
                   {#if row.members.items.length > 0}
@@ -149,7 +140,7 @@
                       {/each}
                       {#if row.members.truncated}
                         <span class="member more"
-                          >+{row.members.total - row.members.shown} more</span
+                          >{t('dead.more', { n: row.members.total - row.members.shown })}</span
                         >
                       {/if}
                     </div>
@@ -172,22 +163,13 @@
         </ul>
       {/if}
       {#if !payload.corroborated}
-        <p>
-          The rows were not checked against the text of the files that can reach them, so a
-          reference the extractor did not record would not have been caught.
-        </p>
+        <p>{t('dead.notChecked')}</p>
       {/if}
       {#if payload.bounded}
-        <p>
-          The scan stopped at its cap — this index holds more unreferenced symbols than were
-          considered.
-        </p>
+        <p>{t('dead.bounded')}</p>
       {/if}
       {#if payload.rows.truncated}
-        <p>
-          Showing {payload.rows.shown} of {payload.rows.total} — the rest are in the index, not on
-          this list.
-        </p>
+        <p>{t('dead.truncated', { shown: payload.rows.shown, total: payload.rows.total })}</p>
       {/if}
     </div>
   {/if}

@@ -7,6 +7,7 @@
 -->
 <script lang="ts">
   import { fileHref } from '../../lib/navigation';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     path: string;
@@ -18,18 +19,18 @@
   let { path, line, source }: Props = $props();
 </script>
 
-<nav class="modes" aria-label="File view mode">
+<nav class="modes" aria-label={t('file.modeAria')}>
   <a
     class="mode"
     class:on={!source}
     href={fileHref(path, line ? { line } : {})}
-    aria-current={!source ? 'page' : undefined}>Outline</a
+    aria-current={!source ? 'page' : undefined}>{t('file.outlineTab')}</a
   >
   <a
     class="mode"
     class:on={source}
     href={fileHref(path, { source: true, ...(line ? { line } : {}) })}
-    aria-current={source ? 'page' : undefined}>Source</a
+    aria-current={source ? 'page' : undefined}>{t('file.sourceTab')}</a
   >
 </nav>
 

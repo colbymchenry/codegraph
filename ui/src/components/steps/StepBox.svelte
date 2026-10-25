@@ -17,6 +17,7 @@
    */
   import type { MapNodeLayout } from '../../lib/map-model';
   import { kindWord, type ProjectKind, type StepNodeInfo } from '../../lib/steps-model';
+  import { locale, t } from '../../lib/locale.svelte';
 
   interface Props {
     info: StepNodeInfo;
@@ -34,20 +35,25 @@
   let { info, project, selected, dimmed, size = null, note = '', onSelect, onStart }: Props = $props();
   const step = $derived(info.step);
 
+  // `locale.current` is read here so the kind words re-render when the viewer's
+  // language switches (`kindWord` itself is not reactive).
+  const kindPhrase = $derived((locale.current, kindWord(step.kind, project, step)));
+
   const cutNote = $derived.by(() => {
+    locale.current;
     switch (step.cut) {
       case 'depth':
-        return ' More happens past the depth of this picture — start here to see it.';
+        return t('step.boxDepth');
       case 'fan-out':
-        return ' It reaches more than the walk follows from one node.';
+        return t('step.boxFanout');
       case 'folded':
-        return ' The walk folded as much plumbing as it allows from one step.';
+        return t('step.boxFolded');
       case 'steps':
-        return ' The picture reached its size limit here.';
+        return t('step.boxSizeLimit');
       case 'screen':
-        return ` Another ${kindWord('screen', project, step)} — a chapter of its own. Start here to see what happens on it.`;
+        return t('step.boxScreen', { kind: kindWord('screen', project, step) });
       case 'component':
-        return ' The event lands in a component of another screen — a picture of its own. Start here to see it.';
+        return t('step.boxComponent');
       default:
         return '';
     }
@@ -70,7 +76,7 @@
     onStart?.(info.id);
   }}
   aria-pressed={selected}
-  title={`${info.label} — ${step.anchor ? 'where this picture starts; ' : ''}${kindWord(step.kind, project, step)}. ${info.sub}.${note ? ` ${note}` : ''}${cutNote}${onStart && !step.anchor ? ' Double-click to start here.' : ''}`}
+  title={`${info.label} — ${step.anchor ? t('step.wherePictureStarts') : ''}${kindPhrase}. ${info.sub}.${note ? ` ${note}` : ''}${cutNote}${onStart && !step.anchor ? t('step.doubleClickStart') : ''}`}
 >
   <span class="name"
     >{#if step.anchor}<span class="mark" aria-hidden="true">●</span>{/if}{info.label}{#if step.cut !== null}<span

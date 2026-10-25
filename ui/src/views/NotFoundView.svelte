@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/locale.svelte';
+
   interface Props {
     path: string;
   }
@@ -7,10 +9,11 @@
 
 <div class="scroll">
   <div class="emptystate">
-    <h2>No such view</h2>
+    <h2>{t('notfound.title')}</h2>
     <p>
-      <span class="mono">#{path}</span> does not match a view. Try
-      <a class="mono link" href="#/">the start</a>.
+      <span class="mono">#{path}</span>
+      {t('notfound.mid')}
+      <a class="mono link" href="#/">{t('notfound.start')}</a>
     </p>
   </div>
 </div>

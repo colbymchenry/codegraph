@@ -8,6 +8,7 @@
    * the keyboard, on the empty screen there is none.
    */
   import KindGlyph from './KindGlyph.svelte';
+  import { t } from '../lib/locale.svelte';
   import type { Palette, PaletteItem } from '../lib/search-model';
 
   interface Props {
@@ -84,7 +85,7 @@
         </span>
       {:else}
         <KindGlyph kind={item.node.kind} />
-        <span class="mid" title={item.node.generated ? `${item.name} — tool-generated` : undefined}>
+        <span class="mid" title={item.node.generated ? t('palette.generatedTitle', { name: item.name }) : undefined}>
           <!-- Generated code recedes here too: a `.pb.go` stub and the
                hand-written thing beside it must not read the same. -->
           <span class="nm" class:gen={item.node.generated}>{item.name}</span>

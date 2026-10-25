@@ -12,6 +12,7 @@
   import { trails } from '../lib/trails.svelte';
   import { replacedTrail, trailNameProblem } from '../lib/trails-model';
   import { toast } from '../lib/toast.svelte';
+  import { t } from '../lib/locale.svelte';
 
   /** Matches `MAX_TRAIL_NAME` in `src/ui-server/api/trail-store.ts`. */
   const MAX_NAME = 120;
@@ -54,7 +55,7 @@
     const replacing = replaces !== null;
     const saved = await trails.save(name, '', hops);
     if (saved === null) return; // the reason is on `trails.failure`, shown below
-    toast.show(replacing ? `Trail replaced · ${name.trim()}` : `Trail saved · ${name.trim()}`);
+    toast.show(replacing ? t('trailbar.replaced', { name: name.trim() }) : t('trailbar.arrived', { name: name.trim() }));
     closeForm();
   }
 
@@ -108,13 +109,10 @@
      whose height grows only while the form is open. -->
 <div class="trailwrap">
 <div class="trailbar">
-  <span class="label">Trail</span>
+  <span class="label">{t('trailbar.trail')}</span>
 
   {#if hops.length === 0}
-    <span class="empty"
-      >Step into a call on the right, or up to a caller on the left — the trail records the
-      path.</span
-    >
+    <span class="empty">{t('trailbar.empty')}</span>
   {:else}
     {#each hops as hop, i (hop.id)}
       {#if i > 0}
@@ -122,10 +120,10 @@
           class="hop-arrow"
           class:up={hop.dir === 'up'}
           title={hop.dir === 'up'
-            ? 'stepped up to a caller'
+            ? t('trailbar.arrowUp')
             : hop.dir === 'down'
-              ? 'stepped down into a call'
-              : 'jumped here'}
+              ? t('trailbar.arrowDown')
+              : t('trailbar.arrowJump')}
           aria-hidden="true"
         >
           {hop.dir === 'up' ? '←' : hop.dir === 'down' ? '→' : '·'}
@@ -147,19 +145,19 @@
   <span class="spacer"></span>
 
   {#if hops.length > 1}
-    <button type="button" class="tb-btn" onclick={readAsFlow}>Read as flow</button>
+    <button type="button" class="tb-btn" onclick={readAsFlow}>{t('trailbar.readFlow')}</button>
   {/if}
   {#if hops.length > 0 && trails.canSave && !naming}
-    <button type="button" class="tb-btn" onclick={openForm}>Save trail</button>
+    <button type="button" class="tb-btn" onclick={openForm}>{t('trailbar.save')}</button>
   {/if}
   {#if hops.length > 0}
-    <button type="button" class="tb-btn" onclick={clear}>Clear</button>
+    <button type="button" class="tb-btn" onclick={clear}>{t('trailbar.clear')}</button>
   {/if}
 </div>
 
 {#if naming}
   <form class="saveform" onsubmit={submit}>
-    <label for="trail-name">Name this trail</label>
+    <label for="trail-name">{t('trailbar.nameLabel')}</label>
     <input
       bind:this={nameInput}
       bind:value={name}
@@ -169,21 +167,21 @@
       maxlength={MAX_NAME}
       autocomplete="off"
       spellcheck="false"
-      placeholder="How a request reaches the handler"
+      placeholder={t('trailbar.namePlaceholder')}
     />
     <button type="submit" class="tb-btn" disabled={problem !== null || trails.busy}>
-      {trails.busy ? 'Saving…' : replaces ? 'Replace' : 'Save'}
+      {trails.busy ? t('trailbar.saving') : replaces ? t('trailbar.replace') : t('trailbar.save')}
     </button>
-    <button type="button" class="tb-btn" onclick={closeForm}>Cancel</button>
+    <button type="button" class="tb-btn" onclick={closeForm}>{t('trailbar.cancel')}</button>
     <!-- Everything the reader should know BEFORE pressing, in one line: what
          it will be called, that it will overwrite, and where it lands. -->
     <span class="hint" class:warn={replaces !== null}>
       {#if replaces}
-        Replaces the saved trail of the same name.
+        {t('trailbar.replaces')}
       {:else if trails.directory}
-        {hops.length} hop{hops.length === 1 ? '' : 's'} · saved to {trails.directory}
+        {t('trailbar.hopCount', { n: hops.length, s: hops.length === 1 ? '' : 's', dir: trails.directory })}
       {:else}
-        {hops.length} hop{hops.length === 1 ? '' : 's'}
+        {t('trailbar.hopCountShort', { n: hops.length, s: hops.length === 1 ? '' : 's' })}
       {/if}
     </span>
     {#if trails.failure}

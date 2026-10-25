@@ -13,7 +13,8 @@
 <script lang="ts">
   import KindGlyph from '../KindGlyph.svelte';
   import { hot, railFocus } from '../../lib/focus.svelte';
-  import { plural, type CalleeRailModel, type CalleeRow } from '../../lib/symbol-model';
+  import type { CalleeRailModel, CalleeRow } from '../../lib/symbol-model';
+  import { t } from '../../lib/locale.svelte';
   import type { WireNodeRef } from '../../lib/api';
 
   interface Props {
@@ -42,8 +43,8 @@
 </script>
 
 <div class="rail-h" data-rail-header>
-  <span>Calls <span class="n">{model.rows.length}</span></span>
-  <span class="hint">step down →</span>
+  <span>{t('sym.callsAria')} <span class="n">{model.rows.length}</span></span>
+  <span class="hint">{t('sym.stepDownHint')}</span>
 </div>
 
 {#each model.rows as row, i (row.relation.node.id)}
@@ -75,14 +76,14 @@
         {node.name}{#if row.lines.length > 1}<span class="dim"> ×{row.lines.length}</span>{/if}
       </div>
       <div class="meta">
-        <span>{node.file === focalFile ? 'same file' : node.file}</span>
+        <span>{node.file === focalFile ? t('sym.sameFile') : node.file}</span>
         {#if row.words.length > 0}<span>{row.words.join(', ')}</span>{/if}
-        {#if row.relation.hub}<span class="tag">hub · {row.relation.fanIn}</span>{/if}
-        {#if row.via}<span class="tag" title="A synthesized edge — dynamic dispatch the parser cannot see"
-            >via {row.via}</span
+        {#if row.relation.hub}<span class="tag">{t('sym.hubFanIn', { fanIn: row.relation.fanIn ?? 0 })}</span>{/if}
+        {#if row.via}<span class="tag" title={t('sym.synthEdgeTitle')}
+            >{t('sym.via', { via: row.via })}</span
           >{/if}
-        {#each row.when as w (w)}<span class="tag when" title="The call runs only under this condition — read from the source as it is now"
-            >when {w}</span
+        {#each row.when as w (w)}<span class="tag when" title={t('sym.whenTitle')}
+            >{t('sym.when', { w })}</span
           >{/each}
       </div>
     </div>
@@ -92,9 +93,11 @@
 {#if model.uncertain.length > 0}
   <details class="rfold" class:unplaced={!placed} data-rail-fold style:top={`${foldTop}px`}>
     <summary>
-      Uncertain <span class="dim"
-        >· {model.uncertain.length} name-only match{model.uncertain.length === 1 ? '' : 'es'},
-        confidence &lt; 0.6</span
+      {t('sym.uncertain')} <span class="dim"
+        >{t('sym.uncertainSummary', {
+          n: model.uncertain.length,
+          m: model.uncertain.length === 1 ? 'match' : 'matches',
+        })}</span
       >
     </summary>
     <div class="fold-body">
@@ -136,13 +139,13 @@
 {:else if model.outsideCalls > 0 || model.outsideTypeRefs > 0 || model.hiddenGroups > 0}
   <div class="rnote" class:unplaced={!placed} style:top={`${noteTop}px`}>
     {#if model.outsideCalls > 0}
-      +{plural(model.outsideCalls, 'more call')} into symbols outside the index{#if model.outsideTypeRefs > 0}{' '}·
-        {plural(model.outsideTypeRefs, 'type reference')}{/if}.
+      {t('sym.outsideCalls', { n: model.outsideCalls, s: model.outsideCalls === 1 ? '' : 's' })}
+      {#if model.outsideTypeRefs > 0}{' '}· {t('sym.outsideTypeRefs', { n: model.outsideTypeRefs, s: model.outsideTypeRefs === 1 ? '' : 's' })}{/if}.
     {:else if model.outsideTypeRefs > 0}
-      {plural(model.outsideTypeRefs, 'type reference')} into symbols outside the index.
+      {t('sym.outsideTypeRefs', { n: model.outsideTypeRefs, s: model.outsideTypeRefs === 1 ? '' : 's' })}.
     {/if}
     {#if model.hiddenGroups > 0}
-      <br />+{model.hiddenGroups} more callee{model.hiddenGroups === 1 ? '' : 's'} not shown.
+      <br />{t('sym.moreCallees', { n: model.hiddenGroups, s: model.hiddenGroups === 1 ? '' : 's' })}
     {/if}
   </div>
 {/if}

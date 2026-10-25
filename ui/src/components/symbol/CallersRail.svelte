@@ -16,6 +16,7 @@
   import { fileHref } from '../../lib/navigation';
   import { hot, railFocus } from '../../lib/focus.svelte';
   import { basename, plural, type CallerRailModel, type CallerRow } from '../../lib/symbol-model';
+  import { t, tPair } from '../../lib/locale.svelte';
   import type { WireNodeRef } from '../../lib/api';
 
   interface Props {
@@ -31,7 +32,7 @@
 
   /** A file node's own "symbol" is the file's top level; say so. */
   function rowName(node: WireNodeRef): string {
-    return node.kind === 'file' ? `${basename(node.file)} (top level)` : node.name;
+    return node.kind === 'file' ? t('sym.topLevel', { name: basename(node.file) }) : node.name;
   }
 
   function rowTitle(row: CallerRow): string {
@@ -52,22 +53,20 @@
 </script>
 
 <div class="rail-h">
-  <span>Called by <span class="n">{model.total}</span></span>
-  <span class="hint">← step up</span>
+  <span>{t('sym.calledByAria')} <span class="n">{model.total}</span></span>
+  <span class="hint">{t('sym.stepUpHint')}</span>
 </div>
 
 {#if model.total === 0}
   <div class="note">
-    Nothing in the graph calls or references this symbol{exported
-      ? ' — it is exported, so callers may live outside the index (or it is an entry point).'
-      : '.'}
+    {t('sym.emptyCallers')}{exported ? t('sym.exportedNote') : '.'}
   </div>
 {/if}
 
 {#each model.groups as group, groupIndex (group.file)}
   <div class="filegroup">
     <div class="fpath">
-      <a href={fileHref(group.file)} title={group.file}>{group.same ? 'same file' : group.file}</a>
+      <a href={fileHref(group.file)} title={group.file}>{group.same ? t('sym.sameFile') : group.file}</a>
       <b>{group.rows.length}</b>
     </div>
     {#each group.rows as row, rowIndex (row.relation.node.id)}
@@ -96,22 +95,22 @@
           <div class="nm">{rowName(node)}</div>
           <div class="meta">
             {#if row.words.length > 0}<span class="kindlbl">{row.words.join(', ')}</span>{/if}
-            {#each row.when as w (w)}<span class="tag when" title="The call runs only under this condition — read from the source as it is now"
-                >when {w}</span
+            {#each row.when as w (w)}<span class="tag when" title={t('sym.whenTitle')}
+                >{t('sym.when', { w })}</span
               >{/each}
             {#each row.lines as line (line)}
               <button
                 type="button"
                 class="chip"
-                title={`Open ${node.name} at line ${line}`}
+                title={t('sym.openAtLine', { name: node.name, line })}
                 onclick={(e) => {
                   e.stopPropagation();
                   onstepUp(node, line);
                 }}>:{line}</button
               >
             {/each}
-            {#if row.via}<span class="kindlbl">via {row.via}</span>{/if}
-            {#if isOrigin}<span class="kindlbl">you came from here</span>{/if}
+            {#if row.via}<span class="kindlbl">{t('sym.via', { via: row.via })}</span>{/if}
+            {#if isOrigin}<span class="kindlbl">{t('sym.cameFromHere')}</span>{/if}
           </div>
         </div>
       </div>
@@ -122,8 +121,11 @@
 {#if model.tests.rows.length > 0}
   <details class="fold">
     <summary>
-      Tests <span class="dim"
-        >· {plural(model.tests.calls, 'call')} from {plural(model.tests.files.length, 'file')}</span
+      {t('sym.tests')} <span class="dim"
+        >{t('sym.testsSummary', {
+          calls: plural(model.tests.calls, tPair('sym.callWord')[0]),
+          files: plural(model.tests.files.length, tPair('sym.fileWord')[0]),
+        })}</span
       >
     </summary>
     <div class="body">
@@ -158,9 +160,11 @@
 {#if model.uncertain.length > 0}
   <details class="fold">
     <summary>
-      Uncertain <span class="dim"
-        >· {model.uncertain.length} name-only match{model.uncertain.length === 1 ? '' : 'es'},
-        confidence &lt; 0.6</span
+      {t('sym.uncertain')} <span class="dim"
+        >{t('sym.uncertainSummary', {
+          n: model.uncertain.length,
+          m: model.uncertain.length === 1 ? 'match' : 'matches',
+        })}</span
       >
     </summary>
     <div class="body">
@@ -199,8 +203,7 @@
 
 {#if model.hiddenGroups > 0}
   <div class="note">
-    +{model.hiddenGroups} more caller{model.hiddenGroups === 1 ? '' : 's'} not shown — this symbol
-    has more than the rail lists.
+    {t('sym.moreCallers', { n: model.hiddenGroups, s: model.hiddenGroups === 1 ? '' : 's' })}
   </div>
 {/if}
 

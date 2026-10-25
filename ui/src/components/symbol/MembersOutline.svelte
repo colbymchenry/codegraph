@@ -12,6 +12,7 @@
   import KindGlyph from '../KindGlyph.svelte';
   import type { WireNodeRef, WireOverride } from '../../lib/api';
   import type { OutlineRow } from '../../lib/symbol-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     rows: OutlineRow[];
@@ -30,13 +31,13 @@
    */
   function overrideTitle(o: WireOverride): string {
     return o.relation === 'implements'
-      ? `Declares a member ${o.baseTypeName} requires — matched by name.`
-      : `Redeclares a member of ${o.baseTypeName} — matched by name.`;
+      ? t('sym.overrideImplements', { name: o.baseTypeName })
+      : t('sym.overrideExtends', { name: o.baseTypeName });
   }
 </script>
 
 <div class="subh">
-  <span>Members</span>
+  <span>{t('sym.membersHeader')}</span>
   <span class="n">{total}</span>
 </div>
 
@@ -55,7 +56,7 @@
       <span class="sig">
         {#if row.member.overrides}
           <span class="ovr" title={overrideTitle(row.member.overrides)}>
-            {row.member.overrides.relation === 'implements' ? 'satisfies' : 'overrides'}
+            {row.member.overrides.relation === 'implements' ? t('sym.satisfies') : t('sym.overridesWord')}
             {row.member.overrides.baseTypeName}
           </span>
         {/if}{row.member.signature ?? ''}</span>
@@ -69,7 +70,7 @@
 
 {#if truncated}
   <div class="note">
-    Showing {rows.length} of {total} members — open the file to see the rest.
+    {t('sym.membersTruncated', { shown: rows.length, total })}
   </div>
 {/if}
 

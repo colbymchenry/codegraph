@@ -14,6 +14,7 @@
 <script lang="ts">
   import { fileHref } from '../../lib/navigation';
   import { plural } from '../../lib/symbol-model';
+  import { t, tPair } from '../../lib/locale.svelte';
   import type { WireBlastScale, WireBlastSummary } from '../../lib/api';
 
   interface Props {
@@ -35,34 +36,33 @@
 
 <div class="blast">
   <div class="bh">
-    <b>Blast radius</b>
-    <span class="stat"><strong>{blast.direct}</strong> direct dependent{blast.direct === 1 ? '' : 's'}</span>
-    <span class="stat"><strong>{blast.withinHops}</strong> within {blast.hops} hops</span>
-    <span class="stat"><strong>{blast.files}</strong> file{blast.files === 1 ? '' : 's'}</span>
-    <span class="stat"><strong>{blast.testFiles}</strong> test file{blast.testFiles === 1 ? '' : 's'}</span>
+    <b>{t('blast.title')}</b>
+    <span class="stat"><strong>{blast.direct}</strong> {t('blast.directNoun', { s: blast.direct === 1 ? '' : 's' })}</span>
+    <span class="stat"><strong>{blast.withinHops}</strong> {t('blast.withinHops', { n: blast.hops })}</span>
+    <span class="stat"><strong>{blast.files}</strong> {t('blast.fileNoun', { s: blast.files === 1 ? '' : 's' })}</span>
+    <span class="stat"><strong>{blast.testFiles}</strong> {t('blast.testFileNoun', { s: blast.testFiles === 1 ? '' : 's' })}</span>
     {#if blast.routes > 0}
-      <span class="stat"><strong>{blast.routes}</strong> route{blast.routes === 1 ? '' : 's'}</span>
+      <span class="stat"><strong>{blast.routes}</strong> {t('blast.routeNoun', { s: blast.routes === 1 ? '' : 's' })}</span>
     {/if}
   </div>
 
   <div
     class="bar"
-    title={`Scaled to the widest radius in the index: ${maxWithin} symbols within ${blast.hops} hops.`}
+    title={t('blast.barTitle', { symbols: maxWithin, hops: blast.hops })}
   >
     <i style:width={`${share(blast.withinHops, maxWithin)}%`}></i>
     <i class="direct" style:width={`${share(blast.direct, maxDirect)}%`}></i>
   </div>
 
   <div class="legend">
-    dark: direct dependents · light: within {blast.hops} hops — scaled to the widest radius in the
-    index{#if scale?.estimated}{' '}<span class="dim"
-        >(measured across its {scale.sampled} most-depended-on symbols)</span
+    {t('blast.legend', { hops: blast.hops })}{#if scale?.estimated}{' '}<span class="dim"
+        >{t('blast.estimated', { n: scale.sampled })}</span
       >{/if}
   </div>
 
   {#if blast.topFiles.length > 0}
     <details>
-      <summary>What would need re-checking if this changed</summary>
+      <summary>{t('blast.checkSummary')}</summary>
       <div class="body">
         {#each blast.topFiles as entry (entry.file)}
           <div class="fp">
@@ -71,12 +71,14 @@
           </div>
         {/each}
         {#if blast.files > blast.topFiles.length}
-          <div class="fp dim">+{blast.files - blast.topFiles.length} more files</div>
+          <div class="fp dim">{t('blast.moreFiles', { n: blast.files - blast.topFiles.length })}</div>
         {/if}
         {#if testCalls > 0}
           <div class="note">
-            plus {plural(testCalls, 'call')} from {plural(testFiles, 'test file')} — the tests that
-            would catch a regression.
+            {t('blast.plusTests', {
+              calls: plural(testCalls, tPair('sym.callWord')[0]),
+              files: plural(testFiles, tPair('sym.testFileWord')[0]),
+            })}
           </div>
         {/if}
       </div>

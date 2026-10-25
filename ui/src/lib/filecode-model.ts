@@ -31,6 +31,7 @@ import type {
   WireOutlineEntry,
 } from './api';
 import { lastSegment, relationWords, synthesizedBy, type LineRef } from './symbol-model';
+import { t, tPair } from './locale';
 
 /* ------------------------------------------------------------- constants -- */
 
@@ -480,8 +481,9 @@ export function arcsInRange(arcs: readonly FileArc[], first: number, last: numbe
 
 /* --------------------------------------------------------------- header -- */
 
-/** `209 calls within this file` / `no calls stay inside this file`. */
+/** `209 calls within this file` / `1 call stays inside this file` / `no calls stay inside this file`. */
 export function arcSummary(count: number): string {
-  if (count === 0) return 'No calls in this file reach another symbol in it.';
-  return `${count} ${count === 1 ? 'call stays' : 'calls stay'} within this file`;
+  if (count === 0) return t('fc.arcSummaryNone');
+  const [one, many] = tPair('fc.arcSummaryMany');
+  return (count === 1 ? one : many).replace('{n}', String(count));
 }

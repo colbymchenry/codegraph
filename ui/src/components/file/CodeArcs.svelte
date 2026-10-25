@@ -15,6 +15,7 @@
 <script lang="ts">
   import { hot } from '../../lib/focus.svelte';
   import { ARC_COLUMN, type FileArc } from '../../lib/filecode-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     /** Already filtered and windowed by the view. */
@@ -41,8 +42,8 @@
   }
 
   function label(arc: FileArc): string {
-    const direction = arc.toLine < arc.fromLine ? 'above' : 'below';
-    return `line ${arc.fromLine} calls ${arc.targetName}, defined ${direction} at line ${arc.toLine}`;
+    const direction = arc.toLine < arc.fromLine ? t('fc.above') : t('fc.below');
+    return t('fc.arcLabel', { from: arc.fromLine, target: arc.targetName, direction, to: arc.toLine });
   }
 </script>
 

@@ -19,6 +19,7 @@
   import { tokenClass, type Token } from '../../lib/highlight';
   import { assignRefs, type CodeBlock, type LineRef } from '../../lib/symbol-model';
   import { hot } from '../../lib/focus.svelte';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     block: CodeBlock;
@@ -110,7 +111,7 @@
 <div class="code">
   {#each chunks as chunk (chunk.lines[0]?.n ?? -1)}
     {#if chunk.gapBefore > 0}
-      <div class="gap">⋯ {chunk.gapBefore} lines without calls</div>
+      <div class="gap">{t('sym.linesWithoutCalls', { n: chunk.gapBefore })}</div>
     {/if}
     {#each chunk.lines as line (line.n)}
       <div class="ln" class:hot={isHot(line)} data-line={line.n}>
@@ -145,7 +146,7 @@
   {/each}
 
   {#if block.tailGap > 0}
-    <div class="gap">⋯ {block.tailGap} more lines</div>
+    <div class="gap">{t('sym.moreLines', { n: block.tailGap })}</div>
   {/if}
 </div>
 

@@ -31,6 +31,7 @@ import type {
   WireFlowEdge,
   WireFlowHop,
 } from './api';
+import { t } from './locale';
 
 /* ------------------------------------------------------------ dimensions -- */
 
@@ -141,18 +142,18 @@ const plural = (n: number, one: string, many: string): string => (n === 1 ? one 
 export function endCapText(boundary: WireFlowBoundary): EndCapText {
   const sites: EndCapSite[] = boundary.sites.map((site) => {
     const notes: string[] = [];
-    if (site.key === null) notes.push('the key is a runtime value');
+    if (site.key === null) notes.push(t('flow.endCapKey'));
     if (site.moreSites > 0) {
-      notes.push(`+${site.moreSites} more such ${plural(site.moreSites, 'site', 'sites')} here`);
+      notes.push(t('flow.endCapMoreSites', { n: site.moreSites, s: plural(site.moreSites, 'site', 'sites') }));
     }
     return {
-      headline: `${site.label} at line ${site.line}`,
+      headline: t('flow.endCapHeadline', { label: site.label, line: site.line }),
       key: site.key,
       notes,
       candidates: site.candidates,
       candidateHeading:
         site.candidates.length > 0
-          ? `${site.candidates.length} candidate ${plural(site.candidates.length, 'target', 'targets')} \u203a`
+          ? t('flow.endCapCandidates', { n: site.candidates.length, t: plural(site.candidates.length, 'target', 'targets') })
           : null,
       candidateNote: site.candidateNote,
     };
@@ -162,25 +163,25 @@ export function endCapText(boundary: WireFlowBoundary): EndCapText {
   return {
     intro:
       boundary.sites.length > 0
-        ? `${boundary.node.name} chooses its next call at runtime.`
-        : `${boundary.node.name} is the last symbol on this path.`,
+        ? t('flow.endCapIntro', { name: boundary.node.name })
+        : t('flow.endCapLast', { name: boundary.node.name }),
     sites,
     quiet:
       boundary.sites.length > 0
         ? null
-        : 'No dynamic-dispatch site was detected in its body, so nothing here explains the break.',
+        : t('flow.endCapQuiet'),
     uncertainHeading:
       boundary.uncertain.total > 0
-        ? `${boundary.uncertain.total} name-only ${plural(boundary.uncertain.total, 'match', 'matches')} not followed (confidence < 0.6)`
+        ? t('flow.endCapUncertain', { n: boundary.uncertain.total, m: plural(boundary.uncertain.total, 'match', 'matches') })
         : null,
     uncertain: boundary.uncertain.items,
     further:
       boundary.further.total > 0
-        ? `It makes ${boundary.further.total} further resolved ${plural(boundary.further.total, 'call', 'calls')} this path does not need.`
+        ? t('flow.endCapFurther', { n: boundary.further.total, c: plural(boundary.further.total, 'call', 'calls') })
         : null,
     missed:
       missedNames.length > 0
-        ? `Never reaches ${missedNames.join(', ')}${boundary.missed.length < missedNames.length ? '…' : '.'}`
+        ? `${t('flow.endCapNeverReaches', { names: missedNames.join(', ') })}${boundary.missed.length < missedNames.length ? '…' : '.'}`
         : null,
   };
 }
@@ -189,7 +190,7 @@ export function endCapText(boundary: WireFlowBoundary): EndCapText {
 export function endCapHeight(boundary: WireFlowBoundary): number {
   const text = endCapText(boundary);
   let h = END_CAP_PADDING * 2;
-  h += wrappedLines(`Where the graph stops. ${text.intro}`) * END_CAP_LINE;
+  h += wrappedLines(`${t('flow.endCapWhereStops')} ${text.intro}`) * END_CAP_LINE;
   for (const site of text.sites) {
     h += END_CAP_GAP;
     h += wrappedLines(site.headline) * END_CAP_LINE;
@@ -329,7 +330,7 @@ export function labelLinesFor(edge: WireFlowEdge): string[] {
 
 /** `line 2029`, or null when the edge carries no line. */
 export function lineLabelFor(edge: WireFlowEdge): string | null {
-  return typeof edge.line === 'number' && edge.line > 0 ? `line ${edge.line}` : null;
+  return typeof edge.line === 'number' && edge.line > 0 ? t('flow.lineLabel', { n: edge.line }) : null;
 }
 
 /**
@@ -587,8 +588,8 @@ export function buildFlowLayout(flows: readonly WireFlow[], activeId: string | n
       target: cap.id,
       edge: null,
       flows: cap.flows,
-      label: 'end of static path',
-      labelLines: ['end of', 'static path'],
+      label: `${t('flow.endOfStaticFirst')} ${t('flow.endOfStaticSecond')}`,
+      labelLines: [t('flow.endOfStaticFirst'), t('flow.endOfStaticSecond')],
       lineLabel: null,
       dash: END_CAP_DASH,
       cap: true,

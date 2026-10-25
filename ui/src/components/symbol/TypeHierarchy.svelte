@@ -24,6 +24,7 @@
     visibleHierarchy,
     HIER_ROW_H,
   } from '../../lib/hierarchy-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     hierarchy: WireHierarchy;
@@ -47,9 +48,9 @@
   let counts = $derived(
     [
       hierarchy.ancestors.total > 0
-        ? `${hierarchy.ancestors.total} above`
+        ? t('hier.aboveCount', { n: hierarchy.ancestors.total })
         : '',
-      hierarchy.direct > 0 ? `${hierarchy.descendants.total} below` : '',
+      hierarchy.direct > 0 ? t('hier.belowCount', { n: hierarchy.descendants.total }) : '',
     ]
       .filter(Boolean)
       .join(' · ')
@@ -59,16 +60,16 @@
     const where = `${row.node.file}:${row.node.line}`;
     if (!row.entry) return `${row.node.qualifiedName} — ${where}`;
     const wiring = row.entry.synthesized
-      ? ` — matched by ${row.entry.via ?? 'the resolver'}${row.entry.registeredAt ? ` at ${row.entry.registeredAt}` : ''}`
+      ? ` — ${t('hier.matchedBy', { via: row.entry.via ?? t('hier.resolver') })}${row.entry.registeredAt ? ` ${t('hier.at', { loc: row.entry.registeredAt })}` : ''}`
       : '';
     return `${row.node.qualifiedName} — ${where}${wiring}`;
   }
 </script>
 
 <div class="subh">
-  <span>Type hierarchy</span>
+  <span>{t('hier.title')}</span>
   <span class="n">{counts}</span>
-  <span class="hint">supertypes above · subtypes below</span>
+  <span class="hint">{t('hier.hint')}</span>
 </div>
 
 {#if model.headline}
@@ -111,13 +112,13 @@
         <span class="word">{row.word}</span>
         {#if row.entry?.synthesized}
           <span class="pill" title={row.entry.registeredAt ?? ''}>
-            via {row.entry.via ?? 'resolver'}
+            {t('sym.via', { via: row.entry.via ?? t('hier.resolver') })}
           </span>
         {/if}
         {#if row.entry && row.entry.hiddenSubtypes > 0}
-          <span class="pill">+{row.entry.hiddenSubtypes} below</span>
+          <span class="pill">{t('hier.hiddenBelow', { n: row.entry.hiddenSubtypes })}</span>
         {/if}
-        <span class="file">{row.node.file === focus.file ? 'same file' : row.node.file}</span>
+        <span class="file">{row.node.file === focus.file ? t('sym.sameFile') : row.node.file}</span>
       </button>
     {/if}
   {/each}
@@ -126,7 +127,7 @@
 
 {#if model.foldFrom !== null}
   <button type="button" class="fold" onclick={() => (expanded = !expanded)}>
-    {expanded ? 'Fold' : `+${model.foldCount} more ${model.foldNoun}`}
+    {expanded ? t('hier.fold') : t('hier.foldMore', { n: model.foldCount, noun: model.foldNoun })}
   </button>
 {/if}
 

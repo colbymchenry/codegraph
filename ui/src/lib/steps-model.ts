@@ -13,6 +13,7 @@
  */
 
 import { whenWords } from './conditions';
+import { t, tPair } from './locale';
 import type { WireMapLink, WireMapModule, WireStep, WireStepDecision, WireStepLink, WireStepTrigger, WireStepsPayload } from './wire';
 import {
   buildMapLayout,
@@ -196,29 +197,29 @@ export function kindWord(kind: WireStep['kind'], project: ProjectKind = 'app', s
 export function kindWords(kind: WireStep['kind'], project: ProjectKind = 'app', step?: WireStep): [string, string] {
   switch (kind) {
     case 'screen':
-      if (step?.screen?.endpoint) return ['endpoint', 'endpoints'];
-      return project === 'api' ? ['endpoint', 'endpoints'] : project === 'web' ? ['page', 'pages'] : ['screen', 'screens'];
+      if (step?.screen?.endpoint) return tPair('step.kindEndpoint');
+      return project === 'api' ? tPair('step.kindEndpoint') : project === 'web' ? tPair('step.kindPage') : tPair('step.kindScreen');
     case 'trigger':
-      return ['handler', 'handlers'];
+      return tPair('step.kindHandler');
     case 'bridge':
       // An endpoint reached across a tier is a call to the server wherever it is.
-      if (step?.screen?.endpoint) return ['call to the server', 'calls to the server'];
-      return project === 'app' ? ['native call', 'native calls'] : project === 'web' ? ['call to the server', 'calls to the server'] : ['call to another tier', 'calls to another tier'];
+      if (step?.screen?.endpoint) return tPair('step.kindServerCall');
+      return project === 'app' ? tPair('step.kindNativeCall') : project === 'web' ? tPair('step.kindServerCall') : tPair('step.kindOtherTier');
     case 'event':
-      return project === 'app' ? ['native event', 'native events'] : project === 'web' ? ['arrives from the server', 'arrive from the server'] : ['arrives from a queue or bus', 'arrive from a queue or bus'];
+      return project === 'app' ? tPair('step.kindNativeEvent') : project === 'web' ? tPair('step.kindServerEvent') : tPair('step.kindQueueEvent');
     case 'store':
-      return project === 'api' ? ['data call', 'data calls'] : ['store action', 'store actions'];
+      return project === 'api' ? tPair('step.kindDataCall') : tPair('step.kindStoreAction');
     case 'effect':
-      return ['outside the index', 'outside the index'];
+      return tPair('step.kindOutside');
     default:
-      return ['start', 'start'];
+      return tPair('step.kindStart');
   }
 }
 
 /** `3 handlers`, `1 endpoint`, `11 outside the index`. */
 export function countWords(n: number, kind: WireStep['kind'], project: ProjectKind = 'app'): string {
   const [one, many] = kindWords(kind, project);
-  return `${n} ${n === 1 ? one : many}`;
+  return t('steps.countWords', { n, word: n === 1 ? one : many });
 }
 
 /**
@@ -227,21 +228,21 @@ export function countWords(n: number, kind: WireStep['kind'], project: ProjectKi
  * for a server, `POST /users · after authenticate, validate(…)`,
  * `@Process('email')`, `page load · /blog/[slug]`.
  */
-export function triggerWords(t: WireStepTrigger): string {
-  const after = t.after && t.after.length > 0 ? ` · after ${t.after.join(', ')}` : '';
-  switch (t.kind) {
+export function triggerWords(trig: WireStepTrigger): string {
+  const after = trig.after && trig.after.length > 0 ? t('step.triggerAfter', { after: trig.after.join(', ') }) : '';
+  switch (trig.kind) {
     case 'prop':
-      return t.of ? `${t.name} · <${t.of}>` : t.name;
+      return trig.of ? `${trig.name} · <${trig.of}>` : trig.name;
     case 'option':
-      return t.of ? `${t.name} · ${t.of}(…)` : t.name;
+      return trig.of ? `${trig.name} · ${trig.of}(…)` : trig.name;
     case 'request':
-      return `${t.name} ${t.of ?? ''}`.trim() + after;
+      return `${trig.name} ${trig.of ?? ''}`.trim() + after;
     case 'decorator':
-      return `@${t.name}(${t.of ?? ''})` + after;
+      return `@${trig.name}(${trig.of ?? ''})` + after;
     case 'load':
-      return `page load · ${t.of ?? t.name}` + after;
+      return t('step.triggerPageLoad') + (trig.of ?? trig.name) + after;
     default:
-      return t.of ? `${t.name}(${t.of})` : t.name;
+      return trig.of ? `${trig.name}(${trig.of})` : trig.name;
   }
 }
 
@@ -268,15 +269,15 @@ export function stepSub(step: WireStep, project: ProjectKind = 'app'): string {
       return step.sub;
     case 'trigger':
       // The event before the file: `onPress · <Button> · index.tsx`.
-      return step.trigger ? `${triggerWords(step.trigger)} · ${file}` : `handler · ${file}`;
+      return step.trigger ? `${triggerWords(step.trigger)} · ${file}` : `${t('step.handlerPrefix')}${file}`;
     case 'bridge':
       // An endpoint the code crosses to says its handler, as an endpoint box does.
       if (step.screen) return step.sub;
-      return `${project === 'app' ? 'native' : project === 'web' ? 'server' : 'another tier'} · ${file}`;
+      return `${project === 'app' ? t('step.bridgeNative') : project === 'web' ? t('step.bridgeServer') : t('step.bridgeTier')} · ${file}`;
     case 'event':
       return `${step.label} · ${file}`;
     case 'store':
-      return `${project === 'api' ? 'data' : 'store'} · ${file}`;
+      return `${project === 'api' ? t('step.storeData') : t('step.storeWord')} · ${file}`;
     case 'effect':
       return step.sub;
     default:

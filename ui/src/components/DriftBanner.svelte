@@ -13,6 +13,7 @@
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     /** Project-relative path, shown in mono. */
@@ -26,7 +27,7 @@
 
 <div class="drift" role="status">
   <span class="glyph" aria-hidden="true">⚠</span>
-  <span class="body"><code>{file}</code> changed on disk after the last index sync — {@render children()}</span>
+  <span class="body"><code>{file}</code> {t('drift.prefix')} {@render children()}</span>
 </div>
 
 <style>

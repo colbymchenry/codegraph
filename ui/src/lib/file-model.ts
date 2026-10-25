@@ -20,6 +20,7 @@
 
 import type { WireFilePayload, WireImportRow, WireOutlineEntry } from './api';
 import { basename } from './symbol-model';
+import { t, tPair } from './locale';
 
 export { basename } from './symbol-model';
 
@@ -187,11 +188,15 @@ export function formatBytes(bytes: number): string {
  * reader has no way to resolve.
  */
 export function fileMetaLine(payload: WireFilePayload): string {
-  const parts = [payload.file.language, formatBytes(payload.file.size)];
-  parts.push(`${payload.outline.total} ${payload.outline.total === 1 ? 'symbol' : 'symbols'}`);
-  if (payload.file.generated) parts.push('generated');
-  if (payload.file.test) parts.push('test');
-  return parts.join(' · ');
+  const [symbolOne, symbolMany] = tPair('file.symbolWord');
+  return t('file.metaLine', {
+    language: payload.file.language,
+    size: formatBytes(payload.file.size),
+    count: payload.outline.total,
+    symbolWord: payload.outline.total === 1 ? symbolOne : symbolMany,
+    generated: payload.file.generated ? t('file.generatedWord') : '',
+    test: payload.file.test ? t('file.testWord') : '',
+  });
 }
 
 /** The document title / heading for a file: its basename. */

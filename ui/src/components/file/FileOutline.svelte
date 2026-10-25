@@ -23,6 +23,7 @@
     OUTLINE_VIRTUAL_THRESHOLD,
     type OutlineEntryRow,
   } from '../../lib/file-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     rows: OutlineEntryRow[];
@@ -100,8 +101,8 @@
 </script>
 
 <div class="subh">
-  <span>Outline</span>
-  <span class="n">in source order</span>
+  <span>{t('file.outlineTab')}</span>
+  <span class="n">{t('file.inSourceOrder')}</span>
   <span class="n count">{total}</span>
 </div>
 
@@ -117,7 +118,7 @@
       style:padding-left={`${4 + row.indent * 22}px`}
       onclick={() => onopen(row.entry)}
       onmouseenter={() => onhover?.(index)}
-      title={`${row.entry.qualifiedName} — line ${row.entry.line}`}
+      title={t('file.lineTitle', { name: row.entry.qualifiedName, line: row.entry.line })}
     >
       <KindGlyph kind={row.entry.kind} />
       <span class="nm">{row.entry.name}</span>
@@ -133,15 +134,13 @@
 
 {#if rows.length === 0}
   <div class="note">
-    Nothing was extracted from this file — it holds no symbols the graph
-    recognises, only top-level code, or a language without an extractor.
+    {t('file.emptyOutline')}
   </div>
 {/if}
 
 {#if truncated}
   <div class="note">
-    Showing {rows.length} of {total} symbols. The rest are in the index; this
-    screen caps what it draws.
+    {t('file.truncatedOutline', { shown: rows.length, total })}
   </div>
 {/if}
 

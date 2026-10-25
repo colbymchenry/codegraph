@@ -392,3 +392,13 @@ Node ids and file paths are encoded per slash-separated segment, so
 `#/file/src/mcp/tools.ts` stays readable and still round-trips a segment
 containing a reserved character. Build hashes with `symbolHref()` /
 `fileHref()` / `mapHref()` / `flowHref()` rather than by hand.
+
+## Language
+
+The TopBar has a language selector that switches the viewer's UI between
+**English** and **Simplified Chinese (zh-CN)**. The choice is persisted in
+localStorage under `codegraph-viewer-locale` and restored on the next visit; if
+storage is unavailable (private mode) the selection lasts for that session. The
+translation covers UI chrome only — navigation, buttons, tooltips, empty states
+and errors. Symbol names, file paths, route paths and source code are never
+translated, so switching languages never changes what the graph means.

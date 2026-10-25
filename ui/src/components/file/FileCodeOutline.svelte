@@ -12,6 +12,7 @@
   import KindGlyph from '../KindGlyph.svelte';
   import { OUTLINE_VIRTUAL_THRESHOLD, type OutlineEntryRow } from '../../lib/file-model';
   import { NAV_ROW_HEIGHT } from '../../lib/filecode-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     rows: OutlineEntryRow[];
@@ -81,7 +82,7 @@
 
 <div class="navrail">
   <div class="navh">
-    <span>Outline</span>
+    <span>{t('file.outlineTab')}</span>
     <span class="dim">{total}</span>
   </div>
   <div class="navlist">
@@ -94,7 +95,7 @@
           class:dimmed={row.dimmed}
           class:current={row.entry.id === currentId}
           style:padding-left={`${6 + row.indent * 14}px`}
-          title={`${row.entry.qualifiedName} — line ${row.entry.line}`}
+          title={t('file.lineTitle', { name: row.entry.qualifiedName, line: row.entry.line })}
           onclick={() => ongo(row.entry.line, row.entry.id)}
         >
           <KindGlyph kind={row.entry.kind} />
@@ -106,7 +107,7 @@
     </div>
   </div>
   {#if truncated}
-    <div class="note">Showing {rows.length} of {total} symbols.</div>
+    <div class="note">{t('fc.outlineTruncated', { shown: rows.length, total })}</div>
   {/if}
 </div>
 

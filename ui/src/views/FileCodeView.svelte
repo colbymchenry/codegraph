@@ -65,6 +65,7 @@
   import { liveRefresh } from '../lib/live.svelte';
   import { plural, synthesizedBy, type Connector, type LineRef } from '../lib/symbol-model';
   import { walkTo } from '../lib/walk';
+  import { t, tPair } from '../lib/locale.svelte';
 
   interface Props {
     path: string;
@@ -183,7 +184,7 @@
       // A different file (or a reload) landed while this was in flight.
       if (signal?.aborted || payload?.file.path !== file.path) return;
       if (!slice.lines) {
-        pageError = slice.reason ?? 'Source is not available for this file.';
+        pageError = slice.reason ?? t('fc.sourceUnavailable');
         return;
       }
       const from = slice.from ?? page.requestFrom;
@@ -427,7 +428,7 @@
 {#if failure}
   <div class="scroll">
     <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}</h2>
+      <h2>{failure.code === 'not-found' ? t('file.notInIndex') : t('file.couldNotLoad')}</h2>
       <p class="mono">{path}</p>
       <p>{failure.message}</p>
       {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
@@ -435,7 +436,7 @@
   </div>
 {:else if loading || !payload}
   <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
+    <div class="emptystate"><p class="dim">{t('file.loading')}</p></div>
   </div>
 {:else}
   <div class="codeview" class:wide={outlineRows.length > 0}>
@@ -462,9 +463,9 @@
           <span class="kindword">
             {payload.file.language} · {formatBytes(payload.file.size)} ·
             {payload.file.totalLines === null
-              ? 'length unknown'
-              : plural(payload.file.totalLines, 'line')} ·
-            {plural(payload.outline.total, 'symbol')}
+              ? t('fc.lengthUnknown')
+              : plural(payload.file.totalLines, tPair('fc.lineWord')[0])} ·
+            {plural(payload.outline.total, tPair('file.symbolWord')[0])}
           </span>
           <span class="loc">{payload.file.path}</span>
           <div class="spacer"></div>
@@ -474,17 +475,17 @@
         <div class="toolbar" class:hidden={driftMode}>
           <span class="arcnote">
             {arcSummary(payload.intraFileCalls)}{#if crowded}{' '}<span class="dim"
-                >— showing the ones the symbol under the pointer takes part in</span
+                >{t('fc.arcCrowded')}</span
               >{/if}
           </span>
           <span
             class="railnote"
-            title="One row per pair: a symbol in this file, and a symbol it reaches."
+            title={t('fc.railNoteTitle')}
           >
-            Calls <span class="n">{payload.calls.total}</span>{#if payload.calls.truncated}<span
-                class="dim"> · showing {payload.calls.shown}</span
+            {t('fc.callsLabel')} <span class="n">{payload.calls.total}</span>{#if payload.calls.truncated}<span
+                class="dim">{t('fc.showing', { n: payload.calls.shown })}</span
               >{/if}{#if payload.outside.total > 0}{' '}<span class="dim"
-                >· {plural(payload.outside.total, 'reference')} outside the index</span
+                >{t('fc.outsideRefs', { n: plural(payload.outside.total, tPair('fc.referenceWord')[0]) })}</span
               >{/if}
           </span>
         </div>
@@ -492,15 +493,13 @@
         {#if payload.drift}
           <div class="banner">
             <DriftBanner file={payload.file.path}>
-              indexed line ranges may be shifted; showing the file's current source, with the
-              call arcs, ports and rail switched off — they are drawn from lines this file no
-              longer has. The next sync picks it up.
+              {t('fc.drift')}
             </DriftBanner>
           </div>
         {:else if payload.file.totalLines === null}
           <div class="banner">
             <DriftBanner file={payload.file.path}>
-              {payload.reason ?? 'it could not be read from disk.'}
+              {payload.reason ?? t('fc.readError')}
             </DriftBanner>
           </div>
         {:else if pageError}
@@ -539,7 +538,7 @@
               />
             </div>
 
-            <aside class="rail" bind:this={railEl} aria-label="Calls">
+            <aside class="rail" bind:this={railEl} aria-label={t('fc.callsLabel')}>
               {#if !driftMode}
                 <FileCodeRail
                   rows={windowRows}

@@ -10,6 +10,7 @@
  * Design spec §3.2.
  */
 
+import { plural as localePlural, t } from './locale';
 import type {
   WireEdge,
   WireMember,
@@ -64,11 +65,11 @@ export function edgeWord(edge: WireEdge): string {
     case 'calls':
       return '';
     case 'instantiates':
-      return 'creates';
+      return t('sym.creates');
     case 'navigates':
-      return 'navigates to';
+      return t('sym.navigatesTo');
     case 'references':
-      return edge.valueRef ? 'passes as value' : 'uses type';
+      return edge.valueRef ? t('sym.passesAsValue') : t('sym.usesType');
     default:
       return edge.kind;
   }
@@ -98,7 +99,7 @@ export function relationWhens(relation: WireRelation): string[] {
 export function synthesizedBy(relation: WireRelation): string | null {
   if (!relation.synthesized) return null;
   const edge = relation.edges.find((e) => e.provenance === 'heuristic');
-  return edge?.synthesizedBy ?? edge?.via ?? 'synthesized';
+  return edge?.synthesizedBy ?? edge?.via ?? t('sym.synthesized');
 }
 
 export function basename(path: string): string {
@@ -231,9 +232,9 @@ export function refsByLine(payload: WireSymbolPayload): Map<number, LineRef[]> {
         uncertain: relation.uncertain,
         outside: false,
         title:
-          `${word || 'calls'} ${relation.node.qualifiedName} — ${relation.node.file}:${relation.node.line}` +
-          (edge.confidence != null ? ` · confidence ${edge.confidence}` : '') +
-          (edge.resolvedBy ? ` · resolved by ${edge.resolvedBy}` : ''),
+          `${word || t('sym.calls')} ${relation.node.qualifiedName} — ${relation.node.file}:${relation.node.line}` +
+          (edge.confidence != null ? t('sym.confidence', { n: edge.confidence }) : '') +
+          (edge.resolvedBy ? t('sym.resolvedBy', { name: edge.resolvedBy }) : ''),
       });
     }
   }
@@ -281,7 +282,7 @@ function outsideRefs(outside: WireOutsideIndex): Array<{ line: number; ref: Line
         targetId: null,
         uncertain: false,
         outside: true,
-        title: `${sample.name} is not in the index — nothing here resolves it`,
+        title: t('sym.outsideTitle', { name: sample.name }),
       },
     });
   }
@@ -533,5 +534,5 @@ export function kindPhrase(node: {
 
 /** "1 caller" / "12 callers" — the counts sit next to too many nouns to inline. */
 export function plural(count: number, one: string, many = `${one}s`): string {
-  return `${count} ${count === 1 ? one : many}`;
+  return localePlural(count, one, many);
 }

@@ -3,6 +3,7 @@
   import { trail } from '../lib/trail.svelte';
   import SearchPalette from './SearchPalette.svelte';
   import { live } from '../lib/live.svelte';
+  import { locale, t, type LocaleCode } from '../lib/locale.svelte';
 
   interface Props {
     /** Indexed project name, e.g. "codegraph/". Null until stats load. */
@@ -47,15 +48,14 @@
   let liveNote = $derived.by(() => {
     if (live.degraded !== null) {
       return {
-        text: 'Live updates off',
-        title: `${live.degraded} This page no longer refreshes itself — reload it after a sync.`,
+        text: t('live.off'),
+        title: t('live.degradedTitle', { reason: live.degraded }),
       };
     }
     if (live.stopped) {
       return {
-        text: 'Not live',
-        title:
-          'Lost the connection to codegraph ui and stopped retrying. Focus this tab to try again, or reload the page.',
+        text: t('live.notLive'),
+        title: t('live.lostTitle'),
       };
     }
     return null;
@@ -63,28 +63,35 @@
 </script>
 
 <header class="topbar">
-  <a class="brand" href="#/" aria-label="CodeGraph home">
+  <a class="brand" href="#/" aria-label={t('brand.homeAria')}>
     <span class="brand-mark" aria-hidden="true"></span>
     <span class="brand-name">CodeGraph</span>
     <span class="brand-sub">ui</span>
   </a>
 
-  <nav class="views" aria-label="Views">
-    {#if showScreens}<a href={screensHref()} class:active={view === 'screens' || view === 'home'}>Screens</a>{/if}
-    <a href={stepsHref()} class:active={view === 'steps'}>Steps</a>
-    <a href={entryHref()} class:active={view === 'entry'}>Entry points</a>
-    <a href={mapHref()} class:active={view === 'map'}>Map</a>
-    <a href={symbolTabHref} class:active={view === 'symbol' || (view === 'home' && !showScreens)}>Symbol</a>
-    <a href={flowHref()} class:active={view === 'flow'}>Flow</a>
-    <a href={deadHref()} class:active={view === 'dead'}>Dead code</a>
+  <nav class="views" aria-label={t('nav.viewsAria')}>
+    {#if showScreens}<a href={screensHref()} class:active={view === 'screens' || view === 'home'}>{t('nav.screens')}</a>{/if}
+    <a href={stepsHref()} class:active={view === 'steps'}>{t('nav.steps')}</a>
+    <a href={entryHref()} class:active={view === 'entry'}>{t('nav.entry')}</a>
+    <a href={mapHref()} class:active={view === 'map'}>{t('nav.map')}</a>
+    <a href={symbolTabHref} class:active={view === 'symbol' || (view === 'home' && !showScreens)}>{t('nav.symbol')}</a>
+    <a href={flowHref()} class:active={view === 'flow'}>{t('nav.flow')}</a>
+    <a href={deadHref()} class:active={view === 'dead'}>{t('nav.dead')}</a>
   </nav>
 
   <SearchPalette bind:this={search} />
 
-  <div class="project" title="Indexed project">
+  <div class="project" title={t('topbar.indexedTitle')}>
     {#if liveNote}<span class="offline" title={liveNote.title}>{liveNote.text}</span>{/if}
     {#if project}<span class="mono">{project}</span>{/if}
     {#if stats}<span class="dim">{stats}</span>{/if}
+    <label class="locale" title={locale.current === 'en' ? '中文' : 'English'}>
+      <span class="sr-only">{t('nav.viewsAria')}</span>
+      <select bind:value={locale.current} onchange={(e) => locale.set(e.currentTarget.value as LocaleCode)}>
+        <option value="en">English</option>
+        <option value="zh-CN">中文</option>
+      </select>
+    </label>
   </div>
 </header>
 
@@ -160,6 +167,27 @@
     background: var(--paper-2);
     color: var(--ink-3);
     font-size: 11.5px;
+  }
+
+  .locale select {
+    margin-left: 10px;
+    padding: 1px 4px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink-2);
+    font-size: 12px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   /* Below ~1000px the stats are the first thing worth losing — but not the

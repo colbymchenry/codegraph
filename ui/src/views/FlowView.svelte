@@ -28,6 +28,7 @@
   import { decodeTrail } from '../lib/trail-codec';
   import { buildFlowLayout, type FlowCardLayout, type FlowLayout } from '../lib/flow-model';
   import { basename } from '../lib/symbol-model';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     from: string | null;
@@ -215,15 +216,15 @@
 
   function note(p: WireFlowPayload): string {
     if (p.query.kind === 'trail') {
-      return 'Your trail, read as a flow: each card is opened at the line that carried you to the next one.';
+      return t('flow.noteTrail');
     }
     if (p.flows.some((f) => f.partial)) {
-      return 'No static path connects them. The card is where the looking stopped — a call whose target is chosen at runtime — and the cap names the form, the key and who could be on the other side.';
+      return t('flow.notePartial');
     }
     if (p.query.kind === 'directed') {
-      return 'Every card is a call the graph recorded. A dashed link is a hop no one can see in the source — a callback, an interface, a re-render — and it names where it was wired.';
+      return t('flow.noteDirected');
     }
-    return 'The longest call path among the symbols you named, the same one codegraph_explore leads with.';
+    return t('flow.noteDefault');
   }
 
   /**
@@ -235,28 +236,28 @@
    */
   const exportLabel = $derived(
     showAll && flows.length > 1
-      ? `all ${flows.length} paths`
-      : (activeFlow?.label ?? 'flow')
+      ? t('flow.captionAll', { n: flows.length })
+      : (activeFlow?.label ?? t('flow.captionDefault'))
   );
 
   function buildSvg(scale: number): string {
-    if (layout === null) throw new Error('There is no strip to export yet.');
+    if (layout === null) throw new Error(t('flow.buildStripError'));
     const hops = activeFlow?.hops.length ?? 0;
     return flowSvg(layout, {
       scale,
       activeFlowId: picked,
       showAll,
-      caption: showAll ? exportLabel : `${exportLabel}${hops > 1 ? ` · ${hops} hops` : ''}`,
+      caption: showAll ? exportLabel : `${exportLabel}${hops > 1 ? t('flow.hops', { n: hops }) : ''}`,
     });
   }
 </script>
 
 <div class="flowview">
   <header class="fhead">
-    <h1>Flow</h1>
+    <h1>{t('flow.title')}</h1>
     {#if flows.length > 0}
       <select
-        aria-label="Which path to draw"
+        aria-label={t('flow.whichPathAria')}
         value={showAll ? ALL : (picked ?? '')}
         onchange={(event) => {
           const value = (event.currentTarget as HTMLSelectElement).value;
@@ -266,11 +267,11 @@
       >
         {#each flows as flow (flow.id)}
           <option value={flow.id}
-            >{flow.label}{flow.hops.length > 1 ? ` · ${flow.hops.length} hops` : ''}</option
+            >{flow.label}{flow.hops.length > 1 ? t('flow.hops', { n: flow.hops.length }) : ''}</option
           >
         {/each}
         {#if flows.length > 1}
-          <option value={ALL}>All {flows.length} paths</option>
+          <option value={ALL}>{t('flow.allPaths', { n: flows.length })}</option>
         {/if}
       </select>
     {/if}
@@ -285,27 +286,27 @@
   <div class="fstage">
     {#if error !== null}
       <div class="state">
-        <h2>The flow could not be built</h2>
+        <h2>{t('flow.buildError')}</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Following the calls…</p></div>
+      <div class="state"><p class="dim">{t('flow.following')}</p></div>
     {:else if payload === null}
       <div class="state">
-        <h2>Nothing to follow yet</h2>
+        <h2>{t('flow.nothingYet')}</h2>
         <p>
-          Ask for a path in the search box — “how does execute reach getFile”, or
-          <span class="mono">execute -&gt; getFile</span> — or walk a trail and read it as a flow.
+          {t('flow.nothingYetBodyBefore')}
+          <span class="mono">{t('flow.example')}</span>
+          {t('flow.nothingYetBodyAfter')}
         </p>
       </div>
     {:else if layout === null}
       <div class="state">
-        <h2>No path between them</h2>
+        <h2>{t('flow.noPath')}</h2>
         <p>{payload.reason}</p>
         {#if payload.query.from && payload.query.to}
           <p class="dim">
-            Asked: <span class="mono">{payload.query.from}</span> to
-            <span class="mono">{payload.query.to}</span>.
+            {t('flow.asked', { from: payload.query.from, to: payload.query.to })}
           </p>
         {/if}
       </div>
@@ -337,17 +338,16 @@
       {/if}
       {#each payload.ambiguous as amb (amb.token)}
         <p>
-          <span class="mono">{amb.token}</span> names {amb.others.length + 1} definitions.
+          {t('flow.namesDefs', { token: amb.token, n: amb.others.length + 1 })}
           {#if amb.chosen}
-            This path runs through the one in
-            <span class="mono">{basename(amb.chosen.file)}:{amb.chosen.line}</span>.
+            {t('flow.runsThrough', { loc: `${basename(amb.chosen.file)}:${amb.chosen.line}` })}
           {:else}
-            None of them are on this path.
+            {t('flow.noneOnPath')}
           {/if}
         </p>
       {/each}
       {#each payload.unresolved as token (token)}
-        <p><span class="mono">{token}</span> names nothing in this index.</p>
+        <p>{t('flow.namesNothing', { token })}</p>
       {/each}
     </footer>
   {/if}

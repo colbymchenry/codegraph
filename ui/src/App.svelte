@@ -30,6 +30,7 @@
   import { project } from './lib/project.svelte';
   import { live } from './lib/live.svelte';
   import { toast } from './lib/toast.svelte';
+  import { t } from './lib/locale.svelte';
 
   // One `/api/stats` for the whole app: the top bar's counts and the Symbol
   // view's blast-radius denominator come out of the same payload.
@@ -61,7 +62,7 @@
       // moved, so their decay lines are stale the moment it does — a hop that
       // was "gone" a minute ago may be back, and vice versa.
       void trails.reload();
-      toast.show('Index updated · reloaded');
+      toast.show(t('app.indexUpdated'));
     });
   });
 

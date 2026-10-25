@@ -13,6 +13,7 @@
  */
 
 import { plural } from './symbol-model';
+import { hasPluralInflection, t } from './locale';
 import { kindWord } from './kinds';
 import type { WireDeadCode, WireDeadCodeGroup, WireDeadCodeRow } from './wire';
 
@@ -23,24 +24,31 @@ import type { WireDeadCode, WireDeadCodeGroup, WireDeadCodeRow } from './wire';
  * "no static reference in the index", which is a strictly weaker claim than
  * "unused", and the difference is the whole risk of acting on it.
  */
-export const DEAD_CODE_CAVEAT =
-  'No static reference in the index — dynamic use is possible.';
+export const DEAD_CODE_CAVEAT = t('dead.caveat');
 
 /** "symbol" / "symbols" — the noun without its count, for sentences that count twice. */
 function noun(count: number, one: string): string {
-  return count === 1 ? one : `${one}s`;
+  return hasPluralInflection() && count !== 1 ? `${one}s` : one;
 }
 
 /** The one-line summary above the list. */
 export function deadCodeHeadline(payload: WireDeadCode | null): string {
   if (!payload) return '';
   const { rows } = payload;
-  if (rows.total === 0) return 'Nothing on this list.';
+  if (rows.total === 0) return t('dead.nothingOnList');
   const lines = payload.groups.reduce((sum, group) => sum + group.lines, 0);
   const shown = rows.truncated
-    ? `${rows.shown} of ${rows.total} ${noun(rows.total, 'symbol')}`
+    ? t('dead.shownOf', {
+        shown: rows.shown.toLocaleString(),
+        total: rows.total.toLocaleString(),
+        noun: noun(rows.total, 'symbol'),
+      })
     : plural(rows.total, 'symbol');
-  return `${shown} in ${plural(payload.groups.length, 'file')} · ${plural(lines, 'line')}`;
+  return t('dead.headline', {
+    shown,
+    files: plural(payload.groups.length, 'file'),
+    lines: plural(lines, 'line'),
+  });
 }
 
 /**
@@ -52,7 +60,11 @@ export function deadCodeHeadline(payload: WireDeadCode | null): string {
  */
 export function deadCodeScale(payload: WireDeadCode | null): string {
   if (!payload || payload.candidates === 0) return '';
-  return `${payload.candidates.toLocaleString()} ${noun(payload.candidates, 'symbol')} in this index carry no incoming reference at all; ${payload.excludedTotal.toLocaleString()} of them were left off this list.`;
+  return t('dead.scale', {
+    candidates: payload.candidates.toLocaleString(),
+    s: noun(payload.candidates, 'symbol'),
+    excluded: payload.excludedTotal.toLocaleString(),
+  });
 }
 
 /** Each exclusion as "N <label>", biggest first — the sentence under the list. */
@@ -65,7 +77,7 @@ export function exclusionPhrases(payload: WireDeadCode | null): string[] {
 export function deadCodeRowMeta(row: WireDeadCodeRow): string {
   const parts = [kindWord(row.kind), plural(row.lines, 'line')];
   if (row.members.total > 0) {
-    parts.push(`${plural(row.members.total, 'member')} unreachable with it`);
+    parts.push(t('dead.unreachableWith', { members: plural(row.members.total, 'member') }));
   }
   return parts.join(' · ');
 }
@@ -73,7 +85,7 @@ export function deadCodeRowMeta(row: WireDeadCodeRow): string {
 /** The group header's right-hand count. */
 export function groupMeta(group: WireDeadCodeGroup): string {
   const parts = [plural(group.rows.length, 'symbol'), plural(group.lines, 'line')];
-  if (group.generated) parts.push('generated');
+  if (group.generated) parts.push(t('dead.generatedPrefix'));
   return parts.join(' · ');
 }
 
@@ -86,10 +98,10 @@ export function groupMeta(group: WireDeadCodeGroup): string {
  */
 export function emptyMessage(payload: WireDeadCode): string {
   if (payload.candidates === 0) {
-    return 'Every symbol in this index is referenced by something. Nothing to show.';
+    return t('dead.emptyAllReferenced');
   }
   if (payload.includeExported) {
-    return `Every one of the ${payload.candidates.toLocaleString()} symbols with no incoming reference has a reason to be reachable anyway — see the list of exclusions below.`;
+    return t('dead.emptyExported', { n: payload.candidates.toLocaleString() });
   }
-  return `All ${payload.candidates.toLocaleString()} symbols with no incoming reference are either reachable from outside this repository or excluded for the reasons below. Turn on "including exported" to see the ones the index cannot check.`;
+  return t('dead.emptyTurnOn', { n: payload.candidates.toLocaleString() });
 }

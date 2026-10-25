@@ -8,6 +8,7 @@
  */
 
 import { fetchStats, type WireStats } from './api';
+import { t } from './locale.svelte';
 
 let stats = $state<WireStats | null>(null);
 let error = $state<string | null>(null);
@@ -43,7 +44,11 @@ export const project = {
   get summary(): string | null {
     if (!stats) return null;
     const n = (value: number): string => value.toLocaleString();
-    return `${n(stats.graph.nodes)} symbols · ${n(stats.graph.edges)} edges · ${n(stats.graph.files)} files indexed`;
+    return t('summary.line', {
+      nodes: n(stats.graph.nodes),
+      edges: n(stats.graph.edges),
+      files: n(stats.graph.files),
+    });
   },
   ensure: load,
   /**

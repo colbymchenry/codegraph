@@ -10,6 +10,7 @@
    * top of the code it is explaining.
    */
   import { kindWord, type ProjectKind } from '../../lib/steps-model';
+  import { locale, t } from '../../lib/locale.svelte';
 
   interface Props {
     project: ProjectKind;
@@ -23,11 +24,15 @@
     onToggle: (open: boolean) => void;
   }
   let { project, order, regions = false, flow, open, onToggle }: Props = $props();
+
+  // `locale.current` is read here so the kind words re-render when the viewer's
+  // language switches (`kindWord` itself is not reactive).
+  const screenKind = $derived((locale.current, kindWord('screen', project)));
 </script>
 
 <div class="legend" class:open class:flow>
   <button class="legend-h" onclick={() => onToggle(!open)} aria-expanded={open}>
-    Key <span class="dim">{open ? '▾' : '▸'}</span>
+    {t('scr.key')} <span class="dim">{open ? '▾' : '▸'}</span>
   </button>
   {#if open}
     <div class="legend-body">
@@ -35,144 +40,131 @@
         <span class="k-box k-anchor mono"><span class="mark">●</span>start</span>
         <span
           >{order
-            ? 'Where the picture starts; below it, what it does in the code’s own order'
+            ? t('step.keyWhereStartsOrder')
             : regions
-              ? 'Where the picture starts; below it, the parts of the ' + kindWord('screen', project) + ', each with what happens there'
-              : 'Where the picture starts; each row down is one more step away'}</span
+              ? t('step.keyWhereStartsScreen', { kind: screenKind })
+              : t('step.keyWhereStartsTree')}</span
         >
       </div>
       {#if regions && !order}
         <div class="lrow">
           <span class="k-cap mono">Name</span>
           <span
-            >A region — the component that owns the boxes under its rule, a box above what it sets in motion. One line from
-            the start into each region stands in for the {kindWord('screen', project)}'s whole fan-out; every other line
-            draws where it leads</span
+            >{t('step.keyRegionBefore')}{t('step.keyRegion', { kind: screenKind })}{t('step.keyRegionAfter')}</span
           >
         </div>
         <div class="lrow">
           <span class="k-label">no line</span>
-          <span
-            >A box nothing points at is the region's own doing — run on render or mount, or from a binding written inline.
-            Select it and its line from the {kindWord('screen', project)} lights, with what fires it</span
-          >
+          <span>{t('step.keyNoLine', { kind: screenKind })}</span>
         </div>
       {/if}
       {#if !order}
         <div class="lrow">
           <span class="k-label mono">→ name</span>
-          <span
-            >What a box leads to, or what reaches it (←), when the two are too far apart for a line to be followed — said
-            in words under the box rather than drawn across the picture. Select the box and every one of its real lines
-            draws</span
-          >
+          <span>{t('step.keyStub')}</span>
         </div>
       {/if}
       {#if project === 'api'}
         <div class="lrow">
           <span class="k-box mono">POST /x</span>
-          <span>An endpoint — its verb and path — or a handler: a function a request, a job, an event or a schedule fires; its line says which</span>
+          <span>{t('step.keyEndpoint')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-cross mono">⇢ fn</span>
-          <span>The code crosses a tier: a call into another service or a job put on a queue (⇢), or a job, an event, a message arriving (⇠)</span>
+          <span>{t('step.keyCrossTier')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-store mono">set</span>
-          <span>A data call — a function in a store or state file</span>
+          <span>{t('step.keyDataCall')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-effect mono">db</span>
-          <span>A call that leaves the index: the database, the response, a queue, email, payments, a cache, auth, the network</span>
+          <span>{t('step.keyEffectApi')}</span>
         </div>
       {:else if project === 'web'}
         <div class="lrow">
           <span class="k-box mono">/path</span>
-          <span>A page, an endpoint, or a handler — a function an event, a request or a page load fires; its line says which</span>
+          <span>{t('step.keyPage')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-cross mono">⇢ fn</span>
-          <span>The code crosses to the server (⇢ a request, a server action) or comes back from it (⇠ a push, a stream)</span>
+          <span>{t('step.keyCrossServer')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-store mono">set</span>
-          <span>A store action — a function in a store file</span>
+          <span>{t('step.keyStoreAction')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-effect mono">api</span>
-          <span>A call that leaves the index: the network, the database, the response, storage, a queue, email</span>
+          <span>{t('step.keyEffectWeb')}</span>
         </div>
       {:else}
         <div class="lrow">
           <span class="k-box mono">/path</span>
-          <span>A screen, or a handler — a function fired from a tap, an option, a listener; its line says the event</span>
+          <span>{t('step.keyScreen')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-cross mono">⇢ fn</span>
-          <span>The code crosses into native (⇢ a bridge call) or comes back from it (⇠ an event)</span>
+          <span>{t('step.keyCrossNative')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-store mono">set</span>
-          <span>A store action — a function in a store file</span>
+          <span>{t('step.keyStoreAction')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-effect mono">api</span>
-          <span>A call that leaves the index: the network, storage, the device, telemetry</span>
+          <span>{t('step.keyEffectApp')}</span>
         </div>
       {/if}
       {#if order}
         <div class="lrow">
           <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line" /></svg>
-          <span>And then — the step at the other end happens after this one; the plumbing between them is folded into the line</span>
+          <span>{t('step.keyAndThen')}</span>
         </div>
         <div class="lrow">
           <span class="k-box k-fork mono">x?</span>
-          <span>A decision both of whose ways are drawn: the box asks the condition once and each line out answers — <span class="mono">yes</span>, <span class="mono">no</span>, a case. An arm that answers or leaves ends there</span>
+          <span>{t('step.keyFork')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">WHEN x</span>
-          <span>A lone guard — an early exit, an <span class="mono">if</span> with one drawn side: what has to hold for the step at the other end. No label = it happens either way</span>
+          <span>{t('step.keyGuard')}</span>
         </div>
         <div class="lrow">
           <span class="k-label">via x</span>
-          <span>Written inside a helper drawn where it is called; <span class="mono">later</span> runs after this returns, <span class="mono">together</span> starts at once, <span class="mono">for each</span> repeats</span>
+          <span>{t('step.keyVia')}</span>
         </div>
         <div class="lrow">
           <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-synth" /></svg>
-          <span>Established by a synthesized hop (an event channel, a callback, a helper's return value)</span>
+          <span>{t('step.keySynth')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">name …</span>
-          <span>Not entered: another {kindWord('screen', project)} (a chapter of its own), or a cap the walk hit — start there to see on</span>
+          <span>{t('step.keyNotEntered', { kind: screenKind })}</span>
         </div>
       {:else}
         <div class="lrow">
           <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line" /></svg>
-          <span>Leads to — the plumbing between the two is folded into the line</span>
+          <span>{t('step.keyLeadsTo')}</span>
         </div>
         <div class="lrow">
           <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-synth" /></svg>
-          <span>Established by a synthesized hop (an event channel, a callback, a helper's return value)</span>
+          <span>{t('step.keySynth')}</span>
         </div>
         <div class="lrow">
           <svg width="44" height="12" aria-hidden="true"><path d="M2 6 H42" class="k-line k-back" /></svg>
-          <span>Goes back up the picture — leaves the top of its box, arrives at the bottom of the other</span>
+          <span>{t('step.keyBack')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">x? · yes</span>
-          <span
-            >A decision made inside a box, both of whose ways are drawn: the condition is said once under the box and
-            each line out of it answers — <span class="mono">yes</span>, <span class="mono">no</span>, a case. These are
-            the only lines labelled before you select anything</span
-          >
+          <span>{t('step.keyDecisionInside')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">→ …x</span>
-          <span>The last condition checked before the step, beside the box at the other end of the selected step's line; ← when it arrives there. None = always</span>
+          <span>{t('step.keyCondition')}</span>
         </div>
         <div class="lrow">
           <span class="k-label mono">name …</span>
-          <span>Not entered: another screen (a chapter of its own), or a cap the walk hit — start there to see on</span>
+          <span>{t('step.keyNotEntered', { kind: screenKind })}</span>
         </div>
       {/if}
     </div>

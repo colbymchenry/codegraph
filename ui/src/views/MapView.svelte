@@ -29,6 +29,7 @@
     type MapEdgeLayout,
     type MapLayout,
   } from '../lib/map-model';
+  import { t } from '../lib/locale.svelte';
 
   interface Props {
     root: string | null;
@@ -209,12 +210,12 @@
    * renders SVG in a README.
    */
   function buildSvg(scale: number): string {
-    if (layout === null) throw new Error('There is no map to export yet.');
+    if (layout === null) throw new Error(t('map.noExport'));
     const root = payload?.root ?? '';
     return mapSvg(layout, {
       scale,
       selected,
-      caption: `${root || 'the project'} · ${layout.nodes.length} modules${selected ? ` · ${selected} selected` : ''}`,
+      caption: `${root || t('map.theProject')} · ${t('map.modules', { n: layout.nodes.length })}${selected ? ` · ${t('map.selected', { name: selected })}` : ''}`,
     });
   }
 
@@ -229,19 +230,15 @@
   <div class="mapstage" bind:this={stage}>
     {#if error !== null}
       <div class="state">
-        <h2>The map could not be built</h2>
+        <h2>{t('map.buildError')}</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Aggregating the graph by module…</p></div>
+      <div class="state"><p class="dim">{t('map.aggregating')}</p></div>
     {:else if layout !== null && layout.nodes.length === 0}
       <div class="state">
-        <h2>Nothing to draw here</h2>
-        <p>
-          No indexed files sit under this root{tests
-            ? ''
-            : ', or every module under it is test code'}. Pick another root on the right.
-        </p>
+        <h2>{t('map.nothingDraw')}</h2>
+        <p>{t('map.noFilesUnderRoot', { or: tests ? '' : t('map.noFilesOr'), tail: t('map.noFilesTail') })}</p>
       </div>
     {:else if layout !== null}
       <SvelteFlow
@@ -301,14 +298,14 @@
         <div class="tip" style={`left:${hovered.x}px;top:${hovered.y}px`}>
           <div class="mono"><b>{hovered.edge.source}</b> → {hovered.edge.target}</div>
           <div class="row2">
-            <span>{hovered.edge.link.count} edges</span>
+            <span>{t('map.edges', { n: hovered.edge.link.count })}</span>
             <span
               >{hovered.edge.link.byKind.map((k) => `${k.kind} ${k.count}`).join(' · ')}</span
             >
           </div>
           {#if hovered.edge.link.declared !== hovered.edge.link.count}
             <div class="row2 dim">
-              <span>{hovered.edge.link.declared} through an import or a declared type</span>
+              <span>{t('map.viaImport', { n: hovered.edge.link.declared })}</span>
             </div>
           {/if}
           {#each hovered.edge.link.topPairs as pair (pair.from + pair.to)}

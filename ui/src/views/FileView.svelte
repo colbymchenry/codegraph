@@ -33,6 +33,7 @@
   import { liveRefresh } from '../lib/live.svelte';
   import { plural } from '../lib/symbol-model';
   import { walkTo } from '../lib/walk';
+  import { t, tPair } from '../lib/locale.svelte';
 
   interface Props {
     path: string;
@@ -247,7 +248,7 @@
 {#if failure}
   <div class="scroll">
     <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}</h2>
+      <h2>{failure.code === 'not-found' ? t('file.notInIndex') : t('file.couldNotLoad')}</h2>
       <p class="mono">{path}</p>
       <p>{failure.message}</p>
       {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
@@ -255,13 +256,13 @@
   </div>
 {:else if loading || !payload || !imports || !importedBy}
   <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
+    <div class="emptystate"><p class="dim">{t('file.loading')}</p></div>
   </div>
 {:else}
   <div class="fileview">
     <div class="pane" data-pane="left">
       <FileRail
-        title="Imported by"
+        title={t('file.importedBy')}
         model={importedBy}
         side="left"
         selected={pane === 'left' ? index : -1}
@@ -269,7 +270,7 @@
           pane = 'left';
           index = i;
         }}
-        emptyNote="Nothing in the index reaches into this file. It is either an entry point, or nothing depends on it yet."
+        emptyNote={t('file.emptyImportedBy')}
       />
     </div>
 
@@ -287,19 +288,18 @@
       <div class="badges">
         {#if payload.topLevel.calls > 0}
           <span class="badge">
-            Runs {plural(payload.topLevel.calls, 'call')} at the top level —
+            {t('file.runsTop', { calls: plural(payload.topLevel.calls, tPair('sym.callWord')[0]) })}
             <button type="button" class="linkish" onclick={openFileNode}>
-              see what it calls
+              {t('file.seeWhatItCalls')}
             </button>
           </span>
         {/if}
         {#if payload.file.generated}
-          <span class="badge">generated</span>
+          <span class="badge">{t('file.generated')}</span>
         {/if}
         {#if payload.file.errors.length > 0}
           <span class="badge warn">
-            {plural(payload.file.errors.length, 'extraction error')} — the outline may be
-            incomplete
+            {t('file.extractionErrors', { n: plural(payload.file.errors.length, tPair('sym.extractionErrorWord')[0]) })}
           </span>
         {/if}
       </div>
@@ -307,10 +307,9 @@
       {#if payload.drift}
         <div class="banner">
           <DriftBanner file={payload.file.path}>
-            indexed line ranges may be shifted, so the outline below is the shape the file had
-            when it was indexed —
-            <a href={fileHref(payload.file.path, { source: true })}>read its current source</a>.
-            The next sync picks it up.
+            {t('file.driftBefore')}
+            <a href={fileHref(payload.file.path, { source: true })}>{t('file.driftOpen')}</a>
+            {t('file.driftAfter')}
           </DriftBanner>
         </div>
       {/if}
@@ -331,7 +330,7 @@
 
     <div class="pane" data-pane="right">
       <FileRail
-        title="Imports"
+        title={t('file.imports')}
         model={imports}
         side="right"
         selected={pane === 'right' ? index : -1}
@@ -339,7 +338,7 @@
           pane = 'right';
           index = i;
         }}
-        emptyNote="This file reaches nothing else in the index — it depends on nothing the graph holds."
+        emptyNote={t('file.emptyImports')}
       />
     </div>
   </div>

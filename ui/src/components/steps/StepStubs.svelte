@@ -11,6 +11,7 @@
    */
   import type { NodeProps } from '@xyflow/svelte';
   import type { StepStub } from '../../lib/steps-model';
+  import { t } from '../../lib/locale.svelte';
 
   /** The most that are named before the rest become a count. */
   const MAX = 3;
@@ -26,19 +27,19 @@
   const restTitle = $derived(
     stubs
       .slice(MAX)
-      .map((s) => `${s.dir === 'out' ? 'leads to' : 'arrives from'} ${s.label}`)
+      .map((s) => `${s.dir === 'out' ? t('step.leadsTo') : t('step.arrivesFrom')} ${s.label}`)
       .join('\n')
   );
 </script>
 
 <div class="stubs" class:dimmed style={`width:${width}px`} aria-hidden="true">
   {#each shown as stub (stub.edge + stub.dir)}
-    <span class="stub" title={`${stub.dir === 'out' ? 'Leads to' : 'Arrives from'} ${stub.label} — too far across the picture to draw as a line. Click the box to draw it.`}>
+    <span class="stub" title={`${stub.dir === 'out' ? t('step.leadsTo') : t('step.arrivesFrom')} ${stub.label} — ${t('step.tooFar')}`}>
       <span class="arrow">{stub.dir === 'out' ? '→' : '←'}</span>{stub.label}
     </span>
   {/each}
   {#if rest > 0}
-    <span class="stub more" title={restTitle}>+{rest} more</span>
+    <span class="stub more" title={restTitle}>{t('step.more', { n: rest })}</span>
   {/if}
 </div>
 

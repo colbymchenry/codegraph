@@ -16,6 +16,7 @@
 <script lang="ts">
   import { fileHref } from '../../lib/navigation';
   import { plural } from '../../lib/symbol-model';
+  import { t } from '../../lib/locale.svelte';
   import type { FileRailModel, FileRailRow } from '../../lib/file-model';
 
   interface Props {
@@ -82,23 +83,22 @@
 
   {#if model.testCount > 0 && model.testCount < model.rows.length}
     <div class="note dim">
-      {plural(model.testCount, 'test file')} at the end of the list.
+      {t('file.railTestFiles', { n: plural(model.testCount, t('file.testFile')) })}
     </div>
   {/if}
 
   {#if model.outside.length > 0}
     <div class="sub">
-      Outside the index <span class="n">{model.outside.length}</span>
+      {t('file.outsideIndex')} <span class="n">{model.outside.length}</span>
     </div>
     {#each model.outside as row (row.name)}
-      <div class="filerow outside" title={`imported at line ${row.lines.join(', ')}`}>
+      <div class="filerow outside" title={t('file.importedAtLine', { lines: row.lines.join(', ') })}>
         <span class="p"><span class="dir">{row.name}</span></span>
         {#if row.lines.length > 1}<span class="n2">×{row.lines.length}</span>{/if}
       </div>
     {/each}
     <div class="note dim">
-      Packages and runtime modules — nothing was indexed for them, so this
-      viewer cannot open them.
+      {t('file.packagesNote')}
     </div>
   {/if}
 </div>

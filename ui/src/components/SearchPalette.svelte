@@ -16,6 +16,7 @@
    */
   import PalettePanel from './PalettePanel.svelte';
   import { palette } from '../lib/palette.svelte';
+  import { t } from '../lib/locale.svelte';
   import type { PaletteItem } from '../lib/search-model';
   import { fileHref, flowHref, navigate } from '../lib/navigation';
   import { openEntryTarget, walkTo } from '../lib/walk';
@@ -29,10 +30,13 @@
   }
 
   let {
-    placeholder = 'Search a symbol or file, or ask “how does execute reach getFile” — press / to focus',
-    label = 'Search symbols and files',
+    placeholder,
+    label,
     onpick,
   }: Props = $props();
+
+  const effectivePlaceholder = $derived(placeholder ?? t('palette.placeholder'));
+  const effectiveLabel = $derived(label ?? t('palette.label'));
 
   let input: HTMLInputElement | null = $state(null);
   let box: HTMLDivElement | null = $state(null);
@@ -141,8 +145,8 @@
     type="search"
     autocomplete="off"
     spellcheck="false"
-    {placeholder}
-    aria-label={label}
+    placeholder={effectivePlaceholder}
+    aria-label={effectiveLabel}
     role="combobox"
     aria-expanded={palette.open}
     aria-controls="palette-panel"

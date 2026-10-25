@@ -19,11 +19,16 @@
   import { buildEntryPalette, type PaletteItem } from '../lib/search-model';
   import { entryHref, fileHref, flowHref, navigate } from '../lib/navigation';
   import { openEntryTarget, walkTo } from '../lib/walk';
+  import { locale, t } from '../lib/locale.svelte';
 
   interface Props {
     project?: string | null;
   }
   let { project = null }: Props = $props();
+
+  const projectSuffix = $derived(
+    project ? (locale.current === 'zh-CN' ? `（${project}）` : ` in ${project}`) : ''
+  );
 
   $effect(() => {
     void palette.ensureEntries();
@@ -61,15 +66,12 @@
 
 <div class="scroll">
   <div class="emptystate">
-    <h2>Nothing selected</h2>
+    <h2>{t('home.nothingSelected')}</h2>
     <p>
-      Search for a symbol or a file to start reading{project ? ` in ${project}` : ''}. Press
-      <code>/</code> to focus the search box.
+      {t('home.searchLine', { project: projectSuffix })} {t('home.pressSlash')}
+      <code>/</code> {t('home.pressSlashAfter')}
     </p>
-    <p>
-      Every symbol you open shows who calls it on the left, its verbatim source in the middle, and
-      what it calls on the right — each callee lined up with the line that makes the call.
-    </p>
+    <p>{t('home.bodyLine')}</p>
   </div>
 
   <!-- Above the derived lists on purpose: a walk somebody named and kept is a
@@ -80,10 +82,10 @@
   </div>
 
   {#if entries.sections.length > 0}
-    <section class="entries" aria-label="Where to start">
+    <section class="entries" aria-label={t('home.whereToStart')}>
       <div class="entries-h">
-        <h3>Where to start</h3>
-        <a href={entryHref()}>All entry points ›</a>
+        <h3>{t('home.whereToStart')}</h3>
+        <a href={entryHref()}>{t('home.allEntryPoints')}</a>
       </div>
       <div class="rows">
         <PaletteRows palette={entries} onpick={pick} />

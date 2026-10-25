@@ -19,6 +19,7 @@
   import { tokenClass, tokensByLine, type Token } from '../../lib/highlight';
   import { assignRefs, basename, type LineRef } from '../../lib/symbol-model';
   import type { FlowCardLayout } from '../../lib/flow-model';
+  import { t } from '../../lib/locale.svelte';
 
   interface Props {
     data: {
@@ -48,8 +49,8 @@
         uncertain: false,
         outside: false,
         title: ref.backwards
-          ? `${hop.node.name} calls ${ref.name} here`
-          : `calls ${ref.name}`,
+          ? t('flow.callRefBackwards', { name: hop.node.name, ref: ref.name })
+          : t('flow.callRefForward', { ref: ref.name }),
       },
     ]);
     return byLine;
@@ -118,8 +119,8 @@
   {:else}
     <p class="nosource">
       {source?.drift
-        ? 'Changed on disk after the last index sync — source is not shown.'
-        : (source?.reason ?? 'Source outside this slice or this index.')}
+        ? t('flow.sourceDrift')
+        : (source?.reason ?? t('flow.sourceUnavailable'))}
     </p>
   {/if}
 </div>
