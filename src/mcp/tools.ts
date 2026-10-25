@@ -1209,15 +1209,26 @@ export function biasHeaderSymbols(
  * fixture (12 generated CRUD symbols on one line), meta-text bought at the
  * price of the source bytes this section exists to point away from.
  */
-function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
+/**
+ * The symbols a pointer entry lists for a file, capped. Shared by the markdown
+ * line and the JSON pointer (#1280) so the two cannot disagree about the cap.
+ */
+function pointerSymbolsFor(nodes: readonly Node[]): { symbols: Array<{ name: string; startLine: number }>; symbolsOmitted: number } {
   const POINTER_SYMBOLS = 6;
   const named = nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export');
   const pool = named.length > 0 ? named : nodes;
   const shown = pool.slice(0, POINTER_SYMBOLS);
-  const more = pool.length - shown.length;
-  const symbols = shown.map((n) => `${n.name}:${n.startLine}`).join(', ')
-    + (more > 0 ? `, +${more} more` : '');
-  return `- ${filePath}: ${symbols}`;
+  return {
+    symbols: shown.map((n) => ({ name: n.name, startLine: n.startLine })),
+    symbolsOmitted: Math.max(0, pool.length - shown.length),
+  };
+}
+
+function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
+  const { symbols, symbolsOmitted } = pointerSymbolsFor(nodes);
+  const listed = symbols.map((n) => `${n.name}:${n.startLine}`).join(', ');
+  const more = symbolsOmitted > 0 ? `, +${symbolsOmitted} more` : '';
+  return `- ${filePath}: ${listed}${more}`;
 }
 /**
  * Emitted when the response was too full to carry ANY of its pointer list. It
@@ -1294,6 +1305,170 @@ export function elidedWantedSpans(
 
 /** A rendered file whose section is missing some of what it set out to deliver. */
 export type ExplorePartialFile = { filePath: string; elided: ReadonlyArray<ExploreWantedSpan> };
+
+/* --- Structured (JSON) output for the read tools (#1280) ------------------ *
+ * `markdown` stays the default everywhere. `format: 'json'` returns the SAME
+ * information the markdown renderer emits, as structured, ANSI-free JSON, so
+ * agent pipelines can post-process it (keep the flow and blast radius, drop or
+ * truncate the `source` fields). The JSON is assembled from the same data the
+ * markdown is rendered from — never parsed back out of the markdown — so the
+ * two modes cannot drift. Display caps (the "... and N more" tails) are
+ * mirrored as explicit `*Omitted` counts rather than dropped.
+ */
+
+/** Schema property shared by every JSON-capable read tool. */
+const JSON_FORMAT_PROPERTY: PropertySchema = {
+  type: 'string',
+  enum: ['markdown', 'json'],
+  description: 'Output format. `json` returns the same information as the markdown output — same files, symbols, flow and blast radius — structured and ANSI-free for programmatic post-processing (dropping the `source` fields cuts most of the size).',
+};
+
+const isJsonFormat = (args: Record<string, unknown>): boolean => args.format === 'json';
+
+/**
+ * Strip the `<line>\t` prefixes explore's renderer adds to source lines,
+ * recovering the raw source the markdown fence wraps. The prefix is
+ * presentation only — every span's real line numbers travel alongside in
+ * `ranges`, so nothing is lost.
+ */
+function stripSourceLineNumbers(body: string): string {
+  if (!body) return body;
+  return body.split('\n').map((line) => line.replace(/^\d+\t/, '')).join('\n');
+}
+
+/** One hop of explore's Flow section: an edge between two named symbols. */
+type ExploreFlowHop = {
+  from: string;
+  fromLocation: string;
+  to: string;
+  toLocation: string;
+  /** Edge kind, or the synthesized-edge note when the hop is heuristic. */
+  via: string;
+  /** Branch condition the hop is guarded by, when one is statically visible. */
+  when?: string;
+};
+
+/** A dynamic-dispatch link: a synthesized hop, not a static edge. */
+type ExploreFlowLink = ExploreFlowHop & { synthesized: true };
+
+/** One entry of explore's blast-radius list. */
+type ExploreBlastRadiusEntry = {
+  node: Node;
+  /** Distinct callers, all kinds. */
+  callers: number;
+  /** Non-test caller files, capped as the markdown shows them. */
+  callerFiles: string[];
+  callerFilesOmitted: number;
+  /** Test files among the callers, capped. */
+  tests: string[];
+  testsOmitted: number;
+  /** Set when no direct test file exists — the indirect-coverage note's text. */
+  testsNote?: string;
+};
+
+/** One symbol as the JSON tools report it. */
+const jsonSymbol = (n: Node) => ({
+  name: n.name,
+  kind: n.kind,
+  filePath: n.filePath,
+  startLine: n.startLine,
+  endLine: n.endLine ?? n.startLine,
+});
+
+/**
+ * Marker on a ToolResult whose text is JSON (#1280). A plain string key, like
+ * {@link EXPLORE_EMISSION_KEY}, because the result crosses the structured-clone
+ * boundary into a query worker. The cross-cutting notices in `execute()` read
+ * it to compose their banner INTO the JSON (a `notices` array) instead of
+ * prepending markdown to it, which would break the caller's parse.
+ */
+const JSON_RESULT_KEY = '_cgJsonFormat';
+
+/** Wrap a payload as the tool's text content, marked for the notice path. */
+const jsonResult = (payload: unknown): ToolResult => ({
+  content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+  [JSON_RESULT_KEY]: true,
+});
+
+/** The error text every markdown path returns, as JSON for a `--json` caller. */
+const jsonError = (message: string): ToolResult => ({
+  ...jsonResult({ error: message }),
+  isError: true,
+});
+
+/**
+ * Compose a cross-cutting notice into a JSON result's `notices` array. No-op
+ * for markdown results, which the callers prepend to as before.
+ */
+const withJsonNotice = (result: ToolResult, notice: string): ToolResult => {
+  if (!result[JSON_RESULT_KEY]) return result;
+  const [head, ...rest] = result.content;
+  if (!head || head.type !== 'text') return result;
+  let payload: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(head.text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return result;
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return result; // not JSON after all — leave it untouched rather than corrupt it
+  }
+  const notes = Array.isArray(payload.notices) ? [...payload.notices as string[], notice] : [notice];
+  return {
+    ...result,
+    content: [{ type: 'text', text: JSON.stringify({ ...payload, notices: notes }, null, 2) }, ...rest],
+  };
+};
+
+/** One symbol as explore's JSON reports it inside a file section. */
+type ExploreJsonSymbol = {
+  name: string;
+  kind: string;
+  filePath: string;
+  startLine: number;
+  endLine: number;
+  qualifiedName?: string;
+};
+
+/** One file section of explore's Source Code, as data. */
+type ExploreJsonFile = {
+  path: string;
+  /** The symbols this section set out to deliver — the header names + gap markers. */
+  symbols: ExploreJsonSymbol[];
+  /** Raw source (no `<line>\t` prefixes) actually sent; null when the agent already holds it. */
+  source: string | null;
+  /** Line ranges `source` covers, so the raw text stays locatable. */
+  ranges: ExploreLineRange[];
+  /** Symbols this section did NOT deliver in full, with the spans it did reach. */
+  elided: ExplorePartialFile['elided'];
+  /** True when the section was skeletonized/windowed rather than sent whole. */
+  clipped: boolean;
+  /** True when the file drifted from the index after its last sync. */
+  stale: boolean;
+};
+
+/** One entry of explore's "Not shown above" pointer list, as data. */
+type ExploreJsonPointer = {
+  path: string;
+  symbols: Array<{ name: string; startLine: number }>;
+  symbolsOmitted: number;
+};
+
+/**
+ * One symbol of codegraph_node's file-view symbol map, as data (#1280) — the
+ * markdown line's name, kind, signature and location, nothing else.
+ */
+const jsonFileSymbol = (n: Node) => ({
+  name: n.name,
+  kind: n.kind,
+  startLine: n.startLine,
+  signature: n.signature ? n.signature.replace(/\s+/g, ' ').trim() : null,
+});
+
+/** The file-view JSON's dependents: the capped list the one-line summary names. */
+const jsonDependents = (dependents: readonly string[]): { dependents: string[]; dependentsOmitted: number } => ({
+  dependents: dependents.slice(0, 8),
+  dependentsOmitted: Math.max(0, dependents.length - 8),
+});
 
 /** Trimmed files the completeness note names one by one; the rest are a count. */
 const TRIMMED_FILES_NAMED = 3;
@@ -1641,6 +1816,14 @@ export interface ToolResult {
    * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
    */
   _cgExploreEmission?: ExploreEmission;
+  /**
+   * INTERNAL marker (#1280): this result's text is JSON. The cross-cutting
+   * notices in {@link ToolHandler.execute} read it to compose their banner
+   * into the payload's `notices` array instead of prepending markdown, and
+   * delete it before the result reaches the client. Keyed by
+   * {@link JSON_RESULT_KEY}; the two must stay in sync.
+   */
+  _cgJsonFormat?: boolean;
   /** Internal structured provenance, preserved by query workers and stripped by execute. */
   _cgAnswerFiles?: AnswerFile[];
 }
@@ -1818,6 +2001,7 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Symbol mode only: disambiguate to the definition at/around this line (use with the file:line a trail showed you).',
         },
+        format: JSON_FORMAT_PROPERTY,
         projectPath: projectPathProperty,
       },
       required: [],
@@ -1838,6 +2022,7 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum number of files to return source from, 1–20. Omit it to use a default sized to the project (4 files below 150 indexed files, 5 below 500, 8 otherwise). Total output is also capped by characters (about 13K–24K by project size), so a higher maxFiles spreads that budget over more files rather than returning more text.',
         },
+        format: JSON_FORMAT_PROPERTY,
         projectPath: projectPathProperty,
       },
       required: ['query'],
@@ -2702,6 +2887,9 @@ export class ToolHandler {
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
+    // JSON results take the notice inside the payload (#1280) — prepending
+    // markdown to JSON breaks the caller's parse.
+    if (result[JSON_RESULT_KEY]) return withJsonNotice(result, notice);
     const [first, ...rest] = result.content;
     if (first && first.type === 'text') {
       return { ...result, content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest] };
@@ -2795,6 +2983,10 @@ export class ToolHandler {
 
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
+    // JSON results collect their notices inside the payload (#1280); markdown
+    // ones keep the banner/footer composition below.
+    const jsonNotices: string[] = [];
+    const note = (text: string): void => { jsonNotices.push(text); };
 
     let cg: CodeGraph;
     try {
@@ -2835,6 +3027,7 @@ export class ToolHandler {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
       if (cg.isWatcherRecovering?.()) {
+        if (result[JSON_RESULT_KEY]) return withJsonNotice(result, formatRecoveringBanner());
         const composed = `${formatRecoveringBanner()}\n\n${head.text}`;
         return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
       }
@@ -2844,6 +3037,7 @@ export class ToolHandler {
       } catch {
         reason = null;
       }
+      if (result[JSON_RESULT_KEY]) return withJsonNotice(result, formatDegradedBanner(reason));
       const composed = `${formatDegradedBanner(reason)}\n\n${head.text}`;
       return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
     }
@@ -2882,6 +3076,11 @@ export class ToolHandler {
     }
     if (!banner && !footer) return result;
 
+    if (result[JSON_RESULT_KEY]) {
+      if (banner) note(banner);
+      if (footer) note(footer);
+      return jsonNotices.reduce((acc, n) => withJsonNotice(acc, n), result);
+    }
     const composed = [banner, text, footer].filter(Boolean).join('\n\n');
     return { ...result, content: [{ type: 'text', text: composed }, ...rest] };
   }
@@ -3022,7 +3221,11 @@ export class ToolHandler {
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const noticed = this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      // The JSON marker is internal plumbing for the notices above — strip it
+      // before the result reaches the client, exactly like the emission record.
+      delete noticed[JSON_RESULT_KEY];
+      return noticed;
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -3502,11 +3705,27 @@ export class ToolHandler {
    * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
    * dropping unrelated `OmsOrderService::list`.
    */
-  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number> } {
+  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): {
+    text: string;
+    pathNodeIds: Set<string>;
+    namedNodeIds: Set<string>;
+    uniqueNamedNodeIds: Set<string>;
+    spineCallSites: Map<string, number>;
+    /** The rendered main chain as hops (#1280) — the same steps `text` narrates. */
+    chain: ExploreFlowHop[];
+    /** Synthesized (dynamic-dispatch) links as hops (#1280). */
+    synthLinks: ExploreFlowLink[];
+    /** Flow-section prose that is data rather than narrative: the boundary announcements. */
+    notes: string[];
+  } {
     // spineCallSites: for each spine node, the line where it CALLS the next hop —
     // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
     // processRunExecutionData) to the call site instead of dumping the whole body.
-    const EMPTY = { text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(), uniqueNamedNodeIds: new Set<string>(), spineCallSites: new Map<string, number>() };
+    const EMPTY = {
+      text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(),
+      uniqueNamedNodeIds: new Set<string>(), spineCallSites: new Map<string, number>(),
+      chain: [] as ExploreFlowHop[], synthLinks: [] as ExploreFlowLink[], notes: [] as string[],
+    };
     try {
       // Token resolution — parsing, overload disambiguation, the CONSTANT/
       // VARIABLE synth endpoints — is shared with `/api/flow`, so a name written
@@ -3530,7 +3749,7 @@ export class ToolHandler {
       // implementation the query names for one it doesn't. Links that rank the same
       // take turns by the named symbol they hang from, so one symbol's long fan-out
       // can't fill the list before another's first link; edge order breaks ties.
-      const collectSynthLinks = (chain: readonly FlowStep[] | null): string[] => {
+      const collectSynthLinks = (chain: readonly FlowStep[] | null): { lines: string[]; links: ExploreFlowLink[] } => {
         const MAX_SYNTH_LINKS = 6;
         const onChain = new Set((chain ?? []).map((s) => s.node.id));
         // A symbol a token picks out (at most 3 definitions), or a named non-callable
@@ -3576,11 +3795,25 @@ export class ToolHandler {
           }
         }
         links.sort((a, b) => Number(a.lowValue) - Number(b.lowValue) || b.weight - a.weight || a.turn - b.turn);
+        // `TrySet → TrySet` says neither which interface nor which implementation:
+        // a same-name link names each end by its owner, as the agent would write it.
+        const linkName = (n: Node, same: boolean): string => (same ? followUpName(n) : n.name);
         const linkLine = (edge: Edge, src: Node, tgt: Node): string => {
-          // `TrySet → TrySet` says neither which interface nor which implementation:
-          // a same-name link names each end by its owner, as the agent would write it.
           const same = src.name === tgt.name;
-          return `- ${same ? followUpName(src) : src.name} → ${same ? followUpName(tgt) : tgt.name}   [${this.synthEdgeNote(edge) ?? edge.kind}]`;
+          return `- ${linkName(src, same)} → ${linkName(tgt, same)}   [${this.synthEdgeNote(edge) ?? edge.kind}]`;
+        };
+        // The same link as data (#1280), built from the same edge/endpoints the
+        // line is — never parsed back out of it.
+        const linkData = (edge: Edge, src: Node, tgt: Node): ExploreFlowLink => {
+          const same = src.name === tgt.name;
+          return {
+            from: linkName(src, same),
+            fromLocation: `${src.filePath}:${src.startLine}`,
+            to: linkName(tgt, same),
+            toLocation: `${tgt.filePath}:${tgt.startLine}`,
+            via: this.synthEdgeNote(edge) ?? edge.kind,
+            synthesized: true,
+          };
         };
         // Distinct links can still read the same, and one line says it: gin declares
         // `Binding` once per build tag, so both declarations' `Bind` link to formBinding's,
@@ -3593,14 +3826,16 @@ export class ToolHandler {
           shown.add(edge.source === prev.id ? linkLine(edge, prev, node) : linkLine(edge, node, prev));
         }
         const synthLines: string[] = [];
+        const synthLinks: ExploreFlowLink[] = [];
         for (const { edge, src, tgt } of links) {
           if (synthLines.length >= MAX_SYNTH_LINKS) break;
           const line = linkLine(edge, src, tgt);
           if (shown.has(line)) continue;
           shown.add(line);
           synthLines.push(line);
+          synthLinks.push(linkData(edge, src, tgt));
         }
-        return synthLines;
+        return { lines: synthLines, links: synthLinks };
       };
       /**
        * No narrative to print — but the agent still NAMED symbols, and their
@@ -3630,6 +3865,7 @@ export class ToolHandler {
         namedNodeIds: new Set<string>(preciseNamedIds),
         uniqueNamedNodeIds: new Set<string>([...uniqueNamedNodeIds].filter((id) => preciseNamedIds.has(id))),
         spineCallSites: new Map<string, number>(),
+        chain: [] as ExploreFlowHop[], synthLinks: [] as ExploreFlowLink[], notes: [] as string[],
       });
       if (named.size < 2) {
         // <2 CALLABLES resolved. Two recoveries before giving up: (1) synthesized
@@ -3637,7 +3873,8 @@ export class ToolHandler {
         // constant→constant, so `named` can be empty while `dynNamed` holds the
         // whole chain; (2) the one resolved callable's body may hold the
         // dynamic-dispatch site that EXPLAINS a half-connected flow.
-        const synthLines = collectSynthLinks(null);
+        const synth = collectSynthLinks(null);
+        const synthLines = synth.lines;
         const boundaries = named.size === 0 ? '' : (this.buildDynamicBoundaries(cg, [...named.values()], named) || '');
         if (synthLines.length === 0 && !boundaries) return identityOnly();
         const out: string[] = [];
@@ -3647,7 +3884,13 @@ export class ToolHandler {
           '', ...synthLines, '');
         if (boundaries) out.push(boundaries);
         out.push('> Full source for these symbols is below.\n');
-        return { text: out.join('\n'), pathNodeIds: new Set(), namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites: new Map<string, number>() };
+        return {
+          text: out.join('\n'), pathNodeIds: new Set(),
+          namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds,
+          spineCallSites: new Map<string, number>(),
+          chain: [] as ExploreFlowHop[], synthLinks: synth.links,
+          notes: boundaries ? [boundaries] : [],
+        };
       }
       // The search itself lives in `../graph/named-symbol-flow`, so the viewer's
       // Flow strip rides exactly this path finder rather than a second one that
@@ -3719,10 +3962,14 @@ export class ToolHandler {
       // wasn't named. The skip drops a hop already in the rendered main chain; a
       // 2-node chain renders nothing (hasMain false) so a direct named→named synth
       // hop still surfaces — too short for Flow, but #687-visible here.
-      const synthLines = collectSynthLinks(hasMain ? best : null);
+      const synth = collectSynthLinks(hasMain ? best : null);
+      const synthLines = synth.lines;
 
       if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return identityOnly();
       const out: string[] = [];
+      // The same chain as hops (#1280), built step-for-step with the prose above
+      // so the two cannot disagree.
+      const chain: ExploreFlowHop[] = [];
       if (hasMain) {
         out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
@@ -3730,6 +3977,18 @@ export class ToolHandler {
           if (step.edge) {
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
             out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            // The hop needs a head; the first step has none by construction.
+            if (i > 0) {
+              const prev = best![i - 1]!.node;
+              chain.push({
+                from: prev.name,
+                fromLocation: `${prev.filePath}:${prev.startLine}`,
+                to: step.node.name,
+                toLocation: `${step.node.filePath}:${step.node.startLine}`,
+                via: this.synthEdgeNote(step.edge) ?? step.edge.kind,
+                ...(when ? { when } : {}),
+              });
+            }
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -3752,7 +4011,12 @@ export class ToolHandler {
       // must keep full source even if it's an off-spine polymorphic sibling — the
       // agent named `getResponseWithInterceptorChain` / `SQLCompiler.execute_sql`
       // as the mechanism, not as an interchangeable leaf. See the skeleton gate.
-      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites };
+      return {
+        text: out.join('\n'), pathNodeIds: pathIds,
+        namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites,
+        chain, synthLinks: synth.links,
+        notes: [boundaryText, polyText].filter((n): n is string => !!n),
+      };
     } catch {
       return EMPTY;
     }
@@ -3968,7 +4232,12 @@ export class ToolHandler {
    * that have no dependents (nothing to warn about), and returns '' when none
    * qualify so a leaf-only exploration stays clean.
    */
-  private buildBlastRadiusSection(
+  /**
+   * The blast-radius rows — which entry symbols have callers, in which files,
+   * covered by which tests — as data. Shared by the markdown section and the
+   * JSON output (#1280) so the two modes cannot disagree.
+   */
+  private collectBlastRadius(
     cg: CodeGraph,
     subgraph: Subgraph,
     /**
@@ -3978,7 +4247,7 @@ export class ToolHandler {
      * the agent took that as the tool having found the wrong method.
      */
     leadingIds: Iterable<string> = [],
-  ): string {
+  ): ExploreBlastRadiusEntry[] {
     const ROOT_CAP = 5; // only the symbols the query actually targeted
     const FILE_CAP = 4; // caller files listed per symbol before "+N more"
     const MEANINGFUL = new Set<string>([
@@ -3991,9 +4260,8 @@ export class ToolHandler {
       .map((id) => subgraph.nodes.get(id))
       .filter((n): n is Node => !!n && MEANINGFUL.has(n.kind))
       .slice(0, ROOT_CAP);
-    if (roots.length === 0) return '';
 
-    const entries: string[] = [];
+    const entries: ExploreBlastRadiusEntry[] = [];
     for (const root of roots) {
       let callers: Array<{ node: Node }> = [];
       try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
@@ -4009,23 +4277,36 @@ export class ToolHandler {
       const testFiles = callerFiles.filter((f) => isTestFile(f));
       const nonTest = callerFiles.filter((f) => !isTestFile(f));
 
-      const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
-      const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
-      const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';
-      const tests = testFiles.length > 0
-        ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
-        : this.indirectTestNote(cg, uniq, rel);
-
-      entries.push(
-        `- \`${root.name}\` (${rel(root.filePath)}:${root.startLine}) — ${uniq.length} caller${uniq.length === 1 ? '' : 's'}${where}${tests}`,
-      );
+      entries.push({
+        node: root,
+        callers: uniq.length,
+        callerFiles: nonTest.slice(0, FILE_CAP),
+        callerFilesOmitted: Math.max(0, nonTest.length - FILE_CAP),
+        tests: testFiles.slice(0, FILE_CAP),
+        testsOmitted: Math.max(0, testFiles.length - FILE_CAP),
+        testsNote: testFiles.length > 0 ? undefined : this.indirectTestNote(cg, uniq, rel),
+      });
     }
-    if (entries.length === 0) return '';
+    return entries;
+  }
 
+  /** The markdown rendering of {@link collectBlastRadius}'s rows. */
+  private renderBlastRadiusSection(entries: ReadonlyArray<ExploreBlastRadiusEntry>): string {
+    if (entries.length === 0) return '';
+    const rel = (p: string) => p.replace(/\\/g, '/');
+    const lines = entries.map((e) => {
+      const shown = e.callerFiles.map((f) => `\`${f}\``).join(', ');
+      const more = e.callerFilesOmitted > 0 ? ` +${e.callerFilesOmitted} more` : '';
+      const where = e.callerFiles.length > 0 ? ` in ${shown}${more}` : '';
+      const tests = e.tests.length > 0
+        ? `; tests: ${e.tests.map((f) => `\`${f}\``).join(', ')}${e.testsOmitted > 0 ? ` +${e.testsOmitted}` : ''}`
+        : e.testsNote;
+      return `- \`${e.node.name}\` (${rel(e.node.filePath)}:${e.node.startLine}) — ${e.callers} caller${e.callers === 1 ? '' : 's'}${where}${tests}`;
+    });
     return [
       '**Blast radius — what depends on these (update/verify before editing)**',
       '',
-      ...entries,
+      ...lines,
       '',
     ].join('\n');
   }
@@ -4198,8 +4479,18 @@ export class ToolHandler {
    * tax on small projects while earning its keep on large ones.
    */
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
+    // #1280: same information as the markdown response, structured and ANSI-free.
+    // Every capture below reads the data the markdown is rendered from.
+    const jsonMode = isJsonFormat(args);
+    // Capture accumulators, filled by the same code that renders each section.
+    const jsonRelationships: Array<{ kind: string; edges: Array<{ source: string; target: string }>; omitted: number }> = [];
+    const jsonFiles = new Map<string, ExploreJsonFile>();
+    const jsonPointers: ExploreJsonPointer[] = [];
+    const jsonNotes: string[] = [];
+    /** Epilogue notes (completeness, budget, lost-pointer) — fitted, so they survive only if they survived. */
+    const jsonEpilogueNotes: string[] = [];
     const rawQuery = this.validateString(args.query, 'query');
-    if (typeof rawQuery !== 'string') return rawQuery;
+    if (typeof rawQuery !== 'string') return jsonMode ? jsonError(rawQuery.content[0]?.text ?? '') : rawQuery;
     // One normalization point so the flow-builder, relevance search, and
     // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
     const query = normalizeQuerySpelling(rawQuery);
@@ -4437,6 +4728,27 @@ export class ToolHandler {
       const empty = `No relevant code found for "${query}"${missNote}${explanation}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
       // call against the tier budget even though it emits no source.
+      // #1280: the empty answer as JSON keeps the miss note — it is data
+      // (which names matched nothing), not decoration.
+      if (jsonMode) {
+        const json = jsonResult({
+          query,
+          summary: empty,
+          flow: [],
+          flowLinks: [],
+          blastRadius: [],
+          relationships: [],
+          files: [],
+          notShown: [],
+          notes: explanation ? [explanation.trim()] : [],
+          truncated: false,
+        });
+        json[EXPLORE_EMISSION_KEY] = {
+          projectRoot, query, files: [], sourceBytes: 0,
+          responseBytes: json.content[0]!.text.length,
+        };
+        return json;
+      }
       return { ...this.textResult(empty), [EXPLORE_EMISSION_KEY]: {
         projectRoot, query, files: [], sourceBytes: 0, responseBytes: empty.length,
       } };
@@ -5233,18 +5545,27 @@ export class ToolHandler {
         unseenNames = cg.getUnseenNames(unresolvedNamedTokens);
       } catch { /* the note must never fail an explore call */ }
     }
-    if (unseenNames.length > 0) lines.push(notInIndexNote(unseenNames, true), '');
+    if (unseenNames.length > 0) {
+      const unseenNote = notInIndexNote(unseenNames, true);
+      lines.push(unseenNote, '');
+      // #1280: the note is data (names the index has never seen) — carry it.
+      jsonNotes.push(unseenNote);
+    }
 
     // A named COBOL copybook's include sites, ALL of them (#2342) — the source
     // below has room for a few include windows, and "what includes X" is the
     // question a copybook name asks.
     const copybookSection = this.buildCopybookSection(namedCopybooks);
-    if (copybookSection) lines.push(copybookSection);
+    if (copybookSection) {
+      lines.push(copybookSection);
+      jsonNotes.push(copybookSection);
+    }
 
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
-    const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
+    const blastRadiusEntries = this.collectBlastRadius(cg, subgraph, exactNodeIds);
+    const blastRadius = this.renderBlastRadiusSection(blastRadiusEntries);
     if (blastRadius) lines.push(blastRadius);
 
     // Relationship map — show how symbols connect
@@ -5279,6 +5600,9 @@ export class ToolHandler {
           lines.push(`- ... and ${edges.length - cap} more`);
         }
         lines.push('');
+        // The same group as data (#1280) — the cap the markdown shows, plus the
+        // count of what it cut, exactly as the "... and N more" line reports.
+        jsonRelationships.push({ kind, edges: shown, omitted: Math.max(0, edges.length - cap) });
       }
     }
 
@@ -5532,6 +5856,8 @@ export class ToolHandler {
       replacing: number;
       /** The full, undeduped section to splice back in. */
       section: string[];
+      /** The section's raw source, for the JSON capture (#1280). */
+      source: string;
       sourceChars: number;
       overhead: number;
       ranges: ExploreLineRange[];
@@ -5891,6 +6217,28 @@ export class ToolHandler {
         // AFTER the fold, whose remainder is in neither.
         const elided = elidedWantedSpans(opts.wanted, [...ranges, ...opts.covered]);
         if (elided.length > 0) trimmedFiles.set(filePath, elided);
+        // #1280: the same section as data, captured here — the one place every
+        // render path emits through — so the JSON and the markdown above cannot
+        // disagree. `source` is the raw text (line prefixes stripped; the real
+        // numbers travel in `ranges`), null when the agent already holds it.
+        if (jsonMode) {
+          jsonFiles.set(filePath, {
+            path: filePath,
+            symbols: opts.wanted.map((w) => ({
+              name: w.name,
+              kind: w.kind,
+              filePath,
+              startLine: w.start,
+              endLine: w.end,
+              ...(w.qualifiedName ? { qualifiedName: w.qualifiedName } : {}),
+            })),
+            source: body.length > 0 ? stripSourceLineNumbers(body) : null,
+            ranges,
+            elided,
+            clipped: opts.clipped,
+            stale: fileStale,
+          });
+        }
         const at = lines.length;
         lines.push(opts.header, '');
         // Charge what the section ACTUALLY costs, not a flat 200 (CG-26). A
@@ -5944,6 +6292,7 @@ export class ToolHandler {
             at,
             replacing: lines.length - at,
             section: [opts.header, '', '```' + lang, opts.fullBody, '```', ''],
+            source: opts.fullBody,
             sourceChars: opts.fullBody.length,
             overhead: opts.overhead,
             ranges: opts.fullRanges,
@@ -6555,6 +6904,21 @@ export class ToolHandler {
         const staleHeader = fileSectionHeader(filePath, '⚠ changed on disk after the last index sync — source omitted (indexed line ranges no longer match, so a slice could show the wrong code). Read this file directly for current content; the change is picked up on that project\'s next index sync.');
         lines.push(staleHeader, '');
         totalChars += staleHeader.length + 2;
+        // #1280: the header above is the whole section — carry it as data too.
+        if (jsonMode) {
+          jsonFiles.set(filePath, {
+            path: filePath,
+            symbols: wantedFrom(group.nodes).map((w) => ({
+              name: w.name, kind: w.kind, filePath, startLine: w.start, endLine: w.end,
+              ...(w.qualifiedName ? { qualifiedName: w.qualifiedName } : {}),
+            })),
+            source: null,
+            ranges: [],
+            elided: [],
+            clipped: true,
+            stale: true,
+          });
+        }
         diag?.recordRender(filePath, 'stale-omitted', 0, true);
         continue;
       }
@@ -7576,6 +7940,15 @@ export class ToolHandler {
           bytes: restore.sourceChars,
           fingerprint: restore.fingerprint,
         });
+        // #1280: the spliced-in section is now the response's source for this
+        // file — the JSON capture must say so too.
+        if (jsonMode) {
+          const captured = jsonFiles.get(restore.filePath);
+          if (captured) {
+            captured.source = stripSourceLineNumbers(restore.source);
+            captured.ranges = [...restore.ranges];
+          }
+        }
         diag?.recordRender(restore.filePath, 'clusters', restore.sourceChars, false);
         diag?.recordDedup(restore.filePath, 0, []);
       }
@@ -7599,10 +7972,10 @@ export class ToolHandler {
     }
     const staleAll = [...new Set([...staleOmitted, ...staleRendered])];
     if (staleAll.length > 0) {
-      lines.push(
-        '',
-        `> ⚠ Changed on disk after the last index sync: ${staleAll.join(', ')}. Line numbers referencing ${staleAll.length === 1 ? 'this file' : 'these files'} elsewhere in this response (flow steps, blast radius, symbol lists) may be shifted until that project's next sync re-indexes ${staleAll.length === 1 ? 'it' : 'them'}.`,
-      );
+      const driftNote = `> ⚠ Changed on disk after the last index sync: ${staleAll.join(', ')}. Line numbers referencing ${staleAll.length === 1 ? 'this file' : 'these files'} elsewhere in this response (flow steps, blast radius, symbol lists) may be shifted until that project's next sync re-indexes ${staleAll.length === 1 ? 'it' : 'them'}.`;
+      lines.push('', driftNote);
+      // #1280: a freshness caveat the JSON consumer needs as much as the agent.
+      jsonNotes.push(driftNote);
     }
 
     // Everything pushed from here on is EPILOGUE — meta-text ABOUT the response
@@ -7655,6 +8028,9 @@ export class ToolHandler {
       const remainingFiles = [...remainingRelevant, ...peripheralFiles];
       for (const [filePath, group] of remainingFiles.slice(0, POINTER_MAX_FILES)) {
         pointerEntries.push(pointerLineFor(filePath, group.nodes));
+        // #1280: the same pointer as data — a withheld file must stay nameable
+        // to a JSON consumer exactly as the markdown keeps it nameable.
+        jsonPointers.push({ path: filePath, ...pointerSymbolsFor(group.nodes) });
       }
       pointerOmitted = Math.max(0, remainingFiles.length - pointerEntries.length);
     }
@@ -7728,12 +8104,19 @@ export class ToolHandler {
     if (keepBudgetNote) room -= roomFor(budgetBlock);
 
     lines.push(...pointerBlock);
-    if (keepCompleteness) lines.push(...completenessBlock);
-    if (keepBudgetNote) lines.push(...budgetBlock);
+    if (keepCompleteness) {
+      lines.push(...completenessBlock);
+      jsonEpilogueNotes.push(completenessBlock[completenessBlock.length - 1]!);
+    }
+    if (keepBudgetNote) {
+      lines.push(...budgetBlock);
+      jsonEpilogueNotes.push(budgetBlock[budgetBlock.length - 1]!);
+    }
     // Nothing has been cut yet, so every trimmed section is still in the response.
     const lostNote = EXPLORE_FALLBACK_NOTES.lost[trimmedShown.length > 0 ? 'trimmed' : 'complete'];
     if (pointersLost && roomFor([lostNote, '']) <= room) {
       lines.push('', lostNote);
+      jsonEpilogueNotes.push(lostNote);
     }
 
     const output = flow.text + lines.join('\n');
@@ -7750,10 +8133,14 @@ export class ToolHandler {
     const EPILOGUE_CUT_NOTE = EXPLORE_FALLBACK_NOTES.cut[
       epilogueOnlyCut !== null && trimmedIn(epilogueOnlyCut) ? 'trimmed' : 'complete'];
 
+    // #1280: whether the response was actually cut — the JSON reports the
+    // same truncation the fallback notes announce in the markdown.
+    let jsonTruncated = false;
     if (output.length > hardCeiling
         && epilogueOnlyCut !== null
         && epilogueOnlyCut.length + EPILOGUE_CUT_NOTE.length <= hardCeiling) {
       finalText = epilogueOnlyCut + EPILOGUE_CUT_NOTE;
+      jsonTruncated = true;
     } else if (output.length > hardCeiling) {
       // Still over with the epilogue gone: cut at a FILE-SECTION boundary (the
       // last ``**` `` file header before the ceiling) so we drop whole trailing
@@ -7766,6 +8153,7 @@ export class ToolHandler {
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
       finalText = safe + EXPLORE_FALLBACK_NOTES.truncated[trimmedIn(safe) ? 'trimmed' : 'complete'];
+      jsonTruncated = true;
     } else {
       finalText = output;
     }
@@ -7833,6 +8221,63 @@ export class ToolHandler {
       const node = cg.getNode(id);
       if (node) answerPaths.add(node.filePath);
     }
+    // #1280: the structured response. Assembled from the captures above — the
+    // same data the markdown was rendered from — and gated by the SAME survival
+    // rules the final cut just applied: a file section the hard ceiling dropped
+    // is absent here too, and an epilogue block it spent is not reported.
+    if (jsonMode) {
+      // The same survival test the markdown applies: a file section the hard
+      // ceiling dropped is not in the final text, so it is not in the JSON
+      // either. (Section presence, not `survivors` — a stale-omitted file's
+      // header is a section too, delivered or cut by exactly the same rule.)
+      const files = [...jsonFiles.values()].filter((f) =>
+        finalText.includes(`${FILE_SECTION_PREFIX}${f.path}` + '`'));
+      const pointers = finalText.includes(POINTER_HEADER) ? jsonPointers : [];
+      const notes = [
+        ...flow.notes,
+        ...jsonNotes,
+        // Fitted epilogue notes: present only if the final text still carries them.
+        ...jsonEpilogueNotes.filter((n) => finalText.includes(n)),
+      ];
+      const payload: Record<string, unknown> = {
+        query,
+        summary: summaryLine,
+        flow: flow.chain,
+        flowLinks: flow.synthLinks,
+        blastRadius: blastRadiusEntries.map((e) => ({
+          symbol: e.node.name,
+          // Same path spelling the markdown row shows (backslashes folded).
+          location: `${e.node.filePath.replace(/\\/g, '/')}:${e.node.startLine}`,
+          callers: e.callers,
+          callerFiles: e.callerFiles,
+          callerFilesOmitted: e.callerFilesOmitted,
+          tests: e.tests,
+          testsOmitted: e.testsOmitted,
+          ...(e.testsNote ? { testsNote: e.testsNote } : {}),
+        })),
+        relationships: jsonRelationships,
+        files,
+        notShown: pointers,
+        notes,
+        truncated: jsonTruncated,
+      };
+      const json = jsonResult(payload);
+      json[EXPLORE_EMISSION_KEY] = {
+        projectRoot,
+        query,
+        files: emittedFiles,
+        sourceBytes,
+        responseBytes: json.content[0]!.text.length,
+      };
+      // Same answer-file provenance the markdown result carries, so the
+      // freshness validation in execute() covers JSON responses too.
+      json._cgAnswerFiles = [...answerPaths].map((file) => ({
+        path: file,
+        contentHash: cg.getFile(file)?.contentHash ?? null,
+      }));
+      return json;
+    }
+
     const result = this.answerResult(cg, finalText, answerPaths);
     result[EXPLORE_EMISSION_KEY] = {
       projectRoot,
@@ -7848,6 +8293,8 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
+    // #1280: same information as the markdown output, structured and ANSI-free.
+    const jsonMode = isJsonFormat(args);
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
@@ -7864,15 +8311,16 @@ export class ToolHandler {
     // header (which files depend on it). `symbolsOnly` returns just the
     // structural map instead. Backed by the index: same bytes Read gives you.
     if (!symbolRaw && fileHint) {
-      return this.handleFileView(cg, fileHint, { offset, limit, symbolsOnly });
+      return this.handleFileView(cg, fileHint, { offset, limit, symbolsOnly, json: jsonMode });
     }
 
     const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
+    if (typeof symbol !== 'string') return jsonMode ? jsonError(symbol.content[0]?.text ?? '') : symbol;
 
     let matches = this.findSymbolMatches(cg, symbol);
     if (matches.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      const miss = `Symbol "${symbol}" not found in the codebase`;
+      return jsonMode ? jsonError(miss) : this.textResult(miss);
     }
 
     // Disambiguate a heavily-overloaded name to a specific definition the caller
@@ -7900,6 +8348,7 @@ export class ToolHandler {
 
     // Single definition — the common case.
     if (matches.length === 1) {
+      if (jsonMode) return jsonResult(await this.nodeJson(cg, matches[0]!, includeCode));
       return this.textResult(this.truncateOutput(await this.renderNodeSection(cg, matches[0]!, includeCode)));
     }
 
@@ -7914,6 +8363,15 @@ export class ToolHandler {
     const header = `**${matches.length} definitions named "${symbol}"**`;
     if (!includeCode) {
       const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
+      if (jsonMode) {
+        return jsonResult({
+          mode: 'symbol',
+          symbol,
+          ambiguous: true,
+          note: 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.',
+          definitions: matches.map((n) => ({ ...jsonSymbol(n), signature: n.signature ?? null })),
+        });
+      }
       return this.textResult(this.truncateOutput(
         [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
       ));
@@ -7926,6 +8384,7 @@ export class ToolHandler {
     // bodiless list. Only a set of many LARGE bodies hits the char budget first.
     const HARD_CAP = 16;
     const rendered: string[] = [];
+    const jsonDefinitions: Array<Record<string, unknown>> = [];
     const listed: Node[] = [];
     let used = 0;
     for (const n of matches) {
@@ -7935,6 +8394,9 @@ export class ToolHandler {
       if (rendered.length === 0 || used + section.length <= BODY_BUDGET) {
         rendered.push(section);
         used += section.length;
+        // #1280: the JSON carries the same bodies the markdown packs, chosen by
+        // the same budget — the section text is the markdown's size proxy.
+        if (jsonMode) jsonDefinitions.push(await this.nodeJson(cg, n, true));
       } else {
         listed.push(n);
       }
@@ -7960,6 +8422,19 @@ export class ToolHandler {
         `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
       );
     }
+    // #1280: the same split — full bodies for what fit the budget, locations
+    // for the remainder — as data.
+    if (jsonMode) {
+      return jsonResult({
+        mode: 'symbol',
+        symbol,
+        ambiguous: true,
+        definitions: jsonDefinitions,
+        otherDefinitions: listed.slice(0, 20).map((n) => ({ ...jsonSymbol(n), signature: n.signature ?? null })),
+        otherDefinitionsOmitted: Math.max(0, listed.length - 20),
+        note: 'Need one of these in full? Call codegraph_node again with `file` or `line` — do NOT Read it.',
+      });
+    }
     return this.textResult(this.truncateOutput(out.join('\n')));
   }
 
@@ -7979,11 +8454,14 @@ export class ToolHandler {
   private async handleFileView(
     cg: CodeGraph,
     fileArg: string,
-    opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
+    opts: { offset?: number; limit?: number; symbolsOnly?: boolean; json?: boolean } = {},
   ): Promise<ToolResult> {
     const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
     const allFiles = cg.getFiles();
-    if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
+    if (allFiles.length === 0) {
+      const miss = 'No files indexed. Run `codegraph index` first.';
+      return opts.json ? jsonError(miss) : this.textResult(miss);
+    }
 
     // Resolve ONE spelling of the path against the index: exact, then
     // suffix-of-path, then substring — narrowing to a single file or handing
@@ -8037,15 +8515,22 @@ export class ToolHandler {
       }
     }
     if (!resolved && candidates.length > 1) {
+      if (opts.json) {
+        return jsonResult({
+          mode: 'file',
+          error: `"${shownArg}" matches ${candidates.length} indexed files — pass a longer path`,
+          candidates: candidates.slice(0, 25).map((f) => f.path),
+          candidatesOmitted: Math.max(0, candidates.length - 25),
+        });
+      }
       return this.textResult(
         [`"${shownArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
           ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
       );
     }
     if (!resolved) {
-      return this.textResult(
-        `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`,
-      );
+      const miss = `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`;
+      return opts.json ? jsonError(miss) : this.textResult(miss);
     }
 
     const filePath = resolved.path;
@@ -8055,8 +8540,10 @@ export class ToolHandler {
     const dependents = cg.getFileDependents(filePath);
 
     // Compact, one-line blast radius (codegraph's value-add over a plain Read).
+    // The cap is shared with the JSON output (#1280) so both name the same files.
+    const DEPENDENTS_CAP = 8;
     const depSummary = dependents.length
-      ? `used by ${dependents.length} file${dependents.length === 1 ? '' : 's'}: ${dependents.slice(0, 8).join(', ')}${dependents.length > 8 ? `, +${dependents.length - 8} more` : ''}`
+      ? `used by ${dependents.length} file${dependents.length === 1 ? '' : 's'}: ${dependents.slice(0, DEPENDENTS_CAP).join(', ')}${dependents.length > DEPENDENTS_CAP ? `, +${dependents.length - DEPENDENTS_CAP} more` : ''}`
       : 'no other indexed file depends on it';
 
     // Symbol-map renderer — for symbolsOnly, the config fallback, and read errors.
@@ -8076,6 +8563,17 @@ export class ToolHandler {
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
+      if (opts.json) {
+        return jsonResult({
+          mode: 'file',
+          path: filePath,
+          symbolsOnly: true,
+          symbols: nodes.slice(0, 200).map(jsonFileSymbol),
+          symbolsOmitted: Math.max(0, nodes.length - 200),
+          ...jsonDependents(dependents),
+          note: 'Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.',
+        });
+      }
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
 
@@ -8085,6 +8583,18 @@ export class ToolHandler {
       const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
+      if (opts.json) {
+        // The security rule holds in JSON too: keys only, never values.
+        return jsonResult({
+          mode: 'file',
+          path: filePath,
+          configuration: true,
+          keys: nodes.slice(0, 200).map(jsonFileSymbol),
+          keysOmitted: Math.max(0, nodes.length - 200),
+          ...jsonDependents(dependents),
+          note: 'Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.',
+        });
+      }
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
 
@@ -8099,6 +8609,16 @@ export class ToolHandler {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
+      if (opts.json) {
+        return jsonResult({
+          mode: 'file',
+          path: filePath,
+          error: 'could not read from disk (it may have moved since indexing)',
+          symbols: nodes.slice(0, 200).map(jsonFileSymbol),
+          symbolsOmitted: Math.max(0, nodes.length - 200),
+          ...jsonDependents(dependents),
+        });
+      }
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
 
@@ -8116,6 +8636,15 @@ export class ToolHandler {
     const DEFAULT_LIMIT = 2000;
     const offset = Math.max(1, opts.offset ?? 1);
     if (offset > total) {
+      if (opts.json) {
+        return jsonResult({
+          mode: 'file',
+          path: filePath,
+          error: `${filePath} has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end`,
+          totalLines: total,
+          ...jsonDependents(dependents),
+        });
+      }
       return this.textResult(`**${filePath}** has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`);
     }
     const maxLines = Math.max(1, opts.limit ?? DEFAULT_LIMIT);
@@ -8141,6 +8670,25 @@ export class ToolHandler {
         '',
         `(lines ${offset}–${shownEnd} of ${total} — pass \`offset\`/\`limit\` for another range, or \`codegraph_node <symbol>\` for one symbol in full)`,
       );
+    }
+    // #1280: the same window as data — raw source (no per-line number prefixes;
+    // the real lines ride on startLine/endLine) plus the structural map and the
+    // blast radius the markdown header carries.
+    if (opts.json) {
+      return jsonResult({
+        mode: 'file',
+        path: filePath,
+        totalLines: total,
+        startLine: offset,
+        endLine: shownEnd,
+        complete,
+        // The same lines the numbered block shows, straight from the split —
+        // not re-parsed out of the numbered text.
+        source: fileLines.slice(start, start + numbered.length).join('\n'),
+        symbols: nodes.slice(0, 200).map(jsonFileSymbol),
+        symbolsOmitted: Math.max(0, nodes.length - 200),
+        ...jsonDependents(dependents),
+      });
     }
     // Self-bounded to CHAR_BUDGET — do NOT route through truncateOutput (15k).
     return this.textResult(out.join('\n'));
@@ -8173,12 +8721,111 @@ export class ToolHandler {
     return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
   }
 
+  /**
+   * One symbol as the JSON tools report it (#1280): the same details, body and
+   * trail the markdown section carries, as data. Assembled from the same
+   * sources the renderer reads — never parsed back out of its markdown — so
+   * the two modes cannot drift. `source` is the RAW body (no `<line>\\t`
+   * prefixes; the real numbers ride on `sourceStartLine`), droppable by
+   * consumers that only want the structure.
+   */
+  private async nodeJson(cg: CodeGraph, node: Node, includeCode: boolean): Promise<Record<string, unknown>> {
+    const trail = this.collectTrail(cg, node);
+    const base = {
+      mode: 'symbol' as const,
+      symbol: {
+        ...jsonSymbol(node),
+        signature: node.signature ?? null,
+        // The markdown shows the docstring only when it is short enough to be
+        // worth the space — mirror that gate exactly.
+        docstring: node.docstring && node.docstring.length < 200 ? node.docstring : null,
+        language: node.language ?? null,
+      },
+      calls: trail.callees.map((e) => ({
+        ...jsonSymbol(e.node),
+        via: this.synthEdgeNote(e.edge),
+      })),
+      calledBy: trail.callers.map((e) => ({
+        ...jsonSymbol(e.node),
+        via: this.synthEdgeNote(e.edge),
+      })),
+      callsOmitted: trail.calleesOmitted,
+      calledByOmitted: trail.callersOmitted,
+    };
+    // Disk-drift gate (issue #1474), same call the markdown renderer makes.
+    if (this.isFileStaleOnDisk(cg, node.filePath)) {
+      const whole = includeCode ? this.staleWholeFileSource(cg, node) : null;
+      return {
+        ...base,
+        stale: true,
+        note: ToolHandler.staleNodeNotice(node.filePath),
+        // A small drifted file ships WHOLE and CURRENT, numbered from 1 — the
+        // same Read-parity fallback the markdown embeds.
+        source: whole,
+        sourceStartLine: whole !== null ? 1 : null,
+        outline: null,
+      };
+    }
+    let code: string | null = null;
+    let outline: string | null = null;
+    if (includeCode) {
+      // Container symbols (class/interface/struct/…) render a structural outline
+      // instead of the wall of source their members sum to — same rule as the
+      // markdown path.
+      if (CONTAINER_NODE_KINDS.has(node.kind)) {
+        outline = this.buildContainerOutline(cg, node);
+      }
+      if (!outline) {
+        code = await cg.getCode(node.id);
+      }
+    }
+    return {
+      ...base,
+      stale: false,
+      source: code,
+      sourceStartLine: code !== null ? (node.startLine || null) : null,
+      outline,
+    };
+  }
+
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
   // codegraph_node's output cap (MAX_OUTPUT_LENGTH) with headroom for the
   // header + trail. A file within these bounds is served WHOLE and CURRENT
   // (Read-parity, correct by construction) instead of a possibly-wrong slice.
   private static readonly STALE_WHOLE_FILE_MAX_LINES = 300;
   private static readonly STALE_WHOLE_FILE_MAX_CHARS = 12000;
+
+  /**
+   * The whole CURRENT source of a drifted file when it is small enough to
+   * serve under codegraph_node's caps (#1474), else null. Shared by the
+   * markdown renderer and the JSON path (#1280) so both make the same call.
+   */
+  private staleWholeFileSource(cg: CodeGraph, node: Node): string | null {
+    try {
+      const absPath = validatePathWithinRoot(cg.getProjectRoot(), node.filePath);
+      if (absPath && existsSync(absPath) && !isConfigLeafNode(node)) {
+        const content = readFileSync(absPath, 'utf-8');
+        const body = content.replace(/\n+$/, '');
+        if (
+          body.length <= ToolHandler.STALE_WHOLE_FILE_MAX_CHARS &&
+          body.split('\n').length <= ToolHandler.STALE_WHOLE_FILE_MAX_LINES
+        ) {
+          return body;
+        }
+      }
+    } catch {
+      /* fall through to the notice */
+    }
+    return null;
+  }
+
+  /**
+   * The staleness caveat for a drifted symbol whose body is omitted — shared
+   * by the markdown notice and the JSON `note` (#1280).
+   */
+  private static staleNodeNotice(filePath: string): string {
+    return `> ⚠ \`${filePath}\` changed on disk after it was last indexed — the indexed line range for this symbol no longer reliably matches, so its body is omitted rather than risk showing a different symbol's code. For current content, call codegraph_node with \`file: "${filePath}"\` (no symbol; \`offset\`/\`limit\` narrow it like Read), or Read the file. The change is picked up automatically on that project's next index sync.`;
+  }
 
   /**
    * codegraph_node render for a symbol whose file changed on disk after the
@@ -8200,35 +8847,17 @@ export class ToolHandler {
       lines.push(`**Signature:** \`${node.signature}\``);
     }
     lines.push('');
-    let embedded = false;
-    if (includeCode) {
-      try {
-        const absPath = validatePathWithinRoot(cg.getProjectRoot(), node.filePath);
-        if (absPath && existsSync(absPath) && !isConfigLeafNode(node)) {
-          const content = readFileSync(absPath, 'utf-8');
-          const body = content.replace(/\n+$/, '');
-          if (
-            body.length <= ToolHandler.STALE_WHOLE_FILE_MAX_CHARS &&
-            body.split('\n').length <= ToolHandler.STALE_WHOLE_FILE_MAX_LINES
-          ) {
-            lines.push(
-              `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed, so the indexed line range for this symbol may no longer match. Showing the file's full CURRENT source instead (Read-parity — treat it as already Read):`,
-              '',
-              '```' + (node.language || ''),
-              numberSourceLines(body, 1),
-              '```',
-            );
-            embedded = true;
-          }
-        }
-      } catch {
-        /* fall through to the notice */
-      }
-    }
-    if (!embedded) {
+    const whole = includeCode ? this.staleWholeFileSource(cg, node) : null;
+    if (whole !== null) {
       lines.push(
-        `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed — the indexed line range for this symbol no longer reliably matches, so its body is omitted rather than risk showing a different symbol's code. For current content, call codegraph_node with \`file: "${node.filePath}"\` (no symbol; \`offset\`/\`limit\` narrow it like Read), or Read the file. The change is picked up automatically on that project's next index sync.`,
+        `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed, so the indexed line range for this symbol may no longer match. Showing the file's full CURRENT source instead (Read-parity — treat it as already Read):`,
+        '',
+        '```' + (node.language || ''),
+        numberSourceLines(whole, 1),
+        '```',
       );
+    } else {
+      lines.push(ToolHandler.staleNodeNotice(node.filePath));
     }
     return lines.join('\n') + this.formatTrail(cg, node);
   }
@@ -8242,13 +8871,18 @@ export class ToolHandler {
    * dynamic dispatch the static graph couldn't resolve — that absence is itself
    * a signal (read that one hop) rather than a dead end.
    */
-  private formatTrail(cg: CodeGraph, node: Node): string {
+  /**
+   * The trail as data (#1280): direct callees and callers, deduped and capped
+   * exactly as the markdown renders them. Shared by {@link formatTrail} and the
+   * JSON output so the two cannot disagree.
+   */
+  private collectTrail(cg: CodeGraph, node: Node): {
+    callees: Array<{ node: Node; edge: Edge }>;
+    callers: Array<{ node: Node; edge: Edge }>;
+    calleesOmitted: number;
+    callersOmitted: number;
+  } {
     const TRAIL_CAP = 12;
-    const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
-      const synth = this.synthEdgeNote(e.edge);
-      return synth ? `${base} [${synth}]` : base;
-    };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
       const seen = new Set<string>([node.id]);
       const out: Array<{ node: Node; edge: Edge }> = [];
@@ -8261,13 +8895,28 @@ export class ToolHandler {
     };
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
+    return {
+      callees: callees.slice(0, TRAIL_CAP),
+      callers: callers.slice(0, TRAIL_CAP),
+      calleesOmitted: Math.max(0, callees.length - TRAIL_CAP),
+      callersOmitted: Math.max(0, callers.length - TRAIL_CAP),
+    };
+  }
+
+  private formatTrail(cg: CodeGraph, node: Node): string {
+    const { callees, callers, calleesOmitted, callersOmitted } = this.collectTrail(cg, node);
     if (callees.length === 0 && callers.length === 0) return '';
+    const fmt = (e: { node: Node; edge: Edge }) => {
+      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const synth = this.synthEdgeNote(e.edge);
+      return synth ? `${base} [${synth}]` : base;
+    };
     const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
-      lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
+      lines.push(`**Calls →** ${callees.map(fmt).join(', ')}${calleesOmitted > 0 ? `, +${calleesOmitted} more` : ''}`);
     }
     if (callers.length > 0) {
-      lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
+      lines.push(`**Called by ←** ${callers.map(fmt).join(', ')}${callersOmitted > 0 ? `, +${callersOmitted} more` : ''}`);
     }
     return lines.join('\n');
   }

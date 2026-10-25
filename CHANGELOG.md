@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph explore` and `codegraph node` now take `-j` / `--json`, like the other read commands. The JSON carries exactly the information the markdown output carries — the summary, the call-path flow, the blast radius, and the file sections with their source — structured and free of terminal escapes, so agent pipelines can post-process it (keep the flow and blast radius, drop the `source` fields). `codegraph node` reports one symbol (details, raw source, caller/callee trail), a file read (window, symbol map, dependents) or a symbol map, matching each markdown mode. The MCP tools take the same output as `format: "json"`. Markdown stays the default everywhere.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

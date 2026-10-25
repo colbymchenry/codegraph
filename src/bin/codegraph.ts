@@ -1396,7 +1396,8 @@ program
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('-j, --json', 'Output as JSON (same information as the markdown output: summary, flow, blast radius, files with source)')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1412,6 +1413,9 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      // The tool renders the JSON itself (#1280) — the CLI just asks for it and
+      // prints the text verbatim, so stdout stays machine-parseable.
+      if (options.json) args.format = 'json';
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
@@ -1674,7 +1678,8 @@ program
   .option('--offset <number>', 'File mode: 1-based start line')
   .option('--limit <number>', 'File mode: maximum lines')
   .option('--symbols-only', 'File mode: just the symbol map + dependents')
-  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+  .option('-j, --json', 'Output as JSON (same information as the markdown output: symbol details, source, trail; or the file read with its symbol map and dependents)')
+  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean; json?: boolean }) => {
     // Need a symbol (positional) OR a file (--file / a path-like positional).
     // With [name] optional, a bare `codegraph node` reaches here with neither
     // and must be told what to pass, rather than crashing downstream.
@@ -1721,6 +1726,9 @@ program
       if (options.offset) args.offset = parseInt(options.offset, 10);
       if (options.limit) args.limit = parseInt(options.limit, 10);
       if (options.symbolsOnly) args.symbolsOnly = true;
+      // The tool renders the JSON itself (#1280) — the CLI just asks for it and
+      // prints the text verbatim, so stdout stays machine-parseable.
+      if (options.json) args.format = 'json';
 
       const result = await handler.execute('codegraph_node', args);
 
