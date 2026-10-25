@@ -16,11 +16,16 @@ import * as path from 'path';
 import { findNearestCodeGraphRoot } from '../directory';
 
 const SEARCH_COMMAND = /^(rg|grep|egrep|fgrep|find|fd|ag|ack)(\.exe)?$/;
-const CODEGRAPH_SUBCOMMAND = /^(explore|query|node|files|context|callers|callees|impact|affected|status)$/;
+// Subcommands that actually query the graph. `files` and `status` are
+// bookkeeping, not queries: running them must NOT count as the required
+// "one CodeGraph query" that unlocks text search.
+const CODEGRAPH_SUBCOMMAND = /^(explore|query|node|callers|callees|impact|affected|context)$/;
 
-// Kept short: a deny reason lands in the model's context.
+// Kept short: a deny reason lands in the model's context. Names the same
+// subcommands as CODEGRAPH_SUBCOMMAND so the message and the allow-list
+// cannot drift.
 const DENY_REASON =
-  'CodeGraph index present: call codegraph_explore (or `codegraph explore|query|node`) first; Grep/Glob unlock after, for literals and non-code files.';
+  'CodeGraph index present: call codegraph_explore (or `codegraph explore|query|node|callers|callees|impact|affected|context`) first; Grep/Glob unlock after, for literals and non-code files.';
 
 interface GatePayload {
   hook_event_name?: string;
@@ -61,7 +66,7 @@ const EXCLUSION_OPTION = /^(--?(exclude|ignore)[\w-]*|-g|--glob|--iglob)$/;
 const unquote = (word: string) => word.replace(/^['"]|['"]$/g, '');
 
 /** Resolves a shell path word against `dir`: expands `~`, and on Windows reads Git Bash's `/c/x` as `C:/x`. */
-function localPath(word: string, dir: string): string {
+export function localPath(word: string, dir: string): string {
   let p = unquote(word);
   if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
   if (process.platform === 'win32') p = p.replace(/^\/([a-zA-Z])(\/|$)/, '$1:/');
@@ -126,16 +131,57 @@ function markerPath(payload: GatePayload, env: NodeJS.ProcessEnv): string {
   return path.join(dir, key);
 }
 
+// Markers are per-session unlock receipts; anything older than a day is stale
+// (a session that long-lived shouldn't stay unlocked on a single early query).
+const MARKER_TTL_MS = 24 * 60 * 60 * 1000;
+
+function markerAgeMs(marker: string): number | null {
+  try {
+    return Date.now() - fs.statSync(marker).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort sweep of stale unlock markers so the tmp dir never accumulates. */
+function pruneStaleMarkers(dir: string): void {
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      const p = path.join(dir, name);
+      const age = markerAgeMs(p);
+      if (age !== null && age > MARKER_TTL_MS) fs.rmSync(p, { force: true });
+    }
+  } catch { /* best-effort */ }
+}
+
+/** True when an unlock marker exists and is not expired. */
+function hasFreshMarker(marker: string): boolean {
+  const age = markerAgeMs(marker);
+  if (age === null) return false;
+  if (age > MARKER_TTL_MS) {
+    try { fs.rmSync(marker, { force: true }); } catch { /* best-effort */ }
+    return false;
+  }
+  return true;
+}
+
+interface GateResult {
+  /** Stdout to print: a PreToolUse deny JSON, or null to allow silently. */
+  stdout: string | null;
+  /** Telemetry counter to bump, only for PreToolUse text-search events. */
+  telemetry: 'deny' | 'allow' | null;
+}
+
 /**
  * Process one hook payload; returns the stdout to print (a PreToolUse deny
  * JSON) or null to allow silently.
  */
-export function runGateHook(raw: string, env: NodeJS.ProcessEnv = process.env): string | null {
+export function runGateHookDetailed(raw: string, env: NodeJS.ProcessEnv = process.env): GateResult {
   try {
-    if (env.CODEGRAPH_NO_GATE_HOOK === '1') return null;
+    if (env.CODEGRAPH_NO_GATE_HOOK === '1') return { stdout: null, telemetry: null };
     const payload = JSON.parse(raw) as GatePayload;
     const tool = typeof payload?.tool_name === 'string' ? payload.tool_name : '';
-    if (!tool) return null;
+    if (!tool) return { stdout: null, telemetry: null };
     const input = payload.tool_input ?? {};
     const command = tool === 'Bash' && typeof input.command === 'string' ? input.command : '';
     const isQuery = /codegraph/i.test(tool) || isCodegraphCommand(command);
@@ -145,27 +191,45 @@ export function runGateHook(raw: string, env: NodeJS.ProcessEnv = process.env): 
       if (isQuery) {
         fs.mkdirSync(path.dirname(marker), { recursive: true });
         fs.closeSync(fs.openSync(marker, 'w'));
+        pruneStaleMarkers(path.dirname(marker));
       }
-      return null;
+      // PostToolUseFailure unlocks too: a failed `codegraph` call can still
+      // reflect a real attempt to query (e.g. an un-indexed project), and the
+      // acceptance criteria treat any post-use event as the signal that the
+      // session is trying to work through CodeGraph. Permissive by design.
+      return { stdout: null, telemetry: null };
     }
 
-    if (isQuery || fs.existsSync(marker)) return null;
+    // Telemetry exists only for PreToolUse text-search events (deny/allow);
+    // Read/Edit and codegraph-tool events are not searches.
+    const isSearch =
+      tool === 'Grep' || tool === 'Glob' || (tool === 'Bash' && isSearchHead(command));
+    if (!isSearch) return { stdout: null, telemetry: null };
+    if (isQuery || hasFreshMarker(marker)) return { stdout: null, telemetry: 'allow' };
+
     // Only searches that read inside an indexed project are gated.
     const cwd = payload.cwd || process.cwd();
     const gated =
       tool === 'Grep' || tool === 'Glob'
         ? readsIndexedCode([localPath(typeof input.path === 'string' && input.path ? input.path : '.', cwd)])
-        : tool === 'Bash' && bashSearchIsGated(command, cwd);
-    if (!gated) return null;
+        : bashSearchIsGated(command, cwd);
+    if (!gated) return { stdout: null, telemetry: 'allow' };
 
-    return JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: DENY_REASON,
-      },
-    });
+    return {
+      stdout: JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: DENY_REASON,
+        },
+      }),
+      telemetry: 'deny',
+    };
   } catch {
-    return null;
+    return { stdout: null, telemetry: null };
   }
+}
+
+export function runGateHook(raw: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  return runGateHookDetailed(raw, env).stdout;
 }

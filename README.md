@@ -471,7 +471,7 @@ npm install -g @colbymchenry/codegraph
 
 <sub>One wildcard auto-approves every CodeGraph tool — `codegraph_explore` is the only one listed by default, but if you re-enable others via `CODEGRAPH_MCP_TOOLS` they're already permitted, no prompt.</sub>
 
-**Optional: make Claude Code query CodeGraph before searching text.** `codegraph gate-hook` is an opt-in hook that, in an indexed project, denies `Grep`, `Glob` and `rg`/`grep`/`find`/`fd` run via Bash until the session has made one CodeGraph query (the MCP tool or `codegraph explore|query|node`). Only searches that read inside the indexed project are gated: a search in `node_modules`, a `grep` over a log in `/tmp`, or `cd elsewhere && grep` is never blocked. Register it yourself — `codegraph install` does not add it:
+**Optional: make Claude Code query CodeGraph before searching text.** `codegraph gate-hook` is an opt-in hook that, in an indexed project, denies `Grep`, `Glob` and `rg`/`grep`/`find`/`fd` run via Bash until the session has made one CodeGraph query (the MCP tool or `codegraph explore|query|node|callers|callees|impact|affected|context`). Only searches that read inside the indexed project are gated: a search in `node_modules`, a `grep` over a log in `/tmp`, or `cd elsewhere && grep` is never blocked. Register it yourself — `codegraph install` does not add it:
 ```json
 {
   "hooks": {
@@ -488,7 +488,7 @@ npm install -g @colbymchenry/codegraph
 }
 ```
 
-<sub>Set `CODEGRAPH_NO_GATE_HOOK=1` to switch it off without editing settings. On any error it allows the call silently, so it can't break a session.</sub>
+<sub>Set `CODEGRAPH_NO_GATE_HOOK=1` to switch it off without editing settings. On any error it allows the call silently, so it can't break a session. The gate finds the indexed project by walking upward from the search path, so in a monorepo a search launched from an un-indexed workspace root is not gated — index the sub-project the agent works in (or run the search from it) to gate those searches.</sub>
 
 </details>
 

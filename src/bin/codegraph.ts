@@ -1684,10 +1684,10 @@ program
         process.stdin.on('error', () => resolve(data));
       });
 
-      const { runGateHook } = await import('../hooks/gate');
-      const out = runGateHook(raw);
-      try { getTelemetry().recordUsage('cli_command', `gate-hook-${out ? 'deny' : 'allow'}`, true); } catch { /* never break the hook */ }
-      if (out) process.stdout.write(out + '\n');
+      const { runGateHookDetailed } = await import('../hooks/gate');
+      const r = runGateHookDetailed(raw);
+      try { if (r.telemetry) getTelemetry().recordUsage('cli_command', `gate-hook-${r.telemetry}`, true); } catch { /* never break the hook */ }
+      if (r.stdout) process.stdout.write(r.stdout + '\n');
     } catch {
       // Degradable by contract: never surface an error to the tool pipeline.
     }
