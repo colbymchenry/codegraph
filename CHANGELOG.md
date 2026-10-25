@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- A project can now index code that lives outside its own root — sibling repositories, microservices, or shared packages — by listing them in `codegraph.json` as `includePaths` (relative paths resolve against the project root) or by passing `--include <path>` to `codegraph init` and `codegraph index`. Files from those paths are indexed, kept up to date by sync and the live watcher, findable in search, and readable like your own source, so an agent working in one service can see and trace code in the others without indexing a whole parent directory. (#499)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

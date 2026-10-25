@@ -34,6 +34,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PathRefusalError } from '../errors';
 import { validatePathWithinRoot, validateProjectPath } from '../utils';
+import { resolveServablePath } from '../external-paths';
 
 export { PathRefusalError };
 
@@ -290,7 +291,7 @@ export function resolveProjectFile(projectRoot: string, relativePath: string): s
     throw new PathRefusalError(`Refusing to read an absolute path: ${decoded}`);
   }
 
-  const absolute = validatePathWithinRoot(projectRoot, decoded);
+  const absolute = resolveServablePath(projectRoot, decoded);
   if (!absolute) {
     throw new PathRefusalError(`Refusing to read a path outside the project: ${decoded}`);
   }

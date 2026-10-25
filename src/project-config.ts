@@ -82,6 +82,17 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Absolute-or-project-root-relative directories OUTSIDE the project root to
+   * index, sync, and search as if they were part of this project (#499). The
+   * multi-repo / microservice case: sibling projects B and C beside A, where an
+   * agent working in A must see B/C's code without indexing a shared parent.
+   * Entries are resolved against the project root (relative) or taken as-is
+   * (absolute); each is mounted under a reserved virtual path
+   * (`__codegraph_external__/<name>/…`) so the in-root path model and its
+   * security checks stay intact. Absent/empty (the default) adds nothing.
+   */
+  includePaths?: string[];
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +102,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  includePaths: string[];
 }
 
 interface CacheEntry {
@@ -114,6 +126,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  includePaths: Object.freeze([]) as unknown as string[],
 });
 
 /**
@@ -167,16 +180,18 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const includePaths = extractIncludePaths(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    includePaths.length === 0
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, includePaths };
 }
 
 /**
@@ -307,6 +322,32 @@ function extractInclude(parsed: object, file: string): string[] {
 }
 
 /**
+ * Validate the `includePaths` list: an array of non-empty strings naming
+ * directories outside the project root to index as part of this project (#499).
+ * A non-array value or a non-string/blank entry warns-and-skips; never throws.
+ * Entries are kept verbatim (trimmed); resolution against the project root
+ * happens in `src/external-paths.ts`.
+ */
+function extractIncludePaths(parsed: object, file: string): string[] {
+  const raw = (parsed as ProjectConfig).includePaths;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "includePaths" in ${PROJECT_CONFIG_FILENAME}: must be an array of directory paths`, { file });
+    return [];
+  }
+
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring an "includePaths" entry in ${PROJECT_CONFIG_FILENAME}: every path must be a non-empty string`, { file });
+      continue;
+    }
+    out.push(entry.trim());
+  }
+  return out;
+}
+
+/**
  * Load the parsed `codegraph.json` for a project, mtime-cached. A missing or
  * malformed file yields the zero-config default. One `stat` (and at most one
  * read/parse) while a single config file is in force, shared across every field.
@@ -391,6 +432,19 @@ export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
 }
 
+/**
+ * Load the validated `includePaths` entries for a project, mtime-cached.
+ *
+ * These name directories outside the project root to index as part of this
+ * project (#499). The entries are the raw, trimmed strings from `codegraph.json`
+ * (absolute, or relative to the project root); resolution into absolute mount
+ * directories happens in `src/external-paths.ts`. An empty result — the
+ * zero-config default — mounts nothing.
+ */
+export function loadIncludePaths(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).includePaths;
+}
+
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
 export function clearProjectConfigCache(): void {
   cache.clear();
@@ -443,6 +497,57 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
     added++;
   }
   config.includeIgnored = merged;
+  fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+  clearProjectConfigCache();
+  return added;
+}
+
+/**
+ * Add directories to a project's `codegraph.json` `includePaths` list, creating
+ * the file if absent and preserving every other key. Used by the CLI's `init
+ * --include <path>` (and `index`/`sync`) to register extra indexing paths on
+ * the user's say-so. Returns the count of paths actually ADDED (ones already
+ * present are skipped, so a re-run is idempotent).
+ *
+ * Same plain-JSON round-trip as {@link addIncludeIgnoredPatterns}: an existing
+ * unparseable config throws (the caller can print the manual snippet), and the
+ * config cache is invalidated so a subsequent index in the same process sees the
+ * new paths.
+ */
+export function addIncludePaths(rootDir: string, paths: string[]): number {
+  const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
+  let config: Record<string, unknown> = {};
+  let raw: string | null = null;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch {
+    raw = null; // missing file — create a fresh one below
+  }
+  if (raw !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`${PROJECT_CONFIG_FILENAME} is not valid JSON — fix it by hand, then re-run.`);
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      config = parsed as Record<string, unknown>;
+    }
+  }
+
+  const existing = Array.isArray(config.includePaths)
+    ? (config.includePaths as unknown[]).filter((p): p is string => typeof p === 'string')
+    : [];
+  const merged = [...existing];
+  const seen = new Set(existing);
+  let added = 0;
+  for (const p of paths) {
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    merged.push(p);
+    added++;
+  }
+  config.includePaths = merged;
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;

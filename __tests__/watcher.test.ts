@@ -31,6 +31,7 @@ import {
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
+import { EXTERNAL_PREFIX } from '../src/external-paths';
 
 // Keep real filesystem operations, with writable exports for failure injection.
 vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
@@ -1219,6 +1220,30 @@ describe('FileWatcher', () => {
       await waitFor(() => has('linkedAdded'), 8000);
       fs.unlinkSync(file);
       await waitFor(() => !has('linkedAfter'), 8000);
+    }, 30000);
+
+    it('watches external include paths (#499) and auto-syncs their edits', async () => {
+      const ext = external();
+      fs.mkdirSync(path.join(ext, 'src'));
+      fs.writeFileSync(path.join(ext, 'src', 'ext.ts'), 'export function extBefore() {}');
+      fs.writeFileSync(
+        path.join(testDir, 'codegraph.json'),
+        JSON.stringify({ includePaths: [path.relative(testDir, ext)] })
+      );
+      cg = initGraph(testDir);
+      await cg.indexAll();
+      expect(has('extBefore')).toBe(true);
+      expect(cg!.getNodesByName('extBefore')[0].filePath.startsWith(`${EXTERNAL_PREFIX}/`)).toBe(true);
+
+      expect(cg.watch({ debounceMs: 100 })).toBe(true);
+      // FSEvents can coalesce writes made while a new stream is being registered.
+      await new Promise(resolve => setTimeout(resolve, 700));
+
+      fs.writeFileSync(path.join(ext, 'src', 'ext.ts'), 'export function extAfter() {}');
+      await waitFor(() => has('extAfter') && !has('extBefore'), 8000);
+
+      fs.writeFileSync(path.join(ext, 'src', 'added.ts'), 'export function extAdded() {}');
+      await waitFor(() => has('extAdded'), 8000);
     }, 30000);
 
     it('watches both targets of a real cycle and deduplicates aliases', async () => {

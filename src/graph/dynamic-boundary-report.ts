@@ -25,7 +25,7 @@
 import type CodeGraph from '../index';
 import type { Edge, Node } from '../types';
 import { scanDynamicDispatch, type BoundaryMatch } from '../mcp/dynamic-boundaries';
-import { validatePathWithinRoot } from '../utils';
+import { resolveServablePath } from '../external-paths';
 import { existsSync, readFileSync } from 'fs';
 
 /** Below this resolution confidence an edge is a name-only guess, not a call. */
@@ -154,7 +154,7 @@ export function findDynamicBoundaries(
     if (sites >= maxSites || scanned >= MAX_SCAN || charsScanned > MAX_TOTAL_CHARS) break;
     if (seenNode.has(node.id) || !node.startLine || !node.endLine) continue;
     seenNode.add(node.id);
-    const absPath = validatePathWithinRoot(projectRoot, node.filePath);
+    const absPath = resolveServablePath(projectRoot, node.filePath);
     if (!absPath || !existsSync(absPath)) continue;
     let content: string;
     try {

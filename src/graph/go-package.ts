@@ -10,7 +10,7 @@
  */
 
 import { closeSync, openSync, readSync } from 'fs';
-import { validatePathWithinRoot } from '../utils';
+import { resolveIndexReadPath } from '../external-paths';
 
 /** The package a Go file declares, by its project-relative path; null when unknown. */
 export type GoPackageOf = (filePath: string) => string | null;
@@ -46,7 +46,7 @@ export function goPackageReader(projectRoot: string): GoPackageOf {
     const hit = cache.get(filePath);
     if (hit !== undefined) return hit;
     let pkg: string | null = null;
-    const absPath = validatePathWithinRoot(projectRoot, filePath);
+    const absPath = resolveIndexReadPath(projectRoot, filePath);
     if (absPath) {
       try {
         const fd = openSync(absPath, 'r');

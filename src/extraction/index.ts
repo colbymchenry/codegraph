@@ -26,6 +26,7 @@ import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExternalMounts, externalToVirtual, resolveIndexReadPath } from '../external-paths';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -1669,11 +1670,64 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
 }
 
 /**
+ * Scan the configured external include paths (`codegraph.json` `includePaths`,
+ * #499) and return their source files as VIRTUAL paths under the reserved
+ * `__codegraph_external__/<slug>/` prefix. Each mount's directory is walked
+ * like the project root (skipping `.git` and CodeGraph data dirs), and files
+ * are kept when their extension is a supported source extension. `.gitignore`
+ * of the external project is deliberately not consulted: the whole mounted
+ * directory is opted in explicitly. Returns an empty list when nothing is
+ * configured.
+ */
+function scanExternalSources(rootDir: string): string[] {
+  const mounts = loadExternalMounts(rootDir);
+  if (mounts.length === 0) return [];
+  const overrides = loadExtensionOverrides(rootDir);
+  const files: string[] = [];
+  const visited = new Set<string>();
+
+  for (const mount of mounts) {
+    const walk = (dir: string): void => {
+      let realDir: string;
+      try {
+        realDir = fs.realpathSync(dir);
+      } catch {
+        return;
+      }
+      if (visited.has(realDir)) return;
+      visited.add(realDir);
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.name === '.git' || isCodeGraphDataDir(entry.name) || entry.name.startsWith('.')) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        const rel = normalizePath(path.relative(mount.abs, full));
+        const virtual = externalToVirtual(mount, rel);
+        if (isSourceFile(virtual, overrides, rootDir)) files.push(virtual);
+      }
+    };
+    walk(mount.abs);
+  }
+  return files;
+}
+
+/**
  * Recursively scan a directory for source files.
  *
  * In git repos, uses `git ls-files` (inherently respects .gitignore at all
  * levels), then keeps files with a supported source extension. For non-git
  * projects, falls back to a filesystem walk that parses .gitignore itself.
+ * External include paths (#499) are appended after the root scan.
  */
 export function scanDirectory(
   rootDir: string,
@@ -1694,11 +1748,16 @@ export function scanDirectory(
         onProgress?.(count, filePath);
       }
     }
+    const external = scanExternalSources(rootDir);
+    files.push(...external);
     return files;
   }
 
   // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, onProgress);
+  const walked = scanDirectoryWalk(rootDir, onProgress);
+  const external = scanExternalSources(rootDir);
+  walked.push(...external);
+  return walked;
 }
 
 /**
@@ -1751,10 +1810,13 @@ export async function scanDirectoryAsync(
         tallySkip(stats, filePath);
       }
     }
+    files.push(...scanExternalSources(rootDir));
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress, stats);
+  const walked = scanDirectoryWalk(rootDir, onProgress, stats);
+  walked.push(...scanExternalSources(rootDir));
+  return walked;
 }
 
 /**
@@ -2558,7 +2620,7 @@ export class ExtractionOrchestrator {
             // Indexing read: follow in-root symlinks the directory walk already
             // descended into (the `../` guard still applies) so files reached
             // via an in-root symlink-to-outside still index (#935).
-            const fullPath = validatePathWithinRoot(this.rootDir, fp, { allowSymlinkEscape: true });
+            const fullPath = resolveIndexReadPath(this.rootDir, fp);
             if (!fullPath) {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
@@ -2721,7 +2783,7 @@ export class ExtractionOrchestrator {
 
         let content: string;
         try {
-          const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+          const fullPath = resolveIndexReadPath(this.rootDir, filePath);
           if (!fullPath) continue;
           // Bounded like the first read: the file may have grown since (#1910).
           const bytes = (await readBoundedSource(fullPath)).bytes;
@@ -2749,7 +2811,7 @@ export class ExtractionOrchestrator {
         result = materializeKernelResult(result, filePath, language);
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const stats = await fsp.stat(path.join(this.rootDir, filePath));
+          const stats = await fsp.stat(resolveIndexReadPath(this.rootDir, filePath)!);
           await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
 
           const idx = errors.indexOf(errEntry);
@@ -2776,7 +2838,7 @@ export class ExtractionOrchestrator {
 
           let fullContent: string;
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            const fullPath = resolveIndexReadPath(this.rootDir, filePath);
             if (!fullPath) continue;
             const bytes = (await readBoundedSource(fullPath)).bytes;
             if (bytes === null) continue;
@@ -2804,7 +2866,7 @@ export class ExtractionOrchestrator {
           result = materializeKernelResult(result, filePath, language);
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
-            const stats = await fsp.stat(path.join(this.rootDir, filePath));
+            const stats = await fsp.stat(resolveIndexReadPath(this.rootDir, filePath)!);
             await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield);
 
             // Salvaged from comment-stripped source: keep a visible trace in
@@ -2896,7 +2958,7 @@ export class ExtractionOrchestrator {
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
     // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
+    const fullPath = resolveIndexReadPath(this.rootDir, relativePath);
 
     if (!fullPath) {
       return {
@@ -2950,7 +3012,7 @@ export class ExtractionOrchestrator {
     stats: fs.Stats
   ): Promise<ExtractionResult> {
     // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
+    const fullPath = resolveIndexReadPath(this.rootDir, relativePath);
     if (!fullPath) {
       logWarn('Path traversal blocked in indexFileWithContent', { relativePath });
       return {
@@ -3585,7 +3647,7 @@ export class ExtractionOrchestrator {
         (p) =>
           isSourceFile(p, overrides, this.rootDir) &&
           !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p))
+          fs.existsSync(resolveIndexReadPath(this.rootDir, p) ?? '')
       );
       trackedFiles = [];
       for (const p of unique) {
@@ -3650,7 +3712,7 @@ export class ExtractionOrchestrator {
     };
     const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
-      if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+      if (!currentSet.has(tracked.path) || !fs.existsSync(resolveIndexReadPath(this.rootDir, tracked.path) ?? '')) {
         removed.push(tracked);
       }
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
@@ -3682,7 +3744,8 @@ export class ExtractionOrchestrator {
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      const fullPath = path.join(this.rootDir, filePath);
+      const fullPath = resolveIndexReadPath(this.rootDir, filePath);
+      if (!fullPath) continue;
       const tracked = trackedMap.get(filePath);
       // A row an older engine stored while the file's grammar could not load
       // (#2335) holds no parse of these bytes: re-index it even though its
@@ -3881,8 +3944,8 @@ export class ExtractionOrchestrator {
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {
         const tracked = this.queries.getFileByPath(filePath);
-        const fullPath = path.join(this.rootDir, filePath);
-        if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
+        const fullPath = resolveIndexReadPath(this.rootDir, filePath);
+        if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fullPath || !fs.existsSync(fullPath)) {
           if (tracked) removed.push(filePath);
           continue;
         }
@@ -3928,7 +3991,8 @@ export class ExtractionOrchestrator {
 
     // Find added and modified files
     for (const filePath of currentFiles) {
-      const fullPath = path.join(this.rootDir, filePath);
+      const fullPath = resolveIndexReadPath(this.rootDir, filePath);
+      if (!fullPath) continue;
       let content: string | null;
       try {
         content = readSourceOrStamp(fullPath);

@@ -40,6 +40,7 @@ import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-conf
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
+import { loadExternalMounts, EXTERNAL_PREFIX, type ExternalMount } from '../external-paths';
 import { watchDisabledReason } from './watch-policy';
 
 /**
@@ -357,6 +358,8 @@ export class FileWatcher {
   private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
+  /** External include paths (#499): mounted and watched alongside the root. */
+  private readonly externalMounts: ExternalMount[] = [];
   private readonly debounceMs: number;
   private readonly syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
@@ -385,6 +388,9 @@ export class FileWatcher {
     this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
     this.isFileStateCurrent = isFileStateCurrent;
+    // External include paths (#499) are watched too, so edits in a sibling
+    // project reach the index live — not only on a manual `codegraph sync`.
+    this.externalMounts = loadExternalMounts(projectRoot);
   }
 
   /**
@@ -513,6 +519,12 @@ export class FileWatcher {
       } catch { /* removed or unreadable directory */ }
     };
     walk(this.projectRoot, false);
+    // External include paths (#499) are outside the root, so they get their
+    // own explicit watches regardless of strategy (forced "linked" traversal),
+    // and their files map to virtual `__codegraph_external__/<slug>/` paths.
+    for (const mount of this.externalMounts) {
+      walk(mount.abs, true);
+    }
     this.knownDirs = directories;
     for (const dir of this.dirWatchers.keys()) {
       if (desired.get(dir) !== this.watchedRealDirs.get(dir)) this.unwatchDir(dir);
@@ -582,6 +594,24 @@ export class FileWatcher {
     this.watchedRealDirs.set(dir, real);
   }
 
+  /**
+   * Map an absolute path to its project-relative POSIX path. Files inside an
+   * external include mount (#499) become virtual `__codegraph_external__/<slug>/…`
+   * paths; everything else is relative to the project root. `null` when the
+   * path is outside both the root and every configured mount.
+   */
+  private toProjectRelative(full: string): string | null {
+    for (const mount of this.externalMounts) {
+      const rel = path.relative(mount.abs, full);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+        return normalizePath(`${EXTERNAL_PREFIX}/${mount.slug}/${rel}`);
+      }
+    }
+    const rel = path.relative(this.projectRoot, full);
+    if (!rel || rel.startsWith('..')) return null;
+    return normalizePath(rel);
+  }
+
   /** Events are relative to a watch's logical path, even for an external target. */
   private handleDirEvent(dir: string, filename: string | Buffer | null): void {
     if (this.stopped) return;
@@ -590,7 +620,7 @@ export class FileWatcher {
       return;
     }
     const full = path.join(dir, String(filename));
-    const rel = normalizePath(path.relative(this.projectRoot, full));
+    const rel = this.toProjectRelative(full);
     if (!rel || rel === '.') {
       this.scheduleTreeRefresh();
       return;

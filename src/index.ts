@@ -65,6 +65,7 @@ import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
+import { resolveIndexReadPath } from './external-paths';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -1599,7 +1600,9 @@ export class CodeGraph {
     if (!tracked) return false;
 
     try {
-      const stat = fs.statSync(path.join(this.projectRoot, filePath));
+      const fullPath = resolveIndexReadPath(this.projectRoot, filePath);
+      if (!fullPath) return false;
+      const stat = fs.statSync(fullPath);
       return (
         stat.isFile() &&
         Number.isFinite(stat.mtimeMs) &&

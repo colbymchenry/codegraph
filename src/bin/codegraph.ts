@@ -682,13 +682,25 @@ async function recordIndexTelemetry(
  */
 async function runInit(
   projectPath: string,
-  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; include?: string[] },
 ): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
   clack.intro('Initializing CodeGraph');
 
   try {
+    // Persist `--include` extra indexing paths (#499) BEFORE the early-return
+    // guards below, so `codegraph init --include <path>` on an already-
+    // initialized project still registers the paths (the next index/sync picks
+    // them up). `addIncludePaths` is idempotent and preserves other config keys.
+    if (options.include && options.include.length > 0) {
+      const { addIncludePaths } = await import('../project-config');
+      const added = addIncludePaths(projectPath, options.include);
+      if (added > 0) {
+        clack.log.info(`Added ${added} extra ${added === 1 ? 'path' : 'paths'} to index (codegraph.json "includePaths").`);
+      }
+    }
+
     // Refuse to index your home directory / a filesystem root — it pulls in
     // caches, other projects, and your whole tree (a multi-GB index + watcher
     // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
@@ -796,7 +808,8 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('--include <paths...>', 'Extra directories outside the project root to index as part of this project (e.g. a sibling microservice); saved to codegraph.json "includePaths"')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; include?: string[] }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
@@ -870,7 +883,8 @@ program
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--include <paths...>', 'Extra directories outside the project root to index as part of this project; saved to codegraph.json "includePaths"')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; include?: string[] }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
     // looking for one. resolveProjectPath walks up to the nearest initialized
     // ancestor, which is right for `codegraph query` run from a subdirectory,
@@ -878,6 +892,13 @@ program
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
     // `codegraph index` (cwd) may resolve upward.
     const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
+
+    // Persist `--include` extra indexing paths (#499) before the rebuild, so a
+    // re-index picks them up. Idempotent; preserves other config keys.
+    if (options.include && options.include.length > 0) {
+      const { addIncludePaths } = await import('../project-config');
+      addIncludePaths(projectPath, options.include);
+    }
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force

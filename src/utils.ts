@@ -70,7 +70,7 @@ export function isConfigLeafNode(node: { kind: string; language?: string }): boo
  * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
  * case than the lexical root, which would otherwise false-reject a valid file.
  */
-function isWithinDir(child: string, parent: string): boolean {
+export function isWithinDir(child: string, parent: string): boolean {
   let c = child;
   let p = parent;
   if (process.platform === 'win32') {

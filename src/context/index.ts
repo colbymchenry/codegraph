@@ -24,7 +24,8 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
+import { isConfigLeafNode } from '../utils';
+import { resolveServablePath } from '../external-paths';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
@@ -1407,7 +1408,7 @@ export class ContextBuilder {
       return node.signature || node.qualifiedName || node.name;
     }
 
-    const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
+    const filePath = resolveServablePath(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {
       return null;

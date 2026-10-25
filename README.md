@@ -711,6 +711,28 @@ ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
 from some result sets outright — `deprioritize` only ever changes rank. Reach
 for `exclude` when you want something gone.
 
+### Indexing code outside the project
+
+By default a project indexes only the directory it was initialized in. In a
+multi-repo or microservice workspace you often want an agent working in one
+service to see and trace code in sibling projects without indexing the whole
+parent directory. List those directories under `includePaths` in
+`codegraph.json` — relative paths resolve against the project root, absolute
+paths are used as-is:
+
+```json
+{
+  "includePaths": ["../project-B/src", "../project-C/src"]
+}
+```
+
+The same effect is available on the command line — `codegraph init --include
+../project-B` (and `codegraph index --include ../project-B`) writes the paths
+into `codegraph.json` for you. Files under these paths are indexed, kept up to
+date by `codegraph sync` and the live watcher, findable in search, and readable
+as source exactly like your own code. Re-index (`codegraph index`) after
+changing `includePaths`.
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

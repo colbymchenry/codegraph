@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp } from '../file-limits';
-import { validatePathWithinRoot } from '../utils';
+import { resolveIndexReadPath } from '../external-paths';
 
 export interface AnswerFile {
   path: string;
@@ -35,7 +35,7 @@ export async function validateAnswerFiles(root: string, files: AnswerFile[]): Pr
     }
     try {
       const hash = createHash('sha256');
-      const absolute = validatePathWithinRoot(root, file.path);
+      const absolute = resolveIndexReadPath(root, file.path);
       if (!absolute) { stale.push(file.path); continue; }
       // A file over the index's size limit is stored as its size stamp
       // (#1910): when the stamp still matches, the file is current without

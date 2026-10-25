@@ -52,7 +52,8 @@ import {
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
-import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { clamp, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { resolveIndexReadPath, resolveServablePath } from '../external-paths';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
@@ -217,7 +218,7 @@ export function normalizeQuerySpelling(query: string): string {
  */
 function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
   try {
-    const abs = validatePathWithinRoot(projectRoot, relPath);
+    const abs = resolveServablePath(projectRoot, relPath);
     return abs !== null && statSync(abs).isFile();
   } catch {
     return false;
@@ -2761,7 +2762,7 @@ export class ToolHandler {
     let stale = false;
     try {
       const rec = cg.getFile(relPath);
-      const absPath = rec ? validatePathWithinRoot(root, relPath) : null;
+      const absPath = rec ? resolveIndexReadPath(root, relPath) : null;
       if (rec && absPath && existsSync(absPath)) {
         const st = statSync(absPath);
         // Same freshness test as the sync fast path (extraction/index.ts):
@@ -3462,7 +3463,7 @@ export class ToolHandler {
     try {
       const rec = cg.getFile(caller.filePath);
       if (!rec) return '';
-      const abs = validatePathWithinRoot(cg.getProjectRoot(), caller.filePath);
+      const abs = resolveIndexReadPath(cg.getProjectRoot(), caller.filePath);
       if (!abs) return '';
       const st = statSync(abs);
       // Drifted since the index: the recorded line may point elsewhere.
@@ -5776,7 +5777,7 @@ export class ToolHandler {
       }
       diag?.recordSpendable(filePath, allowance);
       diag?.recordFunded(filePath, fundedHeadroom);
-      const absPath = validatePathWithinRoot(projectRoot, filePath);
+      const absPath = resolveServablePath(projectRoot, filePath);
       if (!absPath || !existsSync(absPath)) {
         diag?.recordSkip(filePath, 'unreadable');
         continue;
@@ -8089,8 +8090,9 @@ export class ToolHandler {
     }
 
     // Read the current bytes from disk through the security chokepoint
-    // (validatePathWithinRoot: blocks `../` traversal and symlink escapes, #527).
-    const abs = validatePathWithinRoot(cg.getProjectRoot(), filePath);
+    // (resolveServablePath: blocks `../` traversal and symlink escapes, #527;
+    // external include paths resolve only to their configured mounts).
+    const abs = resolveServablePath(cg.getProjectRoot(), filePath);
     let content: string | null = null;
     if (abs) {
       try { content = readFileSync(abs, 'utf-8'); } catch { content = null; }
@@ -8203,7 +8205,7 @@ export class ToolHandler {
     let embedded = false;
     if (includeCode) {
       try {
-        const absPath = validatePathWithinRoot(cg.getProjectRoot(), node.filePath);
+        const absPath = resolveServablePath(cg.getProjectRoot(), node.filePath);
         if (absPath && existsSync(absPath) && !isConfigLeafNode(node)) {
           const content = readFileSync(absPath, 'utf-8');
           const body = content.replace(/\n+$/, '');
