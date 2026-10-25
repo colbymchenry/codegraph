@@ -20,7 +20,7 @@ import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
 import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
-import { describeThreadBudget, resolveProjectThreadLimit, threadBudget } from '../thread-budget';
+import { resolveProjectThreadLimit, threadBudget } from '../thread-budget';
 import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
 
@@ -159,25 +159,19 @@ export class MCPEngine {
       return;
     }
     // #2527: the query pool draws on the same run-wide thread budget as the
-    // index-time pools. `minimum` keeps a serving run at the size it gets
-    // today unless the user asked for a cap.
+    // index-time pools. It claims one slot per worker as it grows (see
+    // QueryPool), so a watcher sync running in this process still has slots to
+    // build its parse pool with.
     const budget = threadBudget(resolveProjectThreadLimit({
       projectRoot: root ?? undefined,
       availableParallelism: os.availableParallelism(),
-      minimum: size,
     }));
-    size = budget.claim(size);
-    if (size <= 0) {
-      process.stderr.write(
-        `[CodeGraph MCP] Query pool disabled (thread budget ${budget.limit.total} from ${budget.limit.source} is spent); serving reads in-process.\n`,
-      );
-      return;
-    }
     try {
-      this.queryPool = new QueryPool({ root, size });
+      this.queryPool = new QueryPool({ root, size, threadBudget: budget });
       this.toolHandler.setQueryPool(this.queryPool);
       process.stderr.write(
-        `[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads (${describeThreadBudget(budget.limit, { parse: 0, query: size, resolve: 0 }, { cores: os.availableParallelism(), pools: ['query'] })}).\n`,
+        `[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads ` +
+        `(thread budget ${budget.limit.total} from ${budget.limit.source}).\n`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

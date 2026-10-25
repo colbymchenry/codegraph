@@ -27,6 +27,7 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
 import type { ToolResult } from './tools';
+import type { ThreadBudget } from '../thread-budget';
 
 /** Compiled sibling — `query-worker.js` lives next to this file in `dist/mcp/`. */
 const WORKER_FILE = path.join(__dirname, 'query-worker.js');
@@ -112,6 +113,13 @@ export interface QueryPoolOptions {
   createWorker?: () => PoolWorker;
   /** How long destroy() waits on a worker still starting up (tests shorten it). Default 15s. */
   startSettleMs?: number;
+  /**
+   * Run-wide thread budget (#2527). The pool grows lazily, so it claims ONE
+   * slot per worker at spawn and returns it when that worker goes away — a
+   * live query pool therefore holds only the threads it actually runs, leaving
+   * room for a watcher sync's parse pool in the same process.
+   */
+  threadBudget?: ThreadBudget;
 }
 
 /**
@@ -176,6 +184,9 @@ export class QueryPool {
   private readonly maxRetries: number;
   private readonly createWorker: () => PoolWorker;
   private readonly startSettleMs: number;
+  private readonly threadBudget?: ThreadBudget;
+  /** Workers currently holding a budget slot (released when they go away). */
+  private readonly slotHolders = new Set<PoolWorker>();
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
@@ -184,6 +195,7 @@ export class QueryPool {
     this.maxRetries = opts.maxRetries ?? 1;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
+    this.threadBudget = opts.threadBudget;
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
 
@@ -221,15 +233,20 @@ export class QueryPool {
 
   private spawnOne(): void {
     if (this.destroyed || this.workers.size >= this.maxSize) return;
+    // Claim before creating: a full budget means "serve with the workers this
+    // pool already has" rather than exceeding the run's ceiling.
+    if (this.threadBudget && this.threadBudget.claim(1) === 0) return;
     let w: PoolWorker;
     try {
       w = this.createWorker();
     } catch {
+      this.releaseSlot(undefined);
       this.totalCrashes++; // counts toward the circuit breaker
       return;
     }
     this.workers.add(w);
     this.pendingWorkers.add(w);
+    if (this.threadBudget) this.slotHolders.add(w);
     let settle!: () => void;
     const settled = new Promise<void>((resolve) => { settle = resolve; });
     this.starts.set(w, { settled, settle });
@@ -271,6 +288,7 @@ export class QueryPool {
     this.workers.delete(w);
     this.pendingWorkers.delete(w);
     this.idle = this.idle.filter((x) => x !== w);
+    this.releaseSlot(w);
     this.totalCrashes++;
     const job = this.inflight.get(w);
     this.inflight.delete(w);
@@ -295,6 +313,7 @@ export class QueryPool {
       this.queue.length > this.idle.length + this.pendingWorkers.size &&
       this.workers.size < this.maxSize &&
       this.pendingWorkers.size < MAX_CONCURRENT_SPAWN &&
+      (!this.threadBudget || this.threadBudget.remaining > 0) &&
       this.healthy
     ) {
       this.spawnOne();
@@ -344,6 +363,16 @@ export class QueryPool {
   }
 
   /**
+   * Return one budget slot. `undefined` is the path taken when a worker could
+   * not be created after its slot was claimed.
+   */
+  private releaseSlot(w: PoolWorker | undefined): void {
+    if (!this.threadBudget) return;
+    if (w !== undefined && !this.slotHolders.delete(w)) return;
+    this.threadBudget.release(1);
+  }
+
+  /**
    * Terminate a worker, but not while it is still starting up: wait for it to
    * post 'ready' (or go away), up to `startSettleMs` (WORKER_START_SETTLE_MS —
    * see that constant for the crash this avoids).
@@ -378,6 +407,11 @@ export class QueryPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => this.terminateStarted(w)));
+    try {
+      await Promise.all(ws.map((w) => this.terminateStarted(w)));
+    } finally {
+      // Every worker is gone; hand the run's budget back (#2527).
+      for (const w of ws) this.releaseSlot(w);
+    }
   }
 }

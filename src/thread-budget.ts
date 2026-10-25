@@ -6,25 +6,28 @@
  * the parse pool (`extraction/parse-pool`), the resolution pool
  * (`resolution/resolver-pool`) and the query pool (`mcp/query-pool`) — and each
  * one sized itself from the core count on its own. Each pool alone is polite
- * (it leaves a core for the main thread), but the pools that share a run add
- * up: an index run drives the parse pool AND the resolution pool at the same
- * time, and with no shared ceiling that total can occupy every core and leave
- * the machine unresponsive for the duration of the build.
+ * (it leaves a core for the main thread), but their sizes add up: a long-lived
+ * MCP server keeps its query pool live while a watcher sync builds the parse
+ * and resolution pools, and on a machine whose cores are already spoken for
+ * that total can occupy every core and leave the desktop unresponsive.
  *
- * This module is the single place that decides how many worker threads a run
- * may use, and hands that budget to whichever pools the run actually creates.
+ * This module is the single place that decides how many worker threads may be
+ * live at once, and is the allocator the pools draw on when they are built.
  *
  * Precedence for the limit (highest first):
  *   1. `--threads <n>` on the CLI (index / init / sync)
  *   2. `maxThreads` in the project's `codegraph.json`
  *   3. `CODEGRAPH_MAX_THREADS` in the environment
- *   4. default — the largest combination of pools that can run at once, capped
- *      to `cores - 1` so the main thread and the OS always keep a core.
+ *   4. default — `cores - 2` so the main thread and the OS always keep room,
+ *      never below the constructing pool's own un-capped size.
  *
- * The budget is applied to the pools that are *constructed together*, not to a
- * fixed three-way split: an `index` run never builds a query pool, so capping
- * parse+resolve+query would silently halve index throughput for no reason. The
- * allocator is therefore given exactly the pools a phase creates.
+ * The ceiling applies to the pools that are alive *together*, not to a fixed
+ * three-way split: an `index` run never builds a query pool, and its parse pool
+ * is torn down before resolution starts, so a fixed split would silently halve
+ * throughput for no reason. Each pool leases the slots it needs — the batch
+ * pools when they are constructed, the query pool one per worker as it grows —
+ * and returns them when those workers go away. The sum of the live leases can
+ * never exceed the limit.
  *
  * Everything here is pure and synchronous so it can be unit-tested without
  * spawning a worker or touching the database.
@@ -65,8 +68,19 @@ export interface ThreadLimit {
   readonly source: ThreadBudgetSource;
 }
 
-/** A pool's own request, before the shared budget is applied. */
-export type PoolWants = Partial<Record<PoolName, number>>;
+/**
+ * Slots reserved by one pool, released when that pool is destroyed.
+ *
+ * Every pool hands its lease back in `destroy()`, so a run that builds pools
+ * one after another (parse, then resolution) — or a long-lived server that
+ * retires and recreates one — never drains the budget it is drawing on.
+ */
+export interface ThreadLease {
+  /** Slots this pool may use. */
+  readonly size: number;
+  /** Return the slots. Idempotent: a second call is a no-op. */
+  release(): void;
+}
 
 /**
  * Cores kept free of worker threads by the default. Two, not one: the main
@@ -118,59 +132,7 @@ export function resolveThreadLimit(input: ThreadLimitInput): ThreadLimit {
   };
 }
 
-/**
- * Divide `total` across the pools a phase constructs.
- *
- * A request that fits is granted in full — this is the common case on a
- * many-core machine and is why applying a budget does not cost throughput.
- * When it does not fit, every pool is scaled back in proportion to its share
- * of the overrun (so no pool is starved by an earlier one), and the rounding
- * slack is handed back one slot at a time in the order the pools are declared.
- *
- * `total` is a hard ceiling on the returned sum: values below 1 are treated as
- * 1 so a pathological `--threads 0` cannot produce a zero-worker run.
- */
-export function allocatePoolSizes(total: number, want: PoolWants): PoolSizes {
-  const entries = (Object.keys(want) as PoolName[])
-    .map((name) => [name, Math.max(0, Math.floor(want[name] ?? 0))] as const)
-    .filter(([, size]) => size > 0);
-  const budget = Math.max(1, Math.floor(total) || 1);
-
-  const result: PoolSizes = { parse: 0, query: 0, resolve: 0 };
-  const requested = entries.reduce((sum, [, size]) => sum + size, 0);
-  if (requested === 0) return result;
-
-  if (requested <= budget) {
-    for (const [name, size] of entries) result[name] = size;
-    return result;
-  }
-
-  // Proportional share, floored. Every pool keeps a share of the budget, so a
-  // pool that is constructed later in the run cannot be starved by one that was
-  // constructed earlier.
-  const assigned = new Map<PoolName, number>();
-  let handedOut = 0;
-  for (const [name, size] of entries) {
-    const share = Math.floor((size * budget) / requested);
-    assigned.set(name, share);
-    handedOut += share;
-  }
-
-  // Hand back the rounding slack in declaration order, never above the request.
-  for (const [name, size] of entries) {
-    if (handedOut >= budget) break;
-    const current = assigned.get(name) ?? 0;
-    if (current < size) {
-      assigned.set(name, current + 1);
-      handedOut++;
-    }
-  }
-
-  for (const [name] of entries) result[name] = assigned.get(name) ?? 0;
-  return result;
-}
-
-/** Granted size per pool after the budget is applied. */
+/** Granted size per pool, for verbose startup logging. */
 export interface PoolSizes {
   parse: number;
   query: number;
@@ -200,11 +162,11 @@ export function describeThreadBudget(
  * Live allocator — the mechanism that makes one limit apply "across all pools
  * together" (issue #2527's wording).
  *
- * Each pool claims slots when it is constructed and hands them back when it is
- * destroyed, so the ceiling holds for whatever combination of pools a run
+ * Each pool claims its slots when it needs them and hands them back when its
+ * workers go away, so the ceiling holds for whatever combination of pools a run
  * actually builds. An index run claims parse then resolve; a serving run claims
- * only query. Neither can exceed the total, and neither can starve the other
- * because a claim is granted `min(wanted, remaining)`.
+ * one query slot per live worker. No pool can push the total past the limit,
+ * and a released slot is immediately available to the next pool.
  */
 export class ThreadBudget {
   private used = 0;
@@ -230,6 +192,25 @@ export class ThreadBudget {
     const granted = Math.min(request, this.remaining);
     this.used += granted;
     return granted;
+  }
+
+  /**
+   * Reserve up to `wanted` worker threads for one pool and return its lease.
+   * The pool releases the lease in `destroy()`; without that, every pool built
+   * later in the process would see a drained budget (issue #2527's first
+   * regression: a second MCP engine sized its query pool to zero).
+   */
+  lease(wanted: number): ThreadLease {
+    const size = this.claim(wanted);
+    let released = false;
+    return {
+      size,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.release(size);
+      },
+    };
   }
 
   /** Return slots held by a pool that has gone away. */
@@ -273,26 +254,19 @@ export function resolveProjectThreadLimit(opts: {
  * indexing.
  */
 function readProjectMaxThreads(projectRoot: string | undefined): number | undefined {
-  if (!projectRoot) return undefined;
-  try {
-    return loadMaxThreads(projectRoot);
-  } catch {
-    // A config read must never break a run — an unreadable codegraph.json
-    // behaves exactly like one with no maxThreads.
-    return undefined;
-  }
+  return projectRoot ? loadMaxThreads(projectRoot) : undefined;
 }
 
 /**
  * Run-scoped budget.
  *
  * The parse and resolution pools are built by different subsystems that never
- * see each other (ExtractionOrchestrator then ReferenceResolver), yet they run
- * side by side during `index`/`init`/`sync` and must fit inside one ceiling.
- * Passing a budget object through both call graphs would thread a new parameter
- * through the whole pipeline for one number, so the budget is held here for the
- * duration of a run instead — the same process-scoped shape the pools already
- * use when they read `CODEGRAPH_*` straight off `process.env`.
+ * see each other (ExtractionOrchestrator then ReferenceResolver), and a
+ * long-lived MCP server keeps a query pool live across both. Passing a budget
+ * object through every call graph would thread a new parameter through the
+ * whole pipeline for one number, so the budget is held here for the duration of
+ * the process — the same process-scoped shape the pools already use when they
+ * read `CODEGRAPH_*` straight off `process.env`.
  *
  * First caller wins on the limit; `resetThreadBudget()` ends the run. Tests call
  * the reset in `afterEach` so runs cannot leak into each other.

@@ -14,7 +14,6 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import {
-  allocatePoolSizes,
   describeThreadBudget,
   DEFAULT_HEADROOM_CORES,
   resolveThreadLimit,
@@ -84,46 +83,6 @@ describe('resolveThreadLimit', () => {
   });
 });
 
-describe('allocatePoolSizes', () => {
-  it('grants every request in full when the budget is big enough', () => {
-    expect(allocatePoolSizes(16, { parse: 8, resolve: 6 })).toEqual({ parse: 8, query: 0, resolve: 6 });
-    expect(allocatePoolSizes(14, { parse: 8, resolve: 6 })).toEqual({ parse: 8, query: 0, resolve: 6 });
-  });
-
-  it('caps the COMBINED total of the pools that share a run', () => {
-    const sizes = allocatePoolSizes(6, { parse: 8, resolve: 6 });
-    expect(sizes.parse + sizes.resolve).toBe(6);
-    expect(sizes.parse).toBeGreaterThan(0);
-    expect(sizes.resolve).toBeGreaterThan(0);
-  });
-
-  it('scales every pool down proportionally — no pool is starved by an earlier one', () => {
-    // 8 + 16 + 6 = 30 wanted, 15 granted: each pool keeps its share.
-    const sizes = allocatePoolSizes(15, { parse: 8, query: 16, resolve: 6 });
-    expect(sizes.parse + sizes.query + sizes.resolve).toBe(15);
-    expect(sizes.query).toBeGreaterThan(sizes.parse);
-    expect(sizes.parse).toBeGreaterThan(sizes.resolve);
-  });
-
-  it('hands the rounding slack back one slot at a time and never above a request', () => {
-    const sizes = allocatePoolSizes(5, { parse: 3, resolve: 3 });
-    expect(sizes.parse + sizes.resolve).toBe(5);
-    expect(sizes.parse).toBeLessThanOrEqual(3);
-    expect(sizes.resolve).toBeLessThanOrEqual(3);
-  });
-
-  it('treats a sub-1 budget as 1 rather than a zero-worker run', () => {
-    expect(allocatePoolSizes(0, { parse: 8 })).toEqual({ parse: 1, query: 0, resolve: 0 });
-    expect(allocatePoolSizes(-4, { parse: 8, resolve: 6 })).toEqual({ parse: 1, query: 0, resolve: 0 });
-    expect(allocatePoolSizes(2.7, { parse: 8, resolve: 6 }).parse).toBe(2);
-  });
-
-  it('ignores absent and non-positive requests', () => {
-    expect(allocatePoolSizes(16, {})).toEqual({ parse: 0, query: 0, resolve: 0 });
-    expect(allocatePoolSizes(16, { parse: 0, resolve: -2 })).toEqual({ parse: 0, query: 0, resolve: 0 });
-  });
-});
-
 describe('ThreadBudget', () => {
   const limit = { total: 10, source: 'flag' as const };
 
@@ -155,6 +114,28 @@ describe('ThreadBudget', () => {
     budget.release(-100);
     expect(budget.claimed).toBe(4);
     budget.release(999);
+    expect(budget.claimed).toBe(0);
+    expect(budget.remaining).toBe(10);
+  });
+
+  it('lease() reserves its granted size and release() returns exactly that', () => {
+    const budget = new ThreadBudget(limit);
+    const first = budget.lease(6);
+    expect(first.size).toBe(6);
+    expect(budget.claimed).toBe(6);
+    const second = budget.lease(8);
+    expect(second.size).toBe(4); // only what was left
+    expect(budget.claimed).toBe(10);
+    first.release();
+    expect(budget.claimed).toBe(4);
+    expect(budget.remaining).toBe(6);
+  });
+
+  it('a lease releases only once, so a repeated destroy cannot inflate the budget', () => {
+    const budget = new ThreadBudget(limit);
+    const lease = budget.lease(4);
+    lease.release();
+    lease.release();
     expect(budget.claimed).toBe(0);
     expect(budget.remaining).toBe(10);
   });

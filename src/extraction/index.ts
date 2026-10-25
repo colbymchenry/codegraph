@@ -2311,13 +2311,14 @@ export class ExtractionOrchestrator {
       // parse is worker-side CPU, and 1 worker measured 34% slower than the
       // old oversubscribed pool on the kernel-scale 2-cpuset envelope
       // (493s vs 369s) — main + store-worker don't fill the second core.
-      // #2527: the parse pool shares one run-wide thread budget with the
-      // resolution pool, so the two together keep headroom instead of
-      // saturating a many-core machine. `minimum` pins the budget at this
-      // pool's own un-capped default, so applying it can only ever cap the
-      // COMBINED total of the run's pools — never shrink a single pool below
-      // the size it gets today (1 parse worker measured 34% slower on a
-      // 2-core envelope, so that would be a real regression).
+      // #2527: the parse pool leases from the run-wide thread budget. Its
+      // `minimum` pins the DEFAULT budget at this pool's own un-capped size, so
+      // the budget can only ever cap the combined total of the pools alive at
+      // once — never shrink a single pool below the size it gets today (1 parse
+      // worker measured 34% slower on a 2-core envelope, so that would be a
+      // real regression). When an explicit cap is already fully held (a query
+      // pool in a daemon), the lease is empty and parsing stays on the main
+      // thread rather than exceeding the ceiling.
       const wantPoolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
       const threadLimit = resolveProjectThreadLimit({
         projectRoot: this.rootDir,
@@ -2325,33 +2326,45 @@ export class ExtractionOrchestrator {
         minimum: wantPoolSize,
       });
       const budget = threadBudget(threadLimit);
-      const poolSize = budget.claim(wantPoolSize);
-      // Read each needed grammar's WASM ONCE here and hand the bytes to every
-      // worker, so spawns/respawns load grammars from memory instead of
-      // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
-      // the very I/O contention that caused the respawn).
-      const grammarBuffers = await readGrammarWasmBytes(neededLanguages);
-      pool = new ParseWorkerPool({
-        languages: neededLanguages,
-        size: poolSize,
-        workerScriptPath: parseWorkerPath,
-        recycleInterval: WORKER_RECYCLE_INTERVAL,
-        parseTimeoutMs: PARSE_TIMEOUT_MS,
-        log,
-        grammarBuffers,
-      });
-      log(`Parse worker pool: ${poolSize} worker(s)`);
-      if (verbose) {
-        log(describeThreadBudget(
-          budget.limit,
-          { parse: poolSize, query: 0, resolve: 0 },
-          { cores: os.availableParallelism(), pools: ['parse'] },
-        ));
+      const lease = budget.lease(wantPoolSize);
+      if (lease.size === 0) {
+        lease.release();
+        await loadGrammarsForLanguages(neededLanguages);
+      } else {
+        // Read each needed grammar's WASM ONCE here and hand the bytes to every
+        // worker, so spawns/respawns load grammars from memory instead of
+        // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
+        // the very I/O contention that caused the respawn).
+        const grammarBuffers = await readGrammarWasmBytes(neededLanguages);
+        const poolSize = lease.size;
+        try {
+          pool = new ParseWorkerPool({
+            languages: neededLanguages,
+            size: poolSize,
+            workerScriptPath: parseWorkerPath,
+            recycleInterval: WORKER_RECYCLE_INTERVAL,
+            parseTimeoutMs: PARSE_TIMEOUT_MS,
+            log,
+            grammarBuffers,
+            threadLease: lease,
+          });
+        } catch (err) {
+          lease.release();
+          throw err;
+        }
+        log(`Parse worker pool: ${poolSize} worker(s)`);
+        if (verbose) {
+          log(describeThreadBudget(
+            budget.limit,
+            { parse: poolSize, query: 0, resolve: 0 },
+            { cores: os.availableParallelism(), pools: ['parse'] },
+          ));
+        }
+        // Bulk index: every core will be needed — spawn the whole pool now so
+        // worker boot overlaps the first read batches instead of trickling in
+        // behind queue-pressure growth.
+        pool.prewarm();
       }
-      // Bulk index: every core will be needed — spawn the whole pool now so
-      // worker boot overlaps the first read batches instead of trickling in
-      // behind queue-pressure growth.
-      pool.prewarm();
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
       await loadGrammarsForLanguages(neededLanguages);

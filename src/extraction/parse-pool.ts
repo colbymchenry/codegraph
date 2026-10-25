@@ -29,6 +29,7 @@
 
 import { Worker } from 'worker_threads';
 import type { Language, ExtractionResult } from '../types';
+import type { ThreadLease } from '../thread-budget';
 
 /**
  * Minimal worker surface the pool drives — satisfied by a real `worker_threads`
@@ -192,6 +193,11 @@ export interface ParseWorkerPoolOptions {
    * the worker's own disk read.
    */
   grammarBuffers?: Record<string, Uint8Array>;
+  /**
+   * Slots this pool reserved from the shared thread budget (#2527). Returned
+   * in `destroy()` so a later pool in the same run is not starved.
+   */
+  threadLease?: ThreadLease;
 }
 
 export class ParseWorkerPool {
@@ -219,10 +225,12 @@ export class ParseWorkerPool {
   private readonly loadSettleMs: number;
   private readonly log: (msg: string) => void;
   private readonly grammarBuffers?: Record<string, Uint8Array>;
+  private readonly threadLease?: ThreadLease;
 
   constructor(opts: ParseWorkerPoolOptions) {
     this.languages = opts.languages;
     this.grammarBuffers = opts.grammarBuffers;
+    this.threadLease = opts.threadLease;
     this.maxSize = Math.max(1, Math.min(opts.size, MAX_PARSE_POOL_SIZE));
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
@@ -519,6 +527,11 @@ export class ParseWorkerPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => this.terminateSettled(w)));
+    try {
+      await Promise.all(ws.map((w) => this.terminateSettled(w)));
+    } finally {
+      // The workers are gone; the run's next pool may have their slots (#2527).
+      this.threadLease?.release();
+    }
   }
 }

@@ -17,7 +17,7 @@ import type { Edge, UnresolvedReference } from '../types';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 import { terminateOnceStarted, workerStarted } from '../worker-teardown';
-import type { ThreadBudget } from '../thread-budget';
+import type { ThreadBudget, ThreadLease } from '../thread-budget';
 
 /** One synthesis pass's output: its edge list + worker-measured wall clock. */
 export interface SynthPassResult {
@@ -89,6 +89,7 @@ export class ResolverPool {
   private synthWaiters = new Map<number, { resolve: (r: SynthPassResult) => void; reject: (e: Error) => void }>();
   private recycleWaiters = new Map<number, () => void>();
   private failed: Error | null = null;
+  private destroyed = false;
 
   /**
    * Pool size from CPU headroom, memory headroom, and the explicit override.
@@ -164,25 +165,33 @@ export class ResolverPool {
     }
     if (size === null) return null;
     // #2527: take this pool's workers out of the run-wide thread budget the
-    // parse pool is already drawing on. A grant below 2 is below the pool's
-    // own worth-its-boot threshold (see resolvePoolSize) — hand the slots back
-    // and stay sequential rather than booting a worker pool for one thread.
-    const granted = threadBudget ? threadBudget.claim(size) : size;
+    // parse pool has just returned. A grant below 2 is below the pool's own
+    // worth-its-boot threshold (see resolvePoolSize) — hand the slots back and
+    // stay sequential rather than booting a worker pool for one thread.
+    const lease = threadBudget ? threadBudget.lease(size) : undefined;
+    const granted = lease ? lease.size : size;
     if (granted < 2) {
-      if (threadBudget) threadBudget.release(granted);
+      lease?.release();
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
         console.error(`[pool-timing] pool disabled: thread budget granted ${granted} of ${size} requested`);
       }
       return null;
     }
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, granted);
+      return new ResolverPool(workerScript, dbPath, projectRoot, granted, lease);
     } catch {
+      lease?.release();
       return null;
     }
   }
 
-  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+  private constructor(
+    workerScript: string,
+    dbPath: string,
+    projectRoot: string,
+    size: number,
+    private readonly threadLease?: ThreadLease,
+  ) {
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerScript);
       const started = workerStarted(worker);
@@ -368,20 +377,27 @@ export class ResolverPool {
    * booted, on a busy machine, can have a worker still loading its modules.
    */
   async destroy(closeTimeoutMs = CLOSE_TIMEOUT_MS): Promise<void> {
-    await Promise.all(
-      this.workers.map(
-        (pw) =>
-          new Promise<void>((resolve) => {
-            const t = setTimeout(() => {
-              void terminateOnceStarted(pw.worker, pw.started).then(() => resolve());
-            }, closeTimeoutMs);
-            pw.worker.once('exit', () => {
-              clearTimeout(t);
-              resolve();
-            });
-            pw.worker.postMessage({ type: 'close' });
-          })
-      )
-    );
+    if (this.destroyed) return;
+    this.destroyed = true;
+    try {
+      await Promise.all(
+        this.workers.map(
+          (pw) =>
+            new Promise<void>((resolve) => {
+              const t = setTimeout(() => {
+                void terminateOnceStarted(pw.worker, pw.started).then(() => resolve());
+              }, closeTimeoutMs);
+              pw.worker.once('exit', () => {
+                clearTimeout(t);
+                resolve();
+              });
+              pw.worker.postMessage({ type: 'close' });
+            })
+        )
+      );
+    } finally {
+      // The workers are gone; the run's remaining pools may take their slots (#2527).
+      this.threadLease?.release();
+    }
   }
 }
