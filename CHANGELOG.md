@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph query`, `callers`, `callees` and `impact` now accept `--compact` to print one dense line per result — kind, name, file:line, plus the result's top relationship — instead of the padded multi-line view. It's the fast path when you want a token-efficient, machine-parseable summary. (ref #500)
+- New `codegraph graph <symbol>` command prints a symbol's call chain as a tree with `└─`/`├─` glyphs and "calls →" edges, down to `--depth N` (default 2, max 10). Cycles are detected and marked `(cycle)` instead of recursing forever. `--compact` selects a denser one-line-per-node form. (ref #500)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

@@ -19,6 +19,7 @@
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
+ *   codegraph graph <symbol>     Visualize a symbol's call chain (--depth, --compact)
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
@@ -73,6 +74,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
+import { buildCallChain, formatCallChain, compactSymbolLabel, compactSymbolRelation } from '../graph/compact';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -1310,7 +1312,8 @@ program
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
   .option('-j, --json', 'Output as JSON')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean }) => {
+  .option('-c, --compact', 'One dense line per result (kind, name, file:line + top relation)')
+  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean; compact?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1346,6 +1349,16 @@ program
       if (options.json) {
         console.log(JSON.stringify(results, null, 2));
         if (truncated) console.error(truncationMessage);
+      } else if (options.compact) {
+        if (results.length === 0) {
+          info(`No results found for "${search}"`);
+        } else {
+          for (const result of results) {
+            const relation = compactSymbolRelation(cg, [result.node]);
+            console.log(`${compactSymbolLabel(result.node)}${relation ? ` — ${relation}` : ''}`);
+          }
+          if (truncated) info(truncationMessage);
+        }
       } else {
         if (results.length === 0) {
           info(`No results found for "${search}"`);
@@ -2327,7 +2340,8 @@ for (const direction of ['callers', 'callees'] as const) {
     .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
     .option('-l, --limit <number>', 'Maximum results per definition (also caps the JSON union)', '20')
     .option('-j, --json', 'Output as JSON')
-    .action(async (symbol: string, options: { path?: string; file?: string; limit?: string; json?: boolean }) => {
+    .option('-c, --compact', 'One dense line per result (kind, name, file:line + relations)')
+    .action(async (symbol: string, options: { path?: string; file?: string; limit?: string; json?: boolean; compact?: boolean }) => {
       const projectPath = resolveProjectPath(options.path);
 
       try {
@@ -2400,6 +2414,16 @@ for (const direction of ['callers', 'callees'] as const) {
               limit,
               truncated: total > limit,
             }, null, 2));
+          } else if (options.compact) {
+            if (note) warn(note);
+            for (const { nodes, edges } of collected) {
+              const limited = nodes.slice(0, limit);
+              for (const node of limited) {
+                const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
+                const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
+                console.log(`${compactSymbolLabel(node)}${relation}`);
+              }
+            }
           } else {
             if (note) warn(note);
             if (ambiguous) {
@@ -2451,7 +2475,8 @@ program
   .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean }) => {
+  .option('-c, --compact', 'One dense line per affected symbol (kind, name, file:line)')
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean; compact?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -2514,6 +2539,13 @@ program
             edgeCount: unionEdges.size,
             affected: [...unionNodes.values()].map(cliNode),
           }, null, 2));
+        } else if (options.compact) {
+          if (note) warn(note);
+          for (const { nodes } of collected) {
+            for (const node of nodes.values()) {
+              console.log(compactSymbolLabel(node));
+            }
+          }
         } else {
           if (note) warn(note);
           if (ambiguous) {
@@ -2547,6 +2579,63 @@ program
       }
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph graph <symbol> — call-chain visualization.
+ *
+ * Resolves the symbol (same lookup as callers/callees/impact), then walks its
+ * callees down to --depth levels and prints a tree with `└─` / `├─` branch
+ * glyphs and "calls →" edges. --compact selects the dense one-line-per-node
+ * form (no kind); the default form keeps the kind for readability. The walk
+ * guards against cycles (a repeated ancestor is marked "(cycle)" and not
+ * recursed into) and caps depth to 10.
+ */
+program
+  .command('graph <symbol>')
+  .description('Visualize a symbol\'s call chain (down to called functions) as a tree')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
+  .option('-d, --depth <number>', 'Call-chain depth (default 2)', '2')
+  .option('-c, --compact', 'Dense one-line-per-node output (no kind labels)')
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; compact?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
+        if (targets.length === 0) {
+          error(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          process.exit(1);
+        }
+
+        const { groups, filteredOut } = groupDefinitions(targets, options.file);
+        if (filteredOut) warn(`no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`);
+        if (groups.length > 1) {
+          console.log(chalk.bold(`\nCall chain of "${symbol}" — ${groups.length} distinct definitions (each with its own chain; narrow with --file):`));
+        }
+        for (const group of groups) {
+          const tree = buildCallChain(cg, group[0]!, depth);
+          if (groups.length > 1) {
+            console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)}:\n`));
+          }
+          console.log(formatCallChain(tree, { compact: options.compact }));
+        }
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`graph failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

@@ -534,19 +534,28 @@ codegraph index [path]            # Full index (--force to re-index, --quiet for
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
-codegraph query <search>          # Search symbols (--kind, --limit, --json)
+codegraph query <search>          # Search symbols (--kind, --limit, --json, --compact)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
-codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
-codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
-codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
+codegraph callers <symbol>        # Find what calls a function/method (--limit, --json, --compact)
+codegraph callees <symbol>        # Find what a function/method calls (--limit, --json, --compact)
+codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json, --compact)
+codegraph graph <symbol>          # Visualize a symbol's call chain as a tree (--depth, --compact)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
 codegraph upgrade [version]       # Update to the latest release (--check, --force)
 codegraph version                 # Print the installed version (also -v, --version)
 codegraph help [command]          # Show help, optionally for one command
+```
+
+### `codegraph graph`
+
+Prints a symbol's call chain (what it calls, down to `--depth` levels) as a tree with `└─` / `├─` branch glyphs. Useful for a quick, visual trace of a call path without reading the source. `--compact` drops the kind labels for denser one-line-per-node output. Cycles are detected and marked `(cycle)` instead of recursing forever; `--depth` defaults to 2 and caps at 10.
+
+```bash
+codegraph graph "handleLogin" --depth 2 --compact
 ```
 
 ### `codegraph affected`
