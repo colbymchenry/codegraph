@@ -1367,6 +1367,200 @@ describe('Installer targets — partial-state idempotency', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Claude Code personal (gitignored) routing (#243)
+//
+// `-l local` writes project-scope config, but permissions and instructions
+// used to land in team-tracked files (.claude/settings.json, .claude/CLAUDE.md).
+// `--personal` routes every settings write to the gitignored
+// .claude/settings.local.json, instructions to the gitignored
+// ./CLAUDE.local.md, and opts the shared .mcp.json declaration into this
+// user's sessions through enabledMcpjsonServers. Uninstall --personal is the
+// inverse and never edits the team-shared files.
+// ---------------------------------------------------------------------------
+describe('Installer — Claude Code personal (gitignored) routing (#243)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('personal-home');
+    tmpCwd = mkTmpDir('personal-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const mcpJson = () => path.join(tmpCwd, '.mcp.json');
+  const sharedSettings = () => path.join(tmpCwd, '.claude', 'settings.json');
+  const sharedInstructions = () => path.join(tmpCwd, '.claude', 'CLAUDE.md');
+  const localSettings = () => path.join(tmpCwd, '.claude', 'settings.local.json');
+  const localInstructions = () => path.join(tmpCwd, 'CLAUDE.local.md');
+  const readJson = (file: string) => JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const codegraphAllow = (settings: Record<string, any>) =>
+    Array.isArray(settings.permissions?.allow)
+      ? settings.permissions.allow.filter((p: string) => p.startsWith('mcp__codegraph__'))
+      : [];
+
+  it('routes permissions, instructions and the MCP opt-in to personal files', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: true, personal: true });
+
+    // The shared declaration is still written — that is the team-visible
+    // entry any teammate can opt into; only the opt-in is personal.
+    expect(readJson(mcpJson()).mcpServers.codegraph).toBeDefined();
+
+    const settings = readJson(localSettings());
+    expect(codegraphAllow(settings)).toContain('mcp__codegraph__*');
+    expect(settings.enabledMcpjsonServers).toEqual(['codegraph']);
+
+    const md = fs.readFileSync(localInstructions(), 'utf-8');
+    expect(md).toContain(CODEGRAPH_SECTION_START);
+    expect(md).toContain('codegraph explore');
+
+    // Neither team-tracked Claude file was created.
+    expect(fs.existsSync(sharedSettings())).toBe(false);
+    expect(fs.existsSync(sharedInstructions())).toBe(false);
+  });
+
+  it('leaves an existing team settings.json byte-for-byte alone — hooks included', () => {
+    const claude = getTarget('claude')!;
+    fs.mkdirSync(path.dirname(sharedSettings()), { recursive: true });
+    const teamConfig = JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          { matcher: 'Write', hooks: [{ type: 'command', command: './hook.sh' }] },
+        ],
+      },
+    }, null, 2) + '\n';
+    fs.writeFileSync(sharedSettings(), teamConfig);
+
+    claude.install('local', { autoAllow: true, promptHook: true, personal: true });
+
+    expect(fs.readFileSync(sharedSettings(), 'utf-8')).toBe(teamConfig);
+    expect(fs.existsSync(sharedInstructions())).toBe(false);
+    // The prompt hook went to the personal file instead.
+    const settings = readJson(localSettings());
+    const commands = (settings.hooks?.UserPromptSubmit ?? [])
+      .flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+    expect(commands.some((c: string) => c.includes('codegraph prompt-hook'))).toBe(true);
+  });
+
+  it('preserves unrelated personal settings and merges the opt-in list', () => {
+    const claude = getTarget('claude')!;
+    fs.mkdirSync(path.dirname(localSettings()), { recursive: true });
+    fs.writeFileSync(localSettings(), JSON.stringify({
+      enabledMcpjsonServers: ['other-server'],
+      permissions: { allow: ['Bash(git:*)'] },
+      model: 'sonnet',
+    }, null, 2) + '\n');
+
+    claude.install('local', { autoAllow: true, personal: true });
+
+    const settings = readJson(localSettings());
+    expect(settings.enabledMcpjsonServers).toEqual(['other-server', 'codegraph']);
+    expect(settings.permissions.allow).toEqual(['Bash(git:*)', 'mcp__codegraph__*']);
+    expect(settings.model).toBe('sonnet');
+  });
+
+  it('is idempotent — a second personal install changes nothing', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: true, promptHook: true, personal: true });
+    const second = claude.install('local', { autoAllow: true, promptHook: true, personal: true });
+    for (const file of second.files) {
+      expect(file.action).toBe('unchanged');
+    }
+  });
+
+  it('uninstall --personal removes exactly the personal entries, leaving team config alone', () => {
+    const claude = getTarget('claude')!;
+    fs.mkdirSync(path.dirname(sharedSettings()), { recursive: true });
+    const teamConfig = JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: 'Write', hooks: [{ type: 'command', command: './hook.sh' }] }] },
+    }, null, 2) + '\n';
+    const teamInstructions = '# Team rules\n\nUse tabs.\n';
+    fs.writeFileSync(sharedSettings(), teamConfig);
+    fs.writeFileSync(sharedInstructions(), teamInstructions);
+
+    claude.install('local', { autoAllow: true, promptHook: true, personal: true });
+    const reports = uninstallTargets([claude], 'local', true);
+    expect(reports[0].status).toBe('removed');
+
+    // The personal settings file keeps no codegraph leftovers (it held
+    // nothing but ours, so it is left as an empty document).
+    expect(readJson(localSettings())).toEqual({});
+    // CLAUDE.local.md held only our block → removed outright.
+    expect(fs.existsSync(localInstructions())).toBe(false);
+    // Team-shared files are untouched, byte for byte.
+    expect(fs.readFileSync(sharedSettings(), 'utf-8')).toBe(teamConfig);
+    expect(fs.readFileSync(sharedInstructions(), 'utf-8')).toBe(teamInstructions);
+    // The shared .mcp.json declaration is not this user's to remove.
+    expect(readJson(mcpJson()).mcpServers.codegraph).toBeDefined();
+    expect(claude.detect('local').personalConfigured).toBeUndefined();
+  });
+
+  it('uninstall --personal keeps a user\'s other personal settings', () => {
+    const claude = getTarget('claude')!;
+    fs.mkdirSync(path.dirname(localSettings()), { recursive: true });
+    fs.writeFileSync(localSettings(), JSON.stringify({
+      enabledMcpjsonServers: ['codegraph', 'other-server'],
+      permissions: { allow: ['mcp__codegraph__*', 'Bash(git:*)'] },
+      model: 'sonnet',
+    }, null, 2) + '\n');
+
+    claude.uninstall('local', { personal: true });
+
+    const settings = readJson(localSettings());
+    expect(settings.enabledMcpjsonServers).toEqual(['other-server']);
+    expect(settings.permissions.allow).toEqual(['Bash(git:*)']);
+    expect(settings.model).toBe('sonnet');
+  });
+
+  it('detect reports personalConfigured for a personal install only', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: false });
+    expect(claude.detect('local').personalConfigured).toBeUndefined();
+
+    claude.install('local', { autoAllow: false, personal: true });
+    expect(claude.detect('local').personalConfigured).toBe(true);
+  });
+
+  it('refresh rewrites the personal block without creating the shared files', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: true, personal: true });
+    // Simulate a block left by an older installer: same markers, old wording.
+    fs.writeFileSync(localInstructions(), LEGACY_BLOCK + '\n');
+
+    const report = refreshTargets([claude], 'local').find((r) => r.id === 'claude')!;
+    expect(report.status).toBe('refreshed');
+    expect(report.changedPaths).toContain(localInstructions());
+
+    const md = fs.readFileSync(localInstructions(), 'utf-8');
+    expect(md).not.toContain('codegraph_search');
+    expect(md).toContain('codegraph_explore');
+    expect(fs.existsSync(sharedInstructions())).toBe(false);
+    expect(fs.existsSync(sharedSettings())).toBe(false);
+  });
+
+  it('a plain local install keeps the team-shared destinations (default unchanged)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: true });
+
+    expect(codegraphAllow(readJson(sharedSettings()))).toContain('mcp__codegraph__*');
+    expect(fs.readFileSync(sharedInstructions(), 'utf-8')).toContain('codegraph explore');
+    expect(fs.existsSync(localSettings())).toBe(false);
+    expect(fs.existsSync(localInstructions())).toBe(false);
+  });
+});
+
 describe('Installer targets — registry', () => {
   it('getTarget returns the right target for each id', () => {
     expect(getTarget('claude')?.id).toBe('claude');

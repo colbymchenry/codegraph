@@ -68,6 +68,14 @@ export interface RunInstallerOptions {
   /** Skip the auto-allow prompt; use this value directly. */
   autoAllow?: boolean;
   /**
+   * Route Claude Code's project config to its gitignored personal files
+   * (`settings.local.json`, `CLAUDE.local.md`) and opt the `.mcp.json`
+   * declaration into this user's sessions. Implies `location: 'local'`
+   * when no location is given, and narrows the default target set to
+   * Claude Code (the only target with a personal variant).
+   */
+  personal?: boolean;
+  /**
    * Skip every confirm and use defaults: location=global,
    * autoAllow=true, target=auto. For scripting / CI.
    */
@@ -83,13 +91,27 @@ export async function runInstaller(): Promise<void> {
   return runInstallerWithOptions({});
 }
 
-export async function runInstallerWithOptions(opts: RunInstallerOptions): Promise<void> {
+export async function runInstallerWithOptions(optsIn: RunInstallerOptions): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
   clack.intro(`CodeGraph v${getVersion()}`);
 
   // --yes implies all defaults; explicit flags still win.
-  const useDefaults = opts.yes === true;
+  const useDefaults = optsIn.yes === true;
+
+  // --personal is a Claude Code, project-local option. It narrows the
+  // default target set to Claude (other agents have no personal variant)
+  // and defaults the location to this project; an explicit --target or
+  // --location still wins.
+  if (optsIn.personal && optsIn.location === 'global') {
+    throw new Error(
+      '--personal writes project-local, gitignored Claude Code config — it can’t be combined with --location=global. ' +
+      'A global install is already per-user; use --location=local (or omit --location).',
+    );
+  }
+  const opts: RunInstallerOptions = optsIn.personal
+    ? { ...optsIn, target: optsIn.target ?? 'claude', location: optsIn.location ?? 'local' }
+    : optsIn;
 
   // Step 1: which agent targets? Asked FIRST so the user knows what
   // they're committing to before we touch npm or disk. Detection
@@ -241,7 +263,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = target.install(location, { autoAllow, promptHook, personal: opts.personal });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -317,6 +339,13 @@ export interface RunUninstallerOptions {
   /** Remove agent configs only — leave the CLI binary installed. */
   keepCli?: boolean;
   /**
+   * Remove Claude Code's personal (gitignored) project config only —
+   * `settings.local.json`, `CLAUDE.local.md` and the `.mcp.json`
+   * opt-in list. Implies `location: 'local'` when no location is given,
+   * and narrows the default target set to Claude Code.
+   */
+  personal?: boolean;
+  /**
    * `__filename` of the CLI entry (dist/bin/codegraph.js) — install-method
    * detection is keyed off the running binary's real location.
    */
@@ -354,6 +383,7 @@ export interface UninstallReport {
 export function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
+  personal = false,
 ): UninstallReport[] {
   return targets.map((target) => {
     if (!target.supportsLocation(location)) {
@@ -366,7 +396,7 @@ export function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = target.uninstall(location);
+    const result = target.uninstall(location, { personal });
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -427,12 +457,20 @@ export function refreshTargets(
     if (!target.supportsLocation(location)) {
       return { ...base, status: 'unsupported' as const, changedPaths: [] };
     }
-    if (!target.detect(location).alreadyConfigured) {
+    const detection = target.detect(location);
+    if (!detection.alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
     let result: WriteResult;
     try {
-      result = target.install(location, { autoAllow: false, promptHook: undefined });
+      // Rewrite the variant that is actually installed: a personal
+      // (gitignored) project install must not have the refresh create
+      // the team-shared files it deliberately avoided.
+      result = target.install(location, {
+        autoAllow: false,
+        promptHook: undefined,
+        personal: detection.personalConfigured === true,
+      });
     } catch (err) {
       // One agent's file that can't be written (a symbolic link to a
       // read-only file, say: #2721) must not stop the rest of the sweep
@@ -461,12 +499,25 @@ export function refreshTargets(
  * block, permissions) — never the `.codegraph/` index, which `codegraph
  * uninit` owns.
  */
-export async function runUninstaller(opts: RunUninstallerOptions): Promise<void> {
+export async function runUninstaller(optsIn: RunUninstallerOptions): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
   clack.intro(`CodeGraph v${getVersion()} — uninstall`);
 
-  const useDefaults = opts.yes === true;
+  const useDefaults = optsIn.yes === true;
+
+  // --personal only names a Claude Code, project-local surface; default
+  // the location to this project (a global uninstall is already
+  // per-user, so the combination is a user mistake worth naming).
+  if (optsIn.personal && optsIn.location === 'global') {
+    throw new Error(
+      '--personal removes project-local, gitignored Claude Code config — it can’t be combined with --location=global. ' +
+      'Use --location=local (or omit --location).',
+    );
+  }
+  const opts: RunUninstallerOptions = optsIn.personal
+    ? { ...optsIn, location: optsIn.location ?? 'local' }
+    : optsIn;
 
   // Step 1: which location — asked FIRST, the one decision the user
   // must make. Global sweeps ~/.claude, ~/.codex, etc.; local sweeps
@@ -499,6 +550,11 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   let targets: AgentTarget[];
   if (opts.target !== undefined) {
     targets = resolveTargetFlag(opts.target, location);
+  } else if (opts.personal) {
+    // Only Claude Code has a personal project variant; sweeping the
+    // other agents here would remove their team-shared local configs.
+    const claude = getTarget('claude');
+    targets = claude ? [claude] : [];
   } else {
     targets = [...ALL_TARGETS];
   }
@@ -508,7 +564,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = uninstallTargets(targets, location);
+  const reports = uninstallTargets(targets, location, opts.personal);
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {

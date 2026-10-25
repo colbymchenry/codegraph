@@ -10,6 +10,17 @@
  *   - Instructions to `~/.claude/CLAUDE.md` (global) or
  *     `./.claude/CLAUDE.md` (local).
  *
+ * A local install can be **personal** (`personal: true`, issue #243):
+ * every settings write (permissions, hooks) goes to
+ * `./.claude/settings.local.json`, instructions go to
+ * `./CLAUDE.local.md` at the project root, and the `.mcp.json`
+ * declaration is opted into through `enabledMcpjsonServers` in that
+ * same local settings file. Claude Code gitignores both personal files
+ * by default, so the install leaves the team-tracked tree untouched —
+ * the `.mcp.json` entry stays a declaration no teammate activates.
+ * A global install is already per-user, so `personal` has no meaning
+ * there and is ignored.
+ *
  * A non-blank `CLAUDE_CONFIG_DIR` moves all three global files into
  * that profile directory, including `.claude.json` (#1627).
  *
@@ -28,6 +39,7 @@ import {
   DetectionResult,
   InstallOptions,
   Location,
+  UninstallOptions,
   WriteResult,
 } from './types';
 import {
@@ -93,11 +105,50 @@ function mcpJsonPath(loc: Location): string {
 function legacyLocalMcpPath(): string {
   return path.join(process.cwd(), '.claude.json');
 }
-function settingsJsonPath(loc: Location): string {
-  return path.join(configDir(loc), 'settings.json');
+function settingsJsonPath(loc: Location, personal = false): string {
+  const name = loc === 'local' && personal ? 'settings.local.json' : 'settings.json';
+  return path.join(configDir(loc), name);
 }
-function instructionsPath(loc: Location): string {
+function instructionsPath(loc: Location, personal = false): string {
+  // Claude Code reads CLAUDE.local.md from the project root (gitignored by
+  // its scaffolding), not from inside .claude/.
+  if (loc === 'local' && personal) return path.join(process.cwd(), 'CLAUDE.local.md');
   return path.join(configDir(loc), 'CLAUDE.md');
+}
+/** Personal routing exists only for a project-local install; user scope is already personal. */
+function isPersonalScope(loc: Location, personal: boolean | undefined): boolean {
+  return loc === 'local' && personal === true;
+}
+
+const MCP_SERVER_NAME = 'codegraph';
+
+/**
+ * True when the project holds personal (gitignored) codegraph config.
+ * `detect` reports it so `codegraph upgrade`'s refresh rewrites the
+ * personal files instead of re-creating the team-shared ones.
+ */
+function hasPersonalInstall(): boolean {
+  const settings = readJsonFile(settingsJsonPath('local', true));
+  if (
+    Array.isArray(settings.enabledMcpjsonServers) &&
+    settings.enabledMcpjsonServers.includes(MCP_SERVER_NAME)
+  ) {
+    return true;
+  }
+  const allow = settings.permissions?.allow;
+  if (
+    Array.isArray(allow) &&
+    allow.some((p: unknown) => typeof p === 'string' && p.startsWith('mcp__codegraph__'))
+  ) {
+    return true;
+  }
+  const instructions = instructionsPath('local', true);
+  if (!fs.existsSync(instructions)) return false;
+  try {
+    return fs.readFileSync(instructions, 'utf-8').includes(CODEGRAPH_SECTION_START);
+  } catch {
+    return false;
+  }
 }
 
 class ClaudeCodeTarget implements AgentTarget {
@@ -119,13 +170,20 @@ class ClaudeCodeTarget implements AgentTarget {
     const installed = loc === 'global'
       ? fs.existsSync(configDir(loc)) || fs.existsSync(mcpPath)
       : fs.existsSync(mcpPath) || fs.existsSync(configDir(loc));
-    return { installed, alreadyConfigured, configPath: mcpPath };
+    const result: DetectionResult = { installed, alreadyConfigured, configPath: mcpPath };
+    // Only present when a personal install exists, so a shared-scope
+    // detection result keeps its historical shape.
+    if (loc === 'local' && hasPersonalInstall()) result.personalConfigured = true;
+    return result;
   }
 
   install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
+    const personal = isPersonalScope(loc, opts.personal);
 
-    // 1. MCP server entry
+    // 1. MCP server entry — the project-scope declaration. Personal
+    // installs keep it shared (that is the point: one declaration any
+    // teammate can opt into); only the opt-in below is personal.
     files.push(writeMcpEntry(loc));
 
     // 1b. Migrate away any stale ./.claude.json left by a pre-#207
@@ -136,9 +194,17 @@ class ClaudeCodeTarget implements AgentTarget {
       if (migrated) files.push(migrated);
     }
 
+    // 1c. Personal: activate the declaration for this user only. Claude
+    // Code loads project-scope servers listed in enabledMcpjsonServers
+    // from the gitignored settings.local.json, so committing .mcp.json
+    // does not turn the server on for anyone else.
+    if (personal) {
+      files.push(writeMcpEnabledEntry());
+    }
+
     // 2. Permissions (only when autoAllow)
     if (opts.autoAllow) {
-      files.push(writePermissionsEntry(loc));
+      files.push(writePermissionsEntry(loc, personal));
     }
 
     // 2b. Strip stale auto-sync hooks left by a pre-0.8 install. Those
@@ -147,7 +213,7 @@ class ClaudeCodeTarget implements AgentTarget {
     // Stop hook now fails every turn with "unknown command
     // 'sync-if-dirty'". Cleaning up on install makes an upgrade
     // self-healing. Only surfaced when something was actually removed.
-    const hookCleanup = cleanupLegacyHooks(loc);
+    const hookCleanup = cleanupLegacyHooks(loc, personal);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
     // 2c. Front-load prompt hook (Claude UserPromptSubmit). Opt-in via the
@@ -156,9 +222,9 @@ class ClaudeCodeTarget implements AgentTarget {
     // (and an upgrade re-run honors the new choice); `undefined` leaves it
     // untouched for callers that don't manage it.
     if (opts.promptHook === true) {
-      files.push(writePromptHookEntry(loc));
+      files.push(writePromptHookEntry(loc, personal));
     } else if (opts.promptHook === false) {
-      const removed = removePromptHookEntry(loc);
+      const removed = removePromptHookEntry(loc, personal);
       if (removed.action === 'removed') files.push(removed);
     }
 
@@ -167,37 +233,52 @@ class ClaudeCodeTarget implements AgentTarget {
     // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
     // harnesses) actually see, so the block carries the codegraph
     // pointers there. Upsert self-heals a stale pre-#529 long block.
-    files.push(upsertInstructionsEntry(instructionsPath(loc)));
+    // Personal installs write CLAUDE.local.md at the project root
+    // instead, which Claude Code reads for this user alone.
+    files.push(upsertInstructionsEntry(instructionsPath(loc, personal)));
 
     return { files };
   }
 
-  uninstall(loc: Location): WriteResult {
+  uninstall(loc: Location, opts: UninstallOptions = {}): WriteResult {
     const files: WriteResult['files'] = [];
+    const personal = isPersonalScope(loc, opts.personal);
 
-    // 1. MCP server entry
-    const mcpPath = mcpJsonPath(loc);
-    const config = readJsonFile(mcpPath);
-    if (config.mcpServers?.codegraph) {
-      delete config.mcpServers.codegraph;
-      if (Object.keys(config.mcpServers).length === 0) {
-        delete config.mcpServers;
+    // 1. MCP server entry. The personal uninstall leaves the shared
+    // declaration alone — it is the team-visible `.mcp.json` entry any
+    // teammate can opt into, not this user's config. Removing it is a
+    // plain `codegraph uninstall`.
+    if (!personal) {
+      const mcpPath = mcpJsonPath(loc);
+      const config = readJsonFile(mcpPath);
+      if (config.mcpServers?.codegraph) {
+        delete config.mcpServers.codegraph;
+        if (Object.keys(config.mcpServers).length === 0) {
+          delete config.mcpServers;
+        }
+        writeJsonFile(mcpPath, config);
+        files.push({ path: mcpPath, action: 'removed' });
+      } else {
+        files.push({ path: mcpPath, action: 'not-found' });
       }
-      writeJsonFile(mcpPath, config);
-      files.push({ path: mcpPath, action: 'removed' });
-    } else {
-      files.push({ path: mcpPath, action: 'not-found' });
+
+      // 1b. Also strip the codegraph entry from a legacy ./.claude.json
+      // so uninstall fully reverses a pre-#207 local install.
+      if (loc === 'local') {
+        const migrated = cleanupLegacyLocalMcp();
+        if (migrated) files.push(migrated);
+      }
     }
 
-    // 1b. Also strip the codegraph entry from a legacy ./.claude.json
-    // so uninstall fully reverses a pre-#207 local install.
-    if (loc === 'local') {
-      const migrated = cleanupLegacyLocalMcp();
-      if (migrated) files.push(migrated);
+    // 1c. Personal: drop the project-scope opt-in so the declaration no
+    // longer loads for this user.
+    if (personal) {
+      const disabled = removeMcpEnabledEntry();
+      if (disabled.action === 'removed') files.push(disabled);
     }
 
     // 2. Permissions
-    const settingsPath = settingsJsonPath(loc);
+    const settingsPath = settingsJsonPath(loc, personal);
     const settings = readJsonFile(settingsPath);
     if (Array.isArray(settings.permissions?.allow)) {
       const before = settings.permissions.allow.length;
@@ -225,15 +306,15 @@ class ClaudeCodeTarget implements AgentTarget {
     // moved to the per-target architecture; restoring it here means
     // uninstall — and the npm `preuninstall` hook that drives it — fully
     // reverses a legacy install.
-    const hookCleanup = cleanupLegacyHooks(loc);
+    const hookCleanup = cleanupLegacyHooks(loc, personal);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
     // 2c. Remove the front-load prompt hook this installer may have written.
-    const promptHookCleanup = removePromptHookEntry(loc);
+    const promptHookCleanup = removePromptHookEntry(loc, personal);
     if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
 
     // 3. Instructions — strip the legacy CodeGraph block if present.
-    files.push(removeInstructionsEntry(loc));
+    files.push(removeInstructionsEntry(loc, personal));
 
     return { files };
   }
@@ -363,8 +444,9 @@ function isPromptHookCommand(command: unknown): boolean {
 function removeHookCommandsMatching(
   loc: Location,
   match: (command: unknown) => boolean,
+  personal = false,
 ): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+  const file = settingsJsonPath(loc, personal);
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
 
   const settings = readJsonFile(file);
@@ -411,8 +493,8 @@ function removeHookCommandsMatching(
  * pre-0.8 install wrote. Exported for direct unit-testing; reused by both
  * `install` (an upgrade self-heals) and `uninstall`.
  */
-export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
-  return removeHookCommandsMatching(loc, isLegacyCodegraphHookCommand);
+export function cleanupLegacyHooks(loc: Location, personal = false): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isLegacyCodegraphHookCommand, personal);
 }
 
 /**
@@ -420,12 +502,49 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
  * writePromptHookEntry). Used by `uninstall`, and by `install` when the user
  * opts out, so the choice round-trips.
  */
-export function removePromptHookEntry(loc: Location): WriteResult['files'][number] {
-  return removeHookCommandsMatching(loc, isPromptHookCommand);
+export function removePromptHookEntry(loc: Location, personal = false): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isPromptHookCommand, personal);
 }
 
-export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+/**
+ * Opt the project-scope `.mcp.json` declaration into this user's Claude
+ * Code sessions (`personal` installs only). Claude Code activates a
+ * project-scope server only when it is in `enabledMcpjsonServers` in the
+ * gitignored `settings.local.json`, so committing `.mcp.json` never
+ * turns the server on for a teammate. Idempotent: an entry already
+ * present leaves the file byte-for-byte untouched.
+ */
+function writeMcpEnabledEntry(): WriteResult['files'][number] {
+  const file = settingsJsonPath('local', true);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!Array.isArray(settings.enabledMcpjsonServers)) settings.enabledMcpjsonServers = [];
+  if (settings.enabledMcpjsonServers.includes(MCP_SERVER_NAME)) {
+    return { path: file, action: 'unchanged' };
+  }
+  settings.enabledMcpjsonServers.push(MCP_SERVER_NAME);
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/** Inverse of `writeMcpEnabledEntry`: drop codegraph from the personal opt-in list. */
+function removeMcpEnabledEntry(): WriteResult['files'][number] {
+  const file = settingsJsonPath('local', true);
+  if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
+  const settings = readJsonFile(file);
+  const list = settings.enabledMcpjsonServers;
+  if (!Array.isArray(list) || !list.includes(MCP_SERVER_NAME)) {
+    return { path: file, action: 'not-found' };
+  }
+  settings.enabledMcpjsonServers = list.filter((server: string) => server !== MCP_SERVER_NAME);
+  if (settings.enabledMcpjsonServers.length === 0) delete settings.enabledMcpjsonServers;
+  writeJsonFile(file, settings);
+  return { path: file, action: 'removed' };
+}
+
+export function writePermissionsEntry(loc: Location, personal = false): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc, personal);
   const settings = readJsonFile(file);
   const created = !fs.existsSync(file);
 
@@ -455,8 +574,8 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
  * hooks (the user's own, or other events) are preserved. Opt-in — the installer
  * only calls this when the user accepts the prompt (default-yes).
  */
-export function writePromptHookEntry(loc: Location): WriteResult['files'][number] {
-  const file = settingsJsonPath(loc);
+export function writePromptHookEntry(loc: Location, personal = false): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc, personal);
   const created = !fs.existsSync(file);
   const settings = readJsonFile(file);
 
@@ -507,8 +626,8 @@ export function writePromptHookEntry(loc: Location): WriteResult['files'][number
  * when there's nothing to strip; the install caller drops those from
  * the report so a fresh install stays quiet.
  */
-export function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
-  const file = instructionsPath(loc);
+export function removeInstructionsEntry(loc: Location, personal = false): WriteResult['files'][number] {
+  const file = instructionsPath(loc, personal);
   const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
   return { path: file, action };
 }

@@ -39,6 +39,15 @@ export interface DetectionResult {
   alreadyConfigured: boolean;
   /** Path inspected; surfaced in diagnostic / dry-run output. */
   configPath?: string;
+  /**
+   * Set (to `true`) when a personal, gitignored project-scope install is
+   * present. Claude Code owns that variant (`settings.local.json`,
+   * `CLAUDE.local.md`); other targets never set it. `refreshTargets`
+   * uses it to rewrite the variant that exists instead of creating the
+   * team-shared one on upgrade. Omitted otherwise, so a plain
+   * shared-scope detection keeps its historical shape.
+   */
+  personalConfigured?: boolean;
 }
 
 /**
@@ -75,6 +84,20 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /**
+   * Route this install to project-scope, personal (gitignored) files
+   * instead of the team-shared ones. Claude Code is the only target with
+   * such a variant: permissions/hooks go to `.claude/settings.local.json`,
+   * instructions to `CLAUDE.local.md`, and the `.mcp.json` declaration is
+   * opted into via `enabledMcpjsonServers`. Meaningless for a global
+   * (user-scope) install, and ignored by every other target.
+   */
+  personal?: boolean;
+}
+
+export interface UninstallOptions {
+  /** Remove the personal (gitignored) variant only; see `InstallOptions.personal`. */
+  personal?: boolean;
 }
 
 export interface AgentTarget {
@@ -108,7 +131,7 @@ export interface AgentTarget {
    * markdown sections. Must be safe to call when nothing was ever
    * installed (returns `not-found` actions).
    */
-  uninstall(loc: Location): WriteResult;
+  uninstall(loc: Location, opts?: UninstallOptions): WriteResult;
   /**
    * Print the MCP-server snippet a user would paste manually for this
    * target. Used by `codegraph install --print-config <id>` and by

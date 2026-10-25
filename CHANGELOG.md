@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install -t claude -l local --personal` now keeps a project install out of the team-tracked tree: permissions and hooks go to the gitignored `.claude/settings.local.json`, the instructions block to the gitignored `CLAUDE.local.md`, and codegraph is opted into your own sessions through `enabledMcpjsonServers` so the shared `.mcp.json` declaration doesn't switch on for teammates. `codegraph uninstall --personal` removes those personal entries and leaves `.claude/settings.json`, `.claude/CLAUDE.md` and `.mcp.json` untouched. Without `--personal`, the installer behaves exactly as before. (#243)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

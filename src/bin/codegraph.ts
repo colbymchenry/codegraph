@@ -2703,6 +2703,7 @@ program
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('-i, --init', 'After wiring agents, also run `codegraph init` in the current directory — builds this project’s index, so install + index is one command (combine with --yes for an unattended bootstrap)')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
+  .option('--personal', 'Claude Code only: write the gitignored personal project config (settings.local.json, CLAUDE.local.md) and opt .mcp.json into this user’s sessions instead of writing the team-shared files. Implies --location=local and --target=claude unless explicitly set')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
@@ -2711,6 +2712,7 @@ program
     yes?: boolean;
     init?: boolean;
     permissions?: boolean;
+    personal?: boolean;
     printConfig?: string;
     refresh?: boolean;
   }) => {
@@ -2789,6 +2791,7 @@ program
         target: opts.target,
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
+        personal: opts.personal,
         yes: opts.yes,
       });
     } catch (err) {
@@ -2824,11 +2827,13 @@ program
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
   .option('--keep-cli', 'Remove agent configs only — leave the codegraph CLI installed')
+  .option('--personal', 'Claude Code only: remove the gitignored personal project config (settings.local.json, CLAUDE.local.md, the .mcp.json opt-in) and leave team-shared files alone. Implies --location=local and --target=claude unless explicitly set')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
     keepCli?: boolean;
+    personal?: boolean;
   }) => {
     const { runUninstaller } = await import('../installer');
     if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
@@ -2841,6 +2846,7 @@ program
         location: opts.location as 'global' | 'local' | undefined,
         yes: opts.yes,
         keepCli: opts.keepCli,
+        personal: opts.personal,
         cliFilename: __filename,
       });
     } catch (err) {

@@ -405,6 +405,7 @@ codegraph install --yes                              # auto-detect agents, insta
 codegraph install --yes --init                       # same, then build the current project's index (one-shot bootstrap)
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --target=claude --location=local --personal  # Claude Code: gitignored personal config, this project only
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
 codegraph install --print-config codex               # print snippet, no file writes
 codegraph install --print-config copilot-vscode      # same, for Copilot in VS Code
@@ -417,7 +418,10 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 | `--yes` | (boolean) | prompt every step |
 | `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
+| `--personal` | (boolean) Claude Code only: write the gitignored project config (`settings.local.json`, `CLAUDE.local.md`) and opt `.mcp.json` into your sessions instead of editing team-shared files; implies `--location=local` | — |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
+
+`--personal` keeps a project install off the team-tracked tree: permissions and hooks go to `.claude/settings.local.json`, the instructions block to `CLAUDE.local.md` at the project root, and codegraph is added to `enabledMcpjsonServers` so the shared `.mcp.json` declaration loads for you alone. `codegraph uninstall --personal` removes those personal files and leaves the team-shared `.claude/settings.json`, `.claude/CLAUDE.md`, and `.mcp.json` untouched (a plain `uninstall` removes the shared `.mcp.json` entry).
 
 ### 2. Restart Your Agent
 
