@@ -54,11 +54,9 @@ export class SvelteExtractor {
         this.processScriptBlock(block, componentNode.id);
       }
 
-      // Extract function calls from template expressions ({fn(...)})
-      this.extractTemplateCalls(componentNode.id, scriptBlocks);
-
-      // Extract component usages from template (<ComponentName>)
-      this.extractTemplateComponents(componentNode.id);
+      // Extract template references: `{fn(...)}` calls and `<Component>`
+      // usages, in one pass over the template lines.
+      this.extractTemplateReferences(componentNode.id);
 
       // Filter out Svelte rune calls ($state, $props, $derived, etc.)
       this.unresolvedReferences = this.unresolvedReferences.filter(
@@ -190,44 +188,53 @@ export class SvelteExtractor {
   }
 
   /**
-   * Extract function calls from Svelte template expressions.
+   * Extract template references in ONE pass over the template lines: both the
+   * `{fn(...)}` call expressions and the `<PascalCase>` component usages.
    *
    * In Svelte, many function calls happen in markup (e.g., `class={cn(...)}`),
-   * not inside `<script>` blocks. We scan the template portion for `{expression}`
-   * blocks and extract call patterns from them.
+   * not inside `<script>` blocks, and PascalCase tags are component
+   * instantiations — analogous to function calls in imperative code. Both
+   * extractions read the same lines and skip the same `<script>`/`<style>`
+   * ranges, so they share the walk: one covered-line set, one line split, one
+   * iteration. (They used to be two full passes over every line.)
+   *
+   * Reference ORDER is preserved exactly as the two-pass version emitted it —
+   * all call references first, then all component references — because
+   * resolution can disambiguate same-named candidates by insertion order.
    */
-  private extractTemplateCalls(
-    componentNodeId: string,
-    _scriptBlocks: Array<{ content: string; startLine: number }>
-  ): void {
-    // Build a set of line ranges covered by <script> and <style> blocks so we skip them
-    const coveredRanges: Array<[number, number]> = [];
-
-    // Find all <script>...</script> and <style>...</style> ranges
+  private extractTemplateReferences(componentNodeId: string): void {
+    // Line indices covered by <script>/<style> blocks — neither extraction
+    // looks inside them. A Set gives O(1) per-line lookup.
+    const covered = new Set<number>();
     const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
     let tagMatch;
     while ((tagMatch = tagRegex.exec(this.source)) !== null) {
       const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
       const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
+      for (let ln = startLine; ln <= endLine; ln++) covered.add(ln);
     }
 
-    // Find template expressions: {...} outside of script/style blocks
-    // Matches curly-brace expressions, excluding Svelte block syntax ({#if}, {:else}, {/if}, {@html}, {@render})
     const lines = this.source.split('\n');
+    // Template expressions: {...} outside script/style blocks, excluding Svelte
+    // block syntax ({#if}, {:else}, {/if}, {@html}, {@render}).
     const exprRegex = /\{([^}#/:@][^}]*)\}/g;
+    // Function calls: identifiers followed by ( — cn(...), obj.method(...)
+    const callRegex = /\b([a-zA-Z_$][\w$.]*)\s*\(/g;
+    // PascalCase opening/self-closing tags (closing tags </Foo> start with </)
+    const componentTagRegex = /<([A-Z][a-zA-Z0-9_$]*)\b/g;
+
+    const calls: UnresolvedReference[] = [];
+    const components: UnresolvedReference[] = [];
 
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-      // Skip lines inside script/style blocks
-      if (coveredRanges.some(([start, end]) => lineIdx >= start && lineIdx <= end)) continue;
-
+      if (covered.has(lineIdx)) continue;
       const line = lines[lineIdx]!;
+
+      exprRegex.lastIndex = 0;
       let exprMatch;
       while ((exprMatch = exprRegex.exec(line)) !== null) {
         const expr = exprMatch[1]!;
-        // Extract function calls: identifiers followed by (
-        // Matches: cn(...), buttonVariants(...), obj.method(...)
-        const callRegex = /\b([a-zA-Z_$][\w$.]*)\s*\(/g;
+        callRegex.lastIndex = 0;
         let callMatch;
         while ((callMatch = callRegex.exec(expr)) !== null) {
           const calleeName = callMatch[1]!;
@@ -235,7 +242,7 @@ export class SvelteExtractor {
           if (SVELTE_RUNES.has(calleeName)) continue;
           if (calleeName === 'if' || calleeName === 'else' || calleeName === 'each' || calleeName === 'await') continue;
 
-          this.unresolvedReferences.push({
+          calls.push({
             fromNodeId: componentNodeId,
             referenceName: calleeName,
             referenceKind: 'calls',
@@ -246,50 +253,23 @@ export class SvelteExtractor {
           });
         }
       }
-    }
-  }
 
-  /**
-   * Extract component usages from the Svelte template.
-   *
-   * PascalCase tags like <Modal>, <Button />, <DevServerPreview> represent
-   * component instantiations — analogous to function calls in imperative code.
-   * Capturing these creates graph edges from parent to child components and
-   * gives codegraph_explore anchor points in the template markup.
-   */
-  private extractTemplateComponents(componentNodeId: string): void {
-    // Build ranges covered by <script> and <style> blocks to skip them
-    const coveredRanges: Array<[number, number]> = [];
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
-
-    const lines = this.source.split('\n');
-    // Match PascalCase opening/self-closing tags (closing tags </Foo> start with </ so won't match)
-    const componentTagRegex = /<([A-Z][a-zA-Z0-9_$]*)\b/g;
-
-    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-      if (coveredRanges.some(([start, end]) => lineIdx >= start && lineIdx <= end)) continue;
-
-      const line = lines[lineIdx]!;
-      let match;
-      while ((match = componentTagRegex.exec(line)) !== null) {
-        const componentName = match[1]!;
-
-        this.unresolvedReferences.push({
+      componentTagRegex.lastIndex = 0;
+      let tagHit;
+      while ((tagHit = componentTagRegex.exec(line)) !== null) {
+        components.push({
           fromNodeId: componentNodeId,
-          referenceName: componentName,
+          referenceName: tagHit[1]!,
           referenceKind: 'references',
           line: lineIdx + 1, // 1-indexed
-          column: match.index + 1,
+          column: tagHit.index + 1,
           filePath: this.filePath,
           language: 'svelte',
         });
       }
     }
+
+    this.unresolvedReferences.push(...calls, ...components);
   }
+
 }

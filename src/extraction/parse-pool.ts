@@ -214,6 +214,10 @@ export class ParseWorkerPool {
   private readonly languages: Language[];
   private readonly maxSize: number;
   private readonly recycleInterval: number;
+  /** Workers past their recycle threshold that keep serving until their replacement is ready. */
+  private readonly retiring = new Set<ParsePoolWorker>();
+  /** Retiring workers whose replacement is ready: terminate at the next job boundary. */
+  private readonly replacementReady = new Set<ParsePoolWorker>();
   private readonly parseTimeoutMs: number;
   private readonly createWorker: () => ParsePoolWorker;
   private readonly loadSettleMs: number;
@@ -285,7 +289,14 @@ export class ParseWorkerPool {
   }
 
   private spawnOne(): void {
-    if (this.destroyed || this.workers.size >= this.maxSize || !this.healthy) return;
+    if (this.destroyed || !this.healthy) return;
+    // Capacity is maxSize, plus ONE transient slot while a rolling recycle's
+    // replacement boots: retiring.size > pending.size means some retiree still
+    // has no booting replacement. Bounded, so the pool never exceeds
+    // maxSize + 1 live workers (the old worker's heap is reclaimed as soon as
+    // its replacement reports ready).
+    const needsReplacementSlot = this.retiring.size > this.pending.size;
+    if (this.workers.size >= this.maxSize && !(needsReplacementSlot && this.workers.size === this.maxSize)) return;
     let w: ParsePoolWorker;
     try {
       w = this.createWorker();
@@ -315,6 +326,8 @@ export class ParseWorkerPool {
       this.pending.delete(w);
       this.idle.push(w);
       this.drain();
+      // A replacement is up: retire the oldest worker awaiting its swap.
+      this.retireOne();
       return;
     }
     if (m.type === 'parse-result') {
@@ -339,7 +352,20 @@ export class ParseWorkerPool {
       }
       // Recycle the worker once it's done enough parses to have grown its WASM
       // heap; otherwise return it to the idle set for the next job.
-      if ((this.parseCounts.get(w) ?? 0) >= this.recycleInterval) {
+      if (this.retiring.has(w)) {
+        // Past its threshold: keep serving until the replacement is ready,
+        // then retire at this clean job boundary.
+        if (this.replacementReady.has(w)) {
+          this.retiring.delete(w);
+          this.replacementReady.delete(w);
+          this.removeWorker(w);
+          try { void w.terminate(); } catch { /* already gone */ }
+          // A slot freed: another retiree may still be waiting for its replacement.
+          if (this.retiring.size > this.pending.size) this.spawnOne();
+        } else {
+          this.idle.push(w);
+        }
+      } else if ((this.parseCounts.get(w) ?? 0) >= this.recycleInterval) {
         this.recycle(w);
       } else {
         this.idle.push(w);
@@ -364,13 +390,46 @@ export class ParseWorkerPool {
   }
 
   /** Tear down a worker that has hit its recycle threshold and replace it. Not a
-   *  crash, so it doesn't count against the budget. */
+   *  crash, so it doesn't count against the budget.
+   *
+   *  Rolling swap: the old worker STAYS IN SERVICE (it remains in `idle` and
+   *  keeps taking jobs) while its replacement boots — a fresh isolate needs
+   *  ~100-250ms to load the module graph and grammars, and terminating the
+   *  old worker first dropped the pool to maxSize-1 productive workers for
+   *  that whole window (measured: 31 recycles × ~155ms ≈ 1.5s of lost pool
+   *  capacity on an 8k-file repo). It is retired only once the replacement
+   *  reports its grammars loaded (see onMessage), so the pool never dips.
+   *  The pool runs one worker over cap during the swap; the old worker's
+   *  heap is reclaimed the moment its replacement is ready. */
   private recycle(w: ParsePoolWorker): void {
     this.log(`Recycling worker after ${this.parseCounts.get(w)} parses (heap: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB RSS)`);
-    this.removeWorker(w);
+    // Stays in `idle` and keeps taking jobs until its replacement is ready.
+    // (Guarded: recycleAll() walks the idle set, so a worker can already be in it.)
+    this.retiring.add(w);
+    if (!this.idle.includes(w)) this.idle.push(w);
+    this.spawnOne();
+  }
+
+  /**
+   * A replacement finished booting: retire the oldest worker still awaiting
+   * its swap (FIFO — the pool stays at capacity while replacements trickle in).
+   */
+  private retireOne(): void {
+    const old = this.retiring.values().next().value;
+    if (old === undefined) return;
+    if (this.inflight.has(old)) {
+      // Mid-job: it terminates itself when this parse lands (see the
+      // parse-result branch) — killing it now would drop a live file.
+      this.replacementReady.add(old);
+      return;
+    }
+    this.retiring.delete(old);
+    this.replacementReady.delete(old);
+    this.removeWorker(old);
     // Fire-and-forget: worker.terminate() can hang if WASM is wedged.
-    try { void w.terminate(); } catch { /* already gone */ }
-    if (this.healthy && !this.destroyed) this.spawnOne();
+    try { void old.terminate(); } catch { /* already gone */ }
+    // A slot freed: another retiree may still be waiting for its replacement.
+    if (this.retiring.size > this.pending.size) this.spawnOne();
   }
 
   /** The worker's grammar load is over: it reported ready, errored or exited. */
@@ -403,6 +462,8 @@ export class ParseWorkerPool {
     this.workers.delete(w);
     this.pending.delete(w);
     this.parseCounts.delete(w);
+    this.retiring.delete(w);
+    this.replacementReady.delete(w);
     this.idle = this.idle.filter((x) => x !== w);
   }
 
@@ -519,6 +580,8 @@ export class ParseWorkerPool {
     }
     this.inflight.clear();
     this.queue = [];
+    this.retiring.clear();
+    this.replacementReady.clear();
     await Promise.all(ws.map((w) => this.terminateSettled(w)));
   }
 }

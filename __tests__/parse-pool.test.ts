@@ -326,4 +326,82 @@ describe('teardown never terminates a worker mid-load', () => {
     await pool.destroy();
     expect(performance.now() - t0).toBeLessThan(200);
   });
+
+  /**
+   * Rolling recycle (perf: init benchmark): a worker past its recycle
+   * threshold keeps serving while its replacement boots, and is terminated
+   * only once the replacement reports its grammars loaded. The old behaviour
+   * terminated the healthy worker first, dropping the pool to maxSize-1
+   * productive workers for the ~100-250ms a fresh isolate needs to boot
+   * (measured on an 8k-file repo: 31 recycles x ~155ms = ~1.5s of lost pool
+   * capacity per full index).
+   */
+  describe('rolling recycle', () => {
+    /** Fake with a delayed grammar load and a serving tag, so a test can see which worker ran each parse. */
+    class TaggedSlowBootWorker implements ParsePoolWorker {
+      private msgCb?: (m: unknown) => void;
+      private exitCb?: (code: number) => void;
+      alive = true;
+      constructor(private tag: number, private bootMs: number, private onTerminate?: () => void) {}
+      on(event: string, cb: (...args: any[]) => void): void {
+        if (event === 'message') this.msgCb = cb;
+        else if (event === 'exit') this.exitCb = cb;
+      }
+      private reply(id: number, result: ExtractionResult): void {
+        if (this.alive) this.msgCb?.({ type: 'parse-result', id, result });
+      }
+      postMessage(msg: unknown): void {
+        const m = msg as { type: string; id?: number };
+        if (m.type === 'load-grammars') {
+          setTimeout(() => { if (this.alive) this.msgCb?.({ type: 'grammars-loaded' }); }, this.bootMs);
+          return;
+        }
+        if (m.type !== 'parse') return;
+        setTimeout(() => this.reply(m.id!, result(this.tag)), 0);
+      }
+      terminate(): Promise<number> { this.alive = false; this.onTerminate?.(); return Promise.resolve(0); }
+    }
+
+    it('the retiring worker keeps serving until its replacement is ready', async () => {
+      let spawned = 0, terminated = 0;
+      const pool = new ParseWorkerPool({
+        languages: ['typescript'] as Language[],
+        size: 1,
+        recycleInterval: 1, // every parse retires its worker
+        createWorker: () => new TaggedSlowBootWorker(++spawned, 60, () => { terminated++; }),
+      });
+      // Parse 1 runs on worker 1 and retires it (interval 1). Worker 2 needs
+      // 60ms to boot — parse 2 must still be served by worker 1, not wait.
+      const r1 = await pool.requestParse(task('a.ts'));
+      const r2 = await pool.requestParse(task('b.ts'));
+      expect(r1.durationMs).toBe(1); // worker 1
+      expect(r2.durationMs).toBe(1); // still worker 1 — the pool never dipped
+      expect(terminated).toBe(0);    // worker 1 is NOT terminated while its replacement boots
+      await sleep(90);               // worker 2 reports ready
+      expect(terminated).toBe(1);    // now worker 1 is retired
+      const r3 = await pool.requestParse(task('c.ts'));
+      expect(r3.durationMs).toBe(2); // worker 2 serves once ready
+      await pool.destroy();
+    });
+
+    it('never exceeds maxSize + 1 live workers during a burst of recycles', async () => {
+      let spawned = 0, terminated = 0, maxLive = 0;
+      const pool = new ParseWorkerPool({
+        languages: ['typescript'] as Language[],
+        size: 3,
+        recycleInterval: 1, // every parse retires its worker
+        createWorker: () => {
+          spawned++;
+          maxLive = Math.max(maxLive, spawned - terminated);
+          return new TaggedSlowBootWorker(spawned, 5, () => { terminated++; });
+        },
+      });
+      const ps = Array.from({ length: 24 }, (_, i) => pool.requestParse(task('f' + i + '.ts')));
+      const results = await Promise.all(ps);
+      expect(results).toHaveLength(24); // no parse is lost to the swap churn
+      expect(results.every((r) => r.durationMs! > 0)).toBe(true); // every parse got a real result
+      expect(maxLive).toBeLessThanOrEqual(4); // maxSize + the one transient swap slot
+      await pool.destroy();
+    });
+  });
 });
