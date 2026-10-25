@@ -1320,6 +1320,16 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       gitlinkRels.push(rel); // an unexpanded gitlink — recursed into below, not a source file itself
       continue;
     }
+    // Git still lists tracked paths whose working-tree deletion is unstaged
+    // (#2904). Drop only confirmed missing entries before they reach the reader.
+    // lstat keeps dangling symlinks visible, and other failures (e.g. EACCES)
+    // still reach normal read-error reporting instead of being silently hidden.
+    try {
+      fs.lstatSync(path.join(repoDir, rel));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+    }
     files.add(normalizePath(prefix + rel));
   }
 
@@ -3618,8 +3628,8 @@ export class ExtractionOrchestrator {
     }
 
     // Removals: tracked in the DB but no longer a present source file. Check the
-    // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
-    // file deleted from disk but not yet staged, so set membership alone misses it.
+    // filesystem as well as the discovery set, in case a file disappears after
+    // scanning or remains in the candidate set of a scoped reconcile.
     // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
     // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
     let reconcileChecks = 0;
