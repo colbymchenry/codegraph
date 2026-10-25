@@ -82,6 +82,13 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Ceiling on the worker threads CodeGraph may use in total — across the parse,
+   * resolution and query pools together (#2527). A positive integer. Absent
+   * (the default) leaves the built-in headroom in charge; `--threads` on the CLI
+   * wins over this, and `CODEGRAPH_MAX_THREADS` sits between the two.
+   */
+  maxThreads?: number;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +98,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  maxThreads?: number;
 }
 
 interface CacheEntry {
@@ -114,6 +122,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  maxThreads: undefined,
 });
 
 /**
@@ -167,16 +176,38 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const maxThreads = extractMaxThreads(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    maxThreads === undefined
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, maxThreads };
+}
+
+/**
+ * Validate `maxThreads`: a positive integer naming the total worker-thread
+ * budget for a run. Anything else — zero, a negative, a float, a string — is
+ * warned-and-skipped, never fatal, and never clamped into a surprising value:
+ * a typo must fall back to the default headroom rather than silently pinning
+ * the build to one worker.
+ */
+function extractMaxThreads(parsed: object, file: string): number | undefined {
+  const raw = (parsed as ProjectConfig).maxThreads;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+    logWarn(`Ignoring "maxThreads" in ${PROJECT_CONFIG_FILENAME}: must be a positive integer`, {
+      file,
+      value: String(raw),
+    });
+    return undefined;
+  }
+  return raw;
 }
 
 /**
@@ -341,6 +372,17 @@ function loadParsedConfig(rootDir: string): ParsedConfig {
  */
 export function loadExtensionOverrides(rootDir: string): Record<string, Language> {
   return loadParsedConfig(rootDir).extensions;
+}
+
+/**
+ * Load the validated `maxThreads` budget for a project, mtime-cached.
+ *
+ * The total worker-thread ceiling for a run — across the parse, resolution and
+ * query pools together (#2527). `undefined` — the zero-config default — means
+ * the built-in headroom decides instead.
+ */
+export function loadMaxThreads(rootDir: string): number | undefined {
+  return loadParsedConfig(rootDir).maxThreads;
 }
 
 /**

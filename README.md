@@ -529,9 +529,10 @@ codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents AND the CLI (--keep-cli for configs only)
 codegraph init [path]             # Initialize a project + build its graph (one step)
+                                  #   (--threads <n> caps worker threads, --verbose shows pool sizes)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
-codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
-codegraph sync [path]             # Incremental update
+codegraph index [path]            # Full index (--force to re-index, --quiet for less output, --threads <n>)
+codegraph sync [path]             # Incremental update (--threads <n>)
 codegraph status [path]           # Show statistics
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
@@ -733,6 +734,61 @@ defaults and win on conflict, so you can also re-point a built-in (e.g.
 language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
+
+### Worker threads and machine load
+
+CodeGraph parallelises across a few worker pools — the **parse** pool (tree-sitter
+parsing during `index` / `init` / `sync`), the **resolution** pool (linking
+references afterwards) and the **query** pool (serving concurrent reads from the
+MCP server). Each sizes itself from your core count and leaves headroom, and the
+pools that share a run fit inside **one** budget, so a many-core machine stays
+responsive instead of being pinned for the length of a build.
+
+The ceiling is user-facing in three places. Precedence, highest first:
+
+| Where | What to set | Scope |
+| --- | --- | --- |
+| CLI | `--threads <n>` on `codegraph init` / `index` / `sync` | one run |
+| Project | `"maxThreads": 8` in `codegraph.json` | committed with the project |
+| Environment | `CODEGRAPH_MAX_THREADS=8` | one shell / CI job |
+
+```json
+{
+  "maxThreads": 8
+}
+```
+
+```bash
+codegraph index --threads 8        # at most 8 worker threads for this run
+codegraph index --verbose          # prints the resolved pool sizes at startup
+```
+
+With nothing set, the default is your cores minus two — the main thread and the
+OS always keep somewhere to run — and no pool is ever shrunk below the size it
+would have had on its own. A value that isn't a positive integer is ignored and
+the next source in the list decides, so a typo can't silently pin indexing to one
+worker.
+
+For finer control, the individual pools still have their own knobs. These
+override the per-pool sizing; `maxThreads` / `--threads` cap the total on top.
+
+| Variable | Effect |
+| --- | --- |
+| `CODEGRAPH_PARSE_WORKERS` | Parse pool size. `0` or `1` is the single-worker path (the conservative rollback); `N` is clamped to 1–16. |
+| `CODEGRAPH_PARSE_TIMEOUT_MS` | Base per-file parse timeout, raised automatically for large files. Default 10000. |
+| `CODEGRAPH_RESOLVE_WORKERS` | Reference-resolution pool size, capped at 16. `0` disables parallel resolution. |
+| `CODEGRAPH_PARALLEL_RESOLVE_MIN` | Minimum number of unresolved references before the resolution pool engages. `0` forces it on. |
+| `CODEGRAPH_NO_PARALLEL_RESOLVE` | Set to `1` to resolve references sequentially. |
+| `CODEGRAPH_QUERY_POOL_SIZE` | Query pool size for concurrent MCP reads, capped at 16. `0` disables the pool and serves reads in-process. |
+| `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS` | How long a queued read waits before it gets "busy, retry" guidance instead of an answer. Default 45000. |
+
+`codegraph index --verbose` (and `init --verbose`) prints the resolved sizes at
+startup, so you can see what a run actually settled on:
+
+```
+threads: parse=8 (8 of 16; source=default, 18 cores)
+Parse worker pool: 8 worker(s)
+```
 
 ## Telemetry
 

@@ -21,6 +21,7 @@ import {
 import { QueryBuilder, NodeIdentity } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
+import { describeThreadBudget, resolveProjectThreadLimit, threadBudget } from '../thread-budget';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
@@ -2310,7 +2311,21 @@ export class ExtractionOrchestrator {
       // parse is worker-side CPU, and 1 worker measured 34% slower than the
       // old oversubscribed pool on the kernel-scale 2-cpuset envelope
       // (493s vs 369s) — main + store-worker don't fill the second core.
-      const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
+      // #2527: the parse pool shares one run-wide thread budget with the
+      // resolution pool, so the two together keep headroom instead of
+      // saturating a many-core machine. `minimum` pins the budget at this
+      // pool's own un-capped default, so applying it can only ever cap the
+      // COMBINED total of the run's pools — never shrink a single pool below
+      // the size it gets today (1 parse worker measured 34% slower on a
+      // 2-core envelope, so that would be a real regression).
+      const wantPoolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
+      const threadLimit = resolveProjectThreadLimit({
+        projectRoot: this.rootDir,
+        availableParallelism: os.availableParallelism(),
+        minimum: wantPoolSize,
+      });
+      const budget = threadBudget(threadLimit);
+      const poolSize = budget.claim(wantPoolSize);
       // Read each needed grammar's WASM ONCE here and hand the bytes to every
       // worker, so spawns/respawns load grammars from memory instead of
       // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
@@ -2326,6 +2341,13 @@ export class ExtractionOrchestrator {
         grammarBuffers,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
+      if (verbose) {
+        log(describeThreadBudget(
+          budget.limit,
+          { parse: poolSize, query: 0, resolve: 0 },
+          { cores: os.availableParallelism(), pools: ['parse'] },
+        ));
+      }
       // Bulk index: every core will be needed — spawn the whole pool now so
       // worker boot overlaps the first read batches instead of trickling in
       // behind queue-pressure growth.

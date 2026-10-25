@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph index`, `codegraph init` and `codegraph sync` now take `--threads <n>`, and `codegraph.json` takes `maxThreads`, to cap the worker threads CodeGraph uses across all of its pools together — so a full index no longer pins a many-core machine for the length of the build. `--threads` wins over `maxThreads`, which wins over the new `CODEGRAPH_MAX_THREADS`, and with nothing set CodeGraph still keeps two cores free for your desktop. (#2527)
+- `codegraph index --verbose` and `codegraph init --verbose` now print the pool sizes a run settled on and where the limit came from, so it is visible when a build is running fewer workers than the machine has cores. (#2527)
+- The worker pool settings that were only findable by reading the source — `CODEGRAPH_PARSE_WORKERS`, `CODEGRAPH_PARSE_TIMEOUT_MS`, `CODEGRAPH_RESOLVE_WORKERS`, `CODEGRAPH_PARALLEL_RESOLVE_MIN`, `CODEGRAPH_NO_PARALLEL_RESOLVE`, `CODEGRAPH_QUERY_POOL_SIZE` and `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS` — are now documented in the README. (#2527)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

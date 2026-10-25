@@ -787,6 +787,27 @@ async function runInit(
 }
 
 /**
+ * Publish `--threads` where the worker pools can see it (#2527).
+ *
+ * The flag has to reach pools built deep inside the pipeline (parse,
+ * resolution, query), and those already read `CODEGRAPH_*` straight off the
+ * environment — so the CLI publishes the validated value as
+ * `CODEGRAPH_CLI_THREADS`, the highest-precedence input of
+ * `resolveThreadLimit`. An invalid value is a hard error rather than a silent
+ * fallback: a user who asked for a cap must not be told they got one when the
+ * number never landed.
+ */
+function applyThreadsFlag(threads: string | undefined): void {
+  if (threads === undefined) return;
+  const n = Number(threads);
+  if (!Number.isInteger(n) || n < 1) {
+    error(`--threads must be a positive integer (got "${threads}")`);
+    process.exit(1);
+  }
+  process.env.CODEGRAPH_CLI_THREADS = String(n);
+}
+
+/**
  * codegraph init [path]
  */
 program
@@ -796,7 +817,9 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('-t, --threads <n>', 'Cap the total worker threads this run may use (across the parse, resolution and query pools together); overrides maxThreads in codegraph.json')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; threads?: string }) => {
+    applyThreadsFlag(options.threads);
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
@@ -870,7 +893,9 @@ program
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('-t, --threads <n>', 'Cap the total worker threads this run may use (across the parse, resolution and query pools together); overrides maxThreads in codegraph.json')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; threads?: string }) => {
+    applyThreadsFlag(options.threads);
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
     // looking for one. resolveProjectPath walks up to the nearest initialized
     // ancestor, which is right for `codegraph query` run from a subdirectory,
@@ -1000,7 +1025,9 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('-t, --threads <n>', 'Cap the total worker threads this run may use (across the parse, resolution and query pools together); overrides maxThreads in codegraph.json')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; threads?: string }) => {
+    applyThreadsFlag(options.threads);
     const projectPath = resolveProjectPath(pathArg);
 
     try {

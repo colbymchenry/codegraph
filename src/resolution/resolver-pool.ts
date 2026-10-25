@@ -17,6 +17,7 @@ import type { Edge, UnresolvedReference } from '../types';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 import { terminateOnceStarted, workerStarted } from '../worker-teardown';
+import type { ThreadBudget } from '../thread-budget';
 
 /** One synthesis pass's output: its edge list + worker-measured wall clock. */
 export interface SynthPassResult {
@@ -138,7 +139,7 @@ export class ResolverPool {
    * otherwise. `CODEGRAPH_RESOLVE_WORKERS` overrides the computed size
    * (0 disables the pool; values are capped at 16).
    */
-  static tryCreate(dbPath: string, projectRoot: string): ResolverPool | null {
+  static tryCreate(dbPath: string, projectRoot: string, threadBudget?: ThreadBudget): ResolverPool | null {
     if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
@@ -162,8 +163,20 @@ export class ResolverPool {
       );
     }
     if (size === null) return null;
+    // #2527: take this pool's workers out of the run-wide thread budget the
+    // parse pool is already drawing on. A grant below 2 is below the pool's
+    // own worth-its-boot threshold (see resolvePoolSize) — hand the slots back
+    // and stay sequential rather than booting a worker pool for one thread.
+    const granted = threadBudget ? threadBudget.claim(size) : size;
+    if (granted < 2) {
+      if (threadBudget) threadBudget.release(granted);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+        console.error(`[pool-timing] pool disabled: thread budget granted ${granted} of ${size} requested`);
+      }
+      return null;
+    }
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, size);
+      return new ResolverPool(workerScript, dbPath, projectRoot, granted);
     } catch {
       return null;
     }
