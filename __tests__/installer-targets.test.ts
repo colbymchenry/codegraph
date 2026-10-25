@@ -516,6 +516,116 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
+  it('qoder: install writes settings.json (mcpServers.codegraph) and the AGENTS.md block', () => {
+    const qoder = getTarget('qoder')!;
+    const result = qoder.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qoder', 'settings.json');
+    const agentsMd = path.join(tmpHome, '.qoder', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('qoder: install preserves a pre-existing sibling MCP server and other settings', () => {
+    const qoder = getTarget('qoder')!;
+    const settings = path.join(tmpHome, '.qoder', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      theme: 'dark',
+      mcpServers: { other: { type: 'stdio', command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    qoder.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.theme).toBe('dark');
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('qoder: re-running install is byte-identical', () => {
+    const qoder = getTarget('qoder')!;
+    qoder.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qoder', 'settings.json');
+    const agentsMd = path.join(tmpHome, '.qoder', 'AGENTS.md');
+    const settingsBefore = fs.readFileSync(settings, 'utf-8');
+    const agentsBefore = fs.readFileSync(agentsMd, 'utf-8');
+
+    const second = qoder.install('global', { autoAllow: true });
+
+    expect(fs.readFileSync(settings, 'utf-8')).toBe(settingsBefore);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(agentsBefore);
+    for (const file of second.files) expect(file.action).toBe('unchanged');
+  });
+
+  it('qoder: uninstall removes only codegraph entries and keeps sibling settings', () => {
+    const qoder = getTarget('qoder')!;
+    const settings = path.join(tmpHome, '.qoder', 'settings.json');
+    const agentsMd = path.join(tmpHome, '.qoder', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      theme: 'dark',
+      mcpServers: { other: { command: 'x' } },
+    }, null, 2) + '\n');
+    fs.writeFileSync(agentsMd, '# My Qoder memory\n\nAlways respond concisely.\n');
+
+    qoder.install('global', { autoAllow: true });
+    qoder.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.theme).toBe('dark');
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My Qoder memory');
+    expect(body).toContain('Always respond concisely.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('qoder: uninstall is safe when nothing was installed', () => {
+    const qoder = getTarget('qoder')!;
+    expect(() => qoder.uninstall('global')).not.toThrow();
+    expect(fs.existsSync(path.join(tmpHome, '.qoder', 'settings.json'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.qoder', 'AGENTS.md'))).toBe(false);
+  });
+
+  it('qoder: local install writes ./.qoder/settings.local.json and the project-root ./AGENTS.md block', () => {
+    const qoder = getTarget('qoder')!;
+    const result = qoder.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.qoder/settings.local.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), '.qoder', 'settings.local.json'), 'utf-8'),
+    );
+    expect(settings.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+  });
+
+  it('qoder: detect reports installed from the config dir and alreadyConfigured from the entry', () => {
+    const qoder = getTarget('qoder')!;
+    const configPath = path.join(tmpHome, '.qoder', 'settings.json');
+    expect(qoder.detect('global')).toEqual({ installed: false, alreadyConfigured: false, configPath });
+
+    fs.mkdirSync(path.join(tmpHome, '.qoder'), { recursive: true });
+    expect(qoder.detect('global').installed).toBe(true);
+
+    qoder.install('global', { autoAllow: true });
+    expect(qoder.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('qoder: printConfig returns parseable JSON containing mcpServers.codegraph', () => {
+    const qoder = getTarget('qoder')!;
+    const out = qoder.printConfig('global');
+    const parsed = JSON.parse(out.slice(out.indexOf('{')));
+    expect(parsed.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
@@ -1380,6 +1490,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('qoder')?.id).toBe('qoder');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
