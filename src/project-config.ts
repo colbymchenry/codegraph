@@ -82,6 +82,18 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Project-root-relative directories of the CHILD projects that live under
+   * this one — `Project A` / `Project B` under `Project God` in the #1822
+   * shape. `codegraph init` fills it in when it discovers child projects below
+   * the directory being initialized; two consumers read it afterwards: the
+   * indexer (a parent never indexes a child's files — the child owns its own
+   * `.codegraph/`) and the query tools (a search from the parent also covers
+   * its indexed children, which is what makes full-stack work from the parent
+   * folder work). A child may list children of its own, so the relation stays
+   * recursive through the config files instead of being flattened here.
+   */
+  children?: string[];
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +103,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  children: string[];
 }
 
 interface CacheEntry {
@@ -114,6 +127,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  children: Object.freeze([]) as unknown as string[],
 });
 
 /**
@@ -167,16 +181,18 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const children = extractChildren(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    children.length === 0
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, children };
 }
 
 /**
@@ -389,6 +405,124 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the validated `children` list for a project, mtime-cached.
+ *
+ * Each entry is a project-root-relative path to a child project that owns its
+ * own `.codegraph/` (#1822). An empty result — the zero-config default — means
+ * this project declares no children, so it indexes its whole tree exactly as
+ * before.
+ */
+export function loadChildProjects(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).children;
+}
+
+/**
+ * Validate the `children` list: an array of project-root-relative directories.
+ * Entries are normalized to `/` separators with no leading `./` and no trailing
+ * slash, so `Project A/`, `./Project A` and `Project A` name the same child.
+ * Absolute paths, `..` segments and blank entries warn-and-skip; a non-array
+ * value is ignored entirely. Never throws — a malformed config must not break
+ * indexing.
+ */
+/**
+ * Normalize one children entry to the spelling codegraph.json uses: /
+ * separators, no leading ./, no trailing slash, so Project A/, ./Project A
+ * and Project A all name the same child. Returns null when the entry could
+ * escape the project (absolute, drive-lettered, or containing ..) — a child
+ * must always live inside its parent.
+ */
+function normalizeChildPath(entry: string): string | null {
+  let normalized = entry.trim();
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) return null;
+  if (normalized.split("/").includes("..")) return null;
+  return normalized;
+}
+
+function extractChildren(parsed: object, file: string): string[] {
+  const raw = (parsed as ProjectConfig).children;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "children" in ${PROJECT_CONFIG_FILENAME}: must be an array of project-relative directories`, { file });
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring a "children" entry in ${PROJECT_CONFIG_FILENAME}: every entry must be a non-empty string`, { file });
+      continue;
+    }
+    const normalized = normalizeChildPath(entry);
+    if (!normalized) {
+      logWarn(`Ignoring child project "${entry}" in ${PROJECT_CONFIG_FILENAME}: it must be a path inside this project`, { file });
+      continue;
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+/**
+ * Add child-project paths to a project's `codegraph.json` `children` list,
+ * creating the file if absent and preserving every other key. Used by
+ * `codegraph init` when it discovers the child projects under the directory it
+ * initializes (#1822). Returns the count of paths actually ADDED (already-listed
+ * ones are skipped, so a re-run is idempotent) plus the full resulting list,
+ * which the caller prints.
+ *
+ * Same plain-JSON round-trip contract as `addIncludeIgnoredPatterns`: an existing
+ * file that won't parse throws rather than being clobbered, and the config cache
+ * is invalidated so a same-process index sees the new children.
+ */
+export function addChildProjects(rootDir: string, children: string[]): { added: number; children: string[] } {
+  const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
+  let config: Record<string, unknown> = {};
+  let raw: string | null = null;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch {
+    raw = null; // missing file — create a fresh one below
+  }
+  if (raw !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`${PROJECT_CONFIG_FILENAME} is not valid JSON — fix it by hand, then re-run.`);
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      config = parsed as Record<string, unknown>;
+    }
+  }
+
+  const existing: string[] = [];
+  for (const entry of Array.isArray(config.children) ? config.children : []) {
+    const normalized = typeof entry === 'string' ? normalizeChildPath(entry) : null;
+    if (normalized && !existing.includes(normalized)) existing.push(normalized);
+  }
+  const merged = [...existing];
+  const seen = new Set(existing);
+  let added = 0;
+  for (const child of children) {
+    const normalized = normalizeChildPath(child);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    merged.push(normalized);
+    added++;
+  }
+  if (added > 0) {
+    config.children = merged;
+    fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+    cache.delete(rootDir);
+  }
+  return { added, children: merged };
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

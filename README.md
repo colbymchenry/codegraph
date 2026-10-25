@@ -734,6 +734,37 @@ language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
 
+
+### Parent and child projects
+
+A folder that holds several projects — a git super-repo with `Project A` and
+`Project B` side by side, or a workspace root above a frontend and a backend —
+can be initialized itself. `codegraph init` in the parent looks one to three
+levels down for project roots (a build manifest such as `package.json`,
+`Cargo.toml`, `pyproject.toml`, or a `.git` directory) and reports what it found:
+
+- A directory that **already has its own `.codegraph/`** becomes a *child* of
+  the parent: it is recorded under `children` in the parent config file,
+  its files stay out of the parent index (the child graph owns them), and a
+  search issued from the parent also covers the child graph. Results from a
+  child are grouped under its directory name, so the path in the answer is
+  usable from where you are.
+- A directory with **no index of its own** stays part of the parent index, and
+  init names it so you can decide: run `codegraph init` inside it to give it a
+  graph of its own, after which the parent stops indexing its files.
+
+```json
+{
+  "children": ["Project A", "Project B"]
+}
+```
+
+Paths are project-relative; absolute paths and `..` are rejected. The relation
+is recursive — a child may declare children of its own — and the list can be
+edited by hand and committed for the team. Nothing changes for a project with
+no child projects: it indexes its whole tree exactly as before. After adding a
+child, re-index the parent (`codegraph index`) so it stops indexing that
+subtree.
 ## Telemetry
 
 CodeGraph collects **anonymous usage statistics** — which tools and commands get

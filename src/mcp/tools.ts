@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot, listChildProjects } from '../directory';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
 import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
@@ -3164,6 +3164,84 @@ export class ToolHandler {
   }
 
   /**
+   * Search the indexed CHILD projects of the project `cg` answers for (#1822).
+   *
+   * A parent folder holding Project A and Project B has its own graph, and each
+   * child has one of its own. Full-stack work is done FROM the parent, so a
+   * search issued there must also see the children — otherwise the answer is
+   * only the half of the stack the parent happens to index.
+   *
+   * Each child is opened through the ordinary project cache, so it shares one
+   * connection with an explicit projectPath call. A child that cannot be opened,
+   * or whose index cannot answer, is skipped rather than failing the parent.
+   */
+  private searchChildProjects(
+    cg: CodeGraph,
+    query: string,
+    kind: string | undefined,
+    limit: number,
+  ): Array<{ rel: string; results: SearchResult[] }> {
+    let children: Array<{ root: string; rel: string }>;
+    try {
+      children = listChildProjects(cg.getProjectRoot())
+        .filter((child) => child.indexed)
+        .slice(0, 8);
+    } catch {
+      return [];
+    }
+
+    const out: Array<{ rel: string; results: SearchResult[] }> = [];
+    for (const child of children) {
+      try {
+        const childCg = this.openChildProject(child.root);
+        const results = childCg.searchNodes(query, {
+          limit,
+          kinds: kind ? [kind as NodeKind] : undefined,
+        });
+        if (results.length > 0) out.push({ rel: child.rel, results });
+      } catch {
+        // A child index that cannot be opened (moved, mid-rebuild) must not
+        // fail the parent search; it simply contributes nothing.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Open one child project graph for a cross-project query (#1822).
+   *
+   * Production opens it through the ordinary project path (project cache,
+   * lifecycle, worktree checks). Overridable so a test can supply an already
+   * opened instance for a fixture tree without standing up the loader.
+   */
+  protected openChildProject(root: string): CodeGraph {
+    return this.getCodeGraph(root);
+  }
+
+  /**
+   * Render matches found in child projects, grouped per child and prefixed with
+   * the child directory so the path stays usable from the parent (#1822). Paths
+   * stored in a child index are child-relative; from the parent they live under
+   * that child's directory.
+   */
+  private formatChildSearchResults(
+    childResults: Array<{ rel: string; results: SearchResult[] }>,
+  ): string {
+    const lines: string[] = ['**Also found in child projects**', ''];
+    for (const entry of childResults) {
+      lines.push('**' + entry.rel + '/** (' + entry.results.length + ' found)', '');
+      for (const result of entry.results) {
+        const node = result.node;
+        const location = node.startLine ? ':' + node.startLine : '';
+        const file = node.filePath.startsWith('/') ? node.filePath : entry.rel + '/' + node.filePath;
+        lines.push('- **' + node.name + '** (' + node.kind + ') — ' + file + location);
+      }
+      lines.push('');
+    }
+    return lines.join('\n');
+  }
+
+  /**
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
@@ -3185,7 +3263,13 @@ export class ToolHandler {
     });
 
     if (results.length === 0) {
-      return this.textResult(`No results found for "${query}"`);
+      // Empty in the parent does not mean empty in the tree: from a parent
+      // folder the answer must still reach the children's graphs (#1822).
+      const inChildren = this.searchChildProjects(cg, query, kind, limit);
+      if (inChildren.length === 0) {
+        return this.textResult('No results found for "' + query + '"');
+      }
+      return this.answerResult(cg, this.truncateOutput(this.formatChildSearchResults(inChildren)), []);
     }
 
     // Down-rank generated files within the FTS-returned set so a search

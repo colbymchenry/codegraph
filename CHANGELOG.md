@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `codegraph init` in a folder that holds other projects now finds them: a directory that already has its own `.codegraph/` is recorded as a child in `codegraph.json`, its files stay out of the parent index, and a search issued from the parent also covers the child graph, with results grouped under the child directory name. Before, initializing such a folder folded every child into one parent graph, and a query from it never reached a child index of its own. A child with no index of its own is named in the init output so it can be given a graph separately. Thanks @siba2893 for the report. (#1822)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

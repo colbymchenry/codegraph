@@ -9,6 +9,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
 import { loadNodeSqlite } from './db/node-sqlite';
+import { loadChildProjects } from './project-config';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -441,6 +442,105 @@ export function findIndexedSubprojectRoots(
 }
 
 /** Result of {@link resolveServerRoot}. */
+/**
+ * Sub-project roots beneath `root` — the directories that LOOK like a project
+ * of their own, indexed or not (#1822). A project is recognized by the
+ * manifest list `looksLikeProjectRoot` uses (package.json, Cargo.toml,
+ * pyproject.toml, ...) or by a bare .git, which covers Project A (a
+ * frontend) and Project B (a backend) side by side under Project God.
+ *
+ * Descent stops at the first project on a branch — the src directory of a
+ * project is not a second project — and is bounded by depth + count, so a
+ * large tree is never crawled. `root` itself is never a candidate: this
+ * answers what lives UNDER here, not whether `root` is a project.
+ */
+export function findChildProjectRoots(
+  root: string,
+  opts: { maxDepth?: number; max?: number } = {},
+): string[] {
+  if (unsafeIndexRootReason(root) !== null) return [];
+  const maxDepth = opts.maxDepth ?? 3;
+  const max = opts.max ?? 64;
+  const out: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (out.length >= max || depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= max) return;
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith(".") || SUBPROJECT_SCAN_SKIP.has(e.name)) continue;
+      if (isCodeGraphDataDir(e.name)) continue;
+      const child = path.join(dir, e.name);
+      const isProject =
+        looksLikeProjectRoot(child) || fs.existsSync(path.join(child, ".git"));
+      if (isProject) { out.push(child); continue; } // a project owns everything below it
+      walk(child, depth + 1);
+    }
+  };
+  walk(root, 1);
+  return out;
+}
+
+/** One child project of a parent project, as the parent tools need it. */
+export interface ChildProject {
+  /** Absolute path of the child project root. */
+  root: string;
+  /** Parent-relative POSIX path — the spelling codegraph.json children uses. */
+  rel: string;
+  /** The child has its own .codegraph/ index, so it can answer queries. */
+  indexed: boolean;
+  /** The parent codegraph.json lists it under children. */
+  declared: boolean;
+}
+
+/**
+ * Every child project of `root`, merging the two sources that define the
+ * relation (#1822):
+ *   1. DECLARED — codegraph.json children, written by codegraph init for the
+ *      children it found, or added by hand and committed for the team.
+ *   2. DISCOVERED — the bounded scan above, so a project added to the tree
+ *      after init is still found.
+ *
+ * A declared child that no longer exists is dropped; a declared child that
+ * exists but has no index is still reported (indexed: false) so a caller can
+ * say so instead of answering from the parent files. Ordered by rel for
+ * stable output.
+ */
+export function listChildProjects(root: string): ChildProject[] {
+  const byRel = new Map<string, ChildProject>();
+  const add = (abs: string, declared: boolean): void => {
+    const rel = path.relative(root, abs).split(path.sep).join("/");
+    if (!rel || rel.startsWith("..")) return; // not a child of this root
+    const existing = byRel.get(rel);
+    if (existing) {
+      existing.declared = existing.declared || declared;
+      existing.indexed = existing.indexed || isInitialized(abs);
+      return;
+    }
+    byRel.set(rel, { root: abs, rel, indexed: isInitialized(abs), declared });
+  };
+
+  for (const rel of loadChildProjects(root)) {
+    const abs = path.resolve(root, rel);
+    let isDir = false;
+    try { isDir = fs.statSync(abs).isDirectory(); } catch { isDir = false; }
+    if (isDir) add(abs, true);
+  }
+  if (unsafeIndexRootReason(root) === null) {
+    for (const abs of findChildProjectRoots(root)) add(abs, false);
+  }
+
+  return [...byRel.values()].sort((a, b) => a.rel.localeCompare(b.rel));
+}
+
+/**
+ * The child projects of `root` that have their own index — the ones a query
+ * issued from the parent can actually reach.
+ */
+export function indexedChildProjectRoots(root: string): string[] {
+  return listChildProjects(root).filter((c) => c.indexed).map((c) => c.root);
+}
 export interface ServerRootResolution {
   /** The project root to serve as the default, or null when none resolved. */
   root: string | null;

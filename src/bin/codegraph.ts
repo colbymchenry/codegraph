@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR, findChildProjectRoots } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -673,6 +673,37 @@ async function recordIndexTelemetry(
 // =============================================================================
 
 /**
+ * Declare the child projects found under a freshly initialized parent (#1822).
+ *
+ * Only children that ALREADY have their own .codegraph/ are declared: those are
+ * real graphs the parent can query, and declaring them lets the parent leave
+ * their files out of its own index (ScopeIgnore) and reach them from a query.
+ * A child with no graph of its own is NOT declared — the parent keeps indexing
+ * its files, so nothing disappears from the parent graph behind the user back.
+ *
+ * Returns the parent-relative paths that are now declared, and the children the
+ * user may still want to index separately.
+ */
+async function declareChildProjects(projectPath: string): Promise<{ declared: string[]; pending: string[] }> {
+  const indexed: string[] = [];
+  const pending: string[] = [];
+  for (const dir of findChildProjectRoots(projectPath)) {
+    const rel = path.relative(projectPath, dir).split(path.sep).join("/");
+    if (isInitialized(dir)) indexed.push(rel);
+    else pending.push(rel);
+  }
+  if (indexed.length === 0) return { declared: [], pending };
+  try {
+    const { addChildProjects } = await import('../project-config');
+    return { declared: addChildProjects(projectPath, indexed).children, pending };
+  } catch {
+    // A hand-edited codegraph.json that will not parse must not fail the init;
+    // the parent simply keeps indexing the children it could not declare.
+    return { declared: [], pending: [...indexed, ...pending] };
+  }
+}
+
+/**
  * The `init` flow — shared by `codegraph init` and `codegraph install --init`
  * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
  * index under supervision, then the post-index offers. `yes` makes every
@@ -724,6 +755,13 @@ async function runInit(
       clack.log.warn(`Found a codegraph.db without the codegraph schema in ${getCodeGraphDir(projectPath)} (left by an interrupted init?) — rebuilding it.`);
     }
     const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+    // Declare the children that already have a graph BEFORE indexing, so this
+    // index leaves their files out (ScopeIgnore) and a query issued here can
+    // still reach them (#1822).
+    const childProjects = await declareChildProjects(projectPath);
+    if (childProjects.declared.length > 0) {
+      clack.log.info('Child projects with their own index: ' + childProjects.declared.join(', ') + ' — recorded in codegraph.json children; their code stays out of this index and is still reachable from here.');
+    }
     const cg = await CodeGraph.init(projectPath, { index: false });
     clack.log.success(`Initialized in ${projectPath}`);
     // A fresh index on a Windows drive under WSL gets its own directory (#995).
@@ -762,6 +800,15 @@ async function runInit(
     };
     const result = await runIndex();
     printIndexResult(clack, result, projectPath);
+    // A sub-project the user has not indexed is named here: it sits inside this
+    // index, so it is queryable from here, but full-stack work wants a graph of
+    // its own (#1822).
+    if (childProjects.pending.length > 0) {
+      clack.log.info(
+        "Sub-projects without their own index: " + childProjects.pending.join(", ") +
+        " — covered by this index for now. Run codegraph init in each to give it a graph of its own."
+      );
+    }
     await recordIndexTelemetry(cg, result);
 
     // An empty graph at a git super-repo usually means `.gitignore` excludes

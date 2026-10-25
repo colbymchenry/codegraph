@@ -25,8 +25,8 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { isCodeGraphDataDir } from '../directory';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, loadChildProjects, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { isCodeGraphDataDir, isInitialized } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
@@ -973,6 +973,14 @@ export class ScopeIgnore {
      * folder named `[draft]` or `a[b` read as a glob (or did not compile).
      */
     private gitIgnoredDirs: ReadonlySet<string> = new Set(),
+    /**
+     * Declared child projects (codegraph.json children) that have their own
+     * .codegraph/ index (#1822). Their files belong to the CHILD graph, so the
+     * parent neither indexes nor watches them: otherwise a parent index would
+     * duplicate every child symbol and answer questions about the child from a
+     * second, staler copy.
+     */
+    private childProjects: string[] = [],
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
@@ -986,12 +994,31 @@ export class ScopeIgnore {
     }
     return false;
   }
+  /**
+   * True when `rel` is a declared child project root or lies inside one. Both
+   * the directory spelling (`Project A/`) and a file under it match, and the
+   * comparison is segment-aware so a sibling named `Project A2` is NOT covered
+   * by a child called `Project A`.
+   */
+  private inChildProject(rel: string): boolean {
+    const dir = rel.endsWith("/") ? rel : rel + "/";
+    for (const child of this.childProjects) {
+      const prefix = child.endsWith("/") ? child : child + "/";
+      if (dir === prefix || dir.startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
 
   ignores(rel: string): boolean {
     // User `exclude` (#999) is checked first and against the full root-relative
     // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
     // everywhere, including ancestors of embedded repos.
     if (this.exclude && this.exclude.ignores(rel)) return true;
+    // Declared child projects that have their own .codegraph/ (#1822): their
+    // files belong to the CHILD graph, so the parent never indexes or watches
+    // them. Pruned before `include`, which must not pull a child back in.
+    if (this.childProjects.length > 0 && this.inChildProject(rel)) return true;
     // User `include`: force first-party source in despite `.gitignore`. Never
     // resurfaces a built-in default-ignored dir (node_modules/dist/…), so an
     // include pattern can't accidentally pull in dependency/build trees.
@@ -1028,6 +1055,11 @@ export class ScopeIgnore {
  * skip rediscovery; otherwise they're discovered here (the watcher path).
  */
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
+  // Declared child projects that have their OWN index (#1822): the parent
+  // prunes their subtree, because those files belong to the child graph.
+  const childProjects = loadChildProjects(rootDir)
+    .filter((rel) => isInitialized(path.resolve(rootDir, rel)))
+    .map((rel) => rel.replace(/\\/g, "/").replace(/\/+$/, ""));
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
   // The root matcher has defaults + root `.gitignore` + info/exclude +
@@ -1041,6 +1073,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
     new Set(listGitIgnoredDirectories(rootDir)),
+    childProjects,
   );
 }
 
@@ -1669,6 +1702,23 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
 }
 
 /**
+ * Root-relative prefixes (`api/`, `Project A/`) of the child projects this
+ * project declares AND that have their own index (#1822). A parent scan skips
+ * their files: the child graph owns them, and indexing them again in the parent
+ * would answer questions about the child from a second, staler copy.
+ */
+function loadChildProjectPrefixes(rootDir: string): string[] {
+  return loadChildProjects(rootDir)
+    .filter((rel) => isInitialized(path.resolve(rootDir, rel)))
+    .map((rel) => rel.replace(/\\/g, "/").replace(/\/+$/, "") + "/");
+}
+
+/** Whether the root-relative `rel` lives inside one of `prefixes`. */
+function inChildProjectScan(rel: string, prefixes: string[]): boolean {
+  return prefixes.some((prefix) => rel.startsWith(prefix));
+}
+
+/**
  * Recursively scan a directory for source files.
  *
  * In git repos, uses `git ls-files` (inherently respects .gitignore at all
@@ -1681,6 +1731,9 @@ export function scanDirectory(
 ): string[] {
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
+  // Child projects with their own index are NOT part of this scan (#1822):
+  // their files belong to the child graph.
+  const childPrefixes = loadChildProjectPrefixes(rootDir);
 
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
   const gitFiles = getGitVisibleFiles(rootDir);
@@ -1688,6 +1741,8 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      // A child project with its own index owns these files (#1822).
+      if (inChildProjectScan(filePath, childPrefixes)) continue;
       if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
@@ -1733,12 +1788,17 @@ export async function scanDirectoryAsync(
 ): Promise<string[]> {
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
+  // Child projects with their own index are NOT part of this scan (#1822):
+  // their files belong to the child graph.
+  const childPrefixes = loadChildProjectPrefixes(rootDir);
 
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      // A child project with its own index owns these files (#1822).
+      if (inChildProjectScan(filePath, childPrefixes)) continue;
       if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
@@ -1790,6 +1850,10 @@ function scanDirectoryWalk(
     return patterns ? { dir, ig: ignore().add(patterns) } : null;
   };
 
+  // Child projects with their own index own their files (#1822): the walk
+  // never descends into them, so the parent graph does not carry a second,
+  // staler copy of the child tree.
+  const childPrefixes = loadChildProjectPrefixes(rootDir);
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
     for (const { dir, ig } of matchers) {
       let rel = normalizePath(path.relative(dir, fullPath));
@@ -1836,6 +1900,8 @@ function scanDirectoryWalk(
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
+      // A file OR directory inside an indexed child project (#1822).
+      if (childPrefixes.some((prefix) => (relativePath + "/").startsWith(prefix))) continue;
 
       if (entry.isSymbolicLink()) {
         try {
