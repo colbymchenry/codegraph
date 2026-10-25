@@ -786,8 +786,8 @@ override the per-pool sizing; `maxThreads` / `--threads` cap the total on top.
 startup, so you can see what a run actually settled on:
 
 ```
-threads: parse=8 (8 of 16; source=default, 18 cores)
 Parse worker pool: 8 worker(s)
+threads: parse=8 (8 of 16; source=default, 18 cores)
 ```
 
 ## Telemetry
