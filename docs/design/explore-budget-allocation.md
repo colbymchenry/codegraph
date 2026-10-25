@@ -8,6 +8,40 @@ response and guess; you could not say "this file took 16% and that one took 20%.
 
 This document covers the diagnostic that makes it measurable, and the baseline it recorded.
 
+## A caller-supplied budget (#1701)
+
+`maxFiles` is a FILE count, so it never bounded the answer: every admitted file
+contributes its whole symbol bodies plus its share of the blast-radius and
+relationships sections. On a ~500-file TypeScript repo one symbol query answered in
+5.4k characters at `maxFiles: 1`, 8.1k at 3 and 20.5k at 6, and natural-language
+queries stayed at 13-24k in 7 of 8 calls at `maxFiles: 3`.
+
+`maxChars` (1,000-25,000, clamped) bounds the ANSWER. It is applied by lowering the
+envelope BEFORE any ranking or admission -- `applyMaxCharsBudget` in
+`src/mcp/tools.ts` -- so the relative cliff, the proportional split and the render
+ceiling all spend the smaller number, and a tight budget drops trailing files or
+trims bodies instead of truncating mid-method at the final cut. An explicit
+`maxChars` also withdraws the render ceiling 1.5x overshoot: the number the caller
+asked for is a ceiling, not a target. `budget.maxCharsExplicit` records that the
+value came from the caller. A value that is not a finite positive number leaves the
+adaptive budget untouched, so a malformed arg degrades to the default rather than
+failing the call -- the policy `maxFiles` already follows.
+
+Measured on this repo src/ tree (297 indexed files, small tier), one symbol query
+at `maxFiles: 6`:
+
+| `maxChars` | answer characters |
+| ---: | ---: |
+| (unset) | 19,758 |
+| 20,000 | 15,437 |
+| 8,000 | 7,361 |
+| 4,000 | 3,982 |
+| 1,500 | 1,302 |
+| 1,000 | 979 |
+
+The unset row is what the tool answered before the knob existed; every row with a
+budget lands at or under it, and the tightest row still NAMES the files it withheld
+so one follow-up call can fetch them.
 ## The diagnostic
 
 Set `CODEGRAPH_EXPLORE_DEBUG` and every `codegraph_explore` call (MCP tool or

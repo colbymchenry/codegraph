@@ -282,6 +282,11 @@ export function getExploreBudget(fileCount: number): number {
 export interface ExploreOutputBudget {
   /** Hard cap on total output characters. */
   maxOutputChars: number;
+  /**
+   * True when `maxChars` came from the CALLER (#1701): `maxOutputChars` is
+   * then a promise, so the 1.5x render overshoot is withdrawn.
+   */
+  maxCharsExplicit?: boolean;
   /** Default `maxFiles` when the caller didn't specify one. */
   defaultMaxFiles: number;
   /** Cap on contiguous source returned per file (across all its clusters). */
@@ -397,6 +402,44 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
     includeAdditionalFiles: true,
     includeCompletenessSignal: true,
     includeBudgetNote: true,
+  };
+}
+
+/**
+ * Bounds for a caller-supplied `maxChars` (#1701).
+ *
+ * The floor clears `MIN_CHARS + FILE_OVERHEAD`: below it the envelope cannot hold
+ * one complete method, and a fragment forces the Read this tool exists to prevent.
+ * The ceiling is the host inline tool-result cap (~25K): above it the host
+ * externalizes the result to a file the agent then Reads back.
+ */
+export const EXPLORE_MAX_CHARS_MIN = 1000;
+export const EXPLORE_MAX_CHARS_MAX = 25000;
+
+/**
+ * Apply a caller-supplied `maxChars` to the adaptive budget (#1701).
+ *
+ * `maxFiles` counts FILES, not characters: every admitted file contributes its
+ * whole symbol bodies plus its share of the blast-radius and relationships
+ * sections, so a small `maxFiles` still answered in 5-20k characters on the
+ * reporter repo. `maxChars` bounds the ANSWER by lowering the envelope that
+ * `allocateExploreBudget` splits, so relevance ranking, the relative cliff and
+ * the proportional split all keep working on the smaller number, and a tight
+ * budget drops trailing files or trims bodies instead of cutting a method.
+ *
+ * A non-numeric or non-positive value leaves the budget untouched, so a malformed
+ * arg degrades to the adaptive default: the same policy `maxFiles` follows.
+ */
+export function applyMaxCharsBudget(
+  budget: ExploreOutputBudget,
+  maxChars: unknown,
+): ExploreOutputBudget {
+  const n = typeof maxChars === 'number' ? maxChars : NaN;
+  if (!Number.isFinite(n) || n <= 0) return budget;
+  return {
+    ...budget,
+    maxOutputChars: clamp(Math.floor(n), EXPLORE_MAX_CHARS_MIN, EXPLORE_MAX_CHARS_MAX),
+    maxCharsExplicit: true,
   };
 }
 
@@ -1836,7 +1879,11 @@ export const tools: ToolDefinition[] = [
         },
         maxFiles: {
           type: 'number',
-          description: 'Maximum number of files to return source from, 1–20. Omit it to use a default sized to the project (4 files below 150 indexed files, 5 below 500, 8 otherwise). Total output is also capped by characters (about 13K–24K by project size), so a higher maxFiles spreads that budget over more files rather than returning more text.',
+          description: 'Maximum number of files to return source from, 1–20. Omit it to use a default sized to the project (4 files below 150 indexed files, 5 below 500, 8 otherwise). Total output is also capped by characters (about 13K–24K by project size), so a higher maxFiles spreads that budget over more files rather than returning more text. Pass maxChars to bound the answer itself.',
+        },
+        maxChars: {
+          type: 'number',
+          description: 'Maximum characters of the answer, 1,000-25,000. maxFiles counts FILES; this counts the ANSWER, which is what the response costs on every later turn. Lower it for a tighter answer (4,000 orients quickly); raise it when a flow needs more source. It is spent through the same relevance-ranked allocation, so a tight budget drops trailing files or trims bodies instead of cutting a method in half. Omit it for the project-sized default.',
         },
         projectPath: projectPathProperty,
       },
@@ -4222,6 +4269,11 @@ export class ToolHandler {
       budget = getExploreOutputBudget(Infinity);
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    // #1701: a caller-supplied character budget replaces the project-sized envelope
+    // the allocator splits, BEFORE any ranking or admission -- so the relative cliff,
+    // the proportional split and the render ceiling all spend the smaller number
+    // instead of a full-size response being truncated to it at the very end.
+    if (args.maxChars !== undefined) budget = applyMaxCharsBudget(budget, args.maxChars);
 
     // File paths named in the query become PINNED files: guaranteed admission,
     // top of the rank order, funded first — and their span is REMOVED from the
@@ -5443,7 +5495,11 @@ export class ToolHandler {
     // tool-result limit (~25K chars): above it the result is externalized to a
     // file the agent Reads back (a 35K vscode explore did exactly this in the
     // n=4 A/B).
-    const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+    // An explicit `maxChars` (#1701) withdraws the 1.5x overshoot: the number the
+    // caller asked for is a ceiling, not a target to exceed.
+    const hardCeiling = budget.maxCharsExplicit
+      ? Math.min(budget.maxOutputChars, EXPLORE_MAX_CHARS_MAX)
+      : Math.min(Math.round(budget.maxOutputChars * 1.5), EXPLORE_MAX_CHARS_MAX);
     // What the epilogue is OWED — the part of it the loop must not spend (CG-26).
     // Not a flat margin: the old 600 was neither the epilogue's size (1,064 on
     // gin, 2,231 on excalidraw) nor a bound on it, so the loop budgeted for a
@@ -5488,7 +5544,14 @@ export class ToolHandler {
     // first cluster) — and catches it HERE, where a file can be skipped cleanly and
     // a later one still render, instead of at the final truncation, which lops off
     // whichever section happened to land last.
-    const renderCeiling = hardCeiling - epilogueFloor;
+    // A tight explicit `maxChars` (#1701) can leave the epilogue floor alone larger
+    // than the envelope. The loop then still gets half the ceiling instead of a
+    // negative budget, and the final cut below keeps the RESPONSE inside
+    // `hardCeiling` either way.
+    const renderCeiling = Math.max(
+      hardCeiling - epilogueFloor,
+      Math.round(hardCeiling * 0.5),
+    );
     // `flow.text` is PART of the response — it is prepended to `lines` to make
     // the final output — so the render loop has to spend against it, and it
     // never did. Counting it is what makes `renderCeiling` the ceiling it

@@ -480,6 +480,7 @@ CodeGraph's MCP server delivers its usage guidance to your agent **automatically
 
 - **Answer structural questions directly with CodeGraph** — it *is* the pre-built index, so a grep/read loop just repeats work it already did. Treat the returned source as already read.
 - **Reach for `codegraph_explore` for almost anything** — "how does X work", a flow/"how does X reach Y", or surveying an area. One call returns the relevant symbols' verbatim source grouped by file, the call paths between them (dynamic-dispatch hops included), and a blast-radius summary. Name a file or symbol in the query to read its current line-numbered source.
+- **Bound the answer with `maxChars` when a call still feels large** - `maxFiles` is a file count; `maxChars` (1,000-25,000) caps the characters of the answer itself, spent through the same relevance-ranked allocation, so a smaller budget returns fewer files or shorter bodies instead of a method cut in half.
 - **Trust the results — don't re-verify with grep**, and check the staleness banner after edits.
 - Works **per project**: query any project that has a `.codegraph/` index by passing `projectPath` — so a monorepo where only some services are indexed, or a second repo, works in one session. A path with no index returns clean guidance to use built-in tools; indexing stays your decision.
 
@@ -535,7 +536,7 @@ codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
-codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
+codegraph explore <query>         # Relevant symbols' source + call paths in one shot (--max-files, --max-chars; same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)

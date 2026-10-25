@@ -1396,7 +1396,8 @@ program
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('--max-chars <number>', 'Maximum characters of the answer, 1000-25000')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; maxChars?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1412,6 +1413,7 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      if (options.maxChars) args.maxChars = parseInt(options.maxChars, 10);
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
