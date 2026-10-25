@@ -28,6 +28,7 @@ import { goResolver } from './go';
 import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
+import { csharpEcosystemResolver } from './csharp-ecosystem';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
@@ -80,6 +81,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   rustResolver,
   // C#
   aspnetResolver,
+  // C# ecosystem — NuGet packages, DI registration, EF Core schema (issue #1181)
+  csharpEcosystemResolver,
   // Swift
   swiftUIResolver,
   uikitResolver,
@@ -197,6 +200,7 @@ export { goResolver } from './go';
 export { goframeResolver } from './goframe';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
+export { csharpEcosystemResolver } from './csharp-ecosystem';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';

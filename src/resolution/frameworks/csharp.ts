@@ -142,7 +142,11 @@ export const aspnetResolver: FrameworkResolver = {
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
-    const safe = stripCommentsForRegex(content, 'csharp');
+    // Blank `#if`/`#elif`/`#else`/`#endif` directive lines (preserving byte
+    // offsets) before scanning, so a route/DI/EF attribute wrapped in a
+    // conditional-compilation block parses as one continuous token — and a
+    // directive that splits an attribute across lines can't break its regex.
+    const safe = blankCsharpConditionalDirectives(stripCommentsForRegex(content, 'csharp'));
 
     // Class-level [Route("api/[controller]")] prefix — joined onto each action.
     let classPrefix = '';
@@ -152,12 +156,16 @@ export const aspnetResolver: FrameworkResolver = {
     // [HttpGet], [HttpGet("path")], [HttpPost("path", Name="x")] — BARE or with a
     // path. (The old regex required a string, so bare attributes — with the route
     // on the class [Route] — were missed; eShopOnWeb was 24 bare / 2 string.)
-    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)(?:\s*\(\s*"([^"]+)"[^)]*\))?\s*\]/g;
+    // The verb's argument list is matched as any text up to the closing `]`,
+    // so a path on its own line, named args before the path, or a `#if`-split
+    // attribute all match; the path is the first string literal inside.
+    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)([\s\S]*?)\]/g;
     let match: RegExpExecArray | null;
     while ((match = attrRegex.exec(safe)) !== null) {
       const verb = match[1]!;
+      const pathArg = match[2]?.match(/"([^"]+)"/)?.[1] ?? '';
       const method = verb.replace(/^Http/, '').toUpperCase();
-      const routePath = joinCsPath(classPrefix, match[2] || '');
+      const routePath = joinCsPath(classPrefix, pathArg);
       const line = safe.slice(0, match.index).split('\n').length;
 
       const routeNode: Node = {
@@ -178,7 +186,7 @@ export const aspnetResolver: FrameworkResolver = {
       // Next method declaration (skip stacked attributes; C# puts the return type
       // before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      const methodMatch = tail.match(/(?:public|private|protected|internal)\s+[\w<>,\s\[\]?.]+?\s+(\w+)\s*\(/);
+      const methodMatch = tail.match(/\b(?:public|private|protected|internal)\s+(?:[\s\S]*?)\b(\w+)\s*\(/);
       if (methodMatch) {
         references.push({
           fromNodeId: routeNode.id,
@@ -389,6 +397,19 @@ function endpointGroupRoutes(context: ResolutionContext): Node[] {
     if (name !== route.name) updates.push({ ...route, name });
   }
   return updates;
+}
+
+/**
+ * Blank C# conditional-compilation directive lines (`#if`/`#elif`/`#else`/
+ * `#endif`) after comment/string stripping, preserving byte offsets (newlines
+ * kept). Both branches of an `#if/#else` stay visible — the right default for a
+ * code graph — but a directive that previously split an attribute across lines
+ * no longer breaks the route/DI/EF regexes that scan the file.
+ */
+function blankCsharpConditionalDirectives(source: string): string {
+  return source.replace(/^([ \t]*)#[ \t]*(if|elif|else|endif)\b[^\n]*/gm, (m, indent) =>
+    indent + ' '.repeat(m.length - (indent as string).length),
+  );
 }
 
 /** Join a class-level [Route] prefix and an action's path into one normalized `/path`. */

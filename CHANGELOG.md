@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- C# NuGet package dependencies are now indexed as graph nodes: each `<PackageReference>` in a `.csproj` becomes a package node, and the files that `using` it are linked to it, so what a .NET project pulls in — and who uses it — shows up in the graph.
+- C# dependency-injection registrations (`services.AddScoped<IService, Service>()`, `AddTransient`, `AddSingleton`, `AddHttpClient`, `AddHostedService`) now connect the interface to its implementation, so a trace from `IService` can reach the concrete `Service` through the registration.
+- EF Core data models are now indexed: tables and columns declared in `OnModelCreating` (`ToTable`, `HasColumnName`) and in migrations (`CreateTable`) become graph nodes linked to the entity classes they describe.
+- AWS Lambda handlers — a method with `[LambdaSerializer]` or a `FunctionHandler` using Amazon.Lambda.Core — now surface as entry points, like `[ApiController]` / `[Route]` controllers already do.
+- C# route extraction now handles multi-line route attributes and attributes wrapped in `#if` conditional-compilation blocks, so fewer endpoints are missed or mis-attributed. Re-index C# projects after upgrading to pick these up.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

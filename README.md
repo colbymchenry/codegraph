@@ -330,7 +330,8 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Play** | `GET`/`POST`/… verb routes in `conf/routes` → `Controller.method` actions (Scala + Java) |
 | **Gin / chi / gorilla / mux** | `r.GET(...)`, `router.HandleFunc(...)` |
 | **Axum / actix / Rocket** | `.route("/x", get(handler))` |
-| **ASP.NET** | `[HttpGet("/x")]` attributes on action methods |
+| **ASP.NET** | `[HttpGet("/x")]` attributes on action methods (multi-line and `#if`-wrapped attributes included) |
+| **.NET ecosystem** | NuGet `<PackageReference>` dependencies, DI registrations (`AddScoped<IService, Service>()` etc.), EF Core `OnModelCreating` tables/columns and migration `CreateTable` schema, and AWS Lambda `[LambdaSerializer]` / `FunctionHandler` entry points |
 | **Vapor** | `app.get("x", use: handler)` |
 | **Astro** | `src/pages/` file-based routes (`.astro` pages + `.ts` endpoints, `[param]`/`[...rest]` syntax) |
 
@@ -818,7 +819,7 @@ is written):
 | Go | `.go` | Full support |
 | Rust | `.rs` | Full support |
 | Java | `.java` | Full support |
-| C# | `.cs` | Full support |
+| C# | `.cs` | Full support (including NuGet `<PackageReference>` dependencies, DI registrations, EF Core `OnModelCreating`/migration tables & columns, and AWS Lambda entry points) |
 | PHP | `.php` | Full support |
 | Ruby | `.rb` | Full support |
 | C | `.c`, `.h` | Full support |
