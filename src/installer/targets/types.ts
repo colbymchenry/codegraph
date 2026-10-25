@@ -75,6 +75,13 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /**
+   * Route writes to the personal / gitignored variants instead of the
+   * team-shared project files (issue #243). Only meaningful for `local`
+   * installs of Claude Code (global scope is already the user's own
+   * profile). Other targets ignore it.
+   */
+  personal?: boolean;
 }
 
 export interface AgentTarget {
@@ -107,8 +114,12 @@ export interface AgentTarget {
    * preserves sibling MCP servers, sibling permissions, and unrelated
    * markdown sections. Must be safe to call when nothing was ever
    * installed (returns `not-found` actions).
+   *
+   * `opts.personal` reverses a personal (`--personal`) install: it
+   * removes only the personal-scope entries/files (Claude settings.local.json,
+   * CLAUDE.local.md) and leaves the team-shared files untouched.
    */
-  uninstall(loc: Location): WriteResult;
+  uninstall(loc: Location, opts?: { personal?: boolean }): WriteResult;
   /**
    * Print the MCP-server snippet a user would paste manually for this
    * target. Used by `codegraph install --print-config <id>` and by

@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install --personal` (and `codegraph uninstall --personal`) now write Claude Code's project-local config to the personal, gitignored files instead of the team-shared ones: permissions and the MCP opt-in land in `.claude/settings.local.json`, and the instructions block lands in `CLAUDE.local.md` at the project root, so a shared teammate's Claude Code session never picks up your CodeGraph setup. The `.mcp.json` declaration stays committed (that's the team's file); only your activation of it is personal. Default install behavior is unchanged. (#243)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

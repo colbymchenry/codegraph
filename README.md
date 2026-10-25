@@ -396,6 +396,8 @@ The installer will:
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code is one of the targets
 
+For Claude Code, `--location=local` normally writes into team-shared project files (`.claude/settings.json`, `.claude/CLAUDE.md`), which are committed and load for every teammate. Pass `--personal` to route all Claude Code writes to the gitignored personal files instead — `.claude/settings.local.json` (permissions + MCP opt-in) and `CLAUDE.local.md` — so nothing CodeGraph-specific lands in the team-tracked tree. The `.mcp.json` MCP declaration is still committed (it's the team's file); only your activation of it is personal.
+
 The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3). One global `codegraph install` covers every project; you run `codegraph init` once per project.
 
 **Non-interactive (scripting / CI):**
@@ -405,6 +407,7 @@ codegraph install --yes                              # auto-detect agents, insta
 codegraph install --yes --init                       # same, then build the current project's index (one-shot bootstrap)
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --target=claude --location=local --personal  # Claude Code, personal/gitignored files only
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
 codegraph install --print-config codex               # print snippet, no file writes
 codegraph install --print-config copilot-vscode      # same, for Copilot in VS Code
@@ -414,6 +417,7 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 |---|---|---|
 | `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,...`) | prompt |
 | `--location` | `global`, `local` | prompt |
+| `--personal` | (boolean) write Claude Code project-local config to the gitignored personal files (`settings.local.json`, `CLAUDE.local.md`) instead of the team-shared ones | off |
 | `--yes` | (boolean) | prompt every step |
 | `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |

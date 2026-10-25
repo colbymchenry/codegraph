@@ -72,6 +72,13 @@ export interface RunInstallerOptions {
    * autoAllow=true, target=auto. For scripting / CI.
    */
   yes?: boolean;
+  /**
+   * Route writes to the personal / gitignored variants (Claude local
+   * installs: settings.local.json + CLAUDE.local.md) so nothing lands in
+   * the team-shared project files (issue #243). Only meaningful for
+   * Claude Code at `location=local`; ignored elsewhere.
+   */
+  personal?: boolean;
 }
 
 /**
@@ -161,6 +168,13 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // --personal is a project-scope concept: global installs already land in
+  // the user's own profile (~/.claude), so there is nothing personal-vs-shared
+  // to route and the flag is a no-op there. Surface that once, quietly.
+  if (opts.personal && location === 'global') {
+    clack.log.info('note: --personal applies to project-local installs; global installs are already user-scoped.');
+  }
+
   // Step 4: auto-allow permissions (only meaningful for Claude;
   // skipped silently by other targets).
   let autoAllow: boolean;
@@ -241,7 +255,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = target.install(location, { autoAllow, promptHook, personal: opts.personal });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -317,6 +331,13 @@ export interface RunUninstallerOptions {
   /** Remove agent configs only — leave the CLI binary installed. */
   keepCli?: boolean;
   /**
+   * Reverse a personal (`--personal`) install: remove only the
+   * personal-scope entries/files (Claude settings.local.json, CLAUDE.local.md)
+   * and leave the team-shared files untouched (issue #243). Only
+   * meaningful for Claude Code at `location=local`.
+   */
+  personal?: boolean;
+  /**
    * `__filename` of the CLI entry (dist/bin/codegraph.js) — install-method
    * detection is keyed off the running binary's real location.
    */
@@ -354,6 +375,7 @@ export interface UninstallReport {
 export function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
+  opts?: { personal?: boolean },
 ): UninstallReport[] {
   return targets.map((target) => {
     if (!target.supportsLocation(location)) {
@@ -366,7 +388,7 @@ export function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = target.uninstall(location);
+    const result = target.uninstall(location, { personal: opts?.personal });
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -508,7 +530,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = uninstallTargets(targets, location);
+  const reports = uninstallTargets(targets, location, { personal: opts.personal });
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {

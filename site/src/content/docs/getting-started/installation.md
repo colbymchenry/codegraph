@@ -25,6 +25,7 @@ The installer **wires up your agents only — it does not index your code.** Aft
 codegraph install --yes                              # auto-detect agents, install global
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --target=claude --location=local --personal  # Claude Code, personal/gitignored files only
 codegraph install --print-config codex               # print snippet, no file writes
 ```
 
@@ -32,6 +33,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 |---|---|---|
 | `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,…`) | prompt |
 | `--location` | `global`, `local` | prompt |
+| `--personal` | (boolean) write Claude Code project-local config to the gitignored personal files (`settings.local.json`, `CLAUDE.local.md`) instead of the team-shared ones | off |
 | `--yes` | (boolean) | prompt every step |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |

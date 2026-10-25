@@ -3930,3 +3930,134 @@ describe('Antigravity macOS command persistence (#1443)', () => {
     expect(installCommand()).toBe('codegraph');
   });
 });
+
+describe('Claude Code installer — --personal scope (issue #243)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+  const claude = getTarget('claude')!;
+
+  const settingsLocal = () => path.join(tmpCwd, '.claude', 'settings.local.json');
+  const settingsShared = () => path.join(tmpCwd, '.claude', 'settings.json');
+  const instructionsLocal = () => path.join(tmpCwd, 'CLAUDE.local.md');
+  const instructionsShared = () => path.join(tmpCwd, '.claude', 'CLAUDE.md');
+  const mcp = () => path.join(tmpCwd, '.mcp.json');
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('default local install keeps writing the shared paths (no personal files)', () => {
+    claude.install('local', { autoAllow: true });
+
+    expect(fs.existsSync(settingsShared())).toBe(true);
+    expect(fs.existsSync(instructionsShared())).toBe(true);
+    expect(fs.existsSync(mcp())).toBe(true);
+    // Personal variants must NOT be created unless --personal is passed.
+    expect(fs.existsSync(settingsLocal())).toBe(false);
+    expect(fs.existsSync(instructionsLocal())).toBe(false);
+  });
+
+  it('local --personal routes permissions + MCP activation to settings.local.json and instructions to CLAUDE.local.md', () => {
+    claude.install('local', { autoAllow: true, personal: true });
+
+    // The team-shared .mcp.json declaration is still written (it's a
+    // declaration, not a trust grant)…
+    const mcpCfg = JSON.parse(fs.readFileSync(mcp(), 'utf-8'));
+    expect(mcpCfg.mcpServers.codegraph).toBeDefined();
+
+    // …but activation is personal: settings.local.json opts THIS user in
+    // and carries the auto-allow permissions.
+    const local = JSON.parse(fs.readFileSync(settingsLocal(), 'utf-8'));
+    expect(local.enabledMcpjsonServers).toContain('codegraph');
+    expect(local.permissions?.allow).toContain('mcp__codegraph__*');
+
+    // Instructions land in the project-root CLAUDE.local.md.
+    const md = fs.readFileSync(instructionsLocal(), 'utf-8');
+    expect(md).toContain('## CodeGraph');
+
+    // None of the team-shared files are touched.
+    expect(fs.existsSync(settingsShared())).toBe(false);
+    expect(fs.existsSync(instructionsShared())).toBe(false);
+  });
+
+  it('local --personal never co-mingles personal permissions into a pre-existing team settings.json', () => {
+    fs.mkdirSync(path.dirname(settingsShared()), { recursive: true });
+    fs.writeFileSync(
+      settingsShared(),
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'team-hook' }] }] } }, null, 2),
+    );
+
+    claude.install('local', { autoAllow: true, personal: true });
+
+    const after = JSON.parse(fs.readFileSync(settingsShared(), 'utf-8'));
+    expect(after.permissions).toBeUndefined();
+    expect(after.enabledMcpjsonServers).toBeUndefined();
+    // The team's own hooks config is untouched.
+    expect(after.hooks.Stop[0].hooks[0].command).toBe('team-hook');
+  });
+
+  it('local --personal re-run is idempotent', () => {
+    claude.install('local', { autoAllow: true, personal: true });
+    const second = claude.install('local', { autoAllow: true, personal: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('local uninstall --personal cleans exactly the personal files and leaves the shared files untouched', () => {
+    claude.install('local', { autoAllow: true, personal: true });
+    expect(fs.existsSync(settingsLocal())).toBe(true);
+    expect(fs.existsSync(instructionsLocal())).toBe(true);
+
+    claude.uninstall('local', { personal: true });
+
+    // Personal activation + permissions are gone (settings.local.json may be
+    // removed outright, or left as {} when it held nothing else).
+    if (fs.existsSync(settingsLocal())) {
+      const s = JSON.parse(fs.readFileSync(settingsLocal(), 'utf-8'));
+      expect(s.enabledMcpjsonServers).toBeUndefined();
+      expect(s.permissions).toBeUndefined();
+    }
+    // Personal instructions file removed.
+    expect(fs.existsSync(instructionsLocal())).toBe(false);
+    // Shared files untouched: .mcp.json declaration remains, and the shared
+    // settings/instructions were never created.
+    expect(fs.existsSync(mcp())).toBe(true);
+    expect(fs.existsSync(settingsShared())).toBe(false);
+    expect(fs.existsSync(instructionsShared())).toBe(false);
+  });
+
+  it('non-personal uninstall still removes the shared files', () => {
+    claude.install('local', { autoAllow: true });
+    claude.uninstall('local');
+
+    // The .mcp.json declaration is stripped of codegraph (the empty file is
+    // left for siblings / clarity, matching the existing shared behavior).
+    const mcpCfg = JSON.parse(fs.readFileSync(mcp(), 'utf-8'));
+    expect(mcpCfg.mcpServers).toBeUndefined();
+    // Shared settings.json is emptied of the codegraph permissions.
+    const settings = JSON.parse(fs.readFileSync(settingsShared(), 'utf-8'));
+    expect(settings.permissions).toBeUndefined();
+    // Shared instructions file removed.
+    expect(fs.existsSync(instructionsShared())).toBe(false);
+  });
+
+  it('global install with --personal behaves like a normal global install (flag is local-only)', () => {
+    claude.install('global', { autoAllow: true, personal: true });
+
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'settings.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'CLAUDE.md'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(true);
+  });
+});
