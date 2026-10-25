@@ -387,6 +387,403 @@ function mymodule_form_alter(&$form, $form_state, $form_id) {}
 });
 
 // ---------------------------------------------------------------------------
+// extract() — OOP hooks (#[Hook], Drupal 10.2+)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — OOP hooks', () => {
+  it('detects a method-level #[Hook] attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Hook;
+
+use Drupal\\Core\\Entity\\EntityInterface;
+
+class MyHooks {
+  #[Hook('entity_presave')]
+  public function entityPresave(EntityInterface $entity): void {}
+}
+`;
+    const { references } = drupalResolver.extract!(
+      'web/modules/custom/mymodule/src/Hook/MyHooks.php',
+      src,
+    );
+    const hookRef = references.find((r) => r.referenceName === 'hook_entity_presave');
+    expect(hookRef).toBeDefined();
+    expect(hookRef!.fromNodeId.startsWith('method:')).toBe(true);
+  });
+
+  it('detects a class-level #[Hook] with a method: parameter', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Hook;
+
+#[Hook('form_alter', method: 'formAlter')]
+class FormHooks {
+  public function formAlter(array &$form, &$form_state): void {}
+}
+`;
+    const { references } = drupalResolver.extract!(
+      'web/modules/custom/mymodule/src/Hook/FormHooks.php',
+      src,
+    );
+    const hookRef = references.find((r) => r.referenceName === 'hook_form_alter');
+    expect(hookRef).toBeDefined();
+    expect(hookRef!.fromNodeId.startsWith('method:')).toBe(true);
+  });
+
+  it('detects a class-level #[Hook] implemented via __invoke()', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Hook;
+
+#[Hook('cron')]
+class CronHandler {
+  public function __invoke(): void {}
+}
+`;
+    const { references } = drupalResolver.extract!(
+      'web/modules/custom/mymodule/src/Hook/CronHandler.php',
+      src,
+    );
+    const hookRef = references.find((r) => r.referenceName === 'hook_cron');
+    expect(hookRef).toBeDefined();
+    expect(hookRef!.fromNodeId.startsWith('method:')).toBe(true);
+  });
+
+  it('detects every hook in a stack of attributes on one method', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Hook;
+
+class CommentHooks {
+  #[Hook('comment_insert')]
+  #[Hook('comment_update')]
+  public function commentSave($comment): void {}
+}
+`;
+    const { references } = drupalResolver.extract!(
+      'web/modules/custom/mymodule/src/Hook/CommentHooks.php',
+      src,
+    );
+    const names = references.map((r) => r.referenceName);
+    expect(names).toContain('hook_comment_insert');
+    expect(names).toContain('hook_comment_update');
+  });
+
+  it('does not emit hook refs for unrelated attributes', () => {
+    const src = `<?php
+namespace Drupal\\mymodule;
+
+class Foo {
+  #[SomeOtherAttr('x')]
+  public function bar(): void {}
+}
+`;
+    const { references } = drupalResolver.extract!('foo/foo.php', src);
+    expect(references.filter((r) => r.referenceName.startsWith('hook_'))).toHaveLength(0);
+  });
+
+  it('detects OOP hooks in a .module file alongside procedural hooks', () => {
+    const src = `<?php
+use Drupal\\Core\\Entity\\EntityInterface;
+
+/**
+ * Implements hook_node_insert().
+ */
+function mymodule_node_insert($node) {}
+
+class MyHooks {
+  #[Hook('entity_presave')]
+  public function entityPresave(EntityInterface $entity): void {}
+}
+`;
+    const { references } = drupalResolver.extract!(
+      'web/modules/custom/mymodule/mymodule.module',
+      src,
+    );
+    const names = references.map((r) => r.referenceName);
+    expect(names).toContain('hook_node_insert');
+    expect(names).toContain('hook_entity_presave');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extract() — plugin declarations (annotations + attributes)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — plugins', () => {
+  it('detects a @Block docblock annotation (pre-10.2)', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\Block;
+
+use Drupal\\Core\\Block\\BlockBase;
+
+/**
+ * @Block(
+ *   id = "my_block",
+ *   admin_label = @Translation("My block")
+ * )
+ */
+class MyBlock extends BlockBase {}
+`;
+    const { references } = drupalResolver.extract!( 'mymodule/src/Plugin/Block/MyBlock.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:Block' }));
+  });
+
+  it('detects a #[Block] PHP 8 attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\Block;
+
+use Drupal\\Core\\Block\\BlockBase;
+
+#[Block(id: 'my_block', admin_label: 'My block')]
+class MyBlock extends BlockBase {}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/Block/MyBlock.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:Block' }));
+  });
+
+  it('detects an [QueueWorker docblock annotation', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\QueueWorker;
+
+use Drupal\\Core\\Queue\\QueueWorkerBase;
+
+/**
+ * @QueueWorker(
+ *   id = "my_queue_worker",
+ *   title = @Translation("My queue worker")
+ * )
+ */
+class MyQueueWorker extends QueueWorkerBase {
+  public function processItem($item) {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/QueueWorker/MyQueueWorker.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:QueueWorker' }));
+  });
+
+  it('detects a #[Action] PHP 8 attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\Action;
+
+use Drupal\\Core\\Action\\ActionBase;
+
+#[Action(id: 'my_action', label: 'My action')]
+class MyAction extends ActionBase {
+  public function execute($entity = null) {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/Action/MyAction.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:Action' }));
+  });
+
+  it('detects a @Filter docblock annotation', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\Filter;
+
+use Drupal\\filter\\Plugin\\FilterBase;
+
+/**
+ * @Filter(
+ *   id = "my_filter",
+ *   title = @Translation("My filter")
+ * )
+ */
+class MyFilter extends FilterBase {
+  public function process($text, $langcode) {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/Filter/MyFilter.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:Filter' }));
+  });
+
+  it('detects a @ViewsField docblock annotation', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\views\\field;
+
+use Drupal\\views\\Plugin\\views\\field\\FieldPluginBase;
+
+/**
+ * @ViewsField(
+ *   id = "my_field",
+ *   title = @Translation("My field")
+ * )
+ */
+class MyField extends FieldPluginBase {
+  public function render($values) {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/views/field/MyField.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:ViewsField' }));
+  });
+
+  it('detects a #[ViewsField] PHP 8 attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\views\\field;
+
+use Drupal\\views\\Plugin\\views\\field\\FieldPluginBase;
+
+#[ViewsField(id: 'my_field', title: 'My field')]
+class MyField extends FieldPluginBase {
+  public function render($values) {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/views/field/MyField.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:ViewsField' }));
+  });
+
+  it('detects a #[ContentEntityType] PHP 8 attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Entity;
+
+use Drupal\\Core\\Entity\\ContentEntityBase;
+
+#[ContentEntityType(id: 'my_entity', label: 'My entity')]
+class MyEntity extends ContentEntityBase {}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Entity/MyEntity.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:ContentEntityType' }));
+  });
+
+  it('detects a #[RestResource] PHP 8 attribute', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\rest\\resource;
+
+use Drupal\\rest\\Plugin\\ResourceBase;
+
+#[RestResource(id: 'my_resource', label: 'My resource')]
+class MyResource extends ResourceBase {}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/rest/resource/MyResource.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:RestResource' }));
+  });
+
+  it('detects a @Layout docblock annotation', () => {
+    const src = `<?php
+namespace Drupal\\mymodule\\Plugin\\Layout;
+
+use Drupal\\Core\\Layout\\LayoutDefault;
+
+/**
+ * @Layout(
+ *   id = "my_layout",
+ *   label = @Translation("My layout")
+ * )
+ */
+class MyLayout extends LayoutDefault {}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/Plugin/Layout/MyLayout.php', src);
+    expect(references).toContainEqual(expect.objectContaining({ referenceName: 'drupal:plugin:Layout' }));
+  });
+
+  it('does not emit plugin refs for plain classes', () => {
+    const src = `<?php
+namespace Drupal\\mymodule;
+
+class PlainHelper {
+  public function help(): void {}
+}
+`;
+    const { references } = drupalResolver.extract!('mymodule/src/PlainHelper.php', src);
+    expect(references).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extract() — event subscribers (services.yml)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — event subscribers', () => {
+  it('emits a component node + class reference for one subscriber service', () => {
+    const src = `services:
+  mymodule.event_subscriber:
+    class: Drupal\\mymodule\\EventSubscriber\\MySubscriber
+    tags:
+      - { name: event_subscriber }
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'mymodule/mymodule.services.yml',
+      src,
+    );
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.kind).toBe('component');
+    expect(nodes[0]!.name).toBe('mymodule.event_subscriber');
+    expect(references).toHaveLength(1);
+    expect(references[0]!.referenceName).toBe(
+      'Drupal\\mymodule\\EventSubscriber\\MySubscriber',
+    );
+    expect(references[0]!.fromNodeId).toBe(nodes[0]!.id);
+  });
+
+  it('emits separate component nodes for multiple subscriber services', () => {
+    const src = `services:
+  custom.event_subscriber:
+    class: Drupal\\custom\\EventSubscriber\\One
+    tags:
+      - { name: event_subscriber }
+  custom.another_subscriber:
+    class: Drupal\\custom\\EventSubscriber\\Two
+    tags:
+      - { name: event_subscriber }
+`;
+    const { nodes, references } = drupalResolver.extract!('custom/custom.services.yml', src);
+    expect(nodes).toHaveLength(2);
+    expect(references).toHaveLength(2);
+  });
+
+  it('ignores services not tagged event_subscriber', () => {
+    const src = `services:
+  mymodule.plain_service:
+    class: Drupal\\mymodule\\Service\\Foo
+    tags:
+      - { name: foo }
+  mymodule.subscriber:
+    class: Drupal\\mymodule\\EventSubscriber\\MySubscriber
+    tags:
+      - { name: event_subscriber }
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'mymodule/mymodule.services.yml',
+      src,
+    );
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.name).toBe('mymodule.subscriber');
+    expect(references).toHaveLength(1);
+  });
+
+  it('ignores services without a class', () => {
+    const src = `services:
+  mymodule.abstract_subscriber:
+    class: Drupal\\mymodule\\EventSubscriber\\Base
+    abstract: true
+    tags:
+      - { name: event_subscriber }
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'mymodule/mymodule.services.yml',
+      src,
+    );
+    // abstract service has a class but no concrete use — still tagged; keep it.
+    // A service with NO class at all must be ignored:
+    const src2 = `services:
+  mymodule.no_class:
+    tags:
+      - { name: event_subscriber }
+`;
+    const r = drupalResolver.extract!('mymodule/mymodule.services.yml', src2);
+    expect(r.nodes).toHaveLength(0);
+    expect(r.references).toHaveLength(0);
+    expect(nodes).toHaveLength(1);
+  });
+
+  it('returns empty for a yml file with no services block', () => {
+    const { nodes, references } = drupalResolver.extract!(
+      'mymodule/mymodule.libraries.yml',
+      'mymodule.core:\n  css:\n    base:\n      css/base.css: {}\n',
+    );
+    expect(nodes).toHaveLength(0);
+    expect(references).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // resolve()
 // ---------------------------------------------------------------------------
 
@@ -526,6 +923,74 @@ describe('drupalResolver.resolve', () => {
     expect(resolved).not.toBeNull();
     expect(resolved!.targetNodeId).toBe('method:nojs1');
   });
+
+  it('resolves a plugin base-class FQCN to the class node', () => {
+    const baseNode = {
+      id: 'class:base1',
+      kind: 'class' as const,
+      name: 'BlockBase',
+      qualifiedName: 'BlockBase',
+      filePath: 'core/lib/Drupal/Core/Block/BlockBase.php',
+      language: 'php' as const,
+      startLine: 1,
+      endLine: 100,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'BlockBase' ? [baseNode] : []),
+    });
+    const ref = {
+      fromNodeId: 'class:plugin1',
+      referenceName: '\\Drupal\\Core\\Block\\BlockBase',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'mymodule/src/Plugin/Block/MyBlock.php',
+      language: 'php' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('class:base1');
+    expect(resolved!.confidence).toBeGreaterThanOrEqual(0.8);
+  });
+
+  it('resolves an event-subscriber class FQCN to the subscriber class', () => {
+    const subNode = {
+      id: 'class:sub1',
+      kind: 'class' as const,
+      name: 'MySubscriber',
+      qualifiedName: 'MySubscriber',
+      filePath: 'mymodule/src/EventSubscriber/MySubscriber.php',
+      language: 'php' as const,
+      startLine: 1,
+      endLine: 40,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'MySubscriber' ? [subNode] : []),
+    });
+    const ref = {
+      fromNodeId: 'drupal-service:x',
+      referenceName: 'Drupal\\mymodule\\EventSubscriber\\MySubscriber',
+      referenceKind: 'references' as const,
+      line: 2,
+      column: 0,
+      filePath: 'mymodule/mymodule.services.yml',
+      language: 'yaml' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('class:sub1');
+  });
+
+  it('claims canonical drupal:plugin: references', () => {
+    expect(drupalResolver.claimsReference!('drupal:plugin:Block')).toBe(true);
+    expect(drupalResolver.claimsReference!('drupal:plugin:ViewsField')).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -603,6 +1068,94 @@ describe('Drupal end-to-end — route node linked to controller method', () => {
     // Edge: route → build method (or class fallback)
     const edges = cg.getOutgoingEdges(route!.id);
     expect(edges.length).toBeGreaterThan(0);
+
+    cg.close();
+  });
+
+  it('creates an event-subscriber component → class edge and indexes OOP hooks/plugins', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-drupal-svc-'));
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'composer.json'),
+      JSON.stringify({ require: { 'drupal/core-recommended': '~10.5' } }),
+    );
+
+    const modDir = path.join(tmpDir, 'web', 'modules', 'custom', 'my_module');
+    const subDir = path.join(modDir, 'src', 'EventSubscriber');
+    const hookDir = path.join(modDir, 'src', 'Hook');
+    const blockDir = path.join(modDir, 'src', 'Plugin', 'Block');
+    fs.mkdirSync(subDir, { recursive: true });
+    fs.mkdirSync(hookDir, { recursive: true });
+    fs.mkdirSync(blockDir, { recursive: true });
+
+    // services.yml with one event subscriber.
+    fs.writeFileSync(
+      path.join(modDir, 'my_module.services.yml'),
+      [
+        'services:',
+        '  my_module.event_subscriber:',
+        '    class: Drupal\\my_module\\EventSubscriber\\MySubscriber',
+        '    tags:',
+        '      - { name: event_subscriber }',
+      ].join('\n') + '\n',
+    );
+
+    // Subscriber class.
+    fs.writeFileSync(
+      path.join(subDir, 'MySubscriber.php'),
+      [
+        '<?php',
+        'namespace Drupal\\my_module\\EventSubscriber;',
+        'use Symfony\\Component\\EventDispatcher\\EventSubscriberInterface;',
+        'class MySubscriber implements EventSubscriberInterface {',
+        '  public static function getSubscribedEvents() { return []; }',
+        '}',
+      ].join('\n') + '\n',
+    );
+
+    // OOP hook + plugin attribute classes.
+    fs.writeFileSync(
+      path.join(hookDir, 'CronHandler.php'),
+      [
+        '<?php',
+        'namespace Drupal\\my_module\\Hook;',
+        '#[Hook(\'cron\')]',
+        'class CronHandler {',
+        '  public function __invoke(): void {}',
+        '}',
+      ].join('\n') + '\n',
+    );
+    fs.writeFileSync(
+      path.join(blockDir, 'MyBlock.php'),
+      [
+        '<?php',
+        'namespace Drupal\\my_module\\Plugin\\Block;',
+        'use Drupal\\Core\\Block\\BlockBase;',
+        '#[Block(id: \'my_block\')]',
+        'class MyBlock extends BlockBase {}',
+      ].join('\n') + '\n',
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // Event-subscriber component node exists.
+    const components = cg.getNodesByKind('component');
+    expect(components.length).toBeGreaterThan(0);
+    const subscriber = components.find((n) => n.name === 'my_module.event_subscriber');
+    expect(subscriber).toBeDefined();
+
+    // Component → subscriber class edge exists.
+    const compEdges = cg.getOutgoingEdges(subscriber!.id).filter((e) => e.kind === 'references');
+    const reachesClass = compEdges.some((e) => cg.getNode(e.target)?.kind === 'class');
+    expect(reachesClass).toBe(true);
+
+    // OOP hook method and plugin class are indexed.
+    const methods = cg.getNodesByKind('method');
+    expect(methods.some((n) => n.name === '__invoke')).toBe(true);
+    const classes = cg.getNodesByKind('class');
+    expect(classes.some((n) => n.name === 'MyBlock')).toBe(true);
+    expect(classes.some((n) => n.name === 'CronHandler')).toBe(true);
 
     cg.close();
   });

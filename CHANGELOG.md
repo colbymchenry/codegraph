@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Drupal projects now cover more than routes and procedural hooks: class-based `#[Hook(…)]` implementations (method-level, class-level `method:`, and `__invoke()`), plugin declarations in both annotation (`@Block`) and PHP 8 attribute (`#[Block]`) styles linked to canonical `drupal:plugin:*` references, and `event_subscriber` services from `*.services.yml` are all recognized and connected to the classes that implement them. (#300)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
