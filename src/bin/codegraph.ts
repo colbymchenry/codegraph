@@ -55,6 +55,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
+import type { ModifiedDateRange } from '../project-config';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -410,6 +411,7 @@ type IndexResult = {
   durationMs: number;
   filesSkippedUnsupported?: number;
   topUnsupportedExtensions?: { ext: string; count: number }[];
+  filesSkippedByModifiedDate?: number;
 };
 
 /**
@@ -443,6 +445,11 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // #1304: files a last-modified window dropped are not missing data — say
+    // how many were filtered out before parsing.
+    if (result.filesSkippedByModifiedDate) {
+      clack.log.info(`${formatNumber(result.filesSkippedByModifiedDate)} file(s) skipped by the modified date filter`);
+    }
     // Warning-only parse failures keep indexing successful, but must be visible.
     for (const warning of parseWarnings) {
       clack.log.warn(warning.message);
@@ -673,6 +680,32 @@ async function recordIndexTelemetry(
 // =============================================================================
 
 /**
+ * Merge --modified-after / --modified-before over the project window (#1304).
+ * Returns undefined when neither flag is given, so codegraph.json decides.
+ */
+function modifiedDateFromFlags(
+  options: { modifiedAfter?: string; modifiedBefore?: string },
+): ModifiedDateRange | undefined {
+  if (options.modifiedAfter === undefined && options.modifiedBefore === undefined) return undefined;
+  const parse = (raw: string | undefined, flag: string): number | null => {
+    if (raw === undefined) return null;
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms)) {
+      error('Cannot read ' + flag + ' [' + raw + '] as a date - try 2026-01-31 or a full ISO timestamp.');
+      process.exit(1);
+    }
+    return ms;
+  };
+  const after = parse(options.modifiedAfter, '--modified-after');
+  const before = parse(options.modifiedBefore, '--modified-before');
+  if (after !== null && before !== null && after > before) {
+    error('--modified-after is later than --modified-before - that window never matches.');
+    process.exit(1);
+  }
+  return { after, before };
+}
+
+/**
  * The `init` flow — shared by `codegraph init` and `codegraph install --init`
  * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
  * index under supervision, then the post-index offers. `yes` makes every
@@ -682,7 +715,7 @@ async function recordIndexTelemetry(
  */
 async function runInit(
   projectPath: string,
-  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; modifiedAfter?: string; modifiedBefore?: string },
 ): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
@@ -745,15 +778,17 @@ async function runInit(
     // A closure so we can re-run the exact same supervised, progress-rendered
     // index if the user opts gitignored child repos in below (#1156).
     const dbPath = getDatabasePath(projectPath);
+    // #1304: flags, when given, replace the project file for this run.
+    const modifiedDate = modifiedDateFromFlags(options);
     const runIndex = async (): Promise<IndexResult> => {
       const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.verbose) {
-          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true, modifiedDate });
         }
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        const r = await cg.indexAll({ onProgress: progress.onProgress, modifiedDate });
         await progress.stop();
         return r;
       } finally {
@@ -796,7 +831,9 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('--modified-after <date>', 'Only index files last modified at or after this date (overrides codegraph.json)')
+  .option('--modified-before <date>', 'Only index files last modified at or before this date (overrides codegraph.json)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; modifiedAfter?: string; modifiedBefore?: string }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
@@ -870,7 +907,9 @@ program
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--modified-after <date>', 'Only index files last modified at or after this date (overrides codegraph.json)')
+  .option('--modified-before <date>', 'Only index files last modified at or before this date (overrides codegraph.json)')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; modifiedAfter?: string; modifiedBefore?: string }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
     // looking for one. resolveProjectPath walks up to the nearest initialized
     // ancestor, which is right for `codegraph query` run from a subdirectory,
@@ -878,6 +917,8 @@ program
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
     // `codegraph index` (cwd) may resolve upward.
     const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
+    // #1304: flags, when given, replace the project file for this run.
+    const modifiedDate = modifiedDateFromFlags(options);
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -939,7 +980,7 @@ program
           try {
             if (options.quiet) {
               // Quiet mode: no UI, just run against the freshly-recreated graph.
-              const result = await cg.indexAll();
+              const result = await cg.indexAll({ modifiedDate });
               if (!result.success) process.exit(1);
               return;
             }
@@ -951,11 +992,11 @@ program
             // renders identically. Supervision already wraps the whole command.
             const renderIndex = async (): Promise<IndexResult> => {
               if (options.verbose) {
-                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true, modifiedDate });
               }
               process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
               const progress = createShimmerProgress();
-              const r = await cg.indexAll({ onProgress: progress.onProgress });
+              const r = await cg.indexAll({ onProgress: progress.onProgress, modifiedDate });
               await progress.stop();
               return r;
             };
@@ -1130,6 +1171,8 @@ program
       const journalMode = cg.getJournalMode();
 
       const buildInfo = cg.getIndexBuildInfo();
+      // #1304: the mtime window the index was built with, if any.
+      const modifiedFilter = cg.getIndexModifiedDateFilter();
       const reindexRecommended = cg.isIndexStale();
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
@@ -1184,6 +1227,12 @@ program
             // Files with a recorded parse error and no symbols from it
             // (#2336); unchanged until the file or the parser changes.
             filesWithParseErrors: health.parseErrors.length,
+            // #1304: null when the index was built with no window at all.
+            modifiedDateFilter: modifiedFilter.after === null && modifiedFilter.before === null ? null : {
+              modifiedAfter: modifiedFilter.after !== null ? new Date(modifiedFilter.after).toISOString() : null,
+              modifiedBefore: modifiedFilter.before !== null ? new Date(modifiedFilter.before).toISOString() : null,
+              filesSkipped: modifiedFilter.filesSkipped,
+            },
           },
         }));
         cg.destroy();
@@ -1210,6 +1259,16 @@ program
       console.log();
 
       // Index stats
+      // #1304: an active last-modified window is WHY files are missing from the
+      // graph, so name it and the count it dropped before the stats below.
+      if (modifiedFilter.after !== null || modifiedFilter.before !== null) {
+        const from = modifiedFilter.after !== null ? new Date(modifiedFilter.after).toISOString() : 'start of time';
+        const to = modifiedFilter.before !== null ? new Date(modifiedFilter.before).toISOString() : 'now';
+        console.log(chalk.bold('Modified Date Filter:'));
+        console.log(`  Window:    ${from} to ${to}`);
+        console.log(`  Skipped:   ${formatNumber(modifiedFilter.filesSkipped ?? 0)} files (outside the window)`);
+        console.log();
+      }
       console.log(chalk.bold('Index Statistics:'));
       console.log(`  Files:     ${formatNumber(stats.fileCount)}`);
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);

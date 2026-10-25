@@ -25,7 +25,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, loadModifiedDateRange, PROJECT_CONFIG_FILENAME, type ModifiedDateRange } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -112,6 +112,13 @@ export interface IndexResult {
   filesSkippedUnsupported?: number;
   /** The most common unsupported extensions, biggest first. */
   topUnsupportedExtensions?: { ext: string; count: number }[];
+  /**
+   * Files the scan dropped because their filesystem mtime fell outside the
+   * modifiedAfter / modifiedBefore window (#1304). Undefined when no bound is
+   * active, which is the default: no window, nothing counted, no stat beyond
+   * the ones the pipeline already performs.
+   */
+  filesSkippedByModifiedDate?: number;
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
@@ -628,6 +635,43 @@ function loadExcludeMatcher(rootDir: string): Ignore | null {
 function loadIncludeMatcher(rootDir: string): Ignore | null {
   const patterns = loadIncludePatterns(rootDir);
   return patterns.length > 0 ? ignore().add(patterns) : null;
+}
+
+/**
+ * The file-mtime window in force for a scan (#1304): a CLI override for this
+ * run when one was passed, otherwise whatever codegraph.json holds right now.
+ * Resolved once per scan — the config loader is mtime-cached — and read lazily,
+ * like exclude, so editing the config takes effect on the next run rather than
+ * the next process.
+ */
+function resolveModifiedDateRange(rootDir: string, override?: ModifiedDateRange): ModifiedDateRange {
+  if (override) return override;
+  return loadModifiedDateRange(rootDir);
+}
+
+/**
+ * Whether a file passes the mtime window. Both bounds are inclusive; a null
+ * bound is unbounded. A file that cannot be stat-ed is KEPT: the read path
+ * reports that failure with the file name attached, whereas dropping it here
+ * would silently vanish a file the user explicitly asked for.
+ */
+function isWithinModifiedRange(absPath: string, range: ModifiedDateRange): boolean {
+  if (range.after === null && range.before === null) return true;
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(absPath).mtimeMs;
+  } catch {
+    return true;
+  }
+  if (range.after !== null && mtimeMs < range.after) return false;
+  if (range.before !== null && mtimeMs > range.before) return false;
+  return true;
+}
+
+/** Record one file the mtime window dropped (#1304). */
+function tallyModifiedSkip(stats: ScanSkipStats | undefined): void {
+  if (!stats) return;
+  stats.modifiedDateSkipped = (stats.modifiedDateSkipped ?? 0) + 1;
 }
 
 /** Glob metacharacters that end the static (literal) prefix of an `include` pattern. */
@@ -1677,8 +1721,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
  */
 export function scanDirectory(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  stats?: ScanSkipStats,
+  modified?: ModifiedDateRange
 ): string[] {
+  const range = resolveModifiedDateRange(rootDir, modified);
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
@@ -1689,6 +1736,10 @@ export function scanDirectory(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides, rootDir)) {
+        if (!isWithinModifiedRange(path.join(rootDir, filePath), range)) {
+          tallyModifiedSkip(stats);
+          continue;
+        }
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1698,7 +1749,7 @@ export function scanDirectory(
   }
 
   // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, stats, range);
 }
 
 /**
@@ -1716,6 +1767,8 @@ export function scanDirectory(
 export interface ScanSkipStats {
   /** Lowercased extension (with dot) → how many files carried it. */
   unsupportedByExtension: Map<string, number>;
+  /** Files dropped by the #1304 mtime window, when one is active. */
+  modifiedDateSkipped?: number;
 }
 
 /** Record one file the scan declined to index. */
@@ -1729,8 +1782,10 @@ function tallySkip(stats: ScanSkipStats | undefined, rel: string): void {
 export async function scanDirectoryAsync(
   rootDir: string,
   onProgress?: (current: number, file: string) => void,
-  stats?: ScanSkipStats
+  stats?: ScanSkipStats,
+  modified?: ModifiedDateRange
 ): Promise<string[]> {
+  const range = resolveModifiedDateRange(rootDir, modified);
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
@@ -1740,6 +1795,10 @@ export async function scanDirectoryAsync(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides, rootDir)) {
+        if (!isWithinModifiedRange(path.join(rootDir, filePath), range)) {
+          tallyModifiedSkip(stats);
+          continue;
+        }
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1754,7 +1813,7 @@ export async function scanDirectoryAsync(
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress, stats);
+  return scanDirectoryWalk(rootDir, onProgress, stats, range);
 }
 
 /**
@@ -1763,8 +1822,10 @@ export async function scanDirectoryAsync(
 function scanDirectoryWalk(
   rootDir: string,
   onProgress?: (current: number, file: string) => void,
-  stats?: ScanSkipStats
+  stats?: ScanSkipStats,
+  modified?: ModifiedDateRange
 ): string[] {
+  const range = resolveModifiedDateRange(rootDir, modified);
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
@@ -1847,7 +1908,9 @@ function scanDirectoryWalk(
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
-              if (isSourceFile(relativePath, overrides, rootDir)) {
+              if (!isWithinModifiedRange(fullPath, range)) {
+                tallyModifiedSkip(stats);
+              } else if (isSourceFile(relativePath, overrides, rootDir)) {
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -1868,7 +1931,9 @@ function scanDirectoryWalk(
         }
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
-          if (isSourceFile(relativePath, overrides, rootDir)) {
+          if (!isWithinModifiedRange(fullPath, range)) {
+            tallyModifiedSkip(stats);
+          } else if (isSourceFile(relativePath, overrides, rootDir)) {
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
@@ -2192,7 +2257,9 @@ export class ExtractionOrchestrator {
     // passed for a COMPLETELY fresh database, where the main thread performs
     // no reads/writes during the parse loop, so one writer applying bundles
     // in file order preserves the #1015 determinism exactly.
-    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
+    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null,
+    /** #1304 file-mtime window, already resolved by the caller. */
+    modified?: ModifiedDateRange
   ): Promise<IndexResult> {
     const tGrammar = Date.now();
     await initGrammars();
@@ -2233,18 +2300,23 @@ export class ExtractionOrchestrator {
         total: 0,
         currentFile: file,
       });
-    }, skipStats);
+    }, skipStats, modified);
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
     /** Only meaningful when nothing was indexable — see IndexResult (#1502). */
-    const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions'> => {
+    const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions' | 'filesSkippedByModifiedDate'> => {
+      const modifiedSkipped = skipStats.modifiedDateSkipped ?? 0;
       let total = 0;
       for (const n of skipStats.unsupportedByExtension.values()) total += n;
-      if (total === 0) return {};
+      if (total === 0) return modifiedSkipped > 0 ? { filesSkippedByModifiedDate: modifiedSkipped } : {};
       const top = [...skipStats.unsupportedByExtension.entries()]
         .map(([ext, count]) => ({ ext, count }))
         .sort((a, b) => b.count - a.count || a.ext.localeCompare(b.ext))
         .slice(0, 5);
-      return { filesSkippedUnsupported: total, topUnsupportedExtensions: top };
+      return {
+        filesSkippedUnsupported: total,
+        topUnsupportedExtensions: top,
+        ...(modifiedSkipped > 0 ? { filesSkippedByModifiedDate: modifiedSkipped } : {}),
+      };
     };
 
 
@@ -3581,11 +3653,15 @@ export class ExtractionOrchestrator {
       // applies the include precedence itself.)
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
+      // A path the #1304 window excludes is out of scope here exactly like an
+      // excluded one, so a watcher event cannot pull it back into the index.
+      const scopedRange = resolveModifiedDateRange(this.rootDir);
       currentFiles = unique.filter(
         (p) =>
           isSourceFile(p, overrides, this.rootDir) &&
           !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p))
+          fs.existsSync(path.join(this.rootDir, p)) &&
+          isWithinModifiedRange(path.join(this.rootDir, p), scopedRange)
       );
       trackedFiles = [];
       for (const p of unique) {
@@ -3879,10 +3955,13 @@ export class ExtractionOrchestrator {
       const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
+      // Same window as the full scan: a candidate outside it is not pending.
+      const candidateRange = resolveModifiedDateRange(this.rootDir);
       for (const filePath of candidates) {
         const tracked = this.queries.getFileByPath(filePath);
         const fullPath = path.join(this.rootDir, filePath);
-        if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
+        if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)
+          || !isWithinModifiedRange(fullPath, candidateRange)) {
           if (tracked) removed.push(filePath);
           continue;
         }

@@ -64,7 +64,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadModifiedDateRange, type ModifiedDateRange } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -142,6 +142,12 @@ export interface IndexOptions {
   verbose?: boolean;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
+  /**
+   * File last-modified window for THIS run (#1304), resolved by the caller —
+   * the CLI merges its flags over codegraph.json. Omitted (the default), the
+   * project file decides; with neither, the scan drops nothing.
+   */
+  modifiedDate?: ModifiedDateRange;
 }
 
 /**
@@ -625,6 +631,10 @@ export class CodeGraph {
         walValve.start();
       }
       try {
+        // #1304: an explicit caller-supplied window wins over the project file;
+        // otherwise whatever codegraph.json says right now (mtime-cached, read
+        // lazily like exclude, so an edit applies to the next run).
+        const modifiedRange = options.modifiedDate ?? loadModifiedDateRange(this.projectRoot);
         const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
         // Mark the index as in-flight BEFORE any writes: a run killed
@@ -655,7 +665,8 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null,
+            modifiedRange
           );
         } finally {
           if (freshDb) {
@@ -799,6 +810,17 @@ export class CodeGraph {
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
         if (result.success) this.stampWorkspaceFingerprint();
+        // The #1304 window is recorded even when nothing was skipped: status
+        // must be able to say a filter was in force, not only that zero files
+        // fell outside it. An unbounded side is stored empty, so a later run
+        // without the filter overwrites the old one.
+        if (result.success) {
+          try {
+            this.queries.setMetadata('index_modified_after', modifiedRange.after !== null ? String(modifiedRange.after) : '');
+            this.queries.setMetadata('index_modified_before', modifiedRange.before !== null ? String(modifiedRange.before) : '');
+            this.queries.setMetadata('index_modified_skipped', String(result.filesSkippedByModifiedDate ?? 0));
+          } catch { /* metadata is advisory */ }
+        }
 
         if (result.success && result.filesIndexed > 0) {
           try {
@@ -1785,6 +1807,24 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  /**
+   * The #1304 mtime window the last full index was built with, and how many
+   * files it dropped. A side is null when unbounded; both are null when no
+   * window was active at all — the zero-config default.
+   */
+  getIndexModifiedDateFilter(): { after: number | null; before: number | null; filesSkipped: number | null } {
+    const num = (key: string): number | null => {
+      const raw = this.queries.getMetadata(key);
+      if (raw == null || raw === '') return null;
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    return {
+      after: num('index_modified_after'),
+      before: num('index_modified_before'),
+      filesSkipped: num('index_modified_skipped'),
+    };
+  }
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');

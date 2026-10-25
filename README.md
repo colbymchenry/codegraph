@@ -711,6 +711,40 @@ ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
 from some result sets outright — `deprioritize` only ever changes rank. Reach
 for `exclude` when you want something gone.
 
+### Modified date range
+
+When only recent work matters — a migration, an audit, a short-lived
+investigation — narrow the index to files whose last-modified time falls inside an
+interval, instead of indexing the whole tree. Set the bounds in `codegraph.json`:
+
+```json
+{
+  "modifiedAfter": "2026-01-01",
+  "modifiedBefore": "2026-03-31"
+}
+```
+
+Both bounds are optional and both are inclusive, so either side works alone. A
+value is any date `Date.parse` understands: a bare day (`"2026-01-31"`, read as
+midnight UTC), a full timestamp (`"2026-01-31T09:00:00Z"`), or a relative phrase
+(`"7 days ago"`). Files outside the window are dropped during the scan, before any
+file is read or parsed, and the window intersects the path rules above rather than
+replacing them — `exclude`, `include` and `.gitignore` all still apply.
+
+Pass `--modified-after` and/or `--modified-before` to `codegraph init` or
+`codegraph index` to override the file for a single run:
+
+```bash
+codegraph index --modified-after 2026-01-01 --modified-before 2026-03-31
+```
+
+`codegraph status` reports the window the index was built with and how many files
+it filtered out — in `--json` output too — so a smaller graph is always explained
+instead of looking like missing code. A project with no window behaves exactly as
+before: every file is indexed and no timestamp is read. Re-index after changing the
+bounds.
+
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

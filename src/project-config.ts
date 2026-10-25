@@ -82,6 +82,20 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Optional inclusive lower bound for a file last-modified window (#1304).
+   * Accepts any date `Date.parse` understands: a full ISO timestamp
+   * ("2026-01-31T09:00:00Z"), a bare day ("2026-01-31", read as midnight UTC)
+   * or a relative phrase ("7 days ago"). Files whose filesystem mtime falls
+   * OUTSIDE the window are dropped during the scan, before any parsing, so a
+   * date-bounded migration or audit stays cheap. Applies to `init`, `index` and
+   * the full scan behind `sync`; the CLI flags `--modified-after` and
+   * `--modified-before` override it for a single run. Absent (the default) the
+   * scan behaves exactly as before: no file is dropped for its timestamp.
+   */
+  modifiedAfter?: string;
+  /** Optional inclusive upper bound for the window above. */
+  modifiedBefore?: string;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +105,8 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  modifiedAfter: number | null;
+  modifiedBefore: number | null;
 }
 
 interface CacheEntry {
@@ -114,6 +130,8 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  modifiedAfter: null,
+  modifiedBefore: null,
 });
 
 /**
@@ -167,16 +185,27 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const modified = extractModifiedRange(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    modified.after === null &&
+    modified.before === null
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return {
+    extensions,
+    includeIgnored,
+    exclude,
+    include,
+    deprioritize,
+    modifiedAfter: modified.after,
+    modifiedBefore: modified.before,
+  };
 }
 
 /**
@@ -376,6 +405,68 @@ export function loadExcludePatterns(rootDir: string): string[] {
  */
 export function loadDeprioritizePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).deprioritize;
+}
+
+/**
+ * Parse one side of the `modifiedAfter` / `modifiedBefore` pair (#1304).
+ * Returns epoch milliseconds, or null when the key is absent or unusable. A
+ * value this build cannot read is warned about and dropped: a date typo must
+ * never turn into a silently empty index, and it must never throw.
+ */
+function parseModifiedBound(value: unknown, key: string, file: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    logWarn("Ignoring " + PROJECT_CONFIG_FILENAME + " " + key + ": expected a date string", { file, value: String(value) });
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    logWarn("Ignoring " + PROJECT_CONFIG_FILENAME + " " + key + ": empty value", { file });
+    return null;
+  }
+  const ms = Date.parse(trimmed);
+  if (!Number.isFinite(ms)) {
+    logWarn("Ignoring " + PROJECT_CONFIG_FILENAME + " " + key + ": cannot read " + trimmed + " as a date", { file });
+    return null;
+  }
+  return ms;
+}
+
+/**
+ * Validate the `modifiedAfter` / `modifiedBefore` pair as one window. An
+ * inverted window (after later than before) would silently index nothing, so it
+ * is warned about and dropped whole rather than half-applied.
+ */
+function extractModifiedRange(parsed: object, file: string): { after: number | null; before: number | null } {
+  const config = parsed as ProjectConfig;
+  const after = parseModifiedBound(config.modifiedAfter, "modifiedAfter", file);
+  const before = parseModifiedBound(config.modifiedBefore, "modifiedBefore", file);
+  if (after !== null && before !== null && after > before) {
+    logWarn("Ignoring the modified date window in " + PROJECT_CONFIG_FILENAME + ": modifiedAfter is later than modifiedBefore", { file });
+    return { after: null, before: null };
+  }
+  return { after, before };
+}
+
+/** An inclusive, possibly one-sided file-mtime window; null on a side is unbounded. */
+export interface ModifiedDateRange {
+  after: number | null;
+  before: number | null;
+}
+
+/** Shared empty window: the zero-config default, and no `stat` performed at all. */
+export const NO_MODIFIED_DATE_RANGE: ModifiedDateRange = Object.freeze({ after: null, before: null });
+
+/**
+ * Load the validated mtime window for a project, mtime-cached like every other
+ * field. Returns the shared empty window when `codegraph.json` sets neither
+ * bound, which is the zero-config default and keeps the scan free of any
+ * per-file `stat`.
+ */
+export function loadModifiedDateRange(rootDir: string): ModifiedDateRange {
+  const config = loadParsedConfig(rootDir);
+  if (config.modifiedAfter === null && config.modifiedBefore === null) return NO_MODIFIED_DATE_RANGE;
+  return { after: config.modifiedAfter, before: config.modifiedBefore };
 }
 
 /**

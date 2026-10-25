@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+- `codegraph init` and `codegraph index` accept an opt-in file last-modified window. Set `modifiedAfter` and `modifiedBefore` in `codegraph.json`, or pass `--modified-after` / `--modified-before` to override it for a single run, and only files whose filesystem mtime falls inside the interval are indexed. Both bounds are optional and inclusive, the filter runs during the scan before any file is read or parsed, and the window intersects the existing path rules rather than replacing them. A project with no window set behaves exactly as before. `codegraph status` reports the window the index was built with and how many files it filtered out. (#1304)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
