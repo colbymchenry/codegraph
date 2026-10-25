@@ -537,6 +537,8 @@ codegraph unlock [path]           # Remove a stale lock file that's blocking ind
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
+codegraph deps <file>             # Compressed dependency summary for a file: imports, reverse deps, defines (--json)
+codegraph info <symbol>           # Compressed details for a symbol: depends on / used by (--json, --with-code)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)

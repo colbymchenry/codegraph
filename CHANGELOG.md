@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- New `codegraph deps <file>` command: a compressed, token-efficient dependency summary for a single file — what it imports (external packages and local modules with the symbols they pull in), what depends on it, and what it defines. `--json` emits the same data as structured JSON. Built for LLM context injection.
+- New `codegraph info <symbol>` command: a compressed profile for a single symbol — kind, location, exported/visibility, what it depends on, and what uses it. `--with-code` adds the symbol's source body; `--json` emits the data as structured JSON. Built for LLM context injection.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

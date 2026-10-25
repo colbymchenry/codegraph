@@ -16,6 +16,8 @@
  *   codegraph query <search>     Search for symbols
  *   codegraph files [options]    Show project file structure
  *   codegraph context <task>     Build context for a task
+ *   codegraph deps <file>        Compressed dependency summary for a file
+ *   codegraph info <symbol>      Compressed details for a symbol
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
@@ -73,6 +75,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
+import { buildFileDeps, buildSymbolInfo, formatFileDepsMarkdown, formatSymbolInfoMarkdown } from '../graph/compact';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -288,6 +291,23 @@ function resolveProjectPath(pathArg?: string): string {
 
   // Not found - return original path (will fail later with helpful error)
   return absolutePath;
+}
+
+/**
+ * Normalize a user-supplied file argument to the project-relative stored path
+ * the index keys on: strip `./`, collapse backslashes, and relativize an
+ * absolute path against the project root. Returns null when the argument
+ * names a file outside the project (can't be in this index).
+ */
+function normalizeRequestedFile(projectPath: string, arg: string): string | null {
+  let p = arg.trim().replace(/\\/g, '/');
+  if (path.isAbsolute(arg)) {
+    const rel = path.relative(projectPath, arg).replace(/\\/g, '/');
+    if (rel.startsWith('..')) return null;
+    p = rel;
+  }
+  p = p.replace(/^\.\//, '').replace(/^\//, '');
+  return p || null;
 }
 
 /**
@@ -1729,6 +1749,119 @@ program
       if (result.isError) process.exit(1);
     } catch (err) {
       error(`Node lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph deps <file> — a file's dependency map in one compressed shot
+ * (issue #500). What it imports (npm vs resolved local modules), what depends
+ * on it, and what it defines. Purpose-built for LLM context injection: dense
+ * markdown by default, structured JSON with --json.
+ */
+program
+  .command('deps <file>')
+  .description('Compressed dependency summary for a file: imports, reverse deps, and what it defines')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (fileArg: string, options: { path?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        const storedPath = normalizeRequestedFile(projectPath, fileArg);
+        const record = storedPath ? cg.getFile(storedPath) : null;
+        if (!record) {
+          info(`File "${fileArg}" is not in the index. Run "codegraph sync" if it was added recently, or check the path.`);
+          return;
+        }
+
+        const data = buildFileDeps(cg, storedPath!);
+
+        if (options.json) {
+          console.log(JSON.stringify({
+            path: data.path,
+            defines: data.defines,
+            callsOut: { npm: data.npmImports, local: data.localImports },
+            calledBy: data.dependents,
+          }, null, 2));
+        } else {
+          console.log(formatFileDepsMarkdown(data));
+        }
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`deps failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph info <symbol> — a symbol's compact profile (issue #500): kind,
+ * location, export/visibility, what it depends on, and what uses it. Dense
+ * markdown by default, structured JSON with --json, source with --with-code.
+ */
+program
+  .command('info <symbol>')
+  .description('Compressed details for a symbol: kind, location, what it depends on, and what uses it')
+  .option('-p, --path <path>', 'Project path')
+  .option('--with-code', "Include the symbol's source body")
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbol: string, options: { path?: string; withCode?: boolean; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
+        if (targets.length === 0) {
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          return;
+        }
+
+        const { groups } = groupDefinitions(targets);
+        const ambiguous = groups.length > 1;
+        const data = buildSymbolInfo(cg, groups[0]!, symbol, { withCode: !!options.withCode });
+        data.ambiguous = ambiguous;
+
+        if (options.json) {
+          console.log(JSON.stringify({
+            symbol: data.symbol,
+            kind: data.kind,
+            file: `${data.filePath}:${data.startLine}`,
+            exported: data.exported ?? false,
+            vis: data.visibility ?? null,
+            ambiguous: data.ambiguous,
+            dependsOn: data.dependsOn,
+            usedBy: data.usedBy,
+            truncated: data.truncated,
+            code: data.code ?? null,
+          }, null, 2));
+        } else {
+          if (ambiguous) {
+            warn(`"${symbol}" has ${groups.length} distinct definitions — showing the first (narrow with a qualified name like Class.method).`);
+          }
+          console.log(formatSymbolInfoMarkdown(data));
+        }
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`info failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
