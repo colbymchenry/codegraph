@@ -1,5 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { declarationExportedBySource } from '../export-status';
 import { classifyTsClassMember, hasStaticModifier } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
@@ -63,13 +64,15 @@ export const javascriptExtractor: LanguageExtractor = {
     const params = getChildByField(node, 'parameters');
     return params ? getNodeText(params, source) : undefined;
   },
-  isExported: (node, _source) => {
+  isExported: (node, source) => {
     let current = node.parent;
     while (current) {
       if (current.type === 'export_statement') return true;
       current = current.parent;
     }
-    return false;
+    // See typescript.ts: the parent walk misses `export { x }`, `export default
+    // x` and the CommonJS forms; the shared scan closes them (#1721).
+    return declarationExportedBySource(node, source, 'javascript', 'name');
   },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {

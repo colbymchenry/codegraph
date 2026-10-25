@@ -24,6 +24,7 @@ import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestFile, isTestPath } from '../search/query-utils';
 import { inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
+import { CJS_EXPORT, ESM_EXPORT_OR_DECLARE_GLOBAL, IMPORT_STATEMENT } from '../extraction/export-status';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
 /**
@@ -1452,8 +1453,11 @@ const ES_IMPORT_LANGUAGES = new Set<string>([...ESM_FAMILY, 'vue', 'svelte', 'as
  * rather than a classic script. Line-anchored and followed by a name, brace,
  * star or quote, so a dynamic `import(` and the word inside a comment or string
  * do not match.
+ *
+ * Re-exported from the shared export-status module (#1721), which owns the one
+ * implementation of these forms.
  */
-const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
+const HAS_IMPORT_STATEMENT = IMPORT_STATEMENT;
 
 /**
  * Anything the file could offer another file, in every form the extractor's own
@@ -1467,8 +1471,8 @@ const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
  * module` / `declare global` body), so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
-const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
-const HAS_CJS_EXPORT = /\bmodule\.exports\b|\bexports\s*[.[]/;
+const HAS_ESM_EXPORT = ESM_EXPORT_OR_DECLARE_GLOBAL;
+const HAS_CJS_EXPORT = CJS_EXPORT;
 
 /**
  * Per-context memo of "this file is a module that exports nothing", asked once

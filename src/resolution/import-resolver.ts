@@ -11,6 +11,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
+import { isDefaultOnlyExportInSource } from '../extraction/export-status';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
 import { makeLineAt } from './synth-utils';
@@ -321,6 +322,18 @@ function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: Re
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
 function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
   const direct = idx.byName.get(name);
+  // A declaration the shared export-status scan flagged exported because of a
+  // later `export default name` is the module's DEFAULT, not a named export:
+  // `import { Widget } from './x'` names nothing when `x.ts` writes `class
+  // Widget {}` + `export default Widget`. Answering it made the import resolve
+  // where a full index leaves it unresolved, so a sync that dropped the
+  // default kept the edge (#2744). Read lazily, like `clauseAliases`: only a
+  // file that actually writes `export default` pays for the source read.
+  if (direct && isDefaultOnlyExport(filePath, name, context)) {
+    // Fall through: the name is not a named export, and no clause alias will
+    // introduce it either (a clause alias IS a named export).
+    return undefined;
+  }
   if (direct) return direct;
   if (idx.clauseAliases === undefined) {
     // Bind names introduced by a local export clause to their declarations, so
@@ -340,11 +353,41 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
   return idx.clauseAliases.get(name);
 }
 
+/**
+ * Whether `name` is only the file's default export, not a named one — the
+ * per-file answer behind {@link exportedByName}'s guard. Memoized per file as
+ * the set of names the file exports ONLY as its default; a file with no
+ * `export default` statement never reads its source.
+ */
+function isDefaultOnlyExport(filePath: string, name: string, context: ResolutionContext): boolean {
+  let memo = DEFAULT_ONLY_EXPORTS.get(context);
+  if (!memo) DEFAULT_ONLY_EXPORTS.set(context, (memo = new Map()));
+  let names = memo.get(filePath);
+  if (names === undefined) {
+    names = new Set<string>();
+    const source = context.readFile(filePath);
+    // No `export default` at all: nothing can be default-only. Cheap string
+    // test first, so the common file costs no masking.
+    if (source && /\bexport\s+default\b/.test(source)) {
+      for (const node of context.getNodesInFile(filePath)) {
+        if (node.isExported && isDefaultOnlyExportInSource(source, node.language, node.name)) {
+          names.add(node.name);
+        }
+      }
+    }
+    memo.set(filePath, names);
+  }
+  return names.has(name);
+}
+
+const DEFAULT_ONLY_EXPORTS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
 export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
   exportedSymbolMemos.delete(context);
   fileExportIndexes.delete(context);
+  DEFAULT_ONLY_EXPORTS.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
   PROJECT_FOLDER_SUFFIXES.delete(context);

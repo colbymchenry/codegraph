@@ -38,6 +38,7 @@ import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
+import { commonJsExportNameFromAssignment } from './export-status';
 import { commonJsRequireRefs } from './commonjs-requires';
 import {
   getAllFrameworkResolvers,
@@ -3497,32 +3498,8 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * A top-level binding exported by a LATER statement rather than at its
-   * declaration: `export default NAME`, `export { NAME }`, `export { NAME as
-   * default }`. The declaration's own `isExported` (an `export_statement`
-   * ancestor) cannot see these, so a store written as `const useStore =
-   * create(…)` + `export default useStore` read as unexported and its actions
-   * were never extracted. One anchored regex over the file source; JS-family
-   * callers only.
+   * Property-key text with surrounding quotes stripped (`'foo'` → `foo`).
    */
-  private isExportedLater(name: string): boolean {
-    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return false;
-    // Unescaped, a `$` in the name (`items$`, `$store`) is a line-end anchor,
-    // not the character. Escaped as the kernel's `regex::escape` does, so
-    // both paths decide the same.
-    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Inside `{ … }` the name is bounded by a character that can't continue
-    // an identifier, not by `\b`, which takes a `$` for a separator: it can't
-    // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
-    // kernel spells it, since the kernel's `\w` is Unicode.
-    const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
-      'm'
-    );
-    return re.test(this.source);
-  }
-
-  /** Property-key text with surrounding quotes stripped (`'foo'` → `foo`). */
   private objectKeyName(key: SyntaxNode): string {
     return getNodeText(key, this.source).replace(/^['"`]|['"`]$/g, '');
   }
@@ -4000,8 +3977,8 @@ export class TreeSitterExtractor {
             // Scoped to EXPORTED consts to exclude inline-object noise
             // (`ctx.set({...})`) the object-method skip deliberately avoids —
             // where "exported" includes the two-statement form `const useStore
-            // = create(…)` … `export default useStore` (see isExportedLater),
-            // the shape most React Native stores are written in.
+            // = create(…)` … `export default useStore`, which the extractor's
+            // own isExported now sees (the shared export-status scan, #1721).
             const objectOfFns =
               valueNode && (valueNode.type === 'object' || valueNode.type === 'object_expression')
                 ? valueNode
@@ -4015,7 +3992,7 @@ export class TreeSitterExtractor {
             // normal body walk (extracting those consts), not be skipped here.
             const hasInlineFns = !!objectOfFns && this.objectHasInlineFunctions(objectOfFns);
             const extractObjectMethods =
-              (isExported || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
+              isExported && !!objectOfFns && hasInlineFns;
 
             // RTK Query: `createApi`/`injectEndpoints` define endpoints as
             // object-literal properties whose values are `build.query/mutation(...)`
@@ -7304,13 +7281,13 @@ export class TreeSitterExtractor {
     const right = getChildByField(assignment, 'right');
     if (!right || right.startIndex !== value.startIndex || right.endIndex !== value.endIndex) return null;
     const left = getChildByField(assignment, 'left');
-    if (!left || left.type !== 'member_expression') return null;
-    const object = getChildByField(left, 'object');
-    const property = getChildByField(left, 'property');
-    if (!object || !property || property.type !== 'property_identifier') return null;
-    const objectText = getNodeText(object, this.source);
-    if (objectText !== 'exports' && objectText !== 'module.exports') return null;
-    return getNodeText(property, this.source);
+    if (!left) return null;
+    // The dot form (`exports.x`, `module.exports.x`) is a member_expression;
+    // the bracket form (`exports["x"]`) is a subscript_expression. Both are
+    // the same export and both name the value — the shared helper reads the
+    // property out of either (#1721).
+    if (left.type !== 'member_expression' && left.type !== 'subscript_expression') return null;
+    return commonJsExportNameFromAssignment(getNodeText(left, this.source));
   }
 
   /**

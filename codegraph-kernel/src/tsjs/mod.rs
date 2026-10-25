@@ -9,6 +9,7 @@
 //! parity gate fails. Positions are emitted in UTF-16 code units (what
 //! web-tree-sitter reports), see util::col16.
 
+mod export_status;
 mod extractors;
 mod fnref;
 use crate::textutil as util;
@@ -21,6 +22,7 @@ use crate::buffers::{
 use crate::ids;
 use crate::langs;
 use std::collections::{HashMap, HashSet};
+use std::cell::OnceCell;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -217,6 +219,11 @@ pub struct Walker<'t> {
     object_path_owners: HashMap<u32, String>,
     /// ownsObjectLiterals: false for a generated or minified bundle (#2300).
     owns_objects: bool,
+    /// The comment-stripped and fully masked sources the export-status scan
+    /// reads (#1721), computed on first use. The TS side memoizes the same two
+    /// forms; a file with no blind-form declaration never pays for the mask.
+    masked_src: OnceCell<String>,
+    stripped_src: OnceCell<String>,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -268,6 +275,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         vue_store_file: None,
         object_path_owners: HashMap::new(),
         owns_objects: !util::is_generated_file(file_path) && !util::is_minified_content(file_path, source),
+        masked_src: OnceCell::new(),
+        stripped_src: OnceCell::new(),
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -1054,7 +1063,9 @@ impl<'t> Walker<'t> {
     }
 
     /// isExported: walk the parent chain for an export_statement, then ask
-    /// whether a `declare module '…'` / `declare global` body exports it.
+    /// whether a `declare module '…'` / `declare global` body exports it, then
+    /// fall back to the shared source scan for the forms the walk is blind to
+    /// (#1721). Mirrors typescriptExtractor/javascriptExtractor.isExported.
     fn is_exported(&self, node: Node) -> bool {
         let mut cur = node.parent();
         while let Some(p) = cur {
@@ -1063,7 +1074,66 @@ impl<'t> Walker<'t> {
             }
             cur = p.parent();
         }
-        is_ambient_export(node)
+        if is_ambient_export(node) {
+            return true;
+        }
+        self.declaration_exported_by_source(node)
+    }
+
+    /// Mirrors `declarationExportedBySource`: whether a declaration node is
+    /// exported by a form the AST walk cannot see — a later `export { … }` /
+    /// `export default`, or a CommonJS assignment.
+    ///
+    /// Comments and strings are blanked before the scan (see
+    /// `export_status::masked_js_source`): a `// export { x }` in a comment or
+    /// an `'export { x }'` in a string is not an export. The CommonJS bracket
+    /// form keeps its string (`exports["x"]`), so that scan reads the
+    /// comment-stripped source instead. Mirrors the TS side exactly.
+    fn declaration_exported_by_source(&self, node: Node) -> bool {
+        let names = self.declaration_names(node);
+        if names.is_empty() {
+            return false;
+        }
+        let masked = self.masked_src.get_or_init(|| export_status::masked_js_source(self.src));
+        let stripped = self
+            .stripped_src
+            .get_or_init(|| export_status::comment_stripped_js_source(self.src));
+        for name in names {
+            if export_status::is_exported_later_in_source(masked, &name) {
+                return true;
+            }
+            if export_status::is_common_js_exported_name(stripped, &name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mirrors `declarationNames`: the names a declaration node binds — one for
+    /// `function f` / `class C`, one per declarator for `const a = 1, b = 2`.
+    fn declaration_names(&self, node: Node) -> Vec<String> {
+        let mut names = Vec::new();
+        if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+            for i in 0..node.named_child_count() {
+                let Some(declarator) = node.named_child(i) else { continue };
+                if declarator.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(name_node) = declarator.child_by_field_name("name") {
+                    if name_node.kind() == "identifier" {
+                        names.push(self.text(name_node).to_string());
+                    }
+                }
+            }
+            return names;
+        }
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let text = self.text(name_node);
+            if export_status::is_identifier(text) {
+                names.push(text.to_string());
+            }
+        }
+        names
     }
 
     fn has_keyword_child(&self, node: Node, kw: &str) -> bool {

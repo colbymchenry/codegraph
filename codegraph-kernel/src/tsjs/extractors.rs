@@ -141,24 +141,21 @@ impl<'t> Walker<'t> {
     /// `exports.NAME = <node>` / `module.exports.NAME = <node>` — or None for
     /// any other assignment. The node must be the assignment's whole
     /// right-hand side. Mirrors TreeSitterExtractor.commonJsExportName.
+    ///
+    /// The dot form (`exports.x`) is a member_expression; the bracket form
+    /// (`exports["x"]`) is a subscript_expression. Both are the same export and
+    /// both name the value — the shared helper reads the property out of
+    /// either (#1721).
     fn common_js_export_name(&self, assignment: Node<'t>, value: Node<'t>) -> Option<String> {
         let right = assignment.child_by_field_name("right")?;
         if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
             return None;
         }
         let left = assignment.child_by_field_name("left")?;
-        if left.kind() != "member_expression" {
+        if !matches!(left.kind(), "member_expression" | "subscript_expression") {
             return None;
         }
-        let object = left.child_by_field_name("object")?;
-        let property = left.child_by_field_name("property")?;
-        if property.kind() != "property_identifier" {
-            return None;
-        }
-        if !matches!(self.text(object), "exports" | "module.exports") {
-            return None;
-        }
-        Some(self.text(property).to_string())
+        super::export_status::common_js_export_name_from_assignment(self.text(left))
     }
 
     // --- reactComponentHoc / extractReactComponentNode (#841) --------------------
@@ -576,36 +573,6 @@ impl<'t> Walker<'t> {
 
     // --- extractVariable (TS/JS branch) ------------------------------------------------
 
-    /// A top-level binding exported by a LATER statement rather than at its
-    /// declaration: `export default NAME`, `export { NAME }`, `export { NAME as
-    /// default }`. The declaration's own `is_exported` (an `export_statement`
-    /// ancestor) cannot see these. One anchored regex over the file source.
-    /// Mirrors TreeSitterExtractor.isExportedLater.
-    pub(super) fn is_exported_later(&self, name: &str) -> bool {
-        if name.is_empty()
-            || !name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$').unwrap_or(false)
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-        {
-            return false;
-        }
-        let n = regex::escape(name);
-        // `R` (CRLF mode): JS's multiline `^`/`$` treat `\r` as a line end as
-        // well as `\n`; `(?m)` alone sees only `\n`, and would miss `export
-        // default NAME;\r\n` on every Windows autocrlf checkout.
-        // Inside `{ … }` the name is bounded by a character that can't
-        // continue an identifier, not by `\b`, which takes a `$` for a
-        // separator. The crate has no look-around, so the bounds consume.
-        // ASCII classes, not `\w`: this crate's `\w` is Unicode, JS's is not.
-        let pattern = format!(
-            r"(?mR)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{(?:[^}}]*[^0-9A-Za-z_$}}])?{n}(?:[^0-9A-Za-z_$}}][^}}]*)?\}})",
-            n = n
-        );
-        match regex::Regex::new(&pattern) {
-            Ok(re) => re.is_match(self.src),
-            Err(_) => false,
-        }
-    }
-
     /// Returns the initializers it walked under the symbol they declare — a
     /// constant's or a variable's (#693), a component wrapper's — whose fn-ref
     /// candidates that walk already took for the symbol (the caller's scan of
@@ -711,11 +678,12 @@ impl<'t> Walker<'t> {
                 .map(|o| self.object_has_inline_functions(o))
                 .unwrap_or(false);
             // "Exported" includes the two-statement form `const useStore =
-            // create(…)` … `export default useStore` (is_exported_later), the
-            // shape most React Native stores are written in. Mirrors
-            // TreeSitterExtractor.isExportedLater.
+            // create(…)` … `export default useStore`, which is_exported now
+            // sees directly (the shared export-status scan, #1721), the shape
+            // most React Native stores are written in. Mirrors
+            // TreeSitterExtractor.extractVariable.
             let extract_object_methods =
-                (is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
+                is_exported && object_of_fns.is_some() && has_inline_fns;
 
             let rtk_endpoints = match value {
                 Some(v) if v.kind() == "call_expression" => self.find_rtk_endpoints_object(v),

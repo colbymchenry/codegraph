@@ -1,6 +1,7 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { hasFlowPragma } from '../grammars';
+import { declarationExportedBySource } from '../export-status';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 /**
@@ -263,7 +264,7 @@ export const typescriptExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isExported: (node, _source) => {
+  isExported: (node, source) => {
     // Walk the parent chain to find an export_statement ancestor.
     // This correctly handles deeply nested nodes like arrow functions
     // inside variable declarations: `export const X = () => { ... }`
@@ -273,7 +274,13 @@ export const typescriptExtractor: LanguageExtractor = {
       if (current.type === 'export_statement') return true;
       current = current.parent;
     }
-    return isAmbientExport(node);
+    if (isAmbientExport(node)) return true;
+    // The parent walk is exact for the declaration forms and blind to the rest:
+    // `const x = …; export { x }`, `export default x`, and every CommonJS form
+    // (`module.exports`, `exports.x`, `exports["x"]`) left this false. The
+    // shared source scan closes those (#1721) — one implementation, also used
+    // by the kernel's mirror and the resolver's per-file check.
+    return declarationExportedBySource(node, source, 'typescript', 'name');
   },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {
