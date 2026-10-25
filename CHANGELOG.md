@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Qwen Code is now supported by `codegraph install`, detected and configured out of the box. The MCP server entry and the auto-allow permissions both go in `~/.qwen/settings.json` (or `./.qwen/settings.json` for a project-local install), with the CodeGraph guidance block in `~/.qwen/QWEN.md` (or `./QWEN.md` at the project root). Sibling settings and MCP servers are preserved across re-installs, and `codegraph uninstall` removes exactly what install wrote (#2510).
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

@@ -516,6 +516,127 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
+  it('qwen: install writes settings.json (mcpServers.codegraph) and the QWEN.md block (#2510)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(result.files.some((f) => f.path === qwenMd)).toBe(true);
+    expect(fs.existsSync(qwenMd)).toBe(true);
+    expect(fs.readFileSync(qwenMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('qwen: local install writes ./.qwen/settings.json and the project-root ./QWEN.md block (#2510)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.qwen/settings.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/QWEN.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'QWEN.md'))).toBe(true);
+  });
+
+  it('qwen: autoAllow writes the permissions allowlist into settings.json, not a permissions.json (#2510)', () => {
+    const qwen = getTarget('qwen')!;
+    qwen.install('global', { autoAllow: true });
+
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.permissions.allow).toContain('mcp__codegraph__*');
+    // Qwen reads one settings file; a separate permissions.json would be
+    // invisible to it (the stale v1 patch wrote one — issue #2510).
+    expect(fs.existsSync(path.join(tmpHome, '.qwen', 'permissions.json'))).toBe(false);
+  });
+
+  it('qwen: install preserves pre-existing settings (model.name survives)', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      model: { name: 'qwen3-coder-plus' },
+      mcpServers: { other: { command: 'other' } },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.model?.name).toBe('qwen3-coder-plus');
+    expect(after.mcpServers?.other).toEqual({ command: 'other' });
+    expect(after.mcpServers?.codegraph).toBeDefined();
+  });
+
+  it('qwen: uninstall strips codegraph and its permissions, leaving sibling settings intact', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      model: { name: 'qwen3-coder-plus' },
+      mcpServers: { other: { command: 'other' } },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.model?.name).toBe('qwen3-coder-plus');
+    expect(after.mcpServers?.other).toEqual({ command: 'other' });
+    expect(after.mcpServers?.codegraph).toBeUndefined();
+    expect(after.permissions).toBeUndefined();
+  });
+
+  it('qwen: uninstall reports settings.json once, as removed (#2510)', () => {
+    const qwen = getTarget('qwen')!;
+    qwen.install('global', { autoAllow: true });
+
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const result = qwen.uninstall('global');
+    const forSettings = result.files.filter((f) => f.path === settings);
+
+    // MCP entry and permissions share one file, so the path must appear
+    // exactly once — a second entry would be a spurious not-found.
+    expect(forSettings).toHaveLength(1);
+    expect(forSettings[0].action).toBe('removed');
+  });
+
+  it('qwen: uninstall on a clean slate reports not-found and writes nothing', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+
+    const result = qwen.uninstall('global');
+
+    const forSettings = result.files.filter((f) => f.path === settings);
+    expect(forSettings).toHaveLength(1);
+    expect(forSettings[0].action).toBe('not-found');
+    expect(fs.existsSync(settings)).toBe(false);
+  });
+
+  it('qwen: uninstall strips a leftover QWEN.md codegraph block, keeping user content', () => {
+    const qwen = getTarget('qwen')!;
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    fs.mkdirSync(path.dirname(qwenMd), { recursive: true });
+    fs.writeFileSync(qwenMd, `# My personal Qwen context\n\nAlways respond concisely.\n\n${LEGACY_BLOCK}\n`);
+
+    qwen.uninstall('global');
+
+    const body = fs.readFileSync(qwenMd, 'utf-8');
+    expect(body).toContain('# My personal Qwen context');
+    expect(body).toContain('Always respond concisely.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('qwen: printConfig returns the settings.json snippet and touches nothing', () => {
+    const qwen = getTarget('qwen')!;
+    const out = qwen.printConfig('global');
+    expect(out).toContain(path.join(tmpHome, '.qwen', 'settings.json'));
+    expect(JSON.parse(out.slice(out.indexOf('{'))).mcpServers.codegraph).toEqual({
+      type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'],
+    });
+    expect(fs.existsSync(path.join(tmpHome, '.qwen', 'settings.json'))).toBe(false);
+  });
+
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
