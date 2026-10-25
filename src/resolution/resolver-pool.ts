@@ -165,12 +165,14 @@ export class ResolverPool {
     }
     if (size === null) return null;
     // #2527: take this pool's workers out of the run-wide thread budget the
-    // parse pool has just returned. A grant below 2 is below the pool's own
-    // worth-its-boot threshold (see resolvePoolSize) — hand the slots back and
-    // stay sequential rather than booting a worker pool for one thread.
+    // parse pool has just returned. If the budget can only afford one worker —
+    // below this pool's own worth-its-boot threshold (see resolvePoolSize) —
+    // hand the slots back and stay sequential rather than booting a pool for
+    // one thread. An explicit CODEGRAPH_RESOLVE_WORKERS of 1 is the user's own
+    // request and is still honored (granted === size).
     const lease = threadBudget ? threadBudget.lease(size) : undefined;
     const granted = lease ? lease.size : size;
-    if (granted < 2) {
+    if (granted < 2 && granted < size) {
       lease?.release();
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
         console.error(`[pool-timing] pool disabled: thread budget granted ${granted} of ${size} requested`);
