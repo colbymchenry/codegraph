@@ -54,9 +54,9 @@ export interface ParseTask {
 }
 
 /** Default upper bound on the pool size derived from the core count. */
-const DEFAULT_PARSE_POOL_CAP = 8;
+const DEFAULT_PARSE_POOL_CAP = 32;
 /** Hard ceiling on pool size regardless of an explicit env override. */
-const MAX_PARSE_POOL_SIZE = 16;
+const MAX_PARSE_POOL_SIZE = 64;
 /** Parses a worker performs before it's recycled to reclaim WASM heap. */
 const DEFAULT_RECYCLE_INTERVAL = 250;
 /** Base per-parse timeout; scaled up for large files by the caller's formula. */
@@ -104,8 +104,8 @@ const CRASH_BUDGET = 100;
  * Resolve the pool size from the `CODEGRAPH_PARSE_WORKERS` override and the
  * machine's core count.
  *   - explicit `0` or `1` → 1 worker (the old single-worker path; the rollback).
- *   - explicit `N` → N, clamped to [1, 16].
- *   - unset / blank / non-numeric → `clamp(cores - 1, 1, 8)` (leave a core for
+ *   - explicit `N` → N, clamped to [1, 64].
+ *   - unset / blank / non-numeric → `clamp(cores - 1, 1, 32)` (leave a core for
  *     the main thread + UI; never zero — parsing always needs a worker).
  */
 /**

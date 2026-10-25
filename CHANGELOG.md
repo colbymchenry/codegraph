@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Full indexing reads files in larger parallel batches (50 at a time instead of 10) and can run more parse workers on many-core machines (up to 64 when you set `CODEGRAPH_PARSE_WORKERS`, and 32 by default on machines with that many cores), so indexing a large project uses more of the machine's cores. (#1214)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

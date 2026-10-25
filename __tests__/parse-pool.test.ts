@@ -112,15 +112,15 @@ describe('resolveParsePoolSize', () => {
   });
   it('honors a numeric override, capped at the hard ceiling', () => {
     expect(resolveParsePoolSize('4', 8)).toBe(4);
-    expect(resolveParsePoolSize('999', 8)).toBe(16);
+    expect(resolveParsePoolSize('999', 8)).toBe(64);
   });
-  it('defaults to clamp(cores-1, 1, 8) when unset/blank/non-numeric', () => {
+  it('defaults to clamp(cores-1, 1, 32) when unset/blank/non-numeric', () => {
     expect(resolveParsePoolSize(undefined, 8)).toBe(7);
     expect(resolveParsePoolSize('', 8)).toBe(7);
     expect(resolveParsePoolSize('abc', 8)).toBe(7);
     expect(resolveParsePoolSize(undefined, 1)).toBe(1);   // never zero
     expect(resolveParsePoolSize(undefined, 2)).toBe(1);   // leave a core
-    expect(resolveParsePoolSize(undefined, 64)).toBe(8);  // never above the default cap
+    expect(resolveParsePoolSize(undefined, 64)).toBe(32); // never above the default cap
   });
 });
 

@@ -42,8 +42,10 @@ export { oversizeStamp };
 /**
  * Number of files to read in parallel during indexing.
  * File reads are I/O-bound; batching overlaps I/O wait with CPU parse work.
+ * Raised from 10 to 50 (#1214 P4): on a 10k-file project the old batch size
+ * cost 1,000 I/O round-trips, each gated by the backpressure window.
  */
-const FILE_IO_BATCH_SIZE = 10;
+const FILE_IO_BATCH_SIZE = 50;
 
 /**
  * How many files the `sync()` reconcile processes between cooperative yields to
