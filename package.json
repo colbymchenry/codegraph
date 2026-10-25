@@ -20,7 +20,7 @@
     "ui"
   ],
   "scripts": {
-    "build": "tsc && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "build": "tsc && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\" && npm run build-man",
     "build:ui": "cd ui && npm run build && cd .. && node scripts/check-ui-build.mjs",
     "build:lib": "cd ui && npm run build:lib",
     "preuninstall": "node dist/bin/uninstall.js",
@@ -32,7 +32,8 @@
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
-    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
+    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build-man": "mkdir -p dist/man && node dist/bin/codegraph.js man --output dist/man/codegraph.1"
   },
   "keywords": [
     "code-intelligence",

@@ -24,6 +24,7 @@ npm run test:eval       # only __tests__/evaluation/
 npm run eval            # build then run __tests__/evaluation/runner.ts via tsx
 
 npm run cli             # build then run the local dist binary
+`npm run build` also generates the man page `dist/man/codegraph.1` (`npm run build-man`, from `src/bin/man-page.ts`); tests are in `__tests__/cli-man-page.test.ts`.
 
 # Single test file / pattern
 npx vitest run __tests__/installer-targets.test.ts

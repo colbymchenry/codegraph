@@ -51,6 +51,7 @@ try {
 } catch { /* cache is best-effort */ }
 
 import { Command } from 'commander';
+import { renderManPage } from './man-page';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
@@ -2951,6 +2952,28 @@ program
     console.log(packageJson.version);
   });
 
+/**
+ * codegraph man
+ *
+ * Emit the codegraph.1 roff man page on stdout. An --output path writes it to
+ * a file instead. The page is generated from the live commander tree -- the
+ * same one --help reads -- so every non-hidden command lands in the page.
+ *
+ * Regenerate a stale page by running
+ * `codegraph man --output codegraph.1` .
+ */
+program
+  .command('man', { hidden: true })
+  .description('Emit the codegraph.1 man page (stdout or --output <path>)')
+  .option('-o, --output <path>', 'Write the roff source to this file instead of stdout')
+  .action((options: { output?: string }) => {
+    const page = renderManPage(program, { version: packageJson.version });
+    if (options.output) {
+      require('fs').writeFileSync(options.output, page, 'utf-8');
+    } else {
+      process.stdout.write(page);
+    }
+  });
 // Parse and run
 program.parse();
 
