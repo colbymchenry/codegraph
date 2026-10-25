@@ -2,7 +2,7 @@
 
 Nested Codex guidance under `docs/`. Loaded with the repo-root `AGENTS.md` when cwd is under `docs/` (Codex walks root to cwd; shared `project_doc_max_bytes` budget).
 
-Root `AGENTS.md` already carries the non-negotiable retrieval principles (adapt-the-tool, explore budgets, end-to-end synthesis). This file holds the longer validation methodology and Excalidraw worked example that were moved out of root to fit the budget.
+Root `AGENTS.md` already carries the non-negotiable retrieval guards; the evidence behind them, the explore-budget tables, the dynamic-dispatch channel inventory and pointers to this file live in `.claude/skills/codegraph-retrieval/SKILL.md`. This file holds the longer validation methodology and Excalidraw worked example that were moved out of root to fit the budget.
 
 ### Validation methodology (REQUIRED for every new language/framework)
 
