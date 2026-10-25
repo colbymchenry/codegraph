@@ -43,6 +43,7 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { cfmlIncludeFile, isCfmlTemplatePath } from './cfml-includes';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -3722,28 +3723,14 @@ export class ReferenceResolver {
    * in another case, so a single file that matches ignoring case counts too.
    */
   private resolveCfmlIncludePath(ref: UnresolvedRef): ResolvedRef | null {
-    const written = ref.referenceName.trim().replace(/\\/g, '/');
-    const fromRoot = written.startsWith('/');
-    const parts = fromRoot ? [] : ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
-    for (const seg of written.split('/')) {
-      if (seg === '' || seg === '.') continue;
-      if (seg === '..') {
-        if (parts.length === 0) return null; // above the project root
-        parts.pop();
-      } else {
-        parts.push(seg);
-      }
-    }
-    const fileName = parts[parts.length - 1];
-    if (!fileName) return null;
-    const wanted = parts.join('/');
-    const files = this.context.getNodesByLowerName(fileName.toLowerCase()).filter((n) => n.kind === 'file');
-    const exact = files.find((n) => n.filePath === wanted);
-    if (exact) return { original: ref, targetNodeId: exact.id, confidence: fromRoot ? 0.85 : 0.95, resolvedBy: 'file-path' };
-    const folded = files.filter((n) => n.filePath.toLowerCase() === wanted.toLowerCase());
-    return folded.length === 1
-      ? { original: ref, targetNodeId: folded[0]!.id, confidence: fromRoot ? 0.8 : 0.9, resolvedBy: 'file-path' }
-      : null;
+    const target = cfmlIncludeFile(ref.referenceName, ref.filePath, this.context);
+    if (!target) return null;
+    return {
+      original: ref,
+      targetNodeId: target.file.id,
+      confidence: target.fromRoot ? (target.caseFolded ? 0.8 : 0.85) : (target.caseFolded ? 0.9 : 0.95),
+      resolvedBy: 'file-path',
+    };
   }
 
   /**
@@ -4437,10 +4424,6 @@ export class ReferenceResolver {
  * (`formlistshared.cfm`, `../shared/helpers.cfm`, `/app/x.cfm`), not a
  * cfscript `import com.foo.Bar;` or `import "java:…";` (#2651).
  */
-function isCfmlTemplatePath(name: string): boolean {
-  return !name.includes(':') && (name.includes('/') || name.includes('\\') || /\.(?:cfml?|cfc|cfs)$/i.test(name.trim()));
-}
-
 /** The project-relative directory holding `p` ('' for the project root). */
 function goDirOf(p: string): string {
   const dir = path.posix.dirname(p.replace(/\\/g, '/'));

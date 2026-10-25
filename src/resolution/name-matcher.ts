@@ -26,6 +26,7 @@ import { inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
+import { cfmlComponentIncludes, cfmlScopeIncludes } from './cfml-includes';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -7733,20 +7734,51 @@ function isVbUnqualifiedName(ref: UnresolvedRef, receiver: string | null, contex
 const CFML_CHAINS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
 /**
- * Whether a bare CFML call written in a component can mean `method`: its own
- * component's, or one of the components it `extends` (read from source — a
- * dotted path matched against the indexed files by its longest suffix). A
- * call in a `.cfm` template is not judged: a ColdBox view runs inside the
- * renderer's scope. coldbox's `now()` — the built-in — went to a date
- * helper's `now` 228 times; chained `.then()` calls arrive bare too, and keep
- * their method.
+ * Whether a CFML call written in a component can mean `candidate` — a method
+ * of the component, or a `function` a component-level include mixed in
+ * (#2651). A receiver-less call is a call on `this`, as is an explicit
+ * `this.` one, so it reaches the component's own members and those of the
+ * components it `extends` and of every template its body `include`s; a
+ * `super.` call reaches the same chain except its own file. A call on any
+ * other receiver is judged elsewhere. A call in a `.cfm` template is not
+ * judged: a ColdBox view runs inside the renderer's scope. coldbox's
+ * `now()` — the built-in — went to a date helper's `now` 228 times; chained
+ * `.then()` calls arrive bare too, and keep their method.
  */
-function isCfmlMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (!/\.cfc$/i.test(ref.filePath) || !hasNoReceiverOnLine(ref, context)) return true;
-  return cfmlChain(ref.filePath, context).has(method.filePath);
+function isCfmlCallInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/\.cfc$/i.test(ref.filePath)) return true;
+  const receiver = cfmlCallReceiver(ref, context);
+  if (receiver === 'other') return true;
+  const chain = cfmlRefChain(ref, context);
+  return receiver === 'super'
+    ? candidate.filePath !== ref.filePath && chain.has(candidate.filePath)
+    : chain.has(candidate.filePath);
 }
 
-/** A component file and every component file it extends. */
+/**
+ * The files whose functions a call at `ref` can name: the component's chain
+ * (see cfmlChain), plus the templates included directly in the calling
+ * function — a function-local include puts its functions in that function's
+ * scope only, so it widens this call and not the component's members.
+ */
+function cfmlRefChain(ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  let memo = CFML_REF_CHAINS.get(context);
+  if (!memo) CFML_REF_CHAINS.set(context, (memo = new WeakMap()));
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  let chain = cfmlChain(ref.filePath, context);
+  const from = ref.fromNodeId ? context.getNodeById?.(ref.fromNodeId) : null;
+  if (from && from.filePath === ref.filePath && (from.kind === 'method' || from.kind === 'function')) {
+    const included = cfmlScopeIncludes(ref.filePath, from.qualifiedName, context);
+    if (included.length > 0) chain = new Set([...chain, ...included]);
+  }
+  memo.set(ref, chain);
+  return chain;
+}
+
+const CFML_REF_CHAINS = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Set<string>>>();
+
+/** A component file, every component file it extends, and the templates any of them includes. */
 function cfmlChain(file: string, context: ResolutionContext): Set<string> {
   let memo = CFML_CHAINS.get(context);
   if (!memo) CFML_CHAINS.set(context, (memo = new Map()));
@@ -7762,9 +7794,44 @@ function cfmlChain(file: string, context: ResolutionContext): Set<string> {
     const head = text.slice(0, text.search(/\bfunction\b|<cffunction/i) >>> 0 || text.length);
     const ext = /\bextends\s*=\s*["']?([\w.\/:-]+)["']?/i.exec(head)?.[1];
     if (ext) queue.push(...cfmlComponentFiles(ext, f, context));
+    // A template a component's body includes contributes its functions as
+    // the component's own members (the CFML mixin pattern, #2651).
+    if (/\.cfc$/i.test(f)) queue.push(...cfmlComponentIncludes(f, context));
   }
   memo.set(file, chain);
   return chain;
+}
+
+type CfmlCallReceiver = 'this' | 'super' | 'none' | 'other';
+
+const CFML_CALL_RECEIVERS = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, CfmlCallReceiver>>();
+
+/** The receiver a bare CFML call names at its call site (#2651). */
+function cfmlCallReceiver(ref: UnresolvedRef, context: ResolutionContext): CfmlCallReceiver {
+  let memo = CFML_CALL_RECEIVERS.get(context);
+  if (!memo) CFML_CALL_RECEIVERS.set(context, (memo = new WeakMap()));
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  const answer = readCfmlCallReceiver(ref, context);
+  memo.set(ref, answer);
+  return answer;
+}
+
+function readCfmlCallReceiver(ref: UnresolvedRef, context: ResolutionContext): CfmlCallReceiver {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return 'none';
+  const lower = line.toLowerCase();
+  const name = ref.referenceName.toLowerCase();
+  let start = -1;
+  if (lower.startsWith(name, ref.column)) start = ref.column;
+  else if (ref.column >= name.length && lower.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
+  else start = lower.search(new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`));
+  // Not on its line at all: a link of a chain written across lines.
+  if (start < 0) return 'other';
+  const before = line.slice(0, start);
+  if (/(?:^|[^\w$])this\s*\.\s*$/i.test(before)) return 'this';
+  if (/(?:^|[^\w$])super\s*\.\s*$/i.test(before)) return 'super';
+  return /\.\s*$/.test(before) ? 'other' : 'none';
 }
 
 /** The indexed `.cfc` files a component path names: the same directory first, else the longest path suffix. */
@@ -11919,7 +11986,7 @@ export function matchByExactName(
     !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
     !(vbUnqualified && !isVbNestedTypeInScope(n, ref, context)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
-    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
+    !(cfmlBare && (n.kind === 'method' || n.kind === 'function') && !isCfmlCallInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
@@ -26962,7 +27029,7 @@ export function matchFuzzy(
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !isKotlinNumberBitwise(n, ref) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
-    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
+    !(cfmlBare && (n.kind === 'method' || n.kind === 'function') && !isCfmlCallInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
     !(vbScoped && !isVbMemberInScope(n, ref, context)) &&

@@ -47,6 +47,7 @@ import { overrideFilter } from './override-parameters';
 import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 import { isTestPath } from '../search/query-utils';
+import { cfmlComponentIncludes } from './cfml-includes';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1388,6 +1389,47 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
     seen.add(key);
     edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine,
       metadata: { synthesizedBy: 'go-method-contains' } });
+  }
+  return edges;
+}
+
+/**
+ * CFML mixin `contains` edges (#2651). A component may pull a shared template
+ * into its body — `include "formlistshared.cfm";` or `<cfinclude …>` at
+ * component scope — and CFML makes that template's functions members of the
+ * component (and of every subclass), which is how `this.checkRightsPartPrepare()`
+ * and a subclass's unqualified call reach them. Extraction is per file and
+ * cannot see the included template's declarations, so the membership is
+ * synthesized here: each component → the functions declared at the top level
+ * of every template its body includes, following a template's own file-scope
+ * includes too. An include inside a function mixes nothing in and is skipped
+ * by cfmlComponentIncludes.
+ */
+async function cfmlMixinContainsEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  let scanned = 0;
+  for (const cls of queries.iterateNodesByKindIn('class', ['cfml', 'cfscript'])) {
+    if ((++scanned & 63) === 0) await onYield();
+    for (const file of cfmlComponentIncludes(cls.filePath, ctx)) {
+      for (const fn of ctx.getNodesInFile(file)) {
+        if (fn.kind !== 'function') continue;
+        // A closure is contained by its enclosing function, not the template.
+        const topLevel = queries.getIncomingEdges(fn.id, ['contains'])
+          .some((e) => queries.getNodeById(e.source)?.kind === 'file');
+        if (!topLevel) continue;
+        const key = `${cls.id}>${fn.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: cls.id,
+          target: fn.id,
+          kind: 'contains',
+          line: fn.startLine,
+          metadata: { synthesizedBy: 'cfml-mixin' },
+        });
+      }
+    }
   }
   return edges;
 }
@@ -5077,6 +5119,9 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
+  // A CFML component that includes a template gains its functions as members.
+  if (/\.(?:cfc|cfm|cfs)$/i.test(filePath) &&
+    /<cfinclude\b|\b(?:cfinclude|include)\s*(?:\(|template\s*=|["'])/i.test(content)) return true;
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
   if (/\.go$/.test(filePath)) return true;
@@ -5192,6 +5237,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'angularTemplateEdges', gate: (has) => has('typescript'), run: (_q, c, y) => angularTemplateEdges(c, y) },
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
+  // A CFML component-level include makes the included template's functions
+  // the component's members (the mixin pattern, #2651).
+  { name: 'cfmlMixinEdges', gate: (has) => has('cfml', 'cfscript'), run: (q, c, y) => cfmlMixinContainsEdges(q, c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
 ];
 
