@@ -2313,12 +2313,13 @@ export class ExtractionOrchestrator {
       // (493s vs 369s) — main + store-worker don't fill the second core.
       // #2527: the parse pool leases from the run-wide thread budget. Its
       // `minimum` pins the DEFAULT budget at this pool's own un-capped size, so
-      // the budget can only ever cap the combined total of the pools alive at
-      // once — never shrink a single pool below the size it gets today (1 parse
-      // worker measured 34% slower on a 2-core envelope, so that would be a
-      // real regression). When an explicit cap is already fully held (a query
-      // pool in a daemon), the lease is empty and parsing stays on the main
-      // thread rather than exceeding the ceiling.
+      // a plain index (this pool alone) keeps the size it gets today — the
+      // budget only caps the COMBINED total of pools alive at once (1 parse
+      // worker measured 34% slower on a 2-core envelope, so shrinking a lone
+      // pool would be a real regression). When another pool in this process (a
+      // query pool in a daemon) already holds slots the lease is smaller; when
+      // it is empty, parsing stays on the main thread rather than exceeding
+      // the ceiling.
       const wantPoolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
       const threadLimit = resolveProjectThreadLimit({
         projectRoot: this.rootDir,

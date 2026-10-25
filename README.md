@@ -764,10 +764,12 @@ codegraph index --verbose          # prints the resolved pool sizes at startup
 ```
 
 With nothing set, the default is your cores minus two — the main thread and the
-OS always keep somewhere to run — and no pool is ever shrunk below the size it
-would have had on its own. A value that isn't a positive integer is ignored and
-the next source in the list decides, so a typo can't silently pin indexing to one
-worker.
+OS always keep somewhere to run — and that default is never below the parse
+pool's own size, so a plain index gets the same workers it always did. Pools that
+are alive at the same time (a watcher sync inside a running MCP server) share the
+budget, and a pool that cannot get enough of it falls back rather than going over
+the cap. A value that isn't a positive integer is ignored and the next source in
+the list decides, so a typo can't silently pin indexing to one worker.
 
 For finer control, the individual pools still have their own knobs. These
 override the per-pool sizing; `maxThreads` / `--threads` cap the total on top.

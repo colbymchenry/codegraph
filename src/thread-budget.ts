@@ -19,7 +19,8 @@
  *   2. `maxThreads` in the project's `codegraph.json`
  *   3. `CODEGRAPH_MAX_THREADS` in the environment
  *   4. default — `cores - 2` so the main thread and the OS always keep room,
- *      never below the constructing pool's own un-capped size.
+ *      and never below the constructing pool's own un-capped request, so a
+ *      plain `index` keeps the pool size it gets today even on a small machine.
  *
  * The ceiling applies to the pools that are alive *together*, not to a fixed
  * three-way split: an `index` run never builds a query pool, and its parse pool
@@ -52,11 +53,15 @@ export interface ThreadLimitInput {
   /** `os.availableParallelism()` for the process. */
   availableParallelism: number;
   /**
-   * Floor for the DEFAULT only. A pool's own un-capped request, so that
-   * applying the shared budget can never take a pool below the size it gets
-   * today on a small machine. Explicit limits (`--threads`, `maxThreads`,
-   * `CODEGRAPH_MAX_THREADS`) are absolute and ignore this — the user asked for
-   * a cap, so they get the cap.
+   * Floor for the DEFAULT only. A pool's own un-capped request, so the resolved
+   * default is never smaller than the pool would size itself to on a small
+   * machine — a plain `index` (that pool alone) keeps today's size.
+   *
+   * It does not promise a grant while ANOTHER pool holds slots: the combined
+   * ceiling still wins, and a pool that cannot get enough slots falls back
+   * (in-process parsing / sequential resolution) rather than going over it.
+   * Explicit limits (`--threads`, `maxThreads`, `CODEGRAPH_MAX_THREADS`) are
+   * absolute and ignore this — the user asked for a cap, so they get the cap.
    */
   minimum?: number | undefined;
 }
