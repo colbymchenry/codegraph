@@ -54,6 +54,8 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { registerProject, unregisterProject } from '../project-registry';
+import type { ProjectSummary } from '../project-summary';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -702,6 +704,10 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
+      // Backfill the discovery registry: projects initialized by an earlier
+      // release (or by the library API) are otherwise invisible to
+      // `codegraph projects`.
+      registerProject(projectPath);
       clack.log.warn(`Already initialized in ${projectPath}`);
       clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
       try {
@@ -780,6 +786,7 @@ async function runInit(
 
     clack.outro('Done');
     cg.destroy();
+    registerProject(projectPath);
   } catch (err) {
     clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
@@ -812,6 +819,9 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
+        // Drop a registry entry whose index has already gone (deleted by hand),
+        // so `codegraph projects` stops advertising it.
+        unregisterProject(projectPath);
         warn(`CodeGraph is not initialized in ${projectPath}`);
         return;
       }
@@ -837,6 +847,7 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = CodeGraph.openSync(projectPath);
       cg.uninitialize();
+      unregisterProject(projectPath);
 
       // Clean up any git sync hooks we installed (no-op if none / not a repo).
       try {
@@ -1296,6 +1307,95 @@ program
       cg.destroy();
     } catch (err) {
       error(`Failed to get status: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Human-readable status for one project in the `projects` listing.
+ */
+function describeProjectStatus(project: ProjectSummary): string {
+  const dash = getGlyphs().dash;
+  switch (project.status) {
+    case 'up-to-date':
+      return chalk.green('up to date');
+    case 'out-of-date': {
+      const changes = project.pendingChanges;
+      const parts: string[] = [];
+      if (changes) {
+        if (changes.added > 0) parts.push(`${formatNumber(changes.added)} added`);
+        if (changes.modified > 0) parts.push(`${formatNumber(changes.modified)} modified`);
+        if (changes.removed > 0) parts.push(`${formatNumber(changes.removed)} removed`);
+      }
+      return chalk.yellow(`out of date ${dash} ${parts.join(', ')} (run "codegraph sync")`);
+    }
+    case 'unknown':
+      return chalk.yellow('unknown (the change check timed out)');
+    case 'not-indexed':
+      return chalk.red(`not indexed ${dash} run "codegraph init" to rebuild, or "codegraph uninit" to remove this entry`);
+    case 'error':
+      return chalk.red(`failed to open ${dash} ${project.error ?? 'unknown error'}`);
+  }
+}
+
+/**
+ * codegraph projects
+ */
+program
+  .command('projects')
+  .description('List every CodeGraph project registered on this machine')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { json?: boolean }) => {
+    const [{ readProjectsRegistry }, { summarizeProject }] = await Promise.all([
+      import('../project-registry'),
+      import('../project-summary'),
+    ]);
+    const registry = readProjectsRegistry();
+
+    try {
+      const projects: ProjectSummary[] = [];
+      for (const entry of registry.projects) {
+        projects.push(await summarizeProject(entry.path, { registeredAt: entry.registeredAt }));
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify({ registryPath: registry.path, error: registry.error, projects }, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold('\nCodeGraph Projects\n'));
+
+      if (registry.error) {
+        warn(`The project registry at ${registry.path} ${registry.error}. Run "codegraph init" in a project to rebuild it.`);
+        console.log();
+        return;
+      }
+      if (projects.length === 0) {
+        info('No CodeGraph projects are registered yet.');
+        info('Run "codegraph init" inside a project to register it.');
+        console.log();
+        return;
+      }
+
+      for (const project of projects) {
+        console.log(chalk.cyan(project.projectPath));
+        console.log(`  Status:  ${describeProjectStatus(project)}`);
+        if (project.lastIndexedAt) {
+          console.log(`  Indexed: ${project.lastIndexedAt}`);
+        }
+        if (project.stats) {
+          console.log(
+            `  Files:   ${formatNumber(project.stats.fileCount)}   ` +
+            `Nodes: ${formatNumber(project.stats.nodeCount)}   ` +
+            `Edges: ${formatNumber(project.stats.edgeCount)}`
+          );
+        }
+        console.log();
+      }
+      console.log(chalk.dim(`Registry: ${registry.path}`));
+      console.log();
+    } catch (err) {
+      error(`Failed to list projects: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

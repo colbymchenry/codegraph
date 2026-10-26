@@ -12,10 +12,11 @@
  *   - Anti-patterns (don't re-verify with grep; don't hand-reconstruct flows)
  *
  * Keep it tight. The agent reads this every session — long instructions
- * burn tokens. The DEFAULT MCP surface is `codegraph_explore` ALONE (see
- * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
- * tools (node/search/callers/…) stay defined and are re-enablable via
- * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
+ * burn tokens. The DEFAULT MCP surface is `codegraph_explore` plus
+ * `codegraph_projects` (see DEFAULT_MCP_TOOLS in tools.ts) — reference only
+ * those tools here. The other tools (node/search/callers/…) stay defined and
+ * are re-enablable via CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents,
+ * so don't name them.
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
@@ -31,9 +32,9 @@ verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
 round-trips than reading files yourself.
 
-## One tool: codegraph_explore — use it instead of reading files
+## codegraph_explore — use it instead of reading files
 
-There is a single tool, \`codegraph_explore\`, and it is Read-equivalent. It
+There is one query tool, \`codegraph_explore\`, and it is Read-equivalent. It
 takes either a natural-language question or a bag of symbol/file names and
 returns the **verbatim, line-numbered source** of the relevant symbols
 grouped by file — the same \`<n>\\t<line>\` shape \`Read\` gives you, safe to
@@ -55,6 +56,7 @@ calls; a grep/read exploration is dozens.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read. Suggested call counts are advisory only, NOT a quota; extra calls are never rejected or rate-limited.
+- **Which projects are indexed?** → \`codegraph_projects\` lists every project registered on this machine with its path, last index time and whether it is up to date. Pass one of those paths as \`projectPath\` to any codegraph tool to query that project.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.
 - Explore matches names and indexed code words lexically, not by meaning; an empty result reports word matches and may suggest indexed candidate names to retry with \`codegraph_explore\`.
@@ -99,13 +101,16 @@ summary — replacing a grep + Read loop with one round-trip.
 This server started somewhere with no \`.codegraph/\` of its own, so there is no
 default project — but the tools are available and work **per project**:
 
+- Call \`codegraph_projects\` to list every project registered on this machine,
+  then pass one of those paths as \`projectPath\` to \`codegraph_explore\` (and
+  any other codegraph tool). Codegraph resolves the nearest \`.codegraph/\` at or
+  above that path and answers from it — for as many projects as you like in one
+  session.
 - To query a project that HAS a \`.codegraph/\` index (e.g. a service inside a
-  monorepo, or a second repo), pass its path as \`projectPath\` to
-  \`codegraph_explore\` (and any other codegraph tool). Codegraph resolves the
-  nearest \`.codegraph/\` at or above that path and answers from it — for as many
-  projects as you like in one session.
-- For a project with no \`.codegraph/\`, use your built-in tools (Read/Grep/Glob)
-  for that project. Indexing is the user's decision — don't run it yourself, but
-  if it comes up they can run \`codegraph init\` in a project to enable codegraph
-  there (a new index is picked up live, no restart).
+  monorepo, or a second repo) that isn't in that list, pass its path as
+  \`projectPath\` directly. For a project with no \`.codegraph/\`, use your
+  built-in tools (Read/Grep/Glob) for that project. Indexing is the user's
+  decision — don't run it yourself, but if it comes up they can run
+  \`codegraph init\` in a project to enable codegraph there (a new index is
+  picked up live, no restart).
 `;

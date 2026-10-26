@@ -469,7 +469,7 @@ npm install -g @colbymchenry/codegraph
 }
 ```
 
-<sub>One wildcard auto-approves every CodeGraph tool — `codegraph_explore` is the only one listed by default, but if you re-enable others via `CODEGRAPH_MCP_TOOLS` they're already permitted, no prompt.</sub>
+<sub>One wildcard auto-approves every CodeGraph tool — `codegraph_explore` and `codegraph_projects` are the only ones listed by default, but if you re-enable others via `CODEGRAPH_MCP_TOOLS` they're already permitted, no prompt.</sub>
 
 </details>
 
@@ -480,6 +480,7 @@ CodeGraph's MCP server delivers its usage guidance to your agent **automatically
 
 - **Answer structural questions directly with CodeGraph** — it *is* the pre-built index, so a grep/read loop just repeats work it already did. Treat the returned source as already read.
 - **Reach for `codegraph_explore` for almost anything** — "how does X work", a flow/"how does X reach Y", or surveying an area. One call returns the relevant symbols' verbatim source grouped by file, the call paths between them (dynamic-dispatch hops included), and a blast-radius summary. Name a file or symbol in the query to read its current line-numbered source.
+- **Ask `codegraph_projects` which projects exist** — it lists every project registered on the machine with its path, last index time and freshness, so a session that starts outside a repo can pick one to query by `projectPath`.
 - **Trust the results — don't re-verify with grep**, and check the staleness banner after edits.
 - Works **per project**: query any project that has a `.codegraph/` index by passing `projectPath` — so a monorepo where only some services are indexed, or a second repo, works in one session. A path with no index returns clean guidance to use built-in tools; indexing stays your decision.
 
@@ -533,6 +534,7 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
+codegraph projects                # List every initialized project, its stats and freshness (--json)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
@@ -581,15 +583,18 @@ fi
 
 ## MCP Tools
 
-When running as an MCP server, CodeGraph exposes a **single tool** — `codegraph_explore`. Measured agent behavior showed that one strong tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
+When running as an MCP server, CodeGraph exposes **two tools by default** — `codegraph_explore` for answering questions, and `codegraph_projects` for discovering which projects exist to ask about. Measured agent behavior showed that one strong query tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
 
 | Tool | Purpose |
 |------|---------|
 | `codegraph_explore` | Answer almost any question in one call — "how does X work", a flow ("how does X reach Y"), or surveying an area — returning the relevant symbols' verbatim source grouped by file, plus the call paths between them and a blast-radius summary. Surfaces dynamic-dispatch hops (callbacks, React re-render, interface→impl) grep can't follow. Name a file or symbol in the query to read its current line-numbered source, the same shape the Read tool gives you. |
+| `codegraph_projects` | List every CodeGraph project registered on this machine — its path, when it was last indexed, file/node/edge counts, and whether the index is up to date with the working tree — so an agent working outside a project can find the ones it can query by `projectPath`. |
 
 The other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) stay fully functional but **unlisted by default** — everything they return already arrives inline on `codegraph_explore` (its blast-radius section, the relationship map, a symbol's body as its callee list). Re-enable any of them for the MCP surface with the `CODEGRAPH_MCP_TOOLS` environment variable (e.g. `CODEGRAPH_MCP_TOOLS=explore,node,search,callers`), or use their CLI equivalents (`codegraph node` / `query` / `callers` / `callees` / `impact` / `files` / `status`).
 
-Even when the server's own root has no `.codegraph/` index, the tools stay available: pass `projectPath` to query any indexed project — a sub-service in a monorepo, or a second repo — in the same session. A path that has no index returns clean guidance to use built-in tools instead, so nothing fails loudly, and indexing stays your decision.
+Projects are registered by `codegraph init` and removed by `codegraph uninit`, in a machine-wide registry at `~/.codegraph/projects.json` (set `CODEGRAPH_PROJECTS_PATH` to use a different file). The same listing is available from the CLI as `codegraph projects` (add `--json` for scripting).
+
+Even when the server's own root has no `.codegraph/` index, the tools stay available: call `codegraph_projects` to see what is indexed, then pass `projectPath` to query any of them — a sub-service in a monorepo, or a second repo — in the same session. A path that has no index returns clean guidance to use built-in tools instead, so nothing fails loudly, and indexing stays your decision.
 
 ---
 

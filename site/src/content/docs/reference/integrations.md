@@ -52,7 +52,7 @@ Optionally auto-allow CodeGraph's tools in `~/.claude/settings.json`:
 }
 ```
 
-One wildcard auto-approves every CodeGraph tool. The server lists a single tool by default — `codegraph_explore` — but if you re-enable others via the `CODEGRAPH_MCP_TOOLS` environment variable, they're already permitted with no prompt.
+One wildcard auto-approves every CodeGraph tool. The server lists two tools by default — `codegraph_explore` and `codegraph_projects` — but if you re-enable others via the `CODEGRAPH_MCP_TOOLS` environment variable, they're already permitted with no prompt.
 
 :::tip
 Cursor launches MCP subprocesses with the wrong working directory. The installer handles this for you by injecting a `--path` argument; if you wire Cursor up by hand, pass the project path explicitly.

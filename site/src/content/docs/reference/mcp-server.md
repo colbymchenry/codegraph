@@ -9,13 +9,18 @@ CodeGraph runs as a [Model Context Protocol](https://modelcontextprotocol.io/) s
 codegraph serve --mcp
 ```
 
-When a `.codegraph/` index exists, the agent gets the tool below. In a workspace with **no** index, the server announces itself inactive and lists **no** tools — the agent works normally with its built-in tools, and indexing stays your decision.
+The tools stay available even when the server's root has **no** `.codegraph/` index — a monorepo root, or a session that started before you ran `codegraph init`. In that case call `codegraph_projects` to list the projects that are indexed, then pass one of their paths as `projectPath`. A path with no index returns clean guidance to use built-in tools, and indexing stays your decision.
 
-## One tool by default: `codegraph_explore`
+## Two tools by default: `codegraph_explore` and `codegraph_projects`
 
-By default the server exposes a **single tool**, `codegraph_explore`. It's Read-equivalent: give it a natural-language question or a bag of symbol and file names, and it returns the **verbatim, line-numbered source** of the relevant symbols grouped by file — the same shape the `Read` tool gives you — plus the call paths between them (including dynamic-dispatch hops like callbacks, React re-render, and JSX children that grep can't follow) and a blast-radius summary of what depends on them. One call usually answers the whole question.
+By default the server exposes two tools:
 
-Exposing a single strong tool is deliberate. Measured agent behavior showed that one well-aimed tool steers agents to a direct answer better than a menu of narrower ones — fewer mis-picks — and agents reach for it both when answering questions and while editing code.
+- **`codegraph_explore`** is Read-equivalent: give it a natural-language question or a bag of symbol and file names, and it returns the **verbatim, line-numbered source** of the relevant symbols grouped by file — the same shape the `Read` tool gives you — plus the call paths between them (including dynamic-dispatch hops like callbacks, React re-render, and JSX children that grep can't follow) and a blast-radius summary of what depends on them. One call usually answers the whole question.
+- **`codegraph_projects`** lists every CodeGraph project registered on the machine — its path, when it was last indexed, file/node/edge counts, and whether the index is up to date with the working tree — so an agent working outside a project can discover the ones it can query by `projectPath`.
+
+Keeping the query surface to one strong tool is deliberate. Measured agent behavior showed that one well-aimed tool steers agents to a direct answer better than a menu of narrower ones — fewer mis-picks — and agents reach for it both when answering questions and while editing code. `codegraph_projects` is the one question `codegraph_explore` cannot answer at all: which *other* projects exist.
+
+Projects are registered by `codegraph init` and removed by `codegraph uninit`, in a machine-wide registry at `~/.codegraph/projects.json` (set `CODEGRAPH_PROJECTS_PATH` to use a different file). The same listing is available from the CLI as `codegraph projects`.
 
 ## The other tools
 

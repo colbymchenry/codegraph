@@ -12,6 +12,7 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
 codegraph status [path]           # Show statistics (--json)
+codegraph projects                # List every initialized project, its stats and freshness (--json)
 codegraph ui [path]               # Open the browser viewer (not released yet — see below)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
@@ -34,6 +35,8 @@ The MCP server (`codegraph serve --mcp`) is launched automatically by your agent
 ## init, index, and sync
 
 `codegraph init` creates the local `.codegraph/` directory **and** builds the full graph in one step. (The old `-i`/`--index` flag is now a no-op, accepted only so existing scripts don't break.) After that the file watcher keeps the graph current automatically — `index` (a full rebuild from scratch) and `sync` (an incremental update) are only needed when the watcher is disabled or you're scripting against the index outside an agent session.
+
+`init` also registers the project in a machine-wide list, and `uninit` removes it. `codegraph projects` prints that list — each project's path, last index time, file/symbol/link counts, and whether the index is up to date with the working tree — with `--json` for scripting. The list lives at `~/.codegraph/projects.json`; set `CODEGRAPH_PROJECTS_PATH` to keep it somewhere else. The same list is available over MCP as `codegraph_projects`.
 
 ## Query commands
 

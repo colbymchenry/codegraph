@@ -65,6 +65,7 @@ import {
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
+import type { ProjectSummary } from '../project-summary';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
@@ -1859,6 +1860,15 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_projects',
+    description: 'List every CodeGraph project registered on this machine — path, last index time, file/node/edge counts, and whether the index is up to date with the working tree. Use it to discover which projects you can query by passing a path as projectPath.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_files',
     description: 'Indexed file tree with language + symbol counts. Faster than Glob for project layout.',
     inputSchema: {
@@ -1940,17 +1950,19 @@ export function getStaticTools(): ToolDefinition[] {
 }
 
 /**
- * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
- * — the single tool that reliably earns its place: one capped call returns the
- * verbatim source of the relevant symbols grouped by file. Every other tool is a
- * narrower slice of what explore already does, and presence itself steers
- * mis-picks, so they are no longer LISTED to agents.
+ * The MCP tools served by DEFAULT (short names). Pared to `codegraph_explore`
+ * alone plus `codegraph_projects`: explore is the one query tool that earns its
+ * place (one capped call returns the verbatim source of the relevant symbols
+ * grouped by file), and projects is the one question explore cannot answer at
+ * all — which OTHER projects exist to pass as `projectPath`. Every other tool
+ * is a narrower slice of explore, and presence itself steers mis-picks, so they
+ * are no longer LISTED to agents.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
  * status) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const DEFAULT_MCP_TOOLS = new Set(['explore', 'projects']);
 
 /** realpath when the path exists, the path itself otherwise — never throws. */
 function canonicalPath(p: string): string {
@@ -2244,9 +2256,9 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
-    // No explicit allowlist → the default 4-tool surface (see
-    // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
-    // default entirely, so any defined tool can be re-enabled.
+    // No explicit allowlist → the default surface (see DEFAULT_MCP_TOOLS for
+    // the evidence). An allowlist replaces the default entirely, so any
+    // defined tool can be re-enabled.
     let visible = allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
       : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
@@ -2296,7 +2308,12 @@ export class ToolHandler {
         'codegraph_node',
       ]);
       if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
-        visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
+        // Discovery is not a query tool: its usefulness does not shrink with
+        // repo size, and on a small project it is often the only way to learn
+        // other projects exist.
+        visible = visible.filter(
+          t => TINY_REPO_CORE_TOOLS.has(t.name) || t.name === 'codegraph_projects'
+        );
       }
 
       return visible.map(tool => {
@@ -2919,6 +2936,12 @@ export class ToolHandler {
       // surface rejects ablated tools defensively even if a client cached them.
       if (!this.isToolAllowed(toolName)) {
         return this.errorResult(`Tool ${toolName} is disabled via CODEGRAPH_MCP_TOOLS`);
+      }
+      // Project discovery is not project-scoped: it must answer on a server
+      // with NO default project — the case that makes it worth calling — so it
+      // is handled before getCodeGraph() resolves one.
+      if (toolName === 'codegraph_projects') {
+        return await this.handleProjects();
       }
       // Cross-cutting input validation. All tools accept an optional
       // `projectPath` and most accept either `query`, `task`, or
@@ -8270,6 +8293,109 @@ export class ToolHandler {
       lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
+  }
+
+  /**
+   * One project's index state, as `codegraph_projects` prints it.
+   */
+  private describeProjectStatus(project: ProjectSummary): string {
+    switch (project.status) {
+      case 'up-to-date':
+        return 'up to date';
+      case 'out-of-date': {
+        const changes = project.pendingChanges;
+        const parts: string[] = [];
+        if (changes) {
+          if (changes.added > 0) parts.push(`${changes.added} added`);
+          if (changes.modified > 0) parts.push(`${changes.modified} modified`);
+          if (changes.removed > 0) parts.push(`${changes.removed} removed`);
+        }
+        return `out of date — ${parts.join(', ')}; run \`codegraph sync\``;
+      }
+      case 'unknown':
+        return 'unknown (the change check timed out — do not assume it is current)';
+      case 'not-indexed':
+        return 'not indexed — the registry entry outlived its `.codegraph/`; ' +
+          'run `codegraph init` to rebuild or `codegraph uninit` to remove it';
+      case 'error':
+        return `failed to open: ${project.error ?? 'unknown error'}`;
+      default:
+        return project.status;
+    }
+  }
+
+  /**
+   * Handle codegraph_projects — discovery across every initialized project.
+   *
+   * Reached before `getCodeGraph()` (see `execute`): listing projects is most
+   * useful on a server with no default project, where any query would fail.
+   * Change counts are measured out of process so a large checkout cannot stall
+   * the daemon's transport, and a timed-out measurement reports `unknown`
+   * rather than inventing a zero.
+   */
+  private async handleProjects(): Promise<ToolResult> {
+    const [{ readProjectsRegistry }, { summarizeProject }] = await Promise.all([
+      import('../project-registry'),
+      import('../project-summary'),
+    ]);
+    const registry = readProjectsRegistry();
+
+    const lines: string[] = [
+      `**CodeGraph Projects** — ${registry.projects.length} registered`,
+      `Registry: ${registry.path}`,
+      '',
+    ];
+
+    if (registry.error) {
+      lines.push(
+        `> ⚠ The registry ${registry.error}. Run \`codegraph init\` in a project to rebuild it.`,
+        ''
+      );
+    }
+
+    if (registry.projects.length === 0) {
+      lines.push(
+        'No CodeGraph projects are registered on this machine yet. ' +
+        'Run `codegraph init` inside a project to register it.'
+      );
+      return this.textResult(lines.join('\n'));
+    }
+
+    let defaultRoot: string | null = null;
+    try {
+      defaultRoot = this.cg?.getProjectRoot() ?? null;
+    } catch {
+      defaultRoot = null;
+    }
+
+    for (const entry of registry.projects) {
+      // Reuse the session's default instance instead of opening a second
+      // connection to the same database (see openProjectRoot's #238 note).
+      const reuse = this.cg && defaultRoot && isSameIndexRoot(defaultRoot, entry.path)
+        ? this.cg
+        : undefined;
+      const project = await summarizeProject(entry.path, {
+        registeredAt: entry.registeredAt,
+        reuse,
+        measureChanges: measurePendingChanges,
+      });
+
+      lines.push(`- **${project.projectPath}**`, `  - Status: ${this.describeProjectStatus(project)}`);
+      if (project.lastIndexedAt) {
+        lines.push(`  - Last indexed: ${project.lastIndexedAt}`);
+      }
+      if (project.stats) {
+        lines.push(
+          `  - Files: ${project.stats.fileCount.toLocaleString()}, ` +
+          `nodes: ${project.stats.nodeCount.toLocaleString()}, ` +
+          `edges: ${project.stats.edgeCount.toLocaleString()}`
+        );
+      }
+      lines.push('');
+    }
+
+    lines.push('Pass any of these paths as `projectPath` to another codegraph tool to query that project.');
+    return this.textResult(lines.join('\n'));
   }
 
   /**

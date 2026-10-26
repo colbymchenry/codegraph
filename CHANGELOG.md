@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- New `codegraph projects` command and `codegraph_projects` MCP tool list every CodeGraph project on your machine — its path, when it was last indexed, how many files, symbols and links it holds, and whether the index is up to date with your working tree — so an agent that starts outside a project can discover the ones it can query. `codegraph init` registers a project and `codegraph uninit` removes it; the registry lives at `~/.codegraph/projects.json`, and `CODEGRAPH_PROJECTS_PATH` points it somewhere else. (#769)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
