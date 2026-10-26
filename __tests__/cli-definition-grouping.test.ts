@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
-import { lookupSymbolNodes } from '../src/graph/symbol-lookup';
+import { lookupSymbolNodes, qualifiedSymbolMatches } from '../src/graph/symbol-lookup';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const COMMANDS = ['callers', 'callees', 'impact'] as const;
@@ -69,6 +69,20 @@ beforeAll(async () => {
     '  public static void convertCaller() { convert(1); convert("value"); }',
     '}',
   ].join('\n'));
+  write('Pricing.cs', `public static class Format
+{
+    public static string Price(decimal value) => value.ToString("0.00");
+}
+public static class LegacyFormat
+{
+    public static string Price(decimal value) => value.ToString();
+}
+public class Invoice
+{
+    public string Total(decimal value) => Format.Price(value);
+    public string OldTotal(decimal value) => LegacyFormat.Price(value);
+}
+`);
   for (let i = 0; i < 55; i++) {
     write(`crowd/def-${i}.js`, "import { shared } from '../shared.js';\nexport function crowded() { shared(); }\n");
   }
@@ -84,6 +98,20 @@ afterAll(() => {
 });
 
 describe.each(COMMANDS)('%s definition grouping (#1512)', (command) => {
+  it('keeps similarly named classes out of qualified CLI and MCP lookups (#2908)', async () => {
+    const out = json(command, 'Format.Price');
+    expect(out.targets.map((n: any) => n.qualifiedName)).toEqual(['Format::Price']);
+    expect(out.definitions).toHaveLength(1);
+    expect(out.ambiguous).toBe(false);
+    if (command === 'callers') {
+      expect(out.callers.map((n: any) => n.name)).toContain('Total');
+      expect(out.callers.map((n: any) => n.name)).not.toContain('OldTotal');
+    }
+    const result = await handler.execute(`codegraph_${command}`, { symbol: 'Format.Price' });
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).not.toContain('LegacyFormat');
+  });
+
   it('attributes every result and graph edge to its definition in JSON', () => {
     const out = json(command);
     expect(out.ambiguous).toBe(true);
@@ -179,6 +207,14 @@ describe.each(COMMANDS)('%s definition grouping (#1512)', (command) => {
 });
 
 describe('CLI definition boundaries and limits', () => {
+  it('uses the same qualified boundaries for node bodies and explore candidates (#2908)', async () => {
+    expect(qualifiedSymbolMatches(cg, 'Format.Price').map((n) => n.qualifiedName)).toEqual(['Format::Price']);
+    const result = await handler.execute('codegraph_node', { symbol: 'Format.Price', includeCode: true });
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toContain('0.00');
+    expect(result.content[0]?.text).not.toContain('LegacyFormat');
+  });
+
   it('separates different qualified names within the same file', () => {
     const out = json('callees', 'run', ['--file', 'scopes.ts']);
     expect(out.definitions).toHaveLength(2);

@@ -87,8 +87,11 @@ export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackag
   const lastPart = parts[parts.length - 1]!;
   if (node.name !== lastPart) return false;
 
-  // Stage 1: qualified-name containment under the extractor's `::` convention.
-  if (node.qualifiedName.includes(parts.join('::'))) return true;
+  // Stage 1: qualified-name containment starting at a scope boundary.
+  const qualifiedQuery = parts.join('::');
+  if (node.qualifiedName.startsWith(qualifiedQuery) ||
+      node.qualifiedName.includes(`::${qualifiedQuery}`) ||
+      node.qualifiedName.includes(`.${qualifiedQuery}`)) return true;
 
   // Stage 1b: boundary-aligned suffix under a canonical separator.
   //
@@ -98,8 +101,8 @@ export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackag
   // stored qualifiedName is `AppWeb.Format::group`, so the stage-1 spelling
   // `AppWeb::Format::group` cannot match and a perfectly precise query
   // resolved to nothing. Canonicalising both sides and requiring the match to
-  // land on a separator boundary handles both conventions with one rule, and
-  // is strictly tighter than the `includes` above.
+  // land on a separator boundary handles both conventions without matching
+  // part of a scope name.
   const canonicalQuery = canonicalScope(symbol);
   const canonicalNode = canonicalScope(node.qualifiedName);
   if (canonicalNode === canonicalQuery || canonicalNode.endsWith(`.${canonicalQuery}`)) {

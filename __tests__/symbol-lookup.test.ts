@@ -309,6 +309,29 @@ describe('matchesSymbol — containers whose own name contains a separator', () 
   });
 });
 
+describe('matchesSymbol — qualified component boundaries (#2908)', () => {
+  it.each([
+    ['Format::Price', true],
+    ['Shop::Format::Price', true],
+    ['Shop.Format::Price', true],
+    ['Shop.Format.Price', true],
+    ['LegacyFormat::Price', false],
+    ['Shop::LegacyFormat::Price', false],
+    ['Shop.LegacyFormat::Price', false],
+    ['Shop.LegacyFormat.Price', false],
+    ['NamespaceFormat::Price', false],
+  ] as const)('matches %s only at a complete scope component', (qualifiedName, expected) => {
+    expect(matchesSymbol(fakeNode({ name: 'Price', qualifiedName }), 'Format.Price')).toBe(expected);
+  });
+
+  it('preserves qualified names carrying an arity suffix', () => {
+    const node = fakeNode({ name: 'price', qualifiedName: 'Shop.Format::price/2', language: 'erlang' });
+    expect(matchesSymbol(node, 'Format.price/2')).toBe(true);
+    expect(matchesSymbol(node, 'Format.price/1')).toBe(false);
+    expect(matchesSymbol({ ...node, qualifiedName: 'Shop.LegacyFormat::price/2' }, 'Format.price/2')).toBe(false);
+  });
+});
+
 describe.skipIf(!HAS_SQLITE)('lookupSymbolNodes — the shared path used by callers/callees/impact', () => {
   let projectRoot: string;
   let cg: any;
