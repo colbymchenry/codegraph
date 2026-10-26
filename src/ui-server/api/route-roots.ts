@@ -52,6 +52,23 @@ export function looksLikeComponent(node: Node): boolean {
   return JS_FAMILY.has(node.language) && /^[A-Z]/.test(node.name);
 }
 
+/**
+ * Route id → the layouts it renders inside, outermost first: an Angular
+ * parent route's component around its `<router-outlet>`. What happens in a
+ * layout — its tabs, its buttons — happens on every screen nested in it.
+ */
+export function routeLayouts(cg: CodeGraph, routes: readonly Node[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  if (routes.length === 0) return out;
+  for (const e of cg.getOutgoingEdgesFrom(routes.map((r) => r.id), ['references'])) {
+    if ((e.metadata as Record<string, unknown> | undefined)?.layout !== true) continue;
+    const list = out.get(e.source) ?? [];
+    if (!list.includes(e.target)) list.push(e.target);
+    out.set(e.source, list);
+  }
+  return out;
+}
+
 /** Route id → where its code starts, for every route that has an answer. */
 export function routeRoots(cg: CodeGraph, routes: readonly Node[]): Map<string, RouteRoot> {
   const out = new Map<string, RouteRoot>();
@@ -70,9 +87,10 @@ export function routeRoots(cg: CodeGraph, routes: readonly Node[]): Map<string, 
   for (const route of routes) {
     const list = byRoute.get(route.id);
     if (!list || list.length === 0) continue;
-    // 1. The handler the resolver named.
+    // 1. The handler the resolver named. A layout the screen renders inside
+    // (an Angular parent route's component) is not the screen's own.
     const named = list
-      .filter((e) => e.kind === 'references')
+      .filter((e) => e.kind === 'references' && (e.metadata as Record<string, unknown> | undefined)?.layout !== true)
       .map((e) => targets.get(e.target))
       .filter((n): n is Node => !!n && HANDLER_KINDS.has(n.kind) && n.id !== route.id)
       .sort((a, b) => rank(a) - rank(b) || a.startLine - b.startLine);

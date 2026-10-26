@@ -25,7 +25,10 @@ beforeAll(async () => {
 
 describe('ArkTS attribute-chain resolution precision', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -65,7 +68,7 @@ describe('ArkTS attribute-chain resolution precision', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const fns = cg.getNodesByKind('function');
@@ -99,7 +102,10 @@ describe('ArkTS attribute-chain resolution precision', () => {
 
 describe('ArkTS ohpm workspace import resolution', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -146,7 +152,7 @@ describe('ArkTS ohpm workspace import resolution', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const classes = cg.getNodesByKind('class');
@@ -168,7 +174,10 @@ describe('ArkTS ohpm workspace import resolution', () => {
 
 describe('ArkUI state → build() re-render bridge (assignment-gated)', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -201,7 +210,7 @@ describe('ArkUI state → build() re-render bridge (assignment-gated)', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const methods = cg.getNodesByKind('method');
@@ -229,7 +238,10 @@ describe('ArkUI state → build() re-render bridge (assignment-gated)', () => {
 
 describe('ArkUI @ohos.events.emitter bridge', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -266,7 +278,7 @@ describe('ArkUI @ohos.events.emitter bridge', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const methods = cg.getNodesByKind('method');
@@ -299,7 +311,7 @@ describe('ArkUI @ohos.events.emitter bridge', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const fns = cg.getNodesByKind('function');
@@ -314,7 +326,10 @@ describe('ArkUI @ohos.events.emitter bridge', () => {
 
 describe('ArkUI router bridge (pushUrl literal → @Entry struct)', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -343,7 +358,7 @@ describe('ArkUI router bridge (pushUrl literal → @Entry struct)', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const methods = cg.getNodesByKind('method');
@@ -362,7 +377,10 @@ describe('ArkUI router bridge (pushUrl literal → @Entry struct)', () => {
 
 describe('ohpm main entry (custom barrel + .ts consumer)', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -408,7 +426,7 @@ describe('ohpm main entry (custom barrel + .ts consumer)', () => {
         '}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const classes = cg.getNodesByKind('class');

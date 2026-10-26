@@ -15,7 +15,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { NODE_KINDS, EDGE_KINDS } from '../src/types';
-import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
+import { generateNodeId, NodeIdAllocator } from '../src/extraction/tree-sitter-helpers';
 import { getKernel, tryKernelExtract, kernelRoutes, resetKernelForTests } from '../src/extraction/kernel';
 import { extractFromSource } from '../src/extraction';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
@@ -29,6 +29,18 @@ const KERNEL_PATH = path.join(
   'codegraph-kernel.node'
 );
 const kernelBuilt = fs.existsSync(KERNEL_PATH);
+
+it('collision-only identity vectors preserve legacy and repeated-position IDs (#1349)', () => {
+  const ids = new NodeIdAllocator();
+  const base = 'function:bfb15544fed707794274a5c61006ea7b';
+  expect(ids.generate('src/a.ts', 'function', 'foo', 3, 2)).toBe(base);
+  expect(ids.generate('src/a.ts', 'function', 'foo', 3, 24)).toBe(`${base}:24`);
+  expect(ids.generate('src/a.ts', 'function', 'foo', 3, 48)).toBe(`${base}:48`);
+  expect(ids.generate('src/a.ts', 'function', 'foo', 3, 24)).toBe(`${base}:24`);
+  expect(ids.generate('src/a.ts', 'function', 'foo', 3, 2)).toBe(base);
+  expect(ids.generate('src/b.ts', 'function', 'foo', 3, 24)).toBe(generateNodeId('src/b.ts', 'function', 'foo', 3));
+  expect(new NodeIdAllocator().generate('src/a.ts', 'function', 'foo', 3, 24)).toBe(base);
+});
 const expectKernel = process.env.CODEGRAPH_KERNEL_EXPECT === '1';
 
 const FIXTURE = [

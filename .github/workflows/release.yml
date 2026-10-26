@@ -275,10 +275,12 @@ jobs:
           V="${{ steps.ver.outputs.version }}"
           # npm publish can print success without persisting; confirm against the
           # registry (with retries for propagation) so green means really shipped.
+          # Up to 5 minutes per package: 1.6.1's packages all published fine but
+          # took longer than the old 60 s to appear, which failed the run.
           for dir in release/npm/codegraph-* release/npm/main; do
             name=$(node -p "require('./$dir/package.json').name")
             ok=
-            for i in 1 2 3 4 5 6; do
+            for i in $(seq 1 30); do
               if npm view "$name@$V" version >/dev/null 2>&1; then ok=1; break; fi
               echo "waiting for $name@$V to appear ($i)…"; sleep 10
             done

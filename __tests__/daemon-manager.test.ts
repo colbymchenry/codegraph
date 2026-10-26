@@ -98,6 +98,37 @@ describe('runDaemonPicker', () => {
     expect(h.getDone()).toBe('Done.');
   });
 
+  it.each(['unverified', 'still-running'] as const)('does not report %s as stopped', async (outcome) => {
+    const h = harness([rec('/p/a', 42, 1)], ['/p/a', CANCEL]);
+    h.deps.stop = async (root): Promise<StopResult> => ({
+      root,
+      pid: 42,
+      outcome,
+    });
+
+    await runDaemonPicker(h.deps);
+
+    expect(h.notes).toEqual([
+      outcome === 'unverified'
+        ? 'Could not verify daemon (pid 42); left it running with its artifacts intact — /p/a'
+        : 'Could not stop daemon (pid 42); left its artifacts intact — /p/a',
+    ]);
+    expect(h.getDone()).toContain('Cancelled');
+  });
+
+  it.each([
+    ['not-running', 42, 'Daemon was no longer running; removed stale artifacts — /p/a'],
+    ['no-daemon', null, 'No daemon was found — /p/a'],
+  ] as const)('reports the %s race outcome accurately', async (outcome, pid, message) => {
+    const h = harness([rec('/p/a', 42, 1)], ['/p/a', CANCEL]);
+    h.deps.stop = async (root): Promise<StopResult> => ({ root, pid, outcome });
+
+    await runDaemonPicker(h.deps);
+
+    expect(h.notes).toEqual([message]);
+    expect(h.getDone()).toContain('Cancelled');
+  });
+
   it('Cancel (and Esc/Ctrl-C) stop nothing', async () => {
     const h1 = harness([rec('/p/a', 1, 1)], [CANCEL]);
     await runDaemonPicker(h1.deps);

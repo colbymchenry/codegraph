@@ -109,6 +109,24 @@ export async function runDaemonPicker(deps: PickerDeps): Promise<void> {
     }
 
     const result = await deps.stop(String(choice));
+    if (result.outcome === 'still-running') {
+      deps.note(`Could not stop daemon (pid ${result.pid}); left its artifacts intact — ${choice}`);
+      continue;
+    }
+    if (result.outcome === 'unverified') {
+      deps.note(
+        `Could not verify daemon (pid ${result.pid}); left it running with its artifacts intact — ${choice}`
+      );
+      continue;
+    }
+    if (result.outcome === 'not-running') {
+      deps.note(`Daemon was no longer running; removed stale artifacts — ${choice}`);
+      continue;
+    }
+    if (result.outcome === 'no-daemon') {
+      deps.note(`No daemon was found — ${choice}`);
+      continue;
+    }
     const forced = result.outcome === 'kill' ? ', forced' : '';
     deps.note(`Stopped daemon (pid ${result.pid}${forced}) — ${choice}`);
     // Loop: the next iteration re-lists; if more remain it re-prompts, otherwise

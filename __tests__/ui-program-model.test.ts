@@ -328,3 +328,33 @@ describe('the picture in the code’s order', () => {
     expect(stepEdgeVisible(model, sibling, 'inside')).toBe(true);
   });
 });
+
+describe('a body full of checks that draw nothing', () => {
+  it('reads in one pass, not one per combination of checks', () => {
+    // jsoup's `parse` inlines eighty-odd `if`s with no `else` and no step in
+    // them; each one doubled every way on, and the page died overflowing the
+    // stack. They are all one way on, under no condition of their own.
+    const checks: WireItem[] = Array.from({ length: 80 }, (_, i) => ({
+      kind: 'fork',
+      form: 'if',
+      on: `c${i}`,
+      arms: [arm(`c${i}`, [])],
+    }));
+    const root: WireBlock = [{ kind: 'step', step: 'a' }, ...checks, { kind: 'step', step: 'b' }];
+    expect(shape(root)).toEqual(['anchor → a', 'a → b']);
+    expect(buildOrderModel(payload([step('a'), step('b')], root))?.nodes.size).toBe(3);
+  });
+
+  it('claims no side when the code goes on either way', () => {
+    const root: WireBlock = [
+      {
+        kind: 'fork',
+        form: 'if',
+        on: 'user',
+        arms: [arm('user', [{ kind: 'fork', form: 'if', on: 'admin', arms: [arm('admin', [])] }])],
+      },
+      { kind: 'step', step: 'a' },
+    ];
+    expect(shape(root)).toEqual(['anchor → a']);
+  });
+});

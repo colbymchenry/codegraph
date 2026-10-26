@@ -30,10 +30,11 @@
  *
  * **Won't fire on real work.** Heavy parsing runs in the parse worker
  * (off-thread) and the daemon's indexing shells out to a child process, so the
- * daemon's main thread only ever does fast, bounded work. The default timeout
- * is ~300× the 5h #850 wedge shorter, yet far longer than any legitimate
- * main-thread block. Opt out with `CODEGRAPH_NO_WATCHDOG=1`; tune with
- * `CODEGRAPH_WATCHDOG_TIMEOUT_MS`.
+ * daemon's main thread mostly does fast, bounded work; the exception, a sync
+ * storing into SQLite, is what the disk-progress deferral below is for. The
+ * default timeout is ~300× the 5h #850 wedge shorter, yet far longer than any
+ * legitimate main-thread block. Opt out with `CODEGRAPH_NO_WATCHDOG=1`; tune
+ * with `CODEGRAPH_WATCHDOG_TIMEOUT_MS`.
  *
  * **Disk-progress deferral (`progressPaths`).** The CLI `index`/`init` path is
  * different: it runs the SQLite store on this thread, and one long synchronous
@@ -49,6 +50,18 @@
  * coinciding with unrelated file activity — or I/O hung beyond all reason —
  * still dies. A true wedge with no disk progress dies at the base timeout,
  * exactly as before.
+ *
+ * **Every index the process writes counts (#2404).** An MCP server syncs on
+ * its main thread too, and not only the project it was armed for: the shared
+ * daemon writes every project a session names by `projectPath`, and a proxy's
+ * in-process fallback writes its own. {@link addWatchdogProgressPaths} adds a
+ * project's index files the moment this process becomes its writer and drops
+ * them when it lets go; each change re-arms the watchdog with a new child
+ * whose argv carries the whole list. A new process gets its list the instant
+ * it is spawned, whatever the parent does next: a message on the heartbeat
+ * pipe could not promise that, since a pipe write queued behind one still in
+ * flight waits for an event-loop turn, and a sync can block the loop right
+ * after the project is added.
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -71,14 +84,24 @@ function isEnvTruthy(raw: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-/** Parse the timeout env, falling back to the default for missing/invalid values. */
+/**
+ * The longest delay a Node timer holds: anything above 2^31-1 ms is run after
+ * 1 ms instead (with a TimeoutOverflowWarning), so a huge value meant as
+ * "effectively never" would fire at once (#1966).
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Parse the timeout env, falling back to the default for missing/invalid values
+ * and capping at {@link MAX_TIMER_DELAY_MS}.
+ */
 export function parseWatchdogTimeoutMs(
   raw: string | undefined,
   fallback: number = DEFAULT_WATCHDOG_TIMEOUT_MS
 ): number {
   if (raw === undefined) return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMER_DELAY_MS) : fallback;
 }
 
 /** Derive a heartbeat cadence that emits several beats inside the timeout window. */
@@ -164,27 +187,71 @@ export interface WatchdogOptions {
   /**
    * Files whose size/mtime advancing counts as forward progress (the SQLite
    * DB + `-wal` for an in-process indexer). With paths supplied, a silent
-   * timeout only kills when the files did NOT advance — see the header. Omit
-   * for pure heartbeat behavior (the daemon, whose main thread never runs
-   * long synchronous work).
+   * timeout only kills when the files did NOT advance — see the header. The
+   * files of other indexes the process comes to write join at runtime through
+   * {@link addWatchdogProgressPaths}; with neither, a silent timeout kills.
    */
   progressPaths?: string[];
 }
 
 /**
- * Install the main-thread liveness watchdog for a long-lived process. Returns a
- * handle to stop it, or `null` when disabled or when the child can't be spawned
- * (degraded, never throws — a missing watchdog must never keep a process from
- * starting).
+ * Files added with {@link addWatchdogProgressPaths} and not yet dropped, with
+ * how many registrations hold each.
  */
-export function installMainThreadWatchdog(options: WatchdogOptions = {}): WatchdogHandle | null {
-  if (isEnvTruthy(process.env.CODEGRAPH_NO_WATCHDOG)) return null;
+const addedProgressPaths = new Map<string, number>();
 
-  const timeoutMs = parseWatchdogTimeoutMs(process.env.CODEGRAPH_WATCHDOG_TIMEOUT_MS);
-  const checkMs = deriveCheckIntervalMs(timeoutMs);
-  const capMs = timeoutMs * PROGRESS_CAP_MULTIPLIER;
-  const progressPaths = options.progressPaths ?? [];
+/**
+ * Tells each armed watchdog the list of files changed: `added` when a file
+ * joined it, false when files only left it.
+ */
+const armedWatchdogs = new Set<(added: boolean) => void>();
 
+/**
+ * Count `paths` advancing as forward progress for this process's liveness
+ * watchdog, armed now or later, until the returned function is called
+ * (#2404). For the index files of a project this process has just become the
+ * writer of: its syncs store on the main thread, and without this a long one
+ * reads as a wedge whenever the project is not the one the watchdog was armed
+ * for. Registrations of one file nest, and the returned function is
+ * idempotent.
+ */
+export function addWatchdogProgressPaths(paths: readonly string[]): () => void {
+  let added = false;
+  for (const file of paths) {
+    const held = addedProgressPaths.get(file) ?? 0;
+    addedProgressPaths.set(file, held + 1);
+    if (held === 0) added = true;
+  }
+  if (added) for (const changed of armedWatchdogs) changed(true);
+  let dropped = false;
+  return () => {
+    if (dropped) return;
+    dropped = true;
+    let removed = false;
+    for (const file of paths) {
+      const held = addedProgressPaths.get(file) ?? 0;
+      if (held > 1) {
+        addedProgressPaths.set(file, held - 1);
+      } else if (held === 1) {
+        addedProgressPaths.delete(file);
+        removed = true;
+      }
+    }
+    if (removed) for (const changed of armedWatchdogs) changed(false);
+  };
+}
+
+/** One watchdog child process, watching a fixed list of files. */
+interface WatchdogChild {
+  paths: readonly string[];
+  /** Write one heartbeat byte. */
+  beat(): void;
+  /** End the child: EOF, then a kill for good measure. */
+  stop(): void;
+}
+
+/** Spawn a watchdog child for `paths`, or null when it can't be spawned. */
+function spawnWatchdogChild(timeoutMs: number, checkMs: number, capMs: number, paths: readonly string[]): WatchdogChild | null {
   let child: ChildProcess;
   try {
     // No execArgv inheritance (unlike Worker), so the child carries none of our
@@ -192,7 +259,7 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
     // fd 2 so the kill notice lands wherever the parent logs (daemon.log).
     child = spawn(
       process.execPath,
-      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs), String(capMs), ...progressPaths],
+      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs), String(capMs), ...paths],
       {
         stdio: ['pipe', 'ignore', 'inherit'],
         windowsHide: true,
@@ -218,27 +285,88 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
   stdin.on('error', () => { /* child gone; heartbeat writes are best-effort */ });
   child.on('error', (err) => debug(`child error: ${err.message}`));
 
-  // Heartbeat: a byte per tick. When the main thread wedges, these stop and the
-  // child's timeout fires. unref'd so it never keeps the process alive itself.
-  const heartbeat = setInterval(() => {
-    try { stdin.write('\n'); } catch { /* child gone */ }
-  }, checkMs);
-  heartbeat.unref();
-
   // Neither the child nor its pipe should keep the parent alive past its work.
   child.unref();
   try { (stdin as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
 
-  debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs} progressPaths=${progressPaths.length}`);
+  debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs} progressPaths=${paths.length}`);
+
+  return {
+    paths,
+    beat(): void {
+      try { stdin.write('\n'); } catch { /* child gone */ }
+    },
+    stop(): void {
+      try { stdin.end(); } catch { /* ignore */ } // EOF -> child exits cleanly
+      try { child.kill(); } catch { /* ignore */ } // belt-and-suspenders
+    },
+  };
+}
+
+/**
+ * Install the main-thread liveness watchdog for a long-lived process. Returns a
+ * handle to stop it, or `null` when disabled or when the child can't be spawned
+ * (degraded, never throws — a missing watchdog must never keep a process from
+ * starting).
+ */
+export function installMainThreadWatchdog(options: WatchdogOptions = {}): WatchdogHandle | null {
+  if (isEnvTruthy(process.env.CODEGRAPH_NO_WATCHDOG)) return null;
+
+  const timeoutMs = parseWatchdogTimeoutMs(process.env.CODEGRAPH_WATCHDOG_TIMEOUT_MS);
+  const checkMs = deriveCheckIntervalMs(timeoutMs);
+  const capMs = timeoutMs * PROGRESS_CAP_MULTIPLIER;
+  const armedPaths = options.progressPaths ?? [];
+  const watchedPaths = (): string[] => [...new Set([...armedPaths, ...addedProgressPaths.keys()])];
+
+  let current = spawnWatchdogChild(timeoutMs, checkMs, capMs, watchedPaths());
+  if (!current) return null;
+
+  // Heartbeat: a byte per tick. When the main thread wedges, these stop and the
+  // child's timeout fires. unref'd so it never keeps the process alive itself.
+  const heartbeat = setInterval(() => current?.beat(), checkMs);
+  heartbeat.unref();
+
+  // The list of files changed (#2404): a child for the new list takes over,
+  // then the old one goes. Always from a turning event loop, so the old child,
+  // its last heartbeat recent, has no reason to kill meanwhile; a spawn that
+  // fails leaves it watching the old list. An added file takes effect at once,
+  // since a sync may block the loop right after. Dropped files wait for the
+  // next turn, so a process letting go of several projects, as one does on its
+  // way out, re-arms once or not at all.
+  let pendingRearm: NodeJS.Timeout | null = null;
+  const rearm = (): void => {
+    if (pendingRearm) clearTimeout(pendingRearm);
+    pendingRearm = null;
+    if (!current) return;
+    const paths = watchedPaths();
+    if (paths.length === current.paths.length && paths.every((p) => current!.paths.includes(p))) return;
+    const next = spawnWatchdogChild(timeoutMs, checkMs, capMs, paths);
+    if (!next) return;
+    const previous = current;
+    current = next;
+    previous.stop();
+  };
+  const changed = (added: boolean): void => {
+    if (added) {
+      rearm();
+    } else if (!pendingRearm) {
+      pendingRearm = setTimeout(rearm, 0);
+      pendingRearm.unref();
+    }
+  };
+  armedWatchdogs.add(changed);
 
   let stopped = false;
   return {
     stop(): void {
       if (stopped) return;
       stopped = true;
+      armedWatchdogs.delete(changed);
+      if (pendingRearm) clearTimeout(pendingRearm);
+      pendingRearm = null;
       clearInterval(heartbeat);
-      try { stdin.end(); } catch { /* ignore */ } // EOF -> child exits cleanly
-      try { child.kill(); } catch { /* ignore */ } // belt-and-suspenders
+      current?.stop();
+      current = null;
     },
   };
 }

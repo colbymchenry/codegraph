@@ -34,6 +34,11 @@ arch="$(uname -m)"
 case "$os" in
   Darwin) os="darwin" ;;
   Linux)  os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    echo "codegraph: on Windows, open PowerShell and run:" >&2
+    echo "  irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex" >&2
+    exit 1
+    ;;
   *) echo "codegraph: unsupported OS '$os'." >&2; exit 1 ;;
 esac
 case "$arch" in

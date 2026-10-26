@@ -191,6 +191,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -224,6 +225,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -328,7 +330,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -383,7 +385,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         // endLine extension via resolveBody — LIVE for kotlin function/method
         // kinds (in-range for this grammar, so practically a no-op — but the
         // hook is part of the contract).
@@ -730,7 +733,10 @@ impl<'t> Walker<'t> {
         })
     }
 
-    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+    /// The Kotlin visitNode hook: `Some` when it consumed the node, holding the
+    /// initializers it walked as such (`walkInitializer`), which the caller's
+    /// fn-ref scan of the node skips.
+    fn try_visit_hook(&mut self, node: Node<'t>) -> Option<Vec<usize>> {
         // An own-line accessor already walked by its owning property below. The
         // ownership test re-derives the property's kind rather than remembering
         // it: a destructured or local declaration mints no node, so its
@@ -738,10 +744,10 @@ impl<'t> Walker<'t> {
         if matches!(node.kind(), "getter" | "setter") {
             return accessor_owner(node)
                 .and_then(|owner| self.property_kind(owner))
-                .is_some();
+                .map(|_| Vec::new());
         }
         if node.kind() != "property_declaration" {
-            return false;
+            return None;
         }
         let var_decl = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
@@ -761,11 +767,11 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         let name = self.text(name_node).to_string();
         if name.is_empty() {
-            return false;
+            return None;
         }
         let Some(kind) = self.property_kind(node) else {
             // A local — no node is minted, but the initializer is still code.
@@ -775,7 +781,7 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         // The `type`-field signature read is dead (zero fields) → signature
         // undefined; NO docstring/visibility/isStatic — the modifiers merge in
@@ -787,26 +793,30 @@ impl<'t> Walker<'t> {
         // the idiomatic Android callback field) contributed NO call edge at all.
         // The property also OWNS any accessor written on its own line, which the
         // grammar makes a following SIBLING rather than a child; those bodies
-        // used to attribute to the enclosing class.
+        // used to attribute to the enclosing class. The initializers are
+        // walked as such: the fn-ref scan skips them, or it would take each
+        // function value again for the enclosing file or class.
+        let mut walked = Vec::new();
         if let Some(row) = row {
             self.stack.push(Scope { row, kind, name: name.clone() });
             for init in property_initializers(node) {
                 self.visit_function_body(init);
+                walked.push(init.id());
             }
             for acc in following_accessors(node) {
                 self.visit_function_body(acc);
             }
             self.stack.pop();
         }
-        true
+        Some(walked)
     }
 
     // --- the dispatcher (visitNode, Kotlin-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
         stack_guard!();
-        if self.try_visit_hook(node) {
-            self.scan_fn_ref_subtree(node, 0);
+        if let Some(walked) = self.try_visit_hook(node) {
+            self.scan_fn_ref_subtree(node, 0, &walked);
             return;
         }
 
@@ -853,12 +863,14 @@ impl<'t> Walker<'t> {
             // Hook-declined destructuring: extractField/extractVariable both
             // find no matching children for kotlin — NOTHING minted, RHS
             // invisible; candidates-only scan.
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_header" {
             self.extract_import(node);
         } else if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
         }
         // companion_object, anonymous_initializer, secondary_constructor,
         // getter/setter siblings, file_annotation, object_literal, if/when at
@@ -887,6 +899,8 @@ impl<'t> Walker<'t> {
 
         if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
         }
         // (INSTANTIATION_KINDS has no kotlin members; extractBareCall absent.)
 
@@ -1082,7 +1096,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_entry_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -1090,18 +1105,36 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
         // name field → null (zero fields) → the identifier-children scan: one
         // enum_member per direct simple_identifier, positioned AT the
-        // identifier. Entry value_arguments and entry class_bodies (override
-        // methods!) are never visited — invisible (quirk).
+        // identifier. Entry value_arguments are never visited.
+        let mut first: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if matches!(child.kind(), "simple_identifier" | "identifier" | "property_identifier") {
                 let name = self.text(child).to_string();
-                self.create_node("enum_member", &name, child, Extra::default());
+                let row = self.create_node("enum_member", &name, child, Extra::default());
+                if first.is_none() {
+                    first = row.map(|r| (r, name));
+                }
             }
         }
+        first
+    }
+
+    /// `NewBuffer { override fun pipe() … }`: an entry's own class_body
+    /// declares members of its own, scoped under the entry.
+    fn visit_enum_entry_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractTypeAlias — plain node; the alias-value ref walk reads the
@@ -1146,6 +1179,28 @@ impl<'t> Walker<'t> {
     /// extractCall — the kotlin paths: navigation member branch (+ the #750
     /// re-encode) and the raw-text else (paren-then-lambda / glued-invoke
     /// garbage preserved).
+    /// extractKotlinInfixCall — `Users.id eq id1` / `a to b`: a call of the
+    /// middle simple_identifier, `lhs.fn` when the left operand is a plain
+    /// name, else the bare name; literal left operands emit nothing.
+    fn extract_infix_call(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() || node.named_child_count() != 3 {
+            return;
+        }
+        let (Some(lhs), Some(func)) = (node.named_child(0), node.named_child(1)) else { return };
+        if func.kind() != "simple_identifier" || is_literal_receiver(lhs.kind()) {
+            return;
+        }
+        let caller = self.top_row();
+        let name = self.text(func);
+        let receiver = if lhs.kind() == "simple_identifier" { self.text(lhs) } else { "" };
+        let callee = if !receiver.is_empty() && receiver != "this" && receiver != "super" {
+            format!("{receiver}.{name}")
+        } else {
+            name.to_string()
+        };
+        self.push_ref_at(caller, &callee, edge_kind_index("calls").unwrap(), node);
+    }
+
     fn extract_call(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {
             return;
@@ -1526,9 +1581,13 @@ impl<'t> Walker<'t> {
         });
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes (function_declaration) + the fixed list —
@@ -1546,7 +1605,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

@@ -59,38 +59,50 @@ export function installCommandSupervision(label: string, watchdog: WatchdogOptio
 
   // PPID watchdog: detect that the parent (or the host threaded past the
   // relaunch shim) died and we've been orphaned, then exit instead of leaking.
-  // Baseline from the CLI entry's earliest-possible capture — reading
-  // process.ppid here would miss a launcher killed during startup (#1185).
-  const originalPpid = EARLY_PPID;
-  const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
-  const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
-  let ppidTimer: ReturnType<typeof setInterval> | null = null;
-  if (pollMs > 0) {
-    ppidTimer = setInterval(() => {
-      const reason = supervisionLostReason({
-        originalPpid,
-        currentPpid: process.ppid,
-        hostPpid,
-        isAlive: isProcessAlive,
-      });
-      if (reason) {
-        try {
-          process.stderr.write(`[CodeGraph ${label}] Parent process exited (${reason}); aborting.\n`);
-        } catch { /* stderr gone with the parent — exit anyway */ }
-        process.exit(1);
-      }
-    }, pollMs);
-    // Never let the watchdog itself keep the process alive past its real work.
-    ppidTimer.unref();
-  }
+  const stopParentWatch = watchParent((reason) => {
+    try {
+      process.stderr.write(`[CodeGraph ${label}] Parent process exited (${reason}); aborting.\n`);
+    } catch { /* stderr gone with the parent — exit anyway */ }
+    process.exit(1);
+  });
 
   let stopped = false;
   return {
     stop(): void {
       if (stopped) return;
       stopped = true;
-      if (ppidTimer) clearInterval(ppidTimer);
+      stopParentWatch();
       liveness?.stop();
     },
   };
+}
+
+/**
+ * Call `onLost` once, when the parent — or the host threaded past the
+ * relaunch shim — goes away. The shim blocks in `spawnSync` and cannot forward
+ * a signal, so this is how a re-exec'd child learns it was orphaned. Returns a
+ * stop function. `CODEGRAPH_PPID_POLL_MS=0` disables it.
+ */
+export function watchParent(onLost: (reason: string) => void): () => void {
+  // Baseline from the CLI entry's earliest-possible capture — reading
+  // process.ppid here would miss a launcher killed during startup (#1185).
+  const originalPpid = EARLY_PPID;
+  const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
+  const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
+  if (pollMs <= 0) return () => {};
+  const timer = setInterval(() => {
+    const reason = supervisionLostReason({
+      originalPpid,
+      currentPpid: process.ppid,
+      hostPpid,
+      isAlive: isProcessAlive,
+    });
+    if (reason) {
+      clearInterval(timer);
+      onLost(reason);
+    }
+  }, pollMs);
+  // Never let the watchdog itself keep the process alive past its real work.
+  timer.unref();
+  return () => clearInterval(timer);
 }

@@ -5,7 +5,8 @@
 #
 #   irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 #
-# Upgrade with `codegraph upgrade` (or just re-run this). To uninstall: remove
+# Upgrade with `codegraph upgrade` (or just re-run this -- safe even while agent
+# sessions are running CodeGraph). To uninstall: remove
 # $env:LOCALAPPDATA\codegraph and drop its \current\bin entry from your user PATH.
 #
 # Environment:
@@ -13,6 +14,81 @@
 #   CODEGRAPH_INSTALL_DIR  install location (default: %LOCALAPPDATA%\codegraph)
 
 $ErrorActionPreference = 'Stop'
+
+# >>> Install-CodeGraphFiles -- keep identical to WINDOWS_SWAP_FUNCTION in src/upgrade/index.ts
+function Install-CodeGraphFiles([string]$Stage, [string]$Dest) {
+  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete a
+  # running node.exe or a loaded .node addon, but it can rename one, so every
+  # file being replaced (or dropped by the new version) is first renamed aside
+  # to <name>.old-<token>. Any failure puts every file back, so the install is
+  # never left half-replaced or without its node.exe.
+  $ErrorActionPreference = 'Stop'
+  $stageDir = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
+  foreach ($need in 'node.exe', 'bin\codegraph.cmd') {
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need))) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  }
+  $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $asideName = '\.old-[0-9a-f]{8,32}$'
+  $files = @{}; $dirs = @{}
+  foreach ($i in @(Get-ChildItem -LiteralPath $stageDir -Recurse -Force)) {
+    $rel = $i.FullName.Substring($stageDir.Length)
+    if ($i.PSIsContainer) { $dirs[$rel] = $true } else { $files[$rel] = $true }
+  }
+  $undo = New-Object System.Collections.ArrayList
+  function Move-Logged([string]$From, [string]$To) { [IO.File]::Move($From, $To); [void]$undo.Add(@($From, $To)) }
+  function Undo-Logged {
+    $lost = 0
+    for ($n = $undo.Count - 1; $n -ge 0; $n--) {
+      $u = $undo[$n]
+      try { if ($u.Count -eq 2) { [IO.File]::Move($u[1], $u[0]) } else { [IO.Directory]::Delete($u[0]) } } catch { if ($u.Count -eq 2) { $lost++ } }
+    }
+    $undo.Clear()
+    $lost
+  }
+  $done = $false; $at = $Dest
+  try {
+    if (-not (Test-Path -LiteralPath $Dest)) { [void][IO.Directory]::CreateDirectory($Dest); [void]$undo.Add(@($Dest)) }
+    $destDir = (Resolve-Path -LiteralPath $Dest).ProviderPath.TrimEnd('\')
+    foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File)) {
+      if (-not $files.ContainsKey($f.FullName.Substring($destDir.Length)) -and $f.Name -notmatch $asideName) {
+        $at = $f.FullName; Move-Logged $at "$at.old-$token"
+      }
+    }
+    foreach ($rel in @($dirs.Keys | Sort-Object Length)) {
+      $at = $destDir + $rel
+      if (-not [IO.Directory]::Exists($at)) { [void][IO.Directory]::CreateDirectory($at); [void]$undo.Add(@($at)) }
+    }
+    foreach ($rel in @($files.Keys)) {
+      $at = $destDir + $rel
+      if ([IO.File]::Exists($at)) { Move-Logged $at "$at.old-$token" }
+      Move-Logged ($stageDir + $rel) $at
+    }
+    $done = $true
+  } catch {
+    $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+    $lost = Undo-Logged
+    $msg = "Could not replace $at ($($x.Message))."
+    if ($lost) {
+      $msg += " $lost file(s) could not be put back, so the install may not start. Close your agent sessions and any running codegraph commands, then reinstall: irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex"
+    } else {
+      $msg += " Nothing was changed: the existing install still works. If another program has CodeGraph's files open, close your agent sessions (they run the CodeGraph MCP server) and any running codegraph commands, then try again."
+    }
+    $e = New-Object System.Exception($msg); $e.Data['codegraphDamaged'] = [bool]$lost; throw $e
+  } finally {
+    # Interrupted (Ctrl+C) without reaching catch: still put everything back.
+    if (-not $done) { [void](Undo-Logged) }
+  }
+  # Delete what this run and earlier ones renamed aside. A file a running
+  # process still holds can't be deleted yet; the next install retries it.
+  foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+    if ($f.Name -match $asideName) { try { [IO.File]::Delete($f.FullName) } catch {} }
+  }
+  foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)) {
+    if (-not $dirs.ContainsKey($d.FullName.Substring($destDir.Length))) { try { [IO.Directory]::Delete($d.FullName) } catch {} }
+  }
+}
+# <<< Install-CodeGraphFiles
+
 $repo = 'colbymchenry/codegraph'
 $installDir = if ($env:CODEGRAPH_INSTALL_DIR) { $env:CODEGRAPH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'codegraph' }
 
@@ -27,25 +103,28 @@ if (-not $version) {
 }
 if (-not $version) { throw "codegraph: could not resolve latest version; set CODEGRAPH_VERSION." }
 
-# 3. Download + extract the bundle into a stable 'current' dir (overwritten on upgrade).
+# 3. Download the bundle and unpack it next to the stable 'current' dir (same
+# volume, so moving it in is renames, not copies), then move it into 'current'.
+# 'current' is never deleted wholesale: a CodeGraph process that is still
+# running (an agent session's MCP server) holds node.exe and the native kernel,
+# which can't be deleted -- Install-CodeGraphFiles renames them aside instead.
 $url = "https://github.com/$repo/releases/download/$version/codegraph-$target.zip"
 Write-Host "Installing CodeGraph $version ($target)..."
 $tmp = Join-Path $env:TEMP ("cg-" + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $zip = Join-Path $tmp 'cg.zip'
-Invoke-WebRequest -Uri $url -OutFile $zip
-
 $dest = Join-Path $installDir 'current'
-if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Expand-Archive -Path $zip -DestinationPath $dest -Force
-# Archives contain a top-level codegraph-<target>\ dir; flatten it.
-$inner = Join-Path $dest "codegraph-$target"
-if (Test-Path $inner) {
-  Get-ChildItem -Force $inner | Move-Item -Destination $dest -Force
-  Remove-Item -Recurse -Force $inner
+$stage = Join-Path $installDir ('.staging-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+try {
+  Invoke-WebRequest -Uri $url -OutFile $zip
+  New-Item -ItemType Directory -Force -Path $stage | Out-Null
+  Expand-Archive -Path $zip -DestinationPath $stage -Force
+  # Archives contain a top-level codegraph-<target>\ dir.
+  $inner = Join-Path $stage "codegraph-$target"
+  Install-CodeGraphFiles $(if (Test-Path $inner) { $inner } else { $stage }) $dest
+} finally {
+  Remove-Item -LiteralPath $stage, $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
-Remove-Item -Recurse -Force $tmp
 
 # 4. Put the launcher dir on the user's PATH.
 $binDir = Join-Path $dest 'bin'

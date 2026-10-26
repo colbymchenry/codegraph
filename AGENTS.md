@@ -80,7 +80,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/extraction/` — `ExtractionOrchestrator`, tree-sitter wrappers, per-language extractors under `languages/` (one file per language), plus standalone extractors for non-tree-sitter formats (`svelte-extractor.ts`, `vue-extractor.ts`, `liquid-extractor.ts`, `dfm-extractor.ts` for Delphi). `parse-worker.ts` runs heavy parsing off the main thread.
 - `src/resolution/` — `ReferenceResolver` orchestrates `import-resolver.ts` (with `path-aliases.ts` for tsconfig path aliases + cargo workspace member globs), `name-matcher.ts`, and `frameworks/` (Express, Laravel, Rails, FastAPI, Django, Flask, Spring, Gin, Axum, ASP.NET, Vapor, React Router, Next.js — `nextjs.ts`: pages and `route.ts` handlers from files, `router.push` / `redirect` / `NextResponse.redirect` as `navigates` edges, with `next-router-synthesizer.ts` for `<Link href>` — Expo Router, SvelteKit, Vue/Nuxt, Cargo workspaces). Frameworks emit `route` nodes and `references` edges. `callback-synthesizer.ts` holds the whole-graph synthesis passes (`SYNTH_PASSES`, merged in registry order — first-seen wins a duplicate pair) with the language gates; `tier-synthesizer.ts` is the cross-tier pass (a client's literal `fetch`/`axios` path onto its own route, a queue job onto its consumer, a bus / socket event onto its handler — `channel`, `tier`, `registeredAt` on every edge; registered before the in-process emitter pass so its more specific edge wins); `synth-utils.ts` has the helpers they share (`enclosingFn`, `enclosingValue`, `makeLineAt`). Express's `postExtract` composes `app.use('/prefix', router)` mounts onto a mounted file's route names, idempotently (the original path stays in `qualifiedName`).
 - `src/graph/` — `GraphTraverser` (BFS/DFS, impact radius, path finding) and `GraphQueryManager` (high-level queries), plus the shared query-time derivations more than one surface renders: `named-symbol-flow.ts` (the one path finder, behind `codegraph_explore`'s Flow section and the viewer's Flow strip), `dynamic-boundary-report.ts` (where the graph stops), `type-hierarchy.ts` (ancestors/subtypes and the implementation count explore prints and the viewer draws),
-  `dead-code.ts` (unreferenced symbols, and every reason a candidate is NOT claimed). A derivation that two callers render must live here, not in `ToolHandler` — two derivations eventually disagree.
+  `dead-code.ts` (unreferenced symbols, and every reason a candidate is NOT claimed), `synthesized-hop.ts` (how a synthesized hop reads, in explore's Flow, the `codegraph_node` trail and ContextBuilder's call paths — a new synthesizer's wording goes here). A derivation that two callers render must live here, not in `ToolHandler` — two derivations eventually disagree.
 - `src/context/` — `ContextBuilder` + formatter for markdown/JSON output.
 - `src/search/` — full-text query parser and helpers for FTS5.
 - `src/sync/` — `FileWatcher` (native FSEvents/inotify/RDCW) with debounce + filter, and git-hook helpers.
@@ -89,6 +89,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
 - `src/ui/` — terminal UI (shimmer progress, worker).
 - `src/ui-server/` -- read-only JSON API for the `codegraph ui` browser viewer (`api/`: `node`, `flow`, `map`, `screens`, `steps`, `deadcode`, `trails`, `program`, ...) plus static server; Svelte viewer lives in `ui/` (see `docs/design/codegraph-ui-design-spec.md`). `screens`/`steps`/`program` share one fold (`via`/`when` via `graph/branch-guards.ts`); `api/effects.ts` curates calls that leave the index; `api/route-roots.ts` names where a route's code starts. Derivations rendered by more than one surface belong in `src/graph/`, not `ToolHandler`.
+  **Not released yet:** `codegraph ui` / `web` are refused (and hidden from `--help`) unless `CODEGRAPH_UI=1` is set — `src/bin/viewer-gate.ts`. Viewer changelog entries wait in `docs/viewer-launch-changelog.md`, not under `[Unreleased]`. At launch: delete the gate, move those entries back, drop the "not released yet" notes from `site/`.
 
 ### NodeKind / EdgeKind
 
@@ -102,11 +103,11 @@ Defined in `src/types.ts`. Both extractors and resolvers must use these exact st
 `src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @colbymchenry/codegraph` invocation). Architecture:
 
 - `targets/registry.ts` lists every supported agent.
-- `targets/types.ts` defines the `AgentTarget` interface — adding a 5th agent (Continue, Zed, Windsurf…) is **one new file in `targets/` + one entry in `registry.ts`**. Each target owns its config-file location and MCP-server JSON/TOML/JSONC writing. (Targets no longer write an instructions file — see below.)
+- `targets/types.ts` defines the `AgentTarget` interface — adding a 5th agent (Continue, Zed, Windsurf…) is **one new file in `targets/` + one entry in `registry.ts`**. Each target owns its config-file location and MCP-server JSON/TOML/JSONC writing. (Claude, Codex, Gemini and opencode also write a short instructions-file block — see below.)
 - Current targets: `claude.ts`, `cursor.ts`, `codex.ts`, `opencode.ts`.
 - `targets/toml.ts` is a hand-rolled TOML serializer scoped to `[mcp_servers.codegraph]` (used by Codex). Sibling tables and `[[array_of_tables]]` are preserved verbatim. No new dependency.
 - opencode reads `opencode.jsonc` by default; the installer prefers existing `.jsonc`, falls back to `.json`, and creates `.jsonc` for greenfield installs. Edits are surgical via `jsonc-parser` so user comments and formatting survive install/re-install/uninstall round-trips. The MCP entry is OpenCode 2's native `mcp.servers.codegraph` with `disabled: false` and `codemode: false` (so `codegraph_explore` stays on the native tool list); a pre-#1698 `mcp.codegraph` + `enabled` entry is migrated on re-install and removed by uninstall.
-- `instructions-template.ts` no longer holds an instructions body — it exports only the `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers. The installer **stopped writing** a `## CodeGraph` block into each agent's instructions file (`CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.config/opencode/AGENTS.md` / `~/.gemini/GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering doc) because it duplicated the MCP `initialize` instructions verbatim (issue #529). Each target's `install` (self-heal on upgrade) and `uninstall` use the markers to **strip** a block a previous install left behind. `server-instructions.ts` is the single source of truth for agent-facing guidance.
+- `instructions-template.ts` holds `CODEGRAPH_INSTRUCTIONS_BLOCK`, a deliberately short marker-fenced (`<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->`) `## CodeGraph` block. The Claude, Codex, Gemini and opencode targets write it into their instructions file (`CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md` / `~/.config/opencode/AGENTS.md`) via `upsertInstructionsEntry`, and `uninstall` removes it. History: #529 removed the old full playbook because it duplicated the MCP `initialize` instructions; #704 brought back this small block because the instructions file reaches two audiences `initialize` cannot — Task-tool subagents and non-MCP harnesses (the `codegraph explore` CLI). Cursor and Kiro write no block; their `install` only strips one a previous install left behind. Keep the block to command names and the two surfaces; tool guidance itself still belongs in `server-instructions.ts`.
 - All installer changes need matching coverage in `__tests__/installer-targets.test.ts` — there are ~47 parameterized contract tests covering install idempotency, sibling preservation, uninstall reverses install, byte-equal re-runs returning `unchanged`, and partial-state recovery for Codex.
 
 ### Cursor MCP working-directory quirk
@@ -115,7 +116,7 @@ Cursor launches MCP subprocesses with the wrong cwd and doesn't pass `rootUri` i
 
 ### MCP server instructions
 
-`src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools, and as of issue #529 it is the **single source of truth** for agent-facing tool guidance — the installer no longer writes a duplicate `## CodeGraph` instructions block into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules/codegraph.mdc`. Edit tool guidance here and nowhere else.
+`src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools, and as of issue #529 it is the **single source of truth** for agent-facing tool guidance. The installer's instructions-file block (`instructions-template.ts`, see above) only names the tool and the CLI for subagents and non-MCP agents; it does not repeat this guidance. Edit tool guidance here and nowhere else.
 
 ## Retrieval performance & dynamic-dispatch coverage (do not regress)
 
@@ -180,6 +181,8 @@ Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond
 
 Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.
 
+Every engine test file runs in a throwaway home dir (`__tests__/setup-home-sandbox.ts`, a `setupFiles` entry): `HOME`/`USERPROFILE` (+ Windows vars), `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` point into it, and `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/… are cleared; spawned children inherit it. It's a backstop — still inject writes to global state (e.g. `UpgradeDeps.wirePromptHook`, #2275).
+
 ### Windows-gated tests
 
 Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
@@ -210,7 +213,8 @@ For any Windows-specific PR, bug, or implementation, validate it on the real Win
 - Clone fresh into a **Windows-local** path (`C:\dev\codegraph`) and `npm ci` there — never run npm against the shared Mac repo, since `esbuild`/`rollup` ship platform-specific binaries.
 - Guest toolchain (winget): Node LTS, Git, and the **VC++ ARM64 redistributable** (required by `@rollup/rollup-win32-arm64-msvc`, which vitest pulls in).
 - Fetch a contributor PR head straight from their fork to dodge `pull/<n>/head` lag: `git fetch <fork-url> <branch>` then `git checkout -f FETCH_HEAD`.
-- Known pre-existing Windows failures (they reproduce on `main`, unrelated to your change — confirm against `origin/main` before blaming your PR, and don't let them mask new regressions): `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink` (symlink creation needs privileges on Windows); and the `mcp-initialize.test.ts` / `mcp-roots.test.ts` suites, which fail in `afterEach` with `EPERM` removing the temp dir because a spawned `serve --mcp` (its `--liftoff-only` re-exec grandchild) still holds the cwd / SQLite file open — a Windows file-locking quirk, not a logic bug.
+- Windows baseline: as of #2053 the full suite passes on the Windows 11 (ARM64) VM. The only expected exception is `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink`, which needs symlink privileges (Developer Mode) — confirm any other failure against `origin/main` before blaming your PR. The former `mcp-initialize.test.ts` / `mcp-roots.test.ts` `EPERM` teardown failures came from tests spawning `serve --mcp` without the runtime flags (its `--liftoff-only` re-exec grandchild kept the cwd / SQLite file open); spawn it with `WASM_RUNTIME_FLAGS` and await the child's exit before removing the temp dir. Windows checkouts may be CRLF — split source lines on `/\r?\n/` in tests.
+- Windows worker crashes: a worker thread that ends (`terminate()`, its own `process.exit()`, or the process exiting) while V8's concurrent marker is marking its heap kills the process with exit 3221225477 (0xC0000005) and leaves no error or dump. It's worst while the worker is still loading its modules. Owners must not terminate a worker before its first message (`workerStarted` / `terminateOnceStarted`, or the pool's own handshake), and a worker that exits itself calls `collectBeforeExit()` first — both in `src/worker-teardown.ts`. `--no-concurrent-marking` also stops it, but measured about a third slower indexing on the Windows VM, so it is not used.
 
 ## Releases
 
@@ -255,7 +259,10 @@ mismatch between `package.json` and `package-lock.json`, runs
 version fields (top-level + `packages.""`), and auto-commits + pushes the
 result back to `main` with `[skip ci]`. So a GitHub-web-UI single-file edit to
 `package.json` is enough to kick off a clean release. (If they edit both files
-locally, that's fine too — the sync step no-ops.)
+locally, that's fine too — the sync step no-ops.) Bump `ui/package.json` to the
+same version in that change: the component library is versioned with the
+engine, `ui-package.test.ts` pins it, and the workflow does not sync it — the
+1.6.1 bump left `main` red on exactly that.
 
 Once `package.json` is at the target version on `main`, trigger
 **Actions → Release → Run workflow** (on `main`). The workflow:
@@ -272,7 +279,7 @@ publish actions on shared state. Write the files, hand the user the commands.
 ## House rules
 
 - The `0.7.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
-- When changing what the MCP tools do or how agents should use them, edit `src/mcp/server-instructions.ts` — it is the **single source of truth** for agent-facing tool guidance (issue #529). The installer no longer writes a duplicate instructions block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering, so there's nothing to keep in sync anymore. (The repo's own checked-in `.cursor/rules/codegraph.mdc` is dogfooding config — update it too if you use Cursor on this repo, but it ships nowhere.)
+- When changing what the MCP tools do or how agents should use them, edit `src/mcp/server-instructions.ts` — it is the **single source of truth** for agent-facing tool guidance (issue #529). The installer's short instructions-file block (`instructions-template.ts`) only names `codegraph_explore` and the `codegraph explore` CLI; update it only when a tool or CLI command is renamed or removed. (The repo's own checked-in `.cursor/rules/codegraph.mdc` is dogfooding config — update it too if you use Cursor on this repo, but it ships nowhere.)
 - **Before adding or extending a router, a web framework, or a language's `WHEN` rules, read `docs/design/framework-coverage.md`.** It is the standing answer to "what is supported and what is left" across the three axes (route nodes → Entry points, `navigates` edges → Screens, branch-guard rules → the `WHEN` labels), with what each remaining item needs, the traps that have already cost debugging time, and the queries to re-verify it. Update it in the same change that moves a row.
 - CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
 - **When the user references issues, PR comments, or external reports, anchor them to a date and version before drawing conclusions.** Check the comment's `createdAt` against:

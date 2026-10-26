@@ -107,6 +107,28 @@ button:focus-visible {
   padding: 0 4px;
 }
 
+/* --- stale-data warning ------------------------------------------------- */
+
+.data-warning {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--oxblood);
+}
+
+.data-warning p {
+  margin: 0;
+}
+
+.data-warning p + p {
+  margin-top: 6px;
+}
+
+.data-warning strong {
+  color: var(--oxblood);
+  font-weight: 600;
+}
+
 /* --- buttons ------------------------------------------------------------ */
 
 button {

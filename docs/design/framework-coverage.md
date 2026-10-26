@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-19; Vue Router / Nuxt row: 2026-10-22) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -30,7 +30,7 @@ to write. That is why "add a router" is a small, self-contained job.
 
 ## Routers — routes AND navigation (done)
 
-Six. Each reads a literal destination and leaves a computed one, a path no
+Seven. Each reads a literal destination and leaves a computed one, a path no
 route serves, and a conditional whose arms disagree unresolved rather than
 guessed.
 
@@ -38,17 +38,56 @@ guessed.
 |---|---|---|---|---|
 | Expo Router | `frameworks/expo-router.ts` | `expo-router-synthesizer.ts` | `expo-router.test.ts` | — |
 | Next.js | `frameworks/nextjs.ts` | `next-router-synthesizer.ts` | `nextjs.test.ts` | next-saas-starter |
-| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges) |
+| React Router | `frameworks/react-router.ts` | `react-router-synthesizer.ts` | `react-router.test.ts` | proshop (44 edges), proshop-v2 (28), react-redux-realworld (22), react-boilerplate (`styled(Link)`), takenote (v5 `<Redirect>`), bulletproof-react (nested `children`, `lazy` routes, `paths.x.path` constants through an app's own tsconfig alias: 0 → 9 named, linked routes), and its `paths.x.getHref(id)` links and `navigate(paths.x.getHref())` calls (0 → 11 navigates). Route tables another file hands the router (`tableRoutes` in `frameworks/react.ts`, trap 13): the ASP.NET Core React template's `AppRoutes.map(… <Route {...rest}>)` on jasontaylordev/CleanArchitecture's `ClientApp-React` (0 → 6 routes, 11 navigates), replaysMike/Binner (0 → 46, 87), GavinLonDigital/RankingApp, GarrettHays/PaydirtPickem, charlessolar/eShopOnContainersDDD; `useRoutes(routes)` from another file and `[...sessionRoutes]` on uilibrary/matx-react (0 → 7, 16), and its `[...materialRoutes]` once the jsconfig `"baseUrl": "src"` import naming it resolved (7 → 21 routes, each bound through `lazy(() => import(…))` to its page, trap 20); codedthemes' `createBrowserRouter([MainRoutes, LoginRoutes])` on berry and mantis (9 and 8 routes, no navigation they can resolve; each bound to its lazily loaded page and its layout since their `baseUrl` / `"*"` imports resolve, where before they named the local `Loadable(lazy(…))` value); a table `.map`ped inside `<Route path="/dashboard">` on RADeveloping/chickadeeinvest; `useRoutes([...])` in place on minimal-ui-kit/material-kit-react (0 → 7, bound through `lazy(() => import(…))` to each page). A table a function returns, handed over through a variable (`const routes = getRouteMap({ … })` in a class's `render()`, then `createBrowserRouter(routes)`; trap 13): Medusa's admin dashboard (0 → 221 routes, each bound to its page, 613 layout edges, 92 navigations newly linked: 60 `navigate()` calls and 32 `<Link>`s; all 821 edges an AST oracle on the TypeScript compiler expects, and no others), Mercur's admin panel (0 → 216; 775 of 775), serenedb's serene-ui (`buildRoutes = () => [...appRoutes, ...loaderRoutes]`: 0 → 4), 22 control repos byte-identical, and a late-file sync equal to a fresh index on both dashboards. Route objects that render `<Outlet />` (`element: <Outlet />`, `Component: Outlet`, a `lazy` loader handing back `{ Component: Outlet }`; trap 14): both dashboards and mercurjs/vendor-panel drop every `layout:Outlet` reference they made (93, 106 and 87 rows, none of which linked anything) and the 13, 5 and 5 layout edges that drew a product's detail page around its variants' pages; React Router's error-boundaries example's `/` becomes its `Layout` page instead of React Router's own `Outlet`; 21 other repos byte-identical, and 2,677 surveyed router files change only by dropping 40 such references. A table behind `useMemo` (trap 13): anotherIlnaz/tg-tt-bot-stage (`useMemo(() => getRoutes(personalAcc), [personalAcc])`: 0 → 12 routes, 16 navigations), dingtalkwukong/bewild-clone (`useMemo(() => buildRoutes(), [])`: 0 → 13, 4) and the-ctrlv/SpaceR (`useMemo(getRoutes, [])` through a `baseUrl` import: 0 → 10, 21), each route bound to the page its table names; EyeSeeTea/training-app, whose builder maps a config into routes, and BANKFORM1, whose route file imports `createBrowserRouter` and so was read already, unchanged, with 25 other repos byte-identical. JSX index routes and layouts (trap 14): proshop-v2's `createRoutesFromElements` (`/` is HomeScreen inside App, not App; 30 layout edges, the `path=''` guards included; Screens 30 → 74 transitions, the guards' redirects drawn from the screens they guard), chickadeeinvest's table inside `<Route element={<DashboardLayout/>}>` (its 4 routes get the layout), React Router 6.29's own examples and tests, refine's 281 examples (one `/` per app, 191 layout edges, 21 new navigations), crwn-clothing, the vanlife course app, volun-mern (105 layout edges, six levels deep), spotify/vispana, react_persist_login, chushi (`path={"agents"}`: 2 → 6 routes), hathor-explorer (`path=""` at the root), cboard, react-router-auth-v6: 578 of 581 new layout edges name a component of an enclosing `<Route>` (vanlife's 3 inherit a default-import resolution bug that already misbinds its pages), 27 of 27 new navigations precise, no navigation lost, 16 control repos byte-identical. Lazy route modules that are barrels (`exportedComponent` in `frameworks/react.ts`): luci-go's milo/ui (`export * from './x'` index files and `export { X as Component }` clauses: 0 → 51 lazy routes linked; the other 40 load a file under `src/build/`, which the default ignore skips, export only a `loader` or a `handle`, or pick a named export in an async `lazy`), Medusa's admin dashboard (all 193 route-map modules resolve through its `export { X as Component } from` barrels), four more apps (9 routes), 16 control repos byte-identical. Lazy loaders that pick their page (`lazyRouteReference` in `frameworks/react.ts`, trap 18): milo/ui's three tabs (`const { TestTab } = await import('…/tabs')`), 20 apps from a GitHub survey of `createBrowserRouter` + `lazy` (636 picked-page edges, each checked against the target file's own export: 467 by name, 169 as its `export default`; 42 routes written with `async lazy()` now indexed, among them React Router's own `lazy-loading-router-provider` example), an AST oracle on the TypeScript compiler agreeing with the text reader on all 2,538 loaders of 876 surveyed router files, a late-file sync equal to a fresh index on 8 of those apps, and 26 control repos byte-identical, among them ghostfolio, whose 30 Angular lazy routes stay Angular's with React detected in the same project. Barrels that pass on a page they import (`import { UserLayout } from './UserLayout'; export { UserLayout }`, `import Login from './Login'; export default Login`; `exportedComponent` follows the import): Arshia76/DigiShop.Frontend (0 → 27 route and layout edges), 49 other repos byte-identical; `export default withAuth(Page)` is followed nowhere. A page in a folder below the barrel's (`pages/Home/index.tsx` behind `@/pages`) whose route failed waits under the barrel's module key (`module:pages`), which the page's own keys never give: a sync that adds the page, or gives it a definition, walks up the import edges to the barrels that pass it on (`reopenReferencesThroughBarrels` in `resolution/module-importers.ts`) and re-opens what waits under theirs. A late-file sync on DigiShop then equals a fresh index (13 of its routes stayed unlinked before), and 27 other repos sync exactly as before. A name the route file declares itself (trap 19), such as a lazy page or layout, a `Loadable(lazy(…))` or an `observer(…)` value, binds to what that declaration renders wherever the file uses it, in routes, layouts and JSX alike: outline (+31 edges, 7 moved off another file's namesake or onto the screen a lazy declaration loads), mastodon (+20, 9 moved: `lazy(() => import(…).then(({ Emoji }) => …))` values and `let Emoji` locals had gone to other files' components), SigNoz (+7, 4 moved), excalidraw (+3, 1 moved: the Next.js example's `<Excalidraw>` was the docs site's), bulletproof-react (+6), material-kit-react and create-t3-turbo (+1 each), with matx, mantis, proshop, next-saas-starter and berry byte-identical |
 | TanStack Router | `frameworks/tanstack-router.ts` | `tanstack-router-synthesizer.ts` | `tanstack-router.test.ts` | TanStack examples, fastapi-template frontend |
-| Vue Router / Nuxt | `frameworks/vue-router.ts` | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges) |
-| SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts` | sveltekit-realworld (31 edges) |
+| Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts`, `nuxt-navigate-to.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies. Nuxt's `navigateTo` (trap 21): mealie 13 of its 14 calls, nuxt.com 17 of 24, elk 9 of 10 outside the plugin that declares its own, atidone 2 of 2, pages and route middleware alike; the rest are computed, an API endpoint (`{ external: true }`), or a page of a Nuxt layer (`extends: ['./layers/nuxi']`), whose pages sit in a route table of their own. nuxt/ui's docs: 0 of 4, two computed and two whose only page is a catch-all (`[...slug].vue`, named `*slug`) or an optional parameter (`[[tag]].vue`, `:tag?`), which `matchRoute` doesn't read yet, for markup links either |
+| SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
+| Angular | `frameworks/angular-router.ts` | `angular-template-synthesizer.ts` | `angular-router.test.ts` | angular-realworld (31 edges, 18 renders, 32 bindings), Ghostfolio (189 edges, 170 renders, 215 bindings), ngx-admin (routes and renders; its menus are config; 13 bindings), CleanArchitecture's `src/Web/ClientApp` (signals; 12 bindings), angular-spotify (Nx libs behind barrels: 14 routes), jira-clone (class-constant paths, mount-only redirects), jhipster (60), ionic-conference (18), Angular-JumpStart (18) |
 
-Shared machinery all six use, in `frameworks/expo-router.ts`: `RouteTable` /
+Shared machinery all seven use, in `frameworks/expo-router.ts`: `RouteTable` /
 `RootedRouteTable`, `routesForFile`, `addRouteTo`, `matchRoute`, `appRootFor`,
 `parseHrefExpression`, `readHrefViaLocal`, `nthArgumentText`, `readStringAt`,
 `toHref`. Plus `pageForHref` in `frameworks/nextjs.ts` (framework-agnostic
 despite where it lives) and the object-literal walker in
 `frameworks/object-literal.ts`.
+
+Angular is the one whose markup is not indexed: a component's template is a
+`templateUrl` file (or an inline `template:` string) read at synthesis time,
+which also yields the component tree (`<app-foo>` by element selector) — the
+edge a navigation in a child component rides to its screen. A `routerLink:`
+field written in a component's class (a tab bar's or a menu's config, bound
+in a loop elsewhere) counts as a link from that component. An event binding
+(`(click)="save()"`) is a `calls` edge from the component to its own method
+carrying `metadata.trigger`, which Steps uses in place of reading a trigger
+at the edge's line (the binding is in the template, not the source there).
+A property binding, an interpolation, a structural directive or a
+control-flow block that calls one of the component's own members
+(`[name]="icon()"`, `{{ label() }}`, `*matRowDef="let row; columns:
+displayedColumns()"`, `@if (loading())`, `@let total = price();`) is a
+`calls` edge too (`angular-binding`, the binding as `via`), with no trigger:
+it runs when the template renders, so Steps folds it into the screen rather
+than drawing a handler the user fires — a trigger there drew `computed`
+signals as user actions. A member read without a call counts only when it is
+method-kind: a getter is called, a method handed to a child
+(`[displayWith]="displayFn"`, `trackBy: trackById`) is a `references` edge
+with `fnRef`, and a field a call filled (`days = Array.from(…)`) a plain
+`references`. A property read (`[value]="title"`) links nothing, as in
+TypeScript, which records no property reads either; on angular-realworld,
+ngx-admin, Ghostfolio and CleanArchitecture it would have added four times
+the edges and taken nothing off the Dead code list, which never asks about
+properties. A pipe, an object key, a
+microsyntax key (`of`, `trackBy:`, `index`), a template's own names (`let
+item`, `as user`, `#ref`, `@let x`, `let-row`) and a commented-out binding
+link nothing. A route with
+`children` is a layout: its component carries a `references` edge marked
+`layout: true` from each screen nested in it, and `routeLayouts` in
+`route-roots.ts` gives Screens every screen a layout serves. Known limits: a
+route with a custom `matcher` has no static address, a relative navigation
+(`relativeTo`) is left unresolved, an edit to a template file alone is
+picked up at the next sync of any source file (templates are not watched), a
+member a component inherits from a base class is not linked from its
+template, and a template's local hides a same-named member for the rest of
+the template rather than only inside its block.
 
 ---
 
@@ -174,6 +213,10 @@ Each of these cost real debugging time; they are not hypothetical.
    `name` is written above its `path`, so a text window handed every entry its
    predecessor's name — silently, for every route in the file. Use
    `frameworks/object-literal.ts`.
+   A lazy view binds by the FILE it imports, never by the import's last
+   segment: vue-element-admin's views are all `…/index.vue`.
+   Nuxt's `pages/` convention belongs to a Nuxt app only — a plain Vue app's
+   `pages/` folder (halo's console) holds components a router config names.
 5. **A receiver is required for a generic verb.** `push` and `replace` are two
    of the most common method names in JavaScript; claiming a bare one puts every
    `paths.push('/tmp/x')` one string-match away from a route.
@@ -210,6 +253,202 @@ Each of these cost real debugging time; they are not hypothetical.
    per file-count for exactly this reason — an earlier version cached the empty
    pre-index answer and every framework whose dependency lived one directory
    down stayed undetected.
+12. **An app's manifest can sit three or more levels down.** An ASP.NET
+   solution keeps its single-page app in `src/Web/ClientApp/`, and prometheus
+   keeps its React apps in `web/ui/mantine-ui/` under a workspace root at
+   `web/ui/` that declares only tooling. `declaredDependencies` reads the root
+   and the first two levels, then gives the slots left to the directories
+   above JS/TS code, shallowest first. Read only two levels deep, Angular
+   Router never ran on jasontaylordev/CleanArchitecture, and every
+   template-bound handler there was listed as dead code. A new detector that
+   gates on a dependency should ask `dependsOn`, not read a `package.json`
+   itself, so it sees the same manifests every other detector does.
+13. **A route table can be named only by another file.** The ASP.NET Core
+   React template keeps its routes in `AppRoutes.js`, a file that never names
+   the router, and renders them from `App.js` with `AppRoutes.map(({ element,
+   ...rest }) => <Route {...rest} element={element} />)`; codedthemes' admin
+   kits put one route object per file and list them in
+   `createBrowserRouter([MainRoutes, LoginRoutes])`. Read on its own, such a
+   file cannot be told from a menu's `{ path, element }` list, and per-file
+   extraction cannot see the file that hands it over, nor run again when that
+   file changes. So React keeps those routes in the cross-file pass
+   (`FrameworkResolver.crossFileNodes`, reconciled in `runPostExtract` on every
+   index and sync, removals included): it starts from the files that import
+   React Router, takes only a `useRoutes` / `create*Router` argument or a
+   `.map` whose callback renders a `<Route>` from the item's own fields
+   (`{...route}`, `{...rest}`, `path={route.path}` — never
+   `path={r.layout + r.path}`), follows the import to the table and the tables
+   it names in turn, and owns its routes by id (`…:table:<path>`). One limit
+   it shares with every router: a table rendered by a component that is
+   itself mounted under another file's `<Route path="/admin/*">` reads as if
+   at the root. A sync that changes such a route resolves the calls it can
+   answer again (16), as for any other route. A variable that holds a call's
+   result stands for the table the function returns: Medusa's `const routes =
+   getRouteMap({ … })` inside a class's `render()`, `export const routes =
+   buildRoutes()`, `export default buildRoutes()`, `await loadRoutes()`. Which
+   declaration a name means is the one in scope where it is used, decided by
+   the graph's functions: another function's `const routes = getMenu()` is
+   that function's own, and an exported name is a top-level one. A
+   function-local declaration has no node, so the declarations are read from
+   the text and only the scope comes from the graph. What the function's
+   parameters bring in (Medusa's `...coreRoutes`, from plugins) is the
+   caller's to fill and stays unread. What a function returns is every
+   `return` of its own, an early `if (!user) return [];` and each branch
+   alike, and never one of a function written inside it: the first `return
+   [` anywhere in the body was a `.forEach` callback's `[]` in
+   devanshthakker15/BANKFORM1's `generateRoutes`, and could be a helper's
+   menu. A function that returns another's table (`return buildRoutes()`) is
+   followed, and so is `useMemo` (`useMemo(() => getRoutes(user), [user])`,
+   `useMemo(getRoutes, [])`). The body is scanned as text, so a quote right
+   after a word is JSX text's apostrophe (`<p>Don't</p>`), not a string.
+14. **An index route is at its parent's address, so it needs that address
+   written down.** `<Route index element={<Home />} />` inside `<Route
+   path="/" element={<Layout />}>` is the page at `/`, and Layout is the
+   layout of every route nested in it (trap 2: emitting Layout as a second
+   `/` page drew the app's chrome as the home screen and its header's links
+   from `/` alone). A `<Route path>` with no element only groups its children
+   and yields its address the same way. But a `<Routes>` inside a component
+   is mounted wherever another file's `<Route path="shop/*" element={<Shop
+   />}>` puts it: read as `/`, crwn-clothing's `Shop` index made a second
+   home page. So an index route at the top of a `<Routes>` is read only
+   inside the router itself (`createRoutesFromElements(…)`, `<BrowserRouter>`),
+   and one under a path the file does not spell out (`path={paths.agents}`)
+   not at all; `path={"agents"}` is spelled out. Reading what an element
+   renders has three traps of its own: skip elements written in an attribute
+   unless the attribute hands over a page (`component`, `element`, `page`) —
+   `<Suspense fallback={<Loader />}>` bound fifteen routes of one app to the
+   spinner; trim the line break Prettier writes after `element={`, which hid
+   every long element; and read `<Outlet />` as rendering nothing of its own,
+   in a route object too (`element: <Outlet />`, `Component: Outlet`, a `lazy`
+   loader handing back `{ Component: Outlet }`), as a route with no element
+   renders one: taking it for the page made every route inside a
+   `layout:Outlet` that links nothing, and a loader returning it fell back to
+   the module it loads for its `loader`, drawing Medusa's product page around
+   its variants. Such an object is still a route at its own address, inside
+   the layouts around it, unless a page inside claims the address or it sits
+   at its parent's (`path: ''`), where it only groups its children.
+   Version 5's `<Route path="" component={NotFound} />` is a catch-all, not
+   the page at its parent's address. A table written in another file and
+   mapped inside a `<Route element>` gets no layout edge: the layout's name
+   would be looked up in the table's file, and the cross-file pass compares
+   only route names, so a changed layout would never reach the table's routes.
+15. **`resolve()` sees only references written in the framework's own
+   languages** (`getResolvingFrameworks`): Express's `logger` middleware rule
+   once took etcd's Go `*zap.Logger` result types for a method. A navigation
+   written in markup (`.svelte`, `.vue`) needs that language in `languages`.
+   A resolver that reads a language it extracts nothing from lists it in
+   `resolveLanguages` instead — Svelte's `$lib/…` imports in `.ts` route
+   modules, ASP.NET's Razor `@model` — because widening `languages` also runs
+   `extract()` on those files. `claimsReference()` is asked of the same
+   frameworks. It used to be asked of every detected one, because protobuf's
+   C++ `::_pbi::…` calls got past the name pre-filter only on the Swift ↔
+   Objective-C bridge's claim of any name with a `:` in it. The pre-filter
+   now reads a leading `::` as the global scope.
+16. **A navigation call waits for a route, not for a name.** A call indexed
+   before its route existed is parked as failed (or bound to a catch-all, a
+   parameter route, the other arm of a conditional), and sync revisits a
+   failed reference only by matching its last name segment against the names
+   the synced files define — never `push` or `navigate`. Set the resolver's
+   `navigation`: `tails`, the method names its calls end in, and `scope`, the
+   apps whose calls one of its routes can answer (its own app's table, or every
+   file for a table the whole project shares). A sync that adds, removes or
+   renames a route — a cross-file table route included — then resolves those
+   calls again, failed or not; without it the synced index keeps an answer a
+   full index does not have. `sync-navigation-retry.test.ts` runs all seven
+   routers through it, and asserts each router's calls end in a declared tail.
+17. **A sync revisits a resolved route only by the names it carries.** A route
+   that renders a same-file `const Docs = lazy(() => import('./pages/Docs'))`
+   binds to the component that module exports, and to the declaration while
+   the module is missing or exports none (`declaredComponent`). The reference
+   resolved, so the failed-ref retry never sees it, and the rebind of the
+   names a sync defines (CG-33) reaches it only when the module's component
+   is named like the declaration: on minimal-ui-kit/material-kit-react,
+   `/user` stayed on its `UserPage` declaration after `src/pages/user.tsx`
+   (`Page`) came back. A router whose `resolve()` reads modules' content to
+   answer a route says which ones (`FrameworkResolver.lazyModules`), barrels it
+   follows included, and a sync that adds or edits one of them puts the
+   route's reference back for its resolution sweep. The same holds for the
+   JSX a component renders: a sync that adds a component redraws the
+   `jsx-render` edges, since a tag in a file it never touched may name it.
+   A route whose reference FAILED waits under the key of the module it names
+   (`module:pages` for `@/pages`), and a page in a folder below that barrel
+   (`pages/Home/index.tsx`) gives only its own folder's and stem's keys. So a
+   sync that adds a file, or gives one a definition, walks up the import
+   edges to the barrels that pass it on and re-opens what waits under their
+   keys (`reopenReferencesThroughBarrels`, after the failed-ref retry made the
+   barrel's import edge into the added file).
+18. **A lazy loader is code, and its page is what it hands over.** A React
+   Router `lazy` resolves to the route's properties, so `const { TestTab } =
+   await import('./tabs'); return { Component: TestTab }` renders `TestTab`,
+   not the module's default export; reading the first `import('…')` in the
+   loader linked luci-go's tab routes to nothing and other apps' routes to
+   another page of the same module (`lazyRouteReference` in
+   `frameworks/react.ts` follows the loader's bindings to its `Component`, or
+   the one lazily imported export its `element` shows past a guard). The
+   picked export is named the way Vue Router and Angular name a lazy
+   component, `import:<path>#<export>`, so sync's module-tail retry covers it
+   (`MODULE_REFERENCE`), but React is registered before both of them: it
+   answers only references a React route makes (`isReactRouteRef`: tsx or jsx,
+   which Vue's and Angular's route references never are), or it takes theirs
+   first, as an Angular app with React in a `package.json` would let it.
+19. **A name a file declares is that declaration, wherever the file uses it.**
+   JavaScript scoping makes `<RegisterPage />`, a route's `element:
+   <RegisterPage />`, a `layout:` and a TSX type all the `const` the file
+   declares under that name, so every one of them asks `declaredComponent`
+   first (Pattern 1 of `reactResolver.resolve` for any PascalCase reference,
+   `layoutComponent`, and the `jsx-render` synthesizer's `jsxChild`), and the
+   lookup by name runs only for a file that declares no such value. A value is
+   no component node: the lookup by kind skipped it and took a lone
+   same-named component anywhere, so mantis's vite app rendered its Next.js
+   app's `RegisterPage`. What the value renders is read from its initializer
+   (`valueLoader`, by `loaderValue`): the module a lazy loader loads or the
+   export it picks, in either branch of a conditional (SigNoz's `IS_DEV ?
+   React.lazy(…) : null`); the function it wraps (`observer(function
+   Settings() {…})`, SigNoz's `React.memo(TableBody, areEqual)`, mastodon's
+   `forwardRef(ComboboxWithRef) as {…}`); else the
+   declaration itself (`const DialogPortal = DialogPrimitive.Portal`,
+   `createContext(…)`). A module whose default export is `observer(Login)`
+   hands over `Login` (`defaultExportedName`). A tag's edge now depends on the
+   modules the file's lazy values load, so those are synthesis inputs
+   (`lazyValueModules`): a sync that gives one its default export redraws the
+   tag, as a fresh index would draw it. A component node minted for a wrapper
+   with no render function of its own (outline's `styled(ActionButton).attrs(…)
+   <Props>\`…\``, `memo(Button)`) renders the component it wraps, with no tag to
+   read: `wrappedComponentName` reads the name off the declaration, and the
+   `jsx-render` synthesizer binds it as `jsxChild` binds a tag, but only where
+   the file binds the name itself, by a declaration or an import of a project
+   module (`wrappedChild`). bigbluebutton imports through Meteor `/imports/…`
+   paths no resolver follows, and a guess among its dozens of styled `Icon`s
+   and `FlexColumn`s was wrong every time. A file that declares such a wrapper
+   is a synthesis input even with no markup.
+20. **An import that looks like a package can be a path.** Create React App
+   and Vite admin templates (berry, mantis, matx) set `"baseUrl": "src"` or
+   `"paths": { "*": ["./src/*"] }` in a jsconfig and write every cross-file
+   import as `layout/MainLayout` or `pages/auth/Register`. Taken for npm
+   packages, those imports linked nothing: a route table imported that way
+   was never read, and a `lazy(() => import('views/x'))` route bound to the
+   local `Loadable(…)` value instead of its page. The import resolver now
+   reads such a specifier through the importing app's own config and binds it
+   only to an indexed file (`fileExists` also answers for folders and
+   `node_modules`). A package that app's `package.json` declares, or a Node
+   built-in, never reaches a project module that way, only a `.d.ts` the
+   project keeps for it (`"*": ["./typings/*"]`, as tsc reads it). A route
+   resolves its lazy module as TypeScript whatever the file is written in,
+   which is why the TypeScript extension list probes `/index.jsx` last.
+21. **A navigation call named like a function must not fall back to one.**
+   Nuxt auto-imports `navigateTo`, so a call to it is written bare, with no
+   import to say where it comes from. When Vue Router can't read where it goes
+   — a computed destination, a path no page serves, an external URL — the
+   reference would reach the name matcher, which links any project function
+   of that name: elk declares a `navigateTo` of its own inside a plugin. The
+   Vue resolver used to sink every `navigateTo` into an edge to its caller,
+   which hid the navigation too, and which sync never revisits (trap 16).
+   `FrameworkResolver.ownsReference` names the references a framework answers
+   alone: `nuxtResolver` owns a bare `navigateTo` that no declaration or
+   import in the file binds, and one no router links stays unresolved, so a
+   sync binds it when its page appears. An absolute URL is no path of the app:
+   Vue Router's call reader keeps only destinations that start with `/`, as
+   its markup reader does.
 
 ---
 

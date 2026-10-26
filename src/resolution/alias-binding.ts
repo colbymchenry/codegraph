@@ -21,6 +21,7 @@
 
 import type { Node } from '../types';
 import type { ResolutionContext } from './types';
+import { resolveObjectLiteralBinding } from './name-matcher';
 
 /** Kinds that can be a pure alias for another symbol. */
 const ALIAS_BINDING_KINDS = new Set<string>(['constant', 'variable', 'property']);
@@ -79,6 +80,15 @@ export function resolveAliasBinding(
 ): Node | null {
   if (!ALIAS_BINDING_KINDS.has(aliasNode.kind)) return null;
 
+  if (memberName && ['typescript', 'tsx', 'javascript', 'jsx', 'arkts'].includes(aliasNode.language)) {
+    const resolved = resolveObjectLiteralBinding(aliasNode, memberName, {
+      fromNodeId: aliasNode.id, referenceName: memberName, referenceKind: 'calls',
+      filePath: aliasNode.filePath, language: aliasNode.language,
+      line: aliasNode.startLine, column: aliasNode.startColumn,
+    }, context);
+    return resolved ? context.getNodeById?.(resolved.targetNodeId) ?? null : null;
+  }
+
   const targetName = aliasTargetName(aliasNode.signature, memberName);
   if (!targetName || targetName === aliasNode.name) return null;
 
@@ -121,5 +131,32 @@ export function extractLocalExportAliases(content: string): Array<{ exportedName
       }
     }
   }
+  // CommonJS: `exports.setCharset = function setCharset(…)`, `module.exports.x = impl`,
+  // and a named class expression, `exports.Router = class Router {…}` (#2499).
+  const memberRe = /^[ \t]*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=\s*(?:(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|class\s+(?!extends\b)([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)\s*;?[ \t]*$)/gm;
+  let member: RegExpExecArray | null;
+  while ((member = memberRe.exec(content)) !== null) {
+    out.push({ exportedName: member[1]!, localName: member[2] ?? member[3] ?? member[4]! });
+  }
+  // `module.exports = { parse, format: formatDate }`.
+  const objectRe = /^[ \t]*module\.exports\s*=\s*\{([^{}]*)\}/gm;
+  let object: RegExpExecArray | null;
+  while ((object = objectRe.exec(content)) !== null) {
+    for (const raw of object[1]!.split(',')) {
+      const entry = /^\s*([A-Za-z_$][\w$]*)\s*(?::\s*([A-Za-z_$][\w$]*)\s*)?$/.exec(raw);
+      if (entry) out.push({ exportedName: entry[1]!, localName: entry[2] ?? entry[1]! });
+    }
+  }
   return out;
+}
+
+/**
+ * The binding a module's default export is as a whole: `export default
+ * Page;`, `export { Page as default }`. Null for a declaration or an
+ * expression: `export default withAuth(Page)` hands over a call, whose first
+ * identifier is no binding of the module's.
+ */
+export function defaultExportBinding(content: string): string | null {
+  return /(?:^|;)\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*(?:;|$)/m.exec(content)?.[1] ??
+    extractLocalExportAliases(content).find((a) => a.exportedName === 'default')?.localName ?? null;
 }

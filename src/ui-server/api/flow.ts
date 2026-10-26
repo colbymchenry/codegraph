@@ -49,6 +49,9 @@ import {
 } from '../../graph/dynamic-boundary-report';
 import { highlightLines, type HighlightResult } from '../highlight';
 import { badRequest, intParam } from './respond';
+// Hops accepted from a trail: the same cap the trail store saves under, so a
+// trail that can be saved can also be read as a flow (#1976).
+import { MAX_TRAIL_HOPS } from './trail-store';
 import { findIndexedFile, hasDriftedOnDisk, splitLines, toRequestPath } from './source';
 import { resolveProjectFile } from '../security';
 import {
@@ -80,8 +83,6 @@ const HIGHLIGHT_LEAD_MAX = 200;
 /** Distinct paths returned. The header's flow picker is a short list or nothing. */
 export const MAX_FLOWS = 4;
 
-/** Hops accepted from a trail. The trail bar itself is not much longer than this. */
-const MAX_TRAIL_HOPS = 24;
 
 // =============================================================================
 // Wire shapes

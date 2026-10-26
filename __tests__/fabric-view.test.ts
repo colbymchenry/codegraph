@@ -142,3 +142,55 @@ export function App() {
     // The full flow: App (TSX) → MyView (fabric-component) → MyViewView (ObjC native class)
   });
 });
+
+describe('Paper end-to-end: a requireNativeComponent module rendered under another name', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'paper-fixture-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('segmented-control: <RNCSegmentedControlNativeComponent> → requireNativeComponent("RNCSegmentedControl") → the native view', async () => {
+    const write = (rel: string, content: string) => {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    };
+    write('package.json', '{"dependencies":{"react-native":"^0.73"}}');
+    write('js/RNCSegmentedControlNativeComponent.js', `import { requireNativeComponent } from 'react-native';
+module.exports = requireNativeComponent('RNCSegmentedControl');
+`);
+    write('js/SegmentedControl.js', `import * as React from 'react';
+import RNCSegmentedControlNativeComponent from './RNCSegmentedControlNativeComponent';
+export default function SegmentedControl(props) {
+  return <RNCSegmentedControlNativeComponent {...props} />;
+}
+`);
+    write('ios/RNCSegmentedControl.m', `@implementation RNCSegmentedControl
+- (void)setValues:(NSArray *)values { }
+@end
+`);
+    write('ios/RNCSegmentedControlManager.m', `@implementation RNCSegmentedControlManager
+RCT_EXPORT_MODULE()
+RCT_EXPORT_VIEW_PROPERTY(values, NSArray)
+@end
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      const control = cg.getNodesByName('SegmentedControl').find((n) => n.filePath === 'js/SegmentedControl.js')!;
+      const rendered = cg.getOutgoingEdges(control.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)!);
+      const component = rendered.find((n) => n.kind === 'component' && n.name === 'RNCSegmentedControl');
+      expect(component?.filePath).toBe('js/RNCSegmentedControlNativeComponent.js');
+      const native = cg
+        .getOutgoingEdges(component!.id)
+        .filter((e) => (e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'fabric-native-impl')
+        .map((e) => cg.getNode(e.target)!)
+        .filter((n) => n.language === 'objc')
+        .map((n) => n.name);
+      expect(native).toContain('RNCSegmentedControl');
+    } finally {
+      cg.close();
+    }
+  });
+});

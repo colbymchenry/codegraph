@@ -16,23 +16,30 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
-import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
-import { isGeneratedFile } from './generated-detection';
+import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
+import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
+import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs } from './languages/c-cpp';
-import { rustImplTypeName } from './languages/rust';
+import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
+import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
+import { appendCppMacroMethods } from './languages/cpp-macro-methods';
+import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
+import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
+import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { extractBashVariables } from './languages/bash';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
+import { PASCAL_SYSTEM_NAMES } from './languages/pascal-system';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
+import { commonJsRequireRefs } from './commonjs-requires';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -63,9 +70,10 @@ const REACT_COMPONENT_HOCS = new Set(['forwardRef', 'memo', 'React.forwardRef', 
  * inside a type literal (`type Handle = { stop(): void }`), whose members
  * `extractTypeAlias` already extracts and attaches to the alias (#359) — take
  * the fallback and the file gains a phantom top-level `function stop` beside
- * the real `Handle::stop`.
+ * the real `Handle::stop`. An abstract class's `abstract send(): void` is
+ * one too.
  */
-const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature']);
+const SIGNATURE_METHOD_NODE_TYPES = new Set(['method_signature', 'abstract_method_signature']);
 
 /** Vue store collections whose object-literal members are the symbols an agent
  *  looks for. Extracted as function nodes so `actions`/`mutations`/`getters` are
@@ -208,6 +216,24 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
 }
 
 /**
+ * The type a Java or TypeScript supertype clause names, without its type
+ * arguments: `Store` for `implements Store<String>`, `a.Base` for `extends
+ * a.Base<Integer>`, `ns.Other` for TypeScript's `implements ns.Other<number>`.
+ * The grammars wrap a parameterized supertype in a `generic_type` whose first
+ * child is the name; the index holds the interface or class under that name,
+ * so the full text (`Store<String>`) matched nothing and a class implementing
+ * a generic interface had no `implements` edge, nor the interface-impl links
+ * that follow from it. Any other node is its own text, as before.
+ */
+function supertypeName(node: SyntaxNode, source: string): string {
+  if (node.type === 'generic_type') {
+    const named = node.namedChildren.find((c: SyntaxNode) => c.type !== 'type_arguments');
+    if (named) return getNodeText(named, source);
+  }
+  return getNodeText(node, source);
+}
+
+/**
  * Resolve a Scala type node to its base type NAME for name-matching — unwrapping
  * `generic_type` (`Monoid[Int]` → `Monoid`), taking the last segment of a
  * qualified `stable_type_identifier` (`cats.Functor` → `Functor`), and falling
@@ -240,33 +266,26 @@ function scalaBaseTypeName(node: SyntaxNode | null, source: string): string | nu
 }
 
 /**
- * Resolve the declared identifier inside a C declarator. A `declaration`'s
- * `declarator` field nests the name through `init_declarator` (with value),
- * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
- * wrappers (each via their own `declarator` field) down to an `identifier`.
- * A `function_declarator` means the declaration is a function prototype (or a
- * function-pointer var) — return null so it isn't extracted as a variable.
+ * The class a C# declared type names, as `new T()` would name it: `Foo`,
+ * `List<Foo>` → `List`, `Ns.Foo` / `global::Foo` → `Foo`, `Foo?` → `Foo`.
+ * Predefined, array, tuple and pointer types name no class → null. Mirrored
+ * in the kernel (csharp.rs class_type_name).
  */
-function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
-  let cur: SyntaxNode | null = node;
-  let guard = 0;
-  while (cur && guard++ < 12) {
-    switch (cur.type) {
-      case 'identifier':
-        return cur;
-      case 'function_declarator':
-        return null;
-      case 'init_declarator':
-      case 'pointer_declarator':
-      case 'array_declarator':
-      case 'parenthesized_declarator':
-        cur = getChildByField(cur, 'declarator');
-        break;
-      default:
-        return null;
-    }
+function csharpClassTypeName(node: SyntaxNode | null, source: string): string | null {
+  if (!node) return null;
+  switch (node.type) {
+    case 'identifier':
+      return getNodeText(node, source) || null;
+    case 'generic_name':
+      return csharpClassTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier') ?? null, source);
+    case 'qualified_name':
+    case 'alias_qualified_name':
+      return csharpClassTypeName(getChildByField(node, 'name'), source);
+    case 'nullable_type':
+      return csharpClassTypeName(getChildByField(node, 'type'), source);
+    default:
+      return null;
   }
-  return null;
 }
 
 /** First `simple_identifier` in `node`'s subtree (breadth-ish, first-found).
@@ -306,6 +325,18 @@ function swiftPropertyInfo(
   return { nameNode: firstSimpleIdentifier(pattern), isLet, isComputed };
 }
 
+/**
+ * A Ruby constant, or a `scope_resolution` path of constants (`A::B::C`, a
+ * top-level `::A` / `::A::B`): what Ruby reads as a constant. A path through
+ * a value (`obj::Thing`, `self.class::LIMIT`) is not one.
+ */
+function isRubyConstantPath(node: SyntaxNode): boolean {
+  if (node.type === 'constant') return true;
+  if (node.type !== 'scope_resolution') return false;
+  const scope = getChildByField(node, 'scope');
+  return getChildByField(node, 'name')?.type === 'constant' && (!scope || isRubyConstantPath(scope));
+}
+
 /** True when `node` is (transitively) inside a C function body — i.e. a local,
  * not a file/namespace-scope declaration. Walks the parent chain to the root. */
 function hasFunctionAncestor(node: SyntaxNode): boolean {
@@ -338,7 +369,7 @@ const PHP_TYPE_NODES: ReadonlySet<string> = new Set([
  */
 const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
   'field_access',                       // java (`Foo.BAR`)
-  'member_access_expression',           // c#  (`Foo.Bar`)
+  'member_access_expression',           // c# / vb.net (`Foo.Bar`)
   'navigation_expression',              // kotlin / swift (`Foo.bar`)
   'field_expression',                   // scala (`Foo.bar`)
   'class_constant_access_expression',   // php (`Foo::CONST`, `Foo::class`)
@@ -357,10 +388,33 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * static read is pure duplication) — while adding real graph noise (+1813 edges /
  * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
+ * VB.NET (#2305) sends every member read with its receiver instead, and its
+ * resolver decides whether the receiver is a type (see extractVbMemberRead).
+ * Rust imports too, but a variant is usually written through a path that names
+ * its module, not its enum (`mode::Mode::A` under `use crate::mode;`), so no
+ * `use` names the enum at all (#2328).
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp', 'vbnet', 'rust',
 ]);
+
+/**
+ * Parents of a Rust `scoped_identifier` that is not a member written as a
+ * value or a pattern: the prefix of a longer path, or a `use` tree.
+ */
+const RUST_NON_MEMBER_PATH_PARENTS: ReadonlySet<string> = new Set([
+  'scoped_identifier', 'scoped_type_identifier',
+  'use_declaration', 'use_list', 'scoped_use_list', 'use_as_clause', 'use_wildcard',
+]);
+
+/**
+ * VB.NET receivers no project type can be named: the namespace roots
+ * (`System.IO.Path`, `My.Settings`, `Global.X`) and the built-in type keywords
+ * (`String.Empty`, `Integer.MaxValue`). A read through one, or a path that
+ * starts with one, is never sent.
+ */
+const VB_NON_TYPE_RECEIVERS =
+  /^(?:Global|System|Microsoft|My|Boolean|Byte|Char|Date|Decimal|Double|Integer|Long|Object|SByte|Short|Single|String|UInteger|ULong|UShort)$/i;
 
 /**
  * Tree-sitter node kinds that represent constructor invocations
@@ -408,8 +462,156 @@ const LITERAL_RECEIVER_TYPES = new Set([
  */
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
+/** Languages whose `class` node is a class expression (#2499). */
+const CLASS_EXPRESSION_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/** A class expression's head, `class Widget extends Base`: its text up to the body. Mirrored in the kernel (tsjs extract_class). */
+function classExpressionHead(source: string, node: SyntaxNode, body: SyntaxNode): string {
+  return source.substring(node.startIndex, body.startIndex).replace(/[ \t\r\n]+$/, '');
+}
+
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
+
+/**
+ * A named object literal owns its function members (#2300): `const api = {
+ * load() {…}, save: () => {…} }`, the same object inside an IIFE or another
+ * function, or one hung on a path — `window.App = {…}`, `App.utils = {…}`.
+ * Each member is a `function` node qualified under its owner (`api::load`,
+ * `window.App::init`), and the calls written in it are its own. These are the
+ * values a member can hold, and the keys that name one — a computed `[expr]`
+ * key names nothing static, so its member's code stays with the owner.
+ * Mirrored in the kernel (tsjs/extractors.rs).
+ */
+const OBJECT_MEMBER_FUNCTION_TYPES: ReadonlySet<string> = new Set(['arrow_function', 'function_expression', 'generator_function']);
+const STATIC_OBJECT_KEY_TYPES: ReadonlySet<string> = new Set(['property_identifier', 'string', 'number']);
+/**
+ * Path roots that are the global object: `window.App = {…}` defines the global
+ * `App`. (`self` is the global only in a worker; in page code it is far more
+ * often `var self = this`, so `self.x = {…}` stays an ordinary path.)
+ */
+const HOST_GLOBAL_ROOTS: ReadonlySet<string> = new Set(['window', 'globalThis']);
+/** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
+const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
+/** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
+const SWIFT_TYPE_PATH_RECEIVER = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+$/;
+
+/**
+ * Swift wrappers that leave a call's target the same. tree-sitter-swift binds
+ * a prefix operator to the leftmost operand, so `!isReady()` parses as
+ * `(!isReady)()` and `!store.contains(x)` as `(!store).contains(x)`; and
+ * `try`/`await` before a chain bind to the part before its last call, so
+ * `try! A().b()` parses as `(try! A()).b()`. An implicit member's leading `.`
+ * (`.success(x)`) is part of the name, not a wrapper. Mirrored in the kernel's
+ * swift.rs.
+ */
+function isSwiftCallWrapper(node: SyntaxNode, source: string): boolean {
+  if (node.type === 'try_expression' || node.type === 'await_expression') return true;
+  return node.type === 'prefix_expression' && !getNodeText(node, source).startsWith('.');
+}
+
+/** The operand a {@link isSwiftCallWrapper} wraps. */
+function swiftWrappedOperand(node: SyntaxNode): SyntaxNode | null {
+  return getChildByField(node, node.type === 'prefix_expression' ? 'target' : 'expr');
+}
+
+/** Strip {@link isSwiftCallWrapper} wrappers off a Swift callee or receiver. */
+function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
+  let cur = node;
+  while (isSwiftCallWrapper(cur, source)) {
+    const inner = swiftWrappedOperand(cur);
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * A Rust callee path without its turbofish type arguments: `Vec::<u8>::new`
+ * calls `Vec::new`, `Store::with_capacity::<u8>` calls `Store::with_capacity`.
+ * The arguments' brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is no
+ * closing one (`::<fn() -> u8>`). Mirrored in the kernel's strip_turbofish
+ * (rustlang.rs): both emit the same bytes.
+ */
+function stripRustTurbofish(text: string): string {
+  if (!text.includes('::<')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith('::<', i)) {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < text.length; j++) {
+        const c = text[j];
+        if (c === '<') depth++;
+        else if (c === '>' && text[j - 1] !== '-' && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
+/** The most links a Rust receiver chain is kept with (rustReceiverChain). */
+const RUST_RECEIVER_CHAIN_MAX_LINKS = 16;
+
+/**
+ * The receiver chain a Rust method call is written on, when it is fields and
+ * method calls on `self` or on a name: `self.services.store`, `self.store()`,
+ * `vis.map`, `self.0`, `x.get::<u8>(1)` — each field by its name or index,
+ * each call as `name()`, its arguments and turbofish dropped. Null for any
+ * other receiver (a path's call, a literal, parentheses, `?`, `.await`, an
+ * index, a macro), and past RUST_RECEIVER_CHAIN_MAX_LINKS links, which keep
+ * the bare method name. Mirrored in the kernel's receiver_chain
+ * (rustlang.rs): both emit the same bytes.
+ */
+function rustReceiverChain(node: SyntaxNode, source: string): string | null {
+  const links: string[] = [];
+  let cur: SyntaxNode | null = node;
+  while (cur && links.length <= RUST_RECEIVER_CHAIN_MAX_LINKS) {
+    if (cur.type === 'self' || cur.type === 'identifier') {
+      const root = getNodeText(cur, source);
+      if (links.length === 0 || !/^[A-Za-z_]\w*$/.test(root)) return null;
+      return [root, ...links.reverse()].join('.');
+    }
+    let fieldOf: SyntaxNode | null = cur;
+    let call = false;
+    if (cur.type === 'call_expression') {
+      fieldOf = getChildByField(cur, 'function');
+      if (fieldOf?.type === 'generic_function') fieldOf = getChildByField(fieldOf, 'function');
+      call = true;
+    }
+    if (fieldOf?.type !== 'field_expression') return null;
+    const field = getChildByField(fieldOf, 'field');
+    const name = field ? getNodeText(field, source) : '';
+    if (call ? !/^[A-Za-z_]\w*$/.test(name) : !/^(?:[A-Za-z_]\w*|\d+)$/.test(name)) return null;
+    links.push(call ? `${name}()` : name);
+    cur = getChildByField(fieldOf, 'value');
+  }
+  return null;
+}
+
+/**
+ * A Swift receiver's text from its innermost wrapped operand on: the wrappers
+ * sit on the chain's left edge, so `!Settings.Defaults` reads
+ * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
+ */
+function swiftUnwrappedText(node: SyntaxNode, source: string): string {
+  let start = node.startIndex;
+  let cur: SyntaxNode | null = node;
+  while (cur) {
+    if (isSwiftCallWrapper(cur, source)) {
+      cur = swiftWrappedOperand(cur);
+      if (cur) start = cur.startIndex;
+    } else if (cur.type === 'navigation_expression' || cur.type === 'call_expression') {
+      cur = cur.namedChild(0);
+    } else {
+      break;
+    }
+  }
+  return source.substring(start, node.endIndex);
+}
 
 /**
  * Identifier-rooted member chains have no inferred property type (#1566),
@@ -426,30 +628,202 @@ function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
 }
 
 /**
+ * TS/JS wrappers that leave a member call's receiver the same object:
+ * `(x).m()`, `x!.m()`, `(x as T).m()`, `(x satisfies T).m()`, `(<T>x).m()`
+ * and `(await x).m()` all call `m` on what `x` holds.
+ */
+const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
+  'parenthesized_expression', 'non_null_expression', 'as_expression',
+  'satisfies_expression', 'type_assertion', 'await_expression',
+]);
+
+/**
+ * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+ * `await f` (#2586), and a prefix operator over a generic call the same way:
+ * `!settings.get<boolean>('X')`, `void apiRequest<T>()`, `typeof load<T>()`.
+ * The call is to `f`. Peels every `await` and prefix operator, skipping a
+ * comment written after an `await`. Mirrored in the kernel (tsjs/extractors.rs).
+ */
+function peelTsPrefixedCallee(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (cur.type === 'await_expression' || cur.type === 'unary_expression') {
+    const inner = cur.type === 'unary_expression'
+      ? getChildByField(cur, 'argument')
+      : cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
+ * tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
+ * belongs to the right operand, so a non-null over a binary expression peels
+ * to that operand.
+ */
+function peelTsJsReceiver(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (TS_JS_TRANSPARENT_RECEIVER_TYPES.has(cur.type)) {
+    let inner = cur.type === 'type_assertion'
+      ? cur.namedChild(cur.namedChildCount - 1)
+      : cur.namedChild(0);
+    if (cur.type === 'non_null_expression') {
+      while (inner?.type === 'binary_expression') inner = getChildByField(inner, 'right');
+    }
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * The name a TS/JS call's callee writes when it is no member access, past the
+ * wrappers that keep it the same callee — `(fn)()`, `fn!()`, `(fn as F)()`,
+ * `await f<T>()`, the type arguments of a tagged template's tag
+ * (`css<Props>\`…\``) — or null when it names nothing: a call (`connect(map)
+ * (View)`, `create<T>()(…)`, `breakpoint('tablet')\`…\``), a function (an
+ * IIFE), a subscript (`handlers[type]()`), `(0, fn)()`. Its text used to be
+ * the reference's name, an IIFE's whole body among them, which no symbol is.
+ * A dotted chain in parentheses keeps its text, `(a.b)()` → `a.b`, as the
+ * parenthesized-callee normalization in extractCall reads it. `at` is where the
+ * name starts, which is where the reference sits, as a plain `fn()` call's does:
+ * scope checks read the name there (a parameter `fn` shadows a namesake).
+ */
+function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: SyntaxNode } | null {
+  let cur = peelTsJsReceiver(func);
+  while (cur.type === 'instantiation_expression') {
+    const inner = getChildByField(cur, 'function') ?? cur.namedChild(0);
+    if (!inner) return null;
+    cur = peelTsJsReceiver(inner);
+  }
+  if (cur.type === 'identifier' || cur.type === 'super' || cur.type === 'import') return { name: getNodeText(cur, source), at: cur };
+  if (cur.type !== 'member_expression') return null;
+  const chain = getNodeText(cur, source).replace(/\s+/g, '');
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(chain) ? { name: chain, at: cur } : null;
+}
+
+/**
+ * A TS/JS receiver that subscripts the enclosing class's object: an element
+ * of a field, `this.<field>[k]` → `this.<field>[]`, or a field named by a
+ * string key, `this['svc']` → `this.svc`. Null for any other subscript.
+ * Mirrored in the kernel's this_subscript_of.
+ */
+function tsThisSubscriptReceiver(node: SyntaxNode, source: string): string | null {
+  if (node.type !== 'subscript_expression') return null;
+  const objectNode = getChildByField(node, 'object');
+  if (!objectNode) return null;
+  const object = peelTsJsReceiver(objectNode);
+  if (object.type === 'this') {
+    const index = getChildByField(node, 'index');
+    const key = index?.type === 'string' ? /^(['"])([A-Za-z_$][\w$]*)\1$/.exec(getNodeText(index, source))?.[2] : undefined;
+    return key ? `this.${key}` : null;
+  }
+  if (object.type !== 'member_expression' || getChildByField(object, 'object')?.type !== 'this') return null;
+  const property = getChildByField(object, 'property');
+  if (!property || !THIS_FIELD_PROPERTY_TYPES.has(property.type)) return null;
+  return `this.${getNodeText(property, source)}[]`;
+}
+
+/**
+ * Whether a TS/JS receiver still collapses to the bare method name: `this` /
+ * `super` (the resolver reads the owner off the enclosing class) and a member
+ * chain rooted at either or at `window` (the project-global escape of
+ * {@link isUnresolvedTsJsChain}). `new C().m()` has its own encoding. A
+ * subscript anywhere in the chain does not: the resolver cannot read the
+ * receiver back from it, so the bare name would exact-match any project
+ * method of that name. (An element of a this-field is typed instead, see
+ * {@link tsThisSubscriptReceiver}.)
+ */
+function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
+  let cur: SyntaxNode | null = node;
+  while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
+    if (cur.type === 'subscript_expression') return false;
+    const object = getChildByField(cur, 'object');
+    cur = object ? peelTsJsReceiver(object) : null;
+  }
+  if (!cur) return false;
+  if (cur.type === 'this' || cur.type === 'super') return true;
+  return cur.type === 'identifier' && getNodeText(cur, source) === 'window';
+}
+
+/**
  * React hooks that bind a NAME to a handler function (`const onPress =
  * useCallback(() => {…}, [])`). The arrow inside is extracted as a function
  * node named by the declarator — see `reactHookBoundName`.
  */
 const REACT_HANDLER_HOOKS = /^(?:React\.)?use(?:Callback|EffectEvent|Event)$/;
 
+/** Bare Pascal names that are never a project routine's call (#2514), lowercased. */
+const PASCAL_NOT_ROUTINES: ReadonlySet<string> = new Set(['self', 'result', 'true', 'false', 'nil', 'exit', 'break', 'continue']);
+
+/** A routine header of the Pascal source text, for a broken tree's regions (#2514). */
+interface PascalTextRoutine {
+  line: number;
+  classQn: string | null;
+  routine: string | null;
+  locals: Map<string, string | null>;
+}
+
+/**
+ * How a Pascal name written without parentheses may run a routine (#2514):
+ * as a statement (`call`), for its value (`read`), as an event's method
+ * (`ref`), or as a receiver or an indexed value (`recv`). See
+ * resolution/pascal-scope.
+ */
+type PascalNameMode = 'call' | 'read' | 'ref' | 'recv';
+
+/**
+ * Names Delphi's conventions give to data, never to a routine: a field
+ * (`FCount`), a type (`TList`, `EAbort`), a constant (`MAX_PATH`, `CRLF`).
+ * A C library's functions keep their own case (`ERR_get_error`).
+ */
+const PASCAL_DATA_NAME = /^(?:F[A-Z][a-z]|[TE][A-Z][a-z]|[A-Z][A-Z0-9_]*$)/;
+
 export class TreeSitterExtractor {
+  /**
+   * The node's prose, from either place it can live: a preceding comment
+   * sibling (every language) or a docstring inside the body (Python's bare
+   * first-statement string, and the same shape in other languages that opt in
+   * via `getBodyDocstring`). When a node carries both, they are joined rather
+   * than one winning — they are two separate things the author wrote about the
+   * same symbol, and the column holds free text (#1905).
+   */
+  private docstringFor(node: SyntaxNode): string | undefined {
+    const anchor = this.extractor?.getDeclarationWrapper?.(node) ?? node;
+    const preceding = getPrecedingDocstring(
+      anchor,
+      this.source,
+      this.extractor?.docstringStepOverTypes,
+      this.extractor?.docstringSkipsTrailingComments,
+      this.extractor?.docstringSkipsDetachedComments,
+      this.extractor?.docstringSkipsDirectives
+    );
+    const body = this.extractor?.getBodyDocstring?.(node, this.source);
+    if (preceding && body) return `${preceding}\n\n${body}`;
+    return body || preceding;
+  }
+
   private filePath: string;
   private language: Language;
   private source: string;
   private tree: Tree | null = null;
   private nodes: Node[] = [];
+  private nodeIds = new NodeIdAllocator();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
-  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
+  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'jsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
   private static readonly MAX_VALUE_REF_NODES = 20_000;
   private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
   private fileScopeValues = new Map<string, string>();
   private fileScopeValueCounts = new Map<string, number>(); // file-scope nodes per name (conditional-def detection)
   private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
   private errors: ExtractionError[] = [];
+  // Import nodes made for `export … from` statements: no symbols of the file's own.
+  private reExportImports = 0;
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
@@ -458,6 +832,24 @@ export class TreeSitterExtractor {
   // files, and a node per block would flood search with same-named symbols
   // (the #1093 crowd-out failure mode). Always empty outside C/C++.
   private namespacePrefix: string[] = [];
+  // A C++ file whose tree has errors is walked in the scopes its braces
+  // open (see visitInCppBraceScope): the scan of them, null for every other
+  // file, and the class-like nodes extracted so far by the braces of their
+  // bodies.
+  private cppBraceScopes: CppBraceScopes | null = null;
+  private cppClassScopes = new NestedIntervals<string>();
+  private cppClassScopeIds = new Set<string>();
+  // C, C++ and Objective-C: whether a class, struct, union or enum defined in
+  // the type of a declaration outside any body is walked (see visitNode). Not
+  // in a C++ file whose tree has errors and whose braces don't balance: error
+  // recovery can close a namespace or a class at the wrong `}`, or run a class
+  // past its own, and with no brace scopes to correct it the walked class
+  // would land in the wrong scope. C and Objective-C files take the walk even
+  // with errors: neither grammar has a namespace or a class written as a type
+  // (an @interface or @implementation is not one), and a struct, union or
+  // enum body holds fields and enumerators, not functions. Most Objective-C
+  // trees have errors; a macro such as `NS_ASSUME_NONNULL_BEGIN` is enough.
+  private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
   // {flash_fwd_kernel}, so a later `kernel<<<grid, block>>>(params)` (or plain
@@ -467,23 +859,59 @@ export class TreeSitterExtractor {
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  // Paren-less Pascal names (#2514): the names each routine or anonymous
+  // method being walked declares itself (innermost last), the class the
+  // routine belongs to, how many `with` bodies the walk is inside (a bare name
+  // there may be the `with` object's), and per class the names its own data
+  // and the unit's data take (lowercased).
+  private pascalScopes: Array<{
+    locals: Map<string, string | null>;
+    classQn: string | null;
+    routine: string | null;
+    /** The line of the routine's header (0: none), for a broken tree's regions. */
+    startLine: number;
+  }> = [];
+  /** The routine headers of the source text, by line, for a broken tree's regions (#2514). */
+  private pascalTextRoutines: PascalTextRoutine[] | null = null;
+  private pascalSourceLines: string[] | null = null;
+  private pascalWithDepth = 0;
+  private pascalDataNameSets = new Map<string, Set<string>>();
+  /** Bare names read in an expression, kept until the file shows which are variables (#2514). */
+  private pascalReads: Array<{ ref: UnresolvedReference; scope: string; name: string }> = [];
+  /** Per routine class (`''`: none), the names the file assigns to or passes to `Inc`/`Dec`. */
+  private pascalAssigned = new Map<string, Set<string>>();
   // Function-as-value capture (#756): per-language spec + candidates collected
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
   // (see flushFnRefCandidates).
   private fnRefSpec: FnRefSpec | undefined;
-  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
+  // A Go candidate also keeps the value container it came from: the flush
+  // reads its scope from there when the function shadows the name (#2596).
+  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string; goNode?: SyntaxNode }> = [];
   // Memoized "is this a Vue store file" verdict (per-extractor = per-file).
   private vueStoreFile: boolean | null = null;
+  // An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`) is
+  // named by the path's last link but qualified by the whole path, which its
+  // members are then qualified under (see buildQualifiedName, #2300).
+  private objectPathOwners = new Map<string, string>();
+  // Memoized ownsObjectLiterals verdict (per-extractor = per-file).
+  private ownsObjects: boolean | null = null;
   // Source already went through the extractor's preParse at the kernel route
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
+  // The source as the file has it, kept when preParse changed it (by this
+  // instance, or at the kernel route point for a deferred file), for an
+  // extractor whose signatures read it (`signatureAsWritten`) or whose
+  // re-exports keep their statements as written (`reExportAsWritten`).
+  private sourceAsWritten: string | null = null;
+  // Memoized reExportAsWritten verdict (per-extractor = per-file).
+  private reExportsAsWritten: boolean | null = null;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
   ) {
     this.filePath = filePath;
     this.source = source;
@@ -491,6 +919,25 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    if (options?.sourceAsWritten !== undefined && options.sourceAsWritten !== source) {
+      this.sourceAsWritten = options.sourceAsWritten;
+    }
+  }
+
+  /** The text `getSignature` reads: the source as written when the extractor asks for it. */
+  private get signatureSource(): string {
+    return this.extractor?.signatureAsWritten && this.sourceAsWritten !== null ? this.sourceAsWritten : this.source;
+  }
+
+  /**
+   * The text an import node reads its statement from: for a re-export, the
+   * source as written when the extractor asks (`reExportAsWritten`), so
+   * `export type * from './x'` keeps its `type` (#2474).
+   */
+  private importSource(node: SyntaxNode): string {
+    if (node.type !== 'export_statement' || this.sourceAsWritten === null) return this.source;
+    this.reExportsAsWritten ??= this.extractor?.reExportAsWritten?.(this.sourceAsWritten) === true;
+    return this.reExportsAsWritten ? this.sourceAsWritten : this.source;
   }
 
   /**
@@ -542,12 +989,21 @@ export class TreeSitterExtractor {
       // saw (identical outside the blanked directive lines). Skipped when the
       // kernel route point already applied it (sourceIsPreParsed).
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
-        this.source = this.extractor.preParse(this.source, this.filePath);
+        const preParsed = this.extractor.preParse(this.source, this.filePath);
+        if (preParsed !== this.source) this.sourceAsWritten = this.source;
+        this.source = preParsed;
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      if (this.language === 'cpp' && this.tree.rootNode.hasError) {
+        this.cppBraceScopes = scanCppBraceScopes(this.source);
+      }
+      this.walkDeclaredTypes =
+        this.language === 'c' ||
+        this.language === 'objc' ||
+        (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
       const fileNode: Node = {
@@ -564,6 +1020,8 @@ export class TreeSitterExtractor {
         isExported: false,
         updatedAt: Date.now(),
       };
+      const fileDocstring = this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source);
+      if (fileDocstring) fileNode.docstring = fileDocstring;
       this.nodes.push(fileNode);
 
       // Push file node onto stack so top-level declarations get contains edges
@@ -582,12 +1040,19 @@ export class TreeSitterExtractor {
       // nodes and import refs are complete and the file node is still pushed.
       this.flushFnRefCandidates();
       this.flushValueRefs();
+      this.flushPascalReads();
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
 
+      // A CommonJS `require('./x')` is a file import, like ESM's `import`. The
+      // kernel reads the same (kernel/index.ts and the parse worker's transport).
+      this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
+
       // hasError is routine for several grammars; warn only when no symbols survived.
-      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
+      // (A re-export's import of its module is none: a barrel whose other lines
+      // failed to parse has lost what it passes on.)
+      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length - this.reExportImports;
       if (this.tree?.rootNode.hasError && symbolCount === 0) {
         this.errors.push({
           message:
@@ -622,6 +1087,7 @@ export class TreeSitterExtractor {
       }
       // Release source string to reduce GC pressure
       this.source = '';
+      this.sourceAsWritten = null;
     }
 
     return {
@@ -646,8 +1112,9 @@ export class TreeSitterExtractor {
     if (!rule || this.nodeStack.length === 0) return;
     const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
     if (!fromNodeId) return;
+    const goNode = this.language === 'go' ? node : undefined;
     for (const cand of captureFnRefCandidates(node, rule, spec, this.source)) {
-      this.fnRefCandidates.push({ ...cand, fromNodeId });
+      this.fnRefCandidates.push({ ...cand, fromNodeId, goNode });
     }
   }
 
@@ -657,8 +1124,10 @@ export class TreeSitterExtractor {
    * nested function definitions: their bodies are walked — and their
    * candidates attributed — by extractFunction's own body walk.
    */
-  private scanFnRefSubtree(node: SyntaxNode, depth: number): void {
+  private scanFnRefSubtree(node: SyntaxNode, depth: number, walked?: ReadonlySet<number>): void {
     if (!this.fnRefSpec || depth > 12) return;
+    // Subtrees the body walker has already been through.
+    if (walked?.has(node.id)) return;
     const nodeType = node.type;
     if (depth > 0 && (
       this.extractor?.functionTypes.includes(nodeType) ||
@@ -673,7 +1142,7 @@ export class TreeSitterExtractor {
     this.maybeCaptureFnRefs(node, nodeType);
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child) this.scanFnRefSubtree(child, depth + 1);
+      if (child) this.scanFnRefSubtree(child, depth + 1, walked);
     }
   }
 
@@ -740,7 +1209,7 @@ export class TreeSitterExtractor {
 
     const ungated = this.fnRefSpec?.ungatedModes;
     const addressOfOnly = this.fnRefSpec?.addressOfOnly === true;
-    const seen = new Set<string>();
+    const survivors: typeof candidates = [];
     for (const c of candidates) {
       const atFileScope = c.fromNodeId.startsWith('file:');
       // C++ (addressOfOnly): a BARE identifier qualifies only inside a
@@ -778,7 +1247,18 @@ export class TreeSitterExtractor {
           continue;
         }
       }
-      const key = `${c.fromNodeId}|${c.name}`;
+      survivors.push(c);
+    }
+
+    // One reference per function and name, at its first use. In Go, a
+    // function that binds the name itself gets one per scope instead (#2596):
+    // its first use may be the local, which resolution drops, while a later
+    // use in another scope is the package function.
+    const goScopes = this.language === 'go' ? goScopedFnRefScopes(survivors, this.source) : null;
+    const seen = new Set<string>();
+    for (const c of survivors) {
+      const scope = goScopes?.get(c);
+      const key = scope === undefined ? `${c.fromNodeId}|${c.name}` : `${c.fromNodeId}|${c.name}|${scope}`;
       if (seen.has(key)) continue;
       seen.add(key);
       this.unresolvedReferences.push({
@@ -794,9 +1274,10 @@ export class TreeSitterExtractor {
   /**
    * Record value-reference bookkeeping as nodes are created: file-scope const/var symbols with
    * distinctive names become reference targets; function/method/const/var symbols become reader
-   * scopes whose bodies flushValueRefs scans.
+   * scopes whose bodies flushValueRefs scans, and so do React wrapper components, whose
+   * declaration reads values as a constant's does (`${BaseMenuItemCSS}` in a styled template).
    */
-  private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode): void {
+  private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode, valueTarget = true): void {
     // Pascal targets `constant` only: its extractor emits function PARAMETERS
     // (`Dest: TBufferWriter`) and class fields (`declField`) as `variable` at the
     // enclosing scope, which would otherwise become noisy targets (a param name
@@ -805,7 +1286,7 @@ export class TreeSitterExtractor {
     // `var` globals are the rare cost; the parameter/field noise dominates.)
     const targetKindOk =
       this.language === 'pascal' ? kind === 'constant' : kind === 'constant' || kind === 'variable';
-    if (targetKindOk && name.length >= 3 && /[A-Z_]/.test(name)) {
+    if (valueTarget && targetKindOk && name.length >= 3 && /[A-Z_]/.test(name)) {
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       // file-scope OR class/module/struct/enum-scope constants are targets.
       // Class/module scope matters for languages (Ruby) that keep nearly all
@@ -825,7 +1306,7 @@ export class TreeSitterExtractor {
         this.fileScopeValueCounts.set(name, (this.fileScopeValueCounts.get(name) ?? 0) + 1);
       }
     }
-    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable') {
+    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable' || kind === 'component') {
       this.valueRefScopes.push({ id, node, name });
     }
   }
@@ -951,8 +1432,10 @@ export class TreeSitterExtractor {
       // live in the sibling. Pull it in. (A body as a next sibling of the scope
       // node is unique to Dart/Pascal among the value-ref languages — every other
       // grammar nests the body inside the function node — so this is inert
-      // elsewhere.)
-      const sib = scope.node.nextNamedSibling;
+      // elsewhere.) A Pascal routine nested in another is stored as its whole
+      // `defProc`, body included, and the `block` after it is the outer
+      // routine's body: its reads are not the nested routine's.
+      const sib = scope.node.type === 'defProc' ? null : scope.node.nextNamedSibling;
       if (sib && (sib.type === 'function_body' || sib.type === 'block')) stack.push(sib);
       let visited = 0;
       while (stack.length > 0 && visited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
@@ -998,6 +1481,65 @@ export class TreeSitterExtractor {
    * Visit a node and extract information
    */
   private visitNode(node: SyntaxNode): void {
+    if (this.cppBraceScopes) this.visitInCppBraceScope(node, this.cppBraceScopes);
+    else this.dispatchNode(node);
+  }
+
+  /**
+   * Walk a node of a C++ file whose tree has errors in the namespaces and
+   * classes its source braces put it in. That is where the tree put it unless
+   * error recovery closed a scope at the wrong `}` or ran one past its own —
+   * the rest of a class then parses as declarations of the namespace around
+   * it (rocksdb's `struct Opts`), and the rest of each namespace one level out
+   * (protobuf's `FieldDescriptor` at the top level). See cpp-brace-scopes.ts.
+   *
+   * The namespaces apply everywhere. The enclosing classes are set only at
+   * declaration level, where the stack above the file node holds nothing but
+   * class scopes; inside a function (a local class's members) the walk's own
+   * stack stands.
+   */
+  private visitInCppBraceScope(node: SyntaxNode, scopes: CppBraceScopes): void {
+    const at = node.startIndex;
+    const namespaces = this.namespacePrefix;
+    this.namespacePrefix = scopes.namespacesAt(at);
+    const stack = this.nodeStack;
+    let base = stack.length;
+    while (base > 1 && this.cppClassScopeIds.has(stack[base - 1]!)) base--;
+    let walked: string[] | null = null;
+    if (base === 1) {
+      const classes = this.cppClassScopes.at(at);
+      if (classes.length !== stack.length - base || classes.some((id, i) => stack[base + i] !== id)) {
+        walked = stack.splice(base);
+        stack.push(...classes);
+      }
+    }
+    this.dispatchNode(node);
+    if (walked) stack.splice(base, stack.length - base, ...walked);
+    this.namespacePrefix = namespaces;
+  }
+
+  /**
+   * The textual extent of a C++ class-like body while the file is walked in
+   * brace scopes: where the node ends (the `}` that closes its body) to pass
+   * to createNode, or null to keep the tree's.
+   */
+  private cppBodyEnd(body: SyntaxNode | null | undefined): Partial<Node> | null {
+    const close = body ? this.cppBraceScopes?.closeOf(body.startIndex) : undefined;
+    if (close === undefined) return null;
+    const end = this.cppBraceScopes!.positionOf(close + 1);
+    return { endLine: end.line, endColumn: end.column };
+  }
+
+  /** Open a class-like node's body as a scope for visitInCppBraceScope. */
+  private openCppClassScope(node: Node, body: SyntaxNode | null | undefined): void {
+    if (!body) return;
+    const close = this.cppBraceScopes?.closeOf(body.startIndex);
+    if (close !== undefined && this.cppClassScopes.add(body.startIndex, close, node.id)) {
+      this.cppClassScopeIds.add(node.id);
+    }
+  }
+
+  private dispatchNode(node: SyntaxNode): void {
     if (!this.extractor) return;
 
     const nodeType = node.type;
@@ -1011,8 +1553,9 @@ export class TreeSitterExtractor {
         // The hook consumed this subtree, so the walkers below never descend
         // into it — scan it for function-as-value candidates (#756). Scala's
         // hook handles val/var definitions (`val table = Seq(targetCb)`), for
-        // example. The scan is capture-only and halts at nested functions.
-        this.scanFnRefSubtree(node, 0);
+        // example. The scan is capture-only and halts at nested functions;
+        // an initializer the hook walked has captured its own.
+        this.scanFnRefSubtree(node, 0, ctx.walked ?? undefined);
         return;
       }
     }
@@ -1021,6 +1564,27 @@ export class TreeSitterExtractor {
     if (this.language === 'pascal') {
       skipChildren = this.visitPascalNode(node);
       if (skipChildren) return;
+    }
+
+    if (this.language === 'cpp' && isCppConstructorDeclaration(node)) {
+      this.extractMethod(node);
+      return;
+    }
+
+    // C/C++ function-like macros (`#define TRACE(x) ...`) become `constant`
+    // nodes carrying the directive as their signature. A macro is a value,
+    // never an executable callee: the resolver reads these to recognize a
+    // call whose name is a macro visible in the translation unit and refuses
+    // to bind it to a same-named function elsewhere (#1838). Mirrored in the
+    // kernel (ccpp/mod.rs visit_node).
+    if ((this.language === 'c' || this.language === 'cpp') && nodeType === 'preproc_function_def') {
+      const name = getChildByField(node, 'name');
+      if (name) {
+        this.createNode('constant', getNodeText(name, this.source), node, {
+          signature: getNodeText(node, this.source).trim(),
+        });
+      }
+      return;
     }
 
     // C++ namespace blocks: carry the namespace name as a qualifiedName prefix
@@ -1048,10 +1612,40 @@ export class TreeSitterExtractor {
       }
     }
 
+    // C# block namespaces scope only their own body: serilog's Guard.cs opens
+    // `namespace JetBrains.Annotations { … }` and then declares `static class
+    // Guard` at the top level, and a file's second namespace is its own. A
+    // namespace written inside another is `Outer.Inner` — the dotted name a
+    // type's qualifiedName leads with — so it takes the outer's place on the
+    // scope while its body is walked. (A file-scoped `namespace X;` covers
+    // the whole file: extractFilePackage.) Mirrored in the kernel (csharp.rs).
+    if (this.language === 'csharp' && nodeType === 'namespace_declaration') {
+      const nsName = this.extractor.extractPackage?.(node, this.source);
+      if (nsName) {
+        const topId = this.nodeStack[this.nodeStack.length - 1];
+        const top = this.nodes.find((n) => n.id === topId);
+        const outer = top?.kind === 'namespace' ? top : null;
+        if (outer) this.nodeStack.pop();
+        const ns = this.createNode('namespace', outer ? `${outer.name}.${nsName}` : nsName, node);
+        if (ns) this.nodeStack.push(ns.id);
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitNode(child);
+        }
+        if (ns) this.nodeStack.pop();
+        if (outer) this.nodeStack.push(outer.id);
+        return;
+      }
+    }
+
     // Function-as-value capture (#756) — independent of the dispatch ladder
     // below (the captured container types have no other handler there), so it
     // can never shadow or be shadowed by an extraction branch.
     this.maybeCaptureFnRefs(node, nodeType);
+
+    // `window.App = {…}` / `App.utils = {…}`: the object's functions are the
+    // path's members (#2300). Its whole subtree is handled there.
+    if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, true)) return;
 
     // Check for function declarations
     // For Python/Ruby, function_definition inside a class should be treated as method
@@ -1065,8 +1659,14 @@ export class TreeSitterExtractor {
         skipChildren = true; // extractFunction visits children via visitFunctionBody
       }
     }
+    // A bodiless function that no implementation follows: a TypeScript
+    // `declare function`, a `.d.ts` file's own or its `declare module` body's.
+    else if (nodeType === 'function_signature' && this.extractor.isAmbientFunction?.(node, this.filePath)) {
+      this.extractFunction(node);
+      skipChildren = true;
+    }
     // Check for class declarations
-    else if (this.extractor.classTypes.includes(nodeType)) {
+    else if (this.isClassTypeNode(node, nodeType)) {
       // Some languages reuse class_declaration for structs/enums (e.g. Swift)
       const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
       if (classification === 'struct') {
@@ -1077,6 +1677,8 @@ export class TreeSitterExtractor {
         this.extractInterface(node);
       } else if (classification === 'trait') {
         this.extractClass(node, 'trait');
+      } else if (classification === 'module') {
+        this.extractClass(node, 'module');
       } else {
         this.extractClass(node);
       }
@@ -1092,7 +1694,8 @@ export class TreeSitterExtractor {
     // SIGNATURE_METHOD_NODE_TYPES for what falling through would otherwise mint.
     else if (
       this.extractor.methodTypes.includes(nodeType)
-      && (!SIGNATURE_METHOD_NODE_TYPES.has(nodeType) || this.isInsideClassLikeNode())
+      && (!(TS_JS_CHAIN_LANGUAGES.has(this.language) || this.language === 'arkts')
+        || !SIGNATURE_METHOD_NODE_TYPES.has(nodeType) || this.isInsideClassLikeNode())
     ) {
       // TS/JS class fields parse as a methodTypes node; only function-valued
       // fields are methods — a plain field (`public fonts: Fonts;`) is a
@@ -1116,9 +1719,12 @@ export class TreeSitterExtractor {
           this.nodeStack.pop();
         }
         // A field initializer can also register callbacks
-        // (`static handlers = { click: onClick }`) — scan it for
-        // function-as-value candidates (capture-only, halts at functions).
-        this.scanFnRefSubtree(node, 0);
+        // (`static handlers = { click: onClick }`). The walk above took those
+        // for the property, so the scan for function-as-value candidates
+        // (capture-only, halts at functions) skips the initializer it walked
+        // and covers the rest of the field: the class would keep a second
+        // reference to each function from the same spot.
+        this.scanFnRefSubtree(node, 0, propNode && valueNode ? new Set([valueNode.id]) : undefined);
         skipChildren = true;
       } else {
         this.extractMethod(node);
@@ -1146,27 +1752,41 @@ export class TreeSitterExtractor {
       skipChildren = true; // extractEnum visits body children
     }
     // Check for type alias declarations (e.g. `type X = ...` in TypeScript)
-    // For Go, type_spec wraps struct/interface definitions — resolveTypeAliasKind
-    // detects these and extractTypeAlias creates the correct node kind.
+    // For Go, type_spec (and type_alias, `type A = B`) wraps struct/interface
+    // definitions — resolveTypeAliasKind detects these and extractTypeAlias
+    // creates the correct node kind.
     else if (this.extractor.typeAliasTypes.includes(nodeType)) {
       skipChildren = this.extractTypeAlias(node);
     }
     // Check for class properties (e.g. C# property_declaration)
     else if (this.extractor.propertyTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
-      this.extractProperty(node);
-      // Property initializers aren't walked — scan for function-as-value
-      // candidates (#756): Scala `val table = Seq(targetCb)` in an object,
-      // Kotlin `val cb = ::handler` class properties.
-      this.scanFnRefSubtree(node, 0);
+      const propNode = this.extractProperty(node);
+      // The code a property runs is the property's: its calls,
+      // instantiations and reads attribute to it, as a method's do.
+      const bodies = propNode ? this.propertyBodies(node) : [];
+      if (propNode && bodies.length > 0) {
+        this.nodeStack.push(propNode.id);
+        const declaredType = getChildByField(node, 'type');
+        for (const body of bodies) {
+          this.extractTargetTypedNew(body, declaredType);
+          this.visitFunctionBody(body, propNode.id);
+        }
+        this.nodeStack.pop();
+      }
+      // Whatever the body walk didn't cover (a C# property's attributes, any
+      // other language's whole declaration) is scanned for function-as-value
+      // candidates (#756); the bodies captured their own.
+      this.scanFnRefSubtree(node, 0, new Set(bodies.map((b) => b.id)));
       skipChildren = true;
     }
     // Check for class fields (e.g. Java field_declaration, C# field_declaration)
     else if (this.extractor.fieldTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
-      this.extractField(node);
-      // Field initializers aren't walked — scan for function-as-value
-      // candidates (#756): Java `List<IntConsumer> table = List.of(Main::cb)`,
-      // C# `List<Action<int>> table = new() { TargetCb }`.
-      this.scanFnRefSubtree(node, 0);
+      const walked = this.extractField(node);
+      // Scan the declaration for function-as-value candidates (#756): Java
+      // `List<IntConsumer> table = List.of(Main::cb)`. A C# declarator
+      // extractField walked captured its own (`List<Action<int>> table =
+      // new() { TargetCb }` is the field's), so the scan skips it.
+      this.scanFnRefSubtree(node, 0, walked);
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
@@ -1175,19 +1795,41 @@ export class TreeSitterExtractor {
     // languages) keep almost exclusively inside a class/module. A Ruby `CONST =
     // …` has a `constant`-typed LHS; other languages don't put one here, so this
     // is effectively Ruby-only and doesn't disturb their class-internal locals.
+    // An Objective-C declaration written in an `@implementation`
+    // (`static NSString *const kKey = @"…";`) is file-scope C, though it sits
+    // between `@implementation` and `@end`.
     else if (
       this.extractor.variableTypes.includes(nodeType) &&
-      (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
+      (!this.isInsideClassLikeNode() ||
+        this.isClassScopeConstantAssignment(node) ||
+        (this.language === 'objc' && node.parent?.type === 'implementation_definition'))
     ) {
-      this.extractVariable(node);
-      // extractVariable doesn't walk every initializer shape (object literals
-      // are deliberately skipped; Python/Ruby don't walk at all), so scan the
-      // declaration subtree for function-as-value candidates — `const routes =
-      // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
-      // at nested function definitions (their bodies are walked — and
-      // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk.
-      this.scanFnRefSubtree(node, 0);
+      // C, C++ and Objective-C: a class, struct, union or enum defined in the
+      // declaration's type (`struct Foo { … } foo;`, `static struct { … }
+      // SPT;`) is a definition like one written on its own, and the variables
+      // keep their nodes beside it. So is a class the tree reads as a
+      // declaration's type in a file walked in brace scopes (`class X {…}`
+      // glued to the tokens after it by error recovery). In a class or
+      // function body the children walk reaches it; here, this branch skips
+      // that walk. Mirrored in the kernel (ccpp/mod.rs visit_node), which has
+      // no Objective-C walker.
+      const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
+      const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
+      if (definedType) this.visitNode(definedType);
+      const walked = this.extractVariable(node);
+      // extractVariable doesn't walk every initializer (a store's members are
+      // extracted one by one, and only TS/JS, Python, Go and Rust walk one at
+      // all), so scan the declaration subtree for function-as-value candidates
+      // — `const routes = { home: renderHome }`, `handlers = {"recv":
+      // target_cb}`. The scan halts at nested function definitions (their
+      // bodies are walked — and attributed — separately). It skips what was
+      // walked already: a type walked above, and every initializer
+      // extractVariable walked under the symbol it declares — a constant's, a
+      // component wrapper's (which must not hand the component it wraps to the
+      // file). Those captured their own, and flush-time dedup keys on the
+      // source, so the file would keep a second reference to each function
+      // from the same spot.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : walked);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
@@ -1289,13 +1931,16 @@ export class TreeSitterExtractor {
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
     }
-    // Re-export from another module — `export { X } from './y'` (TS/JS). A
-    // re-export is a dependency on the source module just like an import, but
-    // the export_statement is otherwise only descended into (no declaration to
-    // extract), so a barrel that ONLY re-exports produced zero edges and showed
-    // 0 dependents. Link each re-exported name to its definition. Children are
-    // still visited (a non-re-export `export const X = …` has no `source` and
-    // falls through to its normal declaration extraction).
+    // Re-export from another module — `export { X } from './y'`, `export * from
+    // './y'` (TS/JS). A re-export is a dependency on the source module just like
+    // an import, but the export_statement is otherwise only descended into (no
+    // declaration to extract), so a barrel that ONLY re-exports produced zero
+    // edges and showed 0 dependents. It imports the module as `import … from`
+    // does — an import node and a reference to the module, which links the
+    // barrel to the file it names (so a barrel of barrels can be followed) —
+    // and links each re-exported name to its definition. Children are still
+    // visited (a non-re-export `export const X = …` has no `source` and falls
+    // through to its normal declaration extraction).
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
@@ -1303,6 +1948,9 @@ export class TreeSitterExtractor {
        this.language === 'arkts') &&
       getChildByField(node, 'source')
     ) {
+      const before = this.nodes.length;
+      this.extractImport(node);
+      this.reExportImports += this.nodes.length - before;
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       if (parentId) this.emitReExportRefs(node, parentId);
     }
@@ -1327,6 +1975,9 @@ export class TreeSitterExtractor {
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
+    }
+    else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+      this.extractKotlinInfixCall(node);
     }
     // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
     // produce an `instantiates` reference. Children still walked so
@@ -1383,7 +2034,10 @@ export class TreeSitterExtractor {
     kind: NodeKind,
     name: string,
     node: SyntaxNode,
-    extra?: Partial<Node>
+    extra?: Partial<Node>,
+    // False for a value no other scope names by this name — a local, or an
+    // object hung on a dotted path (see captureValueRefScope).
+    valueTarget = true
   ): Node | null {
     // Skip nodes with empty/missing names — they are not meaningful symbols
     // and would cause FK violations when edges reference them (see issue #42)
@@ -1391,7 +2045,7 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
+    const id = this.nodeIds.generate(this.filePath, kind, name, node.startPosition.row + 1, node.startPosition.column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -1445,7 +2099,7 @@ export class TreeSitterExtractor {
       }
     }
 
-    if (this.valueRefsEnabled) this.captureValueRefScope(kind, name, id, node);
+    if (this.valueRefsEnabled) this.captureValueRefScope(kind, name, id, node, valueTarget);
 
     return newNode;
   }
@@ -1516,6 +2170,18 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * The qualified name of a class, struct or union whose declaration writes
+   * its name in a scope (getClassScope): C++'s out-of-line nested `struct
+   * SkipList<Key, Comparator>::Node` is `leveldb::SkipList::Node`, composed
+   * like an out-of-line method's. Its members are qualified under it
+   * (objectPathOwners). Undefined for any other.
+   */
+  private writtenScopeQualifiedName(node: SyntaxNode, name: string): string | undefined {
+    const scope = this.extractor?.getClassScope?.(node, this.source);
+    return scope ? this.composeReceiverQualifiedName(scope, name) : undefined;
+  }
+
+  /**
    * Build qualified name from node stack
    */
   private buildQualifiedName(name: string): string {
@@ -1524,6 +2190,13 @@ export class TreeSitterExtractor {
     // C/C++ enclosing namespaces prefix first (empty for every other language).
     const parts: string[] = [...this.namespacePrefix];
     for (const nodeId of this.nodeStack) {
+      // An object literal hung on a path qualifies what it holds by that path
+      // (`window.App::init`), which already carries its own scope.
+      const pathOwner = this.objectPathOwners.get(nodeId);
+      if (pathOwner !== undefined) {
+        parts.splice(0, parts.length, pathOwner);
+        continue;
+      }
       const node = this.nodes.find((n) => n.id === nodeId);
       if (node && node.kind !== 'file') {
         parts.push(node.name);
@@ -1535,14 +2208,21 @@ export class TreeSitterExtractor {
 
   /**
    * Build an ExtractorContext for passing to language-specific visitNode hooks.
+   * `walked` collects the initializers the hook walks, for the dispatcher's
+   * function-as-value scan to skip.
    */
-  private makeExtractorContext(): ExtractorContext {
+  private makeExtractorContext(): ExtractorContext & { walked: Set<number> | null } {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
-    return {
+    const ctx: ExtractorContext & { walked: Set<number> | null } = {
+      walked: null,
       createNode: (kind, name, node, extra) => self.createNode(kind, name, node, extra),
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
+      walkInitializer: (node, functionId = '') => {
+        (ctx.walked ??= new Set()).add(node.id);
+        self.visitFunctionBody(node, functionId);
+      },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
@@ -1551,6 +2231,7 @@ export class TreeSitterExtractor {
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
     };
+    return ctx;
   }
 
   /**
@@ -1570,7 +2251,9 @@ export class TreeSitterExtractor {
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
-      parentNode.kind === 'module'
+      parentNode.kind === 'module' ||
+      // A Java / Kotlin enum constant with a body of its own (see extractEnum).
+      parentNode.kind === 'enum_member'
     );
   }
 
@@ -1643,6 +2326,7 @@ export class TreeSitterExtractor {
       // descends into this subtree. (#528)
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
+      this.visitParameterDefaults(node, body);
       if (body) {
         this.visitFunctionBody(body, '');
       }
@@ -1660,8 +2344,8 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = getPrecedingDocstring(node, this.source);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const docstring = this.docstringFor(node);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
@@ -1691,6 +2375,7 @@ export class TreeSitterExtractor {
     this.nodeStack.push(funcNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    this.visitParameterDefaults(node, body);
     if (body) {
       this.visitFunctionBody(body, funcNode.id);
     }
@@ -1698,9 +2383,67 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * A parameter's default value is code the function runs, each time a call
+   * leaves that argument out (#2588): `function render(note = buildNote())`
+   * calls buildNote as surely as `const note = buildNote()` in its body would.
+   * Each default, and a computed key in a destructured parameter, is walked as
+   * the body is, with the same scope on the stack, so its calls and `new`
+   * attribute to the function. The names a parameter binds and its type
+   * annotation are not walked. TS/JS only: elsewhere a default may run once,
+   * when the definition does (Python). A function with no body never runs.
+   * Mirrored in the kernel (tsjs/extractors.rs visit_parameter_defaults).
+   */
+  private visitParameterDefaults(fn: SyntaxNode, body: SyntaxNode | null | undefined): void {
+    if (!body || !TS_JS_CHAIN_LANGUAGES.has(this.language)) return;
+    // A class field holds its function: `onPick = (item = first()) => {…}`.
+    const owner = fn.type === 'public_field_definition' || fn.type === 'field_definition' ? body.parent : fn;
+    const params = owner ? getChildByField(owner, 'parameters') : null;
+    if (params) this.visitPatternDefaults(params);
+  }
+
+  /** The defaults in a parameter list or a destructuring pattern, in source order. */
+  private visitPatternDefaults(node: SyntaxNode): void {
+    switch (node.type) {
+      case 'formal_parameters':
+      case 'object_pattern':
+      case 'array_pattern':
+      case 'rest_pattern':
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) this.visitPatternDefaults(child);
+        }
+        return;
+      case 'required_parameter':
+      case 'optional_parameter': {
+        const pattern = getChildByField(node, 'pattern');
+        if (pattern) this.visitPatternDefaults(pattern);
+        const value = getChildByField(node, 'value');
+        if (value) this.visitFunctionBody(value, '');
+        return;
+      }
+      case 'assignment_pattern':
+      case 'object_assignment_pattern': {
+        const left = getChildByField(node, 'left');
+        if (left) this.visitPatternDefaults(left);
+        const right = getChildByField(node, 'right');
+        if (right) this.visitFunctionBody(right, '');
+        return;
+      }
+      case 'pair_pattern': {
+        const key = getChildByField(node, 'key');
+        if (key?.type === 'computed_property_name') this.visitFunctionBody(key, '');
+        const value = getChildByField(node, 'value');
+        if (value) this.visitPatternDefaults(value);
+        return;
+      }
+    }
+  }
+
+  /**
    * Detect a React component declared via an HOC wrapper whose result is itself a
    * component: `forwardRef(...)`, `memo(...)`, `React.forwardRef/memo(...)`, and
-   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``. These
+   * styled-components / emotion `styled.tag\`…\`` / `styled(Base)\`…\``, typed
+   * (`styled.tag<Props>\`…\``) or not. These
    * initializers are a call / tagged-template (not a bare arrow), so the const is
    * otherwise classified `constant` — and a constant is skipped by both the
    * JSX-render edge synthesizer and component resolution, so `<Button/>` usages
@@ -1712,6 +2455,7 @@ export class TreeSitterExtractor {
    * `undefined` when this initializer is not a recognized component wrapper.
    */
   private reactComponentHoc(valueNode: SyntaxNode): { inner: SyntaxNode | null } | undefined {
+    if (this.isTypedStyledTemplate(valueNode)) return { inner: null };
     if (valueNode.type !== 'call_expression') return undefined;
     const callee = getChildByField(valueNode, 'function');
     if (!callee) return undefined;
@@ -1740,12 +2484,49 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * A styled tag with type arguments: `styled.div<Props>\`…\``,
+   * `styled(Base)<Props>\`…\``. tree-sitter's tagged-template call takes no type
+   * arguments, so when the type argument also reads as an expression the
+   * initializer parses as comparisons around it: `(styled.div < Props) > \`…\``.
+   * (A type argument that can't be an expression, like `<{ open: boolean }>`,
+   * error-recovers into a call on the tag instead, which the callee test in
+   * reactComponentHoc takes.) The tag is the leftmost operand, against a `<`;
+   * the template is the rightmost, against a `>` (`>>` when the type argument
+   * ends in its own `<…>`). Operators in between belong to the type argument:
+   * `<A & B>` parses as `(styled.div < A) & (B > \`…\`)`. Mirrored in the
+   * kernel (tsjs/extractors.rs is_typed_styled_template).
+   */
+  private isTypedStyledTemplate(valueNode: SyntaxNode): boolean {
+    if (valueNode.type !== 'binary_expression') return false;
+    let tagParent = valueNode;
+    let tag = getChildByField(valueNode, 'left');
+    while (tag?.type === 'binary_expression') {
+      tagParent = tag;
+      tag = getChildByField(tag, 'left');
+    }
+    let templateParent = valueNode;
+    let template = getChildByField(valueNode, 'right');
+    while (template?.type === 'binary_expression') {
+      templateParent = template;
+      template = getChildByField(template, 'right');
+    }
+    return (
+      !!tag &&
+      template?.type === 'template_string' &&
+      getChildByField(tagParent, 'operator')?.type === '<' &&
+      /^>+$/.test(getChildByField(templateParent, 'operator')?.type ?? '') &&
+      /^styled\b/.test(getNodeText(tag, this.source))
+    );
+  }
+
+  /**
    * Emit a `component` node for an HOC-wrapped React component declaration (see
    * reactComponentHoc). Named by the declarator (`Button`) and located at it so
    * the node range spans the body. When the wrapper has an inline render
    * function, its body is walked so the component's callees (hooks, helpers) are
    * captured under the component node — matching how a plain
-   * `const Foo = () => …` arrow component already behaves.
+   * `const Foo = () => …` arrow component already behaves. Without one, the
+   * initializer is walked instead (walkComponentWrapper).
    */
   private extractReactComponentNode(
     name: string,
@@ -1754,17 +2535,144 @@ export class TreeSitterExtractor {
     extra: { docstring?: string; signature?: string; isExported?: boolean }
   ): void {
     const compNode = this.createNode('component', name, declarator, extra);
-    if (!compNode || !innerFn || !this.extractor) return;
+    if (!compNode || !this.extractor) return;
     this.nodeStack.push(compNode.id);
-    const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
-      ?? getChildByField(innerFn, this.extractor.bodyField);
-    if (body) this.visitFunctionBody(body, compNode.id);
+    if (innerFn) {
+      const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
+        ?? getChildByField(innerFn, this.extractor.bodyField);
+      this.visitParameterDefaults(innerFn, body);
+      if (body) this.visitFunctionBody(body, compNode.id);
+    } else {
+      const value = getChildByField(declarator, 'value');
+      if (value) this.walkComponentWrapper(value);
+    }
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk a wrapper with no render function of its own — `styled.div\`…\``,
+   * `styled(Base).attrs(…)<P>\`…\``, emotion's and MUI's `styled(Base)(styles)`,
+   * `memo(Base)` — with its component on the stack, the way a constant's
+   * initializer is walked with the constant on it (#693). The template's
+   * interpolations, the `.attrs()` / `.withConfig()` / options arguments, a
+   * style function and a `memo` comparator are the component's own code.
+   *
+   * The wrapper's own chain is the library it is declared with: `styled`,
+   * `styled.div`, `.attrs`, `memo` name no project code, so their calls are not
+   * recorded (every one would park as a reference nothing answers). Nor is the
+   * component it wraps (`styled(ActionButton)`, `memo(Button)`) a function
+   * passed as a value: React renders it whenever it renders this one, so the
+   * JSX synthesizer links it as a render, a hop explore can follow. A type
+   * argument read as comparisons (`styled.div<Props>`, see
+   * isTypedStyledTemplate) is a type, and is not walked. Mirrored in the kernel
+   * (tsjs/extractors.rs walk_component_wrapper).
+   */
+  private walkComponentWrapper(link: SyntaxNode): void {
+    switch (link.type) {
+      case 'binary_expression': {
+        // `(styled(Base) < Props) > \`…\``: the tag is the leftmost operand
+        // and the template the rightmost; the operands between are the type.
+        let tag: SyntaxNode | null = link;
+        while (tag?.type === 'binary_expression') tag = getChildByField(tag, 'left');
+        let template: SyntaxNode | null = link;
+        while (template?.type === 'binary_expression') template = getChildByField(template, 'right');
+        if (tag) this.walkComponentWrapper(tag);
+        if (template) this.visitFunctionBody(template, '');
+        return;
+      }
+      case 'call_expression': {
+        const callee = getChildByField(link, 'function');
+        if (callee) this.walkComponentWrapper(callee);
+        const args = getChildByField(link, 'arguments');
+        if (!args) return;
+        // A tagged template's argument is its template: the styles.
+        if (args.type !== 'arguments') {
+          this.visitFunctionBody(args, '');
+          return;
+        }
+        // `styled(Base)`, `memo(Base)`: the first argument is the component
+        // wrapped, or a wrapper around it (`memo(forwardRef(Inner))`).
+        const calleeText = callee ? getNodeText(callee, this.source) : '';
+        const root = calleeText === 'styled' || REACT_COMPONENT_HOCS.has(calleeText);
+        const first = args.namedChild(0);
+        const base = root && (first?.type === 'identifier' || first?.type === 'member_expression') ? first : null;
+        for (let i = 0; i < args.namedChildCount; i++) {
+          const arg = args.namedChild(i);
+          if (!arg || (base && arg.startIndex === base.startIndex)) continue;
+          if (root && i === 0 && arg.type === 'call_expression' && this.isComponentWrapperCall(arg)) {
+            this.walkComponentWrapper(arg);
+          } else if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+            // A style or `.attrs()` function runs as the component's code; its
+            // body is walked as a render function's is, never named for the
+            // declarator (curriedWrapperBoundName would take MUI's
+            // `styled(Box)(({ theme }) => …)` for a function of its own).
+            const body = this.extractor!.resolveBody?.(arg, this.extractor!.bodyField)
+              ?? getChildByField(arg, this.extractor!.bodyField);
+            this.visitParameterDefaults(arg, body);
+            if (body) this.visitFunctionBody(body, '');
+          } else {
+            this.visitFunctionBody(arg, '');
+          }
+        }
+        this.captureWrapperArgumentRefs(args, base);
+        return;
+      }
+      case 'member_expression':
+      case 'subscript_expression': {
+        const object = getChildByField(link, 'object');
+        if (object) this.walkComponentWrapper(object);
+        return;
+      }
+      case 'non_null_expression':
+      case 'parenthesized_expression':
+      case 'instantiation_expression': {
+        // `styled.div<{ open: boolean }>` error-recovers into a call on
+        // `non_null_expression(instantiation_expression(styled.div, …))`.
+        const inner = getChildByField(link, 'function') ?? link.namedChild(0);
+        if (inner) this.walkComponentWrapper(inner);
+        return;
+      }
+    }
+  }
+
+  /** A call of the kind reactComponentHoc reads as a component wrapper: `styled…(…)`, `memo(…)`, `forwardRef(…)`. */
+  private isComponentWrapperCall(call: SyntaxNode): boolean {
+    const callee = getChildByField(call, 'function');
+    if (!callee) return false;
+    const text = getNodeText(callee, this.source);
+    return /^styled\b/.test(text) || REACT_COMPONENT_HOCS.has(text);
+  }
+
+  /**
+   * Function-as-value candidates (#756) among a wrapper call's arguments — a
+   * `memo` comparator, a style function passed by name — attributed to the
+   * component. The component the call wraps is not one: it is what the
+   * component renders.
+   */
+  private captureWrapperArgumentRefs(args: SyntaxNode, base: SyntaxNode | null): void {
+    const spec = this.fnRefSpec;
+    const rule = spec?.dispatch.get(args.type);
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!spec || !rule || !fromNodeId) return;
+    for (const cand of captureFnRefCandidates(args, rule, spec, this.source)) {
+      if (base && cand.line === base.startPosition.row + 1 && cand.column === base.startPosition.column) continue;
+      this.fnRefCandidates.push({ ...cand, fromNodeId });
+    }
   }
 
   /**
    * Extract a class
    */
+  /**
+   * Whether `node` is a class to extract: one of the language's class types,
+   * except a TS/JS class expression without a name (`register(class extends
+   * Base {…})`), which is passed over as before (#2499).
+   */
+  private isClassTypeNode(node: SyntaxNode, nodeType: string): boolean {
+    if (!this.extractor!.classTypes.includes(nodeType)) return false;
+    return nodeType !== 'class' || !CLASS_EXPRESSION_LANGUAGES.has(this.language) || !!getChildByField(node, 'name');
+  }
+
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
@@ -1778,16 +2686,27 @@ export class TreeSitterExtractor {
     if (this.extractor.skipBodilessClass && !resolvedBody) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
-    const isExported = this.extractor.isExported?.(node, this.source);
+    // A class expression's name is bound inside the expression alone, so the
+    // class is never what a module exports by it, and it carries its head
+    // (`class Widget extends Base`) as its signature: a class declaration
+    // has none, which is how resolution tells the two apart (#2499).
+    const expression = node.type === 'class' && CLASS_EXPRESSION_LANGUAGES.has(this.language);
+    const isExported = expression ? false : this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
+      ...(expression && resolvedBody ? { signature: classExpressionHead(this.source, node, resolvedBody) } : {}),
+      ...this.cppBodyEnd(resolvedBody),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!classNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(classNode.id, scoped);
+    this.openCppClassScope(classNode, resolvedBody);
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
@@ -1840,6 +2759,7 @@ export class TreeSitterExtractor {
       if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
         const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
           ?? getChildByField(node, this.extractor.bodyField);
+        this.visitParameterDefaults(node, body);
         if (body) {
           this.visitFunctionBody(body, '');
         }
@@ -1862,8 +2782,8 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const docstring = getPrecedingDocstring(node, this.source);
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const docstring = this.docstringFor(node);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
@@ -1871,10 +2791,20 @@ export class TreeSitterExtractor {
     // on every ordinary method (breaks kernel↔wasm parity JSON equality).
     const isAbstract = this.extractor.isAbstract?.(node) ? true : undefined;
     const returnType = this.extractor.getReturnType?.(node, this.source);
+    // A method that is a top-level declaration (Go: `func (r *T) Name()`) has
+    // the same exportedness rule as a function — the name's case — and a
+    // consumer asking "can another package name this?" needs it on methods
+    // too. Class members keep the flag unset: their reachability is the
+    // class's, and the languages whose isExported walks the parent chain
+    // (JS/TS) would otherwise re-mark every member of an exported class.
+    const isExported = this.extractor.methodsAreTopLevel
+      ? this.extractor.isExported?.(node, this.source)
+      : undefined;
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
+      isExported,
       isAsync,
       isStatic,
       isAbstract,
@@ -1915,6 +2845,7 @@ export class TreeSitterExtractor {
     this.nodeStack.push(methodNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
+    this.visitParameterDefaults(node, body);
     if (body) {
       this.visitFunctionBody(body, methodNode.id);
     }
@@ -1928,7 +2859,7 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
@@ -1982,21 +2913,31 @@ export class TreeSitterExtractor {
     // (#1093) because the two defaults differ — a bodiless CLASS is kept
     // unless a language opts into skipping, a bodiless STRUCT is skipped
     // unless a language opts into keeping.
-    const body = getChildByField(node, this.extractor.bodyField);
+    //
+    // resolveBody first, as for classes and enums: a VB.NET Structure tags
+    // every member as its own `body` field, so the field alone yields only
+    // the first member.
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (!body && node.type !== 'record_declaration' && !this.extractor.allowBodilessStruct)
       return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const scoped = this.writtenScopeQualifiedName(node, name);
 
     const aggregateNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
+      ...this.cppBodyEnd(body),
+      ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
     if (!aggregateNode) return;
+    if (scoped !== undefined) this.objectPathOwners.set(aggregateNode.id, scoped);
+    this.openCppClassScope(aggregateNode, body);
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, aggregateNode.id);
@@ -2031,7 +2972,7 @@ export class TreeSitterExtractor {
     if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
@@ -2054,7 +2995,18 @@ export class TreeSitterExtractor {
       if (!child) continue;
 
       if (memberTypes?.includes(child.type)) {
-        this.extractEnumMembers(child);
+        const member = this.extractEnumMembers(child);
+        // Java's `PLUS { int apply(…) { … } }`, Kotlin's `NewBuffer { override
+        // fun pipe() … }`: the constant's own body declares members of its own.
+        const entryBody = member ? child.namedChildren.find((c) => c.type === 'class_body') : undefined;
+        if (member && entryBody) {
+          this.nodeStack.push(member.id);
+          for (let j = 0; j < entryBody.namedChildCount; j++) {
+            const inner = entryBody.namedChild(j);
+            if (inner) this.visitNode(inner);
+          }
+          this.nodeStack.pop();
+        }
       } else {
         this.visitNode(child);
       }
@@ -2066,28 +3018,30 @@ export class TreeSitterExtractor {
    * Extract enum member names from an enum member node.
    * Handles multi-case declarations (Swift: `case put, delete`) and single-case patterns.
    */
-  private extractEnumMembers(node: SyntaxNode): void {
+  private extractEnumMembers(node: SyntaxNode): Node | null {
     // Try field-based name first (e.g. Rust enum_variant has a 'name' field)
     const nameNode = getChildByField(node, 'name');
     if (nameNode) {
-      this.createNode('enum_member', getNodeText(nameNode, this.source), node);
-      return;
+      return this.createNode('enum_member', getNodeText(nameNode, this.source), node);
     }
 
     // Check for identifier-like children (Swift: simple_identifier, TS: property_identifier)
+    let first: Node | null = null;
     let found = false;
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child && (child.type === 'simple_identifier' || child.type === 'identifier' || child.type === 'property_identifier')) {
-        this.createNode('enum_member', getNodeText(child, this.source), child);
+        const created = this.createNode('enum_member', getNodeText(child, this.source), child);
+        first ??= created;
         found = true;
       }
     }
 
     // If the node itself IS the identifier (e.g. TS property_identifier directly in enum body)
     if (!found && node.namedChildCount === 0) {
-      this.createNode('enum_member', getNodeText(node, this.source), node);
+      return this.createNode('enum_member', getNodeText(node, this.source), node);
     }
+    return first;
   }
 
   /**
@@ -2097,7 +3051,7 @@ export class TreeSitterExtractor {
   private extractProperty(node: SyntaxNode): Node | null {
     if (!this.extractor) return null;
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
@@ -2161,13 +3115,60 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * The parts of a property declaration that run code, for the body walker.
+   * VB.NET writes its `Get` / `Set` blocks, `= initializer` and `As New T`
+   * as children of the declaration itself, so the declaration is walked
+   * whole, the way its methods are (resolveBody). C# runs code in each
+   * accessor's body (`get { … }`, `set => …`) and in the property's `value`:
+   * an expression body's `=> …` or an `= initializer`. Its attributes are
+   * not walked. Mirrored in the kernel (csharp.rs property_bodies).
+   */
+  private propertyBodies(node: SyntaxNode): SyntaxNode[] {
+    if (this.language === 'vbnet') return [node];
+    if (this.language !== 'csharp') return [];
+    const bodies: SyntaxNode[] = [];
+    for (const accessor of getChildByField(node, 'accessors')?.namedChildren ?? []) {
+      const body = accessor.type === 'accessor_declaration' ? getChildByField(accessor, 'body') : null;
+      if (body) bodies.push(body);
+    }
+    const value = getChildByField(node, 'value');
+    if (value) bodies.push(value);
+    return bodies;
+  }
+
+  /**
+   * A C# target-typed `new()` names no type, which is why INSTANTIATION_KINDS
+   * leaves `implicit_object_creation_expression` out. As a field's or
+   * property's initializer, though, it constructs the declared type:
+   * `private readonly List<Foo> _items = new();` instantiates List, as
+   * `new List<Foo>()` does. Emitted from the node-stack top (the member).
+   * Mirrored in the kernel (csharp.rs extract_target_typed_new).
+   */
+  private extractTargetTypedNew(value: SyntaxNode | null, declaredType: SyntaxNode | null): void {
+    if (this.language !== 'csharp' || value?.type !== 'implicit_object_creation_expression') return;
+    const className = declaredType ? csharpClassTypeName(declaredType, this.source) : null;
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!className || !fromNodeId) return;
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: className,
+      referenceKind: 'instantiates',
+      line: value.startPosition.row + 1,
+      column: value.startPosition.column,
+    });
+  }
+
+  /**
    * Extract a class field declaration (e.g. Java field_declaration, C# field_declaration).
    * Extracts each declarator as a 'field' kind node inside the owning class.
+   * Returns the initializers it walked (a C# declarator, a Java `value`), for
+   * the function-as-value scan to skip.
    */
-  private extractField(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractField(node: SyntaxNode): Set<number> {
+    const walked = new Set<number>();
+    if (!this.extractor) return walked;
 
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
@@ -2220,7 +3221,7 @@ export class TreeSitterExtractor {
             isStatic,
           });
         }
-        return;
+        return walked;
       }
     }
 
@@ -2264,12 +3265,26 @@ export class TreeSitterExtractor {
           // candidates, so a lambda / method reference / anonymous class in
           // `private final Runnable r = () -> target();` contributed NO call
           // edge at all and `target` looked callerless. Keyed on the `value`
-          // FIELD, which only Java's `variable_declarator` carries — C#,
-          // VB.NET and PHP spell their initializer differently and are
-          // deliberately untouched here.
-          const valueNode = getChildByField(decl, 'value');
+          // FIELD, which only Java's `variable_declarator` carries. VB.NET
+          // writes `= expr` (the declarator's `initializer`) or `As New T(…)`
+          // (inside its as_clause), and C# writes `= expr` as the
+          // declarator's last, unnamed child, so both walk the whole
+          // declarator. PHP spells its initializer differently and is
+          // untouched.
+          const wholeDeclarator = this.language === 'vbnet' || this.language === 'csharp';
+          const valueNode = wholeDeclarator ? decl : getChildByField(decl, 'value');
           if (valueNode) {
             this.nodeStack.push(fieldNode.id);
+            if (this.language === 'csharp') {
+              this.extractTargetTypedNew(
+                decl.namedChild(decl.namedChildCount - 1),
+                varDecl ? getChildByField(varDecl, 'type') : null,
+              );
+            }
+            // Its function-as-value candidates are the field's, captured here
+            // once (VB.NET captures none): the scan would take Java's again for
+            // the class.
+            walked.add(valueNode.id);
             this.visitFunctionBody(valueNode, fieldNode.id);
             this.nodeStack.pop();
           }
@@ -2288,6 +3303,165 @@ export class TreeSitterExtractor {
         });
       }
     }
+    return walked;
+  }
+
+  /**
+   * Whether a named object literal in this file owns its function members
+   * (#2300). TS/JS only; a generated or minified bundle — named so
+   * (`*.min.js`) or not (a vendored `bundle.js`, by its content) — keeps the
+   * old shape, so its single-letter objects don't become hundreds of nodes.
+   * Mirrored in the kernel (tsjs/extractors.rs owns_object_literals).
+   */
+  private ownsObjectLiterals(): boolean {
+    this.ownsObjects ??= TS_JS_CHAIN_LANGUAGES.has(this.language) && !isGeneratedFile(this.filePath) &&
+      !isMinifiedContent(this.filePath, this.source);
+    return this.ownsObjects;
+  }
+
+  /**
+   * The function an owned literal's member becomes, named by its static key:
+   * `load() {…}`, `load: () => {…}`, `load: function () {…}`, `load: function* () {…}`.
+   * Null for every other member — a computed key, a value, a shorthand, a spread.
+   */
+  private ownedMemberFunction(member: SyntaxNode): { fn: SyntaxNode; name: string } | null {
+    if (member.type === 'method_definition') {
+      const key = getChildByField(member, 'name');
+      return key && STATIC_OBJECT_KEY_TYPES.has(key.type) ? { fn: member, name: this.objectKeyName(key) } : null;
+    }
+    if (member.type !== 'pair') return null;
+    const key = getChildByField(member, 'key');
+    const value = getChildByField(member, 'value');
+    if (!key || !value || !STATIC_OBJECT_KEY_TYPES.has(key.type) || !OBJECT_MEMBER_FUNCTION_TYPES.has(value.type)) return null;
+    return { fn: value, name: this.objectKeyName(key) };
+  }
+
+  /** `value` when it is an object literal that owns at least one function member, else null. */
+  private ownedObjectValue(value: SyntaxNode | null): SyntaxNode | null {
+    if (!value || (value.type !== 'object' && value.type !== 'object_expression') || !this.ownsObjectLiterals()) return null;
+    for (let i = 0; i < value.namedChildCount; i++) {
+      const member = value.namedChild(i);
+      if (member && this.ownedMemberFunction(member)) return value;
+    }
+    return null;
+  }
+
+  /**
+   * Extract an owned literal's members: each function member becomes a node
+   * of its own, qualified under the owner (at file scope for one on the global
+   * object, `global`). Every other member — a value, a computed key, a spread —
+   * runs where the literal is written, so it is walked there: under the owner
+   * for a module-scope declaration (`valuesUnderOwner`, its initializer's calls
+   * are the constant's, #693), under the enclosing function for a local or an
+   * assignment, as they were before members had nodes. The literal's shorthand
+   * members (`{ load }`) go to the function-as-value capture the same way.
+   */
+  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean): void {
+    const enclosing = this.nodeStack;
+    const ownerStack = [...(global ? enclosing.slice(0, 1) : enclosing), ownerId];
+    const valueStack = valuesUnderOwner ? ownerStack : enclosing;
+    this.nodeStack = valueStack;
+    this.maybeCaptureFnRefs(obj, obj.type);
+    for (let i = 0; i < obj.namedChildCount; i++) {
+      const member = obj.namedChild(i);
+      if (!member) continue;
+      const owned = this.ownedMemberFunction(member);
+      this.nodeStack = owned ? ownerStack : valueStack;
+      if (owned) this.extractFunction(owned.fn, owned.name);
+      else this.visitFunctionBody(member, '');
+    }
+    this.nodeStack = enclosing;
+  }
+
+  /**
+   * `const api = { load() {…} }` written in a function body or an IIFE: the
+   * owner gets the node a module-scope declaration would, and its members are
+   * extracted under it (#2300). Returns false when the declarator holds no
+   * owned literal, leaving it to the walker.
+   */
+  private extractLocalObjectOwner(declarator: SyntaxNode): boolean {
+    const nameNode = getChildByField(declarator, 'name');
+    if (nameNode?.type !== 'identifier') return false;
+    const obj = this.ownedObjectValue(getChildByField(declarator, 'value'));
+    if (!obj) return false;
+    const declaration = declarator.parent;
+    const isConst = declaration ? (this.extractor?.isConst?.(declaration) ?? false) : false;
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    // A local: never the target of another scope's value read.
+    const owner = this.createNode(isConst ? 'constant' : 'variable', getNodeText(nameNode, this.source), declarator, {
+      docstring: this.docstringFor(declarator),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: false,
+    }, false);
+    if (!owner) return false;
+    this.extractVariableTypeAnnotation(declarator, owner.id);
+    this.extractOwnedObjectMembers(obj, owner.id, false, false);
+    return true;
+  }
+
+  /**
+   * `window.App = {…}` / `App.utils = {…}` / `dw_page = {…}`: an object
+   * literal assigned to a name owns its function members like a declared one
+   * (#2300). Assigned to a plain identifier — an implicit global, or a binding
+   * declared elsewhere — it is qualified like a declaration. Hung on a path,
+   * the owner is named by the path's last link and qualified by the path as
+   * written — `window.App`, `App.utils` — so its members read
+   * `window.App::init`: a property is reached through its object, not through
+   * the function that happened to assign it (Lua's `M.helpers::a` reads the
+   * same way). A path on the global object is global wherever it is written,
+   * so it is also contained by the file. CommonJS export objects and
+   * prototypes are not namespaces and are left alone. Returns false (nothing
+   * extracted) for any other assignment.
+   */
+  private extractAssignedObjectOwner(node: SyntaxNode, moduleLevel: boolean): boolean {
+    const obj = this.ownedObjectValue(getChildByField(node, 'right'));
+    if (!obj) return false;
+    const path = this.objectOwnerPath(getChildByField(node, 'left'));
+    // A plain name assigned at module level is a global (`dw_page = {…}`); in
+    // a function it is a local being reassigned (`e = {…}` in a bundle's IIFE).
+    if (!path || (path.length === 1 && !moduleLevel)) return false;
+    const qualifiedName = path.length > 1 ? path.join('.') : undefined;
+    const global = path.length > 1 && HOST_GLOBAL_ROOTS.has(path[0]!);
+    const saved = this.nodeStack;
+    if (global) this.nodeStack = saved.slice(0, 1);
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    const statement = node.parent?.type === 'expression_statement' ? node.parent : node;
+    // `App.utils` is read as `App.utils`, never as a bare `utils`: only a name
+    // the code reads by that name is a value-read target.
+    const owner = this.createNode('variable', path[path.length - 1]!, node, {
+      docstring: this.docstringFor(statement),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: false,
+      ...(qualifiedName !== undefined ? { qualifiedName } : {}),
+    }, path.length === 1 || global);
+    this.nodeStack = saved;
+    if (!owner) return false;
+    if (qualifiedName !== undefined) this.objectPathOwners.set(owner.id, qualifiedName);
+    this.extractOwnedObjectMembers(obj, owner.id, false, global);
+    return true;
+  }
+
+  /**
+   * The links of an assignment target written as plain names — `dw_page` →
+   * `['dw_page']`, `window.App` → `['window', 'App']`, `App.utils.dom` →
+   * `['App', 'utils', 'dom']` — or null for anything else: `this.x`, a
+   * computed `a[k]`, a call, CommonJS's `module.exports` / `exports.x`, or a
+   * prototype.
+   */
+  private objectOwnerPath(left: SyntaxNode | null): string[] | null {
+    const path: string[] = [];
+    let cur = left;
+    while (cur?.type === 'member_expression') {
+      const property = getChildByField(cur, 'property');
+      if (property?.type !== 'property_identifier') return null;
+      path.unshift(getNodeText(property, this.source));
+      cur = getChildByField(cur, 'object');
+    }
+    if (cur?.type !== 'identifier') return null;
+    const root = getNodeText(cur, this.source);
+    if (root === 'module' || root === 'exports' || path.includes('prototype')) return null;
+    path.unshift(root);
+    return path;
   }
 
   /**
@@ -2306,6 +3480,11 @@ export class TreeSitterExtractor {
         const value = getChildByField(member, 'value');
         if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
           this.extractFunction(value, this.objectKeyName(key));
+        } else if (value?.type === 'call_expression') {
+          // `key: Effect.fn("…")(function* () {…})` — see curriedWrapperBoundName.
+          const fn = getChildByField(value, 'arguments')?.namedChild(0);
+          const bound = fn ? this.curriedWrapperBoundName(fn) : null;
+          if (fn && bound) this.extractFunction(fn, bound);
         }
       } else if (member.type === 'method_definition') {
         // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
@@ -2329,8 +3508,16 @@ export class TreeSitterExtractor {
    */
   private isExportedLater(name: string): boolean {
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) return false;
+    // Unescaped, a `$` in the name (`items$`, `$store`) is a line-end anchor,
+    // not the character. Escaped as the kernel's `regex::escape` does, so
+    // both paths decide the same.
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Inside `{ … }` the name is bounded by a character that can't continue
+    // an identifier, not by `\b`, which takes a `$` for a separator: it can't
+    // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
+    // kernel spells it, since the kernel's `\w` is Unicode.
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${name}\\s*;?[ \\t]*$|\\{[^}]*\\b${name}\\b[^}]*\\})`,
+      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
       'm'
     );
     return re.test(this.source);
@@ -2688,9 +3875,16 @@ export class TreeSitterExtractor {
    *
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
+   *
+   * Returns the initializers it walked under the symbol they declare — a
+   * constant's or a variable's (#693), a component wrapper's — whose
+   * function-as-value candidates that walk already took for the symbol. The
+   * caller's scan of the declaration skips them: it would take each again for
+   * the file, as a second reference to the same function from the same spot.
    */
-  private extractVariable(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractVariable(node: SyntaxNode): Set<number> | undefined {
+    if (!this.extractor) return undefined;
+    let walked: Set<number> | undefined;
 
     // Different languages have different variable declaration structures
     // TypeScript/JavaScript: lexical_declaration contains variable_declarator children
@@ -2699,7 +3893,7 @@ export class TreeSitterExtractor {
 
     const isConst = this.extractor.isConst?.(node) ?? false;
     const kind: NodeKind = isConst ? 'constant' : 'variable';
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source) ?? false;
 
     // Extract variable declarators based on language
@@ -2725,6 +3919,14 @@ export class TreeSitterExtractor {
               if (nameNode.type === 'object_pattern' && valueNode?.type === 'identifier') {
                 this.extractRtkHookBindings(nameNode, isExported);
               }
+              // A pattern declares no symbol of its own, but its initializer
+              // (and any default value in the pattern) still runs. Walk the
+              // declarator the way a function body walks it, with the
+              // enclosing scope on the stack: the file for module code, which
+              // a `<script setup>` block hands to its component. Without this
+              // `const { data } = useFetch()` recorded no call at all (#2340).
+              // Mirrored in the kernel (tsjs/extractors.rs extract_variable).
+              this.visitFunctionBody(child, '');
               continue;
             }
             const name = getNodeText(nameNode, this.source);
@@ -2754,6 +3956,7 @@ export class TreeSitterExtractor {
                   signature: initSignature,
                   isExported,
                 });
+                if (!hoc.inner) (walked ??= new Set()).add(valueNode.id);
                 continue;
               }
             }
@@ -2767,6 +3970,18 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+            }
+
+            // A named object literal owns its function members, exported or
+            // not (#2300): `const api = { load() {…} }` gives `api::load`, and
+            // the calls written in a member are the member's. The rest of the
+            // literal is walked under the owner. (The same literal inside a
+            // function or an IIFE goes through visitFunctionBody.)
+            const ownedObject = varNode ? this.ownedObjectValue(valueNode) : null;
+            if (varNode && ownedObject) {
+              this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false);
+              (walked ??= new Set()).add(ownedObject.id);
+              continue;
             }
 
             // Exported const object-of-functions — extract each function-valued
@@ -2852,6 +4067,7 @@ export class TreeSitterExtractor {
               if (varNode) this.nodeStack.push(varNode.id);
               this.visitFunctionBody(valueNode, '');
               if (varNode) this.nodeStack.pop();
+              if (varNode) (walked ??= new Set()).add(valueNode.id);
             }
 
             if (extractObjectMethods && objectOfFns) {
@@ -2900,13 +4116,16 @@ export class TreeSitterExtractor {
         if (assigned) this.nodeStack.push(assigned.id);
         this.visitFunctionBody(right, '');
         if (assigned) this.nodeStack.pop();
+        if (assigned) (walked ??= new Set()).add(right.id);
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
-      // These can have multiple identifiers on the left
-      const specs = node.namedChildren.filter(c =>
-        c.type === 'var_spec' || c.type === 'const_spec'
-      );
+      // These can have multiple identifiers on the left. A `var ( … )` group
+      // wraps its specs in a `var_spec_list`; a `const ( … )` group holds them
+      // directly.
+      const specs = node.namedChildren
+        .flatMap((c) => (c.type === 'var_spec_list' ? c.namedChildren : [c]))
+        .filter((c) => c.type === 'var_spec' || c.type === 'const_spec');
 
       for (const spec of specs) {
         const nameNode = spec.namedChild(0);
@@ -2917,8 +4136,10 @@ export class TreeSitterExtractor {
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
+          // A member of a `const ( … )` or `var ( … )` group has its own doc
+          // comment beside it in the parentheses; one without keeps the group's.
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
-            docstring,
+            docstring: this.docstringFor(spec) ?? docstring,
             signature: initSignature,
           });
         }
@@ -2936,6 +4157,7 @@ export class TreeSitterExtractor {
           if (varNode) this.nodeStack.push(varNode.id);
           this.visitFunctionBody(valueField, varNode?.id ?? '');
           if (varNode) this.nodeStack.pop();
+          if (varNode) (walked ??= new Set()).add(valueField.id);
         }
       }
 
@@ -2993,8 +4215,8 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, target.name, nameNode, { docstring, signature: initSignature, isExported });
       });
-    } else if (this.language === 'c') {
-      // C: a `declaration` node's name nests inside the `declarator` field —
+    } else if (this.language === 'c' || this.language === 'objc') {
+      // C and Objective-C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
       // value); a `function_declarator` is a prototype, not a variable. The
       // generic fallback below only finds a *direct* identifier child, which C
@@ -3017,11 +4239,15 @@ export class TreeSitterExtractor {
           // a spurious type-named global for every macro-prefixed prototype in a
           // header. Those misparses are always bare identifiers; real
           // consts/tables always carry an initializer. The only legit loss is
-          // uninitialized scalar globals (`static int g;`).
+          // uninitialized scalar globals (`static int g;`). Objective-C keeps
+          // them, as it did before it shared this branch: until then it read
+          // nothing but bare identifiers, and missed every
+          // `NSString *const kKey = @"…";`.
           if (
             child.type !== 'init_declarator' &&
             child.type !== 'pointer_declarator' &&
-            child.type !== 'array_declarator'
+            child.type !== 'array_declarator' &&
+            !(this.language === 'objc' && child.type === 'identifier')
           ) {
             continue;
           }
@@ -3069,6 +4295,8 @@ export class TreeSitterExtractor {
       // Generic fallback for other languages
       // Try to find identifier children
       const nameField = getChildByField(node, 'name');
+      // A Rust impl's associated const is its type's (`Limits::MAX`), as its methods are.
+      const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
       let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
@@ -3081,6 +4309,7 @@ export class TreeSitterExtractor {
             const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
+              ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
             });
             if (created && nameField && child.startIndex === nameField.startIndex) {
               declared = created;
@@ -3100,9 +4329,11 @@ export class TreeSitterExtractor {
           if (declared) this.nodeStack.push(declared.id);
           this.visitFunctionBody(valueNode, '');
           if (declared) this.nodeStack.pop();
+          if (declared) (walked ??= new Set()).add(valueNode.id);
         }
       }
     }
+    return walked;
   }
 
   /** Resolve a Lua assignment target into its callable name and optional table receiver. */
@@ -3145,7 +4376,7 @@ export class TreeSitterExtractor {
     docstring?: string
   ): void {
     if (!this.extractor) return;
-    const signature = this.extractor.getSignature?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const extra: Partial<Node> = { docstring, signature };
     if (receiver) extra.qualifiedName = this.composeReceiverQualifiedName(receiver, name);
     else extra.isExported = this.extractor.isExported?.(node, this.source);
@@ -3187,7 +4418,7 @@ export class TreeSitterExtractor {
 
     const name = extractName(node, this.source, this.extractor);
     if (name === '<anonymous>') return false;
-    const docstring = getPrecedingDocstring(node, this.source);
+    const docstring = this.docstringFor(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     // Check if this type alias is actually a struct or interface definition
@@ -3208,6 +4439,20 @@ export class TreeSitterExtractor {
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, aggregateNode.id);
+        // A Go struct references the types its fields are declared with, as
+        // the struct: Go fields mint no nodes, and impact never climbs from a
+        // member to its container (Dart's fields are the same, #2327).
+        if (this.language === 'go') {
+          for (const type of goStructFieldTypeNames(node, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: aggregateNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
@@ -3257,14 +4502,21 @@ export class TreeSitterExtractor {
       // impl-navigation can see the contract. Go has no `implements` keyword, so
       // without the interface's method set there's nothing to match against.
       if (this.language === 'go' && typeChild) {
-        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id, node);
       }
       return true;
     }
 
+    const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
+      // A Rust alias is private to its module unless `pub` (any form): the
+      // resolver keeps a private one to its own module (isRustNameInScope).
+      ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
+      // An impl's associated type is its type's (`ValueHint::Err`), named only
+      // through a path, never bare (isRustAssociatedItem).
+      ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
@@ -3284,6 +4536,24 @@ export class TreeSitterExtractor {
           // entry's string-literal name as a searchable member (issue #634).
           this.extractTsTupleContractNames(value, typeAliasNode);
         }
+      } else if (this.language === 'go') {
+        // Go's `type Event = mvccpb.Event` names its type in the `type` field,
+        // and so does a defined type, `type WatchChan <-chan WatchResponse`.
+        for (const type of goAliasTypeNames(node, this.source)) {
+          this.unresolvedReferences.push({
+            fromNodeId: typeAliasNode.id,
+            referenceName: getNodeText(type, this.source),
+            referenceKind: 'references',
+            line: type.startPosition.row + 1,
+            column: type.startPosition.column,
+          });
+        }
+      } else if (this.language === 'dart') {
+        // A Dart typedef has no fields either: the type it aliases is the
+        // rest of the declaration, `void Function(Report r)` in `typedef
+        // ReportCallback = void Function(Report r);`, or a legacy one's
+        // return and parameter types (#2327).
+        pushDartTypeAliasRefs(node, typeAliasNode.id, (ref) => this.unresolvedReferences.push(ref));
       }
     }
     return false;
@@ -3294,9 +4564,12 @@ export class TreeSitterExtractor {
    * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
-   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   * are `type_elem`s, not methods, and are left to inheritance extraction.
+   * Each method references the types its signature names, as a function does
+   * (`decl` declares the interface): a call through the interface reaches the
+   * method, so impact on a type reaches its callers.
    */
-  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string, decl: SyntaxNode): void {
     this.nodeStack.push(ifaceId);
     for (let i = 0; i < interfaceType.namedChildCount; i++) {
       const m = interfaceType.namedChild(i);
@@ -3305,9 +4578,20 @@ export class TreeSitterExtractor {
       if (!nameNode) continue;
       const mname = getNodeText(nameNode, this.source);
       if (mname) {
-        this.createNode('method', mname, m, {
-          signature: this.extractor?.getSignature?.(m, this.source),
+        const methodNode = this.createNode('method', mname, m, {
+          signature: this.extractor?.getSignature?.(m, this.signatureSource),
         });
+        if (methodNode) {
+          for (const type of goInterfaceMethodTypeNames(m, decl, this.source)) {
+            this.unresolvedReferences.push({
+              fromNodeId: methodNode.id,
+              referenceName: getNodeText(type, this.source),
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
     }
     this.nodeStack.pop();
@@ -3351,7 +4635,7 @@ export class TreeSitterExtractor {
           ? 'method'
           : this.isTsFunctionTypedProperty(child) ? 'method' : 'property';
 
-        const docstring = getPrecedingDocstring(child, this.source);
+        const docstring = this.docstringFor(child);
         const signature = getNodeText(child, this.source);
         this.createNode(memberKind, memberName, child, {
           docstring,
@@ -3468,11 +4752,12 @@ export class TreeSitterExtractor {
   private extractImport(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    const importText = getNodeText(node, this.source).trim();
+    const statementSource = this.importSource(node);
+    const importText = getNodeText(node, statementSource).trim();
 
     // Try language-specific hook first
     if (this.extractor.extractImport) {
-      const info = this.extractor.extractImport(node, this.source);
+      const info = this.extractor.extractImport(node, statementSource);
       if (info) {
         this.createNode('import', info.moduleName, node, {
           signature: info.signature,
@@ -3979,11 +5264,61 @@ export class TreeSitterExtractor {
     return this.erlangAtomMacros.get(macroName) ?? null;
   }
 
+  /**
+   * A Kotlin infix call — `Users.id eq id1`, `a to b`, `x shouldBe y` — is a
+   * call of the infix function in the middle: `receiver.fn` when the left
+   * operand is a plain name (as `receiver.fn(arg)` would be), else the bare
+   * name. Nothing records it otherwise, so a project's infix DSL had no
+   * callers. Mirrored in the kernel's extract_infix_call (kotlin.rs).
+   */
+  private extractKotlinInfixCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0 || node.namedChildCount !== 3) return;
+    const lhs = node.namedChild(0);
+    const fn = node.namedChild(1);
+    if (!lhs || !fn || fn.type !== 'simple_identifier' || LITERAL_RECEIVER_TYPES.has(lhs.type)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+    const name = getNodeText(fn, this.source);
+    const receiver = lhs.type === 'simple_identifier' ? getNodeText(lhs, this.source) : '';
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: receiver && receiver !== 'this' && receiver !== 'super' ? `${receiver}.${name}` : name,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // CFML `cfinclude(template="x.cfm")` includes a template, as `include
+    // "x.cfm";` does (#2651): an import of the file, never a call.
+    if (this.language === 'cfscript' && isCfIncludeCall(node, this.source)) {
+      this.extractImport(node);
+      return;
+    }
+
+    // CFML `createObject("component", "a.b.Batch")` makes an instance of the
+    // component, as `new a.b.Batch()` does (#2652): an instantiation of it,
+    // under the path as written, which the resolver reads as `extends`'
+    // component paths. Not a call: createObject is the engine's own function.
+    if (this.language === 'cfscript') {
+      const created = cfmlCreatedComponent(node, this.source);
+      if (created) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: created,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+        return;
+      }
+    }
 
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
@@ -4015,6 +5350,15 @@ export class TreeSitterExtractor {
         }
       } else if (fn.type === 'identifier') {
         calleeName = getNodeText(fn, this.source);
+      } else if (fn.type === 'with_member_access_expression') {
+        // `.Run()` in a `With x` block is `x.Run()`; through a longer path
+        // (`Me._h`, `{T}` for `With DirectCast(o, T)`) the resolver types each link.
+        const member = fn.namedChild(0);
+        const target = this.vbWithTarget(fn);
+        const receiver = target ? this.vbReceiverPath(target) : null;
+        if (member?.type !== 'identifier' || !receiver || VB_NON_TYPE_RECEIVERS.test(receiver.split('.')[0]!)) return;
+        const memberName = getNodeText(member, this.source);
+        calleeName = /^(?:me|mybase|myclass)$/i.test(receiver) ? memberName : `${receiver}.${memberName}`;
       } else {
         return; // parenthesized/chained receivers: no static name to link
       }
@@ -4077,8 +5421,7 @@ export class TreeSitterExtractor {
           }
           // Arity from the call site's own argument list — part of the callee's
           // identity, and what disambiguates `f/1` from `f/2` (#1610).
-          const callArgsNode = getChildByField(node, 'args');
-          const callArity = callArgsNode ? callArgsNode.namedChildCount : 0;
+          const callArity = namedArgCount(getChildByField(node, 'args'));
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: `${calleeName}/${callArity}`,
@@ -4145,7 +5488,7 @@ export class TreeSitterExtractor {
               // qualified matcher then resolves it only when the module
               // defines exactly one arity of that name.
               const mfaList = argExprs[i + 2];
-              const arityTail = mfaList?.type === 'list' ? `/${mfaList.namedChildCount}` : '';
+              const arityTail = mfaList?.type === 'list' ? `/${namedArgCount(mfaList)}` : '';
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
                 referenceName: (isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`) + arityTail,
@@ -4266,7 +5609,10 @@ export class TreeSitterExtractor {
       // — is itself a dependency on that constant; emit a `references` ref so a
       // class used only via its class methods still records a dependent (the edge
       // the old receiver-only callee happened to provide, now made explicit).
-      if (!skip && receiverNode.type === 'constant') {
+      // So is one written with its namespace, `Billing::ChargeCard.call` or
+      // `::Foo.call` (#2503), under the receiver as written; a path through a
+      // value (`obj::Thing`, `self.class::LIMIT`) names no constant.
+      if (!skip && isRubyConstantPath(receiverNode)) {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: receiverName,
@@ -4450,6 +5796,10 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    // Where the call's reference sits: the call itself, or the callee an
+    // `await` was peeled off (`await f<T>(x)` starts at `await`; the call to
+    // `f` starts where `f` does, as in `await f(x)`).
+    let refStart = node.startPosition;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -4629,7 +5979,31 @@ export class TreeSitterExtractor {
         }
       }
     } else {
-      const func = getChildByField(node, 'function') || node.namedChild(0);
+      let func = getChildByField(node, 'function') || node.namedChild(0);
+      if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
+        const peeled = peelTsPrefixedCallee(func);
+        if (peeled !== func) refStart = peeled.startPosition;
+        func = peeled;
+      }
+
+      if (func && this.language === 'swift') {
+        // `-(a + b)`: an operator token applied to a parenthesized value
+        // leaves the call with no callee node, only its arguments — which
+        // must not be read as a callee name. (`!(x)` keeps its `bang` callee:
+        // a project may declare a `prefix func !` for its own types.)
+        // Mirrored in the kernel's extract_call (swift.rs).
+        if (func.type === 'call_suffix') return;
+        func = peelSwiftCallWrappers(func, this.source);
+      }
+
+      // A Rust turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+      // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its type
+      // arguments are no part of the callee's name, which stayed in the ref
+      // (`s.get::<u32>`) and resolved through no strategy. Mirrored in the
+      // kernel's extract_call (rustlang.rs).
+      if (func && this.language === 'rust' && func.type === 'generic_function') {
+        func = getChildByField(func, 'function') ?? func;
+      }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
       // tree-sitter-cpp can't parse an operator_name in field position, so the
@@ -4701,11 +6075,23 @@ export class TreeSitterExtractor {
             // This helps the resolver distinguish method calls from bare function calls
             // (e.g., Python's console.print() vs builtin print())
             // Skip self/this/cls as they don't aid resolution
-            const receiver =
+            const rawReceiver =
               getChildByField(func, 'object') ||
               getChildByField(func, 'operand') ||
               getChildByField(func, 'argument') ||
               func.namedChild(0);
+            // TS/JS: look through wrappers that keep the receiver the same
+            // object (`(x).m()`, `x!.m()`, `(x as T).m()`, `(await f()).m()`),
+            // so the branches below see the identifier / call / chain the
+            // call is really made on. Swift: through a prefix operator, `try`
+            // and `await` (`(!store).contains(x)`, `(try! A()).b()`).
+            const receiver = rawReceiver && TS_JS_CHAIN_LANGUAGES.has(this.language)
+              ? peelTsJsReceiver(rawReceiver)
+              : rawReceiver && this.language === 'swift'
+                ? peelSwiftCallWrappers(rawReceiver, this.source)
+                : rawReceiver;
+            // `this.<field>[]` / `this.<name>` of a subscript receiver, set by its branch below.
+            let thisSubscript: string | null = null;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -4717,6 +6103,8 @@ export class TreeSitterExtractor {
               return;
             }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
+            let constructed: string | null = null;
+            let rustChain: string | null = null;
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
@@ -4724,6 +6112,17 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (this.language === 'rust' && receiver && receiver.type === 'self') {
+              // Rust `self.method()`. Keep the `self.` prefix, exactly as the
+              // field shape below does (#1585): the resolver reads the owner
+              // off the CALLING method's qualified name and resolves the
+              // method on that type. Collapsing to the bare method name handed
+              // the resolver a name with no owner, which it then matched among
+              // all same-named methods by file proximity — so `self.reset()`
+              // inside `impl Target` landed on a `Decoy::reset` that happened
+              // to sit nearer, with nothing in the edge to show it was a guess
+              // (#1861). Mirrored in the kernel's extract_call (rustlang.rs).
+              calleeName = `self.${methodName}`;
             } else if (
               this.language === 'rust' &&
               receiver &&
@@ -4739,11 +6138,20 @@ export class TreeSitterExtractor {
               // or unknown. Previously this collapsed to the bare method name,
               // which exact-matched whichever same-named method was nearest —
               // often the calling method itself, a self-edge not in the source.
-              // Deeper chains (`self.a.b.m()`), `self.f().m()` and parenthesized
-              // receivers keep the bare name. Mirrored in the kernel's
-              // extract_call (rustlang.rs).
+              // Mirrored in the kernel's extract_call (rustlang.rs).
               const fieldName = getNodeText(getChildByField(receiver, 'field')!, this.source);
               calleeName = `self.${fieldName}.${methodName}`;
+            } else if (this.language === 'rust' && receiver && (rustChain = rustReceiverChain(receiver, this.source)) !== null) {
+              // Rust call on a longer chain of fields and method calls —
+              // `self.services.store.put()`, `self.store().put()`,
+              // `vis.map.get()`, split over lines by rustfmt or not (#2836).
+              // Keep the chain, calls written `name()`: the bare method name
+              // this used to emit said nothing of which value the call is
+              // made on. The resolver reads the receiver where the call is
+              // written. Parenthesized receivers, `?`, `.await` and a path's
+              // call (`Foo::new().a().b()`) keep the bare name. Mirrored in
+              // the kernel's extract_call (rustlang.rs).
+              calleeName = `${rustChain}.${methodName}`;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
@@ -4770,7 +6178,12 @@ export class TreeSitterExtractor {
                 // call_expression's first named child (a navigation_expression
                 // `Foo.getInstance`, or a bare identifier for a free/constructor call).
                 const innerNav = receiver.namedChild(0);
-                innerCallee = innerNav ? getNodeText(innerNav, this.source).replace(/\s+/g, '') : '';
+                // Swift: without a `try`/`await`/prefix operator on its left
+                // edge (`try! Foo.make().bar().baz()`).
+                const innerText = !innerNav ? ''
+                  : this.language === 'swift' ? swiftUnwrappedText(innerNav, this.source)
+                  : getNodeText(innerNav, this.source);
+                innerCallee = innerText.replace(/\s+/g, '');
                 // Only re-encode a CLASS / companion-factory / constructor chain,
                 // whose receiver chain starts with a capitalized type
                 // (`Foo.getInstance().bar()`, `Foo().bar()`). An instance chain
@@ -4780,10 +6193,16 @@ export class TreeSitterExtractor {
                 // fluent codebases. Leave those to the bare-name path.
                 reencode = /^[A-Z]/.test(innerCallee);
               } else {
-                const innerFn = getChildByField(receiver, 'function');
+                let innerFn = getChildByField(receiver, 'function');
+                // Rust: the inner call's turbofish is no part of its name either
+                // (`Foo::create::<T>().run()`, `Vec::<u8>::new().len()`).
+                if (this.language === 'rust' && innerFn?.type === 'generic_function') {
+                  innerFn = getChildByField(innerFn, 'function') ?? innerFn;
+                }
                 innerCallee = innerFn
                   ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
                   : '';
+                if (this.language === 'rust') innerCallee = stripRustTurbofish(innerCallee);
                 // Rust: only re-encode an associated-function chain
                 // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
                 // Go: only a bare package-level factory chain (`New().Method()`),
@@ -4801,6 +6220,31 @@ export class TreeSitterExtractor {
                 else reencode = !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
+            } else if (
+              this.language === 'swift' &&
+              receiver &&
+              receiver.type === 'navigation_expression' &&
+              SWIFT_TYPE_PATH_RECEIVER.test(swiftUnwrappedText(receiver, this.source).replace(/\s+/g, ''))
+            ) {
+              // Swift call through a type path — `API.PackageController.GetRoute.query(on:)`,
+              // on one line or split before the `.query`. Keep the path: the
+              // bare method name this used to emit exact-matched whichever
+              // type's `query` came first (every route in a Vapor app has one).
+              // The resolver finds the member on the type the path names, or
+              // leaves the call unresolved. An instance chain (`self.store.load()`,
+              // `viewModel.state.reset()`) is not a type path and stays bare. A
+              // prefix operator on the path's head is not part of it
+              // (`!Settings.Defaults.isOn()`). Mirrored in the kernel's
+              // extract_call (swift.rs).
+              calleeName = `${swiftUnwrappedText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (this.language === 'cfscript' && receiver && (constructed = cfmlConstructedComponent(receiver, this.source))) {
+              // CFML call on the component the receiver constructs —
+              // `createObject("component", "a.b.Batch").init()`, `new
+              // a.b.Batch().init()` (#2652). Encode `<component>().<method>`:
+              // the resolver finds the component as `new`/`extends` do and the
+              // method on it, or nothing. The bare `init` this used to emit
+              // matched whichever component's `init` came first.
+              calleeName = `${constructed}().${methodName}`;
             } else if (
               this.language === 'cfscript' &&
               receiver &&
@@ -4824,7 +6268,7 @@ export class TreeSitterExtractor {
               receiver &&
               receiver.type === 'member_expression' &&
               getChildByField(receiver, 'object')?.type === 'this' &&
-              getChildByField(receiver, 'property')?.type === 'property_identifier'
+              THIS_FIELD_PROPERTY_TYPES.has(getChildByField(receiver, 'property')?.type ?? '')
             ) {
               // TS/JS call through a field of the enclosing class —
               // `this.mailer.send()` (#1496). Keep the `this.<field>` prefix:
@@ -4837,8 +6281,22 @@ export class TreeSitterExtractor {
               // itself when the two share a name, a self-edge not in the
               // source. Same discipline as Rust's `self.<field>` (#1585).
               // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              // An ES private field (`this.#items.add()`) is the same shape;
+              // its name keeps the `#` (#1987).
               const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
               calleeName = `this.${fieldName}.${methodName}`;
+            } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              (thisSubscript = tsThisSubscriptReceiver(receiver, this.source)) !== null
+            ) {
+              // An element of a field of the enclosing class —
+              // `this.listeners[type].push()`, `this.items[0].save()` — kept
+              // as `this.<field>[].<method>`: the resolver reads the element
+              // type off the field's declaration (`Item[]`, `Record<K, V>`)
+              // or leaves it unresolved. `this['svc'].start()` is the field
+              // itself. Mirrored in the kernel's extract_call.
+              calleeName = `${thisSubscript}.${methodName}`;
             } else if (
               (this.language === 'typescript' ||
                 this.language === 'javascript' ||
@@ -4861,7 +6319,8 @@ export class TreeSitterExtractor {
               // static receiver at all — emit nothing: a silent miss, never a
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
-              const innerFn = getChildByField(receiver, 'function');
+              let innerFn = getChildByField(receiver, 'function');
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsPrefixedCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -4886,21 +6345,66 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
               isUnresolvedTsJsChain(receiver, this.source)
             ) {
-              // `holder.values.get()` has no inferred property type (#1566).
-              // Emitting bare `get` exact-matches an unrelated project method;
-              // preserving the chain alone would still allow receiver guessing.
-              // Emit nothing until the property type can be established. This
-              // also covers host chains such as `chrome.storage.local.get()`
-              // (#1707). Calls inside arguments are visited independently.
+              // Keep the source call for effect reporting, but never collapse
+              // it to a guessed method. The resolver only lets frameworks
+              // with receiver evidence handle these qualified chains.
+              const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
+              calleeName = chain;
+            } else if (TS_JS_CHAIN_LANGUAGES.has(this.language) && receiver?.type === 'new_expression') {
+              // Constructor receiver — `new Runner().run()`, `new RegExp(p).exec(s)`.
+              // The class is written at the call, so keep it: `new Runner().run`
+              // tells the resolver the receiver is an INSTANCE of `Runner`, and
+              // the method resolves on that class (or a supertype) or nowhere —
+              // a built-in or external class has no project method to bind to.
+              // The bare method name this used to emit exact-matched any
+              // same-named project method (`new RegExp(p).exec()` onto a
+              // database wrapper's `exec`). A constructor that is not a plain
+              // name or member chain (`new (f())().m()`) emits nothing.
               // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              const ctor = getChildByField(receiver, 'constructor');
+              const ctorName = ctor ? getNodeText(ctor, this.source).replace(/\s+/g, '') : '';
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(ctorName)) return;
+              // `new this.constructor().copy(this)`, a static `new this().init()`:
+              // an instance of the enclosing class, which no name is written for,
+              // keeps the bare method name, as a call on `this` does.
+              calleeName = ctorName === 'this' || ctorName === 'this.constructor' ? methodName : `new ${ctorName}().${methodName}`;
+            } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              !keepsBareTsJsReceiver(receiver, this.source)
+            ) {
+              // Any other TS/JS receiver is an expression with no static
+              // type here — `(a ?? b).map()`, `f().list.map()`,
+              // `arr[0].run()`, `this.a.b[k].run()`, `(() => {}).call()`. The bare method name this
+              // used to emit exact-matched whichever project method shared the
+              // name (`(await list()).map()` onto an adapter class's `map`).
+              // Emit nothing: a silent miss, never a wrong edge. Mirrored in
+              // the kernel's extract_call (tsjs/extractors.rs).
               return;
+            } else if (this.language === 'python' && receiver) {
+              // Any receiver shape the branches above do not claim — attribute
+              // chain (`self.data.append`) and subscript (`d[k].append`). The
+              // call-chain shape (`rows.setdefault(k, []).append(x)`) is taken
+              // by the `<inner>().<method>` branch above (#1748), which runs
+              // first. These previously fell through to a bare methodName. A
+              // bare name matching a common
+              // list/dict/str method (`append`, `get`, `update`, ...) can exact-match
+              // an unrelated top-level project function sharing that name, fabricating
+              // a call edge (#66, same class as #1230/#1276). Keep the receiver's
+              // source text as a qualifier so the ref can only resolve through
+              // import/module-member resolution, never the bare-name fallback; an
+              // unresolvable qualifier is a silent miss, never a wrong edge.
+              const receiverText = getNodeText(receiver, this.source).replace(/\s+/g, ' ').trim();
+              calleeName = receiverText ? `${receiverText}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
           }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
-          // Scoped call: Module::function()
-          calleeName = getNodeText(func, this.source);
+          // Scoped call: Module::function(); a Rust path's turbofish is no
+          // part of the name (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+          calleeName = this.language === 'rust' ? stripRustTurbofish(getNodeText(func, this.source)) : getNodeText(func, this.source);
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
           // C# member call `recv.Method(...)`. When the receiver is itself a call
           // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
@@ -4917,6 +6421,15 @@ export class TreeSitterExtractor {
           } else {
             calleeName = getNodeText(func, this.source);
           }
+        } else if (TS_JS_CHAIN_LANGUAGES.has(this.language)) {
+          // A callee that names nothing — a call, a function, a subscript —
+          // is no reference: a silent miss, never a name no symbol has. A
+          // curried call's inner call is visited on its own. Mirrored in the
+          // kernel's extract_call (tsjs/extractors.rs callee_name_of).
+          const named = tsJsCalleeName(func, this.source);
+          if (named === null) return;
+          calleeName = named.name;
+          refStart = named.at.startPosition;
         } else {
           calleeName = getNodeText(func, this.source);
         }
@@ -4976,8 +6489,8 @@ export class TreeSitterExtractor {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
+        line: refStart.row + 1,
+        column: refStart.column,
       });
     }
   }
@@ -5099,26 +6612,34 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Is this C++ `declaration` a stack/direct-initialization object construction
-   * that invokes a constructor — `Calculator calc(0)` (direct-init) or
-   * `Widget w{1, 2}` (brace-init) — as opposed to a plain variable or a
-   * function declaration? Used to emit an `instantiates` edge for the
+   * C++ stack construction — `Calculator calc(0)` / `Widget w{1, 2}` — is
    * call-less construction syntax (#1035); heap `new T(...)` is handled
    * separately by INSTANTIATION_KINDS.
    *
-   * Two signals, both required:
-   *  - the `type` field is a class-like NAMED type (`type_identifier`,
-   *    `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
-   *    `auto` (`placeholder_type_specifier` — that form always carries a real
-   *    `call_expression`, already handled), and sized specifiers are excluded —
-   *    they construct no class; and
-   *  - a declarator carries constructor arguments: an `init_declarator` whose
-   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
-   *    This skips default construction `Calculator c;` (no value) and the
-   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
-   *    a function decl — not a construction).
+   * The `type` field must be a class-like NAMED type (`type_identifier`,
+   * `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
+   * `auto` (`placeholder_type_specifier` — that form always carries a real
+   * `call_expression`, already handled), and sized specifiers are excluded —
+   * they construct no class. `extern T x;` declares, it constructs nothing.
+   *
+   * Per declarator:
+   *  - a bare `identifier` is default construction (`T item;`) — arity 0;
+   *  - an `init_declarator` whose `value` is an `argument_list` (`(args)`) or
+   *    `initializer_list` (`{args}`) carries constructor arguments — arity is
+   *    the argument count. An array declarator's braces hold ELEMENTS, not
+   *    constructor arguments, so each braced element has its own arity;
+   *  - pointer / reference / function declarators construct nothing:
+   *    `T* p{}` is a null pointer, `T& r{x}` binds a reference, and the
+   *    most-vexing-parse `T c();` is a function declaration.
+   *
+   * `instantiates` (the type) is retained for initialized declarations,
+   * preserving the #1035 dependency edges. `calls` (`T::T/arity`, resolved to
+   * the constructor by src/resolution/cpp-constructor.ts, #1839) is emitted
+   * for every declarator with an arity, default construction included.
+   * Mirrored in the kernel (ccpp/mod.rs cpp_stack_constructions).
    */
-  private isCppStackConstruction(node: SyntaxNode): boolean {
+  private cppStackConstructions(node: SyntaxNode): { instantiates: boolean; arities: number[] } {
+    const none = { instantiates: false, arities: [] };
     const typeNode = getChildByField(node, 'type');
     if (
       !typeNode ||
@@ -5126,17 +6647,59 @@ export class TreeSitterExtractor {
         typeNode.type !== 'template_type' &&
         typeNode.type !== 'qualified_identifier')
     ) {
-      return false;
+      return none;
     }
+    let instantiates = false;
+    const arities: number[] = [];
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child?.type !== 'init_declarator') continue;
+      if (!child) continue;
+      if (child.type === 'storage_class_specifier' && getNodeText(child, this.source) === 'extern') return none;
+      if (child.type === 'identifier' || child.type === 'array_declarator') {
+        if (child.type === 'array_declarator' && !this.cppObjectArray(child)) continue;
+        arities.push(0);
+        continue;
+      }
+      if (child.type !== 'init_declarator') continue;
+      const declarator = getChildByField(child, 'declarator');
+      if (declarator?.type !== 'identifier' && declarator?.type !== 'array_declarator') continue;
       const value = getChildByField(child, 'value');
-      if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
-        return true;
+      if (!value || (value.type !== 'argument_list' && value.type !== 'initializer_list')) continue;
+      instantiates = true;
+      if (declarator.type === 'identifier') {
+        arities.push(value.namedChildren.filter((c) => c.type !== 'comment').length);
+      } else if (this.cppObjectArray(declarator)) {
+        const dimensions: number[] = [];
+        let array: SyntaxNode | null = declarator;
+        while (array?.type === 'array_declarator') {
+          const size = getChildByField(array, 'size')?.text ?? '';
+          dimensions.unshift(/^\d+$/.test(size) && Number.isSafeInteger(Number(size)) ? Number(size) : NaN);
+          array = getChildByField(array, 'declarator');
+        }
+        const elements = (list: SyntaxNode, depth: number): void => {
+          const entries = list.namedChildren.filter((c) => c.type !== 'comment');
+          let elided = false;
+          for (const entry of entries) {
+            if (depth + 1 < dimensions.length) {
+              if (entry.type === 'initializer_list') elements(entry, depth + 1);
+              else elided = true; // Unbraced multidimensional layout needs type information.
+            } else {
+              arities.push(entry.type === 'initializer_list'
+                ? entry.namedChildren.filter((c) => c.type !== 'comment').length : 1);
+            }
+          }
+          if (!elided && (entries.length === 0 || dimensions[depth]! > entries.length)) arities.push(0);
+        };
+        elements(value, 0);
       }
     }
-    return false;
+    return { instantiates, arities };
+  }
+
+  private cppObjectArray(node: SyntaxNode): boolean {
+    let element = getChildByField(node, 'declarator');
+    while (element?.type === 'array_declarator') element = getChildByField(element, 'declarator');
+    return element?.type === 'identifier';
   }
 
   /**
@@ -5149,7 +6712,7 @@ export class TreeSitterExtractor {
    * where types are Capitalized by convention, and skipped when the access is a
    * call's callee (the call extractor already links the method).
    */
-  private extractStaticMemberRef(node: SyntaxNode): void {
+  private extractStaticMemberRef(node: SyntaxNode, knownParent?: SyntaxNode): void {
     if (!STATIC_MEMBER_LANGS.has(this.language)) return;
     if (this.nodeStack.length === 0) return;
     const ownerId = this.nodeStack[this.nodeStack.length - 1];
@@ -5161,10 +6724,48 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
-      const prev = node.previousNamedSibling;
+      const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
+        // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
+        // argument, which the body walker references as a type.
+        const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
+        if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
       }
+      return;
+    }
+
+    // Rust writes an enum variant as a path: read (`Mode::A`, `mode::Mode::B`,
+    // `xs.map(Mode::C)`), matched (`Mode::C(x) =>`, `Mode::D { .. } =>`), or
+    // `Self::A` in an impl (#2328). The receiver — the segment before the
+    // member — is referenced where it is written, so a `mode::` / `other::`
+    // prefix scopes it as it scopes a type annotation, and the resolver keeps it
+    // only on an enum that declares the member (an associated const read the
+    // same way, `Limits::MAX`, links nothing). A lowercase receiver is a module
+    // and a lowercase member a function (`util::take`, `Foo::new`); a call's
+    // callee (`Mode::C(1)`) and a struct literal's name are already linked to
+    // their member; the prefix of a longer path and a `use` tree name no member.
+    // Mirrored by the native kernel's `extract_static_member_ref` — change both.
+    if (this.language === 'rust') {
+      if (node.type !== 'scoped_identifier' && node.type !== 'scoped_type_identifier') return;
+      // Looked up only at a body's root (a `const X: M = M::A;` value).
+      const parent = knownParent ?? node.parent;
+      if (!parent) return;
+      if (node.type === 'scoped_type_identifier' ? parent.type !== 'struct_pattern'
+        : RUST_NON_MEMBER_PATH_PARENTS.has(parent.type)) return;
+      if (parent.type === 'call_expression' && getChildByField(parent, 'function')?.startIndex === node.startIndex) return;
+      const member = getChildByField(node, 'name');
+      let recv = getChildByField(node, 'path');
+      if (recv?.type === 'scoped_identifier') recv = getChildByField(recv, 'name');
+      if (!member || recv?.type !== 'identifier' || !/^[A-Z]/.test(getNodeText(member, this.source))) return;
+      let text = getNodeText(recv, this.source);
+      if (text === 'Self') text = this.extractor!.getReceiverType?.(node, this.source) ?? '';
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
+      return;
+    }
+
+    if (this.language === 'vbnet') {
+      this.extractVbMemberRead(node, knownParent, ownerId);
       return;
     }
 
@@ -5183,12 +6784,15 @@ export class TreeSitterExtractor {
     // The receiver must be a SIMPLE capitalized identifier — `Type.X`, not the
     // nested `a.B.c` (whose own head member-access is visited separately) nor a
     // lowercase `obj.field` / `pkg.func`.
-    const recv =
+    const rawRecv =
       getChildByField(node, 'object') ??
       getChildByField(node, 'expression') ??
       getChildByField(node, 'scope') ??
       node.namedChild(0);
-    if (!recv) return;
+    if (!rawRecv) return;
+    // Swift binds a prefix operator to the head: `!Config.shared.isOn` is
+    // `(!Config).shared.isOn`. Mirrored in the kernel (swift.rs).
+    const recv = this.language === 'swift' ? peelSwiftCallWrappers(rawRecv, this.source) : rawRecv;
     const t = recv.type;
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
@@ -5207,6 +6811,131 @@ export class TreeSitterExtractor {
       line: node.startPosition.row + 1,
       column: node.startPosition.column,
     });
+  }
+
+  /**
+   * VB.NET: a value read or write through a receiver — `AppSession.SessionId`,
+   * `AppSession.CurrentUser = "demo"`, `x.Normal = 3`, `Me._h.Title`, `.Value`
+   * in a `With` block, `.Switch` in `New BoolParam With {.Switch = "--x"}` —
+   * is a use of the member, and through a type name of the type (#2305). One
+   * `references` ref carries the member with its receiver as a path:
+   * `x.Normal`, `Me._h.Title`, or `{T}.Switch` for a value whose type the code
+   * writes (a cast's, a `New`'s). The resolver decides what the receiver is —
+   * a project type, or a value of the type it is declared as — which only it
+   * can tell in case-insensitive VB.NET (see vbnet-receivers'
+   * matchVbMemberRead). A call through the access is the call extractor's.
+   */
+  private extractVbMemberRead(node: SyntaxNode, knownParent: SyntaxNode | undefined, ownerId: string): void {
+    let receiver: string | null;
+    let member: SyntaxNode | null;
+    if (node.type === 'member_access_expression') {
+      member = getChildByField(node, 'member');
+      const object = getChildByField(node, 'object');
+      receiver = object && !this.isVbSplitNew(object) ? this.vbReceiverPath(object) : null;
+    } else if (node.type === 'with_member_access_expression') {
+      member = node.namedChild(0);
+      const target = this.vbWithTarget(node);
+      receiver = target ? this.vbReceiverPath(target) : null;
+    } else if (node.type === 'member_initializer') {
+      member = getChildByField(node, 'name');
+      const creation = (knownParent ?? node.parent)?.parent;
+      receiver = creation?.type === 'object_creation_expression' ? this.vbReceiverPath(creation) : null;
+    } else return;
+    if (!receiver || member?.type !== 'identifier' || VB_NON_TYPE_RECEIVERS.test(receiver.split('.')[0]!)) return;
+    // `x.Method()`: the access is the callee of a call, which the call extractor links.
+    const parent = node.type === 'member_initializer' ? null : knownParent ?? node.parent;
+    if (parent && this.extractor!.callTypes.includes(parent.type)) {
+      const callee = getChildByField(parent, 'function') ?? getChildByField(parent, 'method') ?? parent.namedChild(0);
+      if (callee && callee.startIndex === node.startIndex) return;
+    }
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: `${receiver}.${getNodeText(member, this.source)}`,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /**
+   * A VB.NET receiver as the resolver reads it: a name, `Me` / `MyClass` /
+   * `MyBase`, a member of one (`Me._h`, `user.Settings`), a `With` block's
+   * `.Inner`, or `{T}` for a value whose type the code writes there
+   * (`DirectCast(o, T)`, `New T(…)`). Null for anything else — an index, a
+   * call's result, a built-in type — which no declaration here types.
+   */
+  private vbReceiverPath(node: SyntaxNode, depth = 0): string | null {
+    if (depth > 6) return null;
+    switch (node.type) {
+      case 'identifier':
+        return getNodeText(node, this.source);
+      case 'me_expression':
+        return 'Me';
+      case 'myclass_expression':
+        return 'MyClass';
+      case 'mybase_expression':
+        return 'MyBase';
+      case 'parenthesized_expression': {
+        const inner = node.namedChild(0);
+        return inner ? this.vbReceiverPath(inner, depth + 1) : null;
+      }
+      case 'member_access_expression':
+      case 'with_member_access_expression': {
+        const through = node.type === 'member_access_expression';
+        const member = through ? getChildByField(node, 'member') : node.namedChild(0);
+        if (member?.type !== 'identifier') return null;
+        const object = through ? getChildByField(node, 'object') : this.vbWithTarget(node);
+        if (through && object && this.isVbSplitNew(object)) return null;
+        const head = object ? this.vbReceiverPath(object, depth + 1) : null;
+        return head ? `${head}.${getNodeText(member, this.source)}` : null;
+      }
+      case 'cast_expression':
+      case 'object_creation_expression': {
+        let type = getChildByField(node, 'type');
+        // `New T()` parses as an array type whose rank is the constructor's empty parentheses.
+        if (node.type === 'object_creation_expression' && type?.type === 'array_type') {
+          const rank = type.namedChildren.find((c: SyntaxNode) => c.type === 'array_rank_specifier');
+          type = rank && /^\(\s*\)$/.test(getNodeText(rank, this.source)) ? getChildByField(type, 'element_type') : null;
+        }
+        if (!type || type.type === 'predefined_type' || type.type === 'array_type') return null;
+        const written = getNodeText(type, this.source).replace(/\s+/g, ' ');
+        // .NET's own types (`System.Drawing.Point`) are never the project's.
+        return /^(?:System|Microsoft|My)\./i.test(written) ? null : `{${written}}`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Whether `node`, a member access's object, is `New System` of `New
+   * System.Drawing.Size(…)` or `New Ns` of `New Ns.Holder`: the grammar reads
+   * a qualified type after `New` as members read through a `New` of its first
+   * name. A value's `New` has its parentheses (`New Holder().Normal`).
+   */
+  private isVbSplitNew(node: SyntaxNode): boolean {
+    return node.type === 'object_creation_expression' && !getChildByField(node, 'arguments') &&
+      !getChildByField(node, 'initializer') && getChildByField(node, 'type')?.type !== 'array_type';
+  }
+
+  /**
+   * What a VB.NET `.Member` is read through: the expression of the `With`
+   * block it is in (a nested block's own `With .Inner` is read through the
+   * block around it), or the object an initializer sets up (`New T With {.X =
+   * 1}`). Null in an anonymous type's `New With {.X = 1}`, which declares X.
+   */
+  private vbWithTarget(node: SyntaxNode): SyntaxNode | null {
+    let child = node;
+    for (let p = node.parent; p; child = p, p = p.parent) {
+      if (p.type === 'with_statement') {
+        const expression = getChildByField(p, 'expression');
+        if (expression && expression.startIndex === child.startIndex && expression.endIndex === child.endIndex) continue;
+        return expression;
+      }
+      if (p.type === 'object_initializer') return p.parent?.type === 'object_creation_expression' ? p.parent : null;
+      if (p.type === 'anonymous_object_creation_expression') return null;
+    }
+    return null;
   }
 
   /**
@@ -5297,6 +7026,21 @@ export class TreeSitterExtractor {
    * (most non-decorator-using languages), the function is a no-op.
    */
   private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+    // Rust outer attributes are siblings, not children of the function.
+    // Preserve Tauri's runtime registration for the dead-code decorator rule.
+    if (this.language === 'rust' && declNode.type === 'function_item') {
+      for (let sibling = declNode.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+        if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
+        if (sibling.type !== 'attribute_item') break;
+        const attribute = sibling.namedChild(0);
+        const name = attribute?.namedChild(0)?.text.replace(/\s/g, '');
+        if (name === 'tauri::command') {
+          const decorated = this.nodes.find(n => n.id === decoratedId);
+          if (decorated) decorated.decorators = ['tauri::command'];
+          break;
+        }
+      }
+    }
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
       // Solidity `modifier_invocation` (unique to that grammar) sits
@@ -5401,9 +7145,16 @@ export class TreeSitterExtractor {
     //    wrapper objects from `parent`/`namedChild` navigation, so
     //    `sibling === declNode` is unreliable — `startIndex` does
     //    the matching instead.
-    const parent = declNode.parent;
+    //
+    //    A grammar that wraps the declaration (Dart's `declaration`
+    //    around a member with no body) puts the annotations before the
+    //    wrapper, so the scan starts there. One that lets comments sit
+    //    between the annotations and the declaration (Dart) steps over them.
+    const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
+    const stepOver = this.extractor?.decoratorStepOverTypes;
+    const parent = anchor.parent;
     if (parent) {
-      const declStart = declNode.startIndex;
+      const declStart = anchor.startIndex;
       let declIdx = -1;
       for (let i = 0; i < parent.namedChildCount; i++) {
         const sibling = parent.namedChild(i);
@@ -5416,6 +7167,7 @@ export class TreeSitterExtractor {
         for (let j = declIdx - 1; j >= 0; j--) {
           const sibling = parent.namedChild(j);
           if (!sibling) continue;
+          if (stepOver?.includes(sibling.type)) continue;
           if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
             break; // non-decorator separator → stop consuming
           }
@@ -5607,11 +7359,84 @@ export class TreeSitterExtractor {
     return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
   }
 
+  /**
+   * The declarator name for an anonymous function passed to a CURRIED wrapper
+   * call — `const NAME = factory(...)(function () {…})` — or the property key
+   * when the call is an object member, `{ NAME: factory(...)(fn) }`; else null.
+   *
+   * `reactHookBoundName` above already names a function through the declarator
+   * that binds it; the shape is general, but that method is deliberately
+   * bounded to the three React handler hooks. This is the same shape with a
+   * different, equally decidable bound: the callee is itself a call, i.e. a
+   * factory that returns the wrapper (#1747).
+   *
+   * Requiring the callee to be a call is what keeps this narrow. It admits
+   * `Effect.fn("Session.run")(function* () {…})`, `connect(mapState)(fn)` and
+   * a project's own `wrap("name")(fn)`, and it does not admit the one-call
+   * forms where the argument is a computation rather than a body worth a node
+   * of its own — `useMemo(() => 1 + 1, [])`, `arr.map(() => …)` — which stay
+   * anonymous exactly as before.
+   *
+   * Generators are included here and not in `reactHookBoundName`: a React
+   * handler is never a generator, while `function*` is the common form in the
+   * ecosystem this shape comes from.
+   */
+  private curriedWrapperBoundName(node: SyntaxNode): string | null {
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'javascript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'jsx'
+    ) {
+      return null;
+    }
+    if (
+      node.type !== 'arrow_function' &&
+      node.type !== 'function_expression' &&
+      node.type !== 'generator_function'
+    ) {
+      return null;
+    }
+    const args = node.parent;
+    if (!args || args.type !== 'arguments') return null;
+    const first = args.namedChild(0);
+    if (!first || first.startIndex !== node.startIndex || first.endIndex !== node.endIndex) return null;
+    const call = args.parent;
+    if (!call || call.type !== 'call_expression') return null;
+    // The bound that replaces the hook allowlist: the thing being called is
+    // itself a call, so this is the second application of a curried wrapper.
+    const callee = getChildByField(call, 'function');
+    if (!callee || callee.type !== 'call_expression') return null;
+    const binder = call.parent;
+    if (!binder) return null;
+    // `{ getMode: Effect.fn("…")(function* () {…}) }` — a service is often an
+    // object a factory returns, so the wrapper's result lands in a `pair`. The
+    // property key names it, as extractObjectLiteralFunctions names
+    // `key: () => {}`.
+    if (binder.type === 'pair') {
+      const key = getChildByField(binder, 'key');
+      const value = getChildByField(binder, 'value');
+      if (!key || !value || value.startIndex !== call.startIndex || value.endIndex !== call.endIndex) return null;
+      return this.objectKeyName(key);
+    }
+    if (binder.type !== 'variable_declarator') return null;
+    const nameNode = getChildByField(binder, 'name');
+    return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
+  }
+
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
-    const visitForCallsAndStructure = (node: SyntaxNode): void => {
+    // `parent` is handed down by the walk (absent at the body's root): reading
+    // `node.parent` walks down from the tree's root on every call.
+    const visitForCallsAndStructure = (node: SyntaxNode, parent?: SyntaxNode): void => {
       const nodeType = node.type;
+
+      // A function-like macro defined inside a body is still a macro (#1838).
+      if ((this.language === 'c' || this.language === 'cpp') && nodeType === 'preproc_function_def') {
+        this.visitNode(node);
+        return;
+      }
 
       // Bash: the body walker is the ONLY path into function bodies (the main
       // visitNode walker stops at function_definitions), and both commands and
@@ -5630,9 +7455,20 @@ export class TreeSitterExtractor {
       // not in visitNode, so the capture hook must fire in both walkers.
       this.maybeCaptureFnRefs(node, nodeType);
 
+      // A named object literal in a body — an IIFE's `const App = {…}`, a
+      // handler map in a function — owns its function members as one at
+      // module scope does, and so does `window.App = {…}` written in here
+      // (#2300). Each handles its whole subtree.
+      if (nodeType === 'variable_declarator' && this.extractLocalObjectOwner(node)) return;
+      if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, false)) return;
+
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
+
+      // A CFML `include "x.cfm";` in a function body includes the template
+      // there, as it does at component scope (#2651).
+      if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
@@ -5650,6 +7486,8 @@ export class TreeSitterExtractor {
           this.extractAnonymousClass(node, anonBody);
           return;
         }
+      } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+        this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
@@ -5675,8 +7513,29 @@ export class TreeSitterExtractor {
       // (which strips template args / namespace and emits the `instantiates`
       // ref). Children still recurse below, so a nested ctor-arg call
       // (`Calculator calc(make())`) keeps its own `calls` ref.
-      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
-        this.extractInstantiation(node);
+      if (nodeType === 'declaration' && this.language === 'cpp') {
+        const { instantiates, arities } = this.cppStackConstructions(node);
+        if (instantiates) this.extractInstantiation(node);
+        // One `calls` ref per constructed object, naming the constructor and
+        // its argument count (`ns::T::T/1`) so the resolver can pick the
+        // overload — a type is not a callee (#1839).
+        const callerId = this.nodeStack[this.nodeStack.length - 1];
+        const typeNode = getChildByField(node, 'type');
+        if (callerId && typeNode && arities.length) {
+          const className = stripCppTemplateArgs(getNodeText(typeNode, this.source));
+          const name = className.split('::').filter(Boolean).pop();
+          if (name) {
+            for (const arity of arities) {
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: `${className}::${name}/${arity}`,
+                referenceKind: 'calls',
+                line: node.startPosition.row + 1,
+                column: node.startPosition.column,
+              });
+            }
+          }
+        }
       }
 
       // C++ local function-pointer bindings (see cppLocalFnPtrs): record
@@ -5709,7 +7568,45 @@ export class TreeSitterExtractor {
       }
 
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
-      this.extractStaticMemberRef(node);
+      this.extractStaticMemberRef(node, parent);
+
+      // A member read that may run code — Dart's `x.area` calls the getter
+      // `area` (#2338). The resolver links it to a getter, as a call, or to
+      // nothing: a plain field read stays a reference that names no symbol.
+      const read = this.extractor!.extractMemberRead?.(node, parent);
+      if (read) {
+        const readerId = this.nodeStack[this.nodeStack.length - 1];
+        if (readerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: readerId,
+            referenceName: read.name,
+            referenceKind: 'references',
+            line: read.node.startPosition.row + 1,
+            column: read.node.startPosition.column,
+          });
+        }
+      }
+
+      // A type a Dart body names — a local's declared type, a generic argument
+      // (`Future<Report?>.value(null)`, `context.read<Report>()`, and
+      // `ref.read<Report>(p)` when the grammar read that call as comparisons),
+      // a cast, a type test — is the function's dependency, as a TS local's
+      // annotation is just below (#2327).
+      if (this.language === 'dart') {
+        const typeNode = nodeType === 'type_identifier' ? node
+          : nodeType === 'relational_operator' ? dartMisparsedGenericCall(node)?.typeName
+          : undefined;
+        const ownerId = this.nodeStack[this.nodeStack.length - 1];
+        if (typeNode && ownerId && isDartTypeName(typeNode)) {
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: getNodeText(typeNode, this.source),
+            referenceKind: 'references',
+            line: typeNode.startPosition.row + 1,
+            column: typeNode.startPosition.column,
+          });
+        }
+      }
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
       // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for
@@ -5757,6 +7654,16 @@ export class TreeSitterExtractor {
           this.extractFunction(node, hookBound);
           return;
         }
+        // `const run = Effect.fn("Session.run")(function* () {…})` (#1747) —
+        // the same declarator binding through a curried wrapper. Without a node
+        // the body's calls attribute to the enclosing container, so the file or
+        // the outer function picks up an outgoing edge that belongs to this
+        // function and the callee's caller list names the wrong thing.
+        const wrapperBound = this.curriedWrapperBoundName(node);
+        if (wrapperBound) {
+          this.extractFunction(node, wrapperBound);
+          return;
+        }
         // `const handleClear = () => {…}` inside a body (#1669) — the same
         // binding that names a function at module scope names one here, and in
         // a React component it is how every handler that skips `useCallback`
@@ -5773,12 +7680,13 @@ export class TreeSitterExtractor {
 
       // Extract structural nodes found inside function bodies.
       // Each extract method visits its own children, so we return after extracting.
-      if (this.extractor!.classTypes.includes(nodeType)) {
+      if (this.isClassTypeNode(node, nodeType)) {
         const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
         if (classification === 'struct') this.extractStruct(node);
         else if (classification === 'enum') this.extractEnum(node);
         else if (classification === 'interface') this.extractInterface(node);
         else if (classification === 'trait') this.extractClass(node, 'trait');
+        else if (classification === 'module') this.extractClass(node, 'module');
         else this.extractClass(node);
         return;
       }
@@ -5802,7 +7710,7 @@ export class TreeSitterExtractor {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child) {
-          visitForCallsAndStructure(child);
+          visitForCallsAndStructure(child, node);
         }
       }
     };
@@ -5850,10 +7758,38 @@ export class TreeSitterExtractor {
       return;
     }
 
+    // Dart: the type an extension is `on` is one it depends on — `extension
+    // ReportX on Report`, `on List<Report>` (#2327). Not a supertype: a
+    // `references` edge, as a C# extension method's `this Report r` gets.
+    if (this.language === 'dart' && node.type === 'extension_declaration') {
+      for (const onType of node.childrenForFieldName('class')) {
+        if (onType) pushDartTypeRefs(onType, classId, (ref) => this.unresolvedReferences.push(ref));
+      }
+    }
+
     // Look for extends/implements clauses
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
+
+      // Dart: `class A = B with M implements I;` keeps its supertypes in a
+      // `mixin_application` — the same shapes as a class body's clauses.
+      if (this.language === 'dart' && child.type === 'mixin_application_class') {
+        const application = child.namedChildren.find((c: SyntaxNode) => c.type === 'mixin_application');
+        for (const t of application?.namedChildren ?? []) {
+          const targets = t.type === 'type_identifier' ? [t] : t.type === 'mixins' ? t.namedChildren.filter((m: SyntaxNode) => m.type === 'type_identifier') : t.type === 'interfaces' ? t.namedChildren : [];
+          for (const target of targets) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(target, this.source),
+              referenceKind: t.type === 'type_identifier' ? 'extends' : 'implements',
+              line: target.startPosition.row + 1,
+              column: target.startPosition.column,
+            });
+          }
+        }
+        continue;
+      }
 
       if (
         child.type === 'extends_clause' ||
@@ -5922,7 +7858,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
         for (const target of targets) {
           if (target) {
-            const name = getNodeText(target, this.source);
+            const name = supertypeName(target, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -5931,6 +7867,24 @@ export class TreeSitterExtractor {
               column: target.startPosition.column,
             });
           }
+        }
+      }
+
+      // TypeScript: `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+      // supertype is a `type` of the extends_type_clause. A parameterized one
+      // (`generic_type`) is named by its `name` field: the index holds `Store`,
+      // never `Store<T>`.
+      if (child.type === 'extends_type_clause') {
+        for (const target of child.childrenForFieldName('type')) {
+          if (!target) continue;
+          const named = target.type === 'generic_type' ? getChildByField(target, 'name') ?? target : target;
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(named, this.source),
+            referenceKind: 'extends',
+            line: target.startPosition.row + 1,
+            column: target.startPosition.column,
+          });
         }
       }
 
@@ -5971,7 +7925,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : child.namedChildren;
         for (const iface of targets) {
           if (iface) {
-            const name = getNodeText(iface, this.source);
+            const name = supertypeName(iface, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -6000,15 +7954,18 @@ export class TreeSitterExtractor {
         }
       }
 
-      // Go interface embedding: `type Querier interface { LabelQuerier; ... }`
-      // constraint_elem wraps the embedded interface type identifier
-      if (child.type === 'constraint_elem') {
-        const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      // Go interface embedding: `type IRouter interface { IRoutes; Group(…) }`.
+      // tree-sitter-go parses every element of an interface that is not a
+      // method as a `type_elem`; one holding a single named type embeds that
+      // interface. A union (`float32 | float64`), an underlying type (`~int`)
+      // or a lone basic type (`int64`) is a type-set constraint instead.
+      if (this.language === 'go' && child.type === 'type_elem') {
+        const terms = child.namedChildren.filter((c: SyntaxNode) => c.type !== 'comment');
+        const typeId = terms.length === 1 ? goEmbeddedTypeName(terms[0], this.source) : undefined;
         if (typeId) {
-          const name = getNodeText(typeId, this.source);
           this.unresolvedReferences.push({
             fromNodeId: classId,
-            referenceName: name,
+            referenceName: getNodeText(typeId, this.source),
             referenceKind: 'extends',
             line: typeId.startPosition.row + 1,
             column: typeId.startPosition.column,
@@ -6017,21 +7974,23 @@ export class TreeSitterExtractor {
       }
 
       // Go struct embedding: field_declaration without field_identifier
-      // e.g. `type DB struct { *Head; Queryable }` — no field name means embedded type
-      if (child.type === 'field_declaration') {
+      // e.g. `type DB struct { *Head; Queryable; sync.Mutex }` — no field name
+      // means an embedded type, read the way an interface's is.
+      // Go only: C, C++ and Objective-C members are field_declarations too, but
+      // nest their name inside the declarator (`Cache* cache_;`, `jv elems[];`,
+      // `Status Get(int);`), so this test read every such member's type as a
+      // supertype. Their supertypes come from base_class_clause / superclass.
+      if (this.language === 'go' && child.type === 'field_declaration') {
         const hasFieldIdentifier = child.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier');
-        if (!hasFieldIdentifier) {
-          const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-          if (typeId) {
-            const name = getNodeText(typeId, this.source);
-            this.unresolvedReferences.push({
-              fromNodeId: classId,
-              referenceName: name,
-              referenceKind: 'extends',
-              line: typeId.startPosition.row + 1,
-              column: typeId.startPosition.column,
-            });
-          }
+        const typeId = hasFieldIdentifier ? undefined : goEmbeddedTypeName(getChildByField(child, 'type'), this.source);
+        if (typeId) {
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(typeId, this.source),
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
         }
       }
 
@@ -6272,21 +8231,7 @@ export class TreeSitterExtractor {
   /**
    * Built-in/primitive type names that shouldn't create references
    */
-  private readonly BUILTIN_TYPES = new Set([
-    'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
-    'object', 'symbol', 'bigint', 'true', 'false',
-    // Rust
-    'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
-    'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
-    // Java/C#
-    'int', 'long', 'short', 'byte', 'float', 'double', 'char',
-    // Go
-    'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
-    'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
-    // Scala (capitalized primitives + ubiquitous stdlib aliases)
-    'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
-    'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
-  ]);
+  private readonly BUILTIN_TYPES = BUILTIN_TYPE_NAMES;
 
   /**
    * Extract type references from type annotations on a function/method/field node.
@@ -6334,6 +8279,18 @@ export class TreeSitterExtractor {
             c.type === 'constructor_signature' ||
             c.type === 'factory_constructor_signature'
         ) ?? node;
+      }
+      // A redirecting factory names the class it constructs after `=`, then
+      // perhaps that class's constructor (`= _$QuestionImpl.fromJson`, which
+      // parses as two type_identifiers). Neither the constructor nor an import
+      // prefix is a type, and Dart writes types UpperCamel.
+      if (sig.type === 'redirecting_factory_constructor_signature') {
+        for (const child of sig.namedChildren) {
+          if (child.type !== 'type_identifier' || /^[_$]*[A-Z]/.test(child.text)) {
+            this.extractTypeRefsFromSubtree(child, nodeId);
+          }
+        }
+        return;
       }
       this.extractTypeRefsFromSubtree(sig, nodeId);
       return;
@@ -6748,9 +8705,19 @@ export class TreeSitterExtractor {
       return true;
     }
 
-    // block (begin..end) → visit for calls
-    if (nodeType === 'block') {
-      this.visitPascalBlock(node);
+    // block (begin..end) → visit for calls. Outside a routine — a program's
+    // main block, `initialization` and `finalization` — the names in it are
+    // the unit's (#2514). Where the tree has errors, a block outside a routine
+    // (a `blockTr` there) may be the body of one whose header didn't parse;
+    // the source text says whose it is.
+    if (nodeType === 'block' || nodeType === 'blockTr' || nodeType === 'initialization' || nodeType === 'finalization') {
+      const outside = this.pascalScopes.length === 0;
+      if (outside) {
+        this.pascalScopes.push({ locals: new Map([['result', null]]), classQn: null, routine: null, startLine: 0 });
+      }
+      // A `blockTr` may also hold declarations, which are walked as they always were.
+      this.visitPascalBlock(node, nodeType === 'blockTr');
+      if (outside) this.pascalScopes.pop();
       return true;
     }
 
@@ -6952,7 +8919,7 @@ export class TreeSitterExtractor {
     // free routines, so there's no duplicate.
     if (!parentId && !fullName.includes('.')) {
       const fnNode = this.createNode('function', fullName, declProc, {
-        signature: this.extractor?.getSignature?.(declProc, this.source),
+        signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
       if (fnNode) {
@@ -6965,21 +8932,162 @@ export class TreeSitterExtractor {
     if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
-    // Visit the block for calls
-    const block = node.namedChildren.find(
-      (c: SyntaxNode) => c.type === 'block'
-    );
-    if (block) {
-      this.nodeStack.push(parentId);
-      this.visitPascalBlock(block);
-      this.nodeStack.pop();
+    // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
+    // with their constraints (`TList<T: class>`).
+    const owner = fullName.includes('.') ? fullName.replace(/<[^>]*>/g, '').split('.').slice(0, -1).join('::') : null;
+    const routineId = parentId;
+    // What a routine nested in this one is qualified under: the routine's
+    // node, or its name as written when the implementation matched none.
+    const qualifiedName = (): string => {
+      const routine = this.nodes.find((n) => n.id === routineId);
+      return routine && routine.kind !== 'file' ? routine.qualifiedName : fullName.replace(/<[^>]*>/g, '').split('.').join('::');
+    };
+    this.walkPascalRoutine(node, routineId, owner, shortNameKey.replace(/<.*$/, ''), qualifiedName);
+  }
+
+  /**
+   * A routine's declarations and body, walked for its calls with the routine
+   * as their caller. A routine nested in it (`procedure Inner;` between its
+   * header and `begin`) is a function of its own, qualified under it
+   * (`TFoo::Bar::Inner`), whose calls are its own; it sees the names the
+   * routine declares above it, as the routine's body sees them all.
+   */
+  private walkPascalRoutine(node: SyntaxNode, routineId: string, classQn: string | null, routine: string, qualifiedName: () => string): void {
+    const locals = this.pascalRoutineLocals(node, true);
+    this.pascalScopes.push({ locals, classQn, routine, startLine: node.startPosition.row + 1 });
+    this.nodeStack.push(routineId);
+    let block: SyntaxNode | null = null;
+    const misplaced: SyntaxNode[] = [];
+    const broken = node.hasError;
+    for (const c of node.namedChildren) {
+      if (c.type === 'declVars' || c.type === 'declConsts') {
+        for (const decl of c.namedChildren) this.declarePascalLocal(locals, decl);
+      } else if (c.type === 'defProc') {
+        // A nested routine comes before the body. Where the routine's tree
+        // has errors, its parse can swallow the unit's routines after it,
+        // which start their lines where it does: those are the unit's.
+        if (block || (broken && c.startPosition.column <= node.startPosition.column)) misplaced.push(c);
+        else this.extractPascalNestedRoutine(c, classQn, qualifiedName());
+      } else if (c.type === 'block' && !block) {
+        // The first: `{$IFDEF}`s around two bodies leave a second.
+        block = c;
+      }
+    }
+    if (block) this.visitPascalBlock(block);
+    this.nodeStack.pop();
+    this.pascalScopes.pop();
+    for (const c of misplaced) this.extractPascalDefProc(c);
+  }
+
+  /** A routine nested in another (see walkPascalRoutine), under the qualified name of the one it is nested in. */
+  private extractPascalNestedRoutine(node: SyntaxNode, classQn: string | null, outerQualifiedName: string): void {
+    const declProc = node.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+    const nameNode = declProc ? getChildByField(declProc, 'name') : null;
+    if (!declProc || nameNode?.type !== 'identifier') return;
+    const name = getNodeText(nameNode, this.source);
+    const qualifiedName = `${outerQualifiedName}::${name}`;
+    const fn = this.createNode('function', name, node, {
+      qualifiedName,
+      signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
+    });
+    if (!fn) return;
+    this.walkPascalRoutine(node, fn.id, classQn, name.toLowerCase(), () => qualifiedName);
+  }
+
+  /**
+   * The names a routine (a `defProc`) or an anonymous method (a `lambda`)
+   * declares before its body, lowercased, with the class or record type each
+   * is declared with (null when it has none, or none a name can stand for):
+   * parameters, `var`/`const` sections and `Result` (with `headerOnly`, the
+   * parameters and `Result`; walkPascalRoutine adds the sections in order).
+   * The body's inline declarations join as the walk reaches them
+   * (`declarePascalInline`). A bare name among them is the routine's own,
+   * never a call. A nested routine's name is not: it is a routine to call.
+   */
+  private pascalRoutineLocals(routine: SyntaxNode, headerOnly = false): Map<string, string | null> {
+    const names = new Map<string, string | null>();
+    const header = routine.type === 'lambda' ? routine : routine.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+    names.set('result', this.pascalTypeName(header?.namedChildren.find((c: SyntaxNode) => c.type === 'typeref')));
+    const args = header?.namedChildren.find((c: SyntaxNode) => c.type === 'declArgs');
+    for (const arg of args?.namedChildren ?? []) {
+      if (arg.type === 'declArg') this.declarePascalLocal(names, arg);
+    }
+    if (headerOnly) return names;
+    for (const c of routine.namedChildren) {
+      if (c.type === 'declVars' || c.type === 'declConsts') {
+        for (const decl of c.namedChildren) this.declarePascalLocal(names, decl);
+      }
+    }
+    return names;
+  }
+
+  /** The names a parameter, `var` or `const` declaration declares, with the type it gives them (see pascalRoutineLocals). */
+  private declarePascalLocal(names: Map<string, string | null>, decl: SyntaxNode): void {
+    const type = this.pascalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
+    for (const c of decl.namedChildren) {
+      if (c.type === 'identifier') names.set(getNodeText(c, this.source).toLowerCase(), type);
     }
   }
 
   /**
-   * Extract function calls from a Pascal expression
+   * A name a routine's body declares where it stands — an inline `var`, a
+   * `for` or `for … in` loop's variable, an `on E: EFoo do` handler's — joins
+   * the routine's locals before the code that uses it is walked.
    */
-  private extractPascalCall(node: SyntaxNode): void {
+  private declarePascalInline(node: SyntaxNode): void {
+    const locals = this.pascalScopes[this.pascalScopes.length - 1]?.locals;
+    if (!locals) return;
+    const declare = (id: SyntaxNode | null | undefined, type: string | null): void => {
+      if (id?.type !== 'identifier') return;
+      const name = getNodeText(id, this.source).toLowerCase();
+      // A loop over a variable the `var` section declares keeps its type.
+      if (type !== null || !locals.has(name)) locals.set(name, type);
+    };
+    switch (node.type) {
+      case 'varAssignDef':
+      case 'varDef': {
+        let type = this.pascalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref' || c.type === 'type'));
+        const value = node.parent?.type === 'assignment' ? node.parent.namedChild(node.parent.namedChildCount - 1) : null;
+        if (!type && value?.type === 'exprDot') {
+          // `var List := TStringList.Create;`
+          const [cls, ctor] = [value.namedChild(0), value.namedChild(value.namedChildCount - 1)];
+          if (cls?.type === 'identifier' && ctor?.type === 'identifier' && /^create$/i.test(getNodeText(ctor, this.source))) {
+            type = getNodeText(cls, this.source);
+          }
+        }
+        declare(node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier'), type);
+        return;
+      }
+      case 'foreach':
+        declare(getChildByField(node, 'iterator'), null);
+        return;
+      case 'for':
+        declare(node.namedChildren.find((c: SyntaxNode) => c.type === 'assignment')?.namedChild(0), null);
+        return;
+      case 'exceptionHandler':
+        declare(getChildByField(node, 'variable'), this.pascalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref')));
+        return;
+    }
+  }
+
+  /** The class or record name a declared type (`type`/`typeref`) stands for: `TFoo`, `Sys.TFoo` → `TFoo`, `TList<T>` → `TList`. */
+  private pascalTypeName(type: SyntaxNode | null | undefined): string | null {
+    let ref = type?.type === 'type' ? type.namedChild(0) : type;
+    if (ref?.type !== 'typeref') return null;
+    ref = ref.namedChild(0);
+    if (ref?.type === 'typerefDot') ref = ref.namedChild(ref.namedChildCount - 1);
+    else if (ref?.type === 'typerefTpl') ref = ref.namedChild(0);
+    return ref?.type === 'identifier' ? getNodeText(ref, this.source) : null;
+  }
+
+  /**
+   * Extract function calls from a Pascal expression. A `receiverLink` call is
+   * a link inside another call's receiver chain (#2547): it is recorded only
+   * when it can be named precisely — `Obj.Method`, a bare routine, or a
+   * `TFoo.Factory().Method` chain — never as the bare method name a longer
+   * chain like `Client.New.BaseURL(…)` would leave, which matches namesakes.
+   */
+  private extractPascalCall(node: SyntaxNode, receiverLink = false): void {
     if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
@@ -7030,7 +9138,12 @@ export class TreeSitterExtractor {
       calleeName = getNodeText(firstChild, this.source);
     }
 
-    if (calleeName) {
+    const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
+    // In a `with` body a bare `Delete(I)` or `Assign(X)` may be the `with`
+    // object's member rather than the System unit's or the class's: which one
+    // the object's type would have to say (see resolution/pascal-scope).
+    const withMember = this.pascalWithDepth > 0 && firstChild.type === 'identifier' && PASCAL_SYSTEM_NAMES.has(calleeName.toLowerCase());
+    if (calleeName && !vagueLink && !withMember) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
@@ -7040,6 +9153,12 @@ export class TreeSitterExtractor {
       });
     }
 
+    // The calls in the callee itself: a chained call's receiver, like
+    // `MD5FileSized(…)` in `MD5FileSized(…).IsSame(AKey)` (#2547), or the call
+    // whose result is called in `GetHandler()(X)`.
+    if (firstChild.type === 'exprDot') this.extractPascalReceiverCalls(firstChild.namedChild(0));
+    else if (firstChild.type !== 'identifier') this.extractPascalReceiverCalls(firstChild);
+
     // Also visit arguments for nested calls
     const args = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'exprArgs'
@@ -7047,6 +9166,53 @@ export class TreeSitterExtractor {
     if (args) {
       this.visitPascalBlock(args);
     }
+  }
+
+  /**
+   * The calls inside the receiver of a Pascal call or member access, which
+   * the outer reference doesn't cover (#2547): `MD5FileSized(…)` and the
+   * `TMeta.ExtendedPath(APath)` in its arguments for
+   * `MD5FileSized(TMeta.ExtendedPath(APath)).IsSame(AKey)`, `A(1)` in
+   * `A(1).B.C`, `GetIndex(x)` in `List[GetIndex(x)].Free`. A paren'd call
+   * there is a call like any other. A paren-less link (`B` in `A.B.C`, `GetList`
+   * in `GetList.Count`) is read for its value, which a function gives
+   * (#2514): it is recorded as a paren-less name. A typecast
+   * (`TButton(Sender)`) is written like a call; resolution tells it apart by
+   * what the name resolves to.
+   */
+  private extractPascalReceiverCalls(node: SyntaxNode | null, names = true): void {
+    if (!node) return;
+    switch (node.type) {
+      case 'identifier':
+        if (names) this.extractPascalParenlessName(node, null);
+        return;
+      case 'exprCall':
+        this.extractPascalReceiverCall(node, true);
+        return;
+      case 'exprDot':
+        if (names) this.extractPascalParenlessName(node, null);
+        this.extractPascalReceiverCalls(node.namedChild(0), names);
+        return;
+      case 'exprTpl':
+        // `TList<Integer>.Create`: a generic type's name, not a value's.
+        this.extractPascalReceiverCalls(node.namedChild(0), false);
+        return;
+      case 'exprSubscript': {
+        this.extractPascalReceiverCalls(node.namedChild(0), names);
+        const index = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+        if (index) this.visitPascalBlock(index);
+        return;
+      }
+      default:
+        this.visitPascalBlock(node);
+    }
+  }
+
+  /** A receiver call, read as any call is, its arguments' routine values included (#756). */
+  private extractPascalReceiverCall(call: SyntaxNode, receiverLink: boolean): void {
+    this.extractPascalCall(call, receiverLink);
+    const args = call.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+    if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
   }
 
   /**
@@ -7088,10 +9254,11 @@ export class TreeSitterExtractor {
       if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) {
         calleeName = `${innerCallee}().${method}`;
         // The T/I-prefixed inner is itself a real call — record it too.
-        if (receiver.type === 'exprCall') this.extractPascalCall(receiver);
+        if (receiver.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
         else this.extractPascalParenlessCall(receiver);
       } else {
         calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
+        this.extractPascalReceiverCalls(receiver); // `MD5FileSized(…).Reset;` (#2547)
       }
     } else {
       // Simple: `Obj.Method` → the dotted name (resolves via the receiver / bare name).
@@ -7099,6 +9266,7 @@ export class TreeSitterExtractor {
         .filter((c: SyntaxNode) => c.type === 'identifier')
         .map((id: SyntaxNode) => getNodeText(id, this.source))
         .join('.');
+      this.extractPascalReceiverCalls(receiver); // `List[GetIndex(x)].Free;`
     }
 
     if (calleeName) {
@@ -7113,16 +9281,23 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Recursively visit a Pascal block/statement tree for call expressions
+   * Recursively visit a Pascal block/statement tree for call expressions.
+   * With `declarations`, a declaration in it is visited as a declaration.
    */
-  private visitPascalBlock(node: SyntaxNode): void {
+  private visitPascalBlock(node: SyntaxNode, declarations = false): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
+      if (declarations && /^(?:decl|defProc$|interface$|implementation$)/.test(child.type)) {
+        this.visitNode(child);
+        continue;
+      }
       // Function-as-value capture (#756): Pascal bodies are walked here, not
       // in visitNode/visitForCallsAndStructure, so the capture hook fires here
       // — assignment RHS is the Delphi event-wiring idiom (`OnFire := Handler`).
       this.maybeCaptureFnRefs(child, child.type);
+      this.declarePascalInline(child);
+      this.learnPascalVariable(child);
       if (child.type === 'exprCall') {
         this.extractPascalCall(child);
         // The walker doesn't descend into a call's arguments — dispatch the
@@ -7133,21 +9308,346 @@ export class TreeSitterExtractor {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
         // expression) a bare exprDot is ambiguous with a field/property access,
-        // so there we only descend for paren'd inner calls.
+        // so there we only read the paren'd calls in its receiver chain
+        // (`X := A(1).B.C` reads `A(1)`); a call right before the read is
+        // named as any call is.
         if (node.type === 'statement') {
-          this.extractPascalParenlessCall(child);
-        } else {
-          for (let j = 0; j < child.namedChildCount; j++) {
-            const grandchild = child.namedChild(j);
-            if (grandchild?.type === 'exprCall') {
-              this.extractPascalCall(grandchild);
-            }
+          // Where the tree has errors, `procedure TFoo.Bar;` may parse as
+          // one: a routine's header calls nothing (#2514).
+          if (!this.isPascalHeaderName(child)) {
+            this.extractPascalParenlessCall(child);
           }
+        } else {
+          const receiver = child.namedChild(0);
+          if (receiver?.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
+          else this.extractPascalReceiverCalls(receiver);
+          this.extractPascalParenlessName(child, node);
         }
+      } else if (child.type === 'identifier') {
+        this.extractPascalParenlessName(child, node);
+      } else if (child.type === 'with') {
+        this.pascalWithDepth++;
+        this.visitPascalBlock(child, declarations);
+        this.pascalWithDepth--;
+      } else if (child.type === 'lambda') {
+        const outer = this.pascalScopes[this.pascalScopes.length - 1];
+        this.pascalScopes.push({
+          locals: this.pascalRoutineLocals(child),
+          classQn: outer?.classQn ?? null,
+          routine: null,
+          startLine: outer?.startLine ?? 0,
+        });
+        this.visitPascalBlock(child, declarations);
+        this.pascalScopes.pop();
       } else {
-        this.visitPascalBlock(child);
+        // A `begin … end` block in it holds statements only, as it always has.
+        this.visitPascalBlock(child, declarations && child.type !== 'block');
       }
     }
+  }
+
+  /**
+   * A name written without parentheses where a parameterless routine may be
+   * called (#2514): `Before;`, `Result := FProvider.Value + 1`, `if Ready
+   * then`, `OnGet := Handler`, `GetList.Count`. Recorded as a `references`
+   * ref named `{mode}.Name` or `{mode}.Receiver.Name`, with the routine's
+   * class after an `@` (see resolution/pascal-scope), which links only a
+   * routine the name reaches, or nothing. A null `parent` marks a receiver's
+   * link. Names the routine declares itself and names the class's or unit's
+   * own data takes are left out here; a receiver the routine declares is
+   * written as its declared type (`{read}.:TProvider.Value`), or left out
+   * when it has none.
+   */
+  private extractPascalParenlessName(name: SyntaxNode, parent: SyntaxNode | null): void {
+    const scope = this.pascalScopeAt(name.startPosition.row + 1);
+    if (!scope) return;
+    // Where the tree has errors, a routine's header may parse as statements
+    // (`procedure Foo;`): the name it declares is no call.
+    if (this.isPascalHeaderName(name)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+    // Most bare names are the routine's own or the class's data: settled
+    // before what the name's place in the tree says.
+    if (name.type === 'identifier') {
+      const lower = getNodeText(name, this.source).toLowerCase();
+      if (PASCAL_NOT_ROUTINES.has(lower) || this.pascalLocalType(lower, scope.locals) !== undefined) return;
+      if (this.pascalDataNames(scope.classQn).has(lower)) return;
+    }
+    const mode: PascalNameMode | null = parent ? this.pascalNameMode(name, parent) : 'recv';
+    if (!mode) return;
+    // In a `with` body a name may be the `with` object's member, which the
+    // object's type would have to say. Only the method an event is given is
+    // linked there (`OnClick := ButtonClick`), the form's, as it is written.
+    if (this.pascalWithDepth > 0 && (mode !== 'ref' || name.type !== 'identifier')) return;
+    let path: string[];
+    if (name.type === 'identifier') {
+      path = [getNodeText(name, this.source)];
+    } else {
+      const links = this.pascalIdentifierPath(name);
+      if (!links) return;
+      path = links;
+    }
+    const head = path[0]!;
+    const lower = head.toLowerCase();
+    const local = this.pascalLocalType(lower, scope.locals);
+    // Read for its value, a name Delphi's conventions give to data is never a
+    // routine's: lowercase words are locals, fields and enum values (`clRed`),
+    // where a C library's functions aren't (`mach_absolute_time`), and see
+    // PASCAL_DATA_NAME. A statement on its own runs a routine, and an event is
+    // given one, whatever its name (`btnOKClick`).
+    const read = mode !== 'call' && mode !== 'ref';
+    if (read && PASCAL_DATA_NAME.test(path[path.length - 1]!)) return;
+    if (path.length === 1) {
+      if (PASCAL_NOT_ROUTINES.has(lower) || local !== undefined) return;
+      if (read && /^[a-z][A-Za-z]*$/.test(head)) return;
+      if (this.pascalDataNames(scope.classQn).has(lower)) return;
+    } else if (local !== undefined) {
+      // A local's declared class stands for it; a pointer type (`PNode`),
+      // which no class node declares, can't. A local's member as a receiver
+      // is left out: what it reaches is almost always data.
+      if (local === null || mode === 'recv' || /^P[A-Z]/.test(local)) return;
+      path[0] = `:${local}`;
+    } else if (lower !== 'self' && PASCAL_NOT_ROUTINES.has(lower)) {
+      return;
+    }
+    // The routine's class rides along: the reference's own node may be the
+    // file when the implementation matched no declaration.
+    const ref: UnresolvedReference = {
+      fromNodeId: callerId,
+      referenceName: `{${mode}${scope.classQn ? `@${scope.classQn}` : ''}}.${path.join('.')}`,
+      referenceKind: 'references',
+      line: name.startPosition.row + 1,
+      column: name.startPosition.column,
+    };
+    if (path.length === 1 && mode !== 'call') this.pascalReads.push({ ref, scope: scope.classQn ?? '', name: lower });
+    else this.unresolvedReferences.push(ref);
+  }
+
+  /**
+   * A bare name the code assigns to (`Run := 0`) or passes to `Inc`/`Dec` is
+   * a variable, a field or a property wherever the same class's code reads it
+   * (#2514), unless the routine declares it, or it is the function's own name
+   * (its result, in the old style), or a `with` object may hold it.
+   */
+  private learnPascalVariable(node: SyntaxNode): void {
+    if (this.pascalWithDepth > 0) return;
+    let target: SyntaxNode | null = null;
+    if (node.type === 'assignment') {
+      target = node.namedChild(0);
+    } else if (node.type === 'exprCall') {
+      const callee = node.namedChild(0);
+      if (callee?.type === 'identifier' && /^(?:inc|dec)$/i.test(getNodeText(callee, this.source))) {
+        target = node.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs')?.namedChild(0) ?? null;
+      }
+    }
+    if (target?.type !== 'identifier') return;
+    const scope = this.pascalScopeAt(target.startPosition.row + 1);
+    if (!scope) return;
+    const name = getNodeText(target, this.source).toLowerCase();
+    if (name === scope.routine || this.pascalLocalType(name, scope.locals) !== undefined) return;
+    const key = scope.classQn ?? '';
+    let names = this.pascalAssigned.get(key);
+    if (!names) this.pascalAssigned.set(key, (names = new Set()));
+    names.add(name);
+  }
+
+  /** The bare names read in an expression, less those the file shows are variables of their class. */
+  private flushPascalReads(): void {
+    for (const { ref, scope, name } of this.pascalReads) {
+      if (!this.pascalAssigned.get(scope)?.has(name)) this.unresolvedReferences.push(ref);
+    }
+    this.pascalReads = [];
+  }
+
+  /**
+   * Whether a node is the name a routine's header declares (`TFoo.Bar` in
+   * `procedure TFoo.Bar;`), which a tree with errors may parse as a statement.
+   */
+  private isPascalHeaderName(node: SyntaxNode): boolean {
+    if (!this.tree?.rootNode.hasError) return false;
+    const line = (this.pascalSourceLines ??= this.source.split(/\r?\n/))[node.startPosition.row] ?? '';
+    return /^\s*(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+$/i.test(line.slice(0, node.startPosition.column));
+  }
+
+  /**
+   * The declared type of a name the enclosing routines declare (null: none it
+   * can be named by), or undefined when none does. `textLocals` are the
+   * declarations the source text gives a broken tree's routine.
+   */
+  private pascalLocalType(lower: string, textLocals?: Map<string, string | null> | null): string | null | undefined {
+    for (let i = this.pascalScopes.length - 1; i >= 0; i--) {
+      const locals = this.pascalScopes[i]!.locals;
+      if (locals.has(lower)) return locals.get(lower);
+    }
+    return textLocals?.has(lower) ? textLocals.get(lower) : undefined;
+  }
+
+  /**
+   * The class and routine a name at `line` belongs to; null outside any code.
+   * Where the tree has errors, a routine whose header didn't parse is a block
+   * outside any routine, or part of the routine above it, so the source text
+   * says: a header between the tree's routine and the name is the name's,
+   * with the declarations the text gives it.
+   */
+  private pascalScopeAt(line: number): { classQn: string | null; routine: string | null; locals: Map<string, string | null> | null } | null {
+    const scope = this.pascalScopes[this.pascalScopes.length - 1];
+    if (!scope) return null;
+    const own = { classQn: scope.classQn, routine: scope.routine, locals: null };
+    if (!this.tree?.rootNode.hasError) return own;
+    const routines = (this.pascalTextRoutines ??= this.readPascalTextRoutines());
+    let lo = 0;
+    let hi = routines.length - 1;
+    let hit = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (routines[mid]!.line <= line) {
+        hit = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const text = hit >= 0 ? routines[hit]! : null;
+    // Inside a routine the tree parsed, only a later header overrides it.
+    if (!text || text.line <= scope.startLine || (scope.startLine > 0 && text.routine === null)) return own;
+    return text;
+  }
+
+  /**
+   * Each routine header of the source text (`procedure TFoo.Bar(…)`), with
+   * its class, its name and what it declares before its body — parameters,
+   * `Result`'s type, `var` and `const` sections — and where the unit's own
+   * code resumes: after an `end;` that starts its line, which closes a
+   * routine, and at `initialization` and `finalization`. An indented header
+   * is a routine nested in the one above, whose class and names it shares.
+   */
+  private readPascalTextRoutines(): PascalTextRoutine[] {
+    const lines = (this.pascalSourceLines ??= this.source.split(/\r?\n/));
+    const header = /^(\s*)(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+([A-Za-z_]\w*(?:<[^>]*>)?(?:\.[A-Za-z_]\w*(?:<[^>]*>)?)*)/i;
+    const routines: PascalTextRoutine[] = [];
+    let outer: PascalTextRoutine | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i]!;
+      if (/^(?:end;|\s*(?:initialization|finalization)\b)/i.test(text)) {
+        routines.push({ line: i + 1, classQn: null, routine: null, locals: new Map() });
+        outer = null;
+        continue;
+      }
+      const m = header.exec(text);
+      if (!m) continue;
+      const nested: boolean = m[1] !== '' && outer !== null;
+      const parts = m[2]!.replace(/<[^>]*>/g, '').split('.');
+      const routine = parts.pop()!.toLowerCase();
+      let decl = text.slice(m.index + m[0].length);
+      for (let j = i + 1; j < lines.length && j <= i + 200 && !/^\s*(?:begin|asm)\b/i.test(lines[j]!) && !header.test(lines[j]!); j++) {
+        decl += '\n' + lines[j];
+      }
+      decl = decl.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
+      const locals: Map<string, string | null> = new Map(nested ? outer!.locals : []);
+      const result = /^\s*(?:\([^)]*\))?\s*:\s*([A-Za-z_][\w.]*)/.exec(decl);
+      locals.set('result', result ? result[1]!.split('.').pop()! : null);
+      for (const d of decl.matchAll(/([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:(?!=)\s*([A-Za-z_][\w.]*)?/g)) {
+        const type = d[2] ? d[2].split('.').pop()! : null;
+        for (const name of d[1]!.split(',')) locals.set(name.trim().toLowerCase(), type);
+      }
+      if (nested) {
+        // The outer routine's body follows its nested ones: it keeps the
+        // outer routine's class and name, and sees the names of both.
+        routines.push({ line: i + 1, classQn: outer!.classQn, routine: outer!.routine, locals });
+      } else {
+        outer = { line: i + 1, classQn: parts.length > 0 ? parts.join('::') : null, routine, locals };
+        routines.push(outer);
+      }
+    }
+    return routines;
+  }
+
+  /**
+   * How a name in `parent` may run a parameterless routine: `call` as a
+   * statement of its own, `read` for its value in an expression or an
+   * argument, `ref` as the method an event is given, `recv` as what is
+   * indexed; null where it can't (an assignment's target, a case label, a
+   * set literal, a type).
+   */
+  private pascalNameMode(name: SyntaxNode, parent: SyntaxNode): PascalNameMode | null {
+    const is = (field: string): boolean => parent.childForFieldName(field)?.id === name.id;
+    switch (parent.type) {
+      case 'statement':
+        return parent.namedChildCount === 1 && name.type === 'identifier' ? 'call' : null;
+      case 'exprSubscript':
+        return parent.namedChild(0)?.id === name.id ? 'recv' : null;
+      case 'assignment': {
+        const target = parent.namedChild(0);
+        if (!target || target.id === name.id) return null;
+        const last = target.type === 'exprDot'
+          ? target.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop()
+          : target;
+        return last && /^F?On[A-Z]/.test(getNodeText(last, this.source)) ? 'ref' : 'read';
+      }
+      case 'exprArgs':
+        return parent.parent?.type === 'exprCall' || parent.parent?.type === 'exprSubscript' || parent.parent?.type === 'inherited' ? 'read' : null;
+      case 'exprBinary': {
+        const op = parent.namedChildren.find((c: SyntaxNode) => c.id !== name.id && /^k[A-Z]/.test(c.type));
+        return op && (op.type === 'kIs' || op.type === 'kAs') && parent.namedChild(0)?.id !== name.id ? null : 'read';
+      }
+      case 'exprUnary':
+        return parent.child(0)?.type === 'kAt' ? null : 'read';
+      case 'if':
+      case 'ifElse':
+      case 'while':
+      case 'repeat':
+        return is('condition') ? 'read' : null;
+      case 'case':
+        return 'read';
+      case 'foreach':
+        return is('iterable') ? 'read' : null;
+      case 'for':
+        return is('end') ? 'read' : null;
+      case 'exprParens':
+        return 'read';
+      default:
+        return null;
+    }
+  }
+
+  /** The identifiers of a plain dotted name (`FProvider.Value`, `Self.A.B`), or null. */
+  private pascalIdentifierPath(dot: SyntaxNode): string[] | null {
+    const links: string[] = [];
+    let n: SyntaxNode | null = dot;
+    while (n?.type === 'exprDot') {
+      const last = n.namedChild(n.namedChildCount - 1);
+      if (last?.type !== 'identifier') return null;
+      links.unshift(getNodeText(last, this.source));
+      n = n.namedChild(0);
+    }
+    if (n?.type !== 'identifier') return null;
+    links.unshift(getNodeText(n, this.source));
+    return links;
+  }
+
+  /**
+   * The names data takes for a routine of class `classQn`, lowercased: the
+   * class's fields, properties and constants, and the unit's variables and
+   * constants. A bare name among them reads that data.
+   */
+  private pascalDataNames(classQn: string | null): Set<string> {
+    const key = classQn ?? '';
+    let names = this.pascalDataNameSets.get(key);
+    if (names) return names;
+    names = new Set();
+    const prefix = classQn ? `${classQn.toLowerCase()}::` : null;
+    for (const n of this.nodes) {
+      if (n.kind === 'enum_member') {
+        names.add(n.name.toLowerCase()); // enum values are visible unqualified
+        continue;
+      }
+      if (n.kind !== 'field' && n.kind !== 'property' && n.kind !== 'constant' && n.kind !== 'variable') continue;
+      const qn = n.qualifiedName.replace(/<[^>]*>/g, '').toLowerCase();
+      const own = prefix !== null && qn.startsWith(prefix) && qn.indexOf('::', prefix.length) < 0;
+      if (own || !qn.includes('::')) names.add(n.name.toLowerCase());
+    }
+    this.pascalDataNameSets.set(key, names);
+    return names;
   }
 }
 
@@ -7233,9 +9733,15 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null }
+        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source } : undefined
       );
       result = extractor.extract();
+    }
+    // C++ methods the file's own macros define, read from the original source
+    // after either extractor so both mint them (cpp-macro-methods.ts).
+    if (detectedLanguage === 'cpp') {
+      const preParse = EXTRACTORS.cpp?.preParse;
+      appendCppMacroMethods(result, filePath, source, (text) => (preParse ? preParse(text, filePath) : text));
     }
   }
 

@@ -1,7 +1,7 @@
 {
   "name": "@colbymchenry/codegraph-ui",
   "private": true,
-  "version": "1.6.0",
+  "version": "1.6.2",
   "type": "module",
   "description": "The CodeGraph reader as Svelte components: Symbol view, Flow strip and architecture Map behind one data adapter.",
   "keywords": [

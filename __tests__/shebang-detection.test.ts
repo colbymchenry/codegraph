@@ -28,7 +28,7 @@ describe('extensionless shell script detection', () => {
     fs.writeFileSync(path.join(root, 'deploy'), '#!/bin/sh\nhelper\n');
 
     expect(isSourceFile('deploy')).toBe(false);
-    expect(isSourceFile('deploy', root)).toBe(true);
+    expect(isSourceFile('deploy', undefined, root)).toBe(true);
     expect(detectLanguage('deploy', '#!/bin/sh\nhelper\n')).toBe('bash');
   });
 

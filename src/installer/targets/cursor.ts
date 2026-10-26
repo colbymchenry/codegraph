@@ -46,6 +46,7 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  stripMarkedSections,
   writeJsonFile,
 } from './shared';
 import {
@@ -217,18 +218,17 @@ function removeRulesEntry(): WriteResult['files'][number] {
   }
 
   const ourFrontmatter = MDC_FRONTMATTER.trim();
-  const startIdx = content.indexOf(CODEGRAPH_SECTION_START);
-  const endIdx = content.indexOf(CODEGRAPH_SECTION_END);
 
-  // Our marked block is present — strip it, then decide what's left.
-  if (startIdx !== -1 && endIdx > startIdx) {
-    const before = content.substring(0, startIdx).trimEnd();
-    const after = content.substring(endIdx + CODEGRAPH_SECTION_END.length).trimStart();
-    const remainder = (before + (before && after ? '\n\n' : '') + after).trim();
-    if (remainder === '' || remainder === ourFrontmatter) {
+  // Our marked block is present — strip it, then decide what's left. Only
+  // well-formed blocks are stripped, so a stray marker never takes the
+  // user's rules with it (#2506).
+  const remainder = stripMarkedSections(content, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+  if (remainder !== null) {
+    const rest = remainder.trim();
+    if (rest === '' || rest === ourFrontmatter) {
       try { fs.unlinkSync(file); } catch { /* ignore */ }
     } else {
-      atomicWriteFileSync(file, remainder + '\n');
+      atomicWriteFileSync(file, remainder);
     }
     return { path: file, action: 'removed' };
   }

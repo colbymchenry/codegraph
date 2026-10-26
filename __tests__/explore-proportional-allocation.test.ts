@@ -550,3 +550,72 @@ describe('allocateExploreBudget — the diffuse-query control', () => {
     expect(precise).toBeGreaterThan(0.45);
   });
 });
+
+// ── A file the query named is exempt from the MAX_SHARE valve ─────────────────
+
+describe('allocateExploreBudget — a named file keeps its share past the valve', () => {
+  // The valve hedges against a mis-ranked dominant file, and it never
+  // redistributed: a clamped file's excess was left unreserved, where no file
+  // could spend it. A file the query asked for by name — a symbol it defines, or
+  // its path — is not the file the hedge is for. Whether the render loop may
+  // actually SPEND that share is a separate question, answered against spare
+  // room in `explore-named-file-valve.test.ts`.
+  const budget = getExploreOutputBudget(1000);
+  const valve = Math.round(budget.maxOutputChars * EXPLORE_ALLOCATION.MAX_SHARE);
+
+  it('lets a lone named file keep the whole pool rather than the valve', () => {
+    const { allowances, pool } = allocateExploreBudget([cand('named.ts', 42, { named: true })], budget, 8);
+    expect(allowances.get('named.ts')).toBe(pool);
+    expect(allowances.get('named.ts')!).toBeGreaterThan(valve);
+  });
+
+  it('treats a file named by PATH the same way', () => {
+    const { allowances, pool } = allocateExploreBudget([cand('pinned.ts', 42, { pinned: true })], budget, 8);
+    expect(allowances.get('pinned.ts')).toBe(pool);
+  });
+
+  it('takes the excess from the valve, never from the other files', () => {
+    const peers = [cand('p1.ts', 40), cand('p2.ts', 30)];
+    const plain = allocateExploreBudget([cand('top.ts', 900), ...peers], budget, 8).allowances;
+    const named = allocateExploreBudget([cand('top.ts', 900, { named: true }), ...peers], budget, 8).allowances;
+    expect(plain.get('top.ts')).toBe(valve);
+    expect(named.get('top.ts')!).toBeGreaterThan(valve);
+    for (const peer of ['p1.ts', 'p2.ts']) expect(named.get(peer), peer).toBe(plain.get(peer));
+  });
+
+  it('still clamps an unnamed dominant file when a lower file is the named one', () => {
+    const { allowances } = allocateExploreBudget(
+      [cand('dominant.ts', 900), cand('asked.ts', 40, { named: true })],
+      budget,
+      8,
+    );
+    expect(allowances.get('dominant.ts')).toBe(valve);
+  });
+
+  it('still fits the pool exactly, at every tier', () => {
+    for (const fileCount of TIER_FILE_COUNTS) {
+      const tier = getExploreOutputBudget(fileCount);
+      const a = allocateExploreBudget(
+        [cand('top.ts', 900, { named: true }), cand('b.ts', 40), cand('c.ts', 20, { named: true })],
+        tier,
+        8,
+      );
+      expect(reservedTotal(a), `tier ${fileCount}`).toBeLessThanOrEqual(a.pool);
+      expect(a.pool).toBeLessThanOrEqual(tier.maxOutputChars);
+    }
+  });
+
+  it('never gives a named file less at a larger tier', () => {
+    const files = [cand('top.ts', 900, { named: true }), cand('b.ts', 40)];
+    let previous: Map<string, number> | null = null;
+    for (const fileCount of TIER_FILE_COUNTS) {
+      const { allowances } = allocateExploreBudget(files, getExploreOutputBudget(fileCount), 8);
+      if (previous) {
+        for (const [path, chars] of allowances) {
+          expect(chars, `${path} shrank at ${fileCount} files`).toBeGreaterThanOrEqual(previous.get(path)!);
+        }
+      }
+      previous = allowances;
+    }
+  });
+});

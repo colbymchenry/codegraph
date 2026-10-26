@@ -6,7 +6,7 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
-import { stripCommentsForRegex } from '../strip-comments';
+import { REGEX_START_BEFORE, stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
 
@@ -48,6 +48,39 @@ const RESERVED_CALLS = new Set([
   'log', 'error', 'warn', 'info', 'String', 'Number', 'Boolean', 'Array', 'Object',
   'Date', 'Math', 'JSON', 'Promise', 'require', 'fail', 'redirect',
 ]);
+
+// Keywords a `name(` scan over a handler body would otherwise read as calls.
+const JS_KEYWORDS = new Set([
+  'if', 'for', 'while', 'switch', 'function', 'async', 'return', 'typeof', 'await', 'new', 'do', 'else', 'with', 'yield', 'void', 'delete', 'in', 'super', 'import',
+]);
+
+/**
+ * The calls an inline handler's body makes, each once, framework noise aside.
+ * A member call keeps its receiver (`userService.find`, `c.text`) so it
+ * resolves as one: bare, hono's `c.text('…')` matched its client's
+ * `ClientResponse.text` 423 times. A member of an expression (`a.b().c(`)
+ * names nothing this can follow.
+ */
+function handlerCallNames(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const callRe = /((?:[A-Za-z_$][\w$]*\s*\??\.\s*)*)([A-Za-z_$][\w$]*)\s*\(/g;
+  let cm: RegExpExecArray | null;
+  while ((cm = callRe.exec(body)) !== null) {
+    const method = cm[2]!;
+    const receiver = cm[1]!.replace(/\s|\?/g, '').replace(/\.$/, '');
+    if (!receiver && /\.\s*$/.test(body.slice(0, cm.index))) continue;
+    // A keyword is only a keyword when it isn't a member: `if (` is not a
+    // call, `userService.delete(` is. `function helper(` declares helper.
+    if (!receiver && JS_KEYWORDS.has(method)) continue;
+    if (!receiver && /\bfunction\s*\*?\s*$/.test(body.slice(Math.max(0, cm.index - 12), cm.index))) continue;
+    const name = receiver ? `${receiver}.${method}` : method;
+    if (seen.has(name) || RESERVED_CALLS.has(method)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
 
 /**
  * The replies an inline handler makes — `res.status(404).json({…})`,
@@ -104,9 +137,16 @@ export const expressResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A JS/TS module reaches another file's middleware, controller or service
+    // only through an `import` / `require` — the import resolver's — never by
+    // name: SvelteKit's remote functions' `validate(arg)` went to the config
+    // loader's `validate` in another package. The patterns below stay for the
+    // file's own declarations.
+    const sameFile = (id: string | null): string | null =>
+      id !== null && context.getNodeById?.(id)?.filePath === ref.filePath ? id : null;
     // Pattern 1: Middleware references
     if (isMiddlewareName(ref.referenceName)) {
-      const result = resolveMiddleware(ref.referenceName, context);
+      const result = sameFile(resolveMiddleware(ref.referenceName, context, ref.filePath));
       if (result) {
         return {
           original: ref,
@@ -121,7 +161,7 @@ export const expressResolver: FrameworkResolver = {
     const controllerMatch = ref.referenceName.match(/^(\w+)Controller\.(\w+)$/);
     if (controllerMatch) {
       const [, controller, method] = controllerMatch;
-      const result = resolveControllerMethod(controller!, method!, context);
+      const result = sameFile(resolveControllerMethod(controller!, method!, context));
       if (result) {
         return {
           original: ref,
@@ -136,7 +176,7 @@ export const expressResolver: FrameworkResolver = {
     const serviceMatch = ref.referenceName.match(/^(\w+)(Service|Helper|Utils?)\.(\w+)$/);
     if (serviceMatch) {
       const [, name, suffix, method] = serviceMatch;
-      const result = resolveServiceMethod(name! + suffix!, method!, context);
+      const result = sameFile(resolveServiceMethod(name! + suffix!, method!, context));
       if (result) {
         return {
           original: ref,
@@ -157,6 +197,10 @@ export const expressResolver: FrameworkResolver = {
     const now = Date.now();
     const lang = detectLanguage(filePath);
     const safe = stripCommentsForRegex(content, lang);
+    // Brackets and commas are counted on `structure`, where string and regex
+    // contents are blanked: `/[^]]/`, `/}/` or `'a, b)'` must not end an
+    // argument or a body early. Same offsets as `safe`, which the route path
+    // and reply calls are still read from.
     // Match the route head up to the first arg: (app|router).METHOD('/path',
     // (NOT the whole call — handlers are often inline arrows whose `)`/`{}` the
     // old single-regex couldn't span, so inline-handler routes connected to nothing.)
@@ -184,62 +228,9 @@ export const expressResolver: FrameworkResolver = {
 
       // The full argument list = balanced parens from the route call's open paren.
       const openParen = safe.indexOf('(', match.index);
-      const closeParen = openParen >= 0 ? matchDelim(safe, openParen, '(', ')') : -1;
-      const args = closeParen > openParen ? safe.slice(openParen + 1, closeParen) : '';
-      const arrowAt = args.indexOf('=>');
-
-      if (arrowAt >= 0) {
-        // Inline arrow handler (`router.post('/x', async (req,res) => {…})`). The
-        // arrow is anonymous, so its body — the actual request→service flow — would
-        // be lost. Attribute the body's calls to the route node as `calls` edges so
-        // `trace(route, service)` connects. Body = balanced `{…}` after `=>`, or the
-        // single-expression tail for `=> expr` arrows.
-        const afterArrow = args.slice(arrowAt + 2);
-        const braceAt = afterArrow.indexOf('{');
-        let body = afterArrow;
-        let bodyStart = openParen + 1 + arrowAt + 2;
-        if (braceAt >= 0 && afterArrow.slice(0, braceAt).trim() === '') {
-          const end = matchDelim(afterArrow, braceAt, '{', '}');
-          if (end > braceAt) {
-            body = afterArrow.slice(braceAt + 1, end);
-            bodyStart += braceAt + 1;
-          }
-        }
-        const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
-        const seen = new Set<string>();
-        let cm: RegExpExecArray | null;
-        while ((cm = callRe.exec(body)) !== null) {
-          const name = cm[1]!;
-          if (seen.has(name) || RESERVED_CALLS.has(name)) continue;
-          seen.add(name);
-          references.push({
-            fromNodeId: routeNode.id,
-            referenceName: name,
-            referenceKind: 'calls',
-            line,
-            column: 0,
-            filePath,
-            language: lang,
-          });
-        }
-        references.push(...replyRefs(safe, bodyStart, bodyStart + body.length, routeNode.id, filePath, lang));
-      } else {
-        // Named handler: the LAST comma-separated arg (earlier ones are middleware).
-        const parts = args.split(',').map((s) => s.trim()).filter(Boolean);
-        const last = parts[parts.length - 1];
-        const handlerName = last ? extractTailIdent(last) : null;
-        if (handlerName) {
-          references.push({
-            fromNodeId: routeNode.id,
-            referenceName: handlerName,
-            referenceKind: 'references',
-            line,
-            column: 0,
-            filePath,
-            language: lang,
-          });
-        }
-      }
+      const call = openParen >= 0 ? scanCall(safe, openParen) : null;
+      const args = call ? call.structure.slice(1, -1) : '';
+      references.push(...handlerRefs(safe, openParen + 1, args, routeNode.id, line, filePath, lang));
     }
     // The chained form: `router.route('/:id').get(getProduct).put(protect, updateProduct)`
     // — one path, several methods, each with its own handler. One route node
@@ -252,11 +243,12 @@ export const expressResolver: FrameworkResolver = {
         const link = /^\s*\.\s*(get|post|put|patch|delete|all)\s*\(/.exec(safe.slice(at, at + 64));
         if (!link) break;
         const openParen = at + link[0].length - 1;
-        const closeParen = matchDelim(safe, openParen, '(', ')');
-        if (closeParen < 0) break;
+        const call = scanCall(safe, openParen);
+        if (!call) break;
+        const closeParen = call.close;
         const method = link[1]!;
         const line = safe.slice(0, openParen).split('\n').length;
-        const args = safe.slice(openParen + 1, closeParen);
+        const args = call.structure.slice(1, -1);
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,
           kind: 'route',
@@ -271,25 +263,7 @@ export const expressResolver: FrameworkResolver = {
           updatedAt: now,
         };
         nodes.push(routeNode);
-        if (args.includes('=>')) {
-          const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
-          const seen = new Set<string>();
-          let cm: RegExpExecArray | null;
-          while ((cm = callRe.exec(args)) !== null) {
-            const name = cm[1]!;
-            if (seen.has(name) || RESERVED_CALLS.has(name)) continue;
-            seen.add(name);
-            references.push({ fromNodeId: routeNode.id, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language: lang });
-          }
-          references.push(...replyRefs(safe, openParen + 1, closeParen, routeNode.id, filePath, lang));
-        } else {
-          const parts = splitTopLevel(args).map((s) => s.trim()).filter(Boolean);
-          const last = parts[parts.length - 1];
-          const handlerName = last ? extractTailIdent(last) : null;
-          if (handlerName) {
-            references.push({ fromNodeId: routeNode.id, referenceName: handlerName, referenceKind: 'references', line, column: 0, filePath, language: lang });
-          }
-        }
+        references.push(...handlerRefs(safe, openParen + 1, args, routeNode.id, line, filePath, lang));
         at = closeParen + 1;
       }
     }
@@ -319,6 +293,8 @@ export const expressResolver: FrameworkResolver = {
     const files = context.getAllFiles().filter((f) => /\.(m?js|tsx?|cjs)$/.test(f));
     const mounts = new Map<string, Array<{ prefix: string; target: string }>>();
     for (const file of files) {
+      // Most files mount nothing: look for `.use(` before decoding the file.
+      if (context.fileContains && !context.fileContains(file, '.use(')) continue;
       const content = context.readFile(file);
       if (!content || !content.includes('.use(')) continue;
       const lang = detectLanguage(file);
@@ -327,10 +303,13 @@ export const expressResolver: FrameworkResolver = {
       let m: RegExpExecArray | null;
       while ((m = mount.exec(safe)) !== null) {
         const open = safe.indexOf('(', m.index);
-        const close = open >= 0 ? matchDelim(safe, open, '(', ')') : -1;
-        if (close < 0) continue;
-        const args = splitTopLevel(safe.slice(open + 1, close));
-        const last = args[args.length - 1]?.trim() ?? '';
+        const call = open >= 0 ? scanCall(safe, open) : null;
+        if (!call) continue;
+        // Split where the blanked structure says, but read the target from
+        // `safe`: a `require('./users')` target needs its string.
+        const parts = topLevelArgs(call.structure.slice(1, -1));
+        const lastPart = parts[parts.length - 1];
+        const last = lastPart ? safe.slice(open + 1 + lastPart.start, call.close).trim() : '';
         const target = mountTarget(last, safe, file, lang, context);
         if (!target || target === file) continue;
         const list = mounts.get(file) ?? [];
@@ -382,9 +361,114 @@ export const expressResolver: FrameworkResolver = {
   },
 };
 
-/** Top-level comma split of an argument list, strings and brackets respected. */
-function splitTopLevel(args: string): string[] {
+
+/**
+ * What ends a regex literal: its flags, then a member access, a separator or
+ * a closing bracket, an operator, or the end of the line.
+ */
+const REGEX_END_AFTER = /^[dgimsuyv]*[ \t]*(?:\.\s*(?:test|exec|source|flags|global|lastIndex)\b|[,;)\]}:?]|&&|\|\||\r?\n|$)/;
+
+/**
+ * The call whose `(` is at `open`, scanned from there to its matching `)`:
+ * its close, and its text with string contents and regex-literal bodies
+ * blanked (offsets kept) so `/[^]]/`, `/}/`, `'a, b)'` or a backtick in a regex
+ * can't end an argument or a body early. Scanned per call, from the call's own
+ * paren — never from the top of the file — so nothing earlier in the file can
+ * throw it off.
+ */
+function scanCall(safe: string, open: number): { close: number; structure: string } | null {
   const out: string[] = [];
+  let depth = 0;
+  for (let i = open; i < safe.length; i++) {
+    const c = safe[i]!;
+    if ((c === '"' || c === "'") && !closesOnLine(safe, i)) {
+      // JSX text (`<p>Don't</p>`), not a string: an apostrophe with no
+      // closing quote on its line must not blank the `)` after it.
+      out.push(c);
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      out.push(c);
+      for (i++; i < safe.length && safe[i] !== c; i++) {
+        if (c !== '`' && safe[i] === '\n') break;
+        if (safe[i] === '\\' && i + 1 < safe.length) {
+          out.push(' ');
+          i++;
+        }
+        out.push(safe[i] === '\n' ? '\n' : ' ');
+      }
+      if (i < safe.length) out.push(safe[i]!);
+      continue;
+    }
+    if (c === '/' && safe[i + 1] !== '/' && safe[i + 1] !== '*') {
+      const end = regexLiteralEndAt(safe, i);
+      if (end > i) {
+        out.push('/', ...' '.repeat(end - i - 1), '/');
+        i = end;
+        continue;
+      }
+    }
+    out.push(c);
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return { close: i, structure: out.join('') };
+    }
+  }
+  return null;
+}
+
+/** Whether the quote at `i` has an unescaped closing quote on the same line. */
+function closesOnLine(s: string, i: number): boolean {
+  const q = s[i];
+  for (let k = i + 1; k < s.length && s[k] !== '\n'; k++) {
+    if (s[k] === '\\') k++;
+    else if (s[k] === q) return true;
+  }
+  return false;
+}
+
+/**
+ * The closing `/` of the regex literal the `/` at `i` opens, or -1 when it
+ * divides. A regex opens after punctuation or a keyword (REGEX_START_BEFORE)
+ * but not after `)`, `]`, a postfix `!` (`done! / total`), `++` or `--`; it
+ * closes on the same line; and what follows the close must end a regex —
+ * flags, then `.test(`, `,`, `;`, `)`, … — since treating a division as one
+ * (`(a - b) / total * 100) / 100`, JSX `</li>…</ul>`) would hide a bracket.
+ */
+function regexLiteralEndAt(safe: string, i: number): number {
+  let p = i - 1;
+  while (p >= 0 && (safe[p] === ' ' || safe[p] === '\t')) p--;
+  if (p >= 0 && (safe[p] === ')' || safe[p] === ']' || safe[p] === '}')) return -1;
+  if (p >= 1 && safe[p] === '!' && /[\w$)\]]/.test(safe[p - 1]!)) return -1;
+  if (p >= 1 && (safe[p] === '+' || safe[p] === '-') && safe[p - 1] === safe[p]) return -1;
+  if (!REGEX_START_BEFORE.test(safe.slice(Math.max(0, i - 32), i))) return -1;
+  let end = i + 1;
+  let inClass = false;
+  for (; end < safe.length && safe[end] !== '\n'; end++) {
+    if (safe[end] === '\\') { end++; continue; }
+    if (safe[end] === '[') inClass = true;
+    else if (safe[end] === ']') inClass = false;
+    else if (safe[end] === '/' && !inClass) break;
+  }
+  if (end >= safe.length || safe[end] !== '/') return -1;
+  return REGEX_END_AFTER.test(safe.slice(end + 1, end + 24)) ? end : -1;
+}
+
+
+
+
+function functionBodyEnd(text: string, fnAt: number): number {
+  const paramsOpen = text.indexOf('(', fnAt);
+  const paramsClose = paramsOpen >= 0 ? matchDelim(text, paramsOpen, '(', ')') : -1;
+  if (paramsClose < 0) return -1;
+  const braceAt = text.indexOf('{', paramsClose);
+  return braceAt >= 0 ? matchDelim(text, braceAt, '{', '}') : -1;
+}
+
+/** `args` split at its top-level commas, each piece with its offset into `args`. */
+function topLevelArgs(args: string): Array<{ text: string; start: number }> {
+  const out: Array<{ text: string; start: number }> = [];
   let depth = 0;
   let start = 0;
   for (let i = 0; i < args.length; i++) {
@@ -398,15 +482,125 @@ function splitTopLevel(args: string): string[] {
       }
       continue;
     }
+    if (ch === '<' && i > 0 && /[\w$]/.test(args[i - 1]!)) {
+      // A type-argument list (`asyncHandler<Req, Res>(`): its commas split nothing.
+      const generic = /^<[^()<>]*(?:<[^()<>]*>[^()<>]*)*>\s*\(/.exec(args.slice(i));
+      if (generic) {
+        i += generic[0].length - 2;
+        continue;
+      }
+    }
     if (ch === '(' || ch === '[' || ch === '{') depth++;
     else if (ch === ')' || ch === ']' || ch === '}') depth--;
     else if (ch === ',' && depth === 0) {
-      out.push(args.slice(start, i));
+      out.push({ text: args.slice(start, i), start });
       start = i + 1;
     }
   }
-  out.push(args.slice(start));
+  out.push({ text: args.slice(start), start });
   return out;
+}
+
+/**
+ * What a route call's handler contributes. The handler is the LAST argument —
+ * the ones before it are middleware, and an arrow inside one of those
+ * (`rateLimit({ keyGenerator: (req) => req.ip })`, `(req, res, next) => next()`)
+ * says nothing about the handler. A handler that is a function — an arrow, a
+ * `function` expression, or one wrapped in a call (`asyncHandler(async (req,
+ * res) => …)`) — is anonymous, so its body's calls are attributed to the route
+ * as `calls` edges and `trace(route, service)` connects: the body is the
+ * balanced `{…}` after the arrow or parameter list, or an arrow's expression
+ * tail. Anything else is a named handler: a `references` edge to its last name
+ * (`listUsers`, `userController.list`).
+ *
+ * `argsStart` is where `args` begins in `safe`, for the reply-call offsets.
+ */
+function handlerRefs(
+  safe: string,
+  argsStart: number,
+  args: string,
+  fromNodeId: string,
+  line: number,
+  filePath: string,
+  language: 'typescript' | 'javascript'
+): UnresolvedRef[] {
+  // A trailing options object (`…, handler, { cache: true }`) is not the
+  // handler; a trailing array of handlers (`[validate, ctrl.create]`) is read
+  // as its last element.
+  const parts = topLevelArgs(args).filter((a) => a.text.trim());
+  while (parts.length > 1 && /^\s*\{/.test(parts[parts.length - 1]!.text)) parts.pop();
+  const lastPart = parts[parts.length - 1];
+  const arrayAt = lastPart ? lastPart.text.search(/\S/) : -1;
+  if (lastPart && lastPart.text[arrayAt] === '[') {
+    const close = matchDelim(lastPart.text, arrayAt, '[', ']');
+    const inner = close > arrayAt ? topLevelArgs(lastPart.text.slice(arrayAt + 1, close)).filter((a) => a.text.trim()).pop() : undefined;
+    if (inner) parts[parts.length - 1] = { text: inner.text, start: lastPart.start + arrayAt + 1 + inner.start };
+    else parts.pop();
+  }
+  const handler = parts[parts.length - 1];
+  if (!handler) return [];
+  const text = handler.text;
+  // A `function` is the handler's own only when it opens the argument —
+  // directly, or inside wrapper calls (`asyncHandler(function …)`); then its
+  // body starts after its parameter list, not after an arrow inside it
+  // (`items.map((i) => …)`). A `function` anywhere else (a default parameter,
+  // a wrapper's options object) is not the handler.
+  let arrowAt = text.indexOf('=>');
+  const opening = /^\s*(?:[A-Za-z_$][\w$.]*\s*\(\s*)*(?:async\s+)?function\b[^(]*\(/.exec(text);
+  let fnAt = opening ? opening[0].lastIndexOf('function') : -1;
+  if (fnAt >= 0) {
+    // Inside a wrapper, a `function` followed by an arrow after its body is a
+    // callback argument (`withErrors(function onErr(e) {…}, async (req, res) => …)`):
+    // the arrow is the handler.
+    const fnBodyEnd = functionBodyEnd(text, fnAt);
+    const insideWrapper = opening![0].slice(0, fnAt).includes('(');
+    const laterArrow = fnBodyEnd >= 0 && insideWrapper ? text.indexOf('=>', fnBodyEnd) : -1;
+    if (laterArrow >= 0) {
+      arrowAt = laterArrow;
+      fnAt = -1;
+    } else if (insideWrapper && fnBodyEnd >= 0 && !/^[\s)]*$/.test(text.slice(fnBodyEnd + 1))) {
+      // A callback followed by more arguments (`withErrors(function onErr(e)
+      // {…}, ctrl.list)`) is not the handler.
+      arrowAt = -1;
+      fnAt = -1;
+    } else {
+      arrowAt = -1;
+    }
+  }
+
+  if (arrowAt < 0 && fnAt < 0) {
+    const handlerName = extractTailIdent(text.trim()) ?? extractTailIdent(text.slice(text.lastIndexOf(',') + 1).trim());
+    return handlerName
+      ? [{ fromNodeId, referenceName: handlerName, referenceKind: 'references', line, column: 0, filePath, language }]
+      : [];
+  }
+
+  let bodyFrom = arrowAt + 2;
+  if (arrowAt < 0) {
+    const paramsOpen = text.indexOf('(', fnAt);
+    const paramsClose = matchDelim(text, paramsOpen, '(', ')');
+    bodyFrom = paramsClose > paramsOpen ? paramsClose + 1 : text.length;
+  }
+  const afterParams = text.slice(bodyFrom);
+  let body = afterParams;
+  let bodyStart = argsStart + handler.start + bodyFrom;
+  const braceAt = afterParams.indexOf('{');
+  if (braceAt >= 0 && afterParams.slice(0, braceAt).trim() === '') {
+    const end = matchDelim(afterParams, braceAt, '{', '}');
+    if (end > braceAt) {
+      body = afterParams.slice(braceAt + 1, end);
+      bodyStart += braceAt + 1;
+    }
+  }
+
+  // Positions came from the blanked structure; the calls are read from `safe`
+  // at the same offsets, so a call inside a template interpolation counts.
+  const source = safe.slice(bodyStart, bodyStart + body.length);
+  const refs: UnresolvedRef[] = handlerCallNames(source).map((name) => (
+    { fromNodeId, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language }
+  ));
+  refs.push(...replyRefs(safe, bodyStart, bodyStart + body.length, fromNodeId, filePath, language));
+  return refs;
 }
 
 /** `/api` + `/users` → `/api/users`; `/api/` + `/` → `/api`. */
@@ -459,12 +653,20 @@ function isMiddlewareName(name: string): boolean {
 /**
  * Resolve middleware reference using name-based lookup
  */
+/** Node kinds a middleware can be declared as. */
+const MIDDLEWARE_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'variable', 'constant', 'class']);
+
 function resolveMiddleware(
   name: string,
-  context: ResolutionContext
+  context: ResolutionContext,
+  fromFile?: string,
 ): string | null {
-  // Try exact name first
-  const candidates = context.getNodesByName(name);
+  // Try exact name first — the calling file's own first. A middleware is a
+  // declaration (a function, a value, a class), never the file's import of a
+  // package (`import cors from 'cors'`) nor a heading or a module node.
+  const candidates = context.getNodesByName(name)
+    .filter((n) => MIDDLEWARE_KINDS.has(n.kind))
+    .sort((a, b) => Number(b.filePath === fromFile) - Number(a.filePath === fromFile));
   const match = candidates.find((n) =>
     n.name.toLowerCase() === name.toLowerCase() ||
     n.name.toLowerCase() === name.replace(/Middleware$/i, '').toLowerCase()
@@ -474,7 +676,7 @@ function resolveMiddleware(
   // Try without Middleware suffix
   const baseName = name.replace(/Middleware$/i, '');
   if (baseName !== name) {
-    const baseCandidates = context.getNodesByName(baseName);
+    const baseCandidates = context.getNodesByName(baseName).filter((n) => MIDDLEWARE_KINDS.has(n.kind));
     const MIDDLEWARE_DIRS = ['/middleware/', '/middlewares/'];
     const preferred = baseCandidates.filter((n) =>
       MIDDLEWARE_DIRS.some((d) => n.filePath.includes(d))

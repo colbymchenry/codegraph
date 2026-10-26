@@ -41,8 +41,8 @@ Answer, in aggregate and anonymously:
 1. **The schema is the allowlist.** Client sends only the events below; the ingest Worker
    validates against the same allowlist and drops anything else. Adding a field = PR that
    edits this doc + `TELEMETRY.md` + the Worker allowlist together.
-2. **Telemetry may never cost the user anything**: zero added latency on the MCP tool-call
-   hot path (the repo's core invariant), zero new npm dependencies (global `fetch`, Node ≥18),
+2. **Telemetry may never cost the user anything**: no network requests or queue writes on the MCP tool-call
+   hot path (only a small local consent-file read), zero new npm dependencies (global `fetch`, Node ≥18),
    zero bytes on stdout (stdio is the MCP protocol channel), zero retries, zero error noise.
    Every failure mode is silence.
 3. **Off is off.** When disabled, no process opens a socket to the telemetry endpoint — not
@@ -53,7 +53,7 @@ Answer, in aggregate and anonymously:
 
 ## Events
 
-Common envelope on every batch (computed once per process):
+Common envelope on every batch (identity revalidated before each request):
 
 | field | example | notes |
 |---|---|---|
@@ -131,7 +131,12 @@ Surfaces:
   `codegraph collects anonymous usage stats (no code or paths) — "codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: TELEMETRY.md`
 - **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current
   state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything,
-  including the machine ID.
+  including the machine ID. Turning telemetry off stores a null `machine_id` and removes
+  both queued and claimed unsent data. Turning it back on mints a new ID; processes
+  discard memory from the previous identity even if they missed the off/on transition.
+  Requests already in flight cannot be recalled, but every later request chunk and
+  requeue checks current consent and identity again. Config writes use atomic replacement
+  so concurrent readers never see a half-written choice.
 
 `~/.codegraph/telemetry.json`:
 
@@ -154,7 +159,8 @@ other filenames.)
 New module `src/telemetry/` (single small module, no deps):
 
 - **Counters in memory** — recording a tool call/CLI command is an in-memory increment.
-  Nothing on the hot path touches disk or network. MCP tool handlers call
+  The small consent file is refreshed before recording so another process's opt-out is
+  observed. No queue writes or network requests run on this path. MCP tool handlers call
   `telemetry.count('mcp_tool', name, ok)` and move on.
 - **Buffer** — counters persist (debounced, async) to `~/.codegraph/telemetry-queue.jsonl`.
   Hard cap ~256 KB; on overflow drop oldest lines. Corrupt buffer → truncate, never throw.
@@ -189,7 +195,7 @@ with the npm package (excluded by the `files` allowlist):
   The Worker makes **no outbound requests** — nothing is forwarded to a third-party
   analytics vendor, so there is no vendor-side privacy setting to get wrong and no second
   copy of the data anywhere. The complete stored schema is
-  [`telemetry-worker/migrations/0001_init.sql`](../../telemetry-worker/migrations/0001_init.sql),
+  [`telemetry-worker/migrations/`](../../telemetry-worker/migrations/),
   checked in for the same reason the Worker's source is public.
 - The write is off the response path (`ctx.waitUntil`, one `batch()` = one transaction) and
   deliberately **fail-silent**: a D1 error is logged as counts only, never the payload, and
@@ -199,8 +205,10 @@ with the npm package (excluded by the `files` allowlist):
   counts (`daily_machines`, `daily_event_counts`, `daily_dim_counts`) and re-runs the two
   days before it, since offline clients ship completed-day rollups late. Aggregation is
   `INSERT … SELECT … ON CONFLICT DO UPDATE` inside D1 — no event row crosses the wire, and
-  re-running a day is a no-op rather than a double count. The same job **purges raw
-  `events` older than `RETENTION_DAYS`** (90; a var in `wrangler.jsonc`). Rollups and
+  re-running a day is a no-op rather than a double count. Usage counters are stored one
+  row per machine × day × tool (`usage_daily`), each upload adding to its row, so storage
+  does not depend on how often a client uploads. The same job **purges raw `events` and
+  `usage_daily` rows older than `RETENTION_DAYS`** (90; a var in `wrangler.jsonc`). Rollups and
   `machine_days`/`machine_first_seen` are kept forever, so shortening the window costs
   ad-hoc drill-back, never a chart.
 - The Worker remains the seam: changing storage later is a Worker change, not a client
@@ -224,9 +232,9 @@ Full documentation is [`telemetry-dashboard/README.md`](../../telemetry-dashboar
   `telemetry-worker/scripts/smoke-cutover.sh` exists to cover — a mismatch there is silent,
   showing up as a panel that reads zero forever rather than as an error.
 - **Reads rollups, not raw events**, so a chart stays correct for days whose raw rows have
-  been purged. `/api/activation` is the one exception — "did this machine ever run an index"
-  is not a daily aggregate — so it reads raw `events` and is bounded by the retention window,
-  which it reports as `raw_events_from`.
+  been purged. The activation funnel's "did this machine ever run an index" is not a daily
+  aggregate, so it reads `machine_first_seen.first_index_day` instead, which the ingest Worker
+  lowers as each index event is stored and the nightly cron re-derives from raw `events`.
 - **Auth is a shared password and a signed cookie**, sized for exactly two people:
   `ADMIN_PASSWORD` + `SESSION_SECRET` as Worker secrets, constant-time compare, HMAC-signed
   cookie with no session store, everything except `/login` and `robots.txt` gated. Rotating

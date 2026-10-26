@@ -1,0 +1,11 @@
+-- codegraph telemetry — drop the per-machine index on `events`.
+--
+-- Its only query reader was the dashboard's old activation join, which now reads
+-- machine_first_seen.first_index_day. Dropping it saves a row write per stored event,
+-- and it was the first storage lever the 0001 footer names.
+--
+-- A separate migration, applied AFTER the legacy usage rows are folded out of
+-- `events` (see "Backfilling first_index_day" in README.md): with ~30M rows in the
+-- table, dropping the index ran past D1's per-query time limit and was rolled back.
+-- On the folded table it is quick.
+DROP INDEX IF EXISTS events_machine_day;

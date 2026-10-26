@@ -205,3 +205,80 @@ class BatteryModule : Module() {
     expect(pair.c).toBeGreaterThanOrEqual(2); // swift->kotlin AND kotlin->swift
   });
 });
+
+describe('Expo Modules — a JS binding named for its role, not its module', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'expo-modules-binding-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('expo-camera: `CameraManager.fn()` on `export default requireNativeModule<T>("ExpoCamera")` reaches the module’s functions', async () => {
+    const write = (rel: string, content: string) => {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    };
+    write('package.json', '{"dependencies":{"expo-modules-core":"^1.0.0","expo":"*"}}');
+    write('ios/CameraViewModule.swift', `import ExpoModulesCore
+public final class CameraViewModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("ExpoCamera")
+    AsyncFunction("launchScanner") { (options: ScannerOptions) in }
+    AsyncFunction("dismissScanner") { }
+  }
+}
+`);
+    write('android/src/main/java/expo/modules/camera/CameraViewModule.kt', `package expo.modules.camera
+class CameraViewModule : Module() {
+  override fun definition() = ModuleDefinition {
+    Name("ExpoCamera")
+    AsyncFunction("launchScanner") { options: ScannerOptions -> }
+    AsyncFunction("dismissScanner") { }
+  }
+}
+`);
+    write('src/Camera.types.ts', `import { NativeModule } from 'expo';
+export declare class CameraNativeModule extends NativeModule {
+  readonly isAvailableAsync: () => Promise<boolean>;
+}
+`);
+    write('src/ExpoCameraManager.ts', `import { requireNativeModule } from 'expo';
+import type { CameraNativeModule } from './Camera.types';
+
+export default requireNativeModule<CameraNativeModule>('ExpoCamera');
+`);
+    write('src/CameraView.tsx', `import CameraManager from './ExpoCameraManager';
+
+export default class CameraView {
+  static async isAvailableAsync(): Promise<boolean> {
+    return CameraManager.isAvailableAsync();
+  }
+  static async launchScanner(options: object): Promise<void> {
+    await CameraManager.launchScanner(options);
+  }
+}
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      const view = cg.getNodesInFile('src/CameraView.tsx');
+      const from = (name: string) => view.find((n) => n.name === name && n.kind === 'method')!;
+      const callees = (name: string) =>
+        cg
+          .getOutgoingEdges(from(name).id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => cg.getNode(e.target)!)
+          .map((n) => `${n.language}:${n.qualifiedName.split('::').pop()}`)
+          .sort();
+      // Both platforms' `launchScanner`, not CameraView's own.
+      expect(callees('launchScanner')).toEqual(['kotlin:ExpoCamera.launchScanner', 'swift:ExpoCamera.launchScanner']);
+      // Declared natively nowhere here: the type the binding is given, never the caller itself.
+      expect(callees('isAvailableAsync')).toEqual(['typescript:isAvailableAsync']);
+      const target = cg.getOutgoingEdges(from('isAvailableAsync').id).find((e) => e.kind === 'calls')!;
+      expect(cg.getNode(target.target)!.filePath).toBe('src/Camera.types.ts');
+    } finally {
+      cg.close();
+    }
+  });
+});

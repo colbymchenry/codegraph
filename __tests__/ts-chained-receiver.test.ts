@@ -3,7 +3,8 @@
  * .get(k)`, `document.body.querySelector(s)` — ends in a platform API. Emitting
  * the bare method name for it let every such call exact-match whatever project
  * symbol shared the name, so a storage wrapper's `get` called itself (#1707).
- * Those are dropped, as are untyped identifier chains (#1566). The existing
+ * Those calls stay unresolved, as do untyped identifier chains (#1566);
+ * their qualified source references remain available for effect reporting. The existing
  * `window.MyNs.run()` and `this.<field>.m()` paths remain outside that guard.
  */
 

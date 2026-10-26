@@ -15,6 +15,7 @@
  */
 
 import type { ExtractionResult, Language } from '../../types';
+import { commonJsRequireRefs } from '../commonjs-requires';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
@@ -140,6 +141,32 @@ function preParsedSource(filePath: string, source: string, language: Language): 
   return pre ? pre(source, filePath) : source;
 }
 
+/**
+ * Whether the file's re-exports keep their statements as written while the
+ * kernel reads the preParsed bytes (`reExportAsWritten`: TypeScript's
+ * `export type *`, #2474). The decoded result then takes those import nodes'
+ * signatures from `source`, as TreeSitterExtractor does, and the undecoded
+ * fast path steps aside for it.
+ */
+function keepsReExportsAsWritten(source: string, pre: string, language: Language): boolean {
+  return pre !== source && EXTRACTORS[language]?.reExportAsWritten?.(source) === true;
+}
+
+/** Each re-export import node's signature, read from `source` by the node's span. */
+function restoreReExportSignatures(result: ExtractionResult, source: string): void {
+  let lineStarts: number[] | null = null;
+  for (const node of result.nodes) {
+    if (node.kind !== 'import' || !node.signature?.startsWith('export')) continue;
+    if (!lineStarts) {
+      lineStarts = [0];
+      for (let i = source.indexOf('\n'); i !== -1; i = source.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+    }
+    const start = lineStarts[node.startLine - 1]! + node.startColumn;
+    const end = lineStarts[node.endLine - 1]! + node.endColumn;
+    node.signature = source.slice(start, end).trim();
+  }
+}
+
 function isRouted(language: Language): boolean {
   const env = process.env.CODEGRAPH_KERNEL_LANGS;
   if (env === undefined || env === '') return DEFAULT_ROUTED.has(language);
@@ -202,7 +229,9 @@ export interface KernelRawResult {
  * so the main thread never materializes per-node objects. Returns null under
  * exactly the conditions tryKernelExtract does, PLUS when the language has a
  * registered post() pass (post passes operate on decoded results, so those
- * languages keep the decoded path).
+ * languages keep the decoded path), and for a file whose re-exports keep their
+ * statements as written (keepsReExportsAsWritten), which the decoded path
+ * restores.
  */
 export function tryKernelExtractRaw(
   filePath: string,
@@ -214,6 +243,8 @@ export function tryKernelExtractRaw(
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
   const pre = preParsedSource(filePath, source, language);
+  // Its signatures come from the source as written, which needs the decoded path.
+  if (keepsReExportsAsWritten(source, pre, language)) return null;
   try {
     const buffers = kernel.extractFile(filePath, pre, language);
     const meta = buffers.meta;
@@ -269,6 +300,8 @@ export function materializeKernelResult(
     language
   );
   decoded.durationMs = result.durationMs;
+  // References read beside the tables (a CommonJS `require`) ride on the transport.
+  if (result.unresolvedReferences.length > 0) decoded.unresolvedReferences.push(...result.unresolvedReferences);
   return decoded;
 }
 
@@ -293,7 +326,10 @@ export function tryKernelExtract(
   try {
     const buffers = kernel.extractFile(filePath, pre, language);
     const result = decodeExtractBuffers(buffers, filePath, language);
+    if (keepsReExportsAsWritten(source, pre, language)) restoreReExportSignatures(result, source);
     POST_PASSES[language]?.(result, source);
+    // Read beside the tables, as TreeSitterExtractor does (a CommonJS `require`).
+    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, language));
     result.durationMs = Date.now() - t0;
     return result;
   } catch (err) {

@@ -48,6 +48,13 @@ export const NODE_KINDS = [
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
+ * The docstring both engines give a Java record's implicit component accessor
+ * (languages/java.ts, codegraph-kernel/src/java.rs). The resolver reaches one
+ * only through what types its receiver, never by a name-only guess.
+ */
+export const IMPLICIT_RECORD_ACCESSOR_DOC = 'Implicit record component accessor';
+
+/**
  * Types of edges (relationships) between nodes.
  *
  * Runtime-iterable like NODE_KINDS. The ARRAY ORDER is part of the native
@@ -264,6 +271,24 @@ export interface FileRecord {
    * `undefined` as "content signal unknown, fall back to the path check".
    */
   generated?: boolean;
+}
+
+/**
+ * Indexed files whose symbols are missing even though their content hash is
+ * current — what a hash comparison alone calls "up to date" (#2336). Paths are
+ * project-relative and sorted.
+ */
+export interface IndexHealth {
+  /**
+   * Files `sync` re-indexes: stored while their grammar could not load (#2335)
+   * or stored with no nodes and no recorded reason (#1541).
+   */
+  needsReindex: string[];
+  /**
+   * Files with a recorded parse error and no symbols from it. Deterministic:
+   * they stay this way until the file (or the parser) changes.
+   */
+  parseErrors: string[];
 }
 
 // =============================================================================

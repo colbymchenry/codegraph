@@ -44,6 +44,12 @@
       </p>
     </section>
 
+    <!-- Filled from /api/meta when a writer has stopped: the ingest worker (no new
+         events) or the nightly rollup (numbers stuck on an old day). Both have
+         failed silently before, so the page says so instead of drawing old data
+         as if it were current. -->
+    <section class="data-warning" id="data-warning" role="status" hidden></section>
+
     <main class="grid" id="grid"></main>
 
     <script src="/vendor/chart.umd.js"></script>

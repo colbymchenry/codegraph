@@ -30,11 +30,12 @@
 import * as fs from 'fs';
 import type CodeGraph from '../../index';
 import type { Edge, Node } from '../../types';
-import { routeRoots } from './route-roots';
+import { routeLayouts, routeRoots } from './route-roots';
 import { resolveProjectFile } from '../security';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import { createWhenReader } from './when';
 import { toNodeRef, type WireNodeRef } from './wire';
+import { escapeRegExp } from '../../utils';
 
 // =============================================================================
 // Wire shapes
@@ -194,6 +195,9 @@ const SHARED_CHROME_MIN = 3;
 
 /** True when the edge's destination is written at the line the edge points to. */
 function writtenHere(edge: Edge, holder: Node): boolean {
+  // An Angular template names its destination where it is written — in a
+  // file of its own, beside the component the edge leaves from.
+  if ((edge.metadata as Record<string, unknown> | undefined)?.template === true) return true;
   const at = (edge.metadata as Record<string, unknown> | undefined)?.registeredAt;
   if (typeof at !== 'string') return edge.provenance !== 'heuristic';
   return at === `${holder.filePath}:${edge.line}`;
@@ -215,7 +219,7 @@ function writtenHere(edge: Edge, holder: Node): boolean {
  * Entry points, which is the list of what a request or a user can arrive at.
  */
 function isScreenRoute(route: Node): boolean {
-  return route.name.startsWith('/') && !route.filePath.includes('/server/api/');
+  return route.name.startsWith('/') && !`/${route.filePath}`.includes('/server/api/');
 }
 
 export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<WireScreensPayload> {
@@ -269,6 +273,15 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
     const serves = screenOfComponent.get(root.node.id);
     if (serves) serves.push(routeId);
     else screenOfComponent.set(root.node.id, [routeId]);
+  }
+  // A layout serves every screen nested in it: ProfileComponent's tabs are on
+  // both `/profile/:username` and `/profile/:username/favorites`.
+  for (const [routeId, layouts] of routeLayouts(cg, routes)) {
+    for (const layout of layouts) {
+      const serves = screenOfComponent.get(layout);
+      if (!serves) screenOfComponent.set(layout, [routeId]);
+      else if (!serves.includes(routeId)) serves.push(routeId);
+    }
   }
   const nodesById = cg.getNodesByIds([...componentOf.values()].map((n) => n.id).concat(navEdges.map((e) => e.source)));
 
@@ -574,7 +587,7 @@ function mentionsOf(cg: CodeGraph, projectRoot: string, value: Node): Edge[] {
     .slice(0, MAX_MENTION_FILES);
   if (importers.length === 0) return out;
   const files = cg.getNodesByIds(importers);
-  const word = new RegExp(`(?<![\\w$.])${value.name.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const word = new RegExp(`(?<![\\w$.])${escapeRegExp(value.name)}(?![\\w$])`);
   for (const file of files.values()) {
     if (file.kind !== 'file') continue;
     const found = findIndexedFile(cg, file.filePath.replace(/\\/g, '/'));

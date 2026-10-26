@@ -123,7 +123,8 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
- *   escapes the root
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,
@@ -143,23 +144,43 @@ export function validatePathWithinRoot(
   //    The indexing read path (allowSymlinkEscape) skips only this rejection so
   //    it stays consistent with the directory walk, which already followed the
   //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
   try {
-    const realRoot = fs.realpathSync(normalizedRoot);
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    return null;
+  }
+
+  try {
     const realResolved = fs.realpathSync(resolved);
     if (options?.allowSymlinkEscape) {
       return realResolved;
     }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
-    // ENOENT: the path doesn't exist yet (a file about to be written, or an
-    // index entry for a since-deleted file) — no symlink to follow, and the
-    // lexical check already passed, so allow the lexical path. Any other
-    // resolution failure (ELOOP, EACCES, …) is treated as unsafe → reject.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return resolved;
-    }
-    return null;
+    // A missing leaf may still sit below an EXISTING symlink. Resolve the
+    // nearest existing ancestor before allowing a write path: otherwise
+    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+    // passes the lexical check and mkdir follows the symlink out of the root.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
   }
+
+  let ancestor = path.dirname(resolved);
+  while (isWithinDir(ancestor, normalizedRoot)) {
+    try {
+      const realAncestor = fs.realpathSync(ancestor);
+      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
+        return resolved;
+      }
+      return null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      ancestor = parent;
+    }
+  }
+  return null;
 }
 
 /**
@@ -232,6 +253,17 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
+ * Escape `text` to match itself literally inside a regular expression.
+ * Symbol names are not always plain words: C++'s `operator++` and
+ * `operator()`, Scala's `++`, a Kotlin name in backticks. Pass every name
+ * through this before writing it into a `new RegExp(…)` pattern, or the name
+ * is read as pattern syntax and may not compile at all.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Cross-process file lock using a lock file with PID tracking.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from
@@ -240,9 +272,6 @@ export function normalizePath(filePath: string): string {
 export class FileLock {
   private lockPath: string;
   private held = false;
-
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
   constructor(lockPath: string) {
     this.lockPath = lockPath;
@@ -257,18 +286,16 @@ export class FileLock {
       try {
         const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
         const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // A long sync can hold the lock for hours. Its age says nothing about
+        // whether the writer is still alive; only a dead PID is stale.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Stale lock (dead process or malformed PID) - remove it
         fs.unlinkSync(this.lockPath);
       } catch (err) {
         if (err instanceof Error && err.message.includes('locked by another')) {

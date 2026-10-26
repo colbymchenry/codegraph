@@ -6,7 +6,8 @@
 //! decorators (`@staticmethod` yes, `@app.route(...)` no — python's `call`
 //! kind isn't `call_expression`), module-level assignments always extract as
 //! `variable` (no isConst hook), and `self.method` fn-ref candidates carry the
-//! BARE attribute name. Python is not a TYPE_ANNOTATION language — no type
+//! full receiver path (#1820).
+//! Python is not a TYPE_ANNOTATION language — no type
 //! refs anywhere. Files with parse errors defer to wasm.
 
 use crate::buffers::{
@@ -20,6 +21,93 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
+
+// Keep body-docstring selection and cleaning in sync with languages/python.ts.
+fn body_docstring(node: Node, src: &str) -> Option<String> {
+    let body = if node.kind() == "module" { node } else { node.child_by_field_name("body")? };
+    let first = (0..body.named_child_count())
+        .filter_map(|i| body.named_child(i))
+        .find(|c| c.kind() != "comment")?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    if first.named_child_count() != 1 || (0..first.child_count())
+        .filter_map(|i| first.child(i)).any(|c| c.kind() == ",") {
+        return None;
+    }
+    let mut literal = first.named_child(0)?;
+    while literal.kind() == "parenthesized_expression" {
+        literal = (0..literal.named_child_count())
+            .filter_map(|i| literal.named_child(i))
+            .find(|c| c.kind() != "comment")?;
+    }
+    let strings = if literal.kind() == "concatenated_string" {
+        (0..literal.named_child_count()).filter_map(|i| literal.named_child(i))
+            .filter(|c| c.kind() != "comment").collect::<Vec<_>>()
+    } else {
+        vec![literal]
+    };
+    let mut raw = String::new();
+    for string in strings {
+        if string.kind() != "string" {
+            return None;
+        }
+        let start = (0..string.named_child_count()).filter_map(|i| string.named_child(i))
+            .find(|c| c.kind() == "string_start")?;
+        if src[start.byte_range()].bytes().any(|b| matches!(b, b'b' | b'B' | b'f' | b'F')) {
+            return None;
+        }
+        if !(0..string.named_child_count()).filter_map(|i| string.named_child(i))
+            .any(|c| c.kind() == "string_end") {
+            return None;
+        }
+        for i in 0..string.named_child_count() {
+            if let Some(content) = string.named_child(i).filter(|c| c.kind() == "string_content") {
+                raw.push_str(&src[content.byte_range()]);
+            }
+        }
+    }
+    let cleaned = dedent_docstring(&raw);
+    if cleaned.is_empty() { None } else { Some(cleaned) }
+}
+
+fn docstring_space(c: char) -> bool {
+    // Match JavaScript trim, including BOM but excluding NEXT LINE.
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+fn dedent_docstring(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<String> = normalized.split('\n').map(|line| {
+        let mut column = 0;
+        let mut expanded = String::new();
+        for c in line.chars() {
+            let width = if c == '\t' { 8 - column % 8 } else { 1 };
+            column += width;
+            if c == '\t' { expanded.push_str(&" ".repeat(width)); } else { expanded.push(c); }
+        }
+        expanded
+    }).collect();
+    let indent = lines.iter().skip(1).filter(|l| !l.trim_matches(docstring_space).is_empty())
+        .map(|l| l.chars().take_while(|c| docstring_space(*c)).count()).min().unwrap_or(0);
+    let out: Vec<String> = lines.iter().enumerate().map(|(i, l)| {
+        if i == 0 { l.trim_matches(docstring_space).to_string() } else {
+            l.chars().skip(indent).collect::<String>().trim_end_matches(docstring_space).to_string()
+        }
+    }).collect();
+    let start = out.iter().position(|l| !l.trim_matches(docstring_space).is_empty()).unwrap_or(out.len());
+    let end = out.iter().rposition(|l| !l.trim_matches(docstring_space).is_empty()).map_or(start, |i| i + 1);
+    out[start..end].join("\n")
+}
+
+fn docstring_for(node: Node, src: &str) -> Option<String> {
+    let preceding = preceding_docstring(node, src);
+    let body = body_docstring(node, src);
+    match (preceding, body) {
+        (Some(a), Some(b)) if !a.is_empty() => Some(format!("{a}\n\n{b}")),
+        (a, b) => b.or(a),
+    }
+}
 
 struct Scope {
     row: u32,
@@ -54,6 +142,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -84,6 +173,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -102,6 +192,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     let file_id = w.arena.put(&ids::file_node_id(file_path));
     let name_ref = w.arena.put(base_name);
     let qn_ref = w.arena.put(file_path);
+    let docstring = body_docstring(tree.root_node(), source)
+        .map(|doc| w.arena.put(&doc)).unwrap_or(NONE_STR);
     w.tables.push_node(&NodeRow {
         kind: node_kind_index("file").unwrap(),
         visibility: 0,
@@ -113,7 +205,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         name: name_ref,
         qualified_name: qn_ref,
         id: file_id,
-        docstring: NONE_STR,
+        docstring,
         signature: NONE_STR,
         decorators: NONE_STR,
         type_parameters: NONE_STR,
@@ -187,7 +279,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1;
 
         let qualified = {
@@ -338,8 +431,10 @@ impl<'t> Walker<'t> {
             self.extract_class(node);
             skip_children = true;
         } else if kind == "assignment" && !self.inside_class_like() {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The right-hand side extract_variable walked under the assigned
+            // name took its own candidates; the scan covers the rest.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "import_statement" || kind == "import_from_statement" {
             self.extract_import(node);
@@ -402,7 +497,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: docstring_for(node, self.src),
             signature: self.signature_of(node),
             is_async: Some(self.is_async(node)),
             is_static: Some(self.is_static(node)),
@@ -421,7 +516,7 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: docstring_for(node, self.src),
             signature: self.signature_of(node),
             is_async: Some(self.is_async(node)),
             is_static: Some(self.is_static(node)),
@@ -439,7 +534,7 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
-            docstring: preceding_docstring(node, self.src),
+            docstring: docstring_for(node, self.src),
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
@@ -471,7 +566,9 @@ impl<'t> Walker<'t> {
     }
 
     /// extractVariable's python branch: `left = right` at module scope.
-    fn extract_variable(&mut self, node: Node<'t>) {
+    /// Returns the right-hand side when it was walked under the assigned
+    /// name, for the declaration scan to skip.
+    fn extract_variable(&mut self, node: Node<'t>) -> Vec<usize> {
         let docstring = preceding_docstring(node, self.src);
         let left = node.child_by_field_name("left").or_else(|| node.named_child(0));
         let right = node.child_by_field_name("right").or_else(|| node.named_child(1));
@@ -496,16 +593,19 @@ impl<'t> Walker<'t> {
         // module-level `app = FastAPI()` / `handler = lambda: run()` dropped
         // every call on the right-hand side. A tuple target mints no symbol, so
         // its RHS is walked at the enclosing scope rather than lost.
+        let mut walked = Vec::new();
         if let Some(right) = right {
             match assigned {
                 Some((row, name)) => {
                     self.stack.push(Scope { row, kind: "variable", name });
                     self.visit_function_body(right);
                     self.stack.pop();
+                    walked.push(right.id());
                 }
                 None => self.visit_function_body(right),
             }
         }
+        walked
     }
 
     fn extract_import(&mut self, node: Node<'t>) {
@@ -638,6 +738,30 @@ impl<'t> Walker<'t> {
                         // TreeSitterExtractor.extractCall.
                         let Some(inner) = self.plain_inner_callee(r) else { return };
                         callee_name = format!("{inner}().{method_name}");
+                    } else if let Some(r) = receiver {
+                        // Any receiver shape the arms above do not claim — attribute
+                        // chain (`self.data.append`) and subscript (`d[k].append`).
+                        // The call-chain shape (`rows.setdefault(k, []).append(x)`)
+                        // is taken by the `<inner>().<method>` arm above (#1748),
+                        // which is matched first.
+                        // These used to fall through to a BARE method_name. A bare name
+                        // matching a common list/dict/str method (`append`, `get`,
+                        // `update`, ...) exact-matches an unrelated top-level project
+                        // function sharing that name, fabricating a call edge (#66,
+                        // same class as #1230/#1276). Keep the receiver's source text
+                        // as a qualifier so the ref can only resolve through
+                        // import/module-member resolution, never the bare-name
+                        // fallback; an unresolvable qualifier is a silent miss, never
+                        // a wrong edge. Mirrors TreeSitterExtractor.extractCall's
+                        // python branch — the whitespace collapse is JS `\s`
+                        // semantics, not `char::is_whitespace`, so both arms emit the
+                        // same bytes for the parity sweep.
+                        let receiver_text = collapse_js_whitespace(self.text(r));
+                        callee_name = if receiver_text.is_empty() {
+                            method_name.to_string()
+                        } else {
+                            format!("{receiver_text}.{method_name}")
+                        };
                     } else {
                         callee_name = method_name.to_string();
                     }
@@ -811,18 +935,16 @@ impl<'t> Walker<'t> {
         for v in values {
             let (name, anchor) = match v.kind() {
                 "identifier" => (self.text(v).to_string(), v),
-                // `self.handle_click` — object EXACTLY `self`; BARE attr name.
+                // Preserve only statically named member chains, as on WASM.
                 "attribute" => {
-                    let obj = v.child_by_field_name("object");
-                    let attr = v.child_by_field_name("attribute");
-                    match (obj, attr) {
-                        (Some(o), Some(a))
-                            if o.kind() == "identifier" && self.text(o) == "self" =>
-                        {
-                            (self.text(a).to_string(), a)
-                        }
-                        _ => continue,
-                    }
+                    let Some(attr) = v.child_by_field_name("attribute") else { continue };
+                    let name = self.text(v);
+                    if !name.split('.').all(|part| {
+                        !part.is_empty() && part.chars().enumerate().all(|(i, c)| {
+                            c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                        })
+                    }) { continue; }
+                    (name.to_string(), attr)
                 }
                 _ => continue,
             };
@@ -840,9 +962,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes ∪ the fixed arrow/lambda list — python's
@@ -859,7 +985,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -872,6 +998,7 @@ impl<'t> Walker<'t> {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in cands {
             if !c.name.starts_with("this.")
+                && !c.name.contains('.')
                 && !c.name.contains("::")
                 && !self.defined_fn_names.contains(&c.name)
                 && !self.imported_names.contains(&c.name)
@@ -1011,6 +1138,35 @@ fn is_stoplisted(name: &str) -> bool {
         "this" | "self" | "super" | "null" | "nil" | "true" | "false" | "undefined" | "new"
             | "NULL" | "nullptr" | "None"
     )
+}
+
+/// `s.replace(/\s+/g, ' ').trim()` with JavaScript's `\s` class, so a receiver
+/// qualifier is byte-identical to the one TreeSitterExtractor emits. Rust's
+/// `char::is_whitespace` is NOT the same set: it counts U+0085 (NEL), which JS
+/// `\s` does not, and omits U+FEFF (ZWNBSP), which JS `\s` includes.
+fn collapse_js_whitespace(s: &str) -> String {
+    fn is_js_space(c: char) -> bool {
+        matches!(
+            c,
+            '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{feff}'
+                | '\u{2028}' | '\u{2029}'
+                | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+        )
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for c in s.chars() {
+        if is_js_space(c) {
+            in_space = true;
+        } else {
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// LITERAL_RECEIVER_TYPES membership (shared table; python names among them).

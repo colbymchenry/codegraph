@@ -36,6 +36,7 @@ DELETE FROM daily_machines;
 DELETE FROM machine_days;
 DELETE FROM machine_first_seen;
 DELETE FROM events;
+DELETE FROM usage_daily;
 
 -- ---------------------------------------------------------------------------
 -- install — 12, one per machine on its first day
@@ -116,6 +117,12 @@ SELECT machine_id, min(day) FROM events GROUP BY machine_id;
 
 INSERT INTO daily_machines (day, machines, prod_machines)
 SELECT day, count(*), coalesce(sum(prod), 0) FROM machine_days GROUP BY day;
+
+-- The activation funnel's input: each machine's earliest index day (FIRST_INDEX_DAY).
+-- m04 and m06 never index, so theirs stays NULL.
+UPDATE machine_first_seen
+   SET first_index_day = (SELECT min(day) FROM events e
+                           WHERE e.machine_id = machine_first_seen.machine_id AND e.event = 'index');
 
 INSERT INTO daily_event_counts (day, event, count, machines)
 SELECT day, event,

@@ -108,6 +108,21 @@ void Widget::Tick(float Delta) { Health += Delta; }
 Config GlobalConfig;
 int build_number = 7;
 
+// class/struct/union/enum definitions in a declaration's type — nodes beside
+// the variables; an unnamed one takes its first variable's name
+void on_open() {}
+void on_close() {}
+namespace decl_types {
+/** The handler registry. */
+struct Registry {
+  int size() const { return 2; }
+  void (*handlers[2])() = {&on_open, &on_close};
+} registry;
+class Bar { void g() {} } bar, *pbar;
+static struct { int retries; } settings;
+enum { kIdle, kBusy } state;
+}  // namespace decl_types
+
 template <typename T>
 T compute_seed(T v) {
   return v + 1;
@@ -140,3 +155,19 @@ float drive() {
   (void)m;
   return r + f + flags + leg;
 }
+// A function named past its noexcept/throw/requires clauses.
+namespace clauses {
+template <template <typename, typename> class Ser>
+class Json {
+ public:
+  template <typename T, typename U = T>
+  Json(T&& val) noexcept(noexcept(Ser<U>::to_json(*this, val))) {
+    Ser<U>::to_json(*this, val);
+  }
+  void Reserve(int n) throw(std::bad_alloc) {}
+};
+template <typename T>
+T Twice(T v) requires std::integral<T> {
+  return v * 2;
+}
+}  // namespace clauses

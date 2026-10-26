@@ -42,20 +42,16 @@ impl Variant {
         }
     }
     /// TS-family (typescript/tsx): type annotations, interfaces, enums,
-    /// aliases, visibility, isStatic. The JS family lacks all of those hooks.
+    /// aliases, visibility. The JS family lacks all of those hooks.
     fn is_ts(self) -> bool {
         matches!(self, Variant::Typescript | Variant::Tsx)
-    }
-    /// VALUE_REF_LANGS includes typescript/tsx/javascript but NOT jsx.
-    fn value_refs(self) -> bool {
-        !matches!(self, Variant::Jsx)
     }
 }
 
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
 fn is_method_type(v: Variant, kind: &str) -> bool {
     kind == "method_definition"
-        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature"))
+        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature" | "abstract_method_signature"))
         || (!v.is_ts() && kind == "field_definition")
 }
 
@@ -78,7 +74,7 @@ fn is_property_type(v: Variant, kind: &str) -> bool {
 /// `function stop` beside the real `Handle::stop`. Mirrors the TS extractor's
 /// SIGNATURE_METHOD_NODE_TYPES (extraction/tree-sitter.ts).
 fn is_signature_method_type(kind: &str) -> bool {
-    kind == "method_signature"
+    matches!(kind, "method_signature" | "abstract_method_signature")
 }
 
 fn is_function_type(kind: &str) -> bool {
@@ -86,7 +82,16 @@ fn is_function_type(kind: &str) -> bool {
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
-    kind == "class_declaration" || (v.is_ts() && kind == "abstract_class_declaration")
+    kind == "class_declaration" || kind == "class" || (v.is_ts() && kind == "abstract_class_declaration")
+}
+
+/// Whether `node` is a class to extract: a class declaration, or a class
+/// expression (`class`) with a name, `register(class Widget extends Base
+/// {…})` (#2499); an anonymous one is passed over. Mirrors
+/// TreeSitterExtractor.isClassTypeNode.
+fn is_class_node(v: Variant, node: Node) -> bool {
+    let kind = node.kind();
+    is_class_type(v, kind) && (kind != "class" || node.child_by_field_name("name").is_some())
 }
 
 fn is_variable_type(kind: &str) -> bool {
@@ -136,6 +141,24 @@ fn is_vue_collection_name(name: &str) -> bool {
     matches!(name, "actions" | "mutations" | "getters")
 }
 
+/// OBJECT_MEMBER_FUNCTION_TYPES (tree-sitter.ts, #2300): the function values an
+/// owned object literal's member can hold.
+fn is_object_member_function(kind: &str) -> bool {
+    matches!(kind, "arrow_function" | "function_expression" | "generator_function")
+}
+
+/// STATIC_OBJECT_KEY_TYPES (tree-sitter.ts, #2300): keys that name a member — a
+/// computed `[expr]` key names nothing static.
+fn is_static_object_key(kind: &str) -> bool {
+    matches!(kind, "property_identifier" | "string" | "number")
+}
+
+/// HOST_GLOBAL_ROOTS (tree-sitter.ts, #2300): `window.App = {…}` defines the
+/// global `App`. (`self` is usually `var self = this` in page code, not the global.)
+fn is_host_global_root(name: &str) -> bool {
+    matches!(name, "window" | "globalThis")
+}
+
 /// One scope-stack entry (TS keeps node IDs; rows are our equivalent).
 struct Scope {
     row: u32,
@@ -153,6 +176,9 @@ struct Extra {
     is_async: Option<bool>,
     is_static: Option<bool>,
     qualified_name: Option<String>,
+    /// Never a value-read target: a local, or an object hung on a dotted path
+    /// (createNode's `valueTarget = false`, #2300).
+    not_value_target: bool,
 }
 
 struct ValueScope<'t> {
@@ -167,6 +193,7 @@ pub struct Walker<'t> {
     variant: Variant,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     /// Node id string per row. Rows are unique but IDS COLLIDE for same
@@ -184,6 +211,12 @@ pub struct Walker<'t> {
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
     vue_store_file: Option<bool>,
+    /// An object literal hung on a path (`window.App = {…}`) is qualified by
+    /// the path, and so is what it holds (#2300): row → that qualified name.
+    /// Mirrors TreeSitterExtractor.objectPathOwners.
+    object_path_owners: HashMap<u32, String>,
+    /// ownsObjectLiterals: false for a generated or minified bundle (#2300).
+    owns_objects: bool,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -222,6 +255,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         variant,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -232,6 +266,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
         vue_store_file: None,
+        object_path_owners: HashMap::new(),
+        owns_objects: !util::is_generated_file(file_path) && !util::is_minified_content(file_path, source),
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -348,7 +384,9 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
+        let value_target = !extra.not_value_target;
 
         // endLine body extension: resolveBody only (TS/JS: function-valued
         // class fields whose body nests in the arrow / HOF-wrapped arrow).
@@ -366,6 +404,13 @@ impl<'t> Walker<'t> {
         let qualified = extra.qualified_name.unwrap_or_else(|| {
             let mut parts: Vec<&str> = Vec::new();
             for s in &self.stack {
+                // A path-hung object literal qualifies what it holds by its
+                // path (`window.App::init`), which carries its own scope.
+                if let Some(path) = self.object_path_owners.get(&s.row) {
+                    parts.clear();
+                    parts.push(path);
+                    continue;
+                }
                 if s.kind != "file" {
                     parts.push(&s.name);
                 }
@@ -431,18 +476,16 @@ impl<'t> Walker<'t> {
         if kind == "function" || kind == "method" {
             self.defined_fn_names.insert(name.to_string());
         }
-        self.capture_value_ref_scope(kind, name, row, node);
+        self.capture_value_ref_scope(kind, name, row, node, value_target);
         Some(row)
     }
 
     // --- value references (captureValueRefScope / flushValueRefs) --------------
 
-    fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>) {
-        if !self.variant.value_refs() {
-            return;
-        }
+    fn capture_value_ref_scope(&mut self, kind: &'static str, name: &str, row: u32, node: Node<'t>, value_target: bool) {
         let target_kind_ok = kind == "constant" || kind == "variable";
-        if target_kind_ok
+        if value_target
+            && target_kind_ok
             && util::utf16_len(name) >= 3
             && util::has_upper_or_underscore().is_match(name)
         {
@@ -456,7 +499,9 @@ impl<'t> Walker<'t> {
                 *self.fs_value_counts.entry(name.to_string()).or_insert(0) += 1;
             }
         }
-        if matches!(kind, "function" | "method" | "constant" | "variable") {
+        // A React wrapper component reads values as a constant's declaration
+        // does (`${BaseMenuItemCSS}` in a styled template).
+        if matches!(kind, "function" | "method" | "constant" | "variable" | "component") {
             self.value_scopes.push(ValueScope { row, node, name: name.to_string() });
         }
     }
@@ -465,7 +510,7 @@ impl<'t> Walker<'t> {
         let scopes = std::mem::take(&mut self.value_scopes);
         let mut targets = std::mem::take(&mut self.fs_values);
         let counts = std::mem::take(&mut self.fs_value_counts);
-        if !self.variant.value_refs() || std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
+        if std::env::var("CODEGRAPH_VALUE_REFS").as_deref() == Ok("0") {
             return;
         }
         if targets.is_empty() || scopes.is_empty() || util::is_generated_file(self.file_path) {
@@ -571,9 +616,13 @@ impl<'t> Walker<'t> {
     }
 
     /// scanFnRefSubtree: capture-only walk of subtrees the main walkers skip.
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    /// `walked`: subtrees a body walk has already been through.
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: Option<&HashSet<usize>>) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        if walked.map(|w| w.contains(&node.id())).unwrap_or(false) {
             return;
         }
         let kind = node.kind();
@@ -585,7 +634,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -637,11 +686,22 @@ impl<'t> Walker<'t> {
         // Function-as-value capture — independent of the dispatch ladder.
         self.maybe_capture_fn_refs(node);
 
+        // `window.App = {…}` / `App.utils = {…}`: the object's functions are
+        // the path's members (#2300). Its whole subtree is handled there.
+        if kind == "assignment_expression" && self.extract_assigned_object_owner(node, true) {
+            return;
+        }
+
         if is_function_type(kind) {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
             self.extract_function(node, None);
             skip_children = true;
-        } else if is_class_type(self.variant, kind) {
+        } else if kind == "function_signature" && self.variant.is_ts() && is_ambient_function_signature(node, self.file_path) {
+            // A bodiless function that no implementation follows: a
+            // `declare function`, a function in a `declare module` body or a `.d.ts`.
+            self.extract_function(node, None);
+            skip_children = true;
+        } else if is_class_node(self.variant, node) {
             self.extract_class(node);
             skip_children = true;
         } else if is_method_type(self.variant, kind)
@@ -649,12 +709,16 @@ impl<'t> Walker<'t> {
         {
             if classify_ts_class_member(node) == Member::Property {
                 let prop = self.extract_property(node);
+                // The initializer walked under the property took its own
+                // candidates; the scan covers the rest of the field.
+                let mut walked: Option<HashSet<usize>> = None;
                 if let (Some((row, name)), Some(value)) = (prop, node.child_by_field_name("value")) {
                     self.stack.push(Scope { row, kind: "property", name });
                     self.visit_function_body(value);
                     self.stack.pop();
+                    walked = Some(HashSet::from([value.id()]));
                 }
-                self.scan_fn_ref_subtree(node, 0);
+                self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             } else {
                 self.extract_method(node);
             }
@@ -668,13 +732,19 @@ impl<'t> Walker<'t> {
         } else if self.variant.is_ts() && kind == "type_alias_declaration" {
             skip_children = self.extract_type_alias(node);
         } else if is_variable_type(kind) && !self.inside_class_like() {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // An initializer extract_variable walked under the symbol it
+            // declares (a constant's, a component wrapper's) captured its own
+            // candidates; the scan skips it.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, walked.as_ref());
             skip_children = true;
         } else if kind == "import_statement" {
             self.extract_import(node);
         } else if kind == "export_statement" && node.child_by_field_name("source").is_some() {
-            // Re-export: `export { X } from './y'`.
+            // Re-export: `export { X } from './y'`, `export * from './y'`. It
+            // imports the module as `import … from` does (an import node and a
+            // reference to the module), then links each re-exported name.
+            self.extract_import(node);
             self.emit_re_export_refs(node);
         } else if kind == "export_statement" && self.looks_like_vue_store_file() {
             // Vuex MODULE default export (`export default { actions: {…} }`).
@@ -702,7 +772,7 @@ impl<'t> Walker<'t> {
             // says which member wants the type, where `Api → PageId` only said
             // the file did.
             self.extract_property(node);
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, None);
             skip_children = true;
         }
 
@@ -725,6 +795,16 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+
+        // A named object literal in a body (an IIFE's `const App = {…}`) owns
+        // its function members as one at module scope does, and so does
+        // `window.App = {…}` written in here (#2300). Each handles its subtree.
+        if kind == "variable_declarator" && self.extract_local_object_owner(node) {
+            return;
+        }
+        if kind == "assignment_expression" && self.extract_assigned_object_owner(node, false) {
+            return;
+        }
 
         if kind == "call_expression" {
             self.extract_call(node);
@@ -752,6 +832,13 @@ impl<'t> Walker<'t> {
                 self.extract_function(node, Some(bound));
                 return;
             }
+            // `const run = Effect.fn("Session.run")(function* () {…})` (#1747):
+            // the same declarator binding through a curried wrapper. Mirrors
+            // TreeSitterExtractor's curriedWrapperBoundName.
+            if let Some(bound) = self.curried_wrapper_bound_name(node) {
+                self.extract_function(node, Some(bound));
+                return;
+            }
             // `const handleClear = () => {…}` inside a body (#1669): named by
             // its declarator, like at module scope. Mirrors
             // TreeSitterExtractor's declaratorBoundFunction.
@@ -761,7 +848,7 @@ impl<'t> Walker<'t> {
             }
         }
 
-        if is_class_type(self.variant, kind) {
+        if is_class_node(self.variant, node) {
             self.extract_class(node);
             return;
         }
@@ -842,6 +929,71 @@ impl<'t> Walker<'t> {
         Some(self.text(name_node).to_string())
     }
 
+    /// The declarator name for an anonymous function passed to a CURRIED
+    /// wrapper call — `const NAME = factory(...)(function () {…})` — or the
+    /// property key when the call is an object member, `{ NAME: factory(...)(fn) }`;
+    /// else None.
+    ///
+    /// `react_hook_bound_name` above names a function through the declarator
+    /// that binds it; the shape is general, but that method is bounded to the
+    /// three React handler hooks. This is the same shape with a different,
+    /// equally decidable bound: the callee is itself a call, i.e. a factory
+    /// that returns the wrapper (#1747). Requiring that keeps it narrow —
+    /// `useMemo(|| …, [])` and `arr.map(…)` are single calls and stay
+    /// anonymous, exactly as before.
+    ///
+    /// Generators are admitted here and not in `react_hook_bound_name`: a
+    /// React handler is never a generator, while `function*` is the common
+    /// form in the ecosystem this shape comes from.
+    ///
+    /// Mirrors TreeSitterExtractor's curriedWrapperBoundName.
+    fn curried_wrapper_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        // The bound that replaces the hook allowlist: the thing being called
+        // is itself a call, so this is a curried wrapper's second application.
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != "call_expression" {
+            return None;
+        }
+        let binder = call.parent()?;
+        // `{ getMode: Effect.fn("…")(function* () {…}) }`: an object member is
+        // named by its property key, as extract_object_literal_functions names
+        // `key: () => {}`.
+        if binder.kind() == "pair" {
+            let key = binder.child_by_field_name("key")?;
+            let value = binder.child_by_field_name("value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            return Some(util::object_key_name(self.text(key)));
+        }
+        if binder.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = binder.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(name_node).to_string())
+    }
+
     /// extractName / extractNameRaw for the TS/JS configs.
     fn extract_name(&self, node: Node) -> String {
         // javascriptExtractor.resolveName: field_definition names its key the
@@ -901,7 +1053,8 @@ impl<'t> Walker<'t> {
         None
     }
 
-    /// isExported: walk the parent chain for an export_statement.
+    /// isExported: walk the parent chain for an export_statement, then ask
+    /// whether a `declare module '…'` / `declare global` body exports it.
     fn is_exported(&self, node: Node) -> bool {
         let mut cur = node.parent();
         while let Some(p) = cur {
@@ -910,7 +1063,7 @@ impl<'t> Walker<'t> {
             }
             cur = p.parent();
         }
-        false
+        is_ambient_export(node)
     }
 
     fn has_keyword_child(&self, node: Node, kw: &str) -> bool {
@@ -928,13 +1081,10 @@ impl<'t> Walker<'t> {
         self.has_keyword_child(node, "async")
     }
 
-    /// TS has an isStatic hook; JS does not (None = field absent).
+    /// A member's own `static` keyword: the isStatic hook TS and JS share
+    /// (hasStaticModifier, #2761).
     fn is_static(&self, node: Node) -> Option<bool> {
-        if self.variant.is_ts() {
-            Some(self.has_keyword_child(node, "static"))
-        } else {
-            None
-        }
+        Some(self.has_keyword_child(node, "static"))
     }
 
     fn is_const_decl(&self, node: Node) -> bool {
@@ -1005,6 +1155,79 @@ fn resolve_field_body(node: Node) -> Option<Node> {
 /// resolveBody ?? getChildByField(node, 'body') — the body-walk resolution.
 fn body_of(node: Node) -> Option<Node> {
     resolve_field_body(node).or_else(|| node.child_by_field_name("body"))
+}
+
+/// isAmbientExport (languages/typescript.ts): declared in a `declare module
+/// 'x' { … }` or `declare global { … }` body, which TypeScript exports without
+/// an `export` keyword unless the body holds an export declaration of its own.
+fn is_ambient_export(node: Node) -> bool {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "statement_block" && has_export_declaration(p) {
+            return false;
+        }
+        if p.kind() == "ambient_declaration" {
+            // `declare global` is the keyword and a bare block, with no field names.
+            for i in 0..p.child_count() {
+                if p.child(i).is_some_and(|c| c.kind() == "global") {
+                    return true;
+                }
+            }
+            if let Some(declared) = p.named_child(0) {
+                if declared.kind() == "module"
+                    && declared.child_by_field_name("name").is_some_and(|n| n.kind() == "string")
+                {
+                    return true;
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// isAmbientFunctionSignature (languages/typescript.ts): a bodiless
+/// `function_signature` that is a function's declaration, not an overload of
+/// an implementation that follows it — a `declare function`, one in a
+/// `declare global` body, a declaration file's (`.d.ts`, `.d.mts`, `.d.cts`)
+/// own, and one a declaration file's `declare module 'x'` body declares.
+/// Never a namespace's (`declare namespace`, `module Foo {}`), nor one in an
+/// ordinary module file's `declare module` body, an augmentation.
+fn is_ambient_function_signature(node: Node, file_path: &str) -> bool {
+    if node.kind() != "function_signature" {
+        return false;
+    }
+    let lower = file_path.to_ascii_lowercase();
+    let declaration_file = lower.ends_with(".d.ts") || lower.ends_with(".d.mts") || lower.ends_with(".d.cts");
+    let mut ambient = false;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "internal_module" => return false,
+            // `declare module 'x'`; `module Foo {}` is a namespace.
+            "module" => {
+                return declaration_file
+                    && p.child_by_field_name("name").is_some_and(|n| n.kind() == "string");
+            }
+            "ambient_declaration" => ambient = true,
+            _ => {}
+        }
+        cur = p.parent();
+    }
+    ambient || declaration_file
+}
+
+/// hasExportDeclaration: a statement that exports by name or by assignment
+/// (`export {…}`, `export =`, `export default x`), not by declaring.
+fn has_export_declaration(block: Node) -> bool {
+    for i in 0..block.named_child_count() {
+        if let Some(statement) = block.named_child(i) {
+            if statement.kind() == "export_statement" && statement.child_by_field_name("declaration").is_none() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn opt_str(arena: &mut Arena, s: Option<&str>) -> StrRef {

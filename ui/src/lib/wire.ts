@@ -377,6 +377,8 @@ export interface WireRoute {
   routeFile: string;
   routeLine: number;
   routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
 }
 
 export interface WireRoutes {
@@ -410,6 +412,8 @@ export interface WireEntryRoute {
   routeFile: string;
   routeLine: number;
   routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
 }
 
 export interface WireEntryFile extends WireNodeRef {
@@ -596,6 +600,7 @@ export interface WireFlowPayload {
 export interface WireMapModule {
   /** Directory path, the `(root files)` bucket, or a façade file's own path. */
   id: string;
+  /** What the box says: the id, a folder chain nothing forks in written `first/…/last`. */
   label: string;
   files: number;
   symbols: number;

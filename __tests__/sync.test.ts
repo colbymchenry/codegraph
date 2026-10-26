@@ -6,12 +6,47 @@
  * Claude Code hooks integration.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
-import CodeGraph from '../src/index';
+import CodeGraph, { LockUnavailableError } from '../src/index';
+import { QueryBuilder } from '../src/db/queries';
+import { __emitWatchEventForTests } from '../src/sync/watcher';
+
+/**
+ * Index `cg`'s project again from an empty database, as `codegraph index`
+ * does, and return the new handle: the graph a synced index has to match.
+ * indexAll over the synced index is no stand-in — it skips every file whose
+ * content is unchanged, so the edges the sync wrote survive it untouched.
+ */
+async function reindexFromScratch(cg: CodeGraph): Promise<CodeGraph> {
+  const root = cg.getProjectRoot();
+  // recreate unlinks the database file; a held handle makes that EBUSY on Windows.
+  cg.close();
+  const rebuilt = await CodeGraph.recreate(root);
+  await rebuilt.indexAll();
+  return rebuilt;
+}
+
+/**
+ * For a test that indexes twice in its body: on a busy host the default 5s
+ * timeout measures the machine rather than the tree (#1773).
+ */
+const REINDEX_TIMEOUT = 60_000;
+
+/** Every node and edge by natural key, so two indexes of the same files compare directly. */
+function graphOf(cg: CodeGraph): { nodes: string[]; edges: string[] } {
+  const keys = new Map(
+    cg.getFiles()
+      .flatMap((file) => cg.getNodesInFile(file.path))
+      .map((n) => [n.id, `${n.kind} ${n.filePath}:${n.qualifiedName}:${n.startLine}`] as const)
+  );
+  const edges = cg.getOutgoingEdgesFrom([...keys.keys()])
+    .map((e) => `${e.kind} ${keys.get(e.source)} -> ${keys.get(e.target) ?? e.target}`);
+  return { nodes: [...keys.values()].sort(), edges: edges.sort() };
+}
 
 describe('Sync Module', () => {
   describe('Sync Functionality', () => {
@@ -90,6 +125,58 @@ describe('Sync Module', () => {
     });
 
     describe('sync()', () => {
+      it('rejects a live lock and applies the pending edit after release (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        fs.writeFileSync(path.join(testDir, 'src', 'index.ts'),
+          'export function changedUnderLock() { return 2; }');
+        fs.writeFileSync(lockPath, String(process.pid));
+
+        await expect(cg.sync()).rejects.toBeInstanceOf(LockUnavailableError);
+        expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+        expect(cg.searchNodes('changedUnderLock')).toHaveLength(0);
+
+        fs.unlinkSync(lockPath);
+        const result = await cg.sync();
+        expect(result.filesModified).toBe(1);
+        expect(cg.searchNodes('changedUnderLock')).toHaveLength(1);
+      });
+
+      it('open with sync rejects contention without removing the held lock (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        fs.writeFileSync(lockPath, String(process.pid));
+        await expect(CodeGraph.open(testDir, { sync: true })).rejects.toBeInstanceOf(LockUnavailableError);
+        expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+      });
+
+      it('watch retains pending edits under a live lock and retries after release (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        const sync = vi.spyOn(cg, 'sync');
+        const onSyncComplete = vi.fn();
+        const onSyncError = vi.fn();
+        try {
+          cg.watch({ inertForTests: true, debounceMs: 20, onSyncComplete, onSyncError });
+          fs.writeFileSync(path.join(testDir, 'src', 'index.ts'),
+            'export function changedUnderLock() { return 2; }');
+          fs.writeFileSync(lockPath, String(process.pid));
+          __emitWatchEventForTests(testDir, 'src/index.ts');
+
+          await vi.waitFor(() => expect(sync).toHaveBeenCalled());
+          await expect(sync.mock.results[0].value).rejects.toBeInstanceOf(LockUnavailableError);
+          expect(cg.getPendingFiles().map((f) => f.path)).toContain('src/index.ts');
+          expect(onSyncComplete).not.toHaveBeenCalled();
+          expect(onSyncError).not.toHaveBeenCalled();
+
+          fs.unlinkSync(lockPath);
+          await vi.waitFor(() => expect(onSyncComplete).toHaveBeenCalled(), { timeout: 5000 });
+          expect(cg.getPendingFiles()).toHaveLength(0);
+          expect(cg.searchNodes('changedUnderLock')).toHaveLength(1);
+          expect(onSyncError).not.toHaveBeenCalled();
+        } finally {
+          cg.unwatch();
+          sync.mockRestore();
+        }
+      });
+
       it('should reindex added files', async () => {
         // Add a new file
         fs.writeFileSync(
@@ -515,14 +602,11 @@ describe('Sync Module', () => {
     it('the synced graph matches a full re-index (the issue\'s exact complaint)', async () => {
       write('b.ts', `export function greet(): number {\n  return 42;\n}\n`);
       await cg.sync();
-      const synced = cg.getStats();
+      const synced = graphOf(cg);
 
-      await cg.indexAll();
-      const reindexed = cg.getStats();
-
-      expect(synced.edgeCount).toBe(reindexed.edgeCount);
-      expect(synced.nodeCount).toBe(reindexed.nodeCount);
-    });
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
 
     it('a second sync is a no-op and does not duplicate edges', async () => {
       write('b.ts', `export function greet(): number {\n  return 42;\n}\n`);
@@ -609,10 +693,10 @@ describe('Sync Module', () => {
       expect(def?.filePath).toBe('d.ts');
       expect(greetCallers()).toContain('run');
       // Parity with a full re-index — the issue's contract.
-      const synced = cg.getStats();
-      await cg.indexAll();
-      expect(cg.getStats().edgeCount).toBe(synced.edgeCount);
-    });
+      const synced = graphOf(cg);
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
 
     it('drops the edge on removal and restores it when the symbol returns', async () => {
       write('b.ts', `export function other(): number {\n  return 1;\n}\n`);
@@ -780,6 +864,228 @@ describe('Sync Module', () => {
   });
 });
 
+describe('Same-named symbols keep their own cross-file callers across a re-index (#2276)', () => {
+  const dirs: string[] = [];
+  const graphs: CodeGraph[] = [];
+
+  afterEach(() => {
+    for (const cg of graphs.splice(0)) cg.destroy();
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function indexProject(files: Record<string, string>, include: string[]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-2276-'));
+    dirs.push(dir);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), content);
+    }
+    const cg = CodeGraph.initSync(dir, { config: { include, exclude: [] } });
+    graphs.push(cg);
+    await cg.indexAll();
+    return { dir, cg };
+  }
+
+  /** Every method named `name`, in file/line order, with its callers. */
+  function callersOf(cg: CodeGraph, name: string): string[] {
+    return cg
+      .getNodesByName(name)
+      .filter((n) => n.kind === 'method')
+      .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine)
+      .map((n) => `${n.qualifiedName}: ${cg.getCallers(n.id).map((c) => c.node.name).sort().join(',')}`);
+  }
+
+  /**
+   * Index `files`, rewrite one of them, sync, and return the callers of `name`
+   * before the edit, after the sync, and from a fresh index of the edited tree
+   * — the answer a synced index must agree with.
+   */
+  async function editAndSync(
+    files: Record<string, string>,
+    include: string[],
+    editPath: string,
+    edited: string,
+    name: string
+  ) {
+    const { dir, cg } = await indexProject(files, include);
+    const before = callersOf(cg, name);
+    fs.writeFileSync(path.join(dir, editPath), edited);
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+    const fresh = await indexProject({ ...files, [editPath]: edited }, include);
+    return { before, synced: callersOf(cg, name), fresh: callersOf(fresh.cg, name) };
+  }
+
+  const tsOps = [
+    `export class Foo {`,
+    `  execute(): number {`,
+    `    return 1;`,
+    `  }`,
+    `}`,
+    ``,
+    `export class Bar {`,
+    `  execute(): number {`,
+    `    return 2;`,
+    `  }`,
+    `}`,
+    ``,
+  ].join('\n');
+  const tsFiles = {
+    'ops.ts': tsOps,
+    'callers.ts': [
+      `import { Foo, Bar } from './ops';`,
+      ``,
+      `export function runFoo(): number {`,
+      `  const foo = new Foo();`,
+      `  return foo.execute();`,
+      `}`,
+      ``,
+      `export function runBar(): number {`,
+      `  const bar = new Bar();`,
+      `  return bar.execute();`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it.each([
+    ['a body-only edit', tsOps.replace('return 1;', 'return 10;')],
+    ['an edit that shifts the second class', tsOps.replace('return 1;', 'const n = 1;\n    return n;')],
+  ])('two classes defining `execute`: %s keeps each method its own callers', async (_label, edited) => {
+    const { before, synced, fresh } = await editAndSync(tsFiles, ['**/*.ts'], 'ops.ts', edited, 'execute');
+    expect(before).toEqual(['Foo::execute: runFoo', 'Bar::execute: runBar']);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  it('a re-store that fails part-way leaves the old rows and their incoming edges in place', async () => {
+    const { dir, cg } = await indexProject(tsFiles, ['**/*.ts']);
+    const before = callersOf(cg, 'execute');
+    fs.writeFileSync(path.join(dir, 'ops.ts'), tsOps.replace('return 1;', 'return 10;'));
+
+    const store = vi.spyOn(QueryBuilder.prototype, 'storeFileBundle').mockImplementationOnce(() => {
+      throw new Error('simulated crash mid-store');
+    });
+    try {
+      await expect(cg.sync()).rejects.toThrow('simulated crash mid-store');
+    } finally {
+      store.mockRestore();
+    }
+    // Rolled back to the pre-edit file, so the retry still sees a modified
+    // file — one it snapshots — rather than a new one with no history.
+    expect(callersOf(cg, 'execute')).toEqual(before);
+
+    const retry = await cg.sync();
+    expect(retry.filesModified).toBe(1);
+    expect(callersOf(cg, 'execute')).toEqual(before);
+  });
+
+  it('a caller of a removed twin is re-resolved, not handed to the survivor', async () => {
+    const edited = tsOps.slice(tsOps.indexOf('export class Bar'));
+    const { synced, fresh } = await editAndSync(tsFiles, ['**/*.ts'], 'ops.ts', edited, 'execute');
+    expect(synced).toEqual(fresh);
+  });
+
+  const javaFactory = [
+    `package app;`,
+    ``,
+    `public class Factory {`,
+    `  public static Widget create(int size) {`,
+    `    return new Widget();`,
+    `  }`,
+    ``,
+    `  public static Widget create(String name) {`,
+    `    return new Widget();`,
+    `  }`,
+    `}`,
+    ``,
+  ].join('\n');
+  const javaFiles = {
+    'src/app/Factory.java': javaFactory,
+    'src/app/Widget.java': `package app;\n\npublic class Widget {}\n`,
+    'src/app/Client.java': [
+      `package app;`,
+      ``,
+      `public class Client {`,
+      `  public Widget small() {`,
+      `    return Factory.create(1);`,
+      `  }`,
+      ``,
+      `  public Widget named() {`,
+      `    return Factory.create("x");`,
+      `  }`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it('Java overloads: a body edit leaves each overload the callers it had', async () => {
+    const edited = javaFactory.replace(
+      `create(int size) {\n    return new Widget();`,
+      `create(int size) {\n    Widget w = new Widget();\n    return w;`
+    );
+    const { before, synced, fresh } = await editAndSync(javaFiles, ['**/*.java'], 'src/app/Factory.java', edited, 'create');
+    expect(before.some((line) => /: .+/.test(line))).toBe(true);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  // C# records no signature, so its overloads differ only by position.
+  const csFactory = [
+    `namespace App {`,
+    `  public class Factory {`,
+    `    public static Widget Create(int size) {`,
+    `      return new Widget();`,
+    `    }`,
+    ``,
+    `    public static Widget Create(string name) {`,
+    `      return new Widget();`,
+    `    }`,
+    `  }`,
+    ``,
+    `  public class Widget {}`,
+    `}`,
+    ``,
+  ].join('\n');
+  const csFiles = {
+    'Factory.cs': csFactory,
+    'Client.cs': [
+      `namespace App {`,
+      `  public class Client {`,
+      `    public Widget Small() {`,
+      `      return Factory.Create(1);`,
+      `    }`,
+      ``,
+      `    public Widget Named() {`,
+      `      return Factory.Create("x");`,
+      `    }`,
+      `  }`,
+      `}`,
+      ``,
+    ].join('\n'),
+  };
+
+  it('C# overloads with no signature: a body edit pairs them by position', async () => {
+    const edited = csFactory.replace(
+      `Create(int size) {\n      return new Widget();`,
+      `Create(int size) {\n      var w = new Widget();\n      return w;`
+    );
+    const { before, synced, fresh } = await editAndSync(csFiles, ['**/*.cs'], 'Factory.cs', edited, 'Create');
+    expect(before.some((line) => /: .+/.test(line))).toBe(true);
+    expect(synced).toEqual(before);
+    expect(synced).toEqual(fresh);
+  });
+
+  it('C# overloads: a new indistinguishable overload re-resolves the callers instead of guessing', async () => {
+    const edited = csFactory.replace(
+      `  public class Factory {\n`,
+      `  public class Factory {\n    public static Widget Create(bool flag) {\n      return new Widget();\n    }\n\n`
+    );
+    const { synced, fresh } = await editAndSync(csFiles, ['**/*.cs'], 'Factory.cs', edited, 'Create');
+    expect(synced).toEqual(fresh);
+  });
+});
+
 describe('Scoped sync parity (#watcher-scoped)', () => {
   let testDir: string;
   let cg: CodeGraph;
@@ -879,5 +1185,211 @@ describe('Scoped sync parity (#watcher-scoped)', () => {
     const readmitted = await cg.sync({ paths: ['src/b.ts'] });
     expect(readmitted.filesAdded).toBe(1);
     expect(cg.searchNodes('gamma').length).toBe(1);
+  });
+});
+
+// A change that is COMMITTED but not yet indexed used to read as zero pending
+// changes: getChangedFiles' git fast path built its candidate list from
+// `git status --porcelain`, and committing is exactly what removes a file from
+// that output. The hash comparison below it was correct and simply never
+// reached. Committed work is now sourced from `git diff <indexed commit> HEAD`.
+// (#1829)
+describe('committed-but-unindexed changes (#1829)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  const git = (...args: string[]) =>
+    execFileSync('git', args, { cwd: testDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1829-'));
+    git('init');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+
+    fs.mkdirSync(path.join(testDir, 'src'));
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 1; }`);
+    git('add', '-A');
+    git('commit', '-m', 'initial');
+
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('sees a committed NEW file (git status shows nothing; the DB has no row)', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.added).toContain('src/two.ts');
+
+    // status and sync must agree — the whole point is that the number a user
+    // reads matches the work that is actually outstanding.
+    const result = await cg.sync();
+    expect(result.filesAdded).toBe(1);
+    expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
+  });
+
+  it('sees a committed MODIFICATION to an already-tracked file', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alphaRenamed() { return 99; }`);
+    git('add', '-A');
+    git('commit', '-m', 'edit one');
+
+    expect(cg.getChangedFiles().modified).toContain('src/one.ts');
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+    expect(cg.searchNodes('alphaRenamed').length).toBeGreaterThan(0);
+  });
+
+  it('sees a committed DELETE', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    await cg.sync();
+
+    fs.rmSync(path.join(testDir, 'src', 'two.ts'));
+    git('add', '-A');
+    git('commit', '-m', 'remove two');
+
+    expect(cg.getChangedFiles().removed).toContain('src/two.ts');
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+  });
+
+  it('reports zero once the sync has absorbed the commit (the stamp advances)', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    await cg.sync();
+
+    const after = cg.getChangedFiles();
+    expect(after.added).toHaveLength(0);
+    expect(after.modified).toHaveLength(0);
+    expect(after.removed).toHaveLength(0);
+  });
+
+  it('counts a file once when it was committed AND edited again since', async () => {
+    // The same path now reaches the candidate list from both sources — the
+    // committed diff and `git status`. It is still one changed file.
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'edit one');
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 3; }`);
+
+    const changes = cg.getChangedFiles();
+    expect(changes.modified.filter((f) => f === 'src/one.ts')).toHaveLength(1);
+    expect(changes.added).toHaveLength(0);
+
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+  });
+
+  it('sees a committed RENAME as a removal plus an add', async () => {
+    // `--no-renames` on the committed diff is deliberate: the index keys files
+    // by path, so a rename IS a removal and an add, and pairing them up would
+    // only have to be taken apart again.
+    fs.renameSync(path.join(testDir, 'src', 'one.ts'), path.join(testDir, 'src', 'renamed.ts'));
+    git('add', '-A');
+    git('commit', '-m', 'rename one');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.removed).toContain('src/one.ts');
+    expect(changes.added).toContain('src/renamed.ts');
+
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+    expect(result.filesAdded).toBe(1);
+    expect(cg.searchNodes('alpha').every((r) => r.node.filePath !== 'src/one.ts')).toBe(true);
+  });
+
+  it('still filters committed changes by the rules the full index uses', async () => {
+    // vendor/ is a built-in exclude git knows nothing about. Sourcing candidates
+    // from `git diff` must not smuggle in files `git status` would have had
+    // filtered out (#766) — same classifier, both sources.
+    fs.mkdirSync(path.join(testDir, 'vendor'));
+    fs.writeFileSync(path.join(testDir, 'vendor', 'lib.ts'), `export function vendored() { return 1; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add vendor');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.added).not.toContain('vendor/lib.ts');
+    expect(changes.modified).not.toContain('vendor/lib.ts');
+  });
+
+  it('falls back to the full scan when history moved under the index', async () => {
+    // A rebase/gc/shallow clone can leave the stamped commit unreachable. The
+    // fast path cannot diff against a commit that is gone, so the (correct,
+    // slower) full scan has to answer instead of silently reporting zero.
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    (cg as unknown as { queries: { setMetadata(k: string, v: string): void } })
+      .queries.setMetadata('indexed_at_commit', '0'.repeat(40));
+
+    expect(cg.getChangedFiles().added).toContain('src/two.ts');
+  });
+
+  it('an index with no stamp still answers correctly (pre-#1829 index upgrading)', async () => {
+    (cg as unknown as { queries: { setMetadata(k: string, v: string): void } })
+      .queries.setMetadata('indexed_at_commit', '');
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+
+    expect(cg.getChangedFiles().added).toContain('src/two.ts');
+
+    // ...and it self-heals: the sync writes a stamp, so the next read is clean.
+    await cg.sync();
+    expect(cg.getChangedFiles().added).toHaveLength(0);
+  });
+});
+
+
+describe('sync pending-reference recovery reporting (#1360)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-recovery-'));
+    fs.writeFileSync(path.join(testDir, 'index.ts'),
+      'export function caller() { return target(); }\nexport function target() { return 1; }\n');
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it.each([true, false])('reports sweep outcomes without file changes (resolvable=%s)', async (resolvable) => {
+    const queries = (cg as unknown as { queries: import('../src/db/queries').QueryBuilder }).queries;
+    const caller = cg.searchNodes('caller').find(r => r.node.name === 'caller')!.node;
+    const target = cg.searchNodes('target').find(r => r.node.name === 'target')!.node;
+    queries.db.prepare("DELETE FROM edges WHERE source = ? AND target = ? AND kind = 'calls'")
+      .run(caller.id, target.id);
+    queries.insertUnresolvedRef({
+      fromNodeId: caller.id, referenceName: resolvable ? 'target' : 'missingTarget',
+      referenceKind: 'calls', line: 1, column: 35, filePath: 'index.ts', language: 'typescript',
+    });
+    expect(cg.getPendingReferenceCount()).toBe(1);
+
+    const result = await cg.sync();
+    expect(result).toMatchObject({
+      filesAdded: 0, filesModified: 0, filesRemoved: 0,
+      pendingRefsProcessed: 1, pendingRefsResolved: resolvable ? 1 : 0,
+      pendingRefsUnresolved: resolvable ? 0 : 1,
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    expect(cg.getCallees(caller.id).some(r => r.node.id === target.id)).toBe(resolvable);
+    expect(await cg.sync()).toMatchObject({
+      pendingRefsProcessed: 0, pendingRefsResolved: 0, pendingRefsUnresolved: 0,
+    });
   });
 });

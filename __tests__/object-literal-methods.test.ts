@@ -9,11 +9,9 @@
  * MobX/handler maps) real nodes, so `codegraph_node`/`callers` on them resolve
  * instead of returning "not found" and forcing the agent to Read the store.
  *
- * Keyed purely on AST shape — no library names in the implementation — so any
- * same-shaped store is covered. Resolution then falls out of the existing
- * exact-name matcher: every call form (`const {foo}=useStore.getState(); foo()`,
- * `useStore.getState().foo()`, in-store `get().foo()`) reduces to a bare `foo`
- * call that resolves to the action node once it exists.
+ * Extraction is keyed on AST shape. The store-accessor resolver follows
+ * destructured bindings, `useStore.getState().foo()`, and in-store `get().foo()`
+ * to implementations within the store, excluding interface declarations.
  */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import * as fs from 'fs';

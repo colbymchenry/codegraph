@@ -7,6 +7,8 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { GO_TYPE_KINDS, isGoBareName } from '../name-matcher';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const goResolver: FrameworkResolver = {
   name: 'go',
@@ -25,9 +27,24 @@ export const goResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // The patterns below guess a declaration from the shape of a name, but Go
+    // reads a name from one package only: one written bare from the
+    // reference's own, `pkg.Node` from that import's (the import resolver's
+    // job), `x[i].Error()` from whatever type `x[i]` has. So they guess only
+    // for a bare name, only in its own package, and never for an embedded
+    // type, which name matching and the import resolver work out. Past that,
+    // promql/parser's `Node` parameters and embeddings went to
+    // discovery/kubernetes's struct `Node` beside the package's own `Node`
+    // interface, `apiv1.Node` to the struct in the same file, etcd's `Client`
+    // embedding its own `Lease` interface to the server's `Lease` struct, and
+    // every `.String()` called through an expression to the struct
+    // `promql.String`, as an instantiation.
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
+    if (!isGoBareName(ref, context)) return null;
+
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('Handler') || ref.referenceName.startsWith('Handle')) {
-      const result = resolveByNameAndKind(ref.referenceName, 'function', HANDLER_DIRS, context);
+      const result = resolveInOwnPackage(ref, FUNCTION_KINDS, context);
       if (result) {
         return {
           original: ref,
@@ -40,7 +57,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository references
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository') || ref.referenceName.endsWith('Store')) {
-      const result = resolveByNameAndKind(ref.referenceName, null, SERVICE_DIRS, context, SERVICE_KINDS);
+      const result = resolveInOwnPackage(ref, SERVICE_KINDS, context);
       if (result) {
         return {
           original: ref,
@@ -53,7 +70,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 3: Middleware references
     if (ref.referenceName.endsWith('Middleware') || ref.referenceName.startsWith('Auth') || ref.referenceName.startsWith('Log')) {
-      const result = resolveByNameAndKind(ref.referenceName, 'function', MIDDLEWARE_DIRS, context);
+      const result = resolveInOwnPackage(ref, FUNCTION_KINDS, context);
       if (result) {
         return {
           original: ref,
@@ -64,9 +81,12 @@ export const goResolver: FrameworkResolver = {
       }
     }
 
-    // Pattern 4: Model/Entity references (typically PascalCase structs)
+    // Pattern 4: Model/Entity references — a PascalCase type of any kind: the
+    // package's `Node` interface or `Entry` type, not only its structs. Left
+    // to name matching, the result type of `func (f *fanout) Appender(…)
+    // Appender` linked to the method the line declares.
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, 'struct', MODEL_DIRS, context);
+      const result = resolveInOwnPackage(ref, GO_TYPE_KINDS, context);
       if (result) {
         return {
           original: ref,
@@ -165,43 +185,17 @@ function extractGoTailIdent(expr: string): string | null {
   return m ? m[1]! : null;
 }
 
-// Directory patterns for framework resolution
-const HANDLER_DIRS = ['handler', 'handlers', 'api', 'routes', 'controller', 'controllers'];
-const SERVICE_DIRS = ['service', 'services', 'repository', 'store', 'pkg'];
-const MIDDLEWARE_DIRS = ['middleware', 'middlewares'];
-const MODEL_DIRS = ['model', 'models', 'entity', 'entities', 'domain', 'pkg'];
-const SERVICE_KINDS = new Set(['struct', 'interface']);
+const FUNCTION_KINDS: ReadonlySet<string> = new Set(['function']);
+const SERVICE_KINDS: ReadonlySet<string> = new Set(['struct', 'interface']);
 
 /**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- * Uses getNodesByName (O(log n) indexed lookup) instead of iterating every file.
+ * A framework name heuristic's pick (see name-heuristic.ts) among the
+ * declarations of the reference's own package — its directory — its own
+ * file's first. No folder convention applies: Go never reads a bare name from
+ * another package, a dot import aside.
  */
-function resolveByNameAndKind(
-  name: string,
-  kind: string | null,
-  preferredDirs: string[],
-  context: ResolutionContext,
-  kinds?: Set<string>
-): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  // Filter by kind
-  const kindFiltered = candidates.filter((n) => {
-    if (kinds) return kinds.has(n.kind);
-    if (kind) return n.kind === kind;
-    return true;
-  });
-
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirs.some((d) => n.filePath.includes(`/${d}/`))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+function resolveInOwnPackage(ref: UnresolvedRef, kinds: ReadonlySet<string>, context: ResolutionContext): string | null {
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  const inPackage = (n: Node) => n.filePath.startsWith(dir) && !n.filePath.slice(dir.length).includes('/');
+  return pickByNameAndKind(ref, kinds, () => false, context, { accept: inPackage });
 }
