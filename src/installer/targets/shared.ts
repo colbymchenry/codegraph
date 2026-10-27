@@ -77,7 +77,8 @@ export function readJsonFile(filePath: string): Record<string, any> {
  * Write a file atomically: write to `<path>.tmp.<pid>`, then rename.
  *
  * Prevents corruption if the process crashes mid-write. The temp
- * file is cleaned up on rename failure.
+ * file is cleaned up on rename failure. A file that is replaced keeps
+ * its mode, and its owner where this process may set it.
  *
  * A symbolic link is written through, never replaced (#2721). Renaming
  * onto the link's own path swapped the link for a regular copy, so a
@@ -109,14 +110,56 @@ function writeThenRename(filePath: string, content: string, createFolder: boolea
   if (createFolder && !fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+  // The rename puts a new file in the old one's place, and a new file gets
+  // the default mode (0644 under the usual umask) and this process's owner:
+  // a 0600 `~/.claude.json` or `~/.codex/config.toml` holding tokens came
+  // out readable by every account on the machine. So the new file takes the
+  // old one's mode, and its owner where this process may set it. A file
+  // that doesn't exist yet is created with the default mode, as before.
+  const replaced = regularFileStats(filePath);
   const tmpPath = filePath + '.tmp.' + process.pid;
   try {
-    fs.writeFileSync(tmpPath, content);
+    // Opened no more open than the file it replaces (the umask only takes
+    // bits away) and given its exact mode before any content goes in, so not
+    // even the temp file can be read by anyone who couldn't read the old one.
+    const fd = fs.openSync(tmpPath, 'w', replaced ? replaced.mode & 0o777 : 0o666);
+    try {
+      if (replaced) keepModeAndOwner(fd, replaced);
+      fs.writeFileSync(fd, content);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     throw err;
   }
+}
+
+/** The stats of `p` when it is an existing regular file, else null. */
+function regularFileStats(p: string): fs.Stats | null {
+  try {
+    const stats = fs.statSync(p);
+    return stats.isFile() ? stats : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Give the file open at `fd` the owner and mode of the file it replaces.
+ * The owner goes first, because changing it can clear the set-id bits that
+ * the mode then puts back. Only root may give a file away, and only a member
+ * may give it a group, so a refused change leaves this account's owner, as
+ * before. A file system without modes leaves the mode the file was opened
+ * with, which is never more open than the old file's.
+ */
+function keepModeAndOwner(fd: number, replaced: fs.Stats): void {
+  const created = fs.fstatSync(fd);
+  if (created.uid !== replaced.uid || created.gid !== replaced.gid) {
+    try { fs.fchownSync(fd, replaced.uid, replaced.gid); } catch { /* not permitted */ }
+  }
+  try { fs.fchmodSync(fd, replaced.mode & 0o7777); } catch { /* no modes here */ }
 }
 
 /** True when `p` itself is a symbolic link (on Windows, also a junction). */
