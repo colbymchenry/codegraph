@@ -125,6 +125,16 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
 }
 
 /**
+ * Whether a filesystem error means nothing is at the path: ENOENT, or ENOTDIR,
+ * which POSIX reports instead when a folder on the way is a file (Windows
+ * reports ENOENT for both).
+ */
+export function isMissingPathError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
  * Validate that a file path stays within the project root, resolving symlinks.
  *
  * Two layers: a cheap lexical check that catches `../` traversal, then a
@@ -188,7 +198,8 @@ export function validatePathWithinRoot(
     // nearest existing ancestor before allowing a write path: otherwise
     // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
     // passes the lexical check and mkdir follows the symlink out of the root.
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+    // A path under a file (ENOTDIR on POSIX) is a missing leaf too.
+    if (!isMissingPathError(err)) return null;
   }
 
   let ancestor = path.dirname(resolved);
@@ -200,7 +211,7 @@ export function validatePathWithinRoot(
       }
       return null;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      if (!isMissingPathError(err)) return null;
       const parent = path.dirname(ancestor);
       if (parent === ancestor) return null;
       ancestor = parent;

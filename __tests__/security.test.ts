@@ -312,6 +312,19 @@ describe('Symlink escape prevention (#527)', () => {
     }
   });
 
+  // POSIX reports ENOTDIR, not ENOENT, for a path under a FILE (a folder git
+  // still lists that is now a file, #2904). It is a missing leaf like any other:
+  // allowed inside the root, still refused below a link out of it.
+  it('judges a path under an existing file like any missing leaf', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts/child.ts')).toBe(path.join(root, 'src', 'in.ts', 'child.ts'));
+    expect(validatePathWithinRoot(root, 'src/in.ts/child.ts', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('rejects a path under an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape/child.txt')).toBeNull();
+  });
+
   it('rejects every path under a root that does not exist', () => {
     expect(validatePathWithinRoot(path.join(root, 'gone'), 'src/in.ts')).toBeNull();
   });

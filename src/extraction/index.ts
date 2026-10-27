@@ -28,7 +28,7 @@ import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLangu
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
-import { validatePathWithinRoot, normalizePath } from '../utils';
+import { validatePathWithinRoot, normalizePath, isMissingPathError } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks, getFrameworkResolver } from '../resolution/frameworks';
 import { declaredDependencies } from '../resolution/frameworks/package-deps';
@@ -2579,6 +2579,14 @@ export class ExtractionOrchestrator {
             const content = bytes.toString('utf-8');
             return { filePath: fp, content, stats, error: null as Error | null };
           } catch (err) {
+            // Nothing at the path is not a file that could not be read (#2904):
+            // git keeps listing a tracked file deleted from the working tree
+            // until the deletion is staged, a symlink can point at nothing (the
+            // directory walk skips one quietly), and a file can go between the
+            // scan and this read. Skip it. EACCES, EIO and the like still report.
+            if (isMissingPathError(err)) {
+              return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, gone: true };
+            }
             return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: err as Error };
           }
         })
@@ -2586,12 +2594,21 @@ export class ExtractionOrchestrator {
 
       // Dispatch each readable file into the bounded parse window; the window
       // stores results on the main thread as they arrive.
-      for (const { filePath, content, stats, error, skipped } of fileContents) {
+      for (const { filePath, content, stats, error, skipped, gone } of fileContents) {
         if (signal?.aborted) { aborted = true; break; }
 
         if (skipped) {
           // Not a source file after all — counted as done, stored as nothing.
           processed++;
+          onProgress?.({ phase: 'parsing', current: processed, total });
+          continue;
+        }
+
+        if (gone) {
+          // Listed by the scan but not on disk: skipped, stored as nothing. It
+          // still counts toward the tallies, or the run would read as PARTIAL.
+          processed++;
+          filesSkipped++;
           onProgress?.({ phase: 'parsing', current: processed, total });
           continue;
         }
@@ -2921,6 +2938,10 @@ export class ExtractionOrchestrator {
       }
       content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
     } catch (error) {
+      // Nothing at the path: nothing to index, and not a read failure (#2904).
+      if (isMissingPathError(error)) {
+        return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
+      }
       return {
         nodes: [],
         edges: [],
