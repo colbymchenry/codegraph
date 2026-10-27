@@ -31,8 +31,18 @@ const SCRIPT_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
  * proshop-shaped repo indexed its React Router routes (extraction is not
  * gated on detection) and then resolved none of its navigation. Re-reading
  * when the file count changes costs one manifest sweep per index.
+ *
+ * The count alone misses a manifest edit and a swap of one app for another
+ * of the same size (#2519), so a long-lived context also forgets its answer
+ * with {@link clearDeclaredDependencies}, which the resolver calls with its
+ * other per-context memos, before it detects frameworks again.
  */
 const cache = new WeakMap<ResolutionContext, { files: number; names: Set<string> }>();
+
+/** Forget what `context`'s manifests declared, so the next question reads them again. */
+export function clearDeclaredDependencies(context: ResolutionContext): void {
+  cache.delete(context);
+}
 
 /** Every dependency name declared in the manifests read (see the file comment), de-duplicated. */
 export function declaredDependencies(context: ResolutionContext): Set<string> {

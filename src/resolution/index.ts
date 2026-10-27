@@ -46,6 +46,7 @@ import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClas
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
+import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
@@ -389,9 +390,12 @@ export class ReferenceResolver {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
+    // Detection reads through the caches (file contents, existence probes,
+    // declared dependencies): clear them first, or a process that read the
+    // manifests earlier detects by what they said then (#2519).
+    this.clearCaches();
     this.frameworks = detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
-    this.clearCaches();
   }
 
   /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
@@ -625,6 +629,7 @@ export class ReferenceResolver {
       clearCppIncluderMemos(this.context);
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
+      clearDeclaredDependencies(this.context);
     }
   }
 

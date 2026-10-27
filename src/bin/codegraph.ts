@@ -1167,6 +1167,9 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      // Frameworks a sync detected since the last full index (#2516): files
+      // indexed before then were extracted without them.
+      const frameworkChanges = cg.getFrameworkChangesSinceIndex();
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
@@ -1208,7 +1211,9 @@ program
             builtWithVersion: buildInfo.version,
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
-            reindexRecommended,
+            reindexRecommended: reindexRecommended || frameworkChanges !== null,
+            // { added, removed } frameworks since the last full index, or null.
+            frameworksChangedSinceIndex: frameworkChanges,
             // 'complete' | 'partial' (files silently dropped) | 'indexing'
             // (a run was killed mid-index — the index is truncated) |
             // 'failed' | null (predates the marker).
@@ -1341,6 +1346,15 @@ program
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
         info('Run "codegraph index" (full rebuild) or "codegraph sync"');
+        console.log();
+      }
+      if (frameworkChanges) {
+        const changed = [
+          ...(frameworkChanges.added.length > 0 ? [`added ${frameworkChanges.added.join(', ')}`] : []),
+          ...(frameworkChanges.removed.length > 0 ? [`removed ${frameworkChanges.removed.join(', ')}`] : []),
+        ].join('; ');
+        warn(`Frameworks changed since the last full index (${changed}); files indexed before then were read without the change.`);
+        info('Run "codegraph index" to re-index every file with them');
         console.log();
       }
 
