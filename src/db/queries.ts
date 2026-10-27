@@ -4134,6 +4134,14 @@ export class QueryBuilder {
    */
   getUnresolvedReferencesCount(): number {
     if (!this.stmts.getUnresolvedCount) {
+      // An index built before schema v8 (1.4.0 and older) has no `status`,
+      // and the v8 migration marks every one of its rows pending. A read-only
+      // open migrates nothing (`codegraph status`, #2913), so count them all
+      // until a writer's open has migrated it.
+      const columns = this.db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+      if (!columns.some((c) => c.name === 'status')) {
+        return (this.db.prepare('SELECT COUNT(*) as count FROM unresolved_refs').get() as { count: number }).count;
+      }
       this.stmts.getUnresolvedCount = this.db.prepare(
         "SELECT COUNT(*) as count FROM unresolved_refs WHERE status = 'pending'"
       );

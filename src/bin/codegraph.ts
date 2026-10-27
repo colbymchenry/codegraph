@@ -1123,7 +1123,17 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // Status only reads. Opened read-write, it ran the open-time repairs
+      // meant for the writer: during a rebuild's bulk load it recreated the
+      // secondary indexes the indexer had dropped, and the indexer's next
+      // edge write failed with SQLITE_BUSY_SNAPSHOT, "database is locked"
+      // (#2913). Read-only, it leaves migrations, index repair and WAL
+      // maintenance to the writer.
+      const cg = await CodeGraph.open(projectPath, { readOnly: true });
+      const { isRebuildInProgress } = await import('../mcp/writer-lock');
+      // A `codegraph index` in another process owns the database: the
+      // numbers below are a snapshot of a graph being rebuilt.
+      const rebuildInProgress = isRebuildInProgress(projectPath);
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
@@ -1165,6 +1175,9 @@ program
           worktreeMismatch: worktreeMismatch
             ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
             : null,
+          // True while another process runs `codegraph index` on this
+          // project: the statistics are a snapshot of the rebuild (#2913).
+          rebuildInProgress,
           index: {
             builtWithVersion: buildInfo.version,
             builtWithExtractionVersion: buildInfo.extractionVersion,
@@ -1197,14 +1210,18 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
-      if (indexState === 'indexing') {
+      if (rebuildInProgress) {
+        warn('An index rebuild ("codegraph index") is running in another process — the statistics below are a snapshot of it.');
+      } else if (indexState === 'indexing') {
         warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
       } else if (indexState === 'partial') {
         warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
       } else if (indexState === 'failed') {
         warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
       }
-      if (pendingRefs > 0) {
+      // A running rebuild's references are its own work in progress, not an
+      // interrupted run's.
+      if (pendingRefs > 0 && !rebuildInProgress) {
         warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
       }
       console.log();
@@ -1217,15 +1234,16 @@ program
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
       // Surface the WAL sidecar (#1431): a WAL that dwarfs the DB at rest is
       // the killed-session leak — invisible before this line, it only showed
-      // up as a mysteriously full disk. open() above already kicked off the
-      // automatic heal for the oversized case.
+      // up as a mysteriously full disk. The read-only open above leaves the
+      // heal to the next writer's open, such as a sync (#2913).
       if (stats.walSizeBytes > 0) {
         const { WAL_HEAL_THRESHOLD_BYTES } = await import('../db/index');
         const oversized = stats.walSizeBytes > Math.max(WAL_HEAL_THRESHOLD_BYTES, stats.dbSizeBytes);
         const walLabel = `${(stats.walSizeBytes / 1024 / 1024).toFixed(2)} MB`;
         console.log(`  WAL Size:  ${oversized ? chalk.yellow(walLabel) : walLabel}`);
-        if (oversized) {
-          warn('The write-ahead log is larger than the database — killed sessions left it behind. It is reclaimed automatically on open; if it persists across runs, another live CodeGraph process is holding it.');
+        // A running rebuild's WAL is its own, not a killed session's.
+        if (oversized && !rebuildInProgress) {
+          warn('The write-ahead log is larger than the database — killed sessions left it behind. The next "codegraph sync" reclaims it; if it persists after that, another live CodeGraph process is holding it.');
         }
       }
       // Surface the active SQLite backend (node:sqlite — Node's built-in real
@@ -1261,6 +1279,13 @@ program
         console.log(`  ${lang.padEnd(15)} ${formatNumber(count)}`);
       }
       console.log();
+
+      // What follows is advice for an index at rest: sync its pending changes,
+      // re-index an older build. A running rebuild is replacing this one.
+      if (rebuildInProgress) {
+        cg.destroy();
+        return;
+      }
 
       // Pending changes
       const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
