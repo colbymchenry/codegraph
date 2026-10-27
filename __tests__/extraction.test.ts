@@ -13796,6 +13796,246 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('blankCUnbalancedConditionalBranches opens a damaged #if group, one branch kept only when they do not balance, offsets kept', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void f(int id)',
+      '{',
+      '    if (id == 1) {',
+      '        a(id);',
+      '    }',
+      '#if defined(USE_V) || \\',
+      '    defined(USE_W)',
+      '    else if (id == 2) { // "{" in a comment',
+      '        b(id);',
+      '    }',
+      '#else',
+      '    else if (id == 3) {',
+      '        c(id);',
+      '    }',
+      '#endif',
+      '#ifdef USE_X',
+      '    d(id);',
+      '#else',
+      '    e(id);',
+      '#endif',
+      '}',
+      '#if 0',
+      'void dead(void) {',
+      '#else',
+      'void live(void) {',
+      '#endif',
+      '}',
+    ].join('\n');
+    const out = blankCUnbalancedConditionalBranches(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    const lines = out.split('\n');
+    // The `else`-led group's branches each balance, so both stay, read in a
+    // row (`else if (id == 2) {…} else if (id == 3) {…}` is still C); only
+    // its directive lines, continuation included, become spaces.
+    expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
+    expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
+    expect(lines[7]).toBe('    else if (id == 2) { // "{" in a comment');
+    expect(lines[8]).toBe('        b(id);');
+    expect(lines[10]).toBe('     ');
+    expect(lines[11]).toBe('    else if (id == 3) {');
+    expect(lines[12]).toBe('        c(id);');
+    expect(lines[14]).toBe('      ');
+    // A balanced group is untouched, directives included.
+    expect(lines[15]).toBe('#ifdef USE_X');
+    expect(lines[16]).toBe('    d(id);');
+    expect(lines[18]).toBe('    e(id);');
+    expect(lines[19]).toBe('#endif');
+    // `#if 0` keeps the live branch instead.
+    expect(out).not.toContain('dead');
+    expect(lines[24]).toBe('void live(void) {');
+    // `#if 1` is live as written: its first branch stays, not its `#else`.
+    const on = blankCUnbalancedConditionalBranches(
+      ['void g(int id) {', '  if (id) { a(); }', '#if 1', '  else if (id == 2) { live(); }', '#else', '  else if (id == 3) { dead(); }', '#endif', '}'].join('\n')
+    );
+    expect(on).toContain('else if (id == 2) { live(); }');
+    expect(on).not.toContain('dead');
+    // Arms that close the block above and open their own (`} else if (…) {`)
+    // balance too: under a flag, both builds' arms stay (betaflight's
+    // `#if ENABLE_RESCUE_PLAN` in failsafe.c), so neither one's calls are lost.
+    const arms = blankCUnbalancedConditionalBranches(
+      ['void f(int a) {', '  if (a == 1) {', '    one();', '#if ENABLE_X', '  } else if (a == 2) {', '    two();', '#else', '  } else if (a == 3) {', '    three();', '#endif', '  }', '}'].join('\n')
+    ).split('\n');
+    expect(arms[3]).toBe(' '.repeat('#if ENABLE_X'.length));
+    expect(arms[5]).toBe('    two();');
+    expect(arms[8]).toBe('    three();');
+    // A brace inside a block comment is not code. Lua's loadlib.c opens a
+    // banner with `** {====` inside a multi-line comment and closes it with
+    // `/* }==== */`: the group is whole, and every platform's functions stay.
+    const lua = [
+      '#if defined(LUA_DL_DLOPEN)',
+      'static void *ll_load (const char *path) { return dlopen(path); }',
+      '#elif defined(LUA_DL_DLL)',
+      '/*',
+      '** {======================================================',
+      '** This is an implementation of loadlib for Windows',
+      '** =======================================================',
+      '*/',
+      'static void *ll_load (const char *path) { return LoadLibraryA(path); }',
+      '/* }====================================================== */',
+      '#else',
+      'static void *ll_load (const char *path) { return NULL; }',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(lua)).toBe(lua);
+    // A `\` ending a line inside a block comment still continues the
+    // `#define` (jemalloc's tsd.h): the macro body is not code of the group.
+    const guarded = [
+      '#ifndef GUARD_H',
+      '#define GUARD_H',
+      '#define O(n)\t\t\t\t\\',
+      'static int n##_get(void) {\t\t\\',
+      '\t/*\t\t\t\t\t\\',
+      '\t * a comment inside the body\t\\',
+      '\t */\t\t\t\t\t\\',
+      '\treturn 0;\t\t\t\t\\',
+      '}',
+      'O(a)',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(guarded)).toBe(guarded);
+    // No conditional group at all: identity.
+    const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
+    expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('blankCUnbalancedConditionalBranches: two function heads under #ifdef/#else keep the #else head; expression fragments keep their only branch', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    // jq's main.c: `umain` for WIN32, `main` otherwise — `main` must survive.
+    const heads = [
+      '#ifdef WIN32',
+      'int umain(int argc, char* argv[]) {',
+      '#else /*}*/',
+      'int main(int argc, char* argv[]) {',
+      '#endif',
+      '  return run(argc, argv);',
+      '}',
+    ].join('\n');
+    const h = blankCUnbalancedConditionalBranches(heads).split('\n');
+    expect(h[1]).toBe(' '.repeat('int umain(int argc, char* argv[]) {'.length));
+    expect(h[3]).toBe('int main(int argc, char* argv[]) {');
+    expect(h[0]).toBe('            ');
+    // `#ifndef` is the inverse: its first branch is the default build.
+    const inv = heads.replace('#ifdef WIN32', '#ifndef POSIX');
+    expect(blankCUnbalancedConditionalBranches(inv).split('\n')[1]).toBe('int umain(int argc, char* argv[]) {');
+    // A directive right under the kept branch's own is a line of that branch:
+    // only the `#if`/`#else` line itself (and its `\` continuations) goes.
+    const withIncludes = [
+      '#if defined(FEATURE) && \\',
+      '    defined(OTHER)',
+      '#include "feature.h"',
+      'int f(int x) {',
+      '#else',
+      '#include "plain.h"',
+      'int g(int x) {',
+      '#endif',
+      '  return x;',
+      '}',
+    ];
+    const inc = blankCUnbalancedConditionalBranches(withIncludes.join('\n')).split('\n');
+    expect(inc[1]).toBe(' '.repeat(withIncludes[1]!.length));
+    expect(inc[2]).toBe(' '.repeat(withIncludes[2]!.length));
+    expect(inc[5]).toBe('#include "plain.h"');
+    expect(inc[6]).toBe('int g(int x) {');
+    // A branch that is a fragment of an `if (…)` condition (STM32 HAL), or
+    // that opens with `} else if` (betaflight cli.c): directives blanked, the
+    // only branch kept, so the statement parses as written for that build.
+    const frag = [
+      'int check(op_t *h1, op_t *h4)',
+      '{',
+      '  if ((h1 == NULL)',
+      '#if defined(STM32G474xx)',
+      '      || (h4 == NULL)',
+      '#endif',
+      '     )',
+      '  {',
+      '    return 1;',
+      '  }',
+      '  if (',
+      '#if !defined(USE_FLASH)',
+      '      isEmpty(h1) ||',
+      '#endif',
+      '      strncasecmp(h1, "rom", 3) == 0) {',
+      '    reboot(1);',
+      '#if defined(USE_FLASH)',
+      '  } else if (isEmpty(h1)) {',
+      '    reboot(2);',
+      '#endif',
+      '  } else {',
+      '    reboot(0);',
+      '  }',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const f = blankCUnbalancedConditionalBranches(frag).split('\n');
+    expect(f[3]).toBe(' '.repeat('#if defined(STM32G474xx)'.length));
+    expect(f[4]).toBe('      || (h4 == NULL)');
+    expect(f[5]).toBe('      ');
+    expect(f[12]).toBe('      isEmpty(h1) ||');
+    expect(f[17]).toBe('  } else if (isEmpty(h1)) {');
+    expect(f[16]).toBe(' '.repeat('#if defined(USE_FLASH)'.length));
+  });
+
+  it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-c-ifelse-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'current.c'),
+        [
+          'void currentMeterRead(int id, meter_t *meter)',
+          '{',
+          '    if (id == 1) {',
+          '        adcRead(meter);',
+          '    }',
+          '#ifdef USE_VIRTUAL',
+          '    else if (id == 2) {',
+          '        virtualRead(meter);',
+          '    }',
+          '#endif',
+          '    else {',
+          '        resetMeter(meter);',
+          '    }',
+          '}',
+          '',
+          'static bool markBusy(void)',
+          '{',
+          '    ATOMIC_BLOCK(NVIC_PRIO_MAX) {',
+          '        busy = true;',
+          '    }',
+          '    return true;',
+          '}',
+          '',
+          'int after(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'current.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['after', 'currentMeterRead', 'markBusy']);
+        expect(byName.currentMeterRead!.endLine).toBe(14);
+        expect(byName.markBusy!.qualifiedName).toBe('markBusy');
+        expect(byName.markBusy!.endLine).toBe(22);
+        expect(byName.after!.qualifiedName).toBe('after');
+        expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
