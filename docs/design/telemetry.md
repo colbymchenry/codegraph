@@ -80,7 +80,7 @@ Event types:
   counters named `prompt-hook-gate-<outcome>`, outcome ∈ `high-keyword` /
   `high-token` / `medium-segment` / `nudge-projects` / `noop-shape` /
   `noop-no-index` / `noop-unverified` / `noop-explore-keyword` /
-  `noop-explore-token` / `noop-vocab-empty` — decision names only, never
+  `noop-explore-token` / `noop-vocab-empty` / `noop-rebuild` — decision names only, never
   prompt content. This is the gate's measured recall/precision funnel: a
   rising `noop-*` share against the `high`/`medium` tiers is the signal that
   the gate (keyword table or segment matching) is missing real questions.
@@ -89,6 +89,8 @@ Event types:
   `noop-explore-<trigger>` instead (#1143), and a MEDIUM-eligible prompt
   hitting a not-yet-backfilled segment vocabulary records `noop-vocab-empty`
   rather than polluting `noop-unverified` (#1142).
+  A prompt that arrives while `codegraph index` rebuilds the project records
+  `noop-rebuild`: the hook leaves a rebuilding index alone (#2913).
 - **`uninstall`** — one per `uninstall`/`uninit` run (churn signal). Props: `targets`.
 
 One legacy field is still *accepted* and belongs in the mirror even though nothing sends

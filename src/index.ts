@@ -2360,6 +2360,12 @@ export class CodeGraph {
    * usable (already populated — the overwhelmingly common one-SELECT case —
    * or healed here); false when it isn't (empty graph, or another process
    * holds the index lock — that process's own sync heals it).
+   *
+   * A read-only instance, as the hook opens since #2913, writes through a
+   * connection of its own, opened only once it holds the index lock. Every
+   * index and sync holds that lock while it writes, so the repairs a writer's
+   * open runs, and the migration an index from before the table needs, cannot
+   * disturb a bulk load in progress.
    */
   async healSegmentVocabIfEmpty(): Promise<boolean> {
     const empty = (() => {
@@ -2375,7 +2381,16 @@ export class CodeGraph {
       }
       try {
         if (!this.queries.isNameSegmentVocabEmpty()) return true; // raced: healed meanwhile
-        await this.rebuildNameSegmentVocab();
+        if (!this.db.readOnly) {
+          await this.rebuildNameSegmentVocab();
+          return true;
+        }
+        const writer = DatabaseConnection.open(this.db.getPath());
+        try {
+          await this.rebuildNameSegmentVocab(new QueryBuilder(writer.getDb()));
+        } finally {
+          writer.close();
+        }
         return true;
       } finally {
         this.fileLock.release();
@@ -2387,15 +2402,15 @@ export class CodeGraph {
    * Rebuild the segment vocabulary from the current graph, batched and
    * yielding — the upgrade-heal path for indexes built before the vocab table
    * existed. Runs inside the index mutex/lock (sync and
-   * healSegmentVocabIfEmpty hold them).
+   * healSegmentVocabIfEmpty hold them), through `queries`.
    */
-  private async rebuildNameSegmentVocab(): Promise<void> {
+  private async rebuildNameSegmentVocab(queries: QueryBuilder = this.queries): Promise<void> {
     const maybeYield = createYielder();
     const BATCH = 2000;
     for (let offset = 0; ; offset += BATCH) {
-      const names = this.queries.getDistinctNodeNames(BATCH, offset);
+      const names = queries.getDistinctNodeNames(BATCH, offset);
       if (names.length === 0) break;
-      this.queries.insertNameSegmentsBatch(names);
+      queries.insertNameSegmentsBatch(names);
       await maybeYield();
     }
   }

@@ -378,6 +378,32 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/**
+ * Open a project's index for a command that only reads it: `query`,
+ * `explore`, `node`, the prompt hook and the rest (#2913).
+ *
+ * Opened read-write, the index runs the writer's repairs: migrations, the
+ * rebuild of the indexes and search triggers an interrupted bulk load left
+ * out, and WAL maintenance. While `codegraph index` or a sync writes in
+ * another process, those repairs recreate the indexes its bulk load dropped,
+ * and its next write fails with SQLITE_BUSY_SNAPSHOT, "database is locked".
+ * Read-only, a command leaves all of that to the writer, as `status` does
+ * since #2930; an index an older release built is read as it is (see
+ * QueryBuilder.hasSchema).
+ *
+ * During a rebuild the answer comes from a graph still being built, so the
+ * command says so, on stderr to keep a `--json` answer parseable.
+ */
+async function openIndexToRead(projectPath: string): Promise<import('../index').CodeGraph> {
+  const { default: CodeGraph } = await loadCodeGraph();
+  const cg = await CodeGraph.open(projectPath, { readOnly: true });
+  const { isRebuildInProgress } = await import('../mcp/writer-lock');
+  if (isRebuildInProgress(projectPath)) {
+    console.error(`${chalk.yellow(getGlyphs().warn)} An index rebuild ("codegraph index") is running in another process — this answer comes from the part of the index it has rebuilt so far.`);
+  }
+  return cg;
+}
+
 /** "not found" (+ optional did-you-mean) when no exact symbol matches. */
 function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
   const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
@@ -1344,8 +1370,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
       const rawResults = cg.searchNodes(search, {
@@ -1430,8 +1455,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1487,8 +1511,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
 
       const result = await cg.buildContext(taskParts.join(' '), {
         format,
@@ -1592,8 +1615,15 @@ program
         `${lead}\n${projects.map((p) => `  - projectPath: "${p}"`).join('\n')}\n`;
 
       if (plan.exploreRoot) {
-        const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(plan.exploreRoot);
+        // A `codegraph index` in another process is rebuilding this index: it
+        // holds part of the graph until the rebuild ends, and the rebuild
+        // replaces the file, which an open handle blocks on Windows. Inject
+        // nothing, as the MCP tools answer "rebuild in progress" (#2913).
+        const { isRebuildInProgress } = await import('../mcp/writer-lock');
+        if (isRebuildInProgress(plan.exploreRoot)) { gate('noop-rebuild'); return; }
+        // Claude Code runs this hook on its own, on every prompt: read-only, so
+        // it never repairs what an index or sync is in the middle of writing.
+        const cg = await openIndexToRead(plan.exploreRoot);
         try {
           const others = plan.nudgeProjects.length
             ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
@@ -1644,8 +1674,9 @@ program
           // (#1142). Heal it here: on a populated vocab this is one SELECT;
           // the actual backfill is a one-time batched pass whose cost the MCP
           // server's own catch-up sync usually pays first (it runs at every
-          // session start). A distinct noop outcome keeps a dormant vocab
-          // from polluting the noop-unverified recall signal.
+          // session start). It writes through a connection of its own, under
+          // the index lock (#2913). A distinct noop outcome keeps a dormant
+          // vocab from polluting the noop-unverified recall signal.
           const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
           if (!vocabReady) { gate('noop-vocab-empty'); return; }
           const related = cg.getSegmentMatches(proseWords);
@@ -1716,8 +1747,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1788,8 +1818,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       let files = cg.getFiles();
 
       if (files.length === 0) {
@@ -2361,8 +2390,7 @@ for (const direction of ['callers', 'callees'] as const) {
           process.exit(1);
         }
 
-        const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(projectPath);
+        const cg = await openIndexToRead(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
           const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
@@ -2485,8 +2513,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
         const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
@@ -2626,8 +2653,7 @@ program
         process.exit(0);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
       // Custom filter pattern

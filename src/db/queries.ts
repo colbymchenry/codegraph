@@ -466,6 +466,33 @@ export class QueryBuilder {
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
     this.readMemos.clear();
+    this.presentSchema.clear();
+  }
+
+  /**
+   * Tables (`name`) and columns (`table.column`) that later migrations added,
+   * found in this connection's database. See {@link hasSchema}.
+   */
+  private presentSchema = new Set<string>();
+
+  /**
+   * Whether the database holds `table`, or its `column`. An index an older
+   * release built lacks what later migrations add until a writer's open
+   * migrates it, and a read-only open migrates nothing: the CLI's read
+   * commands and the prompt hook open read-only so that a running rebuild is
+   * left alone (#2913). A read that needs a newer table or column checks for
+   * it here and, without it, answers as the migration's defaults would.
+   * Found once and remembered, since a schema only grows; a missing one is
+   * looked for again, so a writer's later migration is seen.
+   */
+  private hasSchema(table: string, column?: string): boolean {
+    const key = column ? `${table}.${column}` : table;
+    if (this.presentSchema.has(key)) return true;
+    const found = column
+      ? this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column) !== undefined
+      : this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+    if (found) this.presentSchema.add(key);
+    return found;
   }
 
   /**
@@ -885,6 +912,8 @@ export class QueryBuilder {
   /** True when the vocab has no rows — an index built before the table existed.
    *  `sync` uses this to heal such databases (see rebuildNameSegmentVocabFrom). */
   isNameSegmentVocabEmpty(): boolean {
+    // Before schema v7 there is no table, which its migration creates empty (#2913).
+    if (!this.hasSchema('name_segment_vocab')) return true;
     const row = this.db.prepare('SELECT 1 FROM name_segment_vocab LIMIT 1').get();
     return row === undefined;
   }
@@ -931,7 +960,7 @@ export class QueryBuilder {
     minWords: number,
     limit: number,
   ): Array<{ name: string; matches: number }> {
-    if (variants.length === 0) return [];
+    if (variants.length === 0 || !this.hasSchema('name_segment_vocab')) return [];
     const placeholders = variants.map(() => '?').join(', ');
     const whens = variants.map(() => 'WHEN ? THEN ?').join(' ');
     const rows = this.db
@@ -956,7 +985,7 @@ export class QueryBuilder {
   /** How many distinct names each segment appears in — the rarity signal that
    *  separates a discriminative word ("checkout") from a ubiquitous one ("state"). */
   getSegmentNameCounts(segments: string[]): Map<string, number> {
-    if (segments.length === 0) return new Map();
+    if (segments.length === 0 || !this.hasSchema('name_segment_vocab')) return new Map();
     const placeholders = segments.map(() => '?').join(', ');
     const rows = this.db
       .prepare(
@@ -969,6 +998,7 @@ export class QueryBuilder {
 
   /** Names containing the given segment (rare-single-word tier). */
   getNamesForSegment(segment: string, limit: number): string[] {
+    if (!this.hasSchema('name_segment_vocab')) return [];
     const rows = this.db
       .prepare('SELECT name FROM name_segment_vocab WHERE segment = ? ORDER BY length(name) ASC LIMIT ?')
       .all(segment, limit) as Array<{ name: string }>;
@@ -1916,32 +1946,34 @@ export class QueryBuilder {
 
     // EXISTS uses FTS postings and the segment primary key, never source scans.
     // Vocab rows can outlive deleted definitions, so verify them against nodes.
+    // An index from before schema v7 has no vocab: FTS alone answers (#2913).
+    const vocab = this.hasSchema('name_segment_vocab');
     const rows = this.db.prepare(`
       WITH words(word, pattern) AS (VALUES ${checked.map(() => '(?, ?)').join(', ')})
       SELECT word, (
-        EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH pattern)
+        EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH pattern)${vocab ? `
         OR EXISTS (
           SELECT 1 FROM name_segment_vocab v WHERE v.segment = word
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = v.name AND n.kind NOT IN ('file', 'import'))
-        )
+        )` : ''}
       ) AS matched FROM words
     `).all(...checked.flatMap(w => [w, `{name qualified_name signature docstring} : "${w}"*`])) as
       Array<{ word: string; matched: number }>;
 
-    const names = this.db.prepare(`
+    const names = this.db.prepare(`${vocab ? `
       SELECT name FROM (
         SELECT v.name FROM name_segment_vocab v
         WHERE v.segment IN (${checked.map(() => '?').join(', ')})
         AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = v.name AND n.kind NOT IN ('file', 'import'))
         LIMIT 12
       )
-      UNION ALL
+      UNION ALL` : ''}
       SELECT name FROM (
         SELECT n.name FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid
         WHERE nodes_fts MATCH ? AND n.kind NOT IN ('file', 'import')
         LIMIT 12
       )
-    `).all(...checked, `name : (${checked.map(w => `"${w}"*`).join(' OR ')})`) as Array<{ name: string }>;
+    `).all(...(vocab ? checked : []), `name : (${checked.map(w => `"${w}"*`).join(' OR ')})`) as Array<{ name: string }>;
     return {
       matched: rows.filter(r => r.matched).map(r => r.word),
       unmatched: rows.filter(r => !r.matched).map(r => r.word),
@@ -2647,9 +2679,12 @@ export class QueryBuilder {
   ): Array<{ node: Node; generated: boolean }> {
     if (kinds.length === 0 || limit <= 0) return [];
     const placeholders = kinds.map(() => '?').join(',');
+    // Before schema v9 no file carries the flag, as its migration's default
+    // leaves them (#2913).
+    const generated = this.hasSchema('files', 'generated') ? 'COALESCE(f.generated, 0)' : '0';
     const rows = this.db
       .prepare(
-        `SELECT n.*, COALESCE(f.generated, 0) AS file_generated
+        `SELECT n.*, ${generated} AS file_generated
            FROM nodes n
            LEFT JOIN files f ON f.path = n.file_path
           WHERE n.kind IN (${placeholders})
@@ -2687,22 +2722,29 @@ export class QueryBuilder {
     const unique = [...new Set(names)].filter((name) => name.length > 0);
     const found = new Set<string>();
     if (unique.length === 0) return found;
+    // Before schema v8 a reference had no tail and was never parked, and the
+    // migration leaves every row pending with an empty tail: only the name
+    // can match (#2913).
+    const parked = this.hasSchema('unresolved_refs', 'status');
 
     for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(
-          `SELECT DISTINCT reference_name AS name FROM unresolved_refs
-            WHERE reference_name IN (${placeholders})
+      const byName = `SELECT DISTINCT reference_name AS name FROM unresolved_refs
+            WHERE reference_name IN (${placeholders})`;
+      const rows = (parked
+        ? this.db
+          .prepare(
+            `${byName}
             UNION
            SELECT DISTINCT name_tail AS name FROM unresolved_refs
             WHERE name_tail IN (${placeholders})
             UNION
            SELECT DISTINCT ${MEMBER_TAIL_SQL} AS name FROM unresolved_refs
             WHERE ${MODULE_PARKED_SQL} AND ${MEMBER_TAIL_SQL} IN (${placeholders})`
-        )
-        .all(...chunk, ...chunk, ...chunk) as Array<{ name: string }>;
+          )
+          .all(...chunk, ...chunk, ...chunk)
+        : this.db.prepare(byName).all(...chunk)) as Array<{ name: string }>;
       for (const row of rows) found.add(row.name);
     }
     return found;
@@ -3745,6 +3787,9 @@ export class QueryBuilder {
     const unique = [...new Set(filePaths)];
     const found = new Set<string>();
     if (unique.length === 0) return found;
+    // An index from before schema v9 has no flag, which its migration adds
+    // as 0 everywhere: the path convention alone decides (#2913).
+    if (!this.hasSchema('files', 'generated')) return found;
 
     for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
@@ -3893,6 +3938,8 @@ export class QueryBuilder {
 
   /** How many indexed files carry the generated flag. Surfaced by `status`. */
   countGeneratedFiles(): number {
+    // Before schema v9 no file carries the flag (#2913).
+    if (!this.hasSchema('files', 'generated')) return 0;
     const row = this.db
       .prepare('SELECT COUNT(*) AS n FROM files WHERE generated = 1')
       .get() as { n: number } | undefined;
@@ -4138,8 +4185,7 @@ export class QueryBuilder {
       // and the v8 migration marks every one of its rows pending. A read-only
       // open migrates nothing (`codegraph status`, #2913), so count them all
       // until a writer's open has migrated it.
-      const columns = this.db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
-      if (!columns.some((c) => c.name === 'status')) {
+      if (!this.hasSchema('unresolved_refs', 'status')) {
         return (this.db.prepare('SELECT COUNT(*) as count FROM unresolved_refs').get() as { count: number }).count;
       }
       this.stmts.getUnresolvedCount = this.db.prepare(
