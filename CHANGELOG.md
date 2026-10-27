@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now tells a variable's reads from its writes. A symbol that uses a file-scope constant or variable records a separate `reads` edge when it takes the value (`y = VALUE`) and a `writes` edge when it stores one (`VALUE = y`), instead of one generic `references` edge, so callers, impact and `codegraph_explore` can answer "where is this global modified?". A compound assignment (`VALUE += 1`) or `VALUE++` is both. Re-index your project after upgrading — an index built by an earlier version keeps the old generic edges until it is rebuilt. (#996)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

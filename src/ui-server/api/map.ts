@@ -50,6 +50,8 @@ export const MAP_EDGE_KINDS: readonly EdgeKind[] = [
   'calls',
   'imports',
   'references',
+  'reads',
+  'writes',
   'instantiates',
   'extends',
   'implements',

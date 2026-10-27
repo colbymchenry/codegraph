@@ -193,7 +193,7 @@ function formatNodeTree(
   // Outgoing edges
   const edges = outgoing.get(node.id) ?? [];
   const significantEdges = edges.filter((e) =>
-    ['calls', 'extends', 'implements', 'imports', 'references'].includes(e.kind)
+    ['calls', 'extends', 'implements', 'imports', 'references', 'reads', 'writes'].includes(e.kind)
   );
 
   // Group by kind

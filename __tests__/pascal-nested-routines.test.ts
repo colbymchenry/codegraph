@@ -393,7 +393,7 @@ end.
 `;
     await withIndex({ 'Values.pas': code }, (cg) => {
       const reads = cg.getOutgoingEdges(routine(cg, 'Parse::Unquote').id)
-        .filter((e) => e.kind === 'references')
+        .filter((e) => e.kind === 'reads')
         .map((e) => cg.getNode(e.target)!.name);
       expect(reads).toEqual(['OP_ANY']);
     });

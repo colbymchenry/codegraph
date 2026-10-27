@@ -1638,9 +1638,10 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        let refs_kind = edge_kind_index("references").unwrap();
+        let reads_kind = edge_kind_index("reads").unwrap();
+        let writes_kind = edge_kind_index("writes").unwrap();
         for scope in &scopes {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: HashSet<(&str, bool)> = HashSet::new();
             let mut stack: Vec<Node> = vec![scope.node];
             let mut visited = 0usize;
             while let Some(n) = stack.pop() {
@@ -1651,24 +1652,41 @@ impl<'t> Walker<'t> {
                 if matches!(n.kind(), "identifier" | "constant" | "name" | "simple_identifier") {
                     let ref_name = self.text(n);
                     if let Some(&target_row) = targets.get(ref_name) {
+                        // #996: an assignment LHS is a `writes`, everything
+                        // else a `reads`, and a compound assignment / `++`
+                        // both reads and writes. Dedupe is per (target, access).
+                        let (read, write) = crate::value_refs::access(n, self.src);
+                        let line = self.line_of(n);
+                        let column = self.col_of(n);
                         let target_id = self.node_ids[target_row as usize].as_str();
-                        if target_id != self.node_ids[scope.row as usize]
-                            && ref_name != scope.name
-                            && !seen.contains(&target_id)
-                        {
-                            seen.insert(target_id);
+                        if target_id != self.node_ids[scope.row as usize] && ref_name != scope.name {
                             let meta = self.arena.put(r#"{"valueRef":true}"#);
-                            self.tables.push_edge(&EdgeRow {
-                                source_idx: scope.row,
-                                target_idx: target_row,
-                                kind: refs_kind,
-                                provenance: 0,
-                                line: NONE,
-                                column: NONE,
-                                metadata_json: meta,
-                                source_id_str: NONE_STR,
-                                target_id_str: NONE_STR,
-                            });
+                            if read && seen.insert((target_id, false)) {
+                                self.tables.push_edge(&EdgeRow {
+                                    source_idx: scope.row,
+                                    target_idx: target_row,
+                                    kind: reads_kind,
+                                    provenance: 0,
+                                    line,
+                                    column,
+                                    metadata_json: meta,
+                                    source_id_str: NONE_STR,
+                                    target_id_str: NONE_STR,
+                                });
+                            }
+                            if write && seen.insert((target_id, true)) {
+                                self.tables.push_edge(&EdgeRow {
+                                    source_idx: scope.row,
+                                    target_idx: target_row,
+                                    kind: writes_kind,
+                                    provenance: 0,
+                                    line,
+                                    column,
+                                    metadata_json: meta,
+                                    source_id_str: NONE_STR,
+                                    target_id_str: NONE_STR,
+                                });
+                            }
                         }
                     }
                 }

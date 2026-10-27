@@ -104,7 +104,7 @@ pub const NODE_KINDS: [&str; 23] = [
 ];
 
 /// Mirror of EDGE_KINDS in src/types.ts — order is the wire contract.
-pub const EDGE_KINDS: [&str; 13] = [
+pub const EDGE_KINDS: [&str; 15] = [
     "contains",
     "calls",
     "imports",
@@ -118,6 +118,8 @@ pub const EDGE_KINDS: [&str; 13] = [
     "overrides",
     "decorates",
     "navigates",
+    "reads",
+    "writes",
 ];
 
 /// ReferenceKind code for the internal-only `function_ref` (#756).

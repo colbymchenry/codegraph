@@ -96,7 +96,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 Defined in `src/types.ts`. Both extractors and resolvers must use these exact strings.
 
 - **NodeKind**: `file`, `module`, `class`, `struct`, `interface`, `trait`, `protocol`, `function`, `method`, `property`, `field`, `variable`, `constant`, `enum`, `enum_member`, `type_alias`, `namespace`, `parameter`, `import`, `export`, `route`, `component`, `union`.
-- **EdgeKind**: `contains`, `calls`, `imports`, `exports`, `extends`, `implements`, `references`, `type_of`, `returns`, `instantiates`, `overrides`, `decorates`.
+- **EdgeKind**: `contains`, `calls`, `imports`, `exports`, `extends`, `implements`, `references`, `type_of`, `returns`, `instantiates`, `overrides`, `decorates`, `navigates`, `reads`, `writes`. (`reads`/`writes` are the same-file value-reference split of #996: an assignment LHS is a `writes`, everything else a `reads`, and a compound assignment / `++` is both. `EDGE_KINDS` order is the kernel wire contract — append, never reorder.)
 
 ### Multi-agent installer
 

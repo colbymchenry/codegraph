@@ -91,7 +91,8 @@ describe('edge wording', () => {
     expect(edgeWord({ kind: 'calls' })).toBe('');
     expect(edgeWord({ kind: 'instantiates' })).toBe('creates');
     expect(edgeWord({ kind: 'references' })).toBe('uses type');
-    expect(edgeWord({ kind: 'references', valueRef: true })).toBe('passes as value');
+    expect(edgeWord({ kind: 'reads' })).toBe('reads');
+    expect(edgeWord({ kind: 'writes' })).toBe('writes');
     expect(edgeWord({ kind: 'implements' })).toBe('implements');
   });
 

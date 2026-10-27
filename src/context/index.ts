@@ -1320,7 +1320,7 @@ export class ContextBuilder {
 
     // Edge recovery: BFS with many entry points leaves most nodes disconnected.
     // Discover edges between already-selected nodes to recover connectivity.
-    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'overrides', 'navigates'];
+    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'reads', 'writes', 'overrides', 'navigates'];
     const recoveredEdges = this.queries.findEdgesBetweenNodes(
       [...finalNodes.keys()],
       recoveryKinds,

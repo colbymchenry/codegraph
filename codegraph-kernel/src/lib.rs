@@ -52,6 +52,7 @@ mod swift;
 mod textutil;
 mod python;
 mod tsjs;
+mod value_refs;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

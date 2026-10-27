@@ -156,9 +156,11 @@ describe.skipIf(!kernelBuilt)('kernel Scala extraction parity', () => {
     // No namespace node, ever (package headers ignored).
     expect(result.nodes.some((n) => n.kind === 'namespace')).toBe(false);
     // Value-ref edges exist and are metadata-tagged.
-    expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.valueRef === true)).toBe(
-      true
-    );
+    expect(
+      result.edges.some(
+        (e) => (e.kind === 'reads' || e.kind === 'writes') && e.metadata?.valueRef === true
+      )
+    ).toBe(true);
   });
 
   it('a hasError flag without ERROR nodes defers (MISSING-only tree)', () => {

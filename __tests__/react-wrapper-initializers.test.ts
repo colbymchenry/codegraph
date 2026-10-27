@@ -160,7 +160,7 @@ describe.each(ENGINES)('a wrapper component walks its initializer and renders wh
     // function of its own named for the declarator.
     expect(db.prepare("SELECT kind FROM nodes WHERE name = 'Root'").all().map((r: any) => r.kind)).toEqual(['component']);
     // A file-scope value the template reads, and a memo comparator passed by name.
-    expect(edgesFrom(db, 'references', "json_extract(e.metadata, '$.valueRef') = 1")).toContain('Plain>BASE_CSS');
+    expect(edgesFrom(db, 'reads', "json_extract(e.metadata, '$.valueRef') = 1")).toContain('Plain>BASE_CSS');
     expect(edgesFrom(db, 'references', "json_extract(e.metadata, '$.fnRef') = 1")).toEqual(['Memoized>areEqual']);
   });
 

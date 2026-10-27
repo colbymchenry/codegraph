@@ -150,13 +150,13 @@ describe('Go variables declared in a var ( … ) block', () => {
         'ErrTooMany calls newError'
       ).toBe(true);
 
-      // Code reading a member in the same file references it.
+      // Code reading a member in the same file reads it (a value-ref edge).
       const check = node('function', 'check').id;
       for (const name of ['ErrNoSides', 'ErrTooMany']) {
         const id = node('variable', name).id;
         expect(
-          result.edges.some((e) => e.kind === 'references' && e.source === check && e.target === id),
-          `check references ${name}`
+          result.edges.some((e) => e.kind === 'reads' && e.source === check && e.target === id),
+          `check reads ${name}`
         ).toBe(true);
       }
     });

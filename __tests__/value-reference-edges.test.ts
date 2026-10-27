@@ -1,8 +1,8 @@
 /**
- * Value-reference edges (TS/JS): same-file `references` edges from a reader
- * symbol to the file-scope const/var it reads, so impact analysis catches
- * "change this constant, affect its readers". Default on; CODEGRAPH_VALUE_REFS=0
- * disables. See TreeSitterExtractor.flushValueRefs.
+ * Value-reference edges (TS/JS): same-file `reads`/`writes` edges from a
+ * symbol to the file-scope const/var it mentions, so impact analysis catches
+ * "change this constant, affect its readers/writers". Default on;
+ * CODEGRAPH_VALUE_REFS=0 disables. See TreeSitterExtractor.flushValueRefs.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -11,21 +11,37 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src';
 
-function valueRefReaders(cg: CodeGraph, constName: string): string[] {
+function valueRefEdges(cg: CodeGraph, constName: string, file?: string): Array<{ kind: string; reader: string }> {
   // Aggregate across ALL nodes of this name — a conditionally-defined module
   // const (`try: X=…; except: X=…`) has more than one, and the edge targets
   // whichever one ended up in the target map.
-  const targets = cg.searchNodes(constName).map((r) => r.node).filter((n) => n.name === constName);
-  const readers = new Set<string>();
+  const targets = cg
+    .searchNodes(constName)
+    .map((r) => r.node)
+    .filter((n) => n.name === constName && (file === undefined || n.filePath.endsWith(file)));
+  const out: Array<{ kind: string; reader: string }> = [];
   for (const t of targets) {
     for (const e of cg.getIncomingEdges(t.id)) {
-      if (e.kind === 'references' && (e.metadata as { valueRef?: boolean } | undefined)?.valueRef) {
-        const r = cg.getNode(e.source)?.name;
-        if (r) readers.add(r);
+      if ((e.kind === 'reads' || e.kind === 'writes') &&
+          (e.metadata as { valueRef?: boolean } | undefined)?.valueRef) {
+        const reader = cg.getNode(e.source)?.name;
+        if (reader) out.push({ kind: e.kind, reader });
       }
     }
   }
-  return [...readers];
+  return out;
+}
+
+function valueRefReaders(cg: CodeGraph, constName: string): string[] {
+  return [...new Set(valueRefEdges(cg, constName).map((e) => e.reader))];
+}
+
+function accesses(cg: CodeGraph, constName: string, file?: string): { reads: string[]; writes: string[] } {
+  const edges = valueRefEdges(cg, constName, file);
+  return {
+    reads: [...new Set(edges.filter((e) => e.kind === 'reads').map((e) => e.reader))].sort(),
+    writes: [...new Set(edges.filter((e) => e.kind === 'writes').map((e) => e.reader))].sort(),
+  };
 }
 
 describe('value-reference edges', () => {
@@ -64,20 +80,123 @@ describe('value-reference edges', () => {
     expect(readers).toEqual(expect.arrayContaining(['rowCount', 'describeTable', 'HEADER']));
   });
 
-  it('surfaces those readers in the impact radius of the const', async () => {
+  it('splits an assignment LHS (writes) from an RHS (reads) (#996)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'state.ts'),
+      [
+        'export let GLOBAL_COUNTER = 0;',
+        'export function reset() { GLOBAL_COUNTER = 0; }',
+        'export function readOnly() { return GLOBAL_COUNTER; }',
+        'export function viaParam(next: number) { GLOBAL_COUNTER = next; }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(accesses(cg, 'GLOBAL_COUNTER')).toEqual({
+      reads: ['readOnly'],
+      writes: ['reset', 'viaParam'],
+    });
+  });
+
+  it('records a compound assignment and ++ as both a read and a write (#996)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'compound.ts'),
+      [
+        'export let GLOBAL_COUNTER = 0;',
+        'export function bump() { GLOBAL_COUNTER += 1; }',
+        'export function tick() { GLOBAL_COUNTER++; }',
+        'export function selfAdd() { GLOBAL_COUNTER = GLOBAL_COUNTER + 1; }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(accesses(cg, 'GLOBAL_COUNTER')).toEqual({
+      reads: ['bump', 'selfAdd', 'tick'],
+      writes: ['bump', 'selfAdd', 'tick'],
+    });
+  });
+
+  it('splits reads and writes in Go, C and Rust (#996)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'state.go'),
+      [
+        'package main',
+        '',
+        'var GLOBAL_COUNTER = 0',
+        '',
+        'func Reset() { GLOBAL_COUNTER = 0 }',
+        'func Bump() { GLOBAL_COUNTER += 1 }',
+        'func ReadOnly() int { return GLOBAL_COUNTER }',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'state.c'),
+      [
+        'int GLOBAL_COUNTER = 0;',
+        'void reset(void) { GLOBAL_COUNTER = 0; }',
+        'void bump(void) { GLOBAL_COUNTER += 1; }',
+        'int read_only(void) { return GLOBAL_COUNTER; }',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'state.rs'),
+      [
+        'static mut GLOBAL_COUNTER: i32 = 0;',
+        'fn reset() { unsafe { GLOBAL_COUNTER = 0; } }',
+        'fn bump() { unsafe { GLOBAL_COUNTER += 1; } }',
+        'fn read_only() -> i32 { unsafe { GLOBAL_COUNTER } }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    for (const lang of ['state.go', 'state.c', 'state.rs']) {
+      expect(accesses(cg, 'GLOBAL_COUNTER', lang), lang).toEqual({
+        reads: lang === 'state.go' ? ['Bump', 'ReadOnly'] : ['bump', 'read_only'],
+        writes: lang === 'state.go' ? ['Bump', 'Reset'] : ['bump', 'reset'],
+      });
+    }
+  });
+
+  it('classifies a Python module const read as a read (#996)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'state.py'),
+      [
+        'MAX_ITEMS = 100',
+        '',
+        'def capped(n):',
+        '    return min(n, MAX_ITEMS)',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(accesses(cg, 'MAX_ITEMS')).toEqual({ reads: ['capped'], writes: [] });
+  });
+
+  it('no longer stores value references under the generic references kind (#996)', async () => {
     fs.writeFileSync(
       path.join(dir, 'palette.ts'),
       [
-        'export const COLOR_PALETTE = { red: "#f00", blue: "#00f" };',
+        'export let COLOR_PALETTE = { red: "#f00" };',
         'export function pickRed() { return COLOR_PALETTE.red; }',
+        'export function repaint() { COLOR_PALETTE = { red: "#0f0" }; }',
       ].join('\n'),
     );
     cg = index();
     await cg.indexAll();
 
     const target = cg.searchNodes('COLOR_PALETTE').map((r) => r.node).find((n) => n.name === 'COLOR_PALETTE')!;
+    const kinds = new Set(cg.getIncomingEdges(target.id).map((e) => e.kind));
+    expect(kinds).toContain('reads');
+    expect(kinds).toContain('writes');
+    expect(kinds).not.toContain('references');
+    // The former reference consumers still see the value's uses: impact still
+    // reaches both the reader and the writer through the caller walk.
     const impacted = [...cg.getImpactRadius(target.id).nodes.values()].map((n) => n.name);
-    expect(impacted).toContain('pickRed');
+    expect(impacted).toEqual(expect.arrayContaining(['pickRed', 'repaint']));
   });
 
   it('does NOT edge a shadowed const — inner re-declaration makes the name ambiguous', async () => {

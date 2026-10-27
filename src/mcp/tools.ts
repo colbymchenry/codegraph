@@ -478,7 +478,7 @@ const ISOLATED_WEAK_KIND_WEIGHT = 0.08;
  * which is exactly the case this guards against.
  */
 const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
-  'calls', 'references', 'extends', 'implements', 'overrides',
+  'calls', 'references', 'reads', 'writes', 'extends', 'implements', 'overrides',
   'instantiates', 'returns', 'type_of', 'decorates', 'navigates',
 ]);
 
@@ -4143,7 +4143,7 @@ export class ToolHandler {
     for (let i = 0; i < n; i++) idx.set(nodeIds[i]!, i);
 
     const RANK_EDGES = new Set<string>([
-      'calls', 'references', 'extends', 'implements', 'overrides',
+      'calls', 'references', 'reads', 'writes', 'extends', 'implements', 'overrides',
       'instantiates', 'returns', 'type_of', 'imports', 'navigates',
     ]);
     const adj: number[][] = Array.from({ length: n }, () => []);
@@ -8727,6 +8727,8 @@ export class ToolHandler {
     if (edge.kind === 'instantiates') return 'instantiation';
     if (edge.kind === 'imports') return 'import';
     if (edge.kind === 'references') return 'reference';
+    if (edge.kind === 'reads') return 'reads';
+    if (edge.kind === 'writes') return 'writes';
     return edge.kind;
   }
 

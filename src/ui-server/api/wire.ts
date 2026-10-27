@@ -166,9 +166,9 @@ export function toNodeDetail(node: Node): WireNodeDetail {
  * `metadata` is a free-form JSON blob in the schema; the fields lifted out here
  * are the ones the viewer draws with — confidence decides the uncertain fold,
  * `provenance`/`synthesizedBy`/`via`/`registeredAt` decide how a connector is
- * dashed and what the "via <mechanism>" pill says, `valueRef` distinguishes
- * "passes as value" from "calls". Anything else in the blob stays out: it is
- * resolver bookkeeping, not something a reader can act on.
+ * dashed and what the "via <mechanism>" pill says, `valueRef` marks a same-file
+ * value use (a `reads`/`writes` edge). Anything else in the blob stays out: it
+ * is resolver bookkeeping, not something a reader can act on.
  */
 export interface WireEdge {
   kind: EdgeKind;
@@ -343,6 +343,8 @@ export const CONTAINER_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>([
 export const CALLER_EDGE_KINDS: ReadonlySet<EdgeKind> = new Set<EdgeKind>([
   'calls',
   'references',
+  'reads',
+  'writes',
   'imports',
   'instantiates',
   'navigates',

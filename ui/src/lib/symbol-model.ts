@@ -68,7 +68,7 @@ export function edgeWord(edge: WireEdge): string {
     case 'navigates':
       return 'navigates to';
     case 'references':
-      return edge.valueRef ? 'passes as value' : 'uses type';
+      return 'uses type';
     default:
       return edge.kind;
   }

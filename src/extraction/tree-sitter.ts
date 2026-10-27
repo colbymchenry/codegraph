@@ -17,6 +17,7 @@ import {
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
+import { valueRefAccess } from './value-ref-access';
 import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
@@ -1311,11 +1312,15 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Emit same-file `references` edges from a symbol to the file-scope const/var it reads (TS/JS).
-   * The engine doesn't edge const→consumer, so impact analysis misses "change this table, affect
-   * its readers" (the ReScript-PR false positive). Same-file only (resolution is unambiguous),
-   * distinctive target names only (dodges the local-shadowing precision trap documented on
-   * function_ref), deduped per (reader, target). Default on (CODEGRAPH_VALUE_REFS=0 disables) +
+   * Emit same-file `reads`/`writes` edges from a symbol to the file-scope
+   * const/var it mentions. The engine doesn't edge const→consumer, so impact
+   * analysis misses "change this table, affect its readers/writers" (the
+   * ReScript-PR false positive). The access mode comes from the AST position
+   * (#996): an assignment LHS writes, everything else reads, and a compound
+   * assignment (`+=`) or `++` both reads and writes. Same-file only
+   * (resolution is unambiguous), distinctive target names only (dodges the
+   * local-shadowing precision trap documented on function_ref), deduped per
+   * (reader, target, access). Default on (CODEGRAPH_VALUE_REFS=0 disables) +
    * additive. Shadowed targets are pruned — see below.
    */
   private flushValueRefs(): void {
@@ -1457,15 +1462,29 @@ export class TreeSitterExtractor {
           const targetId = targets.get(refName);
           // Skip self and same-name targets: a symbol referencing a file-scope
           // sibling of its own name (the two halves of a conditional `try: X=…;
-          // except: X=…`) is never a meaningful value read.
-          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId)) {
-            seen.add(targetId);
-            this.edges.push({
-              source: scope.id,
-              target: targetId,
-              kind: 'references',
-              metadata: { valueRef: true },
-            });
+          // except: X=…`) is never a meaningful value access.
+          if (targetId && targetId !== scope.id && refName !== scope.name) {
+            // #996: an assignment LHS is a `writes`, everything else a `reads`,
+            // and a compound assignment / `++` both reads and writes. Dedupe is
+            // per (target, access): a function that only reads a value keeps
+            // one edge, while one that also writes it gets both.
+            const access = valueRefAccess(n, this.source);
+            const kinds: Array<'reads' | 'writes'> = [];
+            if (access.read) kinds.push('reads');
+            if (access.write) kinds.push('writes');
+            for (const kind of kinds) {
+              const key = `${targetId}:${kind}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              this.edges.push({
+                source: scope.id,
+                target: targetId,
+                kind,
+                line: n.startPosition.row + 1,
+                column: n.startPosition.column,
+                metadata: { valueRef: true },
+              });
+            }
           }
         }
         for (let i = 0; i < n.namedChildCount; i++) {

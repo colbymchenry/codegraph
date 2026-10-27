@@ -389,7 +389,7 @@ export const Box = () => <div data-size={THEME_TOKENS.size} />;
 `, language);
     const name = (id: string) => result.nodes.find((n) => n.id === id)?.name;
     expect(result.edges
-      .filter((e) => e.kind === 'references' && e.metadata?.valueRef === true)
+      .filter((e) => (e.kind === 'reads' || e.kind === 'writes') && e.metadata?.valueRef === true)
       .map((e) => `${name(e.source)} -> ${name(e.target)}`)
       .sort()).toEqual(['AuthRoutes -> LoginPage', 'Box -> THEME_TOKENS', 'Nav -> ROUTE_TABLE', 'Nav -> THEME_TOKENS']);
   });
