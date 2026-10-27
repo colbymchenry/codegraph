@@ -521,6 +521,28 @@ describe('resolveProjectFile — the source read chokepoint', () => {
     expect(() => resolveProjectFile('/', 'etc/passwd')).toThrow(PathRefusalError);
   });
 
+  // #1930: the root is checked as the folder it really names, so a root that
+  // is a link (a junction on Windows) to a sensitive folder is refused too.
+  it('refuses a root that is a link to a sensitive home folder', () => {
+    const home = path.join(tempDir, 'home');
+    fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'FAKE-KEY\n');
+    const root = path.join(tempDir, 'ssh-link');
+    fs.symlinkSync(path.join(home, '.ssh'), root, process.platform === 'win32' ? 'junction' : 'dir');
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      expect(() => resolveProjectFile(root, 'id_ed25519')).toThrow(/sensitive directory/i);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      fs.unlinkSync(root);
+    }
+  });
+
   it.runIf(process.platform !== 'win32')('refuses a symlink pointing out of the project (#527)', () => {
     const link = path.join(projectRoot, 'src', 'escape.ts');
     fs.symlinkSync(path.join(tempDir, 'secret.txt'), link);

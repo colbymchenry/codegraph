@@ -185,6 +185,22 @@ describe('codegraph ui — refusals', () => {
     expect(code).toBe(1);
     expect(output).toContain('Refusing to operate on sensitive');
   });
+
+  // #1930: a link (a junction on Windows) to a sensitive folder is refused like
+  // the folder itself, not taken for an ordinary unindexed project.
+  it('refuses a link to a sensitive home folder', () => {
+    const home = path.join(unindexed, 'home');
+    fs.mkdirSync(path.join(home, '.config'), { recursive: true });
+    const link = path.join(unindexed, 'config-link');
+    fs.symlinkSync(path.join(home, '.config'), link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      const { code, output } = runCli(['ui', link], { HOME: home, USERPROFILE: home });
+      expect(code).toBe(1);
+      expect(output).toContain('Refusing to operate on sensitive');
+    } finally {
+      fs.unlinkSync(link);
+    }
+  });
 });
 
 describe('codegraph ui — serving', () => {

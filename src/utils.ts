@@ -30,6 +30,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 // ============================================================
@@ -45,6 +46,22 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+
+/**
+ * Credential and config folders in the home directory. Unlike the system set,
+ * everything under them is refused too.
+ */
+const SENSITIVE_HOME_DIRS = ['.ssh', '.gnupg', '.aws', '.config'];
+
+/**
+ * How long the real paths of the sensitive home folders are reused. The viewer
+ * re-checks its root on every file it reads, so they are not re-read per check,
+ * but a folder linked somewhere new while the process runs is noticed soon.
+ */
+const SENSITIVE_HOME_TTL_MS = 2_000;
+
+let sensitiveHomeCache: { home: string; expires: number; trees: string[] } | undefined;
+let sensitiveSystemRealPaths: Set<string> | undefined;
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -184,30 +201,136 @@ export function validatePathWithinRoot(
 }
 
 /**
+ * A path in the form the sensitive-folder check compares: lower-cased where the
+ * file system ignores case by default (NTFS, APFS), so `~/.SSH` is `~/.ssh`.
+ */
+function foldPathCase(p: string): string {
+  return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+/** Whether `child` is `parent` or lies under it. Both are already folded. */
+function isSameOrUnder(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  // A root (`C:\`, `/`) already ends with its separator.
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+/**
+ * The plain spelling of a Win32 namespace path: `\\?\C:\x` and `\\.\C:\x` are
+ * `C:\x`, and `\\?\UNC\host\share` is `\\host\share`. `path.resolve` keeps the
+ * prefix, so a string comparison would never see the folder behind it. Other
+ * namespace paths (a `\\?\Volume{…}\` name, a device) are returned unchanged;
+ * the real path the caller also checks names their folder.
+ */
+function stripWin32NamespacePrefix(p: string): string {
+  if (process.platform !== 'win32') return p;
+  const prefix = /^[\\/]{2}[?.][\\/](UNC[\\/])?/i.exec(p);
+  if (!prefix) return p;
+  const rest = p.slice(prefix[0].length);
+  if (prefix[1]) return `\\\\${rest}`;
+  return /^[a-z]:[\\/]/i.test(rest) ? rest : p;
+}
+
+/**
+ * The folder a path really names: links (symlinks, junctions, a `subst` drive)
+ * followed, and the case and long names stored on disk. Null when it can't be
+ * resolved, most often because it doesn't exist; the lexical check still runs.
+ */
+function nativeRealPath(p: string): string | null {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The system set's own real paths, folded. macOS keeps `/etc`, `/tmp` and
+ * `/var` under `/private`, so a project whose real path is `/private/etc` is
+ * `/etc`. Read once: these folders don't move.
+ */
+function sensitiveSystemPaths(): Set<string> {
+  if (!sensitiveSystemRealPaths) {
+    sensitiveSystemRealPaths = new Set();
+    for (const entry of SENSITIVE_PATHS) {
+      // Only this platform's entries: on Windows `/` would resolve to the root
+      // of the current drive and refuse every project at a drive root.
+      const native = process.platform === 'win32' ? /^[a-z]:\\/.test(entry) : entry.startsWith('/');
+      if (!native) continue;
+      const real = nativeRealPath(entry);
+      if (real) sensitiveSystemRealPaths.add(foldPathCase(real));
+    }
+  }
+  return sensitiveSystemRealPaths;
+}
+
+/**
+ * The sensitive home folders, folded: as spelled under the home directory,
+ * under the home's real path (a linked home), and each folder's own real path
+ * (a `~/.ssh` that is itself a link into a dotfiles checkout).
+ */
+function sensitiveHomeTrees(): string[] {
+  const home = os.homedir();
+  const now = Date.now();
+  if (sensitiveHomeCache && sensitiveHomeCache.home === home && now < sensitiveHomeCache.expires) {
+    return sensitiveHomeCache.trees;
+  }
+  const trees = new Set<string>();
+  const realHome = nativeRealPath(home);
+  for (const dir of SENSITIVE_HOME_DIRS) {
+    const spelled = path.join(home, dir);
+    trees.add(foldPathCase(spelled));
+    if (realHome) trees.add(foldPathCase(path.join(realHome, dir)));
+    const real = nativeRealPath(spelled);
+    if (real) trees.add(foldPathCase(real));
+  }
+  sensitiveHomeCache = { home, expires: now + SENSITIVE_HOME_TTL_MS, trees: [...trees] };
+  return sensitiveHomeCache.trees;
+}
+
+/**
  * Validate that a path is a safe project root directory.
  *
  * Rejects sensitive system directories and ensures the path is
  * a real, existing directory. Used at MCP and API entry points
  * to prevent arbitrary directory access.
  *
+ * The path is checked both as spelled and as the folder it really names, so a
+ * link to `~/.ssh`, a case variant (`~/.SSH`) or a `\\?\` spelling is refused
+ * like the folder itself (#1930). It is kept to one realpath per call, since the
+ * viewer calls this for every file it reads: the sensitive folders' own real
+ * paths are cached and re-read every couple of seconds.
+ *
  * @param dirPath - The path to validate
  * @returns An error message if invalid, or null if valid
  */
 export function validateProjectPath(dirPath: string): string | null {
   const resolved = path.resolve(dirPath);
+  const lexical = path.resolve(stripWin32NamespacePrefix(dirPath));
+  const real = nativeRealPath(lexical);
+  const candidates = [lexical];
+  if (real && real !== lexical) candidates.push(real);
+  const named = (candidate: string): string =>
+    candidate === resolved ? resolved : `${resolved} (resolves to ${candidate})`;
 
   // Block sensitive system directories
-  if (SENSITIVE_PATHS.has(resolved) || SENSITIVE_PATHS.has(resolved.toLowerCase())) {
-    return `Refusing to operate on sensitive system directory: ${resolved}`;
+  const systemPaths = sensitiveSystemPaths();
+  for (const candidate of candidates) {
+    if (
+      SENSITIVE_PATHS.has(candidate) ||
+      SENSITIVE_PATHS.has(candidate.toLowerCase()) ||
+      systemPaths.has(foldPathCase(candidate))
+    ) {
+      return `Refusing to operate on sensitive system directory: ${named(candidate)}`;
+    }
   }
 
   // Also block common sensitive home subdirectories
-  const homeDir = require('os').homedir();
-  const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
-    const sensitivePath = path.join(homeDir, dir);
-    if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
-      return `Refusing to operate on sensitive directory: ${resolved}`;
+  const homeTrees = sensitiveHomeTrees();
+  for (const candidate of candidates) {
+    const folded = foldPathCase(candidate);
+    if (homeTrees.some((tree) => isSameOrUnder(folded, tree))) {
+      return `Refusing to operate on sensitive directory: ${named(candidate)}`;
     }
   }
 

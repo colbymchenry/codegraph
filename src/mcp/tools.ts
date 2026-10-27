@@ -2382,6 +2382,14 @@ export class ToolHandler {
       );
     }
 
+    // The root the walk landed on gets the same refusal. A path that doesn't
+    // exist skips the check above, so `~/.config/no-such-dir` would otherwise
+    // walk up into an index of `~/.config` (#1930).
+    const rootError = validateProjectPath(resolvedRoot);
+    if (rootError) {
+      throw new PathRefusalError(rootError);
+    }
+
     const cg = this.openProjectRoot(resolvedRoot, canonicalRoot);
     // The walk above crosses git boundaries. A nested repository the ancestor
     // index leaves out (typically gitignored) would otherwise be answered from
