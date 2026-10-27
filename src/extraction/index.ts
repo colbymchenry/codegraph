@@ -1384,6 +1384,53 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
 }
 
 /**
+ * Whether the repository `rootDir` sits in gitignores `rootDir` itself. Git
+ * then lists nothing inside it, so the git-backed scan and change detection
+ * both step aside for the directory walk. Asked only of a folder below its
+ * repository's root.
+ */
+function isIgnoredByEnclosingRepo(rootDir: string): boolean {
+  try {
+    // git check-ignore exits 0 if the path IS ignored, 1 if not
+    execFileSync(
+      'git',
+      ['check-ignore', '-q', path.resolve(rootDir)],
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** {@link gitRepoPrefix} answers, by folder. */
+const gitRepoPrefixes = new Map<string, string>();
+
+/**
+ * Where `dir` sits in its git repository: '' at the repository's root, else the
+ * path from the root with a trailing slash (`app/`). Throws when `dir` is in no
+ * repository. `git status --porcelain` prints every path from the repository's
+ * root, whichever folder it runs in, so a project below the root takes this
+ * off (#1636). A folder with its own `.git` is a repository or worktree root and
+ * costs no git call; any other answer is kept, since a folder's place in its
+ * repository does not move under a running process.
+ */
+function gitRepoPrefix(dir: string): string {
+  if (fs.existsSync(path.join(dir, '.git'))) return '';
+  const key = path.resolve(dir);
+  let prefix = gitRepoPrefixes.get(key);
+  if (prefix === undefined) {
+    prefix = normalizePath(execFileSync(
+      'git',
+      ['rev-parse', '--show-prefix'],
+      { cwd: dir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    ).trim());
+    gitRepoPrefixes.set(key, prefix);
+  }
+  return prefix;
+}
+
+/**
  * Get all files visible to git (tracked + untracked but not ignored).
  * Respects .gitignore at all levels (root, subdirectories) and descends into
  * embedded (nested, non-submodule) git repos. Returns null on failure
@@ -1400,23 +1447,13 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
       { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     ).trim();
 
-    if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
-      try {
-        // git check-ignore exits 0 if the path IS ignored, 1 if not
-        execFileSync(
-          'git',
-          ['check-ignore', '-q', path.resolve(rootDir)],
-          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-        );
-        // Directory is gitignored by parent repo — fall back to filesystem walk
-        logDebug('project root is gitignored by a parent repo — falling back to filesystem walk', {
-          rootDir,
-          gitRoot,
-        });
-        return null;
-      } catch {
-        // Not ignored — safe to use git ls-files
-      }
+    if (path.resolve(gitRoot) !== path.resolve(rootDir) && isIgnoredByEnclosingRepo(rootDir)) {
+      // Directory is gitignored by parent repo — fall back to filesystem walk
+      logDebug('project root is gitignored by a parent repo — falling back to filesystem walk', {
+        rootDir,
+        gitRoot,
+      });
+      return null;
     }
 
     const files = new Set<string>();
@@ -1495,7 +1532,12 @@ export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null)
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
     const isSource = (filePath: string): boolean => isSourceFile(filePath, overrides, rootDir);
-    collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
+    // A project in a folder below its repository's root (#1636). Git can say
+    // nothing about a folder its repository ignores: decline, as the scan
+    // does, so callers take the full scan that indexed the project.
+    const repoPrefix = gitRepoPrefix(rootDir);
+    if (repoPrefix && isIgnoredByEnclosingRepo(rootDir)) return null;
+    collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined, repoPrefix);
     return changes;
   } catch {
     return null;
@@ -1567,7 +1609,12 @@ export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSource: (filePath: string) => boolean, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string): void {
+/**
+ * `repoPrefix` is where `repoDir` sits in its repository ({@link gitRepoPrefix}):
+ * '' for a repository root, which every embedded repo below is, and the
+ * folder's path from the root (`app/`) for a project below it (#1636).
+ */
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSource: (filePath: string) => boolean, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string, repoPrefix = ''): void {
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1576,7 +1623,12 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
     // below). Nested untracked git repos still collapse to `?? repo/` even
     // with `-uall` — git never crosses a repo boundary — so the recursion
     // still handles them. (#1213)
-    ['status', '--porcelain', '--no-renames', '-z', '-uall'],
+    // Below the repository's root, `-- .` keeps the report to this folder:
+    // git reports the whole repository otherwise. A root runs the command
+    // it always did.
+    repoPrefix
+      ? ['status', '--porcelain', '--no-renames', '-z', '-uall', '--', '.']
+      : ['status', '--porcelain', '--no-renames', '-z', '-uall'],
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
@@ -1587,9 +1639,9 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   // vendor/ dir, or a tracked file under a .gitignored dir, surfaces here as a
   // change — so `codegraph status` (which reads getChangedFiles) reports a
   // pending edit the full index never tracks and `sync` never clears. Matching
-  // repo-relative `rel` at each recursion level mirrors getGitVisibleFiles'
+  // `repoDir`-relative `rel` at each recursion level mirrors getGitVisibleFiles'
   // ScopeIgnore: every embedded repo is judged by ITS OWN rules, never the
-  // parent's. (#766)
+  // parent's, and a project below its repository's root by its own. (#766)
   const ig = buildDefaultIgnore(repoDir);
 
   // One classifier for both candidate sources below, so a committed change is
@@ -1607,7 +1659,7 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
     }
 
     // Added (`??`) / modified files inside an excluded dir must not enter the
-    // index — match against the repo-relative path, same as the full scan. (#766)
+    // index — match against the `repoDir`-relative path, same as the full scan. (#766)
     if (ig.ignores(rel)) return;
     // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
     // matched against the full path — sync must not re-add a tracked file the
@@ -1630,7 +1682,13 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
     if (line.length < 4) continue; // Minimum: "XY file"
 
     const statusCode = line.substring(0, 2);
-    const rel = normalizePath(line.substring(3));
+    let rel = normalizePath(line.substring(3));
+    // Porcelain paths run from the repository's root, whatever the cwd: take
+    // them back to this folder, and leave out anything outside it.
+    if (repoPrefix) {
+      if (!rel.startsWith(repoPrefix) || rel.length === repoPrefix.length) continue;
+      rel = rel.slice(repoPrefix.length);
+    }
 
     // Untracked directory entries (trailing slash) may hide an embedded repo —
     // collect for the recursion below instead of treating as a file.
