@@ -49,7 +49,7 @@ export function lastQualifierPart(symbol: string): string {
  * (`Session.request`, `stage_apply::run`, `pkg/mod.Fn`).
  */
 function canonicalScope(text: string): string {
-  return text.replace(/::/g, '.').replace(/\//g, '.');
+  return text.replace(/::/g, '.').replace(/[\/\\]/g, '.');
 }
 
 /**
@@ -87,24 +87,19 @@ export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackag
   const lastPart = parts[parts.length - 1]!;
   if (node.name !== lastPart) return false;
 
-  // Stage 1: qualified-name containment starting at a scope boundary.
-  const qualifiedQuery = parts.join('::');
-  if (node.qualifiedName.startsWith(qualifiedQuery) ||
-      node.qualifiedName.includes(`::${qualifiedQuery}`) ||
-      node.qualifiedName.includes(`.${qualifiedQuery}`)) return true;
-
-  // Stage 1b: boundary-aligned suffix under a canonical separator.
+  // Stage 1: boundary-aligned suffix under a canonical separator.
   //
   // Splitting on EVERY separator assumes no scope component contains one —
   // false for any language whose module names are themselves dotted (Elixir
   // `AppWeb.Format`, a Java/C# package, a Python dotted module). There the
-  // stored qualifiedName is `AppWeb.Format::group`, so the stage-1 spelling
-  // `AppWeb::Format::group` cannot match and a perfectly precise query
+  // stored qualifiedName is `AppWeb.Format::group`, so the spelling
+  // `AppWeb::Format::group` cannot match directly and a perfectly precise query
   // resolved to nothing. Canonicalising both sides and requiring the match to
   // land on a separator boundary handles both conventions without matching
   // part of a scope name.
   const canonicalQuery = canonicalScope(symbol);
-  const canonicalNode = canonicalScope(node.qualifiedName);
+  const qualifiedBase = node.qualifiedName.replace(/\/\d{1,3}$/, '');
+  const canonicalNode = canonicalScope(qualifiedBase);
   if (canonicalNode === canonicalQuery || canonicalNode.endsWith(`.${canonicalQuery}`)) {
     return true;
   }
@@ -117,7 +112,13 @@ export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackag
   const segments = node.filePath.split('/').filter((s) => s.length > 0);
   const inPath = (hint: string): boolean =>
     segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint);
-  if (containerHints.every(inPath)) return true;
+  const scope = canonicalNode.split('.').slice(0, -1);
+  const ownType = scope[scope.length - 1];
+  const lastHint = containerHints[containerHints.length - 1]!;
+  // Rust/Python/Go qualifiers may name modules; otherwise a path cannot rescue a partial type name.
+  const namesModule = node.language === 'rust' || node.language === 'python' || node.language === 'go';
+  const namesOtherType = !namesModule && ownType !== undefined && ownType !== lastHint && ownType.includes(lastHint);
+  if (!namesOtherType && containerHints.every(inPath)) return true;
 
   // Stage 3: a package, then the scope inside it. `refresh.Discovery.refresh` is
   // method `refresh` of type `Discovery` in Go package `refresh` (a Python
@@ -125,7 +126,6 @@ export function matchesSymbol(node: Node, symbol: string, goPackageOf?: GoPackag
   // qualifiedName and the package in the path, so neither stage above reads the
   // whole name. The leading qualifiers must name the package as stage 2 does,
   // the rest must end the node's scope.
-  const scope = canonicalScope(node.qualifiedName).split('.').slice(0, -1);
   const splits: number[] = [];
   for (let k = 1; k < containerHints.length; k++) {
     const inner = containerHints.slice(k);

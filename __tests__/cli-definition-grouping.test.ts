@@ -69,9 +69,10 @@ beforeAll(async () => {
     '  public static void convertCaller() { convert(1); convert("value"); }',
     '}',
   ].join('\n'));
-  write('Pricing.cs', `public static class Format
+  write('Format.cs', `public static class Format
 {
-    public static string Price(decimal value) => value.ToString("0.00");
+    public static string Price(decimal value) => RenderPrice(value, "0.00");
+    public static string RenderPrice(decimal value, string format) => value.ToString(format);
 }
 public static class LegacyFormat
 {
@@ -82,6 +83,14 @@ public class Invoice
     public string Total(decimal value) => Format.Price(value);
     public string OldTotal(decimal value) => LegacyFormat.Price(value);
 }
+`);
+  write('q.php', `<?php
+namespace App\\Models\\Billing;
+class Format {
+    public static function price($value) { return billing_text($value); }
+}
+function total($value) { return Format::price($value); }
+function billing_text($value) { return $value; }
 `);
   for (let i = 0; i < 55; i++) {
     write(`crowd/def-${i}.js`, "import { shared } from '../shared.js';\nexport function crowded() { shared(); }\n");
@@ -103,13 +112,25 @@ describe.each(COMMANDS)('%s definition grouping (#1512)', (command) => {
     expect(out.targets.map((n: any) => n.qualifiedName)).toEqual(['Format::Price']);
     expect(out.definitions).toHaveLength(1);
     expect(out.ambiguous).toBe(false);
-    if (command === 'callers') {
-      expect(out.callers.map((n: any) => n.name)).toContain('Total');
-      expect(out.callers.map((n: any) => n.name)).not.toContain('OldTotal');
-    }
+    const expected = command === 'callees' ? 'RenderPrice' : 'Total';
+    expect(out[resultKey(command)].map((n: any) => n.name)).toContain(expected);
+    expect(out[resultKey(command)].map((n: any) => n.name)).not.toContain('OldTotal');
     const result = await handler.execute(`codegraph_${command}`, { symbol: 'Format.Price' });
     expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toContain(expected);
     expect(result.content[0]?.text).not.toContain('LegacyFormat');
+    expect(result.content[0]?.text).not.toContain('OldTotal');
+  });
+
+  it('resolves PHP namespace suffixes through CLI and MCP (#2908)', async () => {
+    const symbol = 'Billing::Format::price';
+    const out = json(command, symbol);
+    expect(out.targets.map((n: any) => n.qualifiedName)).toEqual(['App\\Models\\Billing::Format::price']);
+    expect(out.definitions).toHaveLength(1);
+    expect(out.ambiguous).toBe(false);
+    const result = await handler.execute(`codegraph_${command}`, { symbol });
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toContain(command === 'callees' ? 'billing_text' : 'total');
   });
 
   it('attributes every result and graph edge to its definition in JSON', () => {

@@ -320,6 +320,8 @@ describe('matchesSymbol — qualified component boundaries (#2908)', () => {
     ['Shop.LegacyFormat::Price', false],
     ['Shop.LegacyFormat.Price', false],
     ['NamespaceFormat::Price', false],
+    ['Shop::Format::Prices::Price', false],
+    ['Format::PriceList::Price', false],
   ] as const)('matches %s only at a complete scope component', (qualifiedName, expected) => {
     expect(matchesSymbol(fakeNode({ name: 'Price', qualifiedName }), 'Format.Price')).toBe(expected);
   });
@@ -327,8 +329,37 @@ describe('matchesSymbol — qualified component boundaries (#2908)', () => {
   it('preserves qualified names carrying an arity suffix', () => {
     const node = fakeNode({ name: 'price', qualifiedName: 'Shop.Format::price/2', language: 'erlang' });
     expect(matchesSymbol(node, 'Format.price/2')).toBe(true);
+    expect(matchesSymbol(node, 'Format.price')).toBe(true);
     expect(matchesSymbol(node, 'Format.price/1')).toBe(false);
     expect(matchesSymbol({ ...node, qualifiedName: 'Shop.LegacyFormat::price/2' }, 'Format.price/2')).toBe(false);
+  });
+
+  it.each(['src/Format.cs', 'src/Format/LegacyFormat.cs'])(
+    'does not let path %s override a partial class-name mismatch', (filePath) => {
+      const node = fakeNode({ name: 'Price', qualifiedName: 'LegacyFormat::Price', filePath, language: 'csharp' });
+      expect(matchesSymbol(node, 'Format.Price')).toBe(false);
+      expect(matchesSymbol(node, 'LegacyFormat.Price')).toBe(true);
+    }
+  );
+
+  it.each([
+    ['Billing::Format::price', 'price', 'App\\Models\\Billing::Format::price'],
+    ['Billing.Format.price', 'price', 'App\\Models\\Billing::Format::price'],
+    ['Models.Billing.Format.price', 'price', 'App\\Models\\Billing::Format::price'],
+    ['Billing::Format', 'Format', 'App\\Models\\Billing::Format'],
+  ])('resolves PHP namespace suffix %s', (query, name, qualifiedName) => {
+    expect(matchesSymbol(fakeNode({ name, qualifiedName, filePath: 'q.php', language: 'php' }), query)).toBe(true);
+  });
+
+  it.each([
+    ['rust', 'src/format.rs', 'format::price'],
+    ['python', 'src/format.py', 'format.price'],
+    ['go', 'format/pricing.go', 'format.price'],
+  ] as const)('preserves %s module qualifiers contained in a type name', (language, filePath, query) => {
+    const node = fakeNode({ kind: 'method', name: 'price', qualifiedName: 'Reformat::price', language, filePath });
+    expect(matchesSymbol(node, query)).toBe(true);
+    expect(matchesSymbol(node, 'format.Reformat.price')).toBe(true);
+    expect(matchesSymbol(node, 'other.price')).toBe(false);
   });
 });
 
