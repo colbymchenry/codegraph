@@ -1123,7 +1123,17 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // Status only reads. Opened read-write, it ran the open-time repairs
+      // meant for the writer: during a rebuild's bulk load it recreated the
+      // secondary indexes the indexer had dropped, and the indexer's next
+      // edge write failed with SQLITE_BUSY_SNAPSHOT, "database is locked"
+      // (#2913). Read-only, it leaves migrations, index repair and WAL
+      // maintenance to the writer.
+      const cg = await CodeGraph.open(projectPath, { readOnly: true });
+      const { isRebuildInProgress } = await import('../mcp/writer-lock');
+      // A `codegraph index` in another process owns the database: the
+      // numbers below are a snapshot of a graph being rebuilt.
+      const rebuildInProgress = isRebuildInProgress(projectPath);
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
@@ -1165,6 +1175,9 @@ program
           worktreeMismatch: worktreeMismatch
             ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
             : null,
+          // True while another process runs `codegraph index` on this
+          // project: the statistics are a snapshot of the rebuild (#2913).
+          rebuildInProgress,
           index: {
             builtWithVersion: buildInfo.version,
             builtWithExtractionVersion: buildInfo.extractionVersion,
@@ -1197,7 +1210,9 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
-      if (indexState === 'indexing') {
+      if (rebuildInProgress) {
+        warn('An index rebuild ("codegraph index") is running in another process — the statistics below are a snapshot of it.');
+      } else if (indexState === 'indexing') {
         warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
       } else if (indexState === 'partial') {
         warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
