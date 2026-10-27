@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- `codegraph query`, `codegraph files`, `codegraph callers` and the other library-backed commands now start faster: the MCP server behind `codegraph serve` — the daemon, proxy, tool engine and session machinery — is no longer loaded at startup just because the package exports `MCPServer`. On a benchmark project this shrank `query`'s module graph by 25 modules and cut startup time by about a seventh — roughly half a second per run (exact numbers in `docs/benchmarks/query-startup-lazy-mcp.md`). SDK consumers see the same `MCPServer` export as before, loaded on first use.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

@@ -104,7 +104,70 @@ export {
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
-export { MCPServer } from './mcp';
+/*
+ * `MCPServer` is re-exported lazily.
+ *
+ * The static `export { MCPServer } from './mcp'` this replaces pulled the
+ * whole MCP module graph — daemon, proxy, engine, session, writer-lock,
+ * tools — into every consumer of this entry the moment it was required. The
+ * CLI's `query` reaches this module through `loadCodeGraph()` and never
+ * touches the MCP server, but still paid for all of it at startup (see
+ * docs/benchmarks/query-startup-lazy-mcp.md).
+ *
+ * How the lazy value works:
+ *
+ * - The `export const` placeholder keeps the export's type surface identical
+ *   to the old static re-export (value = the class constructor, type = an
+ *   instance).
+ * - The `Object.defineProperty` getter below replaces that placeholder. It is
+ *   written in the exact shape `tsc` emits for `export { X } from './y'`,
+ *   except the `require('./mcp')` runs on first access instead of at module
+ *   load. After access, `MCPServer` is the very class `./mcp` exports — same
+ *   identity, same constructor behaviour. The exact shape is load-bearing:
+ *   CommonJS named-export detection (cjs-module-lexer) only recognizes that
+ *   getter form, and any other — an arrow-function getter, or a getter nested
+ *   inside a block — makes `import { MCPServer } from 'codegraph'` fail from
+ *   ESM.
+ *
+ * `./mcp/version` — the only mcp module this entry still loads eagerly — is
+ * dependency-free by design and stays eager.
+ */
+/** The CodeGraph MCP server, loaded from `./mcp` on first access. */
+export const MCPServer: typeof import('./mcp').MCPServer = undefined as unknown as typeof import('./mcp').MCPServer;
+export type MCPServer = import('./mcp').MCPServer;
+
+// The lazy holder for the `./mcp` namespace. Its getter is the only place
+// that touches `require('./mcp')`. `require` resolves in the built package
+// (dist/, the only form npm ships) — where this re-export keeps working from
+// both CommonJS and ESM. When this *source* is loaded by a test runner like
+// vitest there is no CommonJS `require` for `./mcp`, so in that case import
+// the server directly (`import { MCPServer } from '../src/mcp'`).
+const lazyMcp = {
+  get MCPServer(): typeof import('./mcp').MCPServer {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      return require('./mcp').MCPServer;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `MCPServer could not be loaded from './mcp' (${reason}). ` +
+          'In the built package this resolves through CommonJS require(); ' +
+          "when this source is loaded by a test runner, import it from '../src/mcp' instead.",
+        { cause: err },
+      );
+    }
+  },
+};
+declare const exports: Record<string, unknown> | undefined;
+// Deliberately in the exact shape `tsc` emits for `export { X } from './y'`
+// (`Object.defineProperty(exports, "X", { enumerable: true, get: function () { return y.X; } })`):
+// CommonJS named-export detection (cjs-module-lexer) only recognizes that
+// exact shape, and any deviation — an extra descriptor field like
+// `configurable`, an arrow-function getter, or a getter nested inside a
+// block — makes `import { MCPServer } from 'codegraph'` fail from ESM. The
+// export above supplies the type surface; this getter replaces its runtime
+// placeholder (which stays configurable, so the redefinition is legal).
+Object.defineProperty(exports, "MCPServer", { enumerable: true, get: function () { return lazyMcp.MCPServer; } });
 
 /**
  * Options for initializing a new CodeGraph project
