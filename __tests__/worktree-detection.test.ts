@@ -18,6 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   detectWorktreeIndexMismatch,
+  nestedRepositoryBelow,
   worktreeMismatchWarning,
   gitWorktreeRoot,
   gitCommonDir,
@@ -102,6 +103,72 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     expect(msg).toContain(real(worktree));
     expect(msg).toContain(real(mainRepo));
     expect(msg).toContain('codegraph init');
+  });
+});
+
+/**
+ * Windows spells one directory several ways. VS Code and Cursor pass a
+ * lowercase drive letter (`d:\repo`), a `subst` drive is a second name for a
+ * folder, and NTFS ignores case, while git answers with the spelling on disk.
+ * Compared as strings, a linked worktree spelled unlike git looked like a
+ * different directory: `status` lost the borrowed-index warning, and the MCP
+ * tools refused the worktree as an unindexed repository of its own (#2517).
+ * A lowercase drive letter needs no `subst` mapping or admin rights to show it.
+ */
+describe('a linked worktree spelled with a lowercase drive letter (#2517)', () => {
+  let mainRepo: string;
+  let worktree: string;
+  let embedded: string; // a different repository nested below: still reported
+  const lowerDrive = (p: string) => p.charAt(0).toLowerCase() + p.slice(1);
+
+  beforeEach(() => {
+    mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-2517-'));
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    git(mainRepo, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(mainRepo, '.gitignore'), 'wt/\nembedded/\n');
+    fs.mkdirSync(path.join(mainRepo, 'src'));
+    fs.writeFileSync(path.join(mainRepo, 'src', 'a.ts'), 'export const a = 1;\n');
+    git(mainRepo, 'add', '.');
+    git(mainRepo, 'commit', '-q', '-m', 'init');
+    worktree = path.join(mainRepo, 'wt');
+    git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
+    embedded = path.join(mainRepo, 'embedded');
+    fs.mkdirSync(embedded);
+    git(embedded, 'init', '-q');
+  });
+
+  afterEach(() => {
+    try { git(mainRepo, 'worktree', 'remove', '--force', worktree); } catch { /* best effort */ }
+    fs.rmSync(mainRepo, { recursive: true, force: true });
+  });
+
+  it.runIf(process.platform === 'win32')('still flags the borrowed index, keeping the caller\'s spelling', () => {
+    expect(mainRepo).toMatch(/^[A-Z]:\\/);
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    for (const [start, index] of [[lowerWorktree, lowerMain], [worktree, lowerMain], [lowerWorktree, mainRepo]]) {
+      const m = detectWorktreeIndexMismatch(start, index);
+      expect(m, `${start} on ${index}`).not.toBeNull();
+      expect(m!.indexRoot).toBe(real(index));
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('is not a mismatch from the index root\'s own working tree', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    expect(detectWorktreeIndexMismatch(lowerMain, mainRepo)).toBeNull();
+    expect(detectWorktreeIndexMismatch(mainRepo, lowerMain)).toBeNull();
+    expect(detectWorktreeIndexMismatch(path.join(lowerMain, 'src'), mainRepo)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('is not a nested repository of its own; a different repository below still is', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    expect(nestedRepositoryBelow(lowerWorktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(worktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(lowerWorktree, mainRepo)).toBeNull();
+    expect(nestedRepositoryBelow(lowerDrive(embedded), lowerMain)?.relPath).toBe('embedded');
   });
 });
 
