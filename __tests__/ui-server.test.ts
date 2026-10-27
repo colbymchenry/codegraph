@@ -493,10 +493,39 @@ describe('resolveProjectFile — the source read chokepoint', () => {
     );
   });
 
+  /** A `file=` value as the API receives it: decoded once by the URL parser. */
+  const fromQuery = (encoded: string): string => new URLSearchParams(`file=${encoded}`).get('file') ?? '';
+
   it('refuses traversal out of the project', () => {
-    for (const escape of ['../secret.txt', 'src/../../secret.txt', '..%2fsecret.txt']) {
+    for (const escape of [
+      '../secret.txt',
+      'src/../../secret.txt',
+      fromQuery('..%2fsecret.txt'),
+      fromQuery('src%2F..%2F..%2Fsecret.txt'),
+    ]) {
       expect(() => resolveProjectFile(projectRoot, escape), escape).toThrow(PathRefusalError);
     }
+  });
+
+  // #2009: the path is never decoded a second time, so a `%` in a file's name
+  // is part of the name. Decoding again refused `100%.ts` and read `a b.ts`
+  // in place of `a%20b.ts`. A literal `%2f` stays a name, not a separator.
+  it('reads a file whose name contains % as that file', () => {
+    const names = ['a%20b.ts', 'a b.ts', '100%.ts', '..%2fsecret.txt'];
+    for (const name of names) fs.writeFileSync(path.join(projectRoot, 'src', name), `// ${name}\n`);
+    try {
+      for (const name of names) {
+        expect(resolveProjectFile(projectRoot, `src/${name}`), name).toBe(
+          fs.realpathSync(path.join(projectRoot, 'src', name))
+        );
+      }
+    } finally {
+      for (const name of names) fs.rmSync(path.join(projectRoot, 'src', name), { force: true });
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('still refuses a backslash on Windows', () => {
+    expect(() => resolveProjectFile(projectRoot, 'src\\auth.ts')).toThrow(PathRefusalError);
   });
 
   it('refuses an absolute path', () => {
@@ -511,7 +540,8 @@ describe('resolveProjectFile — the source read chokepoint', () => {
   });
 
   it('refuses a NUL byte', () => {
-    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts%00.png')).toThrow(PathRefusalError);
+    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts\u0000.png')).toThrow(PathRefusalError);
+    expect(() => resolveProjectFile(projectRoot, fromQuery('src/auth.ts%00.png'))).toThrow(PathRefusalError);
   });
 
   // `/etc` resolves to a non-existent `C:\etc` on Windows, so the sensitive-path

@@ -114,7 +114,9 @@ export function resolveRequestedFile(
   requested: string
 ): { record: FileRecord; storedPath: string; absolute: string } {
   const posix = toRequestPath(requested);
-  // Refusals happen here, ahead of everything.
+  // Refusals happen here, ahead of everything. The read and the index lookup
+  // below use the same string, so a `%` in a file's name means the same file
+  // to both (#2009).
   const absolute = resolveProjectFile(projectRoot, posix);
 
   const found = findIndexedFile(cg, posix);
