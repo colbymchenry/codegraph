@@ -8994,6 +8994,21 @@ export function isRustAssociatedItem(n: Node): boolean {
   return n.language === 'rust' && RUST_ASSOCIATED_KINDS.has(n.kind) && n.qualifiedName.includes('::');
 }
 
+/**
+ * Where a Rust item sits in its file's module, as a path through the module
+ * reaches it: written at the file's top level ('top'), or in a module the
+ * file declares inline (`mod imp { … }`, 'inline'), which adds nothing to its
+ * qualified name. Null for an item a module path never names: a method, an
+ * `impl`'s or a trait's associated item, an item of a function body — each
+ * qualified by its owner.
+ */
+export function rustItemPlacement(n: Node, context: ResolutionContext): 'top' | 'inline' | null {
+  if (n.language !== 'rust' || n.qualifiedName !== n.name) return null;
+  const layout = rustUsesOf(n.filePath, context);
+  const at = (layout.lineStarts[n.startLine - 1] ?? 0) + Math.max(0, n.startColumn ?? 0);
+  return rustBlockAt(layout.blocks, at) === null ? 'top' : 'inline';
+}
+
 /** Does one of the file's globs bring in this candidate's module (or, for `use super::*`, its parent's)? */
 function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): boolean {
   if (uses.globs.has(rustModuleName(candidate.filePath))) return true;

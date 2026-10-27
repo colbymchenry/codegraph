@@ -33,6 +33,8 @@ import {
   isPythonFromImportModule,
   isRustAssociatedItem,
   tsGlobalScope,
+  isLexicallyReachable,
+  rustItemPlacement,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -3694,11 +3696,18 @@ function resolveRustPathReference(
   const modSegs = segments.slice(0, -1);
 
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
-  if (!file || file === ref.filePath) return null;
+  if (!file) return null;
 
-  // A module's item, never an impl's associated one: serde's `use
-  // crate::de::Error` is not `de/mod.rs`'s `impl SeqAccess`'s `type Error`.
-  const target = context.getNodesInFile(file).find(
+  // The module's own item. A path never names a method (that is
+  // `Type::method`), nor a fn local to another fn's body: the file's first
+  // same-named node was taken, so an `impl Buf { fn take }` above
+  // `pub fn take` caught every `crate::util::take(…)`. Two module-level items
+  // of one name are `#[cfg]` variants of it; the first one stands for both.
+  // With none, the path reaches an inline module's item through a re-export
+  // (`#[cfg(…)] mod imp { … }` + `pub use imp::*;`), never an associated item
+  // of an `impl` or `trait` body: serde's `use crate::de::Error` is not
+  // `de/mod.rs`'s `impl SeqAccess`'s `type Error`.
+  const candidates = context.getNodesInFile(file).filter(
     (n) =>
       n.name === leaf &&
       !isRustAssociatedItem(n) &&
@@ -3709,14 +3718,22 @@ function resolveRustPathReference(
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
         n.kind === 'constant' ||
-        n.kind === 'method' ||
         n.kind === 'class' ||
-        n.kind === 'interface')
+        n.kind === 'interface') &&
+      isLexicallyReachable(n, ref, context)
   );
-  if (target) {
-    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
-  }
-  return null;
+  const target =
+    candidates.find((n) => rustItemPlacement(n, context) === 'top') ??
+    candidates.find((n) => rustItemPlacement(n, context) === 'inline');
+  if (!target) return null;
+  // A path whose head a `use` binds from the standard library — `fs::read`
+  // under `use std::fs;`, `error::Error` under `use std::{error, io};` — is
+  // std's, whatever the module the project has of that name: `fs/mod.rs`'s own
+  // `read` is not `std::fs::read`. (Asked only here, where it changes the
+  // answer: the check reads the file's `use`s.)
+  const head = modSegs[0]!;
+  if (!/^(?:crate|self|super)$/.test(head) && isBoundToOutOfRepoImport({ ...ref, referenceName: head }, context)) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
 }
 
 /** The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file. */
