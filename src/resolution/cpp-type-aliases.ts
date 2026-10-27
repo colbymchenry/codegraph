@@ -669,8 +669,10 @@ export function cppClassNamed(
   if (typeof found !== 'object') return null;
   if ('cls' in found) return found;
   if ('ambiguous' in found) {
-    // An alias each `#if` arm declares differently: the first declaration.
-    const [first] = [...found.ambiguous].sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+    // An alias each `#if` arm declares differently: the first declaration, by
+    // file in code-unit order (localeCompare follows the host's locale).
+    const [first] = [...found.ambiguous].sort((a, b) =>
+      (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0) || a.startLine - b.startLine);
     return next === name.names.length ? { alias: first! } : null;
   }
   const alias = found.alias;

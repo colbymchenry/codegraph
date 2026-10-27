@@ -469,4 +469,13 @@ describe('React Native bridge resolver — RCT_EXTERN (Swift) modules', () => {
   it('never redirects a native caller', () => {
     expect(reactNativeBridgeResolver.resolve(ref('captureView.finalizeCaptureSession', 'swift', 'ios/x.swift'), ctx)).toBeNull();
   });
+
+  it('picks between two copies of the Swift class by file in code-unit order, the same on every host', () => {
+    // Two app targets' copies: `ios/Beta/…` sorts before `ios/alpha/…` by
+    // code unit, after it by the locale collation localeCompare used.
+    const alpha = swiftMethod('syncSettings', 'CaptureView', 'ios/alpha/CaptureView.swift', 40);
+    const beta = swiftMethod('syncSettings', 'CaptureView', 'ios/Beta/CaptureView.swift', 40);
+    const r = reactNativeBridgeResolver.resolve(ref('captureView.syncSettings', 'tsx', 'src/a.tsx'), makeContext([alpha, beta], files));
+    expect(r?.targetNodeId).toBe(beta.id);
+  });
 });
