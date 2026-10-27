@@ -100,10 +100,10 @@
  */
 
 import fs from 'fs';
-import path from 'path';
 import type CodeGraph from '../index';
 import type { EdgeKind, Node, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
+import { lexicalPathWithinRoot } from '../utils';
 
 // =============================================================================
 // Caps and defaults
@@ -706,11 +706,13 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
  * on disk and this module should not be the thing that trusts it.
  */
 function defaultSourceReader(cg: CodeGraph): (filePath: string) => string | null {
-  const root = path.resolve(cg.getProjectRoot());
+  const root = cg.getProjectRoot();
   return (filePath: string): string | null => {
     try {
-      const absolute = path.resolve(root, filePath);
-      if (absolute !== root && !absolute.startsWith(root + path.sep)) return null;
+      // The shared containment check, which also holds for a project at a
+      // drive root: appending a separator to `C:\` refused every file (#415).
+      const absolute = lexicalPathWithinRoot(root, filePath);
+      if (absolute === null) return null;
       const stat = fs.statSync(absolute);
       if (!stat.isFile() || stat.size > MAX_CORROBORATION_BYTES) return null;
       return fs.readFileSync(absolute, 'utf8');

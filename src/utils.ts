@@ -83,18 +83,27 @@ export function isConfigLeafNode(node: { kind: string; language?: string }): boo
 }
 
 /**
+ * Whether `child` is `parent` or lies under it, compared exactly as given.
+ *
+ * A root (`C:\`, `\\server\share\`, `/`) already ends with its separator, so
+ * none is added to it. Adding one made `C:\\` the prefix, which no path under
+ * the root starts with, so a project at a drive root indexed nothing (#415).
+ */
+function isSameOrUnder(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+/**
  * Whether `child` is `parent` itself or sits underneath it. Case-insensitive on
  * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
  * case than the lexical root, which would otherwise false-reject a valid file.
  */
 function isWithinDir(child: string, parent: string): boolean {
-  let c = child;
-  let p = parent;
   if (process.platform === 'win32') {
-    c = c.toLowerCase();
-    p = p.toLowerCase();
+    return isSameOrUnder(child.toLowerCase(), parent.toLowerCase());
   }
-  return c === p || c.startsWith(p + path.sep);
+  return isSameOrUnder(child, parent);
 }
 
 /**
@@ -206,13 +215,6 @@ export function validatePathWithinRoot(
  */
 function foldPathCase(p: string): string {
   return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
-}
-
-/** Whether `child` is `parent` or lies under it. Both are already folded. */
-function isSameOrUnder(child: string, parent: string): boolean {
-  if (child === parent) return true;
-  // A root (`C:\`, `/`) already ends with its separator.
-  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
 }
 
 /**

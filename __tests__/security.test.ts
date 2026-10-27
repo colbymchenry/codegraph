@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot, lexicalPathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools, __setLoadCodeGraphForTests } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -191,6 +191,40 @@ describe('Path Traversal Prevention', () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
   });
+});
+
+// #415: a root that already ends with its separator (a Windows drive root such
+// as a `Z:\` network drive or a `subst` drive, a UNC share root, POSIX `/`) got
+// a second one appended, so no path under it counted as inside it, and a
+// project there indexed no files. Path math, plus read-only realpaths of `C:\`.
+describe('Path containment at a filesystem root (#415)', () => {
+  it('counts a file under the filesystem root as inside it', () => {
+    const root = path.parse(process.cwd()).root; // `/`, or this drive's root on Windows
+    expect(lexicalPathWithinRoot(root, 'a.ts')).toBe(path.join(root, 'a.ts'));
+    expect(lexicalPathWithinRoot(root, path.join('src', 'b.ts'))).toBe(path.join(root, 'src', 'b.ts'));
+  });
+
+  it.runIf(process.platform === 'win32')('counts a file under a drive root or a share root as inside it', () => {
+    // Neither the drive nor the share has to exist: this is path math only.
+    expect(lexicalPathWithinRoot('Q:\\', 'a.ts')).toBe('Q:\\a.ts');
+    expect(lexicalPathWithinRoot('q:\\', 'src\\b.ts')).toBe('q:\\src\\b.ts');
+    expect(lexicalPathWithinRoot('\\\\server\\share\\', 'a.ts')).toBe('\\\\server\\share\\a.ts');
+    // Another drive or another share is still outside.
+    expect(lexicalPathWithinRoot('Q:\\', 'C:\\Windows\\win.ini')).toBeNull();
+    expect(lexicalPathWithinRoot('\\\\server\\share\\', '\\\\server\\other\\a.ts')).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32' && fs.existsSync('C:\\Windows'))(
+    'lets the realpath check through for a folder under a drive root',
+    () => {
+      expect(validatePathWithinRoot('C:\\', 'Windows')?.toLowerCase()).toBe('c:\\windows');
+      // A path that doesn't exist yet is judged by its nearest existing
+      // ancestor, which here is the drive root itself.
+      expect(validatePathWithinRoot('C:\\', 'codegraph-no-such-dir-415\\a.ts')).toBe(
+        'C:\\codegraph-no-such-dir-415\\a.ts'
+      );
+    }
+  );
 });
 
 describe('Symlink escape prevention (#527)', () => {
