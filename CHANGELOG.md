@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Groovy is now supported. Classes, methods, interfaces, enums, imports, packages, and function definitions in `.groovy`, `.gradle`, `.gvy`, `.gy`, and `.gsh` files are extracted, so Gradle build scripts and Groovy application code can be navigated and searched. (#664)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
