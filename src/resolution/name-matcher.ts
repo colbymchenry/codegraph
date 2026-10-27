@@ -10,6 +10,7 @@ import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
 import { escapeRegExp } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { isJsSuperCallSite } from './js-super-calls';
 import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
@@ -11877,6 +11878,296 @@ function innerScopeShadows(nodes: Node[], ref: UnresolvedRef, context: Resolutio
 }
 
 /**
+ * Languages where a receiver-less call inside a class body means `this.m()`,
+ * and whose scoping filters in matchByExactName can still leave the caller's
+ * own member and a sibling class's side by side (Scala keeps every same-file
+ * member; Java keeps every type a same-named nested type extends). Kotlin,
+ * C#, Swift, Dart and Ruby filter a bare call to what is in reach, and C++
+ * has its own class lookup (matchCppImplicitThisCall).
+ */
+const IMPLICIT_THIS_LANGUAGES = new Set<string>(['java', 'scala']);
+/** Languages whose extractor drops a `this.`/`self.` receiver but where a bare call never means a member. */
+const EXPLICIT_THIS_LANGUAGES = new Set<string>(['python', 'typescript', 'tsx', 'javascript', 'jsx']);
+const MEMBER_OWNER_KINDS = new Set<Node['kind']>(['class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'union', 'module']);
+
+/**
+ * How a call names its receiver, read back from the call site's line: the
+ * extractor emits `render()`, `this.render()`, `self.render()` and
+ * `super.render()` all as `render`. `null` when the line can't be read or the
+ * receiver is something else.
+ */
+function callReceiverKind(ref: UnresolvedRef, context: ResolutionContext): 'bare' | 'self' | 'super' | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const nameEsc = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // The ref's column is the call expression's start, except in Dart, where it
+  // is the argument list right after the name: take the first occurrence at
+  // or after the column, else the last one before it.
+  let at = -1;
+  for (const m of line.matchAll(new RegExp('(?<![\\w$])' + nameEsc + '(?![\\w$])', 'g'))) {
+    at = m.index;
+    if (at >= ref.column) break;
+  }
+  if (at < 0) return null;
+  const before = line.slice(0, at);
+  // Only the languages' own words: Java's extractor drops a `parent.` or
+  // `cls.` receiver too, and there it is a variable (protobuf's
+  // `parent.getFullName()` on the EnumDescriptor an enum value belongs to).
+  if (/(?:^|[^\w$.])super(?:\s*\([^()]*\)|<[^<>]*>)?\s*\.\s*$/.test(before)) return 'super';
+  if (/(?:^|[^\w$.])(?:this|self)\s*\??\.\s*$/.test(before)) return 'self';
+  if (ref.language === 'python' && /(?:^|[^\w$.])cls\s*\.\s*$/.test(before)) return 'self';
+  if (/(?:\.|->|::)\s*$/.test(before)) return null;
+  return 'bare';
+}
+
+/**
+ * A call that means a member of the class it is written in — a receiver-less
+ * `render()` in Java / Scala, or `this.render()` / `self.render()` in
+ * TypeScript / JavaScript / Python — binds by
+ * the language's scoping, not by which same-named method sits nearest: the
+ * caller's own class first, then what it inherits, then (for a bare call) the
+ * classes it is nested in. Without this the same-file line-distance term
+ * handed `RegName.toString()`'s `render()` to a longer sibling class's
+ * `render` declared closer to the call. Walks the caller's qualified-name
+ * scopes innermost-out and returns the first candidate declared directly in
+ * one (a local function of an enclosing method counts, same file only); a
+ * `super.` call skips its own class. Returns null — existing ranking — when
+ * nothing in scope declares the name.
+ */
+function matchEnclosingScopeMember(
+  ref: UnresolvedRef,
+  candidates: Node[],
+  context: ResolutionContext
+): Node | null {
+  if (ref.referenceKind !== 'calls' || /[.:]/.test(ref.referenceName)) return null;
+  const implicit = IMPLICIT_THIS_LANGUAGES.has(ref.language);
+  if (!implicit && !EXPLICIT_THIS_LANGUAGES.has(ref.language)) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller?.qualifiedName) return null;
+  const receiver = callReceiverKind(ref, context);
+  if (!receiver || (receiver === 'bare' && !implicit)) return null;
+
+  const name = ref.referenceName;
+  // One pass over the candidates, keyed by the type that declares each: a
+  // ubiquitous name (`get`, `init`) can bring thousands, and the walk below
+  // asks about several scopes and supertypes.
+  const byOwner = new Map<string, Node[]>();
+  const byOwnerName = new Map<string, Node[]>();
+  for (const c of candidates) {
+    const sep = c.qualifiedName.lastIndexOf('::');
+    if (sep <= 0 || c.qualifiedName.slice(sep + 2) !== name) continue;
+    const owner = c.qualifiedName.slice(0, sep);
+    const simple = owner.includes('::') ? owner.slice(owner.lastIndexOf('::') + 2) : owner;
+    byOwner.set(owner, [...(byOwner.get(owner) ?? []), c]);
+    byOwnerName.set(simple, [...(byOwnerName.get(simple) ?? []), c]);
+  }
+  // Whatever a scope declares under the name shadows the scopes outside it —
+  // a Scala `val` applied like a function, a nested class constructed by a
+  // bare call — but a method is the likelier target when both exist.
+  const callableFirst = (found: Node[]): Node[] =>
+    [...found].sort((a, b) => Number(b.kind === 'method' || b.kind === 'function') - Number(a.kind === 'method' || a.kind === 'function'));
+  // `Owner::Owner` is a constructor: a bare `Owner(...)` builds a new
+  // instance, it does not call an inherited or enclosing member.
+  const members = (owner: string): Node[] =>
+    owner === name || owner.endsWith(`::${name}`)
+      ? []
+      : callableFirst(byOwner.get(owner) ?? []);
+  const typesNamed = (qn: string): Node[] =>
+    context.getNodesByQualifiedName(qn).filter((n) => MEMBER_OWNER_KINDS.has(n.kind) && sameLanguageFamily(n.language, ref.language));
+  // One member of `owner`: the caller's file first; another file only when a
+  // single type in the index carries that qualified name.
+  const pick = (owner: string, isType: boolean): Node | null => {
+    const found = members(owner);
+    if (found.length === 0) return null;
+    const local = found.find((c) => c.filePath === ref.filePath);
+    if (local) return local;
+    return isType && typesNamed(owner).length === 1 ? found[0]! : null;
+  };
+  // The declaration of `scope` the call sits in, else the only one.
+  const declOf = (scope: string): Node | null => {
+    const decls = typesNamed(scope);
+    const enclosing = decls.filter((n) => n.filePath === ref.filePath && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line);
+    if (enclosing.length > 0) return enclosing[enclosing.length - 1]!;
+    return decls.length === 1 ? decls[0]! : null;
+  };
+  // A declaration's supertypes through its own resolved extends/implements
+  // edges, in the order its header names them.
+  const supertypesOf = (type: Node): Node[] => {
+    const supers = context.getSupertypeNodes?.(type.id) ?? [];
+    if (supers.length < 2) return supers;
+    const header = headerOf(type);
+    const at = (s: Node): number => {
+      const i = header.search(new RegExp('(?<![\\w$])' + escapeRegExp(s.name) + '(?![\\w$])'));
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    return [...supers].sort((a, b) => at(a) - at(b));
+  };
+  // Inherited members through those edges, breadth-first: the members of the
+  // very types the declaration extends, where a walk by name reaches every
+  // type of that name (Django's per-backend `DatabaseSchemaEditor`s differ in
+  // what they override).
+  const inheritedThrough = (type: Node): Node | null => {
+    const seen = new Set<string>([type.id]);
+    let frontier = [type];
+    // An interface's or an abstract declaration answers only when no class
+    // further up implements the member: SystemUI's `RotationContextButton
+    // extends ContextualButton implements RotationButton` runs
+    // ButtonDispatcher's `getCurrentView`, not RotationButton's.
+    let declared: Node | null = null;
+    for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
+      const next: Node[] = [];
+      for (const t of frontier) {
+        for (const s of supertypesOf(t)) {
+          if (seen.has(s.id)) continue;
+          seen.add(s.id);
+          next.push(s);
+          if (s.name === name) continue;
+          const abstractOnly = s.kind === 'interface' || s.kind === 'protocol';
+          const found = callableFirst((byOwner.get(s.qualifiedName) ?? []).filter((c) =>
+            c.filePath === s.filePath &&
+            !(receiver === 'super' && (c.isAbstract || abstractOnly))));
+          if (found.length === 0) continue;
+          if (!abstractOnly && !found[0]!.isAbstract) return found[0]!;
+          declared ??= found[0]!;
+        }
+      }
+      frontier = next;
+    }
+    return declared;
+  };
+  // Inherited members, breadth-first over the resolved extends/implements
+  // edges, starting from the caller's own type's supertypes.
+  const inherited = (firstSupers: string[], typeName: string): Node | null => {
+    if (!context.getSupertypes) return null;
+    let frontier = [typeName];
+    const seen = new Set(frontier);
+    for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
+      const next: string[] = [];
+      for (const t of frontier) {
+        for (const s of depth === 0 ? firstSupers : context.getSupertypes(t, ref.language)) {
+          if (seen.has(s)) continue;
+          seen.add(s);
+          next.push(s);
+          if (s === name) continue;
+          // Supertypes come back as bare names: when the caller's language
+          // declares a type of that name, a same-named type of another
+          // language (Scala `Results` vs Java `play.mvc.Results`) is not it.
+          if (!byOwnerName.has(s)) continue;
+          const ownLanguage = context.getNodesByName(s).some((n) => MEMBER_OWNER_KINDS.has(n.kind) && n.language === ref.language);
+          const found = callableFirst((byOwnerName.get(s) ?? []).filter((c) =>
+            (!ownLanguage || c.language === ref.language) &&
+            // `super.m()` runs a superclass body, never an interface's
+            // abstract declaration.
+            !(receiver === 'super' && (c.isAbstract || isInterfaceMember(c)))));
+          // Overloads share a file; copies of a same-named type in several
+          // files are a guess unless one is the caller's.
+          if (found.length > 0 && found.every((c) => c.filePath === found[0]!.filePath)) return found[0]!;
+          if (found.length > 0) return found.find((c) => c.filePath === ref.filePath) ?? null;
+        }
+      }
+      frontier = next;
+    }
+    return null;
+  };
+
+  const segments = caller.qualifiedName.split('::');
+  // A method's scopes start at its owner; a class caller (a field initializer)
+  // is its own scope.
+  const start = MEMBER_OWNER_KINDS.has(caller.kind) ? segments.length : segments.length - 1;
+  for (let i = start; i > 0; i--) {
+    const scope = segments.slice(0, i).join('::');
+    const isType = typesNamed(scope).length > 0;
+    if (!isType) {
+      // `this.`/`super.` name a class member; only a bare call sees locals.
+      if (receiver !== 'bare') continue;
+      const localFn = members(scope).find((c) => c.filePath === ref.filePath && (c.kind === 'method' || c.kind === 'function'));
+      if (localFn) return localFn;
+      continue;
+    }
+    if (receiver !== 'super') {
+      const own = pick(scope, true);
+      if (own) return own;
+    }
+    // The type's own supertypes first; by name when they reach nothing, as
+    // when the index resolved an `extends` to a namesake (Minestom's
+    // `Player extends LivingEntity` to a nested `EntityStatuses.LivingEntity`).
+    const decl = declOf(scope);
+    const supers = directSupertypes(scope, segments[i - 1]!);
+    const viaSuper = (decl && inheritedThrough(decl)) || inherited(supers, segments[i - 1]!);
+    if (viaSuper) return viaSuper;
+    // `this`/`self`/`super` is the innermost instance; outer classes are
+    // reachable only by a bare call.
+    if (receiver !== 'bare') return null;
+    // A supertype outside the index (an Android `View`, the listener an
+    // anonymous class implements) may declare the name, and it would win
+    // over the outer class: stop rather than guess past it.
+    if (supers.length === 0 && declaresSupertype(scope, segments[i - 1]!)) return null;
+  }
+  return null;
+
+  /**
+   * The declaration's header — its text up to the body's `{`. The declaration
+   * that encloses the call when there is one (a Scala `object Cookies` beside
+   * a `trait Cookies`), else every declaration of that name (a C++ class whose
+   * member is defined out of line).
+   */
+  function typeHeader(scope: string): string | null {
+    const decls = typesNamed(scope);
+    const enclosing = decls.filter((n) => n.filePath === ref.filePath && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line);
+    let header = '';
+    for (const decl of enclosing.length > 0 ? enclosing.slice(-1) : decls) {
+      const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split('\n');
+      if (!lines) return null;
+      for (let l = decl.startLine - 1; l < Math.min(lines.length, decl.startLine + 30); l++) {
+        const brace = lines[l]!.indexOf('{');
+        header += ' ' + (brace >= 0 ? lines[l]!.slice(0, brace) : lines[l]);
+        if (brace >= 0) break;
+      }
+    }
+    return decls.length > 0 ? header : null;
+  }
+
+  /** A type declaration's header: its text up to the body's `{`. */
+  function headerOf(decl: Node): string {
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split('\n');
+    let header = '';
+    for (let l = decl.startLine - 1; lines && l < Math.min(lines.length, decl.startLine + 30); l++) {
+      const brace = lines[l]!.indexOf('{');
+      header += ' ' + (brace >= 0 ? lines[l]!.slice(0, brace) : lines[l]);
+      if (brace >= 0) break;
+    }
+    return header;
+  }
+
+  // getSupertypes answers for every type of that simple name (all of a
+  // protobuf file's `Builder`s at once), so keep the ones this declaration's
+  // header actually names, in the order it names them: the first base that
+  // has the member is the one a call reaches (`class A(B, C)`).
+  function directSupertypes(scope: string, simple: string): string[] {
+    const all = context.getSupertypes?.(simple, ref.language) ?? [];
+    if (all.length === 0) return all;
+    const header = typeHeader(scope);
+    if (header === null) return all;
+    const at = (t: string): number => header.search(new RegExp('(?<![\\w$])' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w$])'));
+    return all.filter((t) => at(t) >= 0).sort((a, b) => at(a) - at(b));
+  }
+
+  function isInterfaceMember(member: Node): boolean {
+    const sep = member.qualifiedName.lastIndexOf('::');
+    return sep > 0 && context.getNodesByQualifiedName(member.qualifiedName.slice(0, sep)).some((n) => n.kind === 'interface' || n.kind === 'protocol');
+  }
+
+  function declaresSupertype(scope: string, simple: string): boolean {
+    if (simple.startsWith('<')) return true; // an anonymous class always has one
+    const header = typeHeader(scope);
+    if (header === null) return true;
+    // `extends` / `implements` / `with`, a C++ `:` base list.
+    return /\b(?:extends|implements|with)\b|[\w>)\]]\s*:(?!:)/.test(header);
+  }
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -12093,18 +12384,37 @@ export function matchByExactName(
     };
   }
 
+  // A member of the caller's own class (or what it inherits / is nested in)
+  // is what the name means there, however far away it is declared. Not for a
+  // call written on `super`: the one in a class expression's method gets here
+  // (js-super-calls declines to place it), and its `super` is that
+  // expression's parent, never the enclosing class's (#2497).
+  const member = isJsSuperCallSite(ref, context) ? null : matchEnclosingScopeMember(ref, candidates, context);
+  // The scope names the member, not the overload: when the class declares
+  // the name more than once, the one the arguments fit, else the nearest, is
+  // chosen below — among those overloads only, so a sibling class's namesake
+  // stays out of it.
+  let pool = candidates;
+  if (member) {
+    const overloads = candidates.filter((c) => c.qualifiedName === member.qualifiedName && c.filePath === member.filePath);
+    if (overloads.length <= 1) {
+      return { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'exact-match' };
+    }
+    pool = overloads;
+  }
+
   // Ubiquitous-name ceiling (#999): above it, picking one target among K
   // same-named defs by directory proximity is unreliable AND O(K) per ref — the
   // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
   // Decline; the precise strategies (qualified-name, import, class-name) already
   // ran. Falls through to fuzzy, which itself only resolves a UNIQUE candidate.
-  if (candidates.length > AMBIGUOUS_NAME_CEILING) {
+  if (pool.length > AMBIGUOUS_NAME_CEILING) {
     return null;
   }
 
   // Multiple matches - try to narrow down
-  const nearest = findBestMatch(ref, candidates, context);
-  const bestMatch = nearest && cppFunctionOverload(nearest, candidates, ref, context);
+  const nearest = findBestMatch(ref, pool, context);
+  const bestMatch = nearest && cppFunctionOverload(nearest, pool, ref, context);
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
