@@ -320,9 +320,11 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     // One declared as a type literal, a type from outside the project or an
     // alias of one holds no project method to take.
     if (decl.declared === null || (decl.declared !== undefined && goHasNoProjectMethods(decl.declared, ref, context))) return null;
+    // Nor one a call or a conversion gives a value of such a type.
+    if (decl.valued === null || (decl.valued && goValuedHasNoProjectMethods(decl.valued, context))) return null;
     if (type) {
       return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
-        goDeclaredTypePackage(decl.raw, ref.filePath, context));
+        goDeclaredTypePackage(decl.raw, decl.file ?? ref.filePath, context));
     }
     const types = context.getNodesByName(receiver).filter(n => n.language === 'go' && (n.kind === 'struct' || n.kind === 'interface'));
     if (types.length) return types.length === 1 ? resolveMethodOnType(receiver, member, ref, context, 0.9, 'function-ref') : null;
@@ -19319,13 +19321,39 @@ export function inferLocalReceiverType(
     // *v1.Pod`), which the patterns below don't read, each name of `a, b
     // rest.Interface`, a `var (…)` spec. The patterns scan back for the name
     // with no block scope, so they can also read another declaration of it.
-    const type = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDecl(scanReceiver, ref, context)?.type : undefined;
+    const local = /^[A-Za-z_]\w*$/.test(scanReceiver) ? goLocalDecl(scanReceiver, ref, context) : undefined;
+    const type = local?.type;
     if (type !== undefined) {
       const named = goNamedType(type);
       decl.declared = named;
       if (!named) return null;
       decl.raw = named;
       return named.slice(named.indexOf('.') + 1);
+    }
+    // A local its declaration in scope gives the result of a call or a
+    // conversion — `r := newRing()`, `e, err := NewEngine(1)`, `v1 :=
+    // router.Group(…)`, `list := web.Users(names)` — has the type of that
+    // value, read as the indexed and chained calls read it (#2782): what the
+    // function or method returns (the k-th result of several), or the type
+    // converted to. The patterns below read none of these. A value of a type
+    // from outside the project has no project method, whether an outside
+    // package hands it out (`c, _ := net.Dial(…)`) or a project function
+    // returns it (`*os.File`, `http.RoundTripper`, a `reflect.Value`): a
+    // guess by the method's name took a namesake's (#1954).
+    const index = local?.value ? goScopeIndex(ref.filePath, context) : null;
+    if (local?.value && index && goValueIsCall(local, index)) {
+      const valued = goDeclaredValueType(local, ref.filePath, index, context, 0);
+      if (valued !== undefined) {
+        const named = valued && goNamedType(valued.text);
+        if (!named) {
+          decl.valued = null;
+          return null;
+        }
+        decl.valued = valued;
+        decl.raw = named;
+        decl.file = valued.file;
+        return named.slice(named.indexOf('.') + 1);
+      }
     }
   }
 
@@ -20337,6 +20365,8 @@ export function matchMethodCall(
     // `query string`. Only a type read there rules a call out below. A slice,
     // map, channel, function or interface literal type has no project method.
     if (decl.declared === null) return null;
+    // So does a local a call gives a value of such a type (`c, _ := net.Dial(…)`).
+    if (decl.valued === null) return null;
     const goDeclared = decl.declared;
     // A Go standard method name says nothing of its receiver, so its
     // declaration decides: etcd's parameter `id types.ID` makes `id.String()`
@@ -20436,6 +20466,9 @@ export function matchMethodCall(
       // `c.Now()` on a `clock.PassiveClock` to apimachinery's `Clock`, and gin
       // declares a `ResponseWriter` of its own.
       if (goDeclared !== undefined && goHasNoProjectMethods(goDeclared, ref, context)) return null;
+      // So does a local whose value's type, read in the file that writes it
+      // (a callee's result), is one from outside the project.
+      if (decl.valued && goValuedHasNoProjectMethods(decl.valued, context)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314); Go: the package that declares the type (#2323);
       // TS/JS: the file declaring the class the file imports under that name.
@@ -20446,7 +20479,7 @@ export function matchMethodCall(
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
           : ref.language === 'go'
-            ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
+            ? goDeclaredTypePackage(decl.raw, decl.file ?? ref.filePath, context)
             : ESM_FAMILY.has(ref.language) && !awaited
               ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
               : undefined;
@@ -20518,7 +20551,7 @@ export function matchMethodCall(
       // strategies below, as one on a receiver of unread type does: a type
       // defined over an interface (`type Codec Serializer`) has methods the
       // index doesn't give it.
-      if (goStd && goDeclared !== undefined) return null;
+      if (goStd && (goDeclared !== undefined || decl.valued)) return null;
       // Nor one the type declares in a file the index couldn't read: in
       // kubernetes, `pod.Unmarshal(…)` on a `*v1.Pod` is the pod's own, in
       // core/v1's generated.pb.go, never the `TypeMeta` one a name finds.
@@ -21606,6 +21639,10 @@ interface GoProjectType {
  */
 interface GoReceiverDecl {
   raw?: string;
+  /** The file `raw` is written in, when it is not the call's: a callee's signature spells a result's type. */
+  file?: string;
+  /** The type of the call's or conversion's value a Go local's declaration gives it; null for one with no project method. */
+  valued?: GoTypeText | null;
   asserted?: GoProjectType | null;
   declared?: string | null;
   /** The line the inference read the declaration on. */
@@ -22467,6 +22504,41 @@ function goMethodOnElement(t: GoTypeText, ref: UnresolvedRef, context: Resolutio
 }
 
 /**
+ * Whether the value a Go declaration gives its name is a call or a
+ * conversion: `f(…)`, `pkg.F(…)`, `x.M(…)`, `T(x)`, `a.b().C(…)`, alone or
+ * as this name's place among several values (`a, b := f(), g()`). Not a
+ * `range` clause, a builtin's `make`/`new`/`append`, an assertion
+ * (goAssertedLocalType reads those) or a type switch's guard.
+ */
+function goValueIsCall(local: GoDecl, index: GoScopeIndex): boolean {
+  const { at, k, n } = local.value!;
+  const code = index.code;
+  const rhs = code.slice(at, local.kind === 'header' ? goHeaderValueEnd(code, at) : goStatementEnd(code, at));
+  if (/^\s*range\b/.test(rhs)) return false;
+  const values = goSplitTopLevel(rhs, ',');
+  const value = values.length === n ? values[k]! : rhs;
+  // A type switch's guard (`switch v := x.(type)`) has each case's type, and
+  // an assertion (`v := x.(T)`) is goAssertedLocalType's to read.
+  if (/\.\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*$/.test(value)) return false;
+  return /^\s*[A-Za-z_(][\s\S]*\)\s*$/.test(value) && !/^\s*(?:new|make|append)\s*\(/.test(value);
+}
+
+/**
+ * Whether a Go value of type t has no method the project declares:
+ * a pointer to a pointer, a type literal, a type from outside the project or
+ * a predeclared one, or an alias of such a type. A type parameter or a type
+ * the index can't tell is not ruled out.
+ */
+function goValuedHasNoProjectMethods(t: GoTypeText, context: ResolutionContext): boolean {
+  const text = t.text.replace(/^\*/, '');
+  if (text.startsWith('*') || GO_TYPE_LITERAL.test(text)) return true;
+  const named = goNamedTypeDecls({ ...t, text }, context);
+  if (named === null) return true;
+  if (named === undefined) return false;
+  return named.nodes.every((n) => goAliasTarget(n, context) === null);
+}
+
+/**
  * Whether a file of the Go package in `dir` that the index couldn't read
  * declares `typeName`'s method `methodName` (or can't be read either): the
  * method is then missing from the graph, and the one an embedded type has
@@ -22588,6 +22660,13 @@ function goReceiverChainType(
 ): GoTyped {
   const head = links[0];
   if (!head || head.kind !== 'operand' || depth > GO_VALUE_DEPTH) return undefined;
+  // `….(T)` is a T, whatever the expression before it: prometheus's
+  // `rw.converterPool.Get().(*otlptranslator.PrometheusConverter)` asserts
+  // what an outside `sync.Pool` hands back.
+  const last = links[links.length - 1];
+  if (result === 0 && links.length > 1 && last?.kind === 'assert' && last.text !== 'type') {
+    return goTypeTextAt(last.text, filePath, at, index, context);
+  }
   // The result a call link gives: the one asked for when it ends the chain.
   const resultOf = (k: number): number => (k === links.length - 1 ? result : 0);
   let t: GoTyped;
@@ -22685,6 +22764,16 @@ function goCalledType(
   const fns = context.getNodesByName(name).filter((n) =>
     n.language === 'go' && n.kind === 'function' && goPackageDir(n.filePath) === dir &&
     (imported ? !testFile(n.filePath) : goPackageClause(n.filePath, context) === clause && (testFile(fromFile) || !testFile(n.filePath))));
+  // A bare call the file's own package doesn't declare may be a package's
+  // the file dot-imports: kubernetes' `package watch_test` calls
+  // `NewStreamWatcher(…)` through `. "k8s.io/apimachinery/pkg/watch"`, the
+  // package of its own directory.
+  if (fns.length === 0 && !imported && goPackageTypes(name, dir, context).length === 0) {
+    for (const d of goDotImports(fromFile, context).dirs) {
+      const t = goCalledType(name, d, written, fromFile, true, at, index, context, depth + 1, result);
+      if (t !== undefined) return t;
+    }
+  }
   if (fns.length === 0) {
     // `T(x)`: a conversion, when the package declares the type.
     return result === 0 && goPackageTypes(name, dir, context).length > 0 ? goTypeTextAt(written, fromFile, at, index, context) : undefined;
@@ -22700,10 +22789,15 @@ function goCalledType(
 
 /**
  * The type a Go method call `x.name(…)` gives on an `x` of type t: the first
- * result of the method Go selects (goMethodOnElement). Null when the method
- * is no project type's (t comes from outside the project, or a project type
- * gets it from an embedded outside one): what it returns is unknown to the
- * project too.
+ * result of the method Go selects (goMethodOnElement), or of the function a
+ * func-typed field holds (harbor's `w.jobServiceRedisClient()` through a
+ * `jobServiceRedisClient func() (jm.RedisClient, error)` field). Null when t
+ * comes from outside the project or is predeclared: what its method returns
+ * is no type of the project's. Undefined when that can't be told: a struct or
+ * interface literal (`tc.load()` on a test table's `struct{ load func() Q }`),
+ * a generic type of a package from outside the project, whose method can hand
+ * back its type argument (grpc's `ServerStreamingClient[RangeStreamResponse]`'s
+ * `Recv`), or a project type whose method the index doesn't show.
  */
 function goMethodResultType(t: GoTypeText, name: string, filePath: string, context: ResolutionContext, depth: number, result = 0): GoTyped {
   if (depth > GO_VALUE_DEPTH) return undefined;
@@ -22711,9 +22805,27 @@ function goMethodResultType(t: GoTypeText, name: string, filePath: string, conte
     fromNodeId: '', referenceName: name, referenceKind: 'calls', line: 1, column: 0, filePath, language: 'go',
   };
   const method = goMethodOnElement(t, probe, context);
-  if (!method) return method;
-  const node = context.getNodeById?.(method.targetNodeId);
-  return node ? goSignatureResultType(node, context, result) : undefined;
+  if (method) {
+    const node = context.getNodeById?.(method.targetNodeId);
+    return node ? goSignatureResultType(node, context, result) : undefined;
+  }
+  const viaField = goFuncFieldResultType(t, name, context, depth + 1, result);
+  if (viaField !== undefined || method === undefined) return viaField;
+  const text = t.text.replace(/^\*/, '');
+  if (/^(?:struct|interface)\b/.test(text) || (!GO_TYPE_LITERAL.test(text) && /\]$/.test(text))) return undefined;
+  return goNamedTypeDecls({ ...t, text }, context) ? undefined : null;
+}
+
+/**
+ * What calling a func-typed field `name` of a value of type t gives: result
+ * `result` of the func type the struct declares the field with. Undefined
+ * for no such field, or one of another type.
+ */
+function goFuncFieldResultType(t: GoTypeText, name: string, context: ResolutionContext, depth: number, result = 0): GoTyped {
+  const field = goFieldTypeOf(t, name, context, depth + 1);
+  if (!field || !/^func\s*\(/.test(field.text)) return undefined;
+  const text = goResultText(field.text.replace(/^func\s*/, ''), result);
+  return text === undefined ? undefined : { text: goNormalizeType(text), file: field.file, params: field.params };
 }
 
 /**
@@ -22726,7 +22838,20 @@ function goMethodResultType(t: GoTypeText, name: string, filePath: string, conte
  * `Set[T]` is a `Set`.
  */
 function goSignatureResultType(fn: Node, context: ResolutionContext, result = 0): GoTypeText | undefined {
-  const sig = fn.signature?.trim();
+  const text = goResultText(fn.signature ?? '', result);
+  if (text === undefined) return undefined;
+  const index = goScopeIndex(fn.filePath, context);
+  const params = index ? goTypeParamsAt(index, fn.filePath, index.lineStarts[fn.startLine - 1] ?? 0, context) : undefined;
+  return { text: goNormalizeType(text), file: fn.filePath, params };
+}
+
+/**
+ * Result `result` of a Go signature written `(params) results`, as written:
+ * `CardDo` of `(value int) CardDo`, `*Response` of `(ctx context.Context)
+ * (*Response, error)`, `int` of `() (n int, err error)`. Undefined for none.
+ */
+function goResultText(signature: string, result = 0): string | undefined {
+  const sig = signature.trim();
   if (!sig || sig[0] !== '(') return undefined;
   const close = goClosingBracket(sig, 0);
   if (close < 0) return undefined;
@@ -22749,9 +22874,7 @@ function goSignatureResultType(fn: Node, context: ResolutionContext, result = 0)
     if (!wanted) return undefined;
     text = wanted.trim();
   } else if (result > 0) return undefined;
-  const index = goScopeIndex(fn.filePath, context);
-  const params = index ? goTypeParamsAt(index, fn.filePath, index.lineStarts[fn.startLine - 1] ?? 0, context) : undefined;
-  return { text: goNormalizeType(text), file: fn.filePath, params };
+  return text;
 }
 
 /** A type written at offset `at` of a file, or at package level for no `index`. */
@@ -24621,6 +24744,8 @@ function matchGoFieldChainCall(
   const asserted = decl.asserted;
   if (asserted === null) return null;
   if (decl.declared && goHasNoProjectMethods(decl.declared, ref, context)) return null;
+  // Nor one a call gives a value of a type from outside the project.
+  if (decl.valued && goValuedHasNoProjectMethods(decl.valued, context)) return null;
 
   const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
@@ -24633,7 +24758,7 @@ function matchGoFieldChainCall(
   // names repeat across packages — harbor has a `daoTestSuite` in every DAO
   // package — and another package's same-named struct with a same-named
   // field is not this one (#2323).
-  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, ref.filePath, context);
+  const basePkg = asserted?.dir ?? goDeclaredTypePackage(decl.raw, decl.file ?? ref.filePath, context);
   const declared = structs.filter((n) => goPackageDir(n.filePath) === basePkg);
   if (declared.length > 0 || asserted) structs = declared;
   structs = preferCallSiteFile(structs, ref.filePath);

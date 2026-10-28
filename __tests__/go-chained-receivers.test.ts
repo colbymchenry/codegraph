@@ -364,7 +364,8 @@ func useLiteral() {
 func main() { use(holder{}); useLiteral() }
 `,
     });
-    expect(callees(graph, 'use')).toEqual([]);
+    // A func-typed field's call gives the result its type declares: `h.get()` is an A.
+    expect(callees(graph, 'use')).toEqual(['calls method A::Run']);
     expect(callees(graph, 'useLiteral')).toEqual([]);
   });
 });
