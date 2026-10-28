@@ -353,6 +353,12 @@ export function applyAliases(
 
     let captured = '';
     if (pat.hasWildcard) {
+      // The prefix and the suffix may not share characters. `@x/*/index`
+      // both starts and ends `@x/index` only by counting its one `/` twice,
+      // which leaves nothing for `*` to stand on. tsc's `isPatternMatch`
+      // wants the specifier at least as long as the two together, so this
+      // pattern is skipped and a less specific one may still match.
+      if (importPath.length < pat.prefix.length + pat.suffix.length) continue;
       captured = importPath.slice(pat.prefix.length, importPath.length - pat.suffix.length);
     } else if (importPath !== pat.prefix) {
       // Literal pattern must match exactly.
