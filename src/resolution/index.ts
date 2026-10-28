@@ -50,6 +50,7 @@ import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
+import { createHash } from 'crypto';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
@@ -251,6 +252,50 @@ const CPP_BUILT_INS = new Set([
  *
  * Orchestrates reference resolution using multiple strategies.
  */
+/** The module-config files at the project root a resolver reads, present or not (#2977). */
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod'] as const;
+
+/** Project-relative config path → digest of its content, 'absent' for one not there. */
+export type ModuleConfigSnapshot = Record<string, string>;
+
+/** A stored snapshot's files (see `getModuleConfigSnapshot`); an index without one, or one an older engine wrote, has none. */
+export function parseModuleConfigSnapshot(stored: string | null): ModuleConfigSnapshot {
+  if (!stored) return {};
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as ModuleConfigSnapshot;
+  } catch {
+    return {};
+  }
+}
+
+/** Digest each of `files` (absolute) as the project sees it now, keyed by its project-relative path. */
+function moduleConfigSnapshot(projectRoot: string, files: Iterable<string>): ModuleConfigSnapshot {
+  const snapshot: ModuleConfigSnapshot = {};
+  for (const abs of files) {
+    const rel = path.relative(projectRoot, abs).replace(/\\/g, '/');
+    // A config outside the project (an `extends` into node_modules or a parent
+    // folder) is read where it is; the key stays relative so the index moves.
+    let digest = 'absent';
+    try {
+      digest = createHash('sha256').update(fs.readFileSync(abs)).digest('hex').slice(0, 16);
+    } catch { /* not there, or unreadable: absent */ }
+    snapshot[rel] = digest;
+  }
+  return snapshot;
+}
+
+/** The languages whose imports a changed config file governs: the ES-module family for a tsconfig / jsconfig, Go for a go.mod. */
+export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
+  const languages = new Set<Language>();
+  for (const rel of changed) {
+    if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
+  }
+  return languages;
+}
+
 export class ReferenceResolver {
   private projectRoot: string;
   private queries: QueryBuilder;
@@ -358,6 +403,10 @@ export class ReferenceResolver {
   private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  // The tsconfig / jsconfig files (their `extends` chains included) and go.mod
+  // files the maps above were read from, as absolute paths. A sync compares
+  // their contents with what the index was resolved by (#2977).
+  private moduleConfigFiles = new Set<string>();
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -646,6 +695,7 @@ export class ReferenceResolver {
       if (found !== undefined) break;
       walked.push(dir);
       found = loadGoModule(path.join(this.projectRoot, dir));
+      if (found) this.moduleConfigFiles.add(path.join(this.projectRoot, dir, 'go.mod'));
       if (found || dir === '') break;
       dir = goDirOf(dir);
     }
@@ -1043,7 +1093,7 @@ export class ReferenceResolver {
 
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
-          this.projectAliases = loadProjectAliases(this.projectRoot);
+          this.projectAliases = loadProjectAliases(this.projectRoot, this.moduleConfigFiles);
         }
         return this.projectAliases;
       },
@@ -1061,7 +1111,7 @@ export class ReferenceResolver {
           walked.push(dir);
           const abs = path.join(this.projectRoot, dir);
           if (['tsconfig.json', 'jsconfig.json'].some((name) => fs.existsSync(path.join(abs, name)))) {
-            const aliases = loadProjectAliases(abs);
+            const aliases = loadProjectAliases(abs, this.moduleConfigFiles);
             if (aliases) {
               found = aliases;
               break;
@@ -3033,6 +3083,36 @@ export class ReferenceResolver {
       this.clearCaches();
     }
     return fingerprint;
+  }
+
+  /**
+   * The module-config files the index was resolved by, with a digest of each
+   * (see `moduleConfigSnapshot`): every tsconfig / jsconfig this resolver read
+   * (`extends` chains included), every go.mod, and the root's candidates
+   * whether present or not, so one that appears is seen too. `previous` is the
+   * snapshot the index was stamped with; its files are read again, so a config
+   * this process never loaded still counts.
+   */
+  getModuleConfigSnapshot(previous: string | null): ModuleConfigSnapshot {
+    const files = new Set<string>(this.moduleConfigFiles);
+    for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    for (const rel of Object.keys(parseModuleConfigSnapshot(previous))) files.add(path.join(this.projectRoot, rel));
+    return moduleConfigSnapshot(this.projectRoot, files);
+  }
+
+  /**
+   * Forget the tsconfig / jsconfig alias maps and the go.mod modules this
+   * resolver read, and every memo resolved through them, so the next reference
+   * reads the files as they are now (#2977). The caller re-opens the imports
+   * the old maps resolved.
+   */
+  resetModuleConfig(): void {
+    this.projectAliases = undefined;
+    this.dirAliases.clear();
+    this.goModuleByDir.clear();
+    this.goPackageDirs.clear();
+    this.moduleConfigFiles.clear();
+    this.clearCaches();
   }
 
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
