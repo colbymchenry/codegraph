@@ -138,27 +138,57 @@ impl<'t> Walker<'t> {
     }
 
     /// The property a CommonJS export assignment binds a function to —
-    /// `exports.NAME = <node>` / `module.exports.NAME = <node>` — or None for
-    /// any other assignment. The node must be the assignment's whole
-    /// right-hand side. Mirrors TreeSitterExtractor.commonJsExportName.
+    /// `exports.NAME = <node>` / `module.exports.NAME = <node>`, or the same
+    /// with the name in quotes, `exports["NAME"] = <node>` — or None for any
+    /// other assignment. The node must be the assignment's whole right-hand
+    /// side. Mirrors TreeSitterExtractor.commonJsExportName.
     fn common_js_export_name(&self, assignment: Node<'t>, value: Node<'t>) -> Option<String> {
         let right = assignment.child_by_field_name("right")?;
         if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
             return None;
         }
         let left = assignment.child_by_field_name("left")?;
-        if left.kind() != "member_expression" {
+        if !matches!(left.kind(), "member_expression" | "subscript_expression") {
             return None;
         }
         let object = left.child_by_field_name("object")?;
+        if !matches!(self.text(object), "exports" | "module.exports") {
+            return None;
+        }
+        if left.kind() == "subscript_expression" {
+            return self.quoted_identifier(left.child_by_field_name("index")?).map(str::to_string);
+        }
         let property = left.child_by_field_name("property")?;
         if property.kind() != "property_identifier" {
             return None;
         }
-        if !matches!(self.text(object), "exports" | "module.exports") {
+        Some(self.text(property).to_string())
+    }
+
+    /// The name a string literal spells when it is a plain identifier: `'svc'`
+    /// or `"getItems"` → the text between the quotes. None for anything else,
+    /// including a string with an escape or a character no identifier can
+    /// hold. Mirrors quotedIdentifier in tree-sitter.ts.
+    fn quoted_identifier(&self, node: Node<'t>) -> Option<&'t str> {
+        if node.kind() != "string" {
             return None;
         }
-        Some(self.text(property).to_string())
+        let text = self.text(node);
+        let quoted = text.len() >= 2
+            && (text.starts_with('\'') || text.starts_with('"'))
+            && text.ends_with(&text[..1]);
+        if !quoted {
+            return None;
+        }
+        let key = &text[1..text.len() - 1];
+        let mut chars = key.chars();
+        let first = chars.next()?;
+        if !(first.is_ascii_alphabetic() || first == '_' || first == '$')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            return None;
+        }
+        Some(key)
     }
 
     // --- reactComponentHoc / extractReactComponentNode (#841) --------------------
@@ -1775,22 +1805,7 @@ impl<'t> Walker<'t> {
         }
         let object = peel_receiver(receiver.child_by_field_name("object")?);
         if object.kind() == "this" {
-            let index = receiver.child_by_field_name("index")?;
-            if index.kind() != "string" {
-                return None;
-            }
-            let text = self.text(index);
-            let quoted = text.len() >= 2
-                && (text.starts_with('\'') || text.starts_with('"'))
-                && text.ends_with(&text[..1]);
-            let key = if quoted { &text[1..text.len() - 1] } else { return None };
-            let mut chars = key.chars();
-            let first = chars.next()?;
-            if !(first.is_ascii_alphabetic() || first == '_' || first == '$')
-                || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-            {
-                return None;
-            }
+            let key = self.quoted_identifier(receiver.child_by_field_name("index")?)?;
             return Some(format!("this.{key}"));
         }
         self.this_field_of(object).map(|field| format!("this.{field}[]"))

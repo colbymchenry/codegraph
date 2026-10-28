@@ -705,6 +705,17 @@ function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: S
 }
 
 /**
+ * The name a JS/TS string literal spells when it is a plain identifier: `'svc'`
+ * or `"getItems"` → the text between the quotes. Null for anything else,
+ * including a string with an escape or a character no identifier can hold.
+ * Mirrored in the kernel's quoted_identifier.
+ */
+function quotedIdentifier(node: SyntaxNode | null, source: string): string | null {
+  if (node?.type !== 'string') return null;
+  return /^(['"])([A-Za-z_$][\w$]*)\1$/.exec(getNodeText(node, source))?.[2] ?? null;
+}
+
+/**
  * A TS/JS receiver that subscripts the enclosing class's object: an element
  * of a field, `this.<field>[k]` → `this.<field>[]`, or a field named by a
  * string key, `this['svc']` → `this.svc`. Null for any other subscript.
@@ -716,8 +727,7 @@ function tsThisSubscriptReceiver(node: SyntaxNode, source: string): string | nul
   if (!objectNode) return null;
   const object = peelTsJsReceiver(objectNode);
   if (object.type === 'this') {
-    const index = getChildByField(node, 'index');
-    const key = index?.type === 'string' ? /^(['"])([A-Za-z_$][\w$]*)\1$/.exec(getNodeText(index, source))?.[2] : undefined;
+    const key = quotedIdentifier(getChildByField(node, 'index'), source);
     return key ? `this.${key}` : null;
   }
   if (object.type !== 'member_expression' || getChildByField(object, 'object')?.type !== 'this') return null;
@@ -7305,9 +7315,10 @@ export class TreeSitterExtractor {
 
   /**
    * The property a CommonJS export assignment binds a function to —
-   * `exports.NAME = <node>` or `module.exports.NAME = <node>` — or null for
-   * any other assignment. JS-family only; the node must be the assignment's
-   * whole right-hand side.
+   * `exports.NAME = <node>` or `module.exports.NAME = <node>`, or the same
+   * with the name in quotes, `exports["NAME"] = <node>` — or null for any
+   * other assignment. JS-family only; the node must be the assignment's whole
+   * right-hand side.
    */
   private commonJsExportName(assignment: SyntaxNode, value: SyntaxNode): string | null {
     if (
@@ -7321,12 +7332,14 @@ export class TreeSitterExtractor {
     const right = getChildByField(assignment, 'right');
     if (!right || right.startIndex !== value.startIndex || right.endIndex !== value.endIndex) return null;
     const left = getChildByField(assignment, 'left');
-    if (!left || left.type !== 'member_expression') return null;
+    if (!left || (left.type !== 'member_expression' && left.type !== 'subscript_expression')) return null;
     const object = getChildByField(left, 'object');
-    const property = getChildByField(left, 'property');
-    if (!object || !property || property.type !== 'property_identifier') return null;
+    if (!object) return null;
     const objectText = getNodeText(object, this.source);
     if (objectText !== 'exports' && objectText !== 'module.exports') return null;
+    if (left.type === 'subscript_expression') return quotedIdentifier(getChildByField(left, 'index'), this.source);
+    const property = getChildByField(left, 'property');
+    if (!property || property.type !== 'property_identifier') return null;
     return getNodeText(property, this.source);
   }
 
