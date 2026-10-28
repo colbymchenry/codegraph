@@ -15,6 +15,7 @@ import { escapeRegExp } from '../../utils';
 import { FN_KINDS, makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
+import { inReferencingFolder } from './component-folder';
 
 /** The languages React components, hooks and contexts are written and used in. */
 const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
@@ -2425,9 +2426,8 @@ function resolveComponent(
   const components = candidates.filter((n) => COMPONENT_KINDS.has(n.kind));
   if (components.length === 0) return null;
 
-  // Prefer same directory
-  const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  // Prefer the referencing file's folder, or one below it
+  const sameDir = inReferencingFolder(fromFile, components, (n) => n.filePath);
   if (sameDir.length > 0) return sameDir[0]!.id;
 
   // Prefer component directories
