@@ -2033,7 +2033,7 @@ export class QueryBuilder {
     // are stripped without splitting) and find nothing. See #173.
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^]/g, ' ') // FTS5 special chars separate terms: leaf(entry) -> leaf entry
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
