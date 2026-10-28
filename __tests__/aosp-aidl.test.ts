@@ -68,7 +68,7 @@ describe('AOSP extension: findAidlImpl', () => {
 
     expect(result.status).toBe('found');
     expect(result.declaration).not.toBeNull();
-    expect(result.declaration?.filePath).toBe('src/ITestService.aidl');
+    expect(result.declaration?.filePath).toBe(path.normalize('src/ITestService.aidl'));
     expect(result.declaration?.methods).toEqual(['doWork']);
 
     const stubHit = result.implementations.find((c) => c.kind === 'stub_subclass');
@@ -165,7 +165,7 @@ describe('AOSP extension: findAidlImpl', () => {
       const result = findAidlImpl(cg, dir, 'ISecondOne');
 
       expect(result.status).toBe('found');
-      expect(result.declaration?.filePath).toBe('src/IMulti.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('src/IMulti.aidl'));
       expect(result.declaration?.methods).toEqual(['second']);
       const hit = result.implementations.find((c) => c.kind === 'stub_subclass');
       expect(hit?.name).toBe('SecondImpl');
@@ -213,7 +213,7 @@ describe('AOSP extension: findAidlImpl', () => {
       const result = findAidlImpl(cg, dir, 'IShared');
 
       expect(result.status).toBe('found');
-      expect(result.declaration?.filePath).toBe('moduleB/IShared.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('moduleB/IShared.aidl'));
       const hit = result.implementations.find((c) => c.kind === 'stub_subclass');
       expect(hit?.name).toBe('SharedStub');
       expect(hit?.packageVerified).toBe('verified');
@@ -428,7 +428,7 @@ describe('AOSP extension: findAidlImpl', () => {
       const result = findAidlImpl(cg, dir, 'IVendorOnly');
 
       expect(result.status).not.toBe('declaration_not_found');
-      expect(result.declaration?.filePath).toBe('vendor/oem/interfaces/IVendorOnly.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('vendor/oem/interfaces/IVendorOnly.aidl'));
     });
 
     it('prefers a genuinely package-verified declaration over an earlier unverifiable one, instead of stopping at the first non-mismatch', async () => {
@@ -449,7 +449,7 @@ describe('AOSP extension: findAidlImpl', () => {
       const result = findAidlImpl(cg, dir, 'IAmbiguous');
 
       expect(result.status).toBe('found');
-      expect(result.declaration?.filePath).toBe('src/IAmbiguous_b.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('src/IAmbiguous_b.aidl'));
       const hit = result.implementations.find((c) => c.kind === 'stub_subclass');
       expect(hit?.packageVerified).toBe('verified');
     });

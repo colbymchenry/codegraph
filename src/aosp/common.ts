@@ -110,7 +110,7 @@ export type PackageReachability = 'verified' | 'unverifiable' | 'mismatch';
  * declaration, and vice versa, even though both are named `ICameraProvider`.
  */
 function halGenerationFamily(filePath: string): string | null {
-  const segments = filePath.split('/');
+  const segments = filePath.split(/[\\/]/);
   if (segments.includes('aidl')) return 'aidl';
   const versionSegment = segments.find((s) => /^\d+\.\d+$/.test(s));
   return versionSegment ?? null;

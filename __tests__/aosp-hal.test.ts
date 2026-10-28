@@ -47,7 +47,7 @@ describe('AOSP extension: findHalInterface', () => {
     const result = findHalInterface(cg, dir, 'ILight');
 
     expect(result.status).toBe('found');
-    expect(result.declaration?.filePath).toBe('hardware/interfaces/light/ILight.aidl');
+    expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/light/ILight.aidl'));
     const hit = result.implementations.find((c) => c.kind === 'stub_subclass');
     expect(hit?.name).toBe('LightHalService');
   });
@@ -307,7 +307,7 @@ describe('AOSP extension: findHalInterface', () => {
     const result = findHalInterface(cg, dir, 'IBar', 'hidl');
 
     expect(result.declaration).not.toBeNull();
-    expect(result.declaration?.filePath).toBe('hardware/interfaces/bar/1.0/IBar.hal');
+    expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/bar/1.0/IBar.hal'));
     expect(result.status).toBe('found');
   });
 
@@ -395,7 +395,7 @@ describe('AOSP extension: findHalInterface', () => {
     const result = findHalInterface(cg, dir, 'IVer', 'hidl');
 
     expect(result.status).toBe('found');
-    expect(result.declaration?.filePath).toBe('hardware/interfaces/ver/2.0/IVer.hal');
+    expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/ver/2.0/IVer.hal'));
   });
 
   it('finds a native implementation candidate written in plain C, not just C++', async () => {
@@ -435,7 +435,7 @@ describe('AOSP extension: findHalInterface', () => {
       const result = findHalInterface(cg, dir, 'IGnssCallback', 'hidl');
 
       expect(result.declaration).not.toBeNull();
-      expect(result.declaration?.filePath).toBe('hardware/interfaces/gnss/2.0/IGnssCallback.hal');
+      expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/gnss/2.0/IGnssCallback.hal'));
       expect(result.status).toBe('found');
     });
 
@@ -457,7 +457,7 @@ describe('AOSP extension: findHalInterface', () => {
       await cg.indexAll();
       const result = findHalInterface(cg, dir, 'IFoo');
 
-      expect(result.declaration?.filePath).toBe('hardware/interfaces/foo/aidl/IFoo.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/foo/aidl/IFoo.aidl'));
       expect(result.evidence.some((e) => e.includes('declaration(s) named'))).toBe(false);
     });
 
@@ -488,7 +488,7 @@ describe('AOSP extension: findHalInterface', () => {
       const result = findHalInterface(cg, dir, 'IVendorHal');
 
       expect(result.declaration).not.toBeNull();
-      expect(result.declaration?.filePath).toBe('vendor/oem/hardware/interfaces/IVendorHal.aidl');
+      expect(result.declaration?.filePath).toBe(path.normalize('vendor/oem/hardware/interfaces/IVendorHal.aidl'));
     });
 
     it('does not truncate the method list at a nested enum\'s closing brace', async () => {
@@ -524,7 +524,7 @@ describe('AOSP extension: findHalInterface', () => {
       const result = findHalInterface(cg, dir, 'IAmb', 'hidl');
 
       expect(result.status).toBe('found');
-      expect(result.declaration?.filePath).toBe('hardware/interfaces/amb/2.0/IAmb.hal');
+      expect(result.declaration?.filePath).toBe(path.normalize('hardware/interfaces/amb/2.0/IAmb.hal'));
     });
   });
 });
