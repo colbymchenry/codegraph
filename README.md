@@ -607,6 +607,12 @@ import CodeGraph from '@colbymchenry/codegraph';
 const cg = await CodeGraph.init('/path/to/project');
 // Or: const cg = await CodeGraph.open('/path/to/project');
 
+// Keep the index out of the user's repository — e.g. in an app-data directory:
+// const cg = await CodeGraph.init('/path/to/project', {
+//   storageDir: '/path/to/app-data/codegraph/project-hash',
+// });
+// const cg = await CodeGraph.open('/path/to/project', { storageDir: '/path/to/app-data/codegraph/project-hash' });
+
 await cg.indexAll({
   onProgress: (p) => console.log(`${p.phase}: ${p.current}/${p.total}`)
 });
@@ -620,6 +626,17 @@ cg.watch();   // auto-sync on file changes
 cg.unwatch(); // stop watching
 cg.close();
 ```
+
+`storageDir` separates where the index is kept from what it indexes. When given,
+the database, its WAL sidecars, the lock and any other index file live in that
+directory, source files are still scanned from the project root, and query
+results keep their project-relative paths — so an app can keep user repositories
+clean. Pass the same `storageDir` to `init` and `open`; omit it and CodeGraph
+behaves exactly as before, using `{projectRoot}/.codegraph/`. It is an index
+**directory**, not a database path, so you pick the folder and CodeGraph owns
+what goes in it. The CLI has no equivalent option: a later `codegraph` or MCP
+process could not discover a per-project location stored outside the project, so
+the setting is for hosts that open the library themselves.
 
 Lower-level building blocks are exported from the same entry point for callers
 that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,

@@ -37,6 +37,7 @@ import {
   createDirectory,
   removeDirectory,
   validateDirectory,
+  registerCodeGraphStorageDir,
 } from './directory';
 import {
   ExtractionOrchestrator,
@@ -115,6 +116,15 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /**
+   * Directory that holds the index (`codegraph.db`, its sidecars, the lock)
+   * instead of `{projectRoot}/.codegraph/`. Source files are still scanned from
+   * `projectRoot`. Use it to keep the index in an app-data directory, outside
+   * the user's repository. Resolved with `path.resolve`; must not be the
+   * project root or one of its ancestors. Omit for the default location.
+   */
+  storageDir?: string;
 }
 
 /**
@@ -126,6 +136,24 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /**
+   * The directory the index lives in, when it was built with one — the same
+   * `storageDir` passed to `init`. Omitting it in a process that already
+   * registered one for this project reuses that location; otherwise the
+   * default `{projectRoot}/.codegraph/` is used. See
+   * {@link InitOptions.storageDir}.
+   */
+  storageDir?: string;
+}
+
+/**
+ * Point `projectRoot`'s index at `storageDir` before any path is resolved.
+ * Lives next to the lifecycle methods (not inside them) so `init`, `open`, and
+ * their synchronous/recreate siblings all route through one place.
+ */
+function applyStorageDir(projectRoot: string, storageDir: string | undefined): void {
+  if (storageDir !== undefined) registerCodeGraphStorageDir(projectRoot, storageDir);
 }
 
 /**
@@ -369,6 +397,7 @@ export class CodeGraph {
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    applyStorageDir(resolvedRoot, options.storageDir);
 
     // Check if already initialized
     if (isInitialized(resolvedRoot)) {
@@ -396,8 +425,9 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string): CodeGraph {
+  static initSync(projectRoot: string, options: Pick<InitOptions, 'storageDir'> = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
+    applyStorageDir(resolvedRoot, options.storageDir);
 
     // Check if already initialized
     if (isInitialized(resolvedRoot)) {
@@ -425,6 +455,7 @@ export class CodeGraph {
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    applyStorageDir(resolvedRoot, options.storageDir);
 
     // Check if initialized
     if (!isInitialized(resolvedRoot)) {
@@ -483,9 +514,10 @@ export class CodeGraph {
    * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
    * (and running migrations against) the poisoned database entirely.
    */
-  static async recreate(projectRoot: string): Promise<CodeGraph> {
+  static async recreate(projectRoot: string, options: Pick<InitOptions, 'storageDir'> = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    applyStorageDir(resolvedRoot, options.storageDir);
 
     // Check if initialized — recreate REBUILDS an existing project; it is not a
     // first-time `init`.
@@ -523,8 +555,9 @@ export class CodeGraph {
    * rebuilding them here (#1887): for a caller on a watched event loop, which
    * then awaits {@link recoverIndexes} before it relies on the project.
    */
-  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> & { deferIndexRecovery?: boolean } = {}): CodeGraph {
+  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly' | 'storageDir'> & { deferIndexRecovery?: boolean } = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
+    applyStorageDir(resolvedRoot, options.storageDir);
 
     // Check if initialized
     if (!isInitialized(resolvedRoot)) {

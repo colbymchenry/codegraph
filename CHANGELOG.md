@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Apps embedding CodeGraph can now keep the index out of the user's repository. `CodeGraph.init` and `CodeGraph.open` accept a `storageDir`, and the database and the rest of the index live in that directory — for example your app's data folder — while source files are still read from the project and query results keep their project-relative paths. The project gains no `.codegraph/` folder, and leaving the option out keeps the current behavior exactly. Thanks @275145 for the request. (#986)
+
 ### Security
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.

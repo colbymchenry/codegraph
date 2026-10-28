@@ -39,7 +39,7 @@ import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction'
 import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
-import { isCodeGraphDataDir } from '../directory';
+import { isCodeGraphDataDir, codeGraphStorageRelPath } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
 /**
@@ -387,6 +387,12 @@ export class FileWatcher {
   private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
+  /**
+   * The project-relative path of an in-tree `storageDir` (the index's custom
+   * location), or null when the index lives in `.codegraph/` or outside the
+   * project. Never watched: its WAL churn would feed back into sync.
+   */
+  private readonly inTreeStorageRel: string | null;
   private readonly debounceMs: number;
   private readonly syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
@@ -408,6 +414,7 @@ export class FileWatcher {
     isFileStateCurrent?: (relativePath: string) => boolean
   ) {
     this.projectRoot = projectRoot;
+    this.inTreeStorageRel = codeGraphStorageRelPath(projectRoot);
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
@@ -837,6 +844,9 @@ export class FileWatcher {
     // Ignore any CodeGraph data dir — the active one AND a
     // sibling like `.codegraph-win` a second environment (Windows/WSL) created
     // in the same tree, so neither side watches the other's index (#636).
+    if (this.inTreeStorageRel && (rel === this.inTreeStorageRel || rel.startsWith(this.inTreeStorageRel + '/'))) {
+      return true;
+    }
     return rel.split('/').some(part => isCodeGraphDataDir(part) || part === '.git');
   }
 

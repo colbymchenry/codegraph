@@ -116,10 +116,118 @@ export function codeGraphDirNameFor(projectRoot: string): string {
 }
 
 /**
- * Get the .codegraph directory path for a project
+ * Per-project storage-directory overrides — the `storageDir` option of
+ * `CodeGraph.init` / `CodeGraph.open`, keyed by resolved project root.
+ *
+ * The index location is a property of the project for the life of the process,
+ * so it lives here, beside the other path resolution, and every consumer of
+ * {@link getCodeGraphDir} (the database, locks, the writer/daemon files, the
+ * UI trail store) follows it without changing its own signature. Keyed by both
+ * the caller's spelling and the realpath: the writer lock canonicalizes the
+ * root before asking, and a symlinked checkout must still resolve to the one
+ * storage directory. Empty until a caller opts in, so the default path is
+ * untouched.
+ */
+const storageDirOverrides = new Map<string, string>();
+
+/** `projectRoot`'s storage directory when one was registered, else null. */
+export function getCodeGraphStorageDir(projectRoot: string): string | null {
+  if (storageDirOverrides.size === 0) return null;
+  const key = path.resolve(projectRoot);
+  const direct = storageDirOverrides.get(key);
+  if (direct) return direct;
+  try {
+    return storageDirOverrides.get(fs.realpathSync(key)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Register `storageDir` as `projectRoot`'s CodeGraph data directory (the
+ * `storageDir` option of `CodeGraph.init` / `CodeGraph.open`). The directory
+ * itself is the index directory — `codegraph.db` and its sidecars, the lock,
+ * and the generated `.gitignore` all live directly in it, exactly as they live
+ * in `{projectRoot}/.codegraph/` by default. Source files are still scanned
+ * from `projectRoot`.
+ *
+ * `storageDir` is resolved with `path.resolve`, so an absolute path is
+ * recommended. It must name a directory, and must not be the project root
+ * itself (which would scatter index files through the source tree) or one of
+ * its ancestors (which would put the index above the project it describes).
+ *
+ * The location is per project root for the life of the process: a later
+ * `open` without the option, and the exported path helpers, resolve to it.
+ */
+export function registerCodeGraphStorageDir(projectRoot: string, storageDir: string): void {
+  if (!storageDir.trim()) {
+    throw new Error('storageDir must be a non-empty path.');
+  }
+  const root = path.resolve(projectRoot);
+  const dir = path.resolve(storageDir);
+  if (dir === root || isSamePath(dir, root)) {
+    throw new Error(`storageDir must not be the project root itself (${root}).`);
+  }
+  if (dir === path.parse(dir).root) {
+    throw new Error(`storageDir must not be a filesystem root (${dir}).`);
+  }
+  const rootUnderDir = path.relative(dir, root);
+  if (rootUnderDir && !rootUnderDir.startsWith('..') && !path.isAbsolute(rootUnderDir)) {
+    throw new Error(`storageDir must not be an ancestor of the project root (${dir}).`);
+  }
+  if (fs.existsSync(dir) && !fs.statSync(dir).isDirectory()) {
+    throw new Error(`storageDir exists but is not a directory: ${dir}`);
+  }
+
+  storageDirOverrides.set(root, dir);
+  // The writer lock and daemon paths ask with a realpath'd root.
+  try {
+    const canonicalRoot = fs.realpathSync(root);
+    if (canonicalRoot !== root) storageDirOverrides.set(canonicalRoot, dir);
+  } catch {
+    // The project root normally exists; init can create it later.
+  }
+}
+
+/** Whether two paths name the same directory, tolerating symlinks. */
+function isSamePath(a: string, b: string): boolean {
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The storage directory's path relative to `projectRoot` (normalized, POSIX
+ * separators, e.g. `index-data`) when the index is stored inside the project,
+ * else null. The indexer and watcher skip it so a deliberately in-tree
+ * storage directory is never indexed or watched as project source.
+ */
+export function codeGraphStorageRelPath(projectRoot: string): string | null {
+  const storageDir = getCodeGraphStorageDir(projectRoot);
+  if (!storageDir) return null;
+  const rel = path.relative(path.resolve(projectRoot), storageDir);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join('/');
+}
+
+/**
+ * Whether the index directory can be committed from the project — the default
+ * `{projectRoot}/.codegraph/` or a `storageDir` inside the project. Only then
+ * does the generated `.gitignore` (ignore everything in the index dir) have a
+ * job; an app-data storage directory outside the project is left alone.
+ */
+function indexDirWithinProject(projectRoot: string): boolean {
+  return getCodeGraphStorageDir(projectRoot) === null || codeGraphStorageRelPath(projectRoot) !== null;
+}
+
+/**
+ * Get the .codegraph directory path for a project — the `storageDir` the
+ * project was opened with, else `{projectRoot}/.codegraph/`.
  */
 export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, codeGraphDirNameFor(projectRoot));
+  return getCodeGraphStorageDir(projectRoot) ?? path.join(projectRoot, codeGraphDirNameFor(projectRoot));
 }
 
 /**
@@ -948,8 +1056,11 @@ export function createDirectory(projectRoot: string): void {
   fs.mkdirSync(codegraphDir, { recursive: true });
 
   // Write .gitignore inside .codegraph (create if absent, upgrade a stale
-  // pre-wildcard default left by an older version — issue #788).
-  ensureGitignore(path.join(codegraphDir, '.gitignore'));
+  // pre-wildcard default left by an older version — issue #788). Skipped for a
+  // storage directory outside the project: nothing there is ever committed.
+  if (indexDirWithinProject(projectRoot)) {
+    ensureGitignore(path.join(codegraphDir, '.gitignore'));
+  }
 }
 
 /**
@@ -1091,12 +1202,15 @@ export function validateDirectory(projectRoot: string): {
   // Auto-repair / upgrade .gitignore (non-critical file). A missing one is
   // recreated; a stale pre-wildcard default that never ignored daemon.pid is
   // regenerated in place (issue #788); a user-authored file is left alone.
-  const gitignorePath = path.join(codegraphDir, '.gitignore');
-  const existedBefore = fs.existsSync(gitignorePath);
-  if (!ensureGitignore(gitignorePath) && !existedBefore) {
-    // Only a missing-and-uncreatable file is surfaced; a failed in-place
-    // upgrade of an existing file is non-fatal — the index still works.
-    errors.push('.gitignore missing in .codegraph directory and could not be created');
+  // Not applicable to an app-data storage directory outside the project.
+  if (indexDirWithinProject(projectRoot)) {
+    const gitignorePath = path.join(codegraphDir, '.gitignore');
+    const existedBefore = fs.existsSync(gitignorePath);
+    if (!ensureGitignore(gitignorePath) && !existedBefore) {
+      // Only a missing-and-uncreatable file is surfaced; a failed in-place
+      // upgrade of an existing file is non-fatal — the index still works.
+      errors.push('.gitignore missing in .codegraph directory and could not be created');
+    }
   }
 
   return {

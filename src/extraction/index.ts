@@ -26,7 +26,7 @@ import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { isCodeGraphDataDir } from '../directory';
+import { isCodeGraphDataDir, codeGraphStorageRelPath } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath, isMissingPathError } from '../utils';
 import ignore, { Ignore } from 'ignore';
@@ -722,6 +722,9 @@ function collectIncludedFiles(
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore();
   const visited = new Set<string>();
+  // A `storageDir` deliberately placed inside the project is still the index,
+  // not source — never resurface it, even under an `include` whitelist.
+  const storageRel = codeGraphStorageRelPath(rootDir);
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
     if (isDir) {
@@ -762,6 +765,7 @@ function collectIncludedFiles(
       const abs = path.join(absDir, entry.name);
       const rel = normalizePath(path.relative(rootDir, abs));
       if (!rel || rel.startsWith('..')) continue;
+      if (storageRel && (rel === storageRel || rel.startsWith(storageRel + '/'))) continue;
       if (entry.isSymbolicLink()) {
         try {
           const st = fs.statSync(fs.realpathSync(abs));
@@ -1855,6 +1859,8 @@ function scanDirectoryWalk(
   const visitedDirs = new Set<string>();
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
+  // An in-tree `storageDir` holds the index, not project source.
+  const storageRel = codeGraphStorageRelPath(rootDir);
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -1921,6 +1927,7 @@ function scanDirectoryWalk(
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
+      if (storageRel && (relativePath === storageRel || relativePath.startsWith(storageRel + '/'))) continue;
 
       if (entry.isSymbolicLink()) {
         try {
