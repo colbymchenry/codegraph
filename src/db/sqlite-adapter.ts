@@ -27,11 +27,24 @@ export interface SqliteStatement {
   iterate(...params: any[]): IterableIterator<any>;
 }
 
+export interface TransactionOptions {
+  /**
+   * Take the write lock up front with `BEGIN IMMEDIATE` instead of the default
+   * deferred `BEGIN`. A deferred transaction that has read and then tries to
+   * write while another connection holds the write lock fails with
+   * `SQLITE_BUSY` immediately: SQLite does not consult the busy handler for
+   * that upgrade, because waiting could deadlock. `BEGIN IMMEDIATE` makes a
+   * concurrent writer wait on `busy_timeout` instead. Ignored when the call is
+   * nested inside an open transaction (it is flattened, as always).
+   */
+  immediate?: boolean;
+}
+
 export interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
   pragma(str: string, options?: { simple?: boolean }): any;
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
   /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
@@ -153,13 +166,14 @@ class NodeSqliteAdapter implements SqliteDatabase {
     return row;
   }
 
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T {
     return (...args: any[]) => {
       // Nested call (a transaction()-wrapped helper invoked from inside another
       // transaction): run the body directly inside the enclosing transaction.
       // BEGIN would throw "cannot start a transaction within a transaction",
       // so no existing caller ever relied on nested rollback granularity —
-      // flattening is behavior-preserving and free.
+      // flattening is behavior-preserving and free. `options.immediate` cannot
+      // apply here: the enclosing transaction already chose how it began.
       if (this._txDepth > 0) {
         this._txDepth++;
         try {
@@ -168,7 +182,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
           this._txDepth--;
         }
       }
-      this._db.exec('BEGIN');
+      this._db.exec(options?.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
       this._txDepth = 1;
       try {
         const result = fn(...args);

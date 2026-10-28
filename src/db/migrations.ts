@@ -342,24 +342,38 @@ function recordMigration(db: SqliteDatabase, version: number, description: strin
 
 /**
  * Run all pending migrations
+ *
+ * The version a caller read before calling this can go stale: another process
+ * opening the same index may migrate it in between. So the check and the apply
+ * happen in ONE `BEGIN IMMEDIATE` transaction. Taking the write lock up front
+ * makes a racing opener wait on `busy_timeout`; a deferred transaction instead
+ * fails its read→write upgrade with `SQLITE_BUSY` immediately, because SQLite
+ * does not consult the busy handler for that upgrade (waiting could deadlock).
+ * The version is re-read inside the transaction, so the loser of the race
+ * skips the migrations the winner already applied. (#2980)
  */
 export function runMigrations(db: SqliteDatabase, fromVersion: number): void {
-  const pending = migrations.filter((m) => m.version > fromVersion);
-
-  if (pending.length === 0) {
+  // Nothing can be pending when the caller's read is already current — skip
+  // taking the write lock on that fast path (every open of a current index).
+  if (fromVersion >= CURRENT_SCHEMA_VERSION) {
     return;
   }
 
-  // Sort by version
-  pending.sort((a, b) => a.version - b.version);
+  db.transaction(() => {
+    // The caller's version is a floor: a test or caller may simulate an older
+    // database by passing one, and a database created from current schema.sql
+    // records only v1 and CURRENT, never the versions in between. A version
+    // another process recorded since the caller's read is the newer truth.
+    const current = Math.max(fromVersion, getCurrentVersion(db));
+    const pending = migrations
+      .filter((m) => m.version > current)
+      .sort((a, b) => a.version - b.version);
 
-  // Run each migration in a transaction
-  for (const migration of pending) {
-    db.transaction(() => {
+    for (const migration of pending) {
       migration.up(db);
       recordMigration(db, migration.version, migration.description);
-    })();
-  }
+    }
+  }, { immediate: true })();
 }
 
 /**
