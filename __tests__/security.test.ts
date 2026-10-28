@@ -8,10 +8,12 @@
  * - Atomic writes
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawn, spawnSync } from 'child_process';
+import { pathToFileURL } from 'url';
 import { FileLock, validateProjectPath, validatePathWithinRoot, lexicalPathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools, __setLoadCodeGraphForTests } from '../src/mcp/tools';
@@ -93,6 +95,422 @@ describe('FileLock', () => {
     expect(() => lock.acquire()).not.toThrow();
 
     lock.release();
+  });
+
+  it('prevents multiple processes from taking over a stale lock concurrently (#2979)', async () => {
+    // Spawn a short-lived process and wait for it to exit to obtain a genuinely dead PID
+    const deadChild = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid || 99999999;
+    fs.writeFileSync(lockPath, String(deadPid));
+
+    const workerPath = path.join(tempDir, 'stale-takeover-worker.mjs');
+    const markerDir = path.join(tempDir, 'markers');
+    fs.mkdirSync(markerDir, { recursive: true });
+    const violationFile = path.join(markerDir, 'VIOLATION');
+    const utilsUrl = pathToFileURL(path.resolve(__dirname, '../src/utils.ts')).href;
+
+    fs.writeFileSync(
+      workerPath,
+      `
+import * as fs from 'fs';
+import * as path from 'path';
+import { FileLock } from '${utilsUrl}';
+
+const lockPath = process.argv[2];
+const markerDir = process.argv[3];
+const startAt = Number(process.argv[4]);
+
+while (Date.now() < startAt) {}
+
+const lock = new FileLock(lockPath);
+try {
+  lock.acquire();
+  // Enter critical section: register active worker marker
+  const activeFile = path.join(markerDir, \`\${process.pid}.active\`);
+  fs.writeFileSync(activeFile, '');
+  const active = fs.readdirSync(markerDir).filter((f) => f.endsWith('.active'));
+  if (active.length > 1) {
+    fs.writeFileSync(path.join(markerDir, 'VIOLATION'), \`Collision between \${active.join(', ')}\`);
+  }
+  const until = Date.now() + 80;
+  while (Date.now() < until) {}
+  try { fs.unlinkSync(activeFile); } catch {}
+  lock.release();
+  process.exit(0);
+} catch {
+  process.exit(1);
+}
+`
+    );
+
+    const numWorkers = 6;
+    const startAt = Date.now() + 200;
+    const children = Array.from({ length: numWorkers }, () => {
+      const child = spawn(process.execPath, [workerPath, lockPath, markerDir, String(startAt)], {
+        stdio: 'ignore',
+      });
+      return new Promise<number | null>((resolve) => {
+        child.on('exit', (code) => resolve(code));
+      });
+    });
+
+    const exitCodes = await Promise.all(children);
+    const successes = exitCodes.filter((code) => code === 0).length;
+    const failures = exitCodes.filter((code) => code === 1).length;
+
+    // Mutual exclusion must be strictly preserved
+    expect(fs.existsSync(violationFile)).toBe(false);
+    expect(successes).toBe(1);
+    expect(failures).toBe(numWorkers - 1);
+  });
+
+  it('preserves mutual exclusion during clean-start concurrent acquisition', async () => {
+    const workerPath = path.join(tempDir, 'clean-start-worker.mjs');
+    const markerDir = path.join(tempDir, 'clean-markers');
+    fs.mkdirSync(markerDir, { recursive: true });
+    const violationFile = path.join(markerDir, 'VIOLATION');
+    const utilsUrl = pathToFileURL(path.resolve(__dirname, '../src/utils.ts')).href;
+
+    fs.writeFileSync(
+      workerPath,
+      `
+import * as fs from 'fs';
+import * as path from 'path';
+import { FileLock } from '${utilsUrl}';
+
+const lockPath = process.argv[2];
+const markerDir = process.argv[3];
+const startAt = Number(process.argv[4]);
+
+while (Date.now() < startAt) {}
+
+const lock = new FileLock(lockPath);
+try {
+  lock.acquire();
+  const activeFile = path.join(markerDir, \`\${process.pid}.active\`);
+  fs.writeFileSync(activeFile, '');
+  const active = fs.readdirSync(markerDir).filter((f) => f.endsWith('.active'));
+  if (active.length > 1) {
+    fs.writeFileSync(path.join(markerDir, 'VIOLATION'), \`Collision between \${active.join(', ')}\`);
+  }
+  const until = Date.now() + 80;
+  while (Date.now() < until) {}
+  try { fs.unlinkSync(activeFile); } catch {}
+  lock.release();
+  process.exit(0);
+} catch {
+  process.exit(1);
+}
+`
+    );
+
+    const numWorkers = 6;
+    const startAt = Date.now() + 200;
+    const children = Array.from({ length: numWorkers }, () => {
+      const child = spawn(process.execPath, [workerPath, lockPath, markerDir, String(startAt)], {
+        stdio: 'ignore',
+      });
+      return new Promise<number | null>((resolve) => {
+        child.on('exit', (code) => resolve(code));
+      });
+    });
+
+    const exitCodes = await Promise.all(children);
+    const successes = exitCodes.filter((code) => code === 0).length;
+    expect(fs.existsSync(violationFile)).toBe(false);
+    expect(successes).toBe(1);
+    expect(exitCodes.filter((code) => code === 1).length).toBe(numWorkers - 1);
+  });
+
+  it('clears a stale takeover directory left by a dead process and acquires', () => {
+    const takeoverDir = `${lockPath}.takeover.d`;
+    fs.writeFileSync(lockPath, '99999999');
+    fs.mkdirSync(takeoverDir, { recursive: true });
+    fs.writeFileSync(path.join(takeoverDir, '99999999'), '');
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).not.toThrow();
+
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+    expect(fs.existsSync(takeoverDir)).toBe(false);
+
+    lock.release();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('recovers from an abandoned empty takeover directory', () => {
+    const takeoverDir = `${lockPath}.takeover.d`;
+    fs.writeFileSync(lockPath, '99999999');
+    fs.mkdirSync(takeoverDir, { recursive: true });
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).not.toThrow();
+
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+    expect(fs.existsSync(takeoverDir)).toBe(false);
+
+    lock.release();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('ensures delayed or descheduled processes cannot steal or destroy a live lock (barrier afterReadEntries)', async () => {
+    const takeoverDir = `${lockPath}.takeover.d`;
+    const deadChild = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid || 99999998;
+    fs.writeFileSync(lockPath, String(deadPid));
+    fs.mkdirSync(takeoverDir, { recursive: true });
+    fs.writeFileSync(path.join(takeoverDir, String(deadPid)), '');
+
+    const delayedScript = path.join(tempDir, 'delayed-worker-real.mjs');
+    const pauseMarker = path.join(tempDir, 'delayed.paused');
+    const resumeMarker = path.join(tempDir, 'delayed.resume');
+    const utilsUrl = pathToFileURL(path.resolve(__dirname, '../src/utils.ts')).href;
+
+    // Worker executes real production FileLock with test-only barrier hook
+    fs.writeFileSync(
+      delayedScript,
+      `
+import * as fs from 'fs';
+import { FileLock } from '${utilsUrl}';
+
+const lockPath = process.argv[2];
+const pauseMarker = process.argv[3];
+const resumeMarker = process.argv[4];
+
+const lock = new FileLock(lockPath, {
+  __testHook: (stage) => {
+    if (stage === 'afterReadEntries') {
+      fs.writeFileSync(pauseMarker, '');
+      while (!fs.existsSync(resumeMarker)) {}
+    }
+  }
+});
+
+try {
+  lock.acquire();
+  // Should NOT acquire because another live process will have taken over meanwhile
+  process.exit(2);
+} catch (err) {
+  // Expected: rejected safely
+  process.exit(0);
+}
+`
+    );
+
+    const delayedProc = spawn(process.execPath, [delayedScript, lockPath, pauseMarker, resumeMarker], {
+      stdio: 'ignore',
+    });
+
+    while (!fs.existsSync(pauseMarker)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // Now live process acquires and holds lock via production FileLock
+    const liveLock = new FileLock(lockPath);
+    liveLock.acquire();
+
+    // Verify live lock is acquired
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+
+    // Release barrier to resume the delayed worker while liveLock is actively running
+    fs.writeFileSync(resumeMarker, '');
+
+    const delayedExit = await new Promise<number | null>((resolve) => {
+      delayedProc.on('exit', (code) => resolve(code));
+    });
+    expect(delayedExit).toBe(0);
+
+    // Live lock must still be intact and owned by us
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+
+    liveLock.release();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('ensures delayed or descheduled processes cannot steal or destroy a live lock (barrier afterRmdir)', async () => {
+    const takeoverDir = `${lockPath}.takeover.d`;
+    const deadChild = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid || 99999998;
+    fs.writeFileSync(lockPath, String(deadPid));
+    fs.mkdirSync(takeoverDir, { recursive: true });
+    fs.writeFileSync(path.join(takeoverDir, String(deadPid)), '');
+
+    const delayedScript = path.join(tempDir, 'delayed-worker-rmdir.mjs');
+    const pauseMarker = path.join(tempDir, 'delayed-rmdir.paused');
+    const resumeMarker = path.join(tempDir, 'delayed-rmdir.resume');
+    const utilsUrl = pathToFileURL(path.resolve(__dirname, '../src/utils.ts')).href;
+
+    fs.writeFileSync(
+      delayedScript,
+      `
+import * as fs from 'fs';
+import { FileLock } from '${utilsUrl}';
+
+const lockPath = process.argv[2];
+const pauseMarker = process.argv[3];
+const resumeMarker = process.argv[4];
+
+const lock = new FileLock(lockPath, {
+  __testHook: (stage) => {
+    if (stage === 'afterRmdir') {
+      fs.writeFileSync(pauseMarker, '');
+      while (!fs.existsSync(resumeMarker)) {}
+    }
+  }
+});
+
+try {
+  lock.acquire();
+  process.exit(2);
+} catch (err) {
+  process.exit(0);
+}
+`
+    );
+
+    const delayedProc = spawn(process.execPath, [delayedScript, lockPath, pauseMarker, resumeMarker], {
+      stdio: 'ignore',
+    });
+
+    while (!fs.existsSync(pauseMarker)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    const liveLock = new FileLock(lockPath);
+    liveLock.acquire();
+
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+
+    fs.writeFileSync(resumeMarker, '');
+
+    const delayedExit = await new Promise<number | null>((resolve) => {
+      delayedProc.on('exit', (code) => resolve(code));
+    });
+    expect(delayedExit).toBe(0);
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+
+    liveLock.release();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('cleans up all temporary and coordination artifacts on normal release and exception paths', () => {
+    const lock = new FileLock(lockPath);
+    lock.acquire();
+
+    const parentDir = path.dirname(lockPath);
+    const tmpArtifactsBefore = fs.readdirSync(parentDir).filter((f) => f.includes('.takeover'));
+    expect(tmpArtifactsBefore.length).toBe(0);
+
+    lock.release();
+    const tmpArtifactsAfter = fs.readdirSync(parentDir).filter((f) => f.includes('.takeover'));
+    expect(tmpArtifactsAfter.length).toBe(0);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('prevents multiple processes from taking over when both lock and takeover directory are stale', async () => {
+    const takeoverDir = `${lockPath}.takeover.d`;
+    const deadChild = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid || 99999999;
+    fs.writeFileSync(lockPath, String(deadPid));
+    fs.mkdirSync(takeoverDir, { recursive: true });
+    fs.writeFileSync(path.join(takeoverDir, String(deadPid)), '');
+
+    const workerPath = path.join(tempDir, 'stale-both-worker.mjs');
+    const markerDir = path.join(tempDir, 'stale-both-markers');
+    fs.mkdirSync(markerDir, { recursive: true });
+    const violationFile = path.join(markerDir, 'VIOLATION');
+    const utilsUrl = pathToFileURL(path.resolve(__dirname, '../src/utils.ts')).href;
+
+    fs.writeFileSync(
+      workerPath,
+      `
+import * as fs from 'fs';
+import * as path from 'path';
+import { FileLock } from '${utilsUrl}';
+
+const lockPath = process.argv[2];
+const markerDir = process.argv[3];
+const startAt = Number(process.argv[4]);
+
+while (Date.now() < startAt) {}
+
+const lock = new FileLock(lockPath);
+try {
+  lock.acquire();
+  const activeFile = path.join(markerDir, \`\${process.pid}.active\`);
+  fs.writeFileSync(activeFile, '');
+  const active = fs.readdirSync(markerDir).filter((f) => f.endsWith('.active'));
+  if (active.length > 1) {
+    fs.writeFileSync(path.join(markerDir, 'VIOLATION'), \`Collision between \${active.join(', ')}\`);
+  }
+  const until = Date.now() + 80;
+  while (Date.now() < until) {}
+  try { fs.unlinkSync(activeFile); } catch {}
+  lock.release();
+  process.exit(0);
+} catch {
+  process.exit(1);
+}
+`
+    );
+
+    const numWorkers = 6;
+    const startAt = Date.now() + 200;
+    const children = Array.from({ length: numWorkers }, () => {
+      const child = spawn(process.execPath, [workerPath, lockPath, markerDir, String(startAt)], {
+        stdio: 'ignore',
+      });
+      return new Promise<number | null>((resolve) => {
+        child.on('exit', (code) => resolve(code));
+      });
+    });
+
+    const exitCodes = await Promise.all(children);
+    const successes = exitCodes.filter((code) => code === 0).length;
+    expect(fs.existsSync(violationFile)).toBe(false);
+    expect(successes).toBe(1);
+    expect(exitCodes.filter((code) => code === 1).length).toBe(numWorkers - 1);
+  });
+
+  it('ensures a live lock holder cannot have its lock removed by another process', () => {
+    const holder = new FileLock(lockPath);
+    holder.acquire();
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    const contender = new FileLock(lockPath);
+    expect(() => contender.acquire()).toThrow(/locked by another process/);
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+
+    holder.release();
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('treats processes that return EPERM as alive (not stale)', () => {
+    const foreignPid = 12345;
+    fs.writeFileSync(lockPath, String(foreignPid));
+
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: string | number) => {
+      if (pid === foreignPid && signal === 0) {
+        const err = new Error('operation not permitted') as NodeJS.ErrnoException;
+        err.code = 'EPERM';
+        throw err;
+      }
+      return true;
+    });
+
+    try {
+      const lock = new FileLock(lockPath);
+      expect(() => lock.acquire()).toThrow(/locked by another process \(PID 12345\)/);
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(foreignPid));
+    } finally {
+      killSpy.mockRestore();
+    }
   });
 
   it('should execute function with withLock', () => {

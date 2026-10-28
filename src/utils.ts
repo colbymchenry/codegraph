@@ -399,6 +399,11 @@ export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+export interface FileLockOptions {
+  /** @internal Test-only synchronization hook for verifying concurrency barriers */
+  __testHook?: (stage: 'afterReadEntries' | 'afterRmdir') => void;
+}
+
 /**
  * Cross-process file lock using a lock file with PID tracking.
  *
@@ -408,53 +413,128 @@ export function escapeRegExp(text: string): string {
 export class FileLock {
   private lockPath: string;
   private held = false;
+  private options?: FileLockOptions;
 
-  constructor(lockPath: string) {
+  constructor(lockPath: string, options?: FileLockOptions) {
     this.lockPath = lockPath;
+    this.options = options;
   }
 
   /**
    * Acquire the lock. Throws if the lock is held by another live process.
    */
-  acquire(): void {
-    // Check for existing lock
-    if (fs.existsSync(this.lockPath)) {
-      try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        // A long sync can hold the lock for hours. Its age says nothing about
-        // whether the writer is still alive; only a dead PID is stale.
-        if (!isNaN(pid) && this.isProcessAlive(pid)) {
-          throw new Error(
-            `CodeGraph database is locked by another process (PID ${pid}). ` +
-            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-          );
-        }
-
-        // Stale lock (dead process or malformed PID) - remove it
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
-      }
-    }
-
-    // Write our PID to the lock file using exclusive create flag
+  acquire(isRetry = false): void {
+    // 1. Fast-path: attempt to acquire the lock directly using exclusive creation
     try {
       fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
-      this.held = true;
-    } catch (err: any) {
-      if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
+
+      // If a takeover coordination directory exists and is held by a live process, back off
+      const takeoverDir = `${this.lockPath}.takeover.d`;
+      if (fs.existsSync(takeoverDir) && this.hasActiveLiveTakeover(takeoverDir)) {
+        try { fs.unlinkSync(this.lockPath); } catch {}
         throw new Error(
           'CodeGraph database is locked by another process. ' +
           `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
         );
       }
-      throw err;
+
+      this.held = true;
+      return;
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('locked by another process')) {
+        throw err;
+      }
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw err;
+      }
+    }
+
+    // 2. Lock file exists. Read PID and check if held by a live process
+    let content = '';
+    try {
+      content = fs.readFileSync(this.lockPath, 'utf-8').trim();
+    } catch {
+      // If deleted between wx and read, restart acquisition through the guarded path once
+      if (!isRetry) {
+        return this.acquire(true);
+      }
+      throw new Error(
+        'CodeGraph database is locked by another process. ' +
+        `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+      );
+    }
+
+    const pid = parseInt(content, 10);
+    // A long sync can hold the lock for hours. Its age says nothing about
+    // whether the writer is still alive; only a dead PID is stale.
+    if (!isNaN(pid) && this.isProcessAlive(pid)) {
+      throw new Error(
+        `CodeGraph database is locked by another process (PID ${pid}). ` +
+        `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+      );
+    }
+
+    // 3. Stale lock detected (dead process, unparseable, or empty PID).
+    // Coordinate takeover using an exclusive takeover directory to ensure deterministic
+    // mutual exclusion under arbitrary process scheduling (#2979).
+    const takeoverDir = `${this.lockPath}.takeover.d`;
+    const acquiredCoordination = this.acquireTakeoverCoordination(takeoverDir);
+
+    if (!acquiredCoordination) {
+      throw new Error(
+        'CodeGraph database is locked by another process. ' +
+        `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+      );
+    }
+
+    try {
+      // Double check under exclusive takeover coordination:
+      // Confirm the target lock file is not held by another live process.
+      if (fs.existsSync(this.lockPath)) {
+        try {
+          const curContent = fs.readFileSync(this.lockPath, 'utf-8').trim();
+          const curPid = parseInt(curContent, 10);
+          if (!isNaN(curPid) && this.isProcessAlive(curPid) && curPid !== process.pid) {
+            throw new Error(
+              `CodeGraph database is locked by another process (PID ${curPid}). ` +
+              `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+            );
+          }
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      }
+
+      // Atomically replace the lock file with our PID
+      const tempLockFile = `${this.lockPath}.new.${process.pid}.${Date.now()}`;
+      try {
+        fs.writeFileSync(tempLockFile, String(process.pid));
+        try {
+          fs.renameSync(tempLockFile, this.lockPath);
+        } catch {
+          // Fallback for filesystems that do not allow atomic rename over existing file:
+          // Unlink the verified stale file, then recreate exclusively with 'wx'.
+          // Using 'wx' guarantees that if another process grabbed the path during
+          // the gap, EEXIST is thrown and no live lock is ever overwritten.
+          try { fs.unlinkSync(this.lockPath); } catch {}
+          fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
+        }
+      } finally {
+        try { if (fs.existsSync(tempLockFile)) fs.unlinkSync(tempLockFile); } catch {}
+      }
+
+      this.held = true;
+    } finally {
+      // Clean up takeover coordination directory
+      try {
+        const myPidFile = path.join(takeoverDir, String(process.pid));
+        try { fs.unlinkSync(myPidFile); } catch {}
+        fs.rmdirSync(takeoverDir);
+      } catch {
+        // Best effort
+      }
     }
   }
 
@@ -473,6 +553,95 @@ export class FileLock {
       // Lock file already gone - that's fine
     }
     this.held = false;
+  }
+
+  /**
+   * Acquire exclusive right to take over a stale lock using an atomic directory claim.
+   *
+   * POSIX and Windows filesystem semantics guarantee:
+   * 1. A pre-populated temporary directory atomically moved (rename) into place succeeds
+   *    for at most one process.
+   * 2. rmdirSync fails with ENOTEMPTY if the directory contains any entry.
+   * 3. A delayed process attempting to unlink a dead PID entry cannot delete another
+   *    process's live PID entry because the file name includes the specific PID.
+   */
+  private acquireTakeoverCoordination(takeoverDir: string): boolean {
+    const parentDir = path.dirname(takeoverDir);
+    const tempDir = path.join(
+      parentDir,
+      `.takeover.tmp.${process.pid}.${Date.now()}_${Math.random().toString(36).slice(2)}`
+    );
+    const myPidFile = path.join(tempDir, String(process.pid));
+
+    try {
+      fs.mkdirSync(tempDir, { recursive: true });
+      fs.writeFileSync(myPidFile, '');
+    } catch {
+      return false;
+    }
+
+    try {
+      // 1. Fast path: attempt to rename our populated temp directory into takeoverDir
+      try {
+        fs.renameSync(tempDir, takeoverDir);
+        return true;
+      } catch {
+        // Destination already exists; inspect existing takeover directory
+      }
+
+      // 2. Check if existing takeoverDir is held by a live process or is stale
+      try {
+        if (this.hasActiveLiveTakeover(takeoverDir)) {
+          return false;
+        }
+
+        // Test hook to allow deterministic barrier testing
+        this.options?.__testHook?.('afterReadEntries');
+
+        // All entries belong to dead processes (or directory is empty).
+        // Safely remove only verified dead PID entries. Even under arbitrary scheduling
+        // pauses, unlinking a specific dead PID name can never touch a live process's PID file.
+        const entries = fs.readdirSync(takeoverDir);
+        for (const entry of entries) {
+          const entryPid = parseInt(entry, 10);
+          if (isNaN(entryPid) || !this.isProcessAlive(entryPid)) {
+            try {
+              fs.unlinkSync(path.join(takeoverDir, entry));
+            } catch {
+              // Harmless if another process unlinked it
+            }
+          }
+        }
+
+        // Remove empty directory (will fail with ENOTEMPTY if another live process claimed it)
+        try {
+          fs.rmdirSync(takeoverDir);
+        } catch {
+          // If another process removed it or it's not empty, ignore
+        }
+
+        // Test hook to allow deterministic barrier testing
+        this.options?.__testHook?.('afterRmdir');
+
+        // Attempt to atomically claim takeoverDir
+        try {
+          fs.renameSync(tempDir, takeoverDir);
+          return true;
+        } catch {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    } finally {
+      // Ensure tempDir is cleaned up if it was not renamed into takeoverDir
+      try {
+        if (fs.existsSync(tempDir)) {
+          try { fs.unlinkSync(myPidFile); } catch {}
+          fs.rmdirSync(tempDir);
+        }
+      } catch {}
+    }
   }
 
   /**
@@ -503,12 +672,33 @@ export class FileLock {
    * Check if a process is still running
    */
   private isProcessAlive(pid: number): boolean {
+    if (pid <= 0) return false;
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EPERM') return true;
       return false;
     }
+  }
+
+  /**
+   * Check whether takeover coordination is actively held by another living process.
+   */
+  private hasActiveLiveTakeover(takeoverDir: string): boolean {
+    try {
+      const entries = fs.readdirSync(takeoverDir);
+      for (const entry of entries) {
+        const entryPid = parseInt(entry, 10);
+        if (!isNaN(entryPid) && entryPid !== process.pid && this.isProcessAlive(entryPid)) {
+          return true;
+        }
+      }
+    } catch {
+      // Directory missing or unreadable
+    }
+    return false;
   }
 }
 
