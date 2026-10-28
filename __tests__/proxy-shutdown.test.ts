@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as net from 'net';
 
 const MODULE = path.resolve(__dirname, '../dist/mcp/proxy.js');
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -96,6 +97,77 @@ function startProxy(script: string, env: Record<string, string> = {}): Proxy {
 }
 
 describe('local proxy shutdown (#2311)', () => {
+  it('drains its fallback engine after stdout fails while stdin stays open', async () => {
+    const proxy = startProxy(`
+      runLocalHandshakeProxy({
+        root: process.cwd(),
+        getDaemonSocket: async () => null,
+        makeEngine: () => ({
+          ensureInitialized: async () => {},
+          isReadOnly: () => true,
+          getToolHandler: () => ({ execute: async () => ({ content: [] }) }),
+          stop: () => delay(100).then(() => fs.writeSync(2, 'OUTPUT-CLEANUP\\n')),
+        }),
+      });
+    `);
+    try {
+      proxy.write(INITIALIZE);
+      proxy.write(toolCall(2));
+      await until(() => proxy.out().includes('"id":2') || proxy.exited(), 'the first response');
+      expect(proxy.out(), proxy.err()).toContain('"id":2');
+      proxy.child.stdout!.destroy();
+      proxy.write(toolCall(3));
+      await until(proxy.exited, 'stdout failure shutdown');
+      expect(proxy.child.exitCode, proxy.err()).toBe(0);
+      expect(proxy.err()).toContain('OUTPUT-CLEANUP');
+    } finally {
+      await proxy.dispose();
+    }
+  });
+
+  it('detaches a failed-output legacy proxy without closing another daemon client', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-output-stop-'));
+    const socketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\cg-output-stop-${process.pid}-${Date.now()}`
+      : path.join(dir, 'd.sock');
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('error', () => { /* only this fixture's clients */ });
+      socket.write(JSON.stringify({ codegraph: 'test', pid: process.pid, socketPath, protocol: 1 }) + '\n');
+      socket.on('data', (chunk) => socket.write(chunk));
+    });
+    let other: net.Socket | undefined;
+    let proxy: Proxy | undefined;
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      other = net.createConnection(socketPath);
+      let otherOutput = '';
+      other.on('data', (chunk) => { otherOutput += chunk; });
+      await until(() => otherOutput.includes('"codegraph"'), 'the other client to connect');
+      proxy = startProxy(`require(${JSON.stringify(MODULE)}).runProxy(${JSON.stringify(socketPath)}, 'test');`);
+      proxy.write(INITIALIZE);
+      await until(() => proxy!.out().includes('"id":1') || proxy!.exited(), 'the proxy response');
+      expect(proxy.out(), proxy.err()).toContain('"id":1');
+      expect(sockets.size).toBe(2);
+      proxy.child.stdout!.destroy();
+      proxy.write(toolCall(2));
+      await until(proxy.exited, 'legacy proxy output shutdown');
+      expect(proxy.child.exitCode, proxy.err()).toBe(0);
+      await until(() => sockets.size === 1, 'only the failed connection to detach');
+      other.write('still-alive\n');
+      await until(() => otherOutput.includes('still-alive'), 'another client response');
+      expect(server.listening).toBe(true);
+    } finally {
+      await proxy?.dispose();
+      other?.destroy();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('waits for an engine being retired before it exits', async () => {
     // A writing engine is retired so a daemon can take its lock: the retry
     // hands it back once its call answers. stdin closes while the retirement is

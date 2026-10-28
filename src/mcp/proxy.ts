@@ -26,6 +26,7 @@ import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
+import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -443,6 +444,9 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // instead of a clean close; destroying the stream stops a hung fd from
   // busy-spinning the event loop (#799).
   treatStdinFailureAsShutdown(shutdown);
+  // A host can keep stdin / its PID alive after abandoning the response pipe.
+  // Detach this client and drain its local engine through the same shutdown.
+  treatStdoutFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
   // Backstop for a launch abandoned before any of the above can see it: killed
   // launcher + held-open pipes + reparent that beat the EARLY_PPID capture
@@ -693,6 +697,8 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
     };
     process.stdin.on('close', teardown);
     process.stdin.on('error', teardown);
+    // Detach only this proxy's socket; the shared daemon has other clients.
+    treatStdoutFailureAsShutdown(teardown);
 
     socket.on('data', (chunk) => {
       try { process.stdout.write(chunk); } catch { /* ignore */ }
