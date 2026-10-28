@@ -147,11 +147,34 @@ function parseWorkspaceMembers(cargoToml: string): string[] {
   return extractQuotedValues(membersValue);
 }
 
-function parsePackageName(cargoToml: string): string | null {
+/** A manifest's `[package]` name, wherever the section writes it (after a `categories = [...]` too). */
+export function parsePackageName(cargoToml: string): string | null {
   const packageSection = getSection(cargoToml, 'package');
   if (!packageSection) return null;
   const packageNameMatch = packageSection.match(/name\s*=\s*["']([^"'\n]+)["']/);
   return packageNameMatch?.[1]?.trim() ?? null;
+}
+
+/**
+ * The target roots a manifest names with a `path` of their own: `[lib] path =
+ * "…"` and each `[[bin]] path = "…"` (ripgrep's `crates/core/main.rs`), as
+ * written — relative to the manifest's directory.
+ */
+export function parseTargetPaths(cargoToml: string): { lib?: string; bins: string[] } {
+  const out: { lib?: string; bins: string[] } = { bins: [] };
+  let table: 'lib' | 'bin' | null = null;
+  for (const raw of cargoToml.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (line.startsWith('[')) {
+      table = line === '[lib]' ? 'lib' : line === '[[bin]]' ? 'bin' : null;
+      continue;
+    }
+    const at = table && /^path\s*=\s*["']([^"'\n]+)["']/.exec(line)?.[1]?.replace(/\\/g, '/');
+    if (!at) continue;
+    if (table === 'lib') out.lib = at;
+    else out.bins.push(at);
+  }
+  return out;
 }
 
 function addCrateAlias(map: Map<string, string>, crateName: string, memberPath: string): void {
