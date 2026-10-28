@@ -1170,6 +1170,93 @@ class OwnerController {
     expect(nodes[0].name).toBe('GET /owners/{ownerId}');
     expect(references[0].referenceName).toBe('showOwner');
   });
+
+  // #851: a package-private handler (no access modifier) used to be skipped,
+  // so the next method with a modifier took its route.
+  it('links each package-private handler to its own name, not the next public method (#851)', () => {
+    const src = `@RestController
+@RequestMapping("/api/articles")
+class ArticleController {
+    @GetMapping
+    List<String> list() { return List.of(); }
+
+    @GetMapping("/{slug}")
+    String get(@PathVariable String slug) { return slug; }
+
+    @PostMapping
+    void create(@RequestBody String body) { }
+
+    @DeleteMapping("/{slug}")
+    public void delete(@PathVariable String slug) { }
+
+    @RequestMapping(value = "/feed", method = RequestMethod.GET)
+    ResponseEntity<String> feed() { return null; }
+}`;
+    const { nodes, references } = springResolver.extract!('ArticleController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([
+      'GET /api/articles', 'GET /api/articles/{slug}', 'POST /api/articles', 'DELETE /api/articles/{slug}', 'GET /api/articles/feed',
+    ]);
+    expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual(
+      nodes.map((n, i) => [n.id, ['list', 'get', 'create', 'delete', 'feed'][i]]),
+    );
+  });
+
+  it.each([
+    ['List<String> generic()', 'generic'],
+    ['void none(@RequestBody String body)', 'none'],
+    ['int primitive()', 'primitive'],
+    ['String[][] array()', 'array'],
+    ['org.example.dto.Page<Item> qualified()', 'qualified'],
+    ['ResponseEntity<Map<String, List<Integer>>> nested()', 'nested'],
+    ['static <T extends Comparable<T>> java.util.Map<String, java.util.List<T>>[] typeParams()', 'typeParams'],
+    ['public @ResponseBody int[] annotatedType()', 'annotatedType'],
+    ['final synchronized Object modifiers()', 'modifiers'],
+    ['default ResponseEntity<Void> fromInterface()', 'fromInterface'],
+    ['@Operation(summary = "List (all) items", tags = {"a)"})\n    @ApiResponses({ @ApiResponse(responseCode = "200"), @ApiResponse(responseCode = "404") })\n    List<Item> stacked()', 'stacked'],
+  ])('reads the handler declared under the mapping: %s (#851)', (declaration, name) => {
+    const src = `@RestController
+@RequestMapping("/base")
+class ItemController {
+    @GetMapping("/x")
+    ${declaration} { return null; }
+
+    public void next() { }
+}`;
+    const { references } = springResolver.extract!('ItemController.java', src);
+    expect(references.map(r => r.referenceName)).toEqual([name]);
+  });
+
+  it.each([
+    ['fun plain(): String', 'plain'],
+    ['internal suspend fun modified(): String', 'modified'],
+    ['fun <T> generic(): List<T>', 'generic'],
+    ['@ResponseBody\n    override fun stacked(): String', 'stacked'],
+  ])('reads the Kotlin handler declared under the mapping: %s (#851)', (declaration, name) => {
+    const src = `@RestController
+@RequestMapping("/base")
+class ItemController {
+    @GetMapping("/x")
+    ${declaration} = "ok"
+
+    fun next(): String = "next"
+}`;
+    const { references } = springResolver.extract!('ItemController.kt', src);
+    expect(references.map(r => r.referenceName)).toEqual([name]);
+  });
+
+  it.each([
+    ['private final ItemService service;', 'a field'],
+    ['ItemController(ItemService service) { }', 'a constructor'],
+  ])('links no later method when the mapping is on %s (%s, #851)', (declaration) => {
+    const src = `@RestController
+class ItemController {
+    @GetMapping("/x")
+    ${declaration}
+
+    public String next() { return "next"; }
+}`;
+    expect(springResolver.extract!('ItemController.java', src).references).toEqual([]);
+  });
 });
 
 describe('springResolver.resolve — DI heuristics are gated to Java/Kotlin non-inheritance refs', () => {

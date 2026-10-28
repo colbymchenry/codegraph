@@ -59,6 +59,13 @@ export const springResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A route's handler is the method its mapping annotation is written on,
+    // told apart from an overload by position: under a tall `@Operation` /
+    // `@ApiResponses` stack, the next overload's declaration can be nearer the
+    // annotation than the method it annotates (#851).
+    const handler = routeHandlerAt(ref, context);
+    if (handler) return { original: ref, targetNodeId: handler.id, confidence: 0.95, resolvedBy: 'framework' };
+
     // Spring config-key references — `@Value("${key}")` (single leaf) and
     // `@ConfigurationProperties(prefix="X")` (entire subtree, marked with the
     // `:prefix` suffix in extractSpringValueBindings). Lookup goes through
@@ -237,16 +244,16 @@ export const springResolver: FrameworkResolver = {
       GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', PatchMapping: 'PATCH', DeleteMapping: 'DELETE',
     };
     // Verb-specific method mappings — always method-level, BARE or with a path.
-    const mappingRegex = /@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\b\s*(\([^)]*\))?/g;
+    const mappingRegex = /@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\b/g;
     let match: RegExpExecArray | null;
     while ((match = mappingRegex.exec(safe)) !== null) {
+      const annotation = readAnnotation(safe, match.index, lang);
+      if (!annotation) continue;
       const method = VERB[match[1]!]!;
-      const paths = parseMappingPaths((match[2] || '').replace(/^\(|\)$/g, ''), consts);
+      const paths = parseMappingPaths(annotation.args, consts);
       const line = safe.slice(0, match.index).split('\n').length;
-      // Method it decorates: first declared method after (skip stacked annotations;
-      // Java puts the return type before the name). Bounded so we don't grab a far one.
-      const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      // The method it decorates: the declaration it is written on (#851).
+      const handler = annotatedMethodName(safe, match.index, lang);
       for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method}:${routePath}`,
@@ -257,16 +264,16 @@ export const springResolver: FrameworkResolver = {
           startLine: line,
           endLine: line,
           startColumn: 0,
-          endColumn: match[0].length,
+          endColumn: annotation.end - match.index,
           language: lang,
           updatedAt: now,
         };
         nodes.push(routeNode);
 
-        if (methodMatch) {
+        if (handler) {
           references.push({
             fromNodeId: routeNode.id,
-            referenceName: (methodMatch[1] ?? methodMatch[2])!,
+            referenceName: handler,
             referenceKind: 'references',
             line,
             column: 0,
@@ -280,13 +287,16 @@ export const springResolver: FrameworkResolver = {
     // Method-level @RequestMapping (older style: `@RequestMapping(value="/x",
     // method=RequestMethod.GET)` on a method). The class-level @RequestMapping is
     // the prefix (handled above) — skip it here so it isn't double-counted.
-    const reqRe = /@RequestMapping\b\s*(\([^)]*\))?/g;
+    const reqRe = /@RequestMapping\b/g;
     while ((match = reqRe.exec(safe)) !== null) {
-      const args = (match[1] || '').replace(/^\(|\)$/g, '');
-      const after = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
+      const annotation = readAnnotation(safe, match.index, lang);
+      if (!annotation) continue;
+      const args = annotation.args;
+      const after = safe.slice(annotation.end, annotation.end + 600);
       if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
-      const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
-      if (!methodMatch) continue;
+      // Only on a method: the declaration it is written on (#851).
+      const handler = annotatedMethodName(safe, match.index, lang);
+      if (!handler) continue;
       const verbM = args.match(/method\s*=\s*[{\[]?\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
       const paths = parseMappingPaths(args, consts);
@@ -297,12 +307,12 @@ export const springResolver: FrameworkResolver = {
           kind: 'route',
           name: `${method} ${routePath}`,
           qualifiedName: `${filePath}::route:${routePath}`,
-          filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
+          filePath, startLine: line, endLine: line, startColumn: 0, endColumn: annotation.end - match.index, language: lang, updatedAt: now,
         };
         nodes.push(routeNode);
         references.push({
           fromNodeId: routeNode.id,
-          referenceName: (methodMatch[1] ?? methodMatch[2])!,
+          referenceName: handler,
           referenceKind: 'references',
           line, column: 0, filePath, language: lang,
         });
@@ -552,6 +562,192 @@ function parseMappingPaths(args: string, consts: Map<string, string>): string[] 
 function joinPath(prefix: string, sub: string): string {
   const parts = [prefix, sub].map((p) => p.replace(/^\/+|\/+$/g, '')).filter(Boolean);
   return '/' + parts.join('/');
+}
+
+/** Java modifiers a method may carry before its type parameters and return type. */
+const JAVA_METHOD_MODIFIERS = new Set([
+  'public', 'protected', 'private', 'static', 'final', 'abstract', 'synchronized', 'native', 'strictfp', 'default',
+]);
+/** Kotlin modifiers a function may carry before `fun`. */
+const KOTLIN_FUN_MODIFIERS = new Set([
+  'public', 'protected', 'private', 'internal', 'open', 'override', 'final', 'abstract',
+  'suspend', 'inline', 'operator', 'infix', 'tailrec', 'external', 'actual', 'expect',
+]);
+/** Words that begin a declaration other than a method where a Java return type would stand. */
+const NOT_A_RETURN_TYPE = new Set(['class', 'interface', 'enum', 'record']);
+
+const IDENTIFIER = /[A-Za-z_$][\w$]*/y;
+
+function readIdentifier(s: string, i: number): string | null {
+  IDENTIFIER.lastIndex = i;
+  return IDENTIFIER.exec(s)?.[0] ?? null;
+}
+
+function skipSpace(s: string, i: number): number {
+  while (i < s.length && /\s/.test(s[i]!)) i++;
+  return i;
+}
+
+/** The index past the string or char literal (or `"""` text block) opening at `i`; -1 when it never closes. */
+function skipQuoted(s: string, i: number): number {
+  const quote = s[i]!;
+  if (s.startsWith('"""', i)) {
+    const end = s.indexOf('"""', i + 3);
+    return end < 0 ? -1 : end + 3;
+  }
+  for (let j = i + 1; j < s.length; j++) {
+    if (s[j] === '\\') j++;
+    else if (s[j] === quote) return j + 1;
+    else if (s[j] === '\n') return -1;
+  }
+  return -1;
+}
+
+/** The index past the bracketed group opening at `i` — nested groups and literals inside it included; -1 when it never closes. */
+function skipGroup(s: string, i: number): number {
+  const open = s[i]!;
+  const close = open === '(' ? ')' : open === '[' ? ']' : open === '{' ? '}' : '>';
+  let depth = 0;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j]!;
+    if (c === '"' || (c === "'" && open !== '<')) {
+      const end = skipQuoted(s, j);
+      if (end < 0) return -1;
+      j = end - 1;
+    } else if (c === open) {
+      depth++;
+    } else if (c === close && --depth === 0) {
+      return j + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The annotation at `at` — `@Name`, `@a.b.Name`, Kotlin's `@field:Name` or
+ * `@[A B]` — with its arguments read as a balanced group, so a `)` in a string
+ * or a nested annotation doesn't end it. `end` is past the arguments, or past
+ * the whitespace after a bare name. Null when no annotation is there, or its
+ * arguments never close.
+ */
+function readAnnotation(s: string, at: number, lang: 'java' | 'kotlin'): { args: string; end: number } | null {
+  if (s[at] !== '@') return null;
+  let i = at + 1;
+  if (lang === 'kotlin' && s[i] === '[') {
+    const end = skipGroup(s, i);
+    return end < 0 ? null : { args: '', end };
+  }
+  const readName = (from: number): number => {
+    let j = from;
+    for (;;) {
+      const part = readIdentifier(s, j);
+      if (!part) return -1;
+      j += part.length;
+      if (s[j] !== '.') return j;
+      j++;
+    }
+  };
+  i = readName(i);
+  if (i < 0) return null;
+  // A Kotlin use-site target: `@field:Name`, `@get:Name`.
+  if (lang === 'kotlin' && s[i] === ':') {
+    i = readName(i + 1);
+    if (i < 0) return null;
+  }
+  const next = skipSpace(s, i);
+  if (s[next] !== '(') return { args: '', end: next };
+  const end = skipGroup(s, next);
+  return end < 0 ? null : { args: s.slice(next + 1, end - 1), end };
+}
+
+/**
+ * The name of the method the annotation at `at` is written on (#851): read
+ * past it and every annotation stacked with it, the modifiers — none at all
+ * for a package-private Java method — the type parameters and the return type
+ * (`void`, a primitive, a qualified or nested generic type, an array) to
+ * `name(`; for Kotlin, past the modifiers to `fun`, its type parameters, and
+ * `name(`. Null when what the annotation is written on is no method: a field,
+ * a constructor, a class.
+ */
+function annotatedMethodName(s: string, at: number, lang: 'java' | 'kotlin'): string | null {
+  const modifiers = lang === 'kotlin' ? KOTLIN_FUN_MODIFIERS : JAVA_METHOD_MODIFIERS;
+  // Annotations and modifiers come in any order (`public @ResponseBody String x()`).
+  const skipAnnotationsAndModifiers = (from: number): number => {
+    let i = from;
+    for (;;) {
+      i = skipSpace(s, i);
+      if (s[i] === '@') {
+        const annotation = readAnnotation(s, i, lang);
+        if (!annotation) return -1;
+        i = annotation.end;
+        continue;
+      }
+      const word = readIdentifier(s, i);
+      if (!word || !modifiers.has(word)) return i;
+      i += word.length;
+    }
+  };
+  let i = skipAnnotationsAndModifiers(at);
+  if (i < 0) return null;
+  if (lang === 'kotlin') {
+    if (readIdentifier(s, i) !== 'fun') return null;
+    i = skipSpace(s, i + 3);
+    if (s[i] === '<') {
+      i = skipGroup(s, i);
+      if (i < 0) return null;
+      i = skipSpace(s, i);
+    }
+  } else {
+    if (s[i] === '<') {
+      i = skipGroup(s, i);
+      if (i < 0) return null;
+    }
+    // Annotations on the return type: `<T> @Nullable T x()`.
+    i = skipAnnotationsAndModifiers(i);
+    if (i < 0) return null;
+    const type = readIdentifier(s, i);
+    if (!type || NOT_A_RETURN_TYPE.has(type)) return null;
+    i += type.length;
+    // Its qualifiers, type arguments and array dimensions.
+    for (;;) {
+      const j = skipSpace(s, i);
+      if (s[j] === '<') {
+        i = skipGroup(s, j);
+        if (i < 0) return null;
+      } else if (s[j] === '.') {
+        const k = skipSpace(s, j + 1);
+        const part = readIdentifier(s, k);
+        if (!part) return null;
+        i = k + part.length;
+      } else if (s[j] === '[' && s[skipSpace(s, j + 1)] === ']') {
+        i = skipSpace(s, j + 1) + 1;
+      } else {
+        break;
+      }
+    }
+    i = skipSpace(s, i);
+  }
+  const name = readIdentifier(s, i);
+  if (!name) return null;
+  return s[skipSpace(s, i + name.length)] === '(' ? name : null;
+}
+
+/**
+ * The method a Spring route's handler reference names, found where the
+ * route's mapping annotation is written: the innermost method of that name
+ * whose span — which starts at its first annotation — holds the annotation's
+ * line. Null for any other reference, and when no such method is indexed.
+ */
+function routeHandlerAt(ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  if (ref.referenceKind !== 'references' || (ref.language !== 'java' && ref.language !== 'kotlin')) return null;
+  if (!ref.fromNodeId.startsWith(`route:${ref.filePath}:${ref.line}:`)) return null;
+  let handler: Node | null = null;
+  for (const node of context.getNodesInFile(ref.filePath)) {
+    if ((node.kind !== 'method' && node.kind !== 'function') || node.name !== ref.referenceName) continue;
+    if (node.startLine > ref.line || node.endLine < ref.line) continue;
+    if (!handler || node.startLine > handler.startLine) handler = node;
+  }
+  return handler;
 }
 
 /** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
