@@ -363,7 +363,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       try {
         const local = await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const args = params.arguments || {};
+        if (typeof args !== 'object' || Array.isArray(args)) {
+          writeClient({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Tool arguments must be an object' } });
+          return;
+        }
+        const result = await local.getToolHandler().execute(params.name, args, exploreSession);
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {

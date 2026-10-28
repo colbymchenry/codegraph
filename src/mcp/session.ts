@@ -295,6 +295,13 @@ export class MCPSession {
 
     const toolName = params.name;
     const toolArgs = params.arguments || {};
+    // A string, number or array here is a client bug, not an internal error:
+    // reject it like the missing-name check above instead of letting the tool
+    // handler crash on it and report "internal error, retry" (#2981).
+    if (typeof toolArgs !== 'object' || Array.isArray(toolArgs)) {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Tool arguments must be an object');
+      return;
+    }
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
