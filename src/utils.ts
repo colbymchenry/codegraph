@@ -125,6 +125,18 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
 }
 
 /**
+ * Whether a path made relative to a root (`path.relative(root, p)`, or a
+ * project-relative path) leaves the root: `..` itself, a first segment of
+ * `..` (`../x`, or `..\x` from Windows), or an absolute path, which
+ * `path.relative` gives on Windows for another drive. A folder whose NAME
+ * starts with two dots, like `..generated/`, is inside the root:
+ * `startsWith('..')` took it for a way out.
+ */
+export function escapesRoot(rel: string): boolean {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith('..\\') || path.isAbsolute(rel);
+}
+
+/**
  * Whether a filesystem error means nothing is at the path: ENOENT, or ENOTDIR,
  * which POSIX reports instead when a folder on the way is a file (Windows
  * reports ENOENT for both).

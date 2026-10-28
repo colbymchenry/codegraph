@@ -58,7 +58,7 @@ import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAd
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
-import { Mutex, FileLock } from './utils';
+import { Mutex, FileLock, escapesRoot } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
@@ -252,7 +252,7 @@ export class CodeGraph {
       const rel = path.isAbsolute(filePath)
         ? path.relative(this.projectRoot, filePath)
         : filePath;
-      if (!rel || rel.startsWith('..')) return false;
+      if (!rel || escapesRoot(rel)) return false;
       return matcher.ignores(rel.split(path.sep).join('/'));
     };
     const deprioritized: DeprioritizedPathMatcher = (filePath: string): boolean => {

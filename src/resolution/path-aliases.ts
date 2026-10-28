@@ -31,6 +31,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
+import { escapesRoot } from '../utils';
 
 /** A single alias pattern from `compilerOptions.paths`. */
 export interface AliasPattern {
@@ -372,8 +373,9 @@ export function applyAliases(
       const absolute = path.resolve(aliases.baseUrl, filled);
       const relative = path.relative(projectRoot, absolute);
       // Skip if the rewrite escapes the project root (unsafe + can't
-      // be looked up via the file index anyway).
-      if (relative.startsWith('..')) continue;
+      // be looked up via the file index anyway). A folder named like
+      // `..generated` is inside it.
+      if (escapesRoot(relative)) continue;
       out.push(relative.replace(/\\/g, '/'));
     }
     return out;
@@ -395,7 +397,7 @@ export function aliasAndBaseUrlCandidates(
   const out = applyAliases(importPath, aliases, projectRoot);
   if (aliases.declaresBaseUrl) {
     const relative = path.relative(projectRoot, path.resolve(aliases.baseUrl, importPath));
-    if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    if (relative && !escapesRoot(relative)) {
       out.push(relative.replace(/\\/g, '/'));
     }
   }
