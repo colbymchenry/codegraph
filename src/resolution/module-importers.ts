@@ -424,6 +424,43 @@ export function reopenReferencesThroughBarrels(
     queries.reopenFailedReferences([...failed]);
 }
 
+/**
+ * Re-open, for the sync's sweep, what the files importing any of `modules`
+ * bind through them, after a module's `export … from` clauses changed what
+ * they point at (#2978): `export { foo } from './a'` made `'./b'`, an `export
+ * *` moved the same way, a re-export taken away. The importers did not change
+ * and the module declares nothing of what it passes on, so no definition
+ * delta, added file or failed reference names their bindings, and they stay
+ * on the module the clause used to name. Each importer's edges through the
+ * names it binds from the module go back, up through the modules that pass
+ * them on in turn, with the failures parked under them. Returns the number
+ * re-opened.
+ */
+export function reopenReferencesThroughRetargetedModules(
+  queries: QueryBuilder,
+  reader: ImportReader,
+  modules: ReadonlyArray<{ path: string; language: Language }>,
+): number {
+  const barrels = modules.filter((module) => BARREL_LANGUAGES.has(module.language));
+  if (barrels.length === 0) return 0;
+  const bindings = bindingsOf(importersOf(queries, barrels, reader), reader);
+  const failed = [...bindings].flatMap(([file, { modules: named, names }]) => queries.getFailedReferencesThrough(file, named, names));
+  // What the bindings pointed at: a value typed by a binding reached the
+  // members of that (`w.run()` with `w: Widget`), by their own names, and
+  // those edges follow the binding to its new target.
+  const bound = new Set<string>();
+  for (const [file, { names }] of bindings) {
+    if (names.length === 0) continue;
+    for (const e of queries.getResolutionEdgesThrough(file, names)) if (!e.target.startsWith('file:')) bound.add(e.target);
+  }
+  let reopened = reopenEdges(queries, bindings, () => true) + queries.reopenFailedReferences(failed);
+  if (bound.size === 0) return reopened;
+  const members = queries.getOutgoingEdgesFrom([...bound], ['contains']).map((edge) => edge.target);
+  if (members.length === 0) return reopened;
+  reopened += reopenEdgeList(queries, queries.getResolutionEdgesInto(members).filter((e) => bindings.has(e.sourceFilePath)));
+  return reopened;
+}
+
 /** An import's module edge into a file that an added file now outranks. */
 interface OutrankedImport {
   edge: Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language };

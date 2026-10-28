@@ -127,6 +127,9 @@ export interface IndexResult {
 /**
  * Result of a sync operation
  */
+/** The languages whose modules pass bindings on with `export … from` (#2978). */
+const RE_EXPORTING_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+
 export interface SyncResult {
   /** References attempted by the pending-reference recovery sweep, if run. */
   pendingRefsProcessed?: number;
@@ -164,6 +167,15 @@ export interface SyncResult {
    * nothing downstream.
    */
   definitionDelta?: string[];
+  /**
+   * Modified ES modules whose set of imported modules changed and that pass
+   * bindings on, or stopped passing some on: a re-export that points at
+   * another module now (`export { foo } from './a'` → `'./b'`), one taken
+   * away, or a module given re-exports. Their importers' bindings through them
+   * must be re-resolved: nothing those files declare changed, and the
+   * importers never did (#2978).
+   */
+  reExportsChangedFilePaths?: string[];
   /** Tracked files this sync found gone and deleted from the index. */
   removedFilePaths?: string[];
   /**
@@ -3951,6 +3963,9 @@ export class ExtractionOrchestrator {
     if (filesToIndex.length > 0) {
       for (const pair of this.queries.getNodeNamePairsByFiles(filesToIndex)) pairsBefore.add(pair);
     }
+    // The modules each file imported or re-exported from, before the store
+    // replaces its import nodes (#2978).
+    const importPairsBefore = filesToIndex.length > 0 ? this.queries.getImportNamePairsByFiles(filesToIndex) : new Set<string>();
 
     // The frameworks every file below is extracted with, current (#2516).
     if (addedFilePaths.length > 0 || removedFilePaths.length > 0) this.detectionFileListChanged = true;
@@ -4005,6 +4020,27 @@ export class ExtractionOrchestrator {
     for (const pair of pairsAfter) if (!pairsBefore.has(pair)) deltaNames.add(nameOf(pair));
     const definitionDelta = [...deltaNames];
 
+    // Modified ES modules whose imported modules changed, when they pass
+    // bindings on or stopped passing some on (#2978): a re-export retargeted or
+    // removed changes what their importers bind, which no definition delta
+    // records. An added module's importers are read by the added-files pass.
+    const reExportsChanged: string[] = [];
+    if (filesToIndex.length > 0) {
+      const importPairsAfter = this.queries.getImportNamePairsByFiles(filesToIndex);
+      const fileOf = (pair: string) => pair.slice(0, pair.indexOf('\0'));
+      const changedImports = new Set<string>();
+      const lostImports = new Set<string>();
+      for (const pair of importPairsBefore) if (!importPairsAfter.has(pair)) { changedImports.add(fileOf(pair)); lostImports.add(fileOf(pair)); }
+      for (const pair of importPairsAfter) if (!importPairsBefore.has(pair)) changedImports.add(fileOf(pair));
+      const added = new Set(addedFilePaths);
+      for (const filePath of changedImports) {
+        if (added.has(filePath)) continue;
+        const record = this.queries.getFileByPath(filePath);
+        if (!record || !RE_EXPORTING_LANGUAGES.has(record.language)) continue;
+        if (lostImports.has(filePath) || importReader.reExports(filePath, record.language).length > 0) reExportsChanged.push(filePath);
+      }
+    }
+
     return {
       filesChecked,
       filesAdded,
@@ -4016,6 +4052,7 @@ export class ExtractionOrchestrator {
       ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
+      ...(reExportsChanged.length > 0 ? { reExportsChangedFilePaths: reExportsChanged } : {}),
       ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
       ...(detectedFrameworks ? { detectedFrameworks } : {}),
     };

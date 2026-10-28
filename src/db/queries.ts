@@ -5373,6 +5373,26 @@ export class QueryBuilder {
    * repo-wide may now bind elsewhere. Keying by file makes each definition its
    * own fact, so the move is seen as one removal plus one addition.
    */
+  /**
+   * The `file\0name` pairs of the import nodes in `filePaths`: an import node
+   * is named by the module specifier it names, so these are the modules each
+   * file imports or re-exports from (#2978). Same shape as
+   * {@link getNodeNamePairsByFiles}.
+   */
+  getImportNamePairsByFiles(filePaths: string[]): Set<string> {
+    const pairs = new Set<string>();
+    if (filePaths.length === 0) return pairs;
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE kind = 'import' AND file_path IN (${placeholders})`)
+        .all(...chunk) as Array<{ file_path: string; name: string }>;
+      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+    }
+    return pairs;
+  }
+
   getNodeNamePairsByFiles(filePaths: string[]): Set<string> {
     const pairs = new Set<string>();
     if (filePaths.length === 0) return pairs;
