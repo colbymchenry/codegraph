@@ -19,7 +19,7 @@ import {
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
-import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import { parseQuery, boundedEditDistance, type ParsedQuery } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
@@ -218,6 +218,70 @@ function rowToNode(row: NodeRow): Node {
     returnType: row.return_type ?? undefined,
     updatedAt: row.updated_at,
   };
+}
+
+/**
+ * A search's `path:` and `name:` filters, lowercased once. The values of one
+ * family are OR'd and the two families AND'd, and each value is a literal,
+ * case-insensitive substring of the file path or the symbol's name, as the
+ * query parser documents. JavaScript decides each row a statement returns,
+ * since `toLowerCase` folds Unicode, where SQLite's `lower()` and LIKE fold
+ * ASCII only, and LIKE would read a `%` or `_` in the value as a wildcard; the
+ * statement's own SQL only narrows the rows (see fieldFilterSql).
+ */
+interface FieldFilters {
+  paths: string[];
+  names: string[];
+}
+
+/** The query's `path:`/`name:` filters, or undefined when it has none. */
+function fieldFiltersOf(parsed: ParsedQuery): FieldFilters | undefined {
+  if (parsed.pathFilters.length === 0 && parsed.nameFilters.length === 0) return undefined;
+  return {
+    paths: parsed.pathFilters.map((p) => p.toLowerCase()),
+    names: parsed.nameFilters.map((n) => n.toLowerCase()),
+  };
+}
+
+function passesNameFilters(name: string, filters: FieldFilters): boolean {
+  if (filters.names.length === 0) return true;
+  const lowered = name.toLowerCase();
+  return filters.names.some((n) => lowered.includes(n));
+}
+
+function passesFieldFilters(name: string, filePath: string, filters: FieldFilters): boolean {
+  if (filters.paths.length > 0) {
+    const lowered = filePath.toLowerCase();
+    if (!filters.paths.some((p) => lowered.includes(p))) return false;
+  }
+  return passesNameFilters(name, filters);
+}
+
+const PRINTABLE_ASCII = /^[ -~]*$/;
+
+/**
+ * WHERE terms (each starting with ` AND `) that keep every `nodes` row the
+ * filters could pass, so that SQLite drops most of the others before they
+ * reach JavaScript, which still decides (see passesFieldFilters). On text of
+ * printable ASCII alone, SQLite's `lower()` and `instr()` agree exactly with
+ * `toLowerCase()` and `includes()`, so a printable ASCII value is tested in
+ * SQL. Text holding any other character goes on to JavaScript whatever it
+ * holds, and that is the only text a value with another character can match.
+ */
+function fieldFilterSql(filters: FieldFilters, params: (string | number)[]): string {
+  let sql = '';
+  for (const [column, values] of [['nodes.file_path', filters.paths], ['nodes.name', filters.names]] as const) {
+    if (values.length === 0) continue;
+    const terms: string[] = [];
+    for (const value of values) {
+      if (!PRINTABLE_ASCII.test(value)) continue;
+      terms.push(`instr(lower(${column}), ?) > 0`);
+      params.push(value);
+    }
+    terms.push(`${column} GLOB '*[^ -~]*'`);
+    sql += ` AND (${terms.join(' OR ')})`;
+  }
+  return sql;
 }
 
 /**
@@ -1726,8 +1790,15 @@ export class QueryBuilder {
       parsed.languages.length > 0
         ? Array.from(new Set([...(options.languages ?? []), ...parsed.languages]))
         : options.languages;
-    const pathFilters = parsed.pathFilters;
-    const nameFilters = parsed.nameFilters;
+    // `path:` and `name:` are hard filters, and every candidate source below
+    // applies them before its own limit and offset. Applied only to the final
+    // list, they found nothing whenever the rows that filled the limit all
+    // lay elsewhere, so a match was shown only at a larger limit (#2254).
+    const filters = fieldFiltersOf(parsed);
+    // When no symbol's name passes `name:`, or no symbol's file passes `path:`,
+    // nothing can: answer now, rather than let every source below read all
+    // its candidates to find none.
+    if (filters && !this.fieldFiltersCanMatch(filters)) return [];
     // The text portion drives FTS/LIKE; if all the user typed was
     // filters (`kind:function`), we still need *some* candidate set,
     // so synthesise an empty-text path that returns everything matching
@@ -1738,16 +1809,14 @@ export class QueryBuilder {
 
     // First try FTS5 with prefix matching (skip if FTS5 not available, #1532)
     let results = text
-      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }) : [])
-      // Over-fetch by 5× when running filter-only (no text). The
-      // post-scoring path: + name: filters can be very selective, so
-      // a smaller multiplier risks returning fewer than `limit`
-      // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }, filters) : [])
+      // Over-fetch by 5× when running filter-only (no text): the pool is
+      // re-ranked below, and the extra rows give that ranking room to work.
+      : this.searchAllByFilters({ kinds, languages, limit: limit * 5, offset }, filters);
 
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      results = this.searchNodesLike(text, { kinds, languages, limit, offset }, filters);
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -1755,7 +1824,7 @@ export class QueryBuilder {
     // returned nothing AND there's a text portion long enough to be
     // worth fuzzing (1-char queries would match too much).
     if (results.length === 0 && text.length >= 3) {
-      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+      results = this.searchNodesFuzzy(text, { kinds, languages, limit }, filters);
     }
 
     // Supplement: ensure exact name matches are always candidates.
@@ -1792,8 +1861,10 @@ export class QueryBuilder {
           sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
-        sql += ' LIMIT 20';
-        const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+        if (filters) sql += fieldFilterSql(filters, params);
+        const rows = filters
+          ? this.readFilteredPage<NodeRow>(sql, params, filters, 20, 0)
+          : this.db.prepare(`${sql} LIMIT 20`).all(...params) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
             results.push({ node: rowToNode(row), score: maxFtsScore });
@@ -1801,6 +1872,13 @@ export class QueryBuilder {
           }
         }
       }
+    }
+
+    // The filters once more, before the cut below: every source above has
+    // applied them already, so this only guards against a candidate source
+    // that someday doesn't.
+    if (filters) {
+      results = results.filter((r) => passesFieldFilters(r.node.name, r.node.filePath, filters));
     }
 
     // Apply multi-signal scoring
@@ -1833,40 +1911,51 @@ export class QueryBuilder {
       }
     }
 
-    // Apply path: + name: filters AFTER scoring. Scoring already uses
-    // path/name as a soft signal; the explicit filters here are a hard
-    // gate. Done last so the FTS limit fetched plenty of candidates to
-    // narrow from.
-    if (pathFilters.length > 0) {
-      const lowered = pathFilters.map((p) => p.toLowerCase());
-      results = results.filter((r) => {
-        const fp = r.node.filePath.toLowerCase();
-        return lowered.some((p) => fp.includes(p));
-      });
-    }
-    if (nameFilters.length > 0) {
-      const lowered = nameFilters.map((n) => n.toLowerCase());
-      results = results.filter((r) => {
-        const nm = r.node.name.toLowerCase();
-        return lowered.some((n) => nm.includes(n));
-      });
-    }
-
     return results;
+  }
+
+  /**
+   * One page of the rows `sql` returns that pass `filters`: up to `limit` of
+   * them, after skipping the first `offset` that pass, so a source's limit and
+   * offset count only what the filters let through. `sql` has no LIMIT or
+   * OFFSET of its own. Its rows are streamed and the read stops once the page
+   * is full, so a selective filter holds none of the rows it rejects. Searches
+   * without these filters keep SQLite's LIMIT and OFFSET instead, whose
+   * reading of a negative limit (no limit) this follows.
+   */
+  private readFilteredPage<T extends { name: string; file_path: string }>(
+    sql: string,
+    params: (string | number)[],
+    filters: FieldFilters,
+    limit: number,
+    offset: number,
+  ): T[] {
+    const page: T[] = [];
+    if (limit === 0) return page;
+    let skipped = 0;
+    for (const row of this.db.prepare(sql).iterate(...params) as IterableIterator<T>) {
+      if (!passesFieldFilters(row.name, row.file_path, filters)) continue;
+      if (skipped < offset) {
+        skipped++;
+        continue;
+      }
+      page.push(row);
+      if (page.length === limit) break;
+    }
+    return page;
   }
 
   /**
    * Match-everything path used when the user supplied only field
    * filters (`kind:function lang:typescript`) with no text. Returns
-   * candidates ordered by name; the caller's filter pass narrows to
-   * what was asked for.
+   * candidates ordered by name, a page of those the `path:`/`name:`
+   * filters let through when there are any.
    */
-  private searchAllByFilters(options: {
-    kinds?: NodeKind[];
-    languages?: Language[];
-    limit: number;
-  }): SearchResult[] {
-    const { kinds, languages, limit } = options;
+  private searchAllByFilters(
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number; offset: number },
+    filters?: FieldFilters,
+  ): SearchResult[] {
+    const { kinds, languages, limit, offset } = options;
     let sql = 'SELECT * FROM nodes WHERE 1=1';
     const params: (string | number)[] = [];
     if (kinds && kinds.length > 0) {
@@ -1877,9 +1966,11 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ' ORDER BY name LIMIT ?';
-    params.push(limit);
-    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY name';
+    const rows = filters
+      ? this.readFilteredPage<NodeRow>(sql, params, filters, limit, offset)
+      : this.db.prepare(`${sql} LIMIT ? OFFSET ?`).all(...params, limit, offset) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
   }
 
@@ -1893,7 +1984,8 @@ export class QueryBuilder {
    */
   private searchNodesFuzzy(
     text: string,
-    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number },
+    filters?: FieldFilters,
   ): SearchResult[] {
     const { kinds, languages, limit } = options;
     const lowered = text.toLowerCase();
@@ -1920,14 +2012,19 @@ export class QueryBuilder {
     // separate `SELECT * FROM nodes WHERE name = ?`; without this cap
     // a project with many similar names (`getUser1`, `getUser2`...)
     // could fan out far beyond `limit` queries before the inner-loop
-    // limit kicks in.
+    // limit kicks in. With `path:`/`name:` filters the cap could be spent on
+    // names whose symbols all lie outside them, ahead of the one that
+    // matches (#2254), so a filtered search looks names up until it has
+    // `limit` results, skipping without a lookup each name `name:` rules out.
+    // Every lookup is an index seek on one name.
     const FUZZY_FOLLOWUP_CAP = Math.max(limit * 2, 50);
-    const cappedCandidates = candidates.slice(0, FUZZY_FOLLOWUP_CAP);
+    const cappedCandidates = filters ? candidates : candidates.slice(0, FUZZY_FOLLOWUP_CAP);
 
     const results: SearchResult[] = [];
     const seen = new Set<string>();
     for (const c of cappedCandidates) {
       if (results.length >= limit) break;
+      if (filters && !passesNameFilters(c.name, filters)) continue;
       let sql = 'SELECT * FROM nodes WHERE name = ?';
       const params: (string | number)[] = [c.name];
       if (kinds && kinds.length > 0) {
@@ -1938,8 +2035,10 @@ export class QueryBuilder {
         sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
         params.push(...languages);
       }
-      sql += ' LIMIT 5';
-      const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+      if (filters) sql += fieldFilterSql(filters, params);
+      const rows = filters
+        ? this.readFilteredPage<NodeRow>(sql, params, filters, 5, 0)
+        : this.db.prepare(`${sql} LIMIT 5`).all(...params) as NodeRow[];
       for (const row of rows) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
@@ -2038,7 +2137,7 @@ export class QueryBuilder {
   /**
    * FTS5 search with prefix matching
    */
-  private searchNodesFTS(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesFTS(query: string, options: SearchOptions, filters?: FieldFilters): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
@@ -2096,11 +2195,18 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score LIMIT ? OFFSET ?';
-    params.push(ftsLimit, offset);
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY score';
 
     try {
-      const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      let rows: (NodeRow & { score: number })[];
+      if (filters) {
+        rows = this.readFilteredPage(sql, params, filters, ftsLimit, offset);
+      } else {
+        sql += ' LIMIT ? OFFSET ?';
+        params.push(ftsLimit, offset);
+        rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      }
       return rows.map((row) => ({
         node: rowToNode(row),
         score: Math.abs(row.score), // bm25 returns negative scores
@@ -2115,7 +2221,7 @@ export class QueryBuilder {
    * LIKE-based substring search for cases where FTS doesn't match
    * Useful for camelCase matching (e.g., "signIn" finds "signInWithGoogle")
    */
-  private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesLike(query: string, options: SearchOptions, filters?: FieldFilters): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // This runs when FTS found nothing, and a word FTS can't find is usually
@@ -2175,10 +2281,17 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY score DESC, length(name) ASC';
 
-    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    let rows: (NodeRow & { score: number })[];
+    if (filters) {
+      rows = this.readFilteredPage(sql, params, filters, limit, offset);
+    } else {
+      sql += ' LIMIT ? OFFSET ?';
+      params.push(limit, offset);
+      rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    }
 
     return rows.map((row) => ({
       node: rowToNode(row),
@@ -4318,6 +4431,37 @@ export class QueryBuilder {
       return { names, lowered: lowered.join('\n') + '\n', starts };
     };
     return this.memoizedRead('fuzzyNames', read) ?? read();
+  }
+
+  /**
+   * The distinct file paths of the nodes, lowercased and newline-joined. Read
+   * once until the database changes (fresh inside a transaction), as
+   * {@link fuzzyNames} is.
+   */
+  private loweredNodePaths(): string {
+    const read = (): string => {
+      const rows = this.db.prepare('SELECT DISTINCT file_path FROM nodes').all() as Array<{ file_path: string }>;
+      return rows.map((row) => row.file_path.toLowerCase()).join('\n') + '\n';
+    };
+    return this.memoizedRead('loweredNodePaths', read) ?? read();
+  }
+
+  /**
+   * False when no symbol's name passes the `name:` filters, or no symbol's
+   * file passes the `path:` ones, so that no symbol can pass both. A value
+   * found anywhere in the joined lists counts, so true only means a match
+   * may exist.
+   */
+  private fieldFiltersCanMatch(filters: FieldFilters): boolean {
+    if (filters.names.length > 0) {
+      const names = this.fuzzyNames().lowered;
+      if (!filters.names.some((n) => names.includes(n))) return false;
+    }
+    if (filters.paths.length > 0) {
+      const paths = this.loweredNodePaths();
+      if (!filters.paths.some((p) => paths.includes(p))) return false;
+    }
+    return true;
   }
 
   /**
