@@ -3940,6 +3940,10 @@ export class ExtractionOrchestrator {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
+        // Tracked over the size limit, it had no nodes for an import to land
+        // on: back under it, it is new to its importers, so their failed
+        // imports of it are retried as an added file's are.
+        if (tracked.errors?.some((e) => e.code === 'size_exceeded')) addedFilePaths.push(filePath);
         filesModified++;
       }
     }
