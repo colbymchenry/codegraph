@@ -235,10 +235,12 @@ class IExact:
     return result.content?.[0]?.text ?? '';
   };
 
-  it('fixture sanity: the flow runs as_sql → get_qualify_sql → get_select and compiler.py goes focused', async () => {
+  it('fixture sanity: the flow runs through every named step and compiler.py goes focused', async () => {
     const text = await explore('SQLCompiler.as_sql pre_sql_setup get_select');
     expect(text).toContain('**Flow (call path among the symbols you queried)');
-    expect(text).toMatch(/1\. as_sql \(compiler\.py:\d+\)[\s\S]*2\. get_qualify_sql[\s\S]*3\. get_select/);
+    // #2970: the named `pre_sql_setup` is on the path (via the unnamed bridge
+    // `setup_query`) even though `get_qualify_sql` reaches `get_select` sooner.
+    expect(text).toMatch(/1\. as_sql \(compiler\.py:\d+\)[\s\S]*2\. pre_sql_setup[\s\S]*3\. setup_query[\s\S]*4\. get_select/);
     expect(sectionFor(text, COMPILER), 'the family file renders as a per-symbol view').toContain('· focused');
   });
 

@@ -3500,10 +3500,11 @@ export class ToolHandler {
    * Flow-from-named-symbols: an agent's codegraph_explore query is a bag of
    * symbol names that usually spans the flow it's investigating (e.g.
    * "PmsProductController getList PmsProductService list PmsProductServiceImpl").
-   * Surface the longest call chain AMONG those named symbols — scoped to what the
-   * agent explicitly named, so (unlike a fuzzy relevance set) there's no
-   * wrong-feature wandering. Rides synthesized edges, so controller→service-
-   * interface→impl shows up. Returns '' if no chain of >=3 nodes exists.
+   * Surface the call chain AMONG those named symbols that visits the most of
+   * them (the longest such chain on a tie) — scoped to what the agent explicitly
+   * named, so (unlike a fuzzy relevance set) there's no wrong-feature wandering.
+   * Rides synthesized edges, so controller→service→interface→impl shows up.
+   * Returns '' if no chain of >=3 nodes exists.
    *
    * Ambiguous tokens (Java `list` → dozens of nodes) are disambiguated by
    * CO-NAMING: the agent names the class too, so we keep only `list` candidates
@@ -6185,15 +6186,22 @@ export class ToolHandler {
       // names ~7 Session.swift methods — the build spine PLUS off-path
       // task/didCompleteTask — far past the whole response budget). Engage the
       // per-symbol view to keep the SPINE full and collapse the off-path named
-      // methods to signatures. Only when there IS off-path content to shed —
-      // otherwise the spine is irreducible (a sequential flow has no redundancy),
-      // so leave it to the normal full render.
+      // methods to signatures.
+      //
+      // A file that DEFINES a polymorphic supertype is content to shed by itself
+      // (see `definesPolymorphicSupertype`): its subclasses are redundant whatever
+      // the spine covers. Requiring off-path named content dropped it out of this
+      // view once #2970 put every named step ON the fuller spine — Django's
+      // compiler.py then fell back to the cluster render, dumping the
+      // `SQLInsertCompiler` / `SQLDeleteCompiler` bodies the per-symbol view keeps
+      // as signatures. A sequential spine with no subtree to shed still renders
+      // whole; a family base does not.
       const namedBodyChars = group.nodes
         .filter(n => CALLABLE_BODY.has(n.kind) && (flow.pathNodeIds.has(n.id) || flow.uniqueNamedNodeIds.has(n.id)))
         .reduce((s, n) => s + fileLines.slice(n.startLine - 1, n.endLine).join('\n').length, 0);
+      const offPathNamed = group.nodes.some(n => CALLABLE_BODY.has(n.kind) && flow.uniqueNamedNodeIds.has(n.id) && !flow.pathNodeIds.has(n.id));
       const onSpineGodFile = hasSpineNode
-        && namedBodyChars > allowance
-        && group.nodes.some(n => CALLABLE_BODY.has(n.kind) && flow.uniqueNamedNodeIds.has(n.id) && !flow.pathNodeIds.has(n.id));
+        && (fileDefinesSuper || (namedBodyChars > allowance && offPathNamed));
       // A line RANGE the agent asked for (`lines 900-1003`) is not a symbol, so
       // the per-symbol view has no way to show it — such a file takes the
       // cluster path, which renders anchor spans first.

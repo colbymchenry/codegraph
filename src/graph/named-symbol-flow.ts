@@ -1,9 +1,10 @@
 /**
  * The call path among a bag of named symbols — the one path finder.
  *
- * `codegraph_explore` leads its answer with a "Flow" section: the longest call
- * chain among the symbols an agent named, riding synthesized dynamic-dispatch
- * edges so a controller reaches its implementation through the interface. The
+ * `codegraph_explore` leads its answer with a "Flow" section: the call chain
+ * among the symbols an agent named that visits the most of them — the longest
+ * such chain when several tie — riding synthesized dynamic-dispatch edges so a
+ * controller reaches its implementation through the interface. The
  * viewer's Flow strip (`/api/flow`, design spec §3.5) draws the same thing as
  * cards. They must never disagree, so the search lives here once and both
  * callers ride it: same token parsing, same overload disambiguation, same
@@ -14,9 +15,10 @@
  *
  * - **`mode: 'named'`** is exactly what explore does. Every resolved symbol is
  *   both a possible start and a possible end, at most ONE unnamed symbol may
- *   bridge two named ones ({@link DEFAULT_MAX_BRIDGE}), and the LONGEST chain
- *   wins. The bridge cap is what stops the search wandering a god-function's
- *   fan-out: the agent's own naming is the evidence that a hop is on-topic.
+ *   bridge two named ones ({@link DEFAULT_MAX_BRIDGE}), and the chain that
+ *   visits the MOST named symbols wins (the longest of those on a tie). The
+ *   bridge cap is what stops the search wandering a god-function's fan-out: the
+ *   agent's own naming is the evidence that a hop is on-topic.
  * - **`mode: 'directed'`** is "how does X reach Y", which the agent has no way
  *   to ask and the viewer's search box does. Both ends are pinned, so the
  *   evidence the bridge cap was standing in for is already there and the search
@@ -386,6 +388,7 @@ const DIRECTED_VISIT_CAP = 12_000;
 
 /** How the `named` walk reached a node, and what the route there carries. */
 interface WalkStep {
+  /** The previous route STATE's key, not a bare node id — see {@link walkStateKey}. */
   prev: string | null;
   edge: Edge | null;
   node: Node;
@@ -398,6 +401,27 @@ interface WalkStep {
 }
 
 /**
+ * Identity of a route prefix in the `named` walk: the node, the named symbols
+ * the route collected, and the unnamed-hop streak it ends on.
+ *
+ * A node alone is not enough. `parent` used to hold one route per node, replaced
+ * only by a better route of the SAME length, so depth decided first: issue
+ * #2970 — `entry → mid2 → leaf` reaches `leaf` at depth 2 and the route that
+ * passes the named `deep` (`entry → mid1 → deep → leaf`, depth 3, one more
+ * named symbol) was rejected for being longer. Keying on the named count keeps
+ * both and lets the final choice prefer the fuller one.
+ *
+ * The streak is keyed too, so a route that spends a bridge hop and one that
+ * does not are distinct prefixes, each keeping its own remaining budget. Depth
+ * is not keyed: the first arrival at a state is its shortest, and a longer
+ * route to the same (node, named, streak) is dominated — same reward, same
+ * budget shape, less depth left to spend.
+ */
+function walkStateKey(nodeId: string, namedCount: number, streak: number): string {
+  return `${nodeId}#${namedCount}#${streak}`;
+}
+
+/**
  * Breadth-first over `calls` edges — synthesized ones included, which is what
  * carries a flow across a callback, a re-render or a JSX child.
  *
@@ -405,20 +429,16 @@ interface WalkStep {
  * at most `maxBridge` unnamed symbols may sit between two of them. That cap is
  * what bounds the frontier, so {@link NAMED_VISIT_CAP} is generous.
  *
- * Two routes of the same length to one node are settled by the agent's naming,
- * not by the order the index lists callees in: the route through more named
- * symbols wins. An interface method calls every implementation, so
- * prometheus's `Queryable.Querier` reaches `NewMergeQuerier` through
- * `fanout.Querier` and the TSDB's `DB.Querier` alike; keeping whichever was
- * listed first took the Flow through `DB.Querier` when the query named
- * `fanout.Querier`. A rival route comes from another node at the same depth,
- * and every node at one depth is expanded before any node at the next, so the
- * choice is final before anything is reached through it. Ending on fewer
- * unnamed hops ranks first, so a choice never spends bridge budget that a later
- * hop needs (with the default budget of one, only a route node's streak can
- * differ).
+ * Routes are per STATE, not per node ({@link walkStateKey}). Two routes that
+ * reach a node are the same prefix only when they collected as many named
+ * symbols and end on the same bridge streak; then the shorter one wins (it has
+ * more hops left to spend) and the later one is dropped. A route that visits
+ * MORE named symbols is a different state and is never lost to a shorter one,
+ * however much longer it is — which is what keeps every named symbol on the
+ * Flow when a shorter route reaches one of them first (#2970).
  *
- * Returns the parent map, so a caller can reconstruct any reached node's path.
+ * Returns the parent map keyed by state, so a caller can reconstruct any
+ * reached state's path.
  */
 function walkCalls(
   cg: CodeGraph,
@@ -428,20 +448,26 @@ function walkCalls(
   maxBridge: number
 ): { parent: Map<string, WalkStep>; reached: string[] } {
   const parent = new Map<string, WalkStep>();
-  parent.set(seed.id, {
+  const seedNamed = named.has(seed.id) ? 1 : 0;
+  const seedKey = walkStateKey(seed.id, seedNamed, 0);
+  parent.set(seedKey, {
     prev: null,
     edge: null,
     node: seed,
     depth: 0,
     streak: 0,
-    named: named.has(seed.id) ? 1 : 0,
+    named: seedNamed,
   });
-  const queue: string[] = [seed.id];
+  const queue: string[] = [seedKey];
   const reached: string[] = [];
-  for (let head = 0; head < queue.length && parent.size < NAMED_VISIT_CAP; head++) {
-    const id = queue[head]!;
-    const at = parent.get(id)!;
-    if (id !== seed.id && named.has(id)) reached.push(id);
+  // The cap is about how far the search fans out, so it counts distinct NODES
+  // as before; one node may carry several states, each expanded at most once.
+  const seen = new Set<string>([seed.id]);
+  for (let head = 0; head < queue.length && seen.size < NAMED_VISIT_CAP; head++) {
+    const key = queue[head]!;
+    const at = parent.get(key)!;
+    const id = at.node.id;
+    if (id !== seed.id && named.has(id)) reached.push(key);
     if (at.depth >= maxHops - 1) continue;
     for (const c of cg.getCallees(id)) {
       if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
@@ -450,17 +476,19 @@ function walkCalls(
       // crossing one costs no bridge budget.
       const streak = isNamed ? 0 : c.node.kind === 'route' ? at.streak : at.streak + 1;
       if (streak > maxBridge) continue;
-      const depth = at.depth + 1;
-      const namedOnRoute = at.named + (isNamed ? 1 : 0);
-      const prior = parent.get(c.node.id);
-      if (prior) {
-        // Reached already: only a better route of the same length replaces it.
-        if (prior.depth !== depth) continue;
-        if (streak > prior.streak || (streak === prior.streak && namedOnRoute <= prior.named)) continue;
-      } else {
-        queue.push(c.node.id);
-      }
-      parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node, depth, streak, named: namedOnRoute });
+      const namedCount = at.named + (isNamed ? 1 : 0);
+      const nextKey = walkStateKey(c.node.id, namedCount, streak);
+      if (parent.has(nextKey)) continue;
+      parent.set(nextKey, {
+        prev: key,
+        edge: c.edge,
+        node: c.node,
+        depth: at.depth + 1,
+        streak,
+        named: namedCount,
+      });
+      queue.push(nextKey);
+      seen.add(c.node.id);
     }
   }
   return { parent, reached };
@@ -580,10 +608,7 @@ function walkBidirectional(
   return null;
 }
 
-function chainTo(
-  parent: Map<string, { prev: string | null; edge: Edge | null; node: Node }>,
-  target: string
-): FlowStep[] {
+function chainTo(parent: Map<string, WalkStep>, target: string): FlowStep[] {
   const steps: FlowStep[] = [];
   let cur: string | null = target;
   while (cur) {
@@ -633,25 +658,39 @@ export function resolveNamedSymbolFlow(
     } else {
       for (const seed of [...flow.named.values()].slice(0, MAX_SEEDS)) {
         const { parent, reached } = walkCalls(cg, seed, namedIds, maxHops, maxBridge);
-        // Explore's rule: the DEEPEST named sink this seed can reach. Of two as
-        // deep, the one whose route passes more named symbols, as in the walk.
-        let deepest: WalkStep | null = null;
-        for (const id of reached) {
-          const at = parent.get(id)!;
+        // Explore's rule: of every named sink this seed reaches, the route that
+        // visits the MOST named symbols — the header's promise — and, of two
+        // that visit as many, the deeper one. #2970: the route through the
+        // named `deep` carries one more named symbol than the shorter one
+        // through `mid2`, so it wins even though it is longer.
+        let best: WalkStep | null = null;
+        let bestKey: string | null = null;
+        for (const key of reached) {
+          const at = parent.get(key)!;
           if (
-            !deepest ||
-            at.depth > deepest.depth ||
-            (at.depth === deepest.depth && at.named > deepest.named)
+            !best ||
+            at.named > best.named ||
+            (at.named === best.named && at.depth > best.depth)
           ) {
-            deepest = at;
+            best = at;
+            bestKey = key;
           }
         }
-        if (deepest) found.push(chainTo(parent, deepest.node.id));
+        if (bestKey) found.push(chainTo(parent, bestKey));
       }
     }
 
     if (found.length === 0) return flow;
-    found.sort((a, b) => (directed ? a.length - b.length : b.length - a.length));
+    // Explore ranks by named coverage first: a chain that visits more of the
+    // symbols the agent named is the fuller answer, even when a longer chain
+    // visits fewer (#2970). Of two that visit as many, the longer wins.
+    const namedOnChain = (steps: FlowStep[]): number =>
+      steps.reduce((n, s) => n + (namedIds.has(s.node.id) ? 1 : 0), 0);
+    found.sort((a, b) =>
+      directed
+        ? a.length - b.length
+        : namedOnChain(b) - namedOnChain(a) || b.length - a.length
+    );
 
     // Identical chains, and chains that are just a shorter run along one
     // already kept, are the same answer twice: `a → b → c` and `b → c` differ

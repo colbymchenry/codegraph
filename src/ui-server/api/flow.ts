@@ -19,8 +19,9 @@
  *
  * - `?from=&to=` — a directed question, from the search box's flow grammar.
  *   Both ends pinned, shortest path wins.
- * - `?symbols=a,b,c` — explore's own question, verbatim. Longest chain among
- *   the named symbols wins, at most one unnamed bridge.
+ * - `?symbols=a,b,c` — explore's own question, verbatim. The chain that visits
+ *   the most of the named symbols wins (longest on a tie), at most one unnamed
+ *   bridge.
  * - `?hop=s<id>&hop=d<id>…` — the trail, read as a flow. Nothing is searched:
  *   the hops are the ones the reader walked, and the work is finding the edge
  *   that already connects each consecutive pair.

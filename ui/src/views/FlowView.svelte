@@ -223,7 +223,7 @@
     if (p.query.kind === 'directed') {
       return 'Every card is a call the graph recorded. A dashed link is a hop no one can see in the source — a callback, an interface, a re-render — and it names where it was wired.';
     }
-    return 'The longest call path among the symbols you named, the same one codegraph_explore leads with.';
+    return 'The call path among the symbols you named that visits the most of them, the same one codegraph_explore leads with.';
   }
 
   /**
