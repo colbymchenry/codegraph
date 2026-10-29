@@ -159,11 +159,14 @@ export class AstroExtractor {
   private extractScriptBlocks(): Array<{ content: string; startLine: number }> {
     const blocks: Array<{ content: string; startLine: number }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script ... />` (e.g. `is:inline set:html={...}`) has no
+    // body; match it on its own so it cannot run on to the next `</script>`.
+    const scriptRegex = /<script(\s[^>]*?)?(?:\/>|>(?<content>[\s\S]*?)<\/script>)/g;
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
-      const content = match.groups?.content || match[2] || '';
+      if (match.groups?.content === undefined) continue;
+      const content = match.groups.content;
 
       // Calculate the 0-indexed line where the content begins. The content
       // starts right after the opening tag's `>` — its leading `\n` is part
@@ -225,7 +228,7 @@ export class AstroExtractor {
       coveredRanges.push([frontmatter.startLine - 1, frontmatter.endLine]);
     }
 
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
+    const tagRegex = /<(script|style)(\s[^>]*?)?(?:\/>|>[\s\S]*?<\/\1>)/g;
     let tagMatch;
     while ((tagMatch = tagRegex.exec(this.source)) !== null) {
       const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
