@@ -7,8 +7,10 @@
  * into workspace member crates.
  */
 
+import * as path from 'path';
 import picomatch from 'picomatch';
 import { ResolutionContext } from '../types';
+import { escapesRoot } from '../../utils';
 
 const GLOB_CHARS = /[*?[\]{}!]/;
 const SKIP_DIRS = new Set(['target', 'node_modules', '.git', 'dist', 'build']);
@@ -224,6 +226,8 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
   const expanded: string[] = [];
   const seen = new Set<string>();
   for (const member of members) {
+    // A member outside the project (`../shared`, an absolute path) is neither read nor listed.
+    if (escapesRoot(path.posix.normalize(member.replace(/\\/g, '/')))) continue;
     const candidates = GLOB_CHARS.test(member)
       ? expandGlobMember(member, context)
       : [member];

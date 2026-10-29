@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
-import { escapeRegExp } from '../utils';
+import { escapeRegExp, escapesRoot } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
@@ -8878,6 +8878,12 @@ function rustCrateGraph(context: ResolutionContext): RustCrateGraph {
   const crates = new Map<string, RustCrate>();
   const manifests = new Map<string, string>();
   const byName = new Map<string, string>();
+  // A path a manifest in `dir` writes, as a project path; null when it leaves
+  // the project, which nothing here reads or names.
+  const join = (dir: string, rel: string): string | null => {
+    const joined = path.posix.normalize(dir === '' ? rel : `${dir}/${rel}`).replace(/\/+$/, '');
+    return joined === '.' ? '' : escapesRoot(joined) ? null : joined;
+  };
   const add = (dir: string): boolean => {
     if (crates.has(dir)) return true;
     const text = context.readFile(dir === '' ? 'Cargo.toml' : `${dir}/Cargo.toml`);
@@ -8885,21 +8891,20 @@ function rustCrateGraph(context: ResolutionContext): RustCrateGraph {
     const name = text ? parsePackageName(text)?.replace(/-/g, '_') : undefined;
     if (!name) return false;
     const targets = parseTargetPaths(text!);
-    const file = (rel: string): string => path.posix.normalize(dir === '' ? rel : `${dir}/${rel}`);
-    crates.set(dir, { name, keys: new Map(), deps: new Set(), lib: targets.lib && file(targets.lib), bins: targets.bins.map(file) });
+    const lib = targets.lib === undefined ? null : join(dir, targets.lib);
+    const bins = targets.bins.map((bin) => join(dir, bin)).filter((bin): bin is string => bin !== null);
+    crates.set(dir, { name, keys: new Map(), deps: new Set(), lib: lib ?? undefined, bins });
     manifests.set(dir, text!);
     if (!byName.has(name)) byName.set(name, dir);
     return true;
   };
   add('');
-  for (const dir of getCargoWorkspaceCrateMap(context).values()) add(dir.replace(/^\.(?:\/|$)/, ''));
+  for (const member of getCargoWorkspaceCrateMap(context).values()) {
+    const dir = join('', member);
+    if (dir !== null) add(dir);
+  }
   const inherited = new Map(rustManifestDependencies(context.readFile('Cargo.toml') ?? '')
     .filter((dep) => dep.kind === 'workspace').map((dep) => [dep.key, dep]));
-  // A path from `dir`, as a project directory; null when it leaves the project.
-  const join = (dir: string, rel: string): string | null => {
-    const joined = path.posix.normalize(dir === '' ? rel : `${dir}/${rel}`).replace(/\/+$/, '');
-    return joined === '.' ? '' : joined === '..' || joined.startsWith('../') || path.posix.isAbsolute(joined) ? null : joined;
-  };
   const queue = [...crates.keys()];
   for (let i = 0; i < queue.length; i++) {
     const dir = queue[i]!;
@@ -9912,11 +9917,28 @@ export function matchRustUseBoundName(ref: UnresolvedRef, context: ResolutionCon
   // or last segment — and a call's own name, with its arguments after it: a
   // chained call is recorded where its receiver starts, which may be a local
   // of the method's name (`deadline.as_ref().deadline()`).
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  const line = lines?.[ref.line - 1];
   if (line === undefined || !line.startsWith(name, ref.column) || /(?:\.|::)\s*$/.test(line.slice(0, ref.column))) return undefined;
   const after = line.slice(ref.column + name.length).trimStart();
   if (ref.referenceKind === 'calls' ? !/^(?:\(|::\s*<)/.test(after) : /^(?:\.|::)/.test(after)) return undefined;
   const offset = rustRefOffset(ref, context);
+  // A type rustfmt wrapped below its path — `h: &scheduler::\n    Handle` — is
+  // the path's, not the `use`'s of its last name: read back over the line
+  // break, comments blanked (`// crate::scheduler::` above it is no path).
+  if (ref.referenceKind === 'references' && /^\s*$/.test(line.slice(0, ref.column)) && ref.line > 1 &&
+      /::\s*(?:\/\/.*|\/\*.*)?$/.test(lines![ref.line - 2] ?? '')) {
+    const scopes = rustScopesOf(ref.filePath, context);
+    const qualifier = scopes ? rustWrittenQualifier(scopes.code, offset) : [];
+    if (qualifier.length > 0) {
+      const target = rustPathTarget({ ...ref, referenceName: [...qualifier, name].join('::') }, context);
+      if (!target) return undefined;
+      let scoped = RUST_SCOPED_REFS.get(context);
+      if (!scoped) RUST_SCOPED_REFS.set(context, (scoped = new WeakSet()));
+      scoped.add(ref);
+      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
   const visible = rustVisibleUse(name, ref.filePath, offset, context);
   const local = ref.referenceKind === 'references' ? null : rustShadowingLocal(name, ref, offset, visible, context);
   let target: Node | null | undefined;
@@ -9946,6 +9968,31 @@ export function matchRustUseBoundName(ref: UnresolvedRef, context: ResolutionCon
 
 /** References matchRustUseBoundName answered from the scope around them: a rename, a `let` that holds a function. */
 const RUST_SCOPED_REFS = new WeakMap<ResolutionContext, WeakSet<UnresolvedRef>>();
+
+/**
+ * The module path written right before `offset` in a Rust file's blanked
+ * code, read back over whitespace and line breaks: `scheduler::` before
+ * `Handle` gives `['scheduler']`. Empty when a `::` follows no plain name
+ * (a turbofish's `>::`, a qualified self).
+ */
+function rustWrittenQualifier(code: string, offset: number): string[] {
+  const segs: string[] = [];
+  let i = offset;
+  for (;;) {
+    let j = i - 1;
+    while (j >= 0 && /\s/.test(code[j]!)) j--;
+    if (j < 1 || code[j] !== ':' || code[j - 1] !== ':') break;
+    j -= 2;
+    while (j >= 0 && /\s/.test(code[j]!)) j--;
+    let k = j;
+    while (k >= 0 && /\w/.test(code[k]!)) k--;
+    const seg = code.slice(k + 1, j + 1);
+    if (!/^[A-Za-z_]\w*$/.test(seg)) return [];
+    segs.unshift(seg);
+    i = k + 1;
+  }
+  return segs;
+}
 
 /**
  * The local a bare name at `offset` of `ref`'s function is there (rust-scopes.ts
@@ -9983,8 +10030,12 @@ function rustShadowingLocal(name: string, ref: UnresolvedRef, offset: number, vi
   return local;
 }
 
-/** Kinds a Rust path to a module's item names: never a method, nor a variable (an impl's `const`, a `static`). */
-const RUST_PATH_ITEM_KINDS: ReadonlySet<string> = new Set(['function', 'struct', 'union', 'enum', 'trait', 'type_alias', 'constant']);
+/**
+ * Kinds a Rust path to a module's item names: a module-level `pub const` or
+ * `static` (extracted as a variable) too, never a method — the module's own
+ * items only (rustDeclaredItems), so never an impl's `const`.
+ */
+const RUST_PATH_ITEM_KINDS: ReadonlySet<string> = new Set(['function', 'struct', 'union', 'enum', 'trait', 'type_alias', 'constant', 'variable']);
 
 const RUST_PATH_TARGETS = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
@@ -10005,11 +10056,16 @@ export function rustPathTarget(ref: UnresolvedRef, context: ResolutionContext): 
   const segs = ref.referenceName.replace(/^::/, '').split('::');
   if (segs.length < 2 || !segs.every((s) => /^[A-Za-z_]\w*$/.test(s))) return null;
   const variants = ref.referenceKind === 'imports';
-  // `Foo::new(…)`, `io::Error::new(…)`: through a type, by its name, to no
-  // module's item — only a `use` names a variant that way. (Rust names its
-  // modules in snake_case.)
-  if (!variants && /^[A-Z]/.test(segs[segs.length - 2]!)) return null;
   const offset = rustRefOffset(ref, context);
+  // `sim::items::ItemPool::for_def(…)`, `ItemPool::for_def(…)` under `use
+  // sim::items::ItemPool;`: a call through a type its path or a `use` names
+  // (Rust names its modules in snake_case, its types in CamelCase) is to that
+  // type's associated function or variant. A type the module declares itself,
+  // `Self`, and a type's path in any other position are left as they were.
+  const owner = segs[segs.length - 2]!;
+  const typed = !variants && /^[A-Z]/.test(owner);
+  const ownerUse = typed && segs.length === 2 ? rustVisibleUse(owner, ref.filePath, offset, context) : undefined;
+  if (typed && (ref.referenceKind !== 'calls' || owner === 'Self' || (segs.length === 2 && !ownerUse?.paths.length))) return null;
   const from = rustModuleAt(ref.filePath, offset, context);
   const head = segs[0]!;
   const bare = head !== 'crate' && head !== 'self' && head !== 'super';
@@ -10019,17 +10075,72 @@ export function rustPathTarget(ref: UnresolvedRef, context: ResolutionContext): 
   }
   let memo = RUST_PATH_TARGETS.get(context);
   if (!memo) RUST_PATH_TARGETS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${from.block?.open ?? -1}\0${variants ? 1 : 0}\0${segs.join('::')}`;
+  // (A type a `use` binds is that `use`'s, wherever it is written.)
+  const scope = ownerUse ? `${ownerUse.block}\0${ownerUse.paths[0]!.at}` : '';
+  const key = `${ref.filePath}\0${from.block?.open ?? -1}\0${variants ? 1 : 0}\0${scope}\0${segs.join('::')}`;
   const hit = memo.get(key);
   if (hit !== undefined) return hit === null ? null : context.getNodeById?.(hit) ?? null;
-  let items = rustUsePathItems(segs, from, context, new Set());
-  if (items === null && bare) {
-    const root = rustCrateRootModule(ref.filePath, context);
-    if (root) items = rustUsePathItems(segs, root, context, new Set());
+  // The items the path's segments name — up to its type's, for a typed one.
+  const named = (path: readonly string[]): Node[] | null => {
+    // A type a `use` binds, written alone: the item that `use` names.
+    if (path.length === 1) {
+      const ids = rustUseItemsAt(path[0]!, ref, context);
+      return ids === null ? null : [...ids].map((id) => context.getNodeById?.(id)).filter((n): n is Node => !!n);
+    }
+    let items = rustUsePathItems(path, from, context, new Set());
+    if (items === null && bare) {
+      const root = rustCrateRootModule(ref.filePath, context);
+      if (root) items = rustUsePathItems(path, root, context, new Set());
+    }
+    return items;
+  };
+  let target: Node | null = null;
+  if (typed) {
+    for (const type of named(segs.slice(0, -1)) ?? []) {
+      target = rustTypeMember(type, segs[segs.length - 1]!, context);
+      if (target) break;
+    }
+  } else {
+    target = named(segs)?.find((n) => RUST_PATH_ITEM_KINDS.has(n.kind) || (variants && n.kind === 'enum_member')) ?? null;
   }
-  const target = items?.find((n) => RUST_PATH_ITEM_KINDS.has(n.kind) || (variants && n.kind === 'enum_member')) ?? null;
   memo.set(key, target?.id ?? null);
   return target;
+}
+
+/** Kinds a type's associated item is extracted as: an impl's functions, a `const`, a variant. */
+const RUST_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'function', 'variable', 'constant', 'enum_member']);
+
+const RUST_TYPE_MEMBERS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The associated item `member` of a Rust type, as `Type::member` reaches it:
+ * an enum's variant; else the type's own (inherent) function or `const`, a
+ * trait impl's only when it is the one item of that name; a trait's own
+ * declared method. An impl of the type is written in the type's crate, so a
+ * namesake type's impl in another crate is never it. Null when none is.
+ */
+function rustTypeMember(type: Node, member: string, context: ResolutionContext): Node | null {
+  if (type.language !== 'rust' || !RUST_DECLARED_TYPE_KINDS.has(type.kind) || type.kind === 'type_alias') return null;
+  let memo = RUST_TYPE_MEMBERS.get(context);
+  if (!memo) RUST_TYPE_MEMBERS.set(context, (memo = new Map()));
+  const key = `${type.id}\0${member}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit === null ? null : context.getNodeById?.(hit) ?? null;
+  let found: Node | null = null;
+  if (type.kind === 'enum') found = rustEnumVariants(type, member, context)[0] ?? null;
+  if (!found) {
+    const graph = rustCrateGraph(context);
+    const crate = rustCrateDirOf(type.filePath, graph);
+    const within = (n: Node): boolean => type.kind !== 'trait' ||
+      (n.filePath === type.filePath && n.startLine >= type.startLine && n.startLine <= (type.endLine ?? type.startLine));
+    const all = context.getNodesByName(member).filter((n) => n.language === 'rust' && RUST_MEMBER_KINDS.has(n.kind) &&
+      n.qualifiedName === `${type.name}::${member}` && rustCrateDirOf(n.filePath, graph) === crate && within(n));
+    const inherent = all.filter((n) => !isRustTraitImplMethod(n, context));
+    const pool = inherent.length > 0 ? inherent : all.length === 1 ? all : [];
+    found = pool.find((n) => n.filePath === type.filePath) ?? pool[0] ?? null;
+  }
+  memo.set(key, found?.id ?? null);
+  return found;
 }
 
 /**
@@ -20414,6 +20525,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_USE_ITEMS.delete(context);
   RUST_VISIBLE_ITEMS.delete(context);
   RUST_PATH_TARGETS.delete(context);
+  RUST_TYPE_MEMBERS.delete(context);
   RUST_SCOPED_REFS.delete(context);
   RUST_GLOB_ITEMS.delete(context);
   RUST_CRATES.delete(context);
