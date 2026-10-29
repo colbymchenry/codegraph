@@ -16,16 +16,25 @@
  * somewhere the index can't see, never from another class that declares one.
  * Production code never names a class a test declares. A bare constant
  * (`ChargeCard`) is left to the name strategies, as before.
+ *
+ * A call on what `.new` made (`ChargeCard.new(card).charge!`, recorded as
+ * `new ChargeCard().charge!`) resolves here too, bare constant or path: an
+ * instance method of the class the lookup finds, or nothing (#684).
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { isTestPath } from '../search/query-utils';
-import { rubyAncestry, rubyMethodsOfKindFirst } from './name-matcher';
+import { rubyAncestry, rubyMethodsOfKindFirst, type RubyMethodKind } from './name-matcher';
 
 /** `A::B`, `::A`, `::A::B`: a constant path. Group 1 is a leading `::`. */
 const CONSTANT_PATH = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)$/;
 /** `A::B.m`, `::A.m`: a call on one. Group 3 is the method. */
 const CONSTANT_PATH_CALL = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)\.([A-Za-z_]\w*[?!=]?)$/;
+/**
+ * `new Foo().m`, `new A::B().m!`: a call on what `Foo.new(…)` or `A::B.new`
+ * made, as the extractor records it (#684). Group 3 is the method.
+ */
+const CONSTRUCTED_CALL = /^new (::)?([A-Z]\w*(?:::[A-Z]\w*)*)\(\)\.([A-Za-z_]\w*[?!=]?)$/;
 
 /** What a Ruby constant is in the index: a class, a module, or a value (`RATES = {…}` is a `variable`). */
 const NAMESPACE_KINDS: ReadonlySet<string> = new Set(['class', 'module']);
@@ -48,6 +57,17 @@ export function matchRubyConstantPathRef(ref: UnresolvedRef, context: Resolution
     return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
   }
   if (ref.referenceKind === 'calls') {
+    // A call on an instance `Foo.new(…)` made, bare or namespaced: an instance
+    // method of the class Ruby's lookup finds for `Foo` there, its own or one
+    // its ancestry declares — never a namesake's by the method name alone. A
+    // class the project doesn't declare (rack-protection's `Request.new(env)`
+    // is rack's) has no method here.
+    const made = CONSTRUCTED_CALL.exec(ref.referenceName);
+    if (made) {
+      const cls = constantsNamed(made[2]!, made[1] !== undefined, ref, context)[0];
+      const method = cls?.kind === 'class' ? methodOf(cls.qualifiedName, made[3]!, ref, context, 'instance') : null;
+      return method ? { original: ref, targetNodeId: method.node.id, confidence: method.own ? 0.9 : 0.85, resolvedBy: 'instance-method' } : null;
+    }
     const m = CONSTANT_PATH_CALL.exec(ref.referenceName);
     if (!m || !isNamespaced(m)) return undefined;
     const owner = constantsNamed(m[2]!, m[1] !== undefined, ref, context)[0];
@@ -98,16 +118,23 @@ function lexicalScope(ref: UnresolvedRef, context: ResolutionContext): string {
 /**
  * The method `name` of the class or module `owner`: its own, else the first
  * of its superclasses and mixed-in modules that declares one (rubyAncestry).
- * Of a class's `def self.m` and `def m`, which share one qualified name, the
- * call on the class reaches the class method. Production code never reaches
- * one a test declares.
+ * Of a class's `def self.m` and `def m`, which share one qualified name, a
+ * call on the class reaches the class method, and a call on an instance
+ * (`kind` 'instance') the instance method. Production code never reaches one
+ * a test declares.
  */
-function methodOf(owner: string, name: string, ref: UnresolvedRef, context: ResolutionContext): { node: Node; own: boolean } | null {
+function methodOf(
+  owner: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  kind: RubyMethodKind = 'class',
+): { node: Node; own: boolean } | null {
   const production = !isTestPath(ref.filePath);
   for (const qn of rubyAncestry(owner, context)) {
     const methods = context.getNodesByQualifiedName(`${qn}::${name}`).filter((n) =>
       n.kind === 'method' && n.language === 'ruby' && !(production && isTestPath(n.filePath)));
-    if (methods.length > 0) return { node: rubyMethodsOfKindFirst(ordered(methods, ref), 'class')[0]!, own: qn === owner };
+    if (methods.length > 0) return { node: rubyMethodsOfKindFirst(ordered(methods, ref), kind)[0]!, own: qn === owner };
   }
   return null;
 }

@@ -8397,7 +8397,9 @@ export function rubyAncestry(qn: string, context: ResolutionContext): Set<string
       const sup = /^\s*class\s+[\w:]+\s*<\s*(::)?([A-Z][\w:]*)/.exec(lines[decl.startLine - 1] ?? '');
       if (sup) queue.push(rubyConstantQn(sup[2]!, sup[1] ? '' : outer, context));
       for (const line of lines.slice(decl.startLine, decl.endLine)) {
-        const mix = /^\s*(?:include|extend|prepend)\s+([A-Z:][\w:]*(?:\s*,\s*[A-Z:][\w:]*)*)/.exec(line);
+        // A module a call returns (`include RouteSet.new.tap { … }.url_helpers`,
+        // actionpack's tests) is no mixin of the constant the call starts at.
+        const mix = /^\s*(?:include|extend|prepend)\s+([A-Z:][\w:]*(?:\s*,\s*[A-Z:][\w:]*)*)(?![\w:]|\s*[.(])/.exec(line);
         if (!mix) continue;
         for (const name of mix[1]!.split(/\s*,\s*/)) {
           queue.push(name.startsWith('::') ? rubyConstantQn(name.slice(2), '', context) : rubyConstantQn(name, q, context));
@@ -21822,8 +21824,10 @@ export function matchMethodCall(
   // A JS/TS method name may carry `$`, which `\w` doesn't: an RxJS-style
   // `this.organizationService.organizations$()`, vscode's RPC
   // `this._proxy.$acceptModelChanged()`.
+  // A Ruby method name may end in `!` or `?`: `writer.flush!`, `writer.ready?` (#684).
   const dotMatch =
     (JS_FAMILY.has(ref.language) ? ref.referenceName.match(/^([\w.]+)\.([\w$]+)$/) : null) ??
+    (ref.language === 'ruby' ? ref.referenceName.match(/^([\w.]+)\.(\w+[!?])$/) : null) ??
     ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
     (ref.language === 'cpp'
       ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
@@ -22800,8 +22804,17 @@ export function matchMethodCall(
       };
     }
 
-    // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed)) {
+    // Multiple methods: score by receiver name word overlap with class name.
+    // Not for a Ruby name ending in `!` or `?` called on a value (#684):
+    // `key?`, `empty?`, `respond_to?`, `is_a?` and `merge!` are what the core
+    // classes answer on nearly every receiver, and the receiver's words can't
+    // tell which project method of the name, if any, is meant: activesupport's
+    // `options.key?` on a Hash went to `InheritableOptions#key?`, actionpack's
+    // `body.respond_to?` to `RackBody#respond_to?`. A constant receiver
+    // (`MarshalWithFallback.dumped?`) still names its owner.
+    const rubyBangOrPredicate = ref.language === 'ruby' && /[!?]$/.test(methodName!) && /^[a-z_]/.test(receiverLink(objectOrClass!));
+    if (!rubyBangOrPredicate &&
+        (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed))) {
       // What the receiver is named after is its last link: `builder.tokeniser`
       // is a Tokeniser, `table.Columns` no kind of table. In a python chain the
       // last link as written: Django's `request.META` and `request.GET` are

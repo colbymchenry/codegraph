@@ -336,6 +336,20 @@ function isRubyConstantPath(node: SyntaxNode): boolean {
   return getChildByField(node, 'name')?.type === 'constant' && (!scope || isRubyConstantPath(scope));
 }
 
+/**
+ * The class a Ruby call receiver constructs, as written: `Foo` for
+ * `Foo.new(key)`, `Billing::Card` for `Billing::Card.new`, `::Foo` for
+ * `::Foo.new`. Null for any other receiver, a `new` on a value (`klass.new`)
+ * among them.
+ */
+function rubyConstructedClass(receiver: SyntaxNode, source: string): string | null {
+  if (receiver.type !== 'call') return null;
+  const method = getChildByField(receiver, 'method');
+  const made = getChildByField(receiver, 'receiver');
+  if (!method || getNodeText(method, source) !== 'new' || !made || !isRubyConstantPath(made)) return null;
+  return getNodeText(made, source);
+}
+
 /** True when `node` is (transitively) inside a C function body — i.e. a local,
  * not a file/namespace-scope declaration. Walks the parent chain to the root. */
 function hasFunctionAncestor(node: SyntaxNode): boolean {
@@ -5599,9 +5613,14 @@ export class TreeSitterExtractor {
       }
       const SKIP_RECEIVERS = new Set(['self', 'super']);
       const skip = SKIP_RECEIVERS.has(receiverName);
+      // A call on what `Foo.new(…)` / `Billing::Card.new` made is a call on an
+      // instance of that class: recorded as `new Foo().bar`, the shape a
+      // constructed receiver has in every language, rather than the receiver's
+      // text with its arguments in it (#684).
+      const constructed = rubyConstructedClass(receiverNode, this.source);
       this.unresolvedReferences.push({
         fromNodeId: callerId,
-        referenceName: skip ? methodName : `${receiverName}.${methodName}`,
+        referenceName: skip ? methodName : constructed ? `new ${constructed}().${methodName}` : `${receiverName}.${methodName}`,
         referenceKind: 'calls',
         line,
         column,

@@ -148,6 +148,51 @@ describe.skipIf(!kernelBuilt)('kernel Ruby extraction parity', () => {
     ]);
   });
 
+  // A call on what `.new` made (`CacheWriter.new(key).write_cache`, #684) is
+  // recorded as `new CacheWriter().write_cache` on both backends: the class as
+  // written, without the arguments the receiver's text carried. A `new` on a
+  // value (`klass.new.run`, `self.class.new`) or a later link of a chain keeps
+  // the receiver's text, as before.
+  it('calls on a constructed receiver', () => {
+    const src = [
+      'class Callers',
+      '  def a(key, klass)',
+      '    CacheWriter.new.write_cache(key)',
+      '    CacheWriter.new(key, ttl: 5).flush!',
+      '    Billing::Ledger.new { |l| l }.post',
+      '    ::CacheWriter.new.ready?',
+      '    CacheWriter.new&.write_cache(key)',
+      '    klass.new.run',
+      '    self.class.new(key).run',
+      '    Widget.create(key).save',
+      '    CacheWriter.new.first.second',
+      '  end',
+      'end',
+      '',
+    ].join('\n');
+    assertParity('src/callers.rb', src);
+    process.env.CODEGRAPH_KERNEL = '0';
+    const calls = extractFromSource('src/callers.rb', src, 'ruby').unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && /[.(]/.test(r.referenceName))
+      .map((r) => `${r.referenceName} ${r.line}`);
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(calls.sort()).toEqual([
+      'CacheWriter.new.first.second 11',
+      'Widget.create 10',
+      'Widget.create(key).save 10',
+      'klass.new 8',
+      'klass.new.run 8',
+      'new ::CacheWriter().ready? 6',
+      'new Billing::Ledger().post 5',
+      'new CacheWriter().first 11',
+      'new CacheWriter().flush! 4',
+      'new CacheWriter().write_cache 3',
+      'new CacheWriter().write_cache 7',
+      'self.class.new 9',
+      'self.class.new(key).run 9',
+    ]);
+  });
+
   // A class method (`def self.x`, `def Widget.x`, a `def` in `class << self`)
   // is static on both backends, every other def is not: they share a
   // qualified name with any instance method of the name.
