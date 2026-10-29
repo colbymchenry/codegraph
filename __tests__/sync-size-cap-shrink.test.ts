@@ -44,6 +44,13 @@ describe('sync links the importers of a file that shrinks under the size limit',
       .map((e) => `${cg.getNode(e.target)?.kind}:${cg.getNode(e.target)?.name}`)
       .sort();
   };
+  const matchesFullIndex = async () => {
+    const synced = graphOf(cg);
+    cg.close();
+    cg = await CodeGraph.recreate(dir);
+    await cg.indexAll();
+    expect(synced).toEqual(graphOf(cg));
+  };
 
   beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sizecap-'));
@@ -64,11 +71,7 @@ describe('sync links the importers of a file that shrinks under the size limit',
     write('big.ts', BIG(10));
     await cg.sync();
     expect(importsOfUser()).toEqual(['file:big.ts', 'function:f1']);
-    const synced = graphOf(cg);
-    cg.close();
-    cg = await CodeGraph.recreate(dir);
-    await cg.indexAll();
-    expect(synced).toEqual(graphOf(cg));
+    await matchesFullIndex();
   }, 60_000);
 
   it('and again after it grows over the limit and back', async () => {
@@ -80,5 +83,15 @@ describe('sync links the importers of a file that shrinks under the size limit',
     write('big.ts', BIG(20));
     await cg.sync();
     expect(importsOfUser()).toEqual(['file:big.ts', 'function:f1']);
+    await matchesFullIndex();
+  }, 60_000);
+
+  it('and a change that keeps it over the limit is not taken for an added file', async () => {
+    write('big.ts', BIG(MAX_SOURCE_FILE_SIZE_BYTES + 5000));
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+    expect(result.addedFilePaths).toBeUndefined();
+    expect(importsOfUser()).toEqual([]);
+    await matchesFullIndex();
   }, 60_000);
 });
