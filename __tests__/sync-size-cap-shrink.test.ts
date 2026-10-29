@@ -86,6 +86,23 @@ describe('sync links the importers of a file that shrinks under the size limit',
     await matchesFullIndex();
   }, 60_000);
 
+  it('and the same for a file stored after its parse failed', async () => {
+    // Recorded as a parse failure instead of an oversize skip: still no
+    // nodes, so the same importers wait on it.
+    cg.close();
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const db = new DatabaseSync(path.join(dir, '.codegraph', 'codegraph.db'));
+    db.prepare(`UPDATE files SET errors = ? WHERE path = 'big.ts'`)
+      .run(JSON.stringify([{ message: 'parse failed', filePath: 'big.ts', severity: 'error', code: 'parse_error' }]));
+    db.close();
+    cg = await CodeGraph.open(dir);
+    write('big.ts', BIG(10));
+    const result = await cg.sync();
+    expect(result.addedFilePaths).toEqual(['big.ts']);
+    expect(importsOfUser()).toEqual(['file:big.ts', 'function:f1']);
+    await matchesFullIndex();
+  }, 60_000);
+
   it('and a change that keeps it over the limit is not taken for an added file', async () => {
     write('big.ts', BIG(MAX_SOURCE_FILE_SIZE_BYTES + 5000));
     const result = await cg.sync();
