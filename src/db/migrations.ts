@@ -109,8 +109,9 @@ const migrations: Migration[] = [
       // DDL only — instant on any size database (the row-churn hazards of #1067
       // don't apply). The table starts EMPTY on migrated databases; `sync`
       // detects that over a populated graph and backfills batched+yielding
-      // (CodeGraph.rebuildNameSegmentVocab), and any full index rebuilds it
-      // from scratch. Keep the definition in lockstep with schema.sql.
+      // (CodeGraph.rebuildNameSegmentVocab), and a full index into a fresh
+      // database fills it from scratch. Keep the definition in lockstep with
+      // schema.sql.
       db.exec(`
         CREATE TABLE IF NOT EXISTS name_segment_vocab (
           segment TEXT NOT NULL,

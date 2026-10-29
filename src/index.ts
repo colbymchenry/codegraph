@@ -650,10 +650,15 @@ export class CodeGraph {
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
         try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
-        // Segment vocabulary starts empty and is repopulated by the node write
-        // path as every file (re-)indexes below — so a full index is also the
-        // orphan-cleanup pass for names deleted since the last one.
-        try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        // Segment vocabulary. On a fresh database it starts empty, and the node
+        // write path fills it as every file indexes below. Over an existing
+        // graph the store skips unchanged files, which never write their names
+        // again, so clearing here lost them until a rebuild, and a cancelled or
+        // failed run left the table empty (#2252). There the table is kept, and
+        // the names no symbol carries any more are pruned once the run completes.
+        if (freshDb) {
+          try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        }
         // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
         // triggers, rebuild nodes_fts once from the nodes table afterwards.
         // Crash inside the window is healed on the next DatabaseConnection.open.
@@ -783,6 +788,16 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+        }
+
+        // Over an existing graph the vocabulary was kept (see the top of the
+        // run). Every write of this run has landed, so drop the rows of names
+        // deleted or renamed since they were written — the orphan cleanup the
+        // up-front clear used to do. A cancelled run keeps them all.
+        if (!freshDb && result.success && !options.signal?.aborted) {
+          const tPrune = Date.now();
+          try { this.queries.pruneNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] vocab-prune: ${Date.now() - tPrune}ms`);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
