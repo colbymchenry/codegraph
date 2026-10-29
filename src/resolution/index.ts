@@ -1571,6 +1571,14 @@ export class ReferenceResolver {
     // library one. An untyped chain resolves as the bare method name, the ref
     // the extractor emitted before it kept the chain.
     if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      // A chain rooted at an imported declaration, `JUtil.Nested.deep()` after
+      // `import p.JUtil`, walks that declaration's nested types whichever JVM
+      // language declares them; a chain through its properties is typed below.
+      const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
+      if (root && this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === root)) {
+        const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+        if (viaImport) return viaImport;
+      }
       const chain = matchKotlinReceiverChain(ref, this.context);
       if (chain && 'method' in chain) {
         const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });

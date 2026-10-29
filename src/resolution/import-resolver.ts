@@ -34,6 +34,8 @@ import {
   tsGlobalScope,
   rustPathTarget,
   isRustNameFromStd,
+  isKotlinExtensionInScope,
+  retargetSelfOverload,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
 
@@ -2517,7 +2519,15 @@ export function resolveJvmImport(
   if (sym === '*') return null;
 
   const candidates = context.getNodesByQualifiedName(`${pkg}::${sym}`);
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    // `import p.UtilsKt;` in Java names the class Kotlin compiles `p/Utils.kt`'s
+    // top-level functions into: that file, in that package.
+    if (ref.language !== 'java' || !/^\w+Kt$/.test(sym)) return null;
+    const file = context
+      .getNodesByName(`${sym.slice(0, -2)}.kt`)
+      .find((n) => n.kind === 'file' && context.getNodesInFile(n.filePath).some((d) => d.kind === 'namespace' && d.qualifiedName === pkg));
+    return file ? { original: ref, targetNodeId: file.id, confidence: 0.9, resolvedBy: 'import' } : null;
+  }
 
   // Kotlin Multiplatform: an `expect` declaration and its `actual`s share one
   // FQN across source sets (commonMain / androidMain / appleMain). Taking the
@@ -3691,16 +3701,112 @@ function resolveRustPathReference(
   return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
 
+/** The languages a Java or Kotlin import can name a declaration in: either of them. */
+const JVM_IMPORT_LANGUAGES: ReadonlySet<string> = new Set(['java', 'kotlin']);
+/** Declarations a JVM import's path can step into: `p.Outer.Inner`. */
+const JVM_IMPORT_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'trait', 'type_alias']);
+
 /**
- * Resolve a Java/Kotlin reference whose receiver is the simple name of
- * an imported FQN: `Foo.bar(...)` where `import com.example.Foo;`. The
- * imported FQN converts to a file-path suffix (`com/example/Foo.java`
- * or `.kt`) which uniquely identifies the right symbol when multiple
- * classes share the same simple name.
- *
- * Also handles bare references to the imported class itself
- * (`new Foo()` extraction emits `Foo` as a `references`/`instantiates`
- * ref) and `import static <Foo>.bar` style imports of a single member.
+ * The project declarations a Java or Kotlin import names, in either language:
+ * `import p.Outer.Inner` is `p::Outer::Inner`, the package being some prefix
+ * of the name. Several when Kotlin Multiplatform's `expect` and `actual`s
+ * share it; empty when no project declaration has the name.
+ */
+function jvmImportedDeclarations(fqn: string, context: ResolutionContext): Node[] {
+  const parts = fqn.split('.');
+  for (let i = parts.length - 1; i > 0; i--) {
+    const found = context
+      .getNodesByQualifiedName(`${parts.slice(0, i).join('.')}::${parts.slice(i).join('::')}`)
+      .filter((n) => JVM_IMPORT_LANGUAGES.has(n.language));
+    if (found.length > 0) return found;
+  }
+  return [];
+}
+
+/**
+ * A Kotlin file's top-level functions and properties, as Java sees them: the
+ * members of a class named for the file, `p.UtilsKt` for `p/Utils.kt`. The
+ * declarations of that name in the file's package, in a file of that name.
+ */
+function kotlinFileFacadeMembers(fqn: string, member: string, context: ResolutionContext): Node[] {
+  const dot = fqn.lastIndexOf('.');
+  const facade = fqn.slice(dot + 1);
+  if (dot <= 0 || !/^\w+Kt$/.test(facade)) return [];
+  const fileName = `${facade.slice(0, -2)}.kt`;
+  return context
+    .getNodesByQualifiedName(`${fqn.slice(0, dot)}::${member}`)
+    .filter((n) => n.language === 'kotlin' && (n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant') &&
+      path.posix.basename(n.filePath.replace(/\\/g, '/')) === fileName);
+}
+
+/**
+ * The member a JVM reference names through an imported declaration:
+ * `make` in `JUtil.make()`, `Nested.deep` in `JUtil.Nested.deep()`. Each step
+ * but the last is a nested type in the same file; a Kotlin object's
+ * `INSTANCE` and a class's `Companion`, as Java writes them, are the
+ * declaration itself, whose companion members the index keeps on the class.
+ * A call to a nested class builds it: Kotlin's `Outer.Inner()`. From Kotlin,
+ * an extension declared beside the type (`fun Foo.bar()` in Foo's file)
+ * counts when the calling file can see it: its own package, or an import of
+ * it or of its package. Undefined when a step names nothing the declaration
+ * has, like an inherited member or an extension declared elsewhere, which the
+ * name strategies look up.
+ */
+function jvmImportedMember(owner: Node, steps: string[], ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  // A Kotlin call that builds a type — `Outer.Inner()`, or `Foo()` on an
+  // imported Java class — runs the constructor the type declares (Java's,
+  // a Kotlin secondary one), or else instantiates the type itself. Java
+  // builds with `new`; a Java "call" of a type's name is a record pattern
+  // (`case Result.Error(String m)`) or a static-import's method, kept on the type.
+  const built = (type: Node): Node =>
+    (ref.language === 'kotlin'
+      ? context.getNodesByQualifiedName(`${type.qualifiedName}::${type.name}`)
+        .find((n) => n.kind === 'method' && n.filePath === type.filePath)
+      : undefined) ?? type;
+  let current = owner;
+  for (let i = 0; i < steps.length; i++) {
+    const segment = steps[i]!;
+    const last = i === steps.length - 1;
+    if (!last && (segment === 'INSTANCE' || segment === 'Companion') && current.language === 'kotlin' &&
+        JVM_IMPORT_TYPE_KINDS.has(current.kind)) continue;
+    const members = context
+      .getNodesByQualifiedName(`${current.qualifiedName}::${segment}`)
+      .filter((n) => n.filePath === current.filePath);
+    if (!last) {
+      const nested = members.find((n) => JVM_IMPORT_TYPE_KINDS.has(n.kind));
+      if (!nested) return undefined;
+      current = nested;
+      continue;
+    }
+    if (ref.referenceKind !== 'calls') return members[0];
+    const method = members.find((n) => n.kind === 'method' || n.kind === 'function');
+    if (method) return method;
+    const type = members.find((n) => JVM_IMPORT_TYPE_KINDS.has(n.kind));
+    if (type) return built(type);
+    const holder = current;
+    const extension = ref.language === 'kotlin' && holder.language === 'kotlin'
+      ? context
+        .getNodesByQualifiedName(`${holder.name}::${segment}`)
+        .find((n) => n.kind === 'method' && n.language === 'kotlin' && n.filePath === holder.filePath &&
+          isKotlinExtensionInScope(n, ref, context))
+      : undefined;
+    // A value called like a function (`MangaCover.Book(…)`, an enum entry's
+    // `invoke`) is the value.
+    return extension ?? members[0];
+  }
+  return ref.referenceKind === 'calls' && JVM_IMPORT_TYPE_KINDS.has(current.kind) ? built(current) : current;
+}
+
+/**
+ * Resolve a Java/Kotlin reference through an import of a project declaration:
+ * `Foo.bar(...)` after `import com.example.Foo`, the class itself (`new Foo()`
+ * emits `Foo` as a `references`/`instantiates` ref), and the member an
+ * `import static com.example.Foo.bar` names. The import is read by qualified
+ * name, so it binds the right one of several same-named classes, in Java or
+ * Kotlin whichever language the importing file is written in: a Kotlin file
+ * calling a Java class, a Java file a Kotlin object through `INSTANCE`, or a
+ * Kotlin file's top-level function through its `FileKt` class. A declaration
+ * found only by its file path (`com/example/Foo.java` or `.kt`) still counts.
  */
 function resolveJavaImportedReference(
   ref: UnresolvedRef,
@@ -3709,61 +3815,56 @@ function resolveJavaImportedReference(
 ): ResolvedRef | null {
   if (imports.length === 0) return null;
 
-  const ext = ref.language === 'kotlin' ? '.kt' : '.java';
-
   for (const imp of imports) {
     const matchesBare = imp.localName === ref.referenceName;
     const matchesQualified = ref.referenceName.startsWith(imp.localName + '.');
     if (!matchesBare && !matchesQualified) continue;
+    const memberPath = matchesBare ? [] : ref.referenceName.substring(imp.localName.length + 1).split('.');
 
-    // Convert FQN to a file-path suffix. `com.example.Foo` ->
-    // `com/example/Foo.java` (or `.kt`). The actual file may live
-    // under any source root (`src/main/java/`, `src/`, etc.), so match
-    // by suffix rather than exact path.
-    const fqnPath = imp.source.replace(/\./g, '/') + ext;
+    // An imported type, and what its name reaches: its members and nested
+    // types. An imported function or property (`import p.helper`, an
+    // extension among them) is left to the name strategies, which know a
+    // Kotlin call's receiver: an untyped chain's last call is no call of it.
+    const named = jvmImportedDeclarations(imp.source, context);
+    const declarations = named.filter((n) => JVM_IMPORT_TYPE_KINDS.has(n.kind));
+    // A Kotlin name can be a function and a type at once (Compose's
+    // `fun AppBar(…)` beside `sealed interface AppBar`): a call of the name
+    // alone is the function's, which the file's own path still finds.
+    const callOfFunction = matchesBare && ref.referenceKind === 'calls' &&
+      named.some((n) => n.kind === 'function' || n.kind === 'method');
+    if (declarations.length > 0 && !callOfFunction) {
+      const owner = declarations.length === 1 ? declarations[0]! : pickClosestJvmCandidate(declarations, ref.filePath);
+      const target = jvmImportedMember(owner, memberPath, ref, context);
+      // Of a member's overloads, the one the call's argument count fits:
+      // `ItemStack.Hash.of(stack, registries)`, not `of(stack)`.
+      if (target) return retargetSelfOverload({ original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' }, ref, context);
+      continue;
+    }
 
-    // Which symbol name to look up: the class itself, or a member.
-    const memberName = matchesBare
-      ? imp.localName
-      : ref.referenceName.substring(imp.localName.length + 1);
+    // `UtilsKt.helper()` from Java: a top-level Kotlin function.
+    if (ref.language === 'java' && memberPath.length === 1) {
+      const facadeMembers = kotlinFileFacadeMembers(imp.source, memberPath[0]!, context);
+      if (facadeMembers.length > 0) {
+        const target = facadeMembers.length === 1 ? facadeMembers[0]! : pickClosestJvmCandidate(facadeMembers, ref.filePath);
+        return retargetSelfOverload({ original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' }, ref, context);
+      }
+    }
 
-    const candidates = context.getNodesByName(memberName);
-    for (const node of candidates) {
-      if (node.language !== ref.language) continue;
+    // A declaration the index holds under another name: found by the
+    // import's path (`com/example/Foo.java` or `.kt`, whichever the
+    // declaring file is), under any source root. Its member, by name.
+    const memberName = matchesBare ? imp.localName : memberPath.join('.');
+    const fqnPath = imp.source.replace(/\./g, '/');
+    const ownerPath = imp.source.includes('.') ? imp.source.substring(0, imp.source.lastIndexOf('.')).replace(/\./g, '/') : '';
+    const inFile = (node: Node, file: string): boolean => {
       const fp = node.filePath.replace(/\\/g, '/');
-      if (fp.endsWith(fqnPath) || fp.endsWith('/' + fqnPath)) {
-        return {
-          original: ref,
-          targetNodeId: node.id,
-          confidence: 0.9,
-          resolvedBy: 'import',
-        };
-      }
-    }
-
-    // `import static com.example.Foo.bar;` — the FQN's tail is the
-    // member name, the part before is the owner class. Look up the
-    // member named `<imp.localName>` (e.g. `bar`) and prefer the
-    // candidate whose file matches the parent FQN's path.
-    if (matchesBare) {
-      const dot = imp.source.lastIndexOf('.');
-      if (dot > 0) {
-        const ownerFqn = imp.source.substring(0, dot);
-        const ownerPath = ownerFqn.replace(/\./g, '/') + ext;
-        for (const node of candidates) {
-          if (node.language !== ref.language) continue;
-          const fp = node.filePath.replace(/\\/g, '/');
-          if (fp.endsWith(ownerPath) || fp.endsWith('/' + ownerPath)) {
-            return {
-              original: ref,
-              targetNodeId: node.id,
-              confidence: 0.9,
-              resolvedBy: 'import',
-            };
-          }
-        }
-      }
-    }
+      return ['.java', '.kt'].some((ext) => fp.endsWith(file + ext) && (fp.length === file.length + ext.length || fp[fp.length - file.length - ext.length - 1] === '/'));
+    };
+    const candidates = context.getNodesByName(memberName).filter((n) => JVM_IMPORT_LANGUAGES.has(n.language));
+    const byPath = candidates.find((n) => inFile(n, fqnPath)) ??
+      // `import static com.example.Foo.bar;`: the member's owner names the file.
+      (matchesBare && ownerPath ? candidates.find((n) => inFile(n, ownerPath)) : undefined);
+    if (byPath) return retargetSelfOverload({ original: ref, targetNodeId: byPath.id, confidence: 0.9, resolvedBy: 'import' }, ref, context);
   }
   return null;
 }

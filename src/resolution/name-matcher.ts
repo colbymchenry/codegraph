@@ -8083,6 +8083,20 @@ function isKotlinTopLevelVisible(n: Node, ref: UnresolvedRef, context: Resolutio
   return pkg === here.pkg || here.stars.has(pkg) || here.imports.has(pkg ? `${pkg}.${n.name}` : n.name) || KOTLIN_DEFAULT_IMPORTS.has(pkg);
 }
 
+/**
+ * Whether a Kotlin method found by its type's name can be called from the
+ * reference's file. A member of a class in its file's package (`p::Modes::x`)
+ * can; an extension, `fun Modes.hidden()` indexed as `Modes::hidden`, is
+ * top-level, so only from its own package or through an import of it or its
+ * package (isKotlinTopLevelVisible).
+ */
+export function isKotlinExtensionInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.language !== 'kotlin' || n.kind !== 'method' || n.filePath === ref.filePath) return true;
+  const pkg = kotlinFileScope(n.filePath, context).pkg;
+  if (pkg && n.qualifiedName.startsWith(`${pkg}::`)) return true;
+  return isKotlinTopLevelVisible(n, ref, context);
+}
+
 const PHP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum']);
 const PHP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
 
@@ -13943,6 +13957,12 @@ export function resolveMethodOnType(
   if (ref.language === 'go' && preferredFqn !== undefined) {
     const scoped = resolveGoMethodInPackage(typeName, methodName, preferredFqn, matches, ref, context, confidence, resolvedBy, depth);
     if (scoped !== undefined) return scoped;
+  }
+  // A Kotlin extension, `fun Modes.hidden()` (indexed as `Modes::hidden`), is
+  // a top-level declaration: from another package, only an import of it or of
+  // its package puts it in scope. A member of the type is always reachable.
+  if (ref.language === 'kotlin' && matches.some((m) => !isKotlinExtensionInScope(m, ref, context))) {
+    matches = matches.filter((m) => isKotlinExtensionInScope(m, ref, context));
   }
   if (matches.length === 0) {
     // Conformance fallback: the method may be defined on a supertype `typeName`
@@ -22110,7 +22130,9 @@ export function matchMethodCall(
       // reaches `def self.build`, not `def build`, whichever comes first.
       const methodNode = classStrategyMethod(classNode, methodName!, context, ref.language === 'ruby' ? 'class' : undefined);
 
-      if (methodNode) {
+      // A Kotlin extension beside the class (`fun Modes.shared()`) needs an
+      // import of its own from another package.
+      if (methodNode && !(ref.language === 'kotlin' && !isKotlinExtensionInScope(methodNode, ref, context))) {
         return {
           original: ref,
           targetNodeId: methodNode.id,
@@ -22217,7 +22239,7 @@ export function matchMethodCall(
         // two methods of the name is preferred: the first declared is taken.
         const methodNode = classStrategyMethod(classNode, methodName!, context);
 
-        if (methodNode) {
+        if (methodNode && !(ref.language === 'kotlin' && !isKotlinExtensionInScope(methodNode, ref, context))) {
           if (throughCppNamespace()) return null;
           return {
             original: ref,
@@ -22266,8 +22288,12 @@ export function matchMethodCall(
     if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
       return null;
     }
+    // A Kotlin extension the calling file cannot see, `fun Modes.hidden()` in
+    // another package with neither it nor its package imported, is no
+    // candidate at all: as if no method had its name there.
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName &&
+        !(ref.language === 'kotlin' && !isKotlinExtensionInScope(n, ref, context))
     );
 
     // Filter to same-language candidates first
