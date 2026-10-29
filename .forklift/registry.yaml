@@ -1,0 +1,131 @@
+generatedAt: "2026-10-30T00:00:00Z"
+
+# One commit ahead of upstream/main: the Rego support commit.
+expected_fork_commit_count: 1
+
+features:
+  - name: "rego-language-support"
+    description: >-
+      Indexes Open Policy Agent (OPA) policy modules — rule heads become
+      function nodes, rule-to-rule calls become resolvable calls edges,
+      data/input paths become references, and packages and imports become
+      import nodes. Carries the vendored tree-sitter-rego wasm so the grammar
+      ships with the package rather than resolving from tree-sitter-wasms.
+    owned_paths:
+      - "src/types.ts"
+      - "src/extraction/grammars.ts"
+      - "src/extraction/languages/index.ts"
+      - "src/extraction/languages/rego.ts"
+      - "src/extraction/wasm/tree-sitter-rego.wasm"
+      - "src/resolution/name-matcher.ts"
+      - "__tests__/rego-policy-calls.test.ts"
+    protecting_tests:
+      - "__tests__/rego-policy-calls.test.ts"
+    status: "active"
+
+# Upstream owns release notes and version bumps; the fork always takes them.
+divergences:
+  - path: "CHANGELOG.md"
+    reason: "Upstream owns release notes."
+    resolution: "prefer_upstream"
+  - path: "package.json"
+    reason: "Upstream owns the published version number; the fork must not drift it on sync."
+    resolution: "prefer_upstream"
+
+removals: []
+
+owned_symbols: []
+
+harness:
+  version: 1
+
+  fork:
+    name: "codegraph (malarinv)"
+    short: "cg"
+    remote: "origin"
+    branch: "main"
+
+  upstream:
+    name: "codegraph (colbymchenry)"
+    short: "up"
+    remote: "upstream"
+    branch: "main"
+
+  project:
+    languages: ["typescript"]
+    source_roots: ["src/**"]
+    test_globs: ["__tests__/*.test.ts"]
+    typecheck_command: "npx tsc --noEmit"
+    test_command: "npx vitest run"
+    lint_command: "npx eslint src"
+    conflict_marker_globs: ["src/**/*.ts", "__tests__/**/*.ts"]
+    package_aliases:
+      "@colbymchenry/codegraph": "src"
+
+  checks:
+    # Registration edits in these files gate every other language's behaviour,
+    # so a conflict resolution here needs the full suite, not a spot check.
+    behavioral_source_regex: "^src/(types|extraction|resolution)/.*\\.ts$"
+    native_sentinel: null
+    footprint_baseline: ".forklift/footprint-baseline.json"
+    excludes: [".forklift/"]
+    # semantic_drift:
+    #   tool: "difftastic"
+
+  # No runner script: syncs are a manual rebase onto upstream/main.
+  sync_command: "git fetch upstream && git rebase upstream/main"
+  fork_doc: ".forklift/README.md"
+
+knowledge: |
+  ## Conflict Resolution Decision Tree
+
+  When a sync reports a conflict, apply this logic in order:
+
+  1. Is the file in the Rego feature's `owned_paths`? → prefer ours; the feature
+     owns those registries and the extractor.
+  2. Did upstream restructure `src/extraction/grammars.ts` (the
+     `WASM_GRAMMAR_FILES` / `VENDORED_WASM_LANGS` / `EXTENSION_MAP` tables)?
+     → keep our three Rego rows and re-anchor them on upstream's new shape; the
+     tables are append-mostly, so the conflict is usually a moved anchor.
+  3. Did upstream add a language with its own wasm? → check that ours still
+     resolves from `src/extraction/wasm/` and that `VENDORED_WASM_LANGS`
+     still names `rego`; a refactor into a shared table should keep both rows.
+  4. Did upstream change the `LanguageExtractor` interface or the walker
+     contract (`visitNode` return semantics, `addUnresolvedReference` shape)?
+     → adapted our extractor, then run `__tests__/rego-policy-calls.test.ts`
+     first: it asserts the behaviour, so it is the fastest signal that the
+     contract moved under us.
+  5. Did upstream apply Rego support themselves? → ESCALATE; the feature is
+     then obsolete, and the fork should drop it rather than fight.
+
+  ## Guidelines for New Features
+
+  - **One language, one extractor file.** The extractor lives in its own file
+    and registers through one entry in `src/extraction/languages/index.ts`; the
+    shared-file contact is three type tables plus that one map entry.
+  - **Verify the grammar before vendoring it.** Run
+    `node scripts/add-lang/check-grammar.mjs <wasm> <sample>` — it loads the
+    wasm beside every other vendored grammar under indexing's V8 flags and
+    fails a grammar that corrupts the shared WASM heap.
+  - **Keep tests behavioural.** `__tests__/rego-policy-calls.test.ts` asserts
+    resolved `calls` edges through a full index, not just node counts, so an
+    upstream walker change breaks it loudly.
+
+  ## Porting protocol
+
+  When syncing: `git fetch upstream && git rebase upstream/main`. After the
+  rebase, rebuild (`npm run build`), run the Rego test, then re-copy
+  `dist/extraction/{grammars,types}.js`,
+  `dist/extraction/languages/{index,rego}.js`, `dist/resolution/name-matcher.js`
+  and `dist/extraction/wasm/tree-sitter-rego.wasm` into the installed
+  `~/.codegraph/versions/<ver>/lib/dist/` tree — the installed CLI is a
+  **complete** dist, so a partial copy breaks module resolution.
+
+post_sync_knowledge: |
+  - **Rebuild after every sync.** The installed CLI runs the compiled dist, not
+    this working tree; `npm run build` then copy the full `dist/` into
+    `~/.codegraph/versions/<ver>/lib/dist/` (partial copies break with
+    `Cannot find module './js-super-calls'`).
+  - **Re-verify the grammar wasm.** `scripts/add-lang/check-grammar.mjs` after
+    any upstream change to `src/extraction/wasm-runtime-flags.ts`; the V8 flags
+    the check runs with must stay the ones indexing uses.
