@@ -1,7 +1,8 @@
 generatedAt: "2026-10-30T00:00:00Z"
 
-# One commit ahead of upstream/main: the Rego support commit.
-expected_fork_commit_count: 1
+# Two commits ahead of upstream/main: the Rego support commit and the forklift
+# registration commit that introduces this file.
+expected_fork_commit_count: 2
 
 features:
   - name: "rego-language-support"
