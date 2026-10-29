@@ -1444,7 +1444,8 @@ export class CodeGraph {
         // as a full index resolves.
         //
         // `definitionDelta` is empty for a body-only edit, so the overwhelmingly
-        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it.
+        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it, and
+        // the failed-ref re-open that follows the rebind with it.
         if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(

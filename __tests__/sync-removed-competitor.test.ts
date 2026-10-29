@@ -105,11 +105,33 @@ describe('sync re-resolves a call whose competing candidate went away', () => {
       write('t.ts', 'export function use(x: any): void {\n  x.go();\n}\n');
       cg = CodeGraph.initSync(dir);
       await cg.indexAll();
+      expect(callTargets('use')).toEqual([]);
     });
 
-    it('matches a full index after the other candidate is deleted', async () => {
+    it('after the file holding the other candidate is deleted', async () => {
       fs.unlinkSync(path.join(dir, 'b.ts'));
       await cg.sync();
+      expect(callTargets('use')).toEqual(['A::go']);
+      const synced = graphOf(cg);
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
+
+    it('after an edit renames the other candidate away', async () => {
+      write('b.ts', 'export class B {\n  stop(): number { return 2; }\n}\n');
+      await cg.sync();
+      expect(callTargets('use')).toEqual(['A::go']);
+      const synced = graphOf(cg);
+      cg = await reindexFromScratch(cg);
+      expect(synced).toEqual(graphOf(cg));
+    }, REINDEX_TIMEOUT);
+
+    it('a deletion that leaves the call ambiguous changes nothing', async () => {
+      write('c.ts', 'export class C {\n  go(): number { return 3; }\n}\n');
+      await cg.sync();
+      fs.unlinkSync(path.join(dir, 'b.ts'));
+      await cg.sync();
+      expect(callTargets('use')).toEqual([]);
       const synced = graphOf(cg);
       cg = await reindexFromScratch(cg);
       expect(synced).toEqual(graphOf(cg));
