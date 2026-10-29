@@ -11,7 +11,7 @@ import { escapeRegExp } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
-import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -3632,8 +3632,10 @@ export const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfm
  * read from the source: TS/JS keeps `this.container.classList.toggle()` and
  * `window.$events.listen()` bare, Scala `requestToArmeria(request).execute()`
  * and `_.get.whenRequestMatchesPartial(…)`. `'self'` for `this.m()` /
- * `self.m()` / `super.m()` / `super().m()`; null for a call written bare (or
- * not found). `links` are the member names between `this` and the method.
+ * `self.m()` / `super.m()` / `super().m()` — in JS, `self.m()` only when the
+ * file binds `self` (`globalThis.self` otherwise); null for a call written
+ * bare (or not found). `links` are the member names between `this` and the
+ * method.
  */
 function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { receiver: string; links: string[] } | null {
   if (ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
@@ -3659,10 +3661,68 @@ function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { rec
   const before = text.slice(0, at.index).replace(/\s+$/, '');
   if (!/\??\.$/.test(before)) return null;
   const head = before.replace(/\??\.$/, '').replace(/\s+$/, '');
+  // A JS `self` the file doesn't bind is the global object's own `self` — a
+  // worker's scope, or the page's `window` — never `this`, and is read as the
+  // path it is (`'self'` alone would read as `this`).
+  if (isJsGlobalSelf(head, ref, context)) return { receiver: 'globalThis.self', links: [] };
   if (/(?:^|[^\w$.])(?:this|self|super|Self)$/.test(head) || /(?:^|[^\w$.])super\s*\([^()]*\)$/.test(head)) return { receiver: 'self', links: [] };
   const chain = /(?:^|[^\w$.#])((?:this|super)(?:\s*\??\.\s*#?[\w$]+)+)$/.exec(head);
   const links = chain ? chain[1]!.split('.').slice(1).map((l) => l.replace(/[\s?]/g, '')) : [];
   return { receiver: head.slice(-40), links };
+}
+
+/**
+ * Whether a JS/TS name is one of the browser's own objects where the
+ * reference is written (JS_BROWSER_HOST_GLOBALS: `window`, `self`,
+ * `localStorage`, `history`, …) because the file uses the name only that way
+ * (usesNameOnlyAsReceiver). A call on one is the browser's, never a project
+ * method: `window.open()` is no `WindowService::open`, `history.back()` no
+ * router's `back` (#2907). A file that binds the name — `const history =
+ * createRouter()`, `var self = this`, a parameter, plain or destructured like
+ * outline's `({ document }: Props)` — or imports it calls what that holds.
+ */
+function isBrowserHostGlobal(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return JS_FAMILY.has(ref.language) && JS_BROWSER_HOST_GLOBALS.has(name) &&
+    usesNameOnlyAsReceiver(name, ref.filePath, context);
+}
+
+/** Per context, by `file\0name`: whether the file uses the name only as a receiver. */
+const RECEIVER_ONLY_NAMES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a JS/TS file writes `name` only as a receiver — `document.x`,
+ * `history.back()`, `self?.close()`, `localStorage['k']` — or after
+ * `typeof`, which is how code uses one of the browser's own objects. Any
+ * other mention may bind or hand over a value of the file's own: a parameter
+ * (destructured ones included), a declaration, an import, an argument, an
+ * object key. Read with comments and strings blanked; a property of the same
+ * name (`x.document`) is no mention. An indexOf scan, not a look-behind
+ * regex, so a minified line costs one pass.
+ */
+function usesNameOnlyAsReceiver(name: string, filePath: string, context: ResolutionContext): boolean {
+  let memo = RECEIVER_ONLY_NAMES.get(context);
+  if (!memo) RECEIVER_ONLY_NAMES.set(context, (memo = new Map()));
+  const key = `${filePath}\0${name}`;
+  const known = memo.get(key);
+  if (known !== undefined) return known;
+  const code = blankStringContents(stripCommentsForRegex(context.readFile(filePath) ?? '', 'typescript'));
+  let only = true;
+  for (let at = code.indexOf(name); at !== -1 && only; at = code.indexOf(name, at + 1)) {
+    const end = at + name.length;
+    if ((at > 0 && /[\w$.#]/.test(code[at - 1]!)) || /[\w$]/.test(code[end] ?? '')) continue;
+    let next = end;
+    while (next < code.length && /\s/.test(code[next]!)) next++;
+    const receiver = (code[next] === '.' && code[next + 1] !== '.') || code[next] === '[' ||
+      (code[next] === '?' && code[next + 1] === '.');
+    if (!receiver && !/\btypeof\s+$/.test(code.slice(Math.max(0, at - 16), at))) only = false;
+  }
+  memo.set(key, only);
+  return only;
+}
+
+/** Whether `head`, the code before a call's `.`, ends with a JS `self` that names the global object. */
+function isJsGlobalSelf(head: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return /(?:^|[^\w$.])self$/.test(head) && isBrowserHostGlobal('self', ref, context);
 }
 
 /**
@@ -12382,7 +12442,9 @@ function callReceiverKind(ref: UnresolvedRef, context: ResolutionContext): 'bare
   // `cls.` receiver too, and there it is a variable (protobuf's
   // `parent.getFullName()` on the EnumDescriptor an enum value belongs to).
   if (/(?:^|[^\w$.])super(?:\s*\([^()]*\)|<[^<>]*>)?\s*\.\s*$/.test(before)) return 'super';
-  if (/(?:^|[^\w$.])(?:this|self)\s*\??\.\s*$/.test(before)) return 'self';
+  if (/(?:^|[^\w$.])this\s*\??\.\s*$/.test(before)) return 'self';
+  // A JS `self` the file doesn't bind is the global object, not the instance.
+  if (/(?:^|[^\w$.])self\s*\??\.\s*$/.test(before)) return isBrowserHostGlobal('self', ref, context) ? null : 'self';
   if (ref.language === 'python' && /(?:^|[^\w$.])cls\s*\.\s*$/.test(before)) return 'self';
   if (/(?:\.|->|::)\s*$/.test(before)) return null;
   return 'bare';
@@ -13819,9 +13881,12 @@ const HOST_GLOBAL_RECEIVER =/(?:^|[^\w$.])(window|globalThis)\s*\??\.\s*([A-Za-z
  * name as the project-global escape (#1707) — and `this.render()` inside an
  * object literal's member. Both name the owner of the member they call, which
  * is tried first. Undefined when the call is neither, or no such owner has the
- * member (the bare-name strategies then run as before).
+ * member (the bare-name strategies then run as before). Null when the object
+ * is one of the browser's own: a global `self.close()`, or a `window` chain
+ * that starts at `localStorage`, `history` or another host object, like
+ * `window.localStorage.getItem()` — no project code is that object (#2907).
  */
-export function matchCollapsedObjectCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | undefined {
+export function matchCollapsedObjectCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language) || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return undefined;
   // A call written bare starts with its own name and `(`: no receiver to read.
   const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
@@ -13840,9 +13905,13 @@ export function matchCollapsedObjectCall(ref: UnresolvedRef, context: Resolution
     const hit = owner ? resolveObjectLiteralMember(owner, ref.referenceName, ref, context, 0.85, 'instance-method') : null;
     return hit ?? undefined;
   }
+  // A global `self` arrives as `globalThis.self` (bareCallReceiver).
   const host = HOST_GLOBAL_RECEIVER.exec(written.receiver);
   if (!host) return undefined;
-  return resolveObjectPathMember(host[2]!.replace(/[\s?]/g, ''), ref.referenceName, ref, context, host[1]!) ?? undefined;
+  const path = host[2]!.replace(/[\s?]/g, '');
+  const hit = resolveObjectPathMember(path, ref.referenceName, ref, context, host[1]!);
+  if (hit) return hit;
+  return JS_BROWSER_HOST_GLOBALS.has(path.split('.')[0]!) ? null : undefined;
 }
 
 /**
@@ -21495,6 +21564,14 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  // A call on one of the browser's own objects — `window.open()`,
+  // `localStorage.getItem()`, `location.reload()`, `history.back()` — that
+  // the file neither binds nor imports is the browser's: no project method is
+  // it, whatever the method's name or a class's resemblance to the receiver
+  // (#2907). Ahead of the receiver-type reader, whose backward scan has no
+  // scope and would take a `history: X` member line for this name.
+  if (ref.referenceKind === 'calls' && dotMatch && isBrowserHostGlobal(objectOrClass!, ref, context)) return null;
 
   // A JS/TS call of a member no node in the index is named — `list.push()`,
   // `fs.writeFileSync()`, a test library's matcher — is one only the
@@ -29445,9 +29522,10 @@ function matchReferenceInner(
   if (isUnresolvedJsMemberCall(ref)) return matchObjectPathCall(ref, context);
 
   // `window.App.init()` / a sibling's `this.init()`, recorded by the bare
-  // name: the object they are written on comes first (#2300).
+  // name: the object they are written on comes first (#2300). One of the
+  // browser's own objects is the last word (#2907).
   const collapsed = matchCollapsedObjectCall(ref, context);
-  if (collapsed) return collapsed;
+  if (collapsed !== undefined) return collapsed;
 
   // A Swift call through a type path (`API.PackageController.GetRoute.query`)
   // resolves on the type the path names, or not at all: the strategies below
