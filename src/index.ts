@@ -56,6 +56,7 @@ import {
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
 import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
+import type { CallSiteRow } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
@@ -2723,9 +2724,9 @@ export class CodeGraph {
    *
    * @param nodeId - ID of the function/method node
    * @param maxDepth - Maximum depth to traverse (default: 1)
-   * @returns Array of nodes that call this function
+   * @returns One row per caller, each carrying every call site that reaches it
    */
-  getCallers(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
+  getCallers(nodeId: string, maxDepth: number = 1): CallSiteRow[] {
     return this.traverser.getCallers(nodeId, maxDepth);
   }
 
@@ -2734,9 +2735,9 @@ export class CodeGraph {
    *
    * @param nodeId - ID of the function/method node
    * @param maxDepth - Maximum depth to traverse (default: 1)
-   * @returns Array of nodes called by this function
+   * @returns One row per callee, each carrying every call site that reaches it
    */
-  getCallees(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
+  getCallees(nodeId: string, maxDepth: number = 1): CallSiteRow[] {
     return this.traverser.getCallees(nodeId, maxDepth);
   }
 

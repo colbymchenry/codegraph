@@ -3558,7 +3558,8 @@ export class ToolHandler {
         const turns = new Map<string, number>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           // RAW edges for the same reason as `hasHeuristicEdge` in named-symbol-flow
-          // — a static edge over the same pair hides the synthesized one from getCallers.
+          // — getCallers' one row per pair hands a consumer the first edge, so a
+          // static edge over the same pair would stand in for the synthesized one.
           for (const edge of [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)]) {
             if (edge.provenance !== 'heuristic') continue;
             const otherId = edge.source === n.id ? edge.target : edge.source;

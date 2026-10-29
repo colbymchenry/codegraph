@@ -29,6 +29,29 @@ interface TraversalStep {
 }
 
 /**
+ * Identity of a single call site. Edges are unique on source, target, kind and
+ * position, so two calls on different lines — or two edges of different kinds
+ * between the same pair — are distinct call sites.
+ */
+export function edgeIdentity(edge: Edge): string {
+  return `${edge.source}|${edge.target}|${edge.kind}|${edge.line ?? -1}|${edge.column ?? -1}`;
+}
+
+/**
+ * One caller (or callee) and every call site that reaches it.
+ *
+ * `edges` holds all of them; `edge` is the first, kept for consumers that only
+ * need one relationship. There is still exactly one row per neighbour (#1086) —
+ * the extra call sites stay inside the row instead of becoming extra rows.
+ * A row whose node is the queried symbol carries its recursive call.
+ */
+export interface CallSiteRow {
+  node: Node;
+  edge: Edge;
+  edges: Edge[];
+}
+
+/**
  * Graph traverser for BFS and DFS traversal
  */
 export class GraphTraverser {
@@ -67,8 +90,6 @@ export class GraphTraverser {
     // Edge-identity dedup so a `direction:'both'` scan — which encounters A→B
     // from both endpoints — records each edge once.
     const seenEdges = new Set<string>();
-    const edgeKey = (e: Edge) =>
-      `${e.source}|${e.target}|${e.kind}|${e.line ?? -1}|${e.column ?? -1}`;
     const queue: TraversalStep[] = [{ node: startNode, edge: null, depth: 0 }];
 
     if (opts.includeStart) {
@@ -129,7 +150,7 @@ export class GraphTraverser {
         // adjacency scan (rather than once per dequeue) is what preserves
         // parallel edges to the same target (#1090); `nextNode` is guaranteed
         // to be in `nodes` at this point (just added, or already in-set).
-        const ek = edgeKey(adjEdge);
+        const ek = edgeIdentity(adjEdge);
         if (!seenEdges.has(ek)) {
           seenEdges.add(ek);
           edges.push(adjEdge);
@@ -274,13 +295,14 @@ export class GraphTraverser {
    *
    * @param nodeId - ID of the function/method node
    * @param maxDepth - Maximum depth to traverse (default: 1)
-   * @returns Array of nodes that call this function
+   * @returns One row per caller, each carrying every call site that reaches it
    */
-  getCallers(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
-    const result: Array<{ node: Node; edge: Edge }> = [];
+  getCallers(nodeId: string, maxDepth: number = 1): CallSiteRow[] {
+    const result: CallSiteRow[] = [];
+    const rows = new Map<string, CallSiteRow>();
     const visited = new Map<string, number>();
 
-    this.getCallersRecursive(nodeId, maxDepth, 0, result, visited, new Set([nodeId]));
+    this.getCallersRecursive(nodeId, maxDepth, 0, result, rows, visited);
 
     return result;
   }
@@ -289,9 +311,9 @@ export class GraphTraverser {
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
-    result: Array<{ node: Node; edge: Edge }>,
-    visited: Map<string, number>,
-    reported: Set<string>
+    result: CallSiteRow[],
+    rows: Map<string, CallSiteRow>,
+    visited: Map<string, number>
   ): void {
     // Mark visited BEFORE the depth check, not after. Folding both into one
     // guard meant that when `currentDepth >= maxDepth` fired we returned without
@@ -318,12 +340,36 @@ export class GraphTraverser {
 
     for (const edge of incomingEdges) {
       const callerNode = callerNodes.get(edge.source);
-      if (!callerNode || !this.nearerThanBefore(visited, callerNode.id, currentDepth + 1)) continue;
-      if (!reported.has(callerNode.id)) {
-        reported.add(callerNode.id);
-        result.push({ node: callerNode, edge });
-      }
-      this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, visited, reported);
+      if (!callerNode) continue;
+      // Record the call site even when this caller is already known: a caller
+      // that calls the symbol twice has two sites to update (#2909), and a
+      // recursive call has the symbol itself as its caller. `rows` keeps that
+      // one row per caller; `enterAtDepth` below still cuts the walk.
+      this.recordCallSite(result, rows, callerNode, edge);
+      this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, rows, visited);
+    }
+  }
+
+  /**
+   * Append one call site to its caller's row, creating the row the first time.
+   * The row keeps discovery order and the first edge; `edges` accumulates every
+   * distinct site, so the same call site is never repeated.
+   */
+  private recordCallSite(
+    result: CallSiteRow[],
+    rows: Map<string, CallSiteRow>,
+    node: Node,
+    edge: Edge
+  ): void {
+    let row = rows.get(node.id);
+    if (!row) {
+      row = { node, edge, edges: [] };
+      rows.set(node.id, row);
+      result.push(row);
+    }
+    const identity = edgeIdentity(edge);
+    if (!row.edges.some((seen) => edgeIdentity(seen) === identity)) {
+      row.edges.push(edge);
     }
   }
 
@@ -332,13 +378,14 @@ export class GraphTraverser {
    *
    * @param nodeId - ID of the function/method node
    * @param maxDepth - Maximum depth to traverse (default: 1)
-   * @returns Array of nodes called by this function
+   * @returns One row per callee, each carrying every call site that reaches it
    */
-  getCallees(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
-    const result: Array<{ node: Node; edge: Edge }> = [];
+  getCallees(nodeId: string, maxDepth: number = 1): CallSiteRow[] {
+    const result: CallSiteRow[] = [];
+    const rows = new Map<string, CallSiteRow>();
     const visited = new Map<string, number>();
 
-    this.getCalleesRecursive(nodeId, maxDepth, 0, result, visited, new Set([nodeId]));
+    this.getCalleesRecursive(nodeId, maxDepth, 0, result, rows, visited);
 
     return result;
   }
@@ -347,9 +394,9 @@ export class GraphTraverser {
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
-    result: Array<{ node: Node; edge: Edge }>,
-    visited: Map<string, number>,
-    reported: Set<string>
+    result: CallSiteRow[],
+    rows: Map<string, CallSiteRow>,
+    visited: Map<string, number>
   ): void {
     // Mark visited before the depth check — see getCallersRecursive: the merged
     // guard dropped the `visited.add` at the depth boundary, duplicating a
@@ -372,12 +419,11 @@ export class GraphTraverser {
 
     for (const edge of outgoingEdges) {
       const calleeNode = calleeNodes.get(edge.target);
-      if (!calleeNode || !this.nearerThanBefore(visited, calleeNode.id, currentDepth + 1)) continue;
-      if (!reported.has(calleeNode.id)) {
-        reported.add(calleeNode.id);
-        result.push({ node: calleeNode, edge });
-      }
-      this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
+      if (!calleeNode) continue;
+      // Symmetric with getCallers: every call site lands in the row, and a
+      // function that calls itself lists itself (#2909).
+      this.recordCallSite(result, rows, calleeNode, edge);
+      this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, rows, visited);
     }
   }
 
@@ -396,22 +442,27 @@ export class GraphTraverser {
 
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
+    const seen = new Set<string>();
+    const addEdge = (edge: Edge) => {
+      const identity = edgeIdentity(edge);
+      if (seen.has(identity)) return;
+      seen.add(identity);
+      edges.push(edge);
+    };
 
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
     // Get callers
-    const callers = this.getCallers(nodeId, depth);
-    for (const { node, edge } of callers) {
+    for (const { node, edges: sites } of this.getCallers(nodeId, depth)) {
       nodes.set(node.id, node);
-      edges.push(edge);
+      sites.forEach(addEdge);
     }
 
     // Get callees
-    const callees = this.getCallees(nodeId, depth);
-    for (const { node, edge } of callees) {
+    for (const { node, edges: sites } of this.getCallees(nodeId, depth)) {
       nodes.set(node.id, node);
-      edges.push(edge);
+      sites.forEach(addEdge);
     }
 
     return {

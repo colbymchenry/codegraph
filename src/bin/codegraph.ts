@@ -72,6 +72,7 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import { edgeIdentity } from '../graph/traversal';
 import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
@@ -2421,26 +2422,60 @@ for (const direction of ['callers', 'callees'] as const) {
           const collected = groups.map((group) => {
             const nodes = new Map<string, Node>();
             const edges = new Map<string, Edge>();
+            // Every call site of each neighbour, so one row can show them all (#2909).
+            const sites = new Map<string, Edge[]>();
             for (const target of group) {
               const connections = direction === 'callers' ? cg.getCallers(target.id) : cg.getCallees(target.id);
-              for (const { node, edge } of connections) {
-                nodes.set(node.id, node);
-                edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+              for (const connection of connections) {
+                nodes.set(connection.node.id, connection.node);
+                let row = sites.get(connection.node.id);
+                if (!row) {
+                  row = [];
+                  sites.set(connection.node.id, row);
+                }
+                for (const edge of connection.edges) {
+                  const identity = edgeIdentity(edge);
+                  if (!edges.has(identity)) edges.set(identity, edge);
+                  if (!row.some((seen) => edgeIdentity(seen) === identity)) row.push(edge);
+                }
               }
             }
-            return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
+            return {
+              group,
+              nodes: [...nodes.values()],
+              edges: [...edges.values()],
+              sites: (id: string) => sites.get(id) ?? [],
+            };
           });
 
           const relationships = (node: Node, edges: Edge[]) => [...new Set(edges
             .filter((edge) => (direction === 'callers' ? edge.source : edge.target) === node.id)
             .map((edge) => edge.kind))];
+          // Callers show where each call sits in the caller's own file — the line
+          // an edit has to touch. Callees keep their definition line: the call
+          // site belongs to the calling file, not the callee's.
+          const callSiteSuffix = (node: Node, edges: Edge[]): string => {
+            if (direction !== 'callers') return node.startLine ? `:${node.startLine}` : '';
+            const lines = [...new Set(edges
+              .filter((edge) => edge.source === node.id && typeof edge.line === 'number')
+              .map((edge) => edge.line as number))].sort((a, b) => a - b);
+            if (lines.length === 0) return node.startLine ? `:${node.startLine}` : '';
+            return `:${lines.join(',')}`;
+          };
+          const isRecursive = (node: Node, edges: Edge[]): boolean =>
+            edges.some((edge) => edge.source === edge.target && edge.target === node.id);
           if (options.json) {
-            const definitions = collected.map(({ group, nodes, edges }) => {
+            const definitions = collected.map(({ group, nodes, edges, sites }) => {
               const limited = nodes.slice(0, limit);
               const shown = new Set(limited.map((node) => node.id));
               return {
                 ...cliDefinition(group),
-                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node), relationships: relationships(node, edges) })),
+                [direction]: limited.map((node) => ({
+                  id: node.id,
+                  ...cliNode(node),
+                  relationships: relationships(node, edges),
+                  edges: sites(node.id),
+                })),
                 edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
                 total: nodes.length,
                 limit,
@@ -2448,8 +2483,16 @@ for (const direction of ['callers', 'callees'] as const) {
               };
             });
             const union = new Map<string, Node>();
-            for (const { nodes } of collected) {
-              for (const node of nodes) union.set(node.id, node);
+            const unionSites = new Map<string, Edge[]>();
+            for (const { nodes, sites } of collected) {
+              for (const node of nodes) {
+                union.set(node.id, node);
+                const merged = unionSites.get(node.id) ?? [];
+                for (const edge of sites(node.id)) {
+                  if (!merged.some((seen) => edgeIdentity(seen) === edgeIdentity(edge))) merged.push(edge);
+                }
+                unionSites.set(node.id, merged);
+              }
             }
             const total = union.size;
             console.log(JSON.stringify({
@@ -2462,7 +2505,8 @@ for (const direction of ['callers', 'callees'] as const) {
               note,
               definitions,
               [direction]: [...union.values()].slice(0, limit).map((node) => ({ ...cliNode(node),
-                relationships: relationships(node, collected.flatMap((entry) => entry.edges)) })),
+                relationships: relationships(node, collected.flatMap((entry) => entry.edges)),
+                edges: unionSites.get(node.id) ?? [] })),
               total,
               limit,
               truncated: total > limit,
@@ -2472,7 +2516,7 @@ for (const direction of ['callers', 'callees'] as const) {
             if (ambiguous) {
               console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
             }
-            for (const { group, nodes, edges } of collected) {
+            for (const { group, nodes, edges, sites } of collected) {
               const limited = nodes.slice(0, limit);
               const total = nodes.length;
               const truncated = total > limit;
@@ -2488,10 +2532,11 @@ for (const direction of ['callers', 'callees'] as const) {
                 else info(`No ${direction} found for "${symbol}"`);
               }
               for (const node of limited) {
-                const loc = node.startLine ? `:${node.startLine}` : '';
+                const loc = callSiteSuffix(node, sites(node.id));
                 const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
                 const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
-                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + chalk.dim(relation));
+                const recursive = isRecursive(node, sites(node.id)) ? chalk.dim(' (recursive)') : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + recursive + chalk.dim(relation));
                 console.log(chalk.dim(`  ${node.filePath}${loc}`));
                 console.log();
               }
