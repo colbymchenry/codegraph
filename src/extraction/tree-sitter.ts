@@ -2022,6 +2022,12 @@ export class TreeSitterExtractor {
         skipChildren = true;
       }
     }
+    // Kotlin `object : Api.Listener { … }`: an anonymous class, as Java's
+    // `new Api.Listener() { … }` is (extractKotlinObjectLiteral).
+    else if (this.language === 'kotlin' && nodeType === 'object_literal' &&
+      this.extractKotlinObjectLiteral(node, (header) => this.visitNode(header))) {
+      skipChildren = true;
+    }
     // (Decorator handling lives inside the symbol-creating extractors
     // — extractClass / extractFunction / extractProperty — because the
     // decorator node sits BEFORE the symbol in the AST and the walker
@@ -7014,6 +7020,9 @@ export class TreeSitterExtractor {
     let typeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
     const ltIdx = typeName.indexOf('<');
     if (ltIdx > 0) typeName = typeName.slice(0, ltIdx);
+    // The supertype as written, `Api.Listener` for `new Api.Listener() {…}`:
+    // the last segment alone is a nested type nothing can find.
+    const writtenType = typeName.trim() || 'Object';
     const lastDot = Math.max(typeName.lastIndexOf('.'), typeName.lastIndexOf('::'));
     if (lastDot >= 0) typeName = typeName.slice(lastDot + 1).replace(/^[:.]/, '');
     typeName = typeName.trim() || 'Object';
@@ -7029,7 +7038,7 @@ export class TreeSitterExtractor {
     // bridge T's methods to the override names found in the anon body.
     this.unresolvedReferences.push({
       fromNodeId: classNode.id,
-      referenceName: typeName,
+      referenceName: writtenType,
       referenceKind: 'extends',
       line: typeNode?.startPosition.row ?? node.startPosition.row,
       column: typeNode?.startPosition.column ?? node.startPosition.column,
@@ -7043,6 +7052,72 @@ export class TreeSitterExtractor {
       if (child) this.visitNode(child);
     }
     this.nodeStack.pop();
+  }
+
+  /**
+   * A Kotlin object expression, `object : Api.Listener { … }` or `object :
+   * Base(x), Runnable { … }`: an anonymous class, as Java's `new T() { … }`
+   * is. The class, `<Listener$anon@line>`, extends each supertype as written
+   * (the dotted path, type arguments left out), the code around it
+   * instantiates the first, and its body's declarations are its members — an
+   * override inside is then reached through the interface it implements,
+   * instead of standing as a local function of the code around it. The
+   * header (a constructor's arguments, a `by` delegate) runs in the
+   * enclosing scope: `walkHeader` walks it there. False, with nothing done,
+   * for an object expression without a body.
+   */
+  private extractKotlinObjectLiteral(node: SyntaxNode, walkHeader: (header: SyntaxNode) => void): boolean {
+    const body = node.namedChildren.find((c: SyntaxNode) => c.type === 'class_body');
+    if (!body) return false;
+    const specs = node.namedChildren.filter((c: SyntaxNode) => c.type === 'delegation_specifier');
+    const supertypes: Array<{ name: string; at: SyntaxNode; built: boolean }> = [];
+    for (const spec of specs) {
+      const holder = spec.namedChildren.find((c: SyntaxNode) => c.type === 'constructor_invocation' || c.type === 'explicit_delegation');
+      const userType = (holder ?? spec).namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+      const ids = userType?.namedChildren.filter((c: SyntaxNode) => c.type === 'type_identifier') ?? [];
+      if (ids.length > 0) {
+        supertypes.push({
+          name: ids.map((c: SyntaxNode) => getNodeText(c, this.source)).join('.'),
+          at: ids[0]!,
+          built: holder?.type === 'constructor_invocation',
+        });
+      }
+    }
+    for (const spec of specs) walkHeader(spec);
+    // The class it builds (`object : Base(), Runnable`), else its first
+    // supertype, names the object and is what the code around instantiates —
+    // as written (`mockwebserver3.Dispatcher`, `Detector.Listener`), which
+    // its last name alone would leave to a namesake.
+    const primary = supertypes.find((s) => s.built) ?? supertypes[0];
+    const shortName = primary ? primary.name.slice(primary.name.lastIndexOf('.') + 1) : 'Object';
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (primary && ownerId) {
+      this.unresolvedReferences.push({
+        fromNodeId: ownerId,
+        referenceName: primary.name,
+        referenceKind: 'instantiates',
+        line: primary.at.startPosition.row + 1,
+        column: primary.at.startPosition.column,
+      });
+    }
+    const classNode = this.createNode('class', `<${shortName}$anon@${node.startPosition.row + 1}>`, node, {});
+    if (!classNode) {
+      for (const child of body.namedChildren) walkHeader(child);
+      return true;
+    }
+    for (const supertype of supertypes) {
+      this.unresolvedReferences.push({
+        fromNodeId: classNode.id,
+        referenceName: supertype.name,
+        referenceKind: 'extends',
+        line: supertype.at.startPosition.row + 1,
+        column: supertype.at.startPosition.column,
+      });
+    }
+    this.nodeStack.push(classNode.id);
+    for (const child of body.namedChildren) this.visitNode(child);
+    this.nodeStack.pop();
+    return true;
   }
 
   /**
@@ -7651,6 +7726,15 @@ export class TreeSitterExtractor {
         if (ownerId) this.extractVariableTypeAnnotation(node, ownerId);
       }
 
+      // A Kotlin object expression in a body or an initializer, `object :
+      // Listener { … }`: an anonymous class with its own members, as Java's
+      // `new Listener() { … }` (extractKotlinObjectLiteral). Its header
+      // (constructor arguments, a delegate) is still this body's code.
+      if (this.language === 'kotlin' && nodeType === 'object_literal' &&
+        this.extractKotlinObjectLiteral(node, (header) => visitForCallsAndStructure(header, node))) {
+        return;
+      }
+
       // Nested NAMED functions inside a body — function declarations and named
       // function expressions like `.on('mount', function onmount(){})` — become
       // their own nodes so the graph can link to them (callback handlers, local
@@ -8108,11 +8192,14 @@ export class TreeSitterExtractor {
         const constructorInvocation = child.namedChildren.find((c: SyntaxNode) => c.type === 'constructor_invocation');
         const target = userType ?? constructorInvocation;
         if (target) {
-          const typeId = target.type === 'user_type'
-            ? target.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier') ?? target
-            : target.namedChildren.find((c: SyntaxNode) => c.type === 'user_type')?.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier')
-              ?? target.namedChildren.find((c: SyntaxNode) => c.type === 'user_type') ?? target;
-          const name = getNodeText(typeId, this.source);
+          // `class K : Outer.Inner()` names the nested type by its whole
+          // path (`Outer.Inner`), type arguments left out — not `Outer`.
+          const typeNode = target.type === 'user_type'
+            ? target
+            : target.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+          const ids = typeNode?.namedChildren.filter((c: SyntaxNode) => c.type === 'type_identifier') ?? [];
+          const typeId = ids[0] ?? typeNode ?? target;
+          const name = ids.length > 0 ? ids.map((c: SyntaxNode) => getNodeText(c, this.source)).join('.') : getNodeText(typeId, this.source);
           this.unresolvedReferences.push({
             fromNodeId: classId,
             referenceName: name,

@@ -1631,6 +1631,30 @@ export function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
+  // An anonymous class's member — Java's `new Listener() { … }`, Kotlin's
+  // `object : Listener { … }` — is named only inside the declaration holding
+  // the class: a bare `block()` elsewhere is never the `override val block` of
+  // an object a private property holds. Its overrides are reached through the
+  // type it implements.
+  const anon = candidate.qualifiedName.includes('$anon@') ? ANON_MEMBER_QN.exec(candidate.qualifiedName) : null;
+  if (anon) {
+    if (ref.filePath !== candidate.filePath) return false;
+    // The holder is the declaration of that name around the class's own line
+    // (overloads share the name).
+    const at = Number(anon[2]);
+    let holders = context.getNodesByQualifiedName(anon[1]!)
+      .filter((n) => n.filePath === candidate.filePath && n.startLine <= at && (n.endLine ?? n.startLine) >= at);
+    // A Kotlin extension function is named by its receiver (`Call::asObservable`),
+    // not by the path its object's members carry (`pkg::asObservable`): then
+    // the innermost declaration around the class's line holds it.
+    if (holders.length === 0) {
+      const around = context.getNodesInFile(candidate.filePath).filter((n) =>
+        ANON_HOLDER_KINDS.has(n.kind) && n.startLine <= at && (n.endLine ?? n.startLine) >= at && !n.qualifiedName.includes('$anon@'));
+      const innermost = around.sort((x, y) => y.startLine - x.startLine)[0];
+      if (innermost) holders = [innermost];
+    }
+    return holders.length === 0 || holders.some((n) => ref.line >= n.startLine && ref.line <= (n.endLine ?? n.startLine));
+  }
   // An object literal's member is reached through its object (#2300): a bare
   // `load()` or `setTimeout(load)` never means `App.load`, whatever shares
   // the name — see isObjectMemberReachableByName for the ways that do.
@@ -1662,6 +1686,28 @@ export function isLexicallyReachable(
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const scope = lexicalScopeOf(candidate, context);
   return scope === null || (ref.filePath === candidate.filePath && ref.line >= scope.start && ref.line <= scope.end);
+}
+
+/** A qualified name through an anonymous class: the declaration holding it, then `::<T$anon@line>`. */
+const ANON_MEMBER_QN = /^(.+?)::<[^<>:]*\$anon@(\d+)>(?:::|$)/;
+/** Declarations an anonymous class can be written in. */
+const ANON_HOLDER_KINDS = new Set<Node['kind']>(['function', 'method', 'constant', 'field', 'variable', 'property']);
+
+/** An anonymous class — Java's `new T() { … }`, Kotlin's `object : T { … }` — named `<T$anon@line>`. */
+function isAnonymousClass(n: Node): boolean {
+  return n.name.startsWith('<') && n.name.includes('$anon@');
+}
+
+/** A member of an anonymous class: its qualified name passes through `<T$anon@line>`. */
+function isAnonymousMember(n: Node): boolean {
+  return n.qualifiedName.includes('$anon@') && ANON_MEMBER_QN.test(n.qualifiedName);
+}
+
+/** How many anonymous classes a qualified name passes through. */
+function anonymousDepth(qualifiedName: string): number {
+  let count = 0;
+  for (let i = qualifiedName.indexOf('$anon@'); i >= 0; i = qualifiedName.indexOf('$anon@', i + 6)) count++;
+  return count;
 }
 
 /** Per context: node id → the function body (or Scala block) a declaration is local to. */
@@ -6908,6 +6954,12 @@ function lexicalKotlinMembers(candidates: Node[], ref: UnresolvedRef, context: R
   if (hierarchy.has('*')) return candidates;
   const lexical = candidates.filter((n) => {
     if (n.kind !== 'method') return false;
+    // An object expression's override is not what a call of its own name in
+    // it means — `original!!.contentLength()` in `override fun
+    // contentLength()`, `this@Outer.onScroll(…)`, an extension receiver's
+    // `onDataChanged(…)` — as when its overrides were local functions: the
+    // scopes around it decide.
+    if (n.id === ref.fromNodeId && isAnonymousMember(n)) return false;
     const path = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./);
     let owner = path.pop() ?? '';
     if (owner === 'Companion') owner = path.pop() ?? '';
@@ -13176,7 +13228,9 @@ export function matchByExactName(
     // the real `trait`, and as the sole candidate was adopted outright by the
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
-    (!inheritanceRef || isSupertypeTarget(n)) &&
+    // So does a Kotlin object expression's `instantiates` (Kotlin's only):
+    // okhttp's `object : CookieJar { … }` is no `OverrideParam.CookieJar` entry.
+    (!(inheritanceRef || (ref.language === 'kotlin' && ref.referenceKind === 'instantiates')) || isSupertypeTarget(n)) &&
     // And a supertype or type a TS/JS module names without importing it is
     // its own or a global, never another module's — ahead of the ranking, so
     // a global `interface Window` in a `declare global` still wins.
@@ -13298,6 +13352,71 @@ export function matchByExactName(
   }
 
   return null;
+}
+
+/** Languages whose supertypes are written through their enclosing type with a dot: `Outer.Inner`. */
+const DOTTED_SUPERTYPE_LANGUAGES: ReadonlySet<string> = new Set(['java', 'kotlin', 'csharp']);
+const DOTTED_SUPERTYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'struct', 'trait', 'enum']);
+
+/**
+ * A supertype written through its enclosing type — Java's `class Named extends
+ * Outer.Inner`, `implements Api.Listener` or `new Api.Listener() {…}`, Kotlin's
+ * `class K : Outer.Inner()` or `object : Api.Listener`, C#'s `class N :
+ * Outer.IListener` — or in full (`com.x.Outer.Inner`). The index names a nested
+ * type `p::Outer::Inner`, so the written path is the tail of its qualified
+ * name. A path that is not written in full must start at a type the file can
+ * name: in its own file, package or namespace, or one it imports (C#: one its
+ * usings reach). Of several, the one closest to the file in the tree, or none
+ * when two are as close. Undefined when no project type has the path (a
+ * library supertype), for the other strategies to look at.
+ */
+function matchDottedSupertype(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  // A Kotlin object expression's `instantiates` names its supertype as written too.
+  if (!DOTTED_SUPERTYPE_LANGUAGES.has(ref.language) ||
+      !(isInheritanceRef(ref) || (ref.language === 'kotlin' && ref.referenceKind === 'instantiates'))) return undefined;
+  const written = ref.referenceName.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '').replace(/\s+/g, '');
+  if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(written)) return undefined;
+  const parts = written.split('.');
+  const candidates = context.getNodesByName(parts[parts.length - 1]!).filter((n) => {
+    if (!DOTTED_SUPERTYPE_KINDS.has(n.kind) || !sameLanguageFamily(n.language, ref.language) || n.id === ref.fromNodeId) return false;
+    const dotted = n.qualifiedName.replace(/::/g, '.');
+    return dotted === written || dotted.endsWith(`.${written}`);
+  });
+  if (candidates.length === 0) return undefined;
+  const visible = candidates.filter((n) => {
+    if (n.qualifiedName.replace(/::/g, '.') === written || n.filePath === ref.filePath) return true;
+    // The type the written path starts at: `p::Outer` for `p::Outer::Inner`.
+    const segments = n.qualifiedName.split('::');
+    const rootQn = segments.slice(0, segments.length - (parts.length - 1)).join('::');
+    const cut = rootQn.indexOf('::');
+    const pkg = cut < 0 ? '' : rootQn.slice(0, cut);
+    const rootFqn = rootQn.replace(/::/g, '.');
+    if (ref.language === 'java') {
+      const scope = javaFileScope(ref.filePath, context);
+      return scope.pkg === pkg || scope.single.has(rootFqn) || scope.demand.has(pkg);
+    }
+    if (ref.language === 'kotlin') {
+      const scope = kotlinFileScope(ref.filePath, context);
+      return scope.pkg === pkg || scope.imports.has(rootFqn) || scope.stars.has(pkg);
+    }
+    const root = context.getNodesByQualifiedName(rootQn).find((r) => DOTTED_SUPERTYPE_KINDS.has(r.kind));
+    return root !== undefined && isCsharpTypeVisible(root, { ...ref, referenceName: parts[0]! }, context);
+  });
+  if (visible.length === 0) return null;
+  let chosen = visible[0]!;
+  if (visible.length > 1) {
+    const fromDirs = ref.filePath.split('/').slice(0, -1);
+    const closeness = (n: Node): number => {
+      const dirs = n.filePath.split('/').slice(0, -1);
+      let shared = 0;
+      while (shared < Math.min(dirs.length, fromDirs.length) && dirs[shared] === fromDirs[shared]) shared++;
+      return shared;
+    };
+    const ranked = visible.map((n) => ({ n, c: closeness(n) })).sort((a, b) => b.c - a.c);
+    if (ranked[0]!.c === ranked[1]!.c) return null;
+    chosen = ranked[0]!.n;
+  }
+  return { original: ref, targetNodeId: chosen.id, confidence: 0.9, resolvedBy: 'qualified-name' };
 }
 
 /**
@@ -14298,6 +14417,40 @@ function esClassSupertypes(typeName: string, language: Language, context: Resolu
   return [...names];
 }
 
+/**
+ * The supertypes of the Java / Kotlin types named `typeName` (`LegacyBuilder`,
+ * or a chain, `AssistantMessage::Builder`), in the order the walk by name
+ * reads them, each with the chain of types that names it, its package
+ * dropped: a nested supertype (`extends AssistantMessage.Builder<T>`) is
+ * looked up as `AssistantMessage::Builder` before every `Builder` in the
+ * project is. Null without the edge reader.
+ */
+function jvmSupertypeChains(
+  typeName: string,
+  language: Language,
+  context: ResolutionContext,
+): Array<{ chain: string; name: string }> | null {
+  if (!context.getSupertypeNodes) return null;
+  const simple = typeName.split('::').pop()!;
+  const out: Array<{ chain: string; name: string }> = [];
+  const seen = new Set<string>();
+  for (const n of context.getNodesByName(simple)) {
+    if (n.language !== language || !JVM_DECLARED_TYPE_KINDS.has(n.kind)) continue;
+    if (typeName !== simple && n.qualifiedName !== typeName && !n.qualifiedName.endsWith(`::${typeName}`)) continue;
+    for (const s of context.getSupertypeNodes(n.id)) {
+      if (!s.name || s.name === simple) continue;
+      const segments = s.qualifiedName.split('::');
+      let first = 0;
+      while (first < segments.length - 1 && !/^[A-Z]/.test(segments[first]!)) first++;
+      const chain = segments.slice(first).join('::');
+      if (seen.has(chain)) continue;
+      seen.add(chain);
+      out.push({ chain, name: s.name });
+    }
+  }
+  return out;
+}
+
 // Exported for the precedence unit tests (#1079): they assert the
 // preferredFqn → same-file → matches[0] ordering directly.
 export function resolveMethodOnType(
@@ -14378,6 +14531,24 @@ export function resolveMethodOnType(
         if (depth === 0 && es) {
           const inherited = esInheritedMethod(typeName, methodName, preferredFqn ?? ref.filePath, ref, context);
           if (inherited) return { original: ref, targetNodeId: inherited.id, confidence, resolvedBy };
+        }
+        // A Java / Kotlin supertype is asked by the chain that names it first
+        // (`AssistantMessage::Builder`, not every `Builder`), then — when the
+        // edge reached a namesake, Minestom's `Player extends LivingEntity` to a
+        // nested `EntityStatuses.LivingEntity` — by its name, as before.
+        const jvm = !es && (ref.language === 'java' || ref.language === 'kotlin')
+          ? jvmSupertypeChains(typeName, ref.language, context) : null;
+        if (jvm) {
+          const tried = new Set<string>();
+          for (const { chain, name } of jvm) {
+            for (const t of chain === name ? [chain] : [chain, name]) {
+              if (tried.has(t)) continue;
+              tried.add(t);
+              const via = resolveMethodOnType(t, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1);
+              if (via) return via;
+            }
+          }
+          return null;
         }
         const supertypes = es ? esClassSupertypes(typeName, ref.language, context) : context.getSupertypes!(typeName, ref.language);
         for (const supertype of supertypes) {
@@ -19208,16 +19379,38 @@ function inferJavaFieldReceiverType(
   }
   if (!enclosing) return null;
 
+  // A Kotlin object expression (`object : Callback { … }`) sees the scope it
+  // is written in: a property it does not declare itself is one of the class
+  // around it — okhttp's `server.url(…)` in an `object : Callback`'s
+  // `onResponse` is the test class's `MockWebServer`.
+  while (ref.language === 'kotlin' && isAnonymousClass(enclosing)) {
+    const anon: Node = enclosing;
+    const own = inFile.find((n) => (n.kind === 'field' || n.kind === 'constant' || n.kind === 'variable') &&
+      n.qualifiedName === `${anon.qualifiedName}::${receiverName}`);
+    if (own) return inferKotlinPropertyType(receiverName, own, anon, inFile, ref, context);
+    let outer: Node | null = null;
+    for (const n of inFile) {
+      if ((n.kind !== 'class' && n.kind !== 'interface') || n.language !== ref.language) continue;
+      if (n.startLine < anon.startLine && (n.endLine ?? n.startLine) >= ref.line &&
+          (!outer || n.startLine >= outer.startLine)) outer = n;
+    }
+    if (!outer) return null;
+    enclosing = outer;
+  }
+
   const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const enclosingAnon = anonymousDepth(enclosing.qualifiedName);
   // Kotlin indexes a `val` property as a `constant`, a `var` as a `field`, and
-  // a companion-object property as a `variable`.
+  // a companion-object property as a `variable`. One of an object expression
+  // in the class's code is that object's.
   const field = inFile.find(
     (n) =>
       (n.kind === 'field' || (ref.language === 'kotlin' && (n.kind === 'constant' || n.kind === 'variable'))) &&
       n.name === receiverName &&
       n.language === ref.language &&
       n.startLine >= enclosing.startLine &&
-      (n.endLine ?? n.startLine) <= enclosingEnd,
+      (n.endLine ?? n.startLine) <= enclosingEnd &&
+      !(ref.language === 'kotlin' && anonymousDepth(n.qualifiedName) > enclosingAnon),
   );
   // Kotlin keeps no signature on a property, and a primary-constructor
   // property (`class A(private val repo: Repo)`) is no node at all, so the
@@ -19900,9 +20093,12 @@ function kotlinReceiverDeclaredType(
   const param = inferLocalReceiverType(name, ref, context);
   if (param) return /^[A-Z]/.test(param) ? param : null;
   if (localDeclared) return null;
-  // A property of a superclass: `viewModel` declared in `BaseActivity`.
-  const owner = kotlinEnclosingClass(ref, context);
-  if (!owner || kotlinOwnPropertyType(name, owner, ref, context) !== undefined) return null;
+  // A property of a superclass: `viewModel` declared in `BaseActivity`. In an
+  // object expression, of the class it is written in, unless the object
+  // declares the name itself.
+  const around = kotlinEnclosingClasses(ref, context);
+  const owner = around[around.length - 1];
+  if (!owner || around.some((c) => kotlinOwnPropertyType(name, c, ref, context) !== undefined)) return null;
   return kotlinInheritedPropertyType(name, owner, ref, context);
 }
 
@@ -19912,6 +20108,24 @@ function kotlinEnclosingClass(ref: UnresolvedRef, context: ResolutionContext): N
     .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
       n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
     .sort((a, b) => b.startLine - a.startLine)[0];
+}
+
+/**
+ * The Kotlin classes enclosing `ref`'s line, tightest first: each object
+ * expression (`object : Callback { … }`) the line is in, whose code sees the
+ * scope it is written in, through the first named class.
+ */
+function kotlinEnclosingClasses(ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const around = context.getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+      n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  const out: Node[] = [];
+  for (const c of around) {
+    out.push(c);
+    if (!isAnonymousClass(c)) break;
+  }
+  return out;
 }
 
 /**
@@ -20589,7 +20803,19 @@ function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: 
     else if ((n.kind === 'method' || n.kind === 'function') && (!fn || n.startLine >= fn.startLine)) fn = n;
   }
   if (!cls) return null;
-  const found = memberTypeThroughHierarchy(cls, name, context);
+  let found = memberTypeThroughHierarchy(cls, name, context);
+  // A Kotlin object expression's code sees the class it is written in, as
+  // inferJavaFieldReceiverType walks; its `this` is the object.
+  for (let inner: Node = cls; !found && ref.language === 'kotlin' && isAnonymousClass(inner) && receiver === name;) {
+    let outer: Node | undefined;
+    for (const n of inFile) {
+      if (MEMBER_CLASS_KINDS.has(n.kind) && n.startLine < inner.startLine && n.endLine >= ref.line &&
+          (!outer || n.startLine >= outer.startLine)) outer = n;
+    }
+    if (!outer) break;
+    found = memberTypeThroughHierarchy(outer, name, context);
+    inner = outer;
+  }
   if (!found) return null;
   // A lambda parameter, `var` local, `out` variable or `foreach` binding in
   // the calling method shadows the field, and the local inference that ran
@@ -22745,7 +22971,10 @@ export function matchMethodCall(
     // only method of the name: `cache.aadd()` is `BaseCache`'s, while
     // `value.split()` is no test model's `split`.
     const reachable = targetMethods.filter((m) => isLexicallyReachable(m, ref, context));
-    const scopedOut = reachable.length !== targetMethods.length;
+    // A Kotlin object expression's member out of reach leaves no likelier a
+    // guess than before it was one (its overrides were local functions, never
+    // candidates): okhttp's `it.isReady()` is still the SerialTask interface's.
+    const scopedOut = targetMethods.some((m) => !reachable.includes(m) && !(m.language === 'kotlin' && isAnonymousMember(m)));
     targetMethods = reachable;
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
@@ -29925,7 +30154,11 @@ function matchReferenceInner(
   result = nmTimed('filePath', ref, () => matchByFilePath(ref, context));
   if (result) return result;
 
-  // 1. Qualified name match (highest confidence)
+  // 1. Qualified name match (highest confidence). A dotted Java, Kotlin or C#
+  // supertype (`extends Outer.Inner`) is a nested type's path: the type it
+  // names in the file's reach, or nothing.
+  const dottedSupertype = nmTimedT('dottedSupertype', ref, () => matchDottedSupertype(ref, context));
+  if (dottedSupertype !== undefined) return dottedSupertype;
   result = nmTimed('qualifiedName', ref, () => matchByQualifiedName(ref, context));
   if (result) return result;
 

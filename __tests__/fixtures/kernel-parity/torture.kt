@@ -311,3 +311,41 @@ class ReceiverChainK(private val engine: EngineK) {
         super.toString().length.toString()
     }
 }
+
+// Object expressions as anonymous classes: dotted and generic supertypes, a
+// constructor and a `by` delegate in the header, nested and supertype-less ones.
+// (Multi-line bodies: a one-line class body sets the grammar's phantom error.)
+class ObjectExpressions {
+    val held = object : Outer.Listener, Runnable {
+        override fun on() {
+            helper()
+        }
+        override fun run() {
+        }
+    }
+    fun make(): Base = object : Base(compute()) {
+        override fun run() {
+            val inner = object : Runnable {
+                override fun run() {
+                    helper()
+                }
+            }
+        }
+    }
+    fun delegated() = object : api.IFoo by makeDelegate(), Marker {
+        val x = 1
+    }
+    fun generic() = object : pkg.Outer<IFoo.Stub>.Inner<List<String>>() {
+        val y = 2
+    }
+    fun bare() = object {
+        fun x() {
+            helper()
+        }
+    }
+    fun helper() {
+    }
+    fun compute(): Int = 1
+}
+
+class DottedSuper : Outer.Inner(), com.example.Api.Listener
