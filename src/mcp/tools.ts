@@ -2040,6 +2040,10 @@ export class ToolHandler {
   // (#995), or an index that exists but could not be opened (SQLite's own
   // failure, or no node:sqlite). Engine-maintained; cleared by a successful open.
   private defaultOpenFailure: WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null = null;
+  // Why the default project was refused: the folder it resolved to, or was
+  // searched for from, is a sensitive one (the guard a `projectPath` gets).
+  // Engine-maintained; cleared by a successful open.
+  private defaultRootRefusal: string | null = null;
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -2092,6 +2096,17 @@ export class ToolHandler {
   setDefaultCodeGraph(cg: CodeGraph): void {
     this.cg = cg;
     this.defaultOpenFailure = null;
+    this.defaultRootRefusal = null;
+  }
+
+  /**
+   * Engine-only: record why the default project was refused as a sensitive
+   * folder, so a call without a projectPath says why there is none. `null`
+   * clears it. A refused root was never opened, so no open failure stands.
+   */
+  setDefaultRootRefusal(refusal: string | null): void {
+    this.defaultRootRefusal = refusal;
+    if (refusal) this.defaultOpenFailure = null;
   }
 
   /**
@@ -2327,14 +2342,21 @@ export class ToolHandler {
       if (!this.cg) {
         if (this.defaultOpenFailure) throw this.defaultOpenFailure;
         const searched = this.defaultProjectHint ?? process.cwd();
+        // A refused default is the same "pass projectPath" state, success-shaped
+        // like the rest: the agent can still query every other project.
+        const why = this.defaultRootRefusal
+          ? `${this.defaultRootRefusal}. CodeGraph never uses a credential, config or system folder ` +
+            'as a project, so this session has no default project. To query a project outside such ' +
+            'folders, target it explicitly:\n'
+          : `Searched for a .codegraph/ directory starting from: ${searched}\n` +
+            this.formatKnownSubprojects() +
+            'Either the server root has no index of its own (e.g. a monorepo where only ' +
+            "sub-projects are indexed), or the MCP client launched the server outside your " +
+            'project without reporting the workspace root. Either way, target the project ' +
+            'explicitly:\n';
         throw new NotIndexedError(
           'No CodeGraph project is loaded for this session.\n' +
-          `Searched for a .codegraph/ directory starting from: ${searched}\n` +
-          this.formatKnownSubprojects() +
-          'Either the server root has no index of its own (e.g. a monorepo where only ' +
-          "sub-projects are indexed), or the MCP client launched the server outside your " +
-          'project without reporting the workspace root. Either way, target the project ' +
-          'explicitly:\n' +
+          why +
           '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project" ' +
           '(any project that has a .codegraph/ — including a sub-project of a monorepo)\n' +
           '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]\n' +

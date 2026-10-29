@@ -246,6 +246,8 @@ export class MCPSession {
     // sub-projects indexed) and never surfaced the tools after a mid-session
     // `codegraph init`. When no explicit path is known yet (roots/list dance
     // pending), cwd is the best predictor of where the default will resolve.
+    // A root in a sensitive folder resolves to null here as in the engine, so
+    // that session gets the no-default-project variant too.
     const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.

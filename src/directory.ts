@@ -9,6 +9,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
 import { loadNodeSqlite } from './db/node-sqlite';
+import { sensitiveDirectoryRefusal } from './utils';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -453,6 +454,12 @@ export interface ServerRootResolution {
    * what IS reachable (#1607).
    */
   candidates: string[];
+  /**
+   * Why the root that was found is not served: it, or the path the search
+   * started from, is a sensitive folder (`~/.ssh`, `~/.config`, `/etc`, …),
+   * refused as a tool call's `projectPath` is. `root` is then null.
+   */
+  refusal: string | null;
 }
 
 /**
@@ -484,19 +491,37 @@ function eligibleForSubprojectScan(base: string): boolean {
  *
  * `opts.subprojectScan: false` skips the down-scan entirely (the per-tool-call
  * retry path throttles it; the up-walk always runs).
+ *
+ * The default project gets the sensitive-folder refusal a tool call's
+ * `projectPath` gets: on the path searched from when it exists, and on the
+ * root the search lands on. A refused root resolves to null, with the reason
+ * in `refusal`: the server has no default project, so nothing there is opened,
+ * watched or synced. Sub-projects below a refused path aren't listed either;
+ * a tool call would refuse them.
  */
 export function resolveServerRoot(
   searchFrom: string,
   opts: { subprojectScan?: boolean } = {},
 ): ServerRootResolution {
+  const found = findServerRoot(searchFrom, opts);
+  if (!found.root && found.candidates.length === 0) return found;
+  const startRefusal = fs.existsSync(searchFrom) ? sensitiveDirectoryRefusal(searchFrom) : null;
+  if (!found.root) return startRefusal ? { ...found, candidates: [] } : found;
+  const refusal = startRefusal ?? sensitiveDirectoryRefusal(found.root);
+  return refusal ? { root: null, viaSubScan: false, candidates: [], refusal } : found;
+}
+
+/** {@link resolveServerRoot} before the sensitive-folder refusal. */
+function findServerRoot(searchFrom: string, opts: { subprojectScan?: boolean }): ServerRootResolution {
+  const none: ServerRootResolution = { root: null, viaSubScan: false, candidates: [], refusal: null };
   const up = findNearestCodeGraphRoot(searchFrom);
-  if (up) return { root: up, viaSubScan: false, candidates: [] };
-  if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
+  if (up) return { root: up, viaSubScan: false, candidates: [], refusal: null };
+  if (opts.subprojectScan === false) return none;
   const base = path.resolve(searchFrom);
-  if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
+  if (!eligibleForSubprojectScan(base)) return none;
   const subs = findIndexedSubprojectRoots(base);
-  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs };
-  return { root: null, viaSubScan: false, candidates: subs };
+  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs, refusal: null };
+  return { ...none, candidates: subs };
 }
 
 /**

@@ -91,6 +91,9 @@ export class MCPEngine {
   // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
   // bounded but shouldn't run on every tool call in the no-default state.
   private lastRetrySubScanAt = 0;
+  // The default-root refusal last written to stderr, so the retry on every
+  // tool call doesn't repeat it.
+  private loggedRootRefusal: string | null = null;
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
@@ -247,6 +250,8 @@ export class MCPEngine {
       this.lastRetrySubScanAt = Date.now();
       if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
     }
+    // An up-walk alone can't clear a refusal the throttled down-scan found.
+    if (scanDue || res.refusal) this.noteRootRefusal(res.refusal);
     const resolvedRoot = res.root;
     if (!resolvedRoot) return;
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
@@ -373,15 +378,18 @@ export class MCPEngine {
     // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
     const res = resolveServerRoot(searchFrom);
     const resolvedRoot = res.root;
+    this.noteRootRefusal(res.refusal);
     if (!resolvedRoot) {
       // Sessions may still discover a project later via roots/list, and the
       // per-call retry re-resolves — this state is recoverable, hence stderr
       // (not a failure) + candidates surfaced through the tool-call error.
       this.projectPath = searchFrom;
       this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
-      process.stderr.write(
-        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
-      );
+      if (!res.refusal) {
+        process.stderr.write(
+          `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
+        );
+      }
       if (res.candidates.length > 0) {
         const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
         process.stderr.write(
@@ -409,6 +417,21 @@ export class MCPEngine {
       // The agent otherwise hears only "no project loaded" (#995).
       this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
+  }
+
+  /**
+   * Record why the default project is refused (a sensitive folder, #2929's
+   * guard), or clear that. Tool calls without a projectPath say why there is
+   * no default project, and stderr says it once per reason, since every such
+   * call re-resolves.
+   */
+  private noteRootRefusal(refusal: string | null): void {
+    this.toolHandler.setDefaultRootRefusal(refusal);
+    if (!refusal || refusal === this.loggedRootRefusal) return;
+    this.loggedRootRefusal = refusal;
+    process.stderr.write(
+      `[CodeGraph MCP] ${refusal} — no default project, live sync disabled. Tool calls can still pass projectPath for a project elsewhere.\n`
+    );
   }
 
   /** One stderr line when the default project came from the down-scan (#1606). */

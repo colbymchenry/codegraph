@@ -15,6 +15,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Security
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
+- The MCP server no longer uses a sensitive folder such as `~/.ssh`, `~/.config` or `/etc` as a session's default project, whether the folder came from your AI agent's workspace, the folder the server was started in, or `--path`. Before, only a folder an agent asked for by path was refused, so a session started in one that held an index answered from the files inside and kept it synced; now that session has no default project, and the agent can still query any other project by path.
 
 ### Fixes
 

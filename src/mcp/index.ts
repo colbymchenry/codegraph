@@ -304,6 +304,10 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
  * spawned `process.cwd()` is already realpath'd) and one that passed a
  * symlinked `rootUri` would otherwise hash to different sockets and silently
  * fail to share the daemon.
+ *
+ * A root in a sensitive folder (`~/.ssh`, `~/.config`, `/etc`, …) resolves to
+ * null like a missing one: the session runs in-process with no default
+ * project, and no daemon, lock or socket is set up in that folder.
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
@@ -651,6 +655,14 @@ export class MCPServer {
     // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
     // kills/restarts can be placed in time (#1431 — the log was undatable).
     timestampStderrLines();
+    // A launcher never starts a daemon for a sensitive folder (see
+    // resolveDaemonRoot). One started by hand for such a folder leaves rather
+    // than take the folder's locks and serve it.
+    const refusal = resolveServerRoot(this.projectPath ?? process.cwd()).refusal;
+    if (refusal) {
+      process.stderr.write(`[CodeGraph daemon] ${refusal}; exiting.\n`);
+      process.exit(0);
+    }
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     // Read once and dropped, so nothing this daemon spawns inherits it.
     const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);

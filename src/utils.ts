@@ -318,6 +318,30 @@ function sensitiveHomeTrees(): string[] {
  * @returns An error message if invalid, or null if valid
  */
 export function validateProjectPath(dirPath: string): string | null {
+  const refusal = sensitiveDirectoryRefusal(dirPath);
+  if (refusal) return refusal;
+
+  // Verify it's a real directory
+  const resolved = path.resolve(dirPath);
+  try {
+    const stats = fs.statSync(resolved);
+    if (!stats.isDirectory()) {
+      return `Path is not a directory: ${resolved}`;
+    }
+  } catch {
+    return `Path does not exist or is not accessible: ${resolved}`;
+  }
+
+  return null;
+}
+
+/**
+ * The sensitive-folder half of {@link validateProjectPath}: why `dirPath` is,
+ * or is inside, a folder CodeGraph never uses as a project, or null. Unlike
+ * that function it doesn't require the path to exist or be a directory, so it
+ * can vet a path a project root is searched for from.
+ */
+export function sensitiveDirectoryRefusal(dirPath: string): string | null {
   const resolved = path.resolve(dirPath);
   const lexical = path.resolve(stripWin32NamespacePrefix(dirPath));
   const real = nativeRealPath(lexical);
@@ -345,16 +369,6 @@ export function validateProjectPath(dirPath: string): string | null {
     if (homeTrees.some((tree) => isSameOrUnder(folded, tree))) {
       return `Refusing to operate on sensitive directory: ${named(candidate)}`;
     }
-  }
-
-  // Verify it's a real directory
-  try {
-    const stats = fs.statSync(resolved);
-    if (!stats.isDirectory()) {
-      return `Path is not a directory: ${resolved}`;
-    }
-  } catch {
-    return `Path does not exist or is not accessible: ${resolved}`;
   }
 
   return null;
